@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Scalar, Storage, TensorData};
+use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Op, Scalar, Storage, TensorData};
 
 fn f32s(data: &TensorData) -> Vec<f32> {
     match data.storage() {
@@ -61,6 +61,41 @@ fn embedding_norm_and_dropout_have_expected_semantics() {
         ("nx", TensorData::new([1, 2], vec![3., 4.]).unwrap()),
     ));
     assert!((values[0] - 0.848_528_1).abs() < 1e-5 && (values[1] - 1.131_370_9).abs() < 1e-5);
+}
+
+#[test]
+fn rms_norm_uses_tinygrad_f32_statistics_and_preflights_empty_geometry() {
+    let mut graph = Graph::new();
+    let norm = RMSNorm::new(&mut graph, 2, f32::NAN, false).unwrap();
+    let input = graph.input_dtype("f64", [1, 2], DType::F64);
+    let output = norm.forward(&mut graph, input).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert!(matches!(
+        &graph.node(output).unwrap().op,
+        Op::Cast {
+            dtype: DType::F64,
+            ..
+        }
+    ));
+
+    let affine = RMSNorm::new(&mut graph, 2, 1e-6, true).unwrap();
+    let integer = graph.input_dtype("integer", [1, 2], DType::I16);
+    let affine_output = affine.forward(&mut graph, integer).unwrap();
+    assert_eq!(graph.dtype(affine_output).unwrap(), DType::F32);
+    assert_eq!(graph.parameter_bindings().len(), 1);
+
+    let mut empty_graph = Graph::new();
+    let zero_dim = RMSNorm::new(&mut empty_graph, 0, f32::INFINITY, false).unwrap();
+    let empty = empty_graph.input_dtype("empty", [3, 0], DType::F16);
+    let before = empty_graph.node_count();
+    assert_eq!(zero_dim.forward(&mut empty_graph, empty).unwrap(), empty);
+    assert_eq!(empty_graph.node_count(), before);
+
+    let wrong = empty_graph.input("wrong", [3, 1]);
+    let before = empty_graph.node_count();
+    assert!(zero_dim.forward(&mut empty_graph, wrong).is_err());
+    assert_eq!(empty_graph.node_count(), before);
+    assert!(empty_graph.parameter_bindings().is_empty());
 }
 
 #[test]

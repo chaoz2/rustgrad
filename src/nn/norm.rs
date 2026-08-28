@@ -1,7 +1,7 @@
 //! Stateful and stateless normalization modules.
 
 use super::{
-    Mode, Module, Parameter, StateKind,
+    Mode, Module, Parameter, ParameterSnapshot, StateKind,
     parameter::{ParameterRestore, restore_parameters},
     state::join,
 };
@@ -596,13 +596,20 @@ pub struct RMSNorm {
     dim: usize,
     eps: f32,
 }
+
+/// Fully validates tinygrad's RMSNorm descriptor before a graph node or
+/// parameter binding is published.  The public layer always computes its
+/// statistic in F32, then casts the normalized value back to the input dtype
+/// before applying its optional F32 weight.
+struct RMSNormPlan {
+    input: NodeId,
+    input_dtype: DType,
+    input_is_empty: bool,
+    weight: Option<ParameterSnapshot>,
+}
+
 impl RMSNorm {
     pub fn new(_graph: &mut Graph, dim: usize, eps: f32, affine: bool) -> Result<Self> {
-        if dim == 0 || !eps.is_finite() || eps < 0.0 {
-            return Err(Error::InvalidRandom {
-                reason: "invalid RMSNorm dimension or epsilon",
-            });
-        }
         Ok(Self {
             weight: affine
                 .then(|| Parameter::new(TensorData::ones(Shape::new([dim])).expect("valid"), true)),
@@ -610,32 +617,85 @@ impl RMSNorm {
             eps,
         })
     }
-    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
-        if graph.shape(input)?.dims().last().copied() != Some(self.dim) {
+
+    fn plan(&self, graph: &Graph, input: NodeId) -> Result<RMSNormPlan> {
+        let input_shape = graph.shape(input)?.clone();
+        let input_dtype = graph.dtype(input)?;
+        if input_shape.dims().last().copied() != Some(self.dim) {
             return Err(Error::InvalidReshape {
-                from: graph.shape(input)?.clone(),
+                from: input_shape,
                 to: Shape::new([self.dim]),
             });
         }
-        let original = graph.dtype(input)?;
-        let x = if original == DType::F16 || original == DType::BF16 {
-            graph.cast(input, DType::F32)?
-        } else {
-            input
-        };
+        let input_is_empty = input_shape.numel()? == 0;
+        input_shape
+            .numel()?
+            .checked_mul(input_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        input_shape
+            .numel()?
+            .checked_mul(DType::F32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        let mut statistic_dims = input_shape.dims().to_vec();
+        *statistic_dims
+            .last_mut()
+            .expect("RMSNorm rank was checked above") = 1;
+        let statistic_shape = Shape::new(statistic_dims);
+        statistic_shape
+            .numel()?
+            .checked_mul(DType::F32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(statistic_shape.clone()))?;
+        let weight = self.weight.as_ref().map(Parameter::snapshot).transpose()?;
+        if let Some(weight) = &weight {
+            let expected = Shape::new([self.dim]);
+            if weight.shape != expected || weight.dtype != DType::F32 {
+                return Err(Error::ParameterValueMismatch {
+                    expected_shape: expected,
+                    actual_shape: weight.shape.clone(),
+                    expected_dtype: DType::F32,
+                    actual_dtype: weight.dtype,
+                });
+            }
+            if input_shape.broadcast_with(&weight.shape)? != input_shape {
+                return Err(Error::BroadcastMismatch {
+                    lhs: input_shape.clone(),
+                    rhs: weight.shape.clone(),
+                });
+            }
+            input_shape
+                .numel()?
+                .checked_mul(input_dtype.promote(weight.dtype).itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        }
+        Ok(RMSNormPlan {
+            input,
+            input_dtype,
+            input_is_empty,
+            weight,
+        })
+    }
+
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        let plan = self.plan(graph, input)?;
+        if plan.input_is_empty {
+            return match plan.weight {
+                Some(weight) => {
+                    let weight = graph.bind_parameter(weight)?;
+                    graph.mul(plan.input, weight)
+                }
+                None => Ok(plan.input),
+            };
+        }
+        let x = graph.cast(plan.input, DType::F32)?;
         let squared = graph.square(x)?;
         let mean = graph.reduce(squared, crate::ReduceKind::Mean, Some(vec![-1]), true)?;
         let eps = graph.constant(TensorData::scalar(self.eps));
         let mean = graph.add(mean, eps)?;
         let scale = graph.rsqrt(mean)?;
         let out = graph.mul(x, scale)?;
-        let out = if x != input {
-            graph.cast(out, original)?
-        } else {
-            out
-        };
-        if let Some(weight) = &self.weight {
-            let weight = weight.bind(graph)?;
+        let out = graph.cast(out, plan.input_dtype)?;
+        if let Some(weight) = plan.weight {
+            let weight = graph.bind_parameter(weight)?;
             graph.mul(out, weight)
         } else {
             Ok(out)
