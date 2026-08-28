@@ -1222,8 +1222,18 @@ fn lp_normalization_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap
     if attrs.keys().any(|key| key != "axis" && key != "p") { return Err(bad("unsupported LpNormalization attribute")); }
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
-    let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("LpNormalization input byte extent overflow"))?;
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(&format!("LpNormalization {what} byte extent overflow")))
+    };
+    // The source branches begin with either `x * sign(x)` or `x * x`; both
+    // retain the original descriptor.  Tensor.sum then materializes its
+    // full-shaped accumulator cast before reducing and may narrow only after
+    // the reduction.  Prove that complete chain before either branch node is
+    // appended so a narrow-storage accumulator overflow remains atomic.
+    extent(&shape, input_dtype, "input/base")?;
     let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
     let rank = i64::try_from(shape.rank()).map_err(|_| bad("LpNormalization rank overflow"))?;
     let axes = if rank == 0 {
@@ -1246,12 +1256,16 @@ fn lp_normalization_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap
         DType::F32
     };
     let output_dtype = input_dtype.promote(if denominator_dtype.is_float() { denominator_dtype } else { DType::F32 });
-    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("LpNormalization output byte extent overflow"))?;
+    extent(&shape, sum_dtypes.accumulator, "Sum accumulator")?;
+    extent(&shape, output_dtype, "output")?;
     let mut denom_dims = shape.dims().to_vec();
     for axis in &axes { denom_dims[*axis as usize] = 1; }
     let denominator_shape = Shape::new(denom_dims);
-    denominator_shape.numel()?.checked_mul(denominator_dtype.itemsize()).ok_or_else(|| bad("LpNormalization denominator byte extent overflow"))?;
+    extent(&denominator_shape, sum_dtypes.accumulator, "Sum reduction accumulator")?;
+    extent(&denominator_shape, sum_dtypes.output, "Sum output")?;
+    extent(&denominator_shape, denominator_dtype, "denominator")?;
     let reciprocal_dtype = if denominator_dtype.is_float() { denominator_dtype } else { DType::F32 };
+    extent(&denominator_shape, reciprocal_dtype, "reciprocal")?;
     if denominator_shape.broadcast_with(&shape)? != shape || input_dtype.promote(reciprocal_dtype) != output_dtype {
         return Err(bad("LpNormalization promotion mismatch"));
     }

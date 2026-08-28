@@ -596,6 +596,25 @@ fn lp_normalization_uses_source_p_branches_and_preflights() {
     assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
+
+    // F16 keeps the reduced Sum result narrow, but tinygrad first casts the
+    // entire square branch to its F32 accumulator.  This shape fits every
+    // source/result descriptor yet not that full-sized accumulator; planning
+    // must reject it before publishing the square or cast.
+    let mut overflow = Graph::new();
+    let x = overflow.input_dtype("x", [usize::MAX / 4 + 1], DType::F16);
+    let before_nodes = overflow.node_count();
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("LpNormalization", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(overflow.node_count(), before_nodes);
+    assert_eq!(values["x"], x);
+    assert!(!values.contains_key("out"));
 }
 
 #[test]
