@@ -504,6 +504,50 @@ mod tests {
     }
 
     #[test]
+    fn uniform_implicit_is_source_f32_rand_mul_cast_add_and_preflighted() {
+        Graph::manual_seed(42);
+        let mut graph = Graph::new();
+        let output = graph.uniform_implicit([2, 3], -2.0, 5.0, DType::F16).unwrap();
+        let default = graph.uniform_default([]).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+        assert_eq!(graph.dtype(default).unwrap(), DType::F32);
+        assert!(!graph.node(output).unwrap().requires_grad);
+
+        // The requested F16 cast sits between source-default-F32 Mul and the
+        // final weak-low Add. It must not be replaced with one ranged Random.
+        let Op::Binary { op: crate::BinaryOp::Add, lhs: cast, .. } = graph.op(output).unwrap() else {
+            panic!("expected final source low Add");
+        };
+        let Op::Cast { input: multiply, dtype: DType::F16 } = graph.op(*cast).unwrap() else {
+            panic!("expected requested dtype cast after source Mul");
+        };
+        let Op::Binary { op: crate::BinaryOp::Mul, lhs: scale, rhs: random } = graph.op(*multiply).unwrap() else {
+            panic!("expected scalar-left source scale Mul");
+        };
+        assert!(matches!(graph.op(*scale).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == DType::F32));
+        let Op::Random { kind: RandomKind::Uniform { low, high }, .. } = graph.op(*random).unwrap() else {
+            panic!("expected source unit random stream");
+        };
+        assert_eq!((*low, *high), (0.0, 1.0));
+        assert_eq!(graph.dtype(*random).unwrap(), DType::F32);
+
+        // The literal ordered source validation admits NaN bounds because
+        // Python's `nan >= high` is false; an integer cast is subsequently
+        // lifted by the weak float `low` Add to source-default F32.
+        let nonfinite = graph.uniform_implicit([0], f64::NAN, 1.0, DType::I16).unwrap();
+        assert_eq!(graph.dtype(nonfinite).unwrap(), DType::F32);
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(malformed.uniform_implicit([2], 1.0, 1.0, DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.uniform_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64).is_err());
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn linspace_is_source_literal_f32_lazy_and_preflighted() {
         let mut graph = Graph::new();
         let empty = graph.linspace(2.0, 5.0, 0, DType::F32).unwrap();
@@ -3052,6 +3096,86 @@ impl Graph {
 
     pub fn rand_implicit(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {
         self.rand_implicit_on_device(shape, dtype, 0)
+    }
+
+    /// Source-literal ambient-stream `Tensor.uniform`.
+    ///
+    /// tinygrad does not create a ranged random buffer: it reserves its
+    /// default-F32 `rand` stream, evaluates `(high - low) * rand`, casts that
+    /// product at the requested boundary, and finally adds the weak Python
+    /// `low` scalar.  Keep those storage boundaries visible instead of routing
+    /// this through the seeded raw-range compatibility API.
+    pub fn uniform_implicit(
+        &mut self,
+        shape: impl Into<Shape>,
+        low: f64,
+        high: f64,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let shape = shape.into();
+        // Match Python's source predicate literally: NaN bypasses the ordered
+        // rejection, while equal/reversed finite (and same-signed infinite)
+        // bounds fail before a counter reservation.
+        if low >= high {
+            return Err(Error::InvalidRandom {
+                reason: "uniform requires low < high",
+            });
+        }
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                .map(|_| ())
+        };
+        // `rand` is source default F32 even when uniform's eventual cast asks
+        // for another storage type. Prove both independently before cloning.
+        extent(DType::F32)?;
+        extent(dtype)?;
+
+        // Rehearse the full source composite on a cloned graph using an
+        // explicit stream. This validates every scalar commitment, cast, and
+        // final output descriptor without reserving/mutating the live ambient
+        // stream on a malformed late stage.
+        let mut rehearsal = self.clone();
+        let unit = rehearsal.rand(shape.clone(), DType::F32, 0)?;
+        let scaled = rehearsal.scalar_mul(Scalar::F(high - low), unit)?;
+        let cast = if rehearsal.dtype(scaled)? == dtype {
+            scaled
+        } else {
+            rehearsal.cast(scaled, dtype)?
+        };
+        let rehearsed = rehearsal.add_scalar(cast, Scalar::F(low))?;
+        let output_shape = rehearsal.shape(rehearsed)?.clone();
+        let output_dtype = rehearsal.dtype(rehearsed)?;
+        if output_shape != shape {
+            return Err(Error::InvalidRandom {
+                reason: "uniform output shape changed during preflight",
+            });
+        }
+        output_shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+
+        // All fallible descriptor work has completed, so this is the first
+        // operation that advances the graph's captured default-device stream.
+        let unit = self.rand_implicit(shape, DType::F32)?;
+        let scaled = self.scalar_mul(Scalar::F(high - low), unit)?;
+        let cast = if self.dtype(scaled)? == dtype {
+            scaled
+        } else {
+            self.cast(scaled, dtype)?
+        };
+        let output = self.add_scalar(cast, Scalar::F(low))?;
+        debug_assert_eq!(self.shape(output).expect("uniform preflighted"), &output_shape);
+        debug_assert_eq!(self.dtype(output).expect("uniform preflighted"), output_dtype);
+        Ok(output)
+    }
+
+    /// Omits tinygrad `Tensor.uniform`'s low/high/dtype defaults.
+    pub fn uniform_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
+        self.uniform_implicit(shape, 0.0, 1.0, DType::F32)
     }
 
     /// Implicit `rand` from an isolated numeric device stream. Device `0` is
