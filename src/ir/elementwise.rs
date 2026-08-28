@@ -103,6 +103,15 @@ struct ExtremaScalarPlan {
     scalar: TensorData,
 }
 
+/// Scalar-value descriptor for tinygrad's `Tensor.masked_fill`. Source
+/// spells this as `mask.where(value, input)`: the fill scalar commits at the
+/// input branch's LUB before the Bool mask broadcasts the final Select.
+struct MaskedFillScalarPlan {
+    output_shape: Shape,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Resolves a Python-style scalar at the width tinygrad's `_broadcasted`
 /// commits after its weak scalar promotion. This is shared by scalar-right
 /// public elementwise forms; it intentionally does not model a live U64
@@ -167,6 +176,69 @@ fn extrema_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<Ex
     Ok(ExtremaScalarPlan {
         output_shape,
         input_dtype,
+        output_dtype,
+        scalar,
+    })
+}
+
+fn masked_fill_scalar_plan(
+    graph: &Graph,
+    input: NodeId,
+    mask: NodeId,
+    value: Scalar,
+) -> Result<MaskedFillScalarPlan> {
+    let input_node = graph.node(input)?;
+    let input_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let mask_node = graph.node(mask)?;
+    let mask_shape = mask_node.shape.clone();
+    if mask_node.dtype != DType::Bool {
+        return Err(Error::InvalidLogicalDType {
+            op: "select",
+            actual: mask_node.dtype,
+        });
+    }
+    let value_dtype = source_weak_scalar_dtype(input_dtype, value);
+    let scalar = TensorData::scalar_with_dtype(value, value_dtype);
+    let value_shape = Shape::new([]);
+    let branch_shape = value_shape.broadcast_with(&input_shape)?;
+    let output_shape = mask_shape.broadcast_with(&branch_shape)?;
+    let output_dtype = source_lub(value_dtype, input_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+
+    // Validate the original mask/input, weak scalar storage, both promoted
+    // WHERE branches, broadcast condition, and selected result before any
+    // constant, cast, or Select node is made visible.
+    for (shape, dtype) in [
+        (&input_shape, input_dtype),
+        (&mask_shape, DType::Bool),
+        (scalar.shape(), scalar.dtype()),
+        (&input_shape, output_dtype),
+        (scalar.shape(), output_dtype),
+        (&branch_shape, output_dtype),
+        (&output_shape, DType::Bool),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if scalar.shape() != &value_shape
+        || scalar.dtype() != value_dtype
+        || output_dtype != source_lub(value_dtype, input_dtype)
+        || value_shape.broadcast_with(&input_shape)? != branch_shape
+        || mask_shape.broadcast_with(&branch_shape)? != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "masked_fill scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(MaskedFillScalarPlan {
+        output_shape,
         output_dtype,
         scalar,
     })
@@ -3150,6 +3222,26 @@ impl Graph {
         value: NodeId,
     ) -> Result<NodeId> {
         self.select(mask, value, input)
+    }
+
+    /// Source-compatible scalar-value form of tinygrad's
+    /// `Tensor.masked_fill(mask, value)`. This preserves literal
+    /// `mask.where(value, input)` branch order.
+    pub fn masked_fill_scalar(
+        &mut self,
+        input: NodeId,
+        mask: NodeId,
+        value: Scalar,
+    ) -> Result<NodeId> {
+        let plan = masked_fill_scalar_plan(self, input, mask, value)?;
+        // The whole Select descriptor has passed before the weak scalar is
+        // published. Reuse the live branch order rather than adding a
+        // separate scalar WHERE surface.
+        let value = self.constant(plan.scalar);
+        let output = self.masked_fill(input, mask, value)?;
+        debug_assert_eq!(self.shape(output).expect("masked_fill scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("masked_fill scalar preflighted"), plan.output_dtype);
+        Ok(output)
     }
 
     pub fn neg(&mut self, input: NodeId) -> Result<NodeId> {

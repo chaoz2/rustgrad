@@ -55,6 +55,134 @@ fn masked_fill_rejects_nonboolean_mask_without_allocating_a_node() {
 }
 
 #[test]
+fn masked_fill_scalar_commits_the_value_before_literal_mask_where() {
+    for (dtype, value) in [
+        (DType::Bool, Scalar::Bool(true)),
+        (DType::I8, Scalar::I(-1)),
+        (DType::I16, Scalar::I(-1)),
+        (DType::I32, Scalar::I(-1)),
+        (DType::I64, Scalar::I(-1)),
+        (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)),
+        (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)),
+        (DType::F16, Scalar::F(-0.0)),
+        (DType::BF16, Scalar::F(-0.0)),
+        (DType::F32, Scalar::F(-0.0)),
+        (DType::F64, Scalar::F(-0.0)),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let mask = graph.input_dtype("mask", [2], DType::Bool);
+        let output = graph.masked_fill_scalar(input, mask, value).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+        assert!(matches!(graph.op(NodeId(2)).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == dtype));
+        let Op::Select { condition, on_true, on_false } = graph.op(output).unwrap() else {
+            panic!("masked_fill scalar must lower directly through Select");
+        };
+        assert_eq!(*condition, mask);
+        assert_eq!(*on_true, NodeId(2));
+        assert_eq!(*on_false, input);
+        if dtype.is_float() {
+            let Op::Constant(data) = graph.op(NodeId(2)).unwrap() else {
+                panic!("prepared scalar must be a constant");
+            };
+            assert_eq!(data.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+        }
+    }
+
+    // Python integer/float values are weak against the input branch. Bool
+    // therefore lifts to I32/F32; a live I64/U64 value remains the distinct
+    // F32 source bridge in the backward-compatible tensor form.
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [2, 1], DType::Bool);
+    let mask = mixed.input_dtype("mask", [1, 2], DType::Bool);
+    let integer = mixed.masked_fill_scalar(boolean, mask, Scalar::I(1)).unwrap();
+    let floating = mixed.masked_fill_scalar(boolean, mask, Scalar::F(-0.0)).unwrap();
+    let narrow = mixed.input_dtype("narrow", [], DType::F16);
+    let narrow_mask = mixed.input_dtype("narrow_mask", [], DType::Bool);
+    let narrow_integer = mixed.masked_fill_scalar(narrow, narrow_mask, Scalar::I(1)).unwrap();
+    let integral = mixed.input_dtype("integral", [], DType::I16);
+    let integral_mask = mixed.input_dtype("integral_mask", [], DType::Bool);
+    let integral_float = mixed.masked_fill_scalar(integral, integral_mask, Scalar::F(-0.0)).unwrap();
+    assert_eq!(mixed.shape(integer).unwrap(), &Shape::new([2, 2]));
+    assert_eq!(mixed.dtype(integer).unwrap(), DType::I32);
+    assert_eq!(mixed.dtype(floating).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(narrow_integer).unwrap(), DType::F16);
+    assert_eq!(mixed.dtype(integral_float).unwrap(), DType::F32);
+
+    let input = mixed.input_dtype("i64", [2], DType::I64);
+    let bridge_mask = mixed.input_dtype("bridge_mask", [2], DType::Bool);
+    let value = mixed.input_dtype("u64", [2], DType::U64);
+    let bridged = mixed.masked_fill(input, bridge_mask, value).unwrap();
+    assert_eq!(mixed.dtype(bridged).unwrap(), DType::F32);
+    assert!((0..mixed.node_count()).any(|index| matches!(
+        mixed.op(NodeId(index)).unwrap(),
+        Op::Cast { input: source, dtype: DType::F32 } if *source == input
+    )));
+    assert!((0..mixed.node_count()).any(|index| matches!(
+        mixed.op(NodeId(index)).unwrap(),
+        Op::Cast { input: source, dtype: DType::F32 } if *source == value
+    )));
+
+    // The Select branch ordering is the observable payload rule: a scalar
+    // signed zero or NaN occupies only true lanes, while matching-dtype input
+    // payloads stay untouched on false lanes.
+    let mut specials = Graph::new();
+    let input = specials.input_dtype("input", [], DType::F64);
+    let mask = specials.input_dtype("mask", [], DType::Bool);
+    let negative_zero = specials.masked_fill_scalar(input, mask, Scalar::F(-0.0)).unwrap();
+    let nan = specials.masked_fill_scalar(input, mask, Scalar::F(f64::NAN)).unwrap();
+    let Op::Select { on_true, on_false, .. } = specials.op(negative_zero).unwrap() else { unreachable!() };
+    assert!(matches!(specials.op(*on_true).unwrap(), Op::Constant(data)
+        if data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits()));
+    assert_eq!(*on_false, input);
+    assert!(matches!(specials.op(nan).unwrap(), Op::Select { .. }));
+
+    let mut vjp = Graph::new();
+    let input = vjp.input_dtype("input", [2, 1], DType::F32);
+    let mask = vjp.input_dtype("mask", [1, 3], DType::Bool);
+    let output = vjp.masked_fill_scalar(input, mask, Scalar::F(-0.0)).unwrap();
+    let loss = vjp.sum_all(output).unwrap();
+    let gradient = vjp.grad(loss, input).unwrap();
+    assert_eq!(vjp.shape(gradient).unwrap(), &Shape::new([2, 1]));
+    assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::BF16);
+    let mask = empty.input_dtype("mask", [1, 2], DType::Bool);
+    let output = empty.masked_fill_scalar(input, mask, Scalar::F(-0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.masked_fill_scalar(NodeId(usize::MAX), NodeId(0), Scalar::F(0.0)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let input = malformed.input_dtype("input", [2], DType::F32);
+    let nonboolean = malformed.input_dtype("mask", [2], DType::I32);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.masked_fill_scalar(input, nonboolean, Scalar::F(0.0)),
+        Err(Error::InvalidLogicalDType { op: "select", actual: DType::I32 })
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let mask = malformed.input_dtype("overflow_mask", [1, 2], DType::Bool);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.masked_fill_scalar(overflow, mask, Scalar::F(0.0)),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn allclose_matches_tinygrad_isclose_then_all_for_broadcast_special_and_empty_domains() {
     let mut graph = Graph::new();
     let lhs = graph.input("lhs", [2, 1]);
