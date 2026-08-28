@@ -5110,6 +5110,93 @@ fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
 }
 
 #[test]
+fn where_matches_tinygrad_branch_promotion_and_preflights() {
+    let mut graph = Graph::new();
+    let condition = graph.input_dtype("condition", [2, 1], DType::Bool);
+    let on_true = graph.input_dtype("on_true", [1, 3], DType::I64);
+    let on_false = graph.input_dtype("on_false", [], DType::U64);
+    let mut values = BTreeMap::from([
+        ("condition".into(), condition),
+        ("on_true".into(), on_true),
+        ("on_false".into(), on_false),
+    ]);
+    lower(
+        &mut graph,
+        Msg::new(&node(
+            "Where",
+            &["condition", "on_true", "on_false"],
+            "out",
+        )),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 3]);
+    // tinygrad's two-branch least-upper lattice routes this pair through its
+    // default F32 width; Graph::select alone would choose F64.
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([
+                (
+                    "condition".into(),
+                    TensorData::from_scalars(
+                        [2, 1],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "on_true".into(),
+                    TensorData::from_scalars(
+                        [1, 3],
+                        DType::I64,
+                        [Scalar::I(1), Scalar::I(2), Scalar::I(3)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "on_false".into(),
+                    TensorData::from_scalars([], DType::U64, [Scalar::U(9)]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[1.0, 2.0, 3.0, 9.0, 9.0, 9.0]);
+
+    for (condition_dtype, attrs) in [(DType::I32, Vec::new()), (DType::Bool, vec![int_attr("axis", 0)])] {
+        let mut malformed = Graph::new();
+        let condition = malformed.input_dtype("condition", [1], condition_dtype);
+        let on_true = malformed.input("on_true", [1]);
+        let on_false = malformed.input("on_false", [1]);
+        let mut values = BTreeMap::from([
+            ("condition".into(), condition),
+            ("on_true".into(), on_true),
+            ("on_false".into(), on_false),
+        ]);
+        let before_values = values.clone();
+        let before_nodes = malformed.node_count();
+        let mut encoded = node("Where", &["condition", "on_true", "on_false"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, &attr);
+        }
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&encoded),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+}
+
+#[test]
 fn matmul_rejects_attributes_before_publication() {
     let mut g = Graph::new();
     let lhs = g.input("lhs", [1, 2, 3]);

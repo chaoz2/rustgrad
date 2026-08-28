@@ -2612,6 +2612,76 @@ fn concat_plan(
     })
 }
 
+/// Fully resolved source descriptor for ONNX `Where`.  tinygrad requires a
+/// Bool condition, promotes the two branches through its least-upper lattice,
+/// and only then broadcasts the condition over their common shape.
+struct WherePlan {
+    condition: NodeId,
+    on_true: NodeId,
+    on_false: NodeId,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn where_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<WherePlan> {
+    if ins.len() != 3 || !attrs.is_empty() {
+        return Err(bad("Where requires exactly three inputs and no attributes"));
+    }
+    let inputs = ins
+        .iter()
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let descriptors = inputs
+        .iter()
+        .map(|&input| {
+            let shape = g.shape(input)?.clone();
+            let dtype = g.dtype(input)?;
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| bad("Where input byte extent overflow"))?;
+            Ok((shape, dtype))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if descriptors[0].1 != DType::Bool {
+        return Err(bad("Where condition must be Bool"));
+    }
+    let branch_shape = descriptors[1].0.broadcast_with(&descriptors[2].0)?;
+    let output_shape = descriptors[0].0.broadcast_with(&branch_shape)?;
+    let output_dtype = prelu_dtype(descriptors[1].1, descriptors[2].1);
+    for (shape, what) in [
+        (&descriptors[1].0, "true branch cast"),
+        (&descriptors[2].0, "false branch cast"),
+        (&output_shape, "output"),
+    ] {
+        shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| bad(format!("Where {what} byte extent overflow")))?;
+    }
+    output_shape
+        .numel()?
+        .checked_mul(DType::Bool.itemsize())
+        .ok_or_else(|| bad("Where condition broadcast byte extent overflow"))?;
+    Ok(WherePlan {
+        condition: inputs[0],
+        on_true: inputs[1],
+        on_false: inputs[2],
+        output_shape,
+        output_dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5095,7 +5165,33 @@ pub(super) fn lower(
         "LessOrEqual" if ins.len() == 2 && attrs.is_empty() => g.le(get(0)?, get(1)?)?,
         "Greater" if ins.len() == 2 && attrs.is_empty() => g.gt(get(0)?, get(1)?)?,
         "GreaterOrEqual" if ins.len() == 2 && attrs.is_empty() => g.ge(get(0)?, get(1)?)?,
-        "Where" if ins.len() == 3 && attrs.is_empty() => g.select(get(0)?, get(1)?, get(2)?)?,
+        "Where" if ins.len() == 3 => {
+            let plan = where_plan(g, &ins, &attrs, values)?;
+            let on_true = if g.dtype(plan.on_true).expect("Where true branch preflighted")
+                == plan.output_dtype
+            {
+                plan.on_true
+            } else {
+                g.cast(plan.on_true, plan.output_dtype)?
+            };
+            let on_false = if g.dtype(plan.on_false).expect("Where false branch preflighted")
+                == plan.output_dtype
+            {
+                plan.on_false
+            } else {
+                g.cast(plan.on_false, plan.output_dtype)?
+            };
+            let output = g.select(plan.condition, on_true, on_false)?;
+            debug_assert_eq!(
+                g.shape(output).expect("Where shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Where dtype preflighted"),
+                plan.output_dtype
+            );
+            output
+        }
         "Not" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;
             // tinygrad implements logical_not as a Bool cast followed by
