@@ -20,6 +20,119 @@ pub(crate) struct LazyArangePlan {
     pub(crate) offset: TensorData,
 }
 
+/// Whole-operation descriptor for tinygrad's public `Tensor.one_hot`.
+///
+/// The literal first unsqueezes integer indices, compares them with a
+/// source-default integer arange, then selects strong I32 one/zero scalars.
+/// Keep every descriptor and storage boundary here so no movement, range, or
+/// predicate node can leak from a malformed late shape or byte extent.
+struct OneHotPlan {
+    value_shape: Shape,
+    range: LazyArangePlan,
+    class_shape: Shape,
+    comparison_dtype: DType,
+    output_shape: Shape,
+    one: TensorData,
+    zero: TensorData,
+}
+
+fn one_hot_source_lub(lhs: DType, rhs: DType) -> DType {
+    if matches!(
+        (lhs, rhs),
+        (DType::I64, DType::U64)
+            | (DType::U64, DType::I64)
+            | (DType::U64, DType::I8 | DType::I16 | DType::I32)
+            | (DType::I8 | DType::I16 | DType::I32, DType::U64)
+    ) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
+}
+
+fn one_hot_plan(graph: &Graph, input: NodeId, classes: usize) -> Result<OneHotPlan> {
+    let source = graph.node(input)?;
+    let input_shape = source.shape.clone();
+    let input_dtype = source.dtype;
+    if !input_dtype.is_integer() {
+        return Err(Error::InvalidRandom {
+            reason: "one_hot requires integer indices",
+        });
+    }
+    let class_end = i64::try_from(classes).map_err(|_| Error::InvalidRandom {
+        reason: "one_hot class count exceeds the supported i64 range",
+    })?;
+    let range = lazy_arange_default_int_plan(0, class_end, 1)?;
+    let mut value_dims = input_shape.dims().to_vec();
+    value_dims.push(1);
+    let value_shape = Shape::new(value_dims);
+    let mut class_dims = vec![1; value_shape.rank()];
+    *class_dims.last_mut().expect("one_hot unsqueeze has rank") = classes;
+    let class_shape = Shape::new(class_dims);
+    let mut output_dims = input_shape.dims().to_vec();
+    output_dims.push(classes);
+    let output_shape = Shape::new(output_dims);
+    let comparison_dtype = one_hot_source_lub(input_dtype, range.dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::I(1), DType::I32);
+    let zero = TensorData::scalar_with_dtype(Scalar::I(0), DType::I32);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+
+    // Original index input and its trailing singleton view.
+    extent(&input_shape, input_dtype)?;
+    extent(&value_shape, input_dtype)?;
+    // `lazy_arange_default_int`: typed scalar step -> Expand -> typed
+    // cumsum -> typed offset Add. Its declared range descriptor is also the
+    // later class-axis reshape source.
+    extent(range.step.shape(), range.step.dtype())?;
+    extent(&range.shape, range.dtype)?;
+    extent(&range.shape, range.dtype)?;
+    extent(range.offset.shape(), range.offset.dtype())?;
+    extent(&range.shape, range.dtype)?;
+    extent(&class_shape, range.dtype)?;
+    // Eq is Ne plus Bool logical-not after the source LUB; both casts,
+    // comparison, and Bool stages must fit before either one is published.
+    extent(&value_shape, comparison_dtype)?;
+    extent(&class_shape, comparison_dtype)?;
+    if value_shape.broadcast_with(&class_shape)? != output_shape {
+        return Err(Error::InvalidElementwiseDType {
+            op: "one_hot class broadcast",
+            actual: comparison_dtype,
+        });
+    }
+    extent(&output_shape, comparison_dtype)?;
+    extent(&output_shape, DType::Bool)?;
+    extent(&output_shape, DType::Bool)?;
+    // `where(1, 0)` commits both Python integers as strong default I32.
+    extent(one.shape(), one.dtype())?;
+    extent(zero.shape(), zero.dtype())?;
+    if output_shape.broadcast_with(one.shape())? != output_shape
+        || output_shape.broadcast_with(zero.shape())? != output_shape
+        || one.dtype() != DType::I32
+        || zero.dtype() != DType::I32
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "one_hot value commitment",
+            actual: DType::I32,
+        });
+    }
+    extent(&output_shape, DType::I32)?;
+    Ok(OneHotPlan {
+        value_shape,
+        range,
+        class_shape,
+        comparison_dtype,
+        output_shape,
+        one,
+        zero,
+    })
+}
+
 pub(crate) fn lazy_arange_default_int_plan(
     start: i64,
     end: i64,
@@ -207,6 +320,31 @@ mod tests {
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(invalid.node_count(), before);
+    }
+
+    #[test]
+    fn one_hot_plan_tracks_default_range_width_and_i64_u64_bridge_without_publication() {
+        if usize::BITS < 64 {
+            return;
+        }
+        let mut graph = Graph::new();
+        let indices = graph.input_dtype("indices", [2], DType::U64);
+        let narrow = one_hot_plan(&graph, indices, 3).unwrap();
+        assert_eq!(narrow.range.dtype, DType::I32);
+        assert_eq!(narrow.comparison_dtype, DType::F32);
+        assert_eq!(narrow.output_shape, Shape::from([2, 3]));
+
+        // The endpoint is exclusive: I32 remains valid through i32::MAX +
+        // 1, and the next class forces tinygrad's source-default I64 range.
+        let wide = one_hot_plan(
+            &graph,
+            indices,
+            usize::try_from(i64::from(i32::MAX) + 2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wide.range.dtype, DType::I64);
+        assert_eq!(wide.comparison_dtype, DType::F32);
+        assert_eq!(graph.node_count(), 1);
     }
 
     #[test]
@@ -1620,33 +1758,34 @@ impl Graph {
     }
 
     pub fn one_hot(&mut self, input: NodeId, classes: usize) -> Result<NodeId> {
-        if !self.dtype(input)?.is_integer() {
-            return Err(Error::InvalidRandom {
-                reason: "one_hot requires integer indices",
-            });
-        }
-        let class_end = i64::try_from(classes).map_err(|_| Error::InvalidRandom {
-            reason: "one_hot class count exceeds the supported i64 range",
-        })?;
-        let mut value_dims = self.shape(input)?.dims().to_vec();
-        value_dims.push(1);
-        let value_shape = Shape::new(value_dims.clone());
-        value_shape.numel()?;
-        let mut class_dims = vec![1; value_dims.len()];
-        *class_dims.last_mut().unwrap() = classes;
-        let class_shape = Shape::new(class_dims);
-        class_shape.numel()?;
-        let mut output_dims = self.shape(input)?.dims().to_vec();
-        output_dims.push(classes);
-        Shape::new(output_dims).numel()?;
-
-        let values = self.reshape(input, value_shape)?;
-        let classes_node = self.arange(0, class_end, 1)?;
-        let classes_node = self.reshape(classes_node, class_shape)?;
-        let equal = self.eq(values, classes_node)?;
-        let one = self.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
-        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32));
-        self.select(equal, one, zero)
+        let plan = one_hot_plan(self, input, classes)?;
+        let values = self.reshape(input, plan.value_shape)?;
+        let classes = self.lower_lazy_arange(plan.range)?;
+        let classes = self.reshape(classes, plan.class_shape)?;
+        debug_assert_eq!(
+            one_hot_source_lub(
+                self.dtype(values).expect("one_hot values preflighted"),
+                self.dtype(classes).expect("one_hot classes preflighted"),
+            ),
+            plan.comparison_dtype,
+        );
+        let values = if self.dtype(values)? == plan.comparison_dtype {
+            values
+        } else {
+            self.cast(values, plan.comparison_dtype)?
+        };
+        let classes = if self.dtype(classes)? == plan.comparison_dtype {
+            classes
+        } else {
+            self.cast(classes, plan.comparison_dtype)?
+        };
+        let equal = self.eq(values, classes)?;
+        let one = self.constant(plan.one);
+        let zero = self.constant(plan.zero);
+        let output = self.select(equal, one, zero)?;
+        debug_assert_eq!(self.shape(output).expect("one_hot preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("one_hot preflighted"), DType::I32);
+        Ok(output)
     }
 
     pub fn meshgrid(

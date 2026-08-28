@@ -383,3 +383,37 @@ fn one_hot_preflights_unrepresentable_class_counts_before_creating_nodes() {
     ));
     assert_eq!(graph.node_count(), node_count);
 }
+
+#[test]
+fn one_hot_uses_a_scalar_backed_default_integer_range_and_preflights_the_full_graph() {
+    let mut graph = Graph::new();
+    let indices = graph.input_dtype("indices", [2, 0], DType::I16);
+    let output = graph.one_hot(indices, 3).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 0, 3]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::I32);
+    assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+    assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+        Op::Constant(data) => Some(data.len()),
+        _ => None,
+    }).all(|len| len == 1));
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Reduce {
+        kind: crate::ReduceKind::Sum, ..
+    })));
+
+    let scalar = graph.input_dtype("scalar", [], DType::I32);
+    let scalar_output = graph.one_hot(scalar, 2).unwrap();
+    assert_eq!(graph.shape(scalar_output).unwrap(), &Shape::new([2]));
+    let empty = graph.input_dtype("empty", [0], DType::U8);
+    let empty_output = graph.one_hot(empty, 0).unwrap();
+    assert_eq!(graph.shape(empty_output).unwrap(), &Shape::new([0, 0]));
+
+    let mut invalid = Graph::new();
+    let float = invalid.input("float", [1]);
+    let before = invalid.node_count();
+    assert!(invalid.one_hot(float, 1).is_err());
+    assert_eq!(invalid.node_count(), before);
+    let large = invalid.input_dtype("large", [usize::MAX / 2 + 1], DType::I8);
+    let before = invalid.node_count();
+    assert!(matches!(invalid.one_hot(large, 3), Err(Error::ShapeOverflow(_))));
+    assert_eq!(invalid.node_count(), before);
+}
