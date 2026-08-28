@@ -160,6 +160,7 @@ mod tests {
     fn diagonal_matches_tinygrad_offset_signed_dimensions_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [3, 4]);
+        let default_diagonal = graph.diagonal_default(input).unwrap();
         let diagonal = graph.diagonal(input, 1, 0, 1).unwrap();
         let loss = graph.sum_all(diagonal).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
@@ -168,6 +169,11 @@ mod tests {
             (1..=12).map(|value| value as f32).collect(),
         )
         .unwrap();
+        assert_eq!(graph.shape(default_diagonal).unwrap(), &Shape::from([3]));
+        assert_eq!(
+            execute(&graph, default_diagonal, values.clone()),
+            TensorData::new([3], vec![1., 6., 11.]).unwrap()
+        );
         assert_eq!(
             execute(&graph, diagonal, values.clone()),
             TensorData::new([3], vec![2., 7., 12.]).unwrap()
@@ -1528,6 +1534,14 @@ impl Graph {
         } else {
             self.select(outside, input, zero)
         }
+    }
+
+    /// Extracts the default main diagonal across the first two dimensions.
+    ///
+    /// This is tinygrad's parameter-free `diagonal()` form, equivalent to
+    /// `diagonal(0, 0, 1)`.
+    pub fn diagonal_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.diagonal(input, 0, 0, 1)
     }
 
     /// Extracts an offset diagonal from two signed dimensions.
