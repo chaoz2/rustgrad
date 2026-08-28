@@ -2186,7 +2186,50 @@ impl Graph {
         self.unary(UnaryOp::Erfc, input)
     }
     pub fn asin(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Asin, input)
+        // tinygrad uses the 4.4.46 polynomial approximation, not raw ASIN:
+        // sign(x) * (pi/2 - sqrt(1-abs(x)) * polyN(abs(x), coefficients)).
+        // Preflight every source-width scalar and same-shape intermediate
+        // before publishing the first part of the Horner expansion.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let coefficients = [
+            -0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810,
+            -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050,
+        ];
+        let scalars = coefficients.map(|value| TensorData::scalar_with_dtype(Scalar::F(value), output_dtype));
+        let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
+        let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
+        let half_pi = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), output_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, output_dtype)?;
+        for scalar in scalars.iter().chain([&zero, &one, &half_pi]) {
+            extent(scalar.shape(), scalar.dtype())?;
+            if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape {
+                return Err(Error::InvalidElementwiseDType { op: "asin polynomial scalar promotion", actual: scalar.dtype() });
+            }
+        }
+        if (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+            || input_dtype.promote(output_dtype) != output_dtype
+            || unary_dtype(UnaryOp::Sqrt, output_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType { op: "asin source promotion", actual: output_dtype });
+        }
+        let absolute = self.abs(input)?;
+        let absolute_work = if input_dtype == output_dtype { absolute } else { self.cast(absolute, output_dtype)? };
+        let one = self.constant(one);
+        let radius = self.sqrt(self.sub(one, absolute_work)?)?;
+        let mut polynomial = self.constant(zero);
+        for coefficient in scalars {
+            polynomial = self.add(self.mul(polynomial, absolute_work)?, self.constant(coefficient))?;
+        }
+        let magnitude = self.sub(self.constant(half_pi), self.mul(radius, polynomial)?)?;
+        self.mul(self.sign(input)?, magnitude)
     }
     pub fn acos(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Acos, input)
