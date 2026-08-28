@@ -6164,15 +6164,15 @@ pub(super) fn lower(
             {
                 return Err(bad("unsupported IsInf attribute"));
             }
-            let detect_positive = attrs
-                .get("detect_positive")
-                .map(|value| scalar_i64(value).map(|value| value != 0))
-                .transpose()?
+            // ONNX declares both IsInf selectors as AttributeProto INT.
+            // Decode the original fields rather than the normalized raw map,
+            // so a FLOAT/TENSOR wire payload or an omitted declared type
+            // cannot be mistaken for an enabled selector.
+            let detect_positive = strict_typed_scalar_i64_attr(&n, "detect_positive")?
+                .map(|value| value != 0)
                 .unwrap_or(true);
-            let detect_negative = attrs
-                .get("detect_negative")
-                .map(|value| scalar_i64(value).map(|value| value != 0))
-                .transpose()?
+            let detect_negative = strict_typed_scalar_i64_attr(&n, "detect_negative")?
+                .map(|value| value != 0)
                 .unwrap_or(true);
             let x = get(0)?;
             g.dtype(x)?;

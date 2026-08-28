@@ -10920,8 +10920,8 @@ fn isinf_matches_tinygrad_sign_selection_and_preflights_before_publication() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     let mut constants = BTreeMap::new();
     let mut valid = node("IsInf", &["x"], "out");
-    field(&mut valid, 5, &int_attr("detect_positive", 1));
-    field(&mut valid, 5, &int_attr("detect_negative", 0));
+    field(&mut valid, 5, &typed_int_attr("detect_positive", 1));
+    field(&mut valid, 5, &typed_int_attr("detect_negative", 0));
     lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
     let output = CpuBackend
         .execute(
@@ -10940,7 +10940,24 @@ fn isinf_matches_tinygrad_sign_selection_and_preflights_before_publication() {
 
     let mut attribute = node("IsInf", &["x"], "out");
     field(&mut attribute, 5, &int_attr("keepdims", 1));
-    for invalid in [node("IsInf", &[], "out"), attribute] {
+    let mut duplicate = node("IsInf", &["x"], "out");
+    field(&mut duplicate, 5, &typed_int_attr("detect_positive", 1));
+    field(&mut duplicate, 5, &typed_int_attr("detect_positive", 0));
+    for invalid in [
+        node("IsInf", &[], "out"),
+        attribute,
+        {
+            let mut mistyped = node("IsInf", &["x"], "out");
+            field(&mut mistyped, 5, &float_attr("detect_positive", 1.0));
+            mistyped
+        },
+        {
+            let mut undeclared = node("IsInf", &["x"], "out");
+            field(&mut undeclared, 5, &int_attr("detect_negative", 1));
+            undeclared
+        },
+        duplicate,
+    ] {
         let mut malformed = Graph::new();
         let x = malformed.input("x", [2]);
         let mut values = BTreeMap::from([("x".into(), x)]);
