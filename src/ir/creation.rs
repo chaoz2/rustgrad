@@ -12,11 +12,23 @@ struct StreamRegistry {
     counters: BTreeMap<u32, [u32; 2]>,
 }
 
-struct LazyArangePlan {
-    shape: Shape,
-    dtype: DType,
-    step: TensorData,
-    offset: TensorData,
+#[derive(Clone)]
+pub(crate) struct LazyArangePlan {
+    pub(crate) shape: Shape,
+    pub(crate) dtype: DType,
+    pub(crate) step: TensorData,
+    pub(crate) offset: TensorData,
+}
+
+pub(crate) fn lazy_arange_default_int_plan(
+    start: i64,
+    end: i64,
+    step: i64,
+) -> Result<LazyArangePlan> {
+    match lazy_arange_plan(start, end, step, DType::I32, true) {
+        Ok(plan) => Ok(plan),
+        Err(_) => lazy_arange_plan(start, end, step, DType::I64, true),
+    }
 }
 
 fn lazy_arange_plan(
@@ -1825,7 +1837,7 @@ impl Graph {
         self.lower_lazy_arange(plan)
     }
 
-    fn lower_lazy_arange(&mut self, plan: LazyArangePlan) -> Result<NodeId> {
+    pub(crate) fn lower_lazy_arange(&mut self, plan: LazyArangePlan) -> Result<NodeId> {
         let step = self.lazy_full_with_dtype(plan.shape.clone(), plan.step.scalar_at(0), plan.dtype)?;
         let cumulative = self.cumsum(step, 0)?;
         let offset = self.constant(plan.offset);
@@ -1841,12 +1853,7 @@ impl Graph {
         end: i64,
         step: i64,
     ) -> Result<NodeId> {
-        let dtype = if lazy_arange_plan(start, end, step, DType::I32, true).is_ok() {
-            DType::I32
-        } else {
-            DType::I64
-        };
-        self.lazy_arange_with_dtype(start, end, step, dtype)
+        self.lower_lazy_arange(lazy_arange_default_int_plan(start, end, step)?)
     }
 
     pub fn empty(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {

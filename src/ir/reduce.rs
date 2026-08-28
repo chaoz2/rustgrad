@@ -1,4 +1,5 @@
 use super::{
+    creation::{lazy_arange_default_int_plan, LazyArangePlan},
     shape::{normalize_axes, reduction_shape, unary_dtype},
     Graph, NodeId,
 };
@@ -84,6 +85,104 @@ enum ArgminInverse {
 struct ArgminPlan {
     argmax: ArgmaxPlan,
     inverse: ArgminInverse,
+}
+
+struct CumExtremaPlan {
+    axis: usize,
+    scalar: bool,
+    extent: usize,
+    prefixes: Vec<Vec<(usize, usize)>>,
+    ascending: Option<LazyArangePlan>,
+    descending: Option<LazyArangePlan>,
+    index_offset: Option<TensorData>,
+}
+
+fn cumulative_extrema_plan(
+    input: NodeId,
+    shape: &Shape,
+    dtype: DType,
+    axis: isize,
+) -> Result<CumExtremaPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(shape, dtype)?;
+    extent(shape, DType::I32)?;
+    if shape.rank() == 0 {
+        if !matches!(axis, -1 | 0) {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank: 0,
+            });
+        }
+        return Ok(CumExtremaPlan {
+            axis: 0,
+            scalar: true,
+            extent: 1,
+            prefixes: Vec::new(),
+            ascending: None,
+            descending: None,
+            index_offset: None,
+        });
+    }
+    let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
+    let axis_extent = shape.dims()[axis];
+    let axis_i64 = i64::try_from(axis_extent).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+    let ascending = lazy_arange_default_int_plan(0, axis_i64, 1)?;
+    let descending = lazy_arange_default_int_plan(axis_i64, 0, -1)?;
+    debug_assert_eq!(ascending.dtype, descending.dtype);
+    let index_dtype = descending.dtype;
+    let mut transposed = shape.dims().to_vec();
+    transposed.swap(axis, shape.rank() - 1);
+    let transposed_shape = Shape::new(transposed);
+    let mut matrix = transposed_shape.dims().to_vec();
+    matrix.push(axis_extent);
+    let matrix_shape = Shape::new(matrix);
+    let prefixes = (0..axis_extent)
+        .map(|end| {
+            shape
+                .dims()
+                .iter()
+                .enumerate()
+                .map(|(dimension, &dimension_extent)| {
+                    if dimension == axis {
+                        (0, end + 1)
+                    } else {
+                        (0, dimension_extent)
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // Validate every source, movement, predicate, typed-range, reduction,
+    // cast, and pair-output extent before any prefix node is appended.
+    extent(&transposed_shape, dtype)?;
+    extent(&matrix_shape, DType::Bool)?;
+    extent(&matrix_shape, index_dtype)?;
+    extent(&transposed_shape, index_dtype)?;
+    extent(&transposed_shape, DType::I32)?;
+    for bounds in &prefixes {
+        let prefix = Shape::new(
+            bounds
+                .iter()
+                .map(|&(start, end)| end - start)
+                .collect::<Vec<_>>(),
+        );
+        extent(&prefix, dtype)?;
+    }
+    Ok(CumExtremaPlan {
+        axis,
+        scalar: false,
+        extent: axis_extent,
+        prefixes,
+        ascending: Some(ascending),
+        descending: Some(descending),
+        index_offset: Some(TensorData::scalar_with_dtype(Scalar::I(axis_i64), index_dtype)),
+    })
 }
 
 fn max_reduction_identity(dtype: DType) -> Scalar {
@@ -797,6 +896,97 @@ impl Graph {
     /// the leading axis.
     pub fn cumsum_default(&mut self, input: NodeId) -> Result<NodeId> {
         self.cumsum(input, 0)
+    }
+
+    fn lower_cummax(&mut self, input: NodeId, plan: &CumExtremaPlan) -> Result<(NodeId, NodeId)> {
+        if plan.scalar {
+            let indices = self.lazy_full_with_dtype([], Scalar::I(0), DType::I32)?;
+            return Ok((input, indices));
+        }
+        let values = if plan.extent == 0 {
+            input
+        } else {
+            let prefixes = plan
+                .prefixes
+                .iter()
+                .map(|bounds| {
+                    let prefix = self.shrink(input, bounds.clone())?;
+                    self.max_with_axes(prefix, Some(vec![plan.axis as isize]), true)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.concat(prefixes, plan.axis)?
+        };
+
+        // Literal checked-in tinygrad index path: transpose to trailing axis,
+        // equality with the cumulative values, upper-triangle mask, descending
+        // source-default range, Max, Neg/Add(n), I32 cast, then transpose back.
+        let x_t = self.transpose(input, plan.axis as isize, -1)?;
+        let values_t = self.transpose(values, plan.axis as isize, -1)?;
+        let x_t = self.unsqueeze(x_t, -1)?;
+        let values_t = self.unsqueeze(values_t, -2)?;
+        let equality = self.eq(x_t, values_t)?;
+        let ascending = plan.ascending.as_ref().expect("non-scalar plan");
+        let row_range = self.lower_lazy_arange(ascending.clone())?;
+        let row = self.reshape(row_range, Shape::new([plan.extent, 1]))?;
+        let column_range = self.lower_lazy_arange(ascending.clone())?;
+        let column = self.reshape(column_range, Shape::new([1, plan.extent]))?;
+        let upper = self.le(row, column)?;
+        let matched = self.mul(equality, upper)?;
+        let descending = self.lower_lazy_arange(plan.descending.clone().expect("non-scalar plan"))?;
+        let descending = self.reshape(descending, Shape::new([plan.extent, 1]))?;
+        let candidates = self.mul(matched, descending)?;
+        let maximum = self.max_with_axes(candidates, Some(vec![-2]), false)?;
+        let negative = self.neg(maximum)?;
+        let index_offset = self.constant(plan.index_offset.clone().expect("non-scalar plan"));
+        let indices_t = self.add(negative, index_offset)?;
+        let indices_t = self.cast(indices_t, DType::I32)?;
+        let indices = self.transpose(indices_t, -1, plan.axis as isize)?;
+        debug_assert_eq!(self.shape(values).expect("cummax preflighted"), self.shape(input).expect("cummax preflighted"));
+        debug_assert_eq!(self.dtype(values).expect("cummax preflighted"), self.dtype(input).expect("cummax preflighted"));
+        debug_assert_eq!(self.shape(indices).expect("cummax preflighted"), self.shape(input).expect("cummax preflighted"));
+        debug_assert_eq!(self.dtype(indices).expect("cummax preflighted"), DType::I32);
+        Ok((values, indices))
+    }
+
+    /// Checked-in tinygrad's literal `Tensor.cummax(axis) -> (values, indices)`.
+    pub fn cummax(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let plan = cumulative_extrema_plan(input, &shape, dtype, axis)?;
+        self.lower_cummax(input, &plan)
+    }
+
+    /// Checked-in tinygrad's `Tensor.cummax()` default leading axis.
+    pub fn cummax_default(&mut self, input: NodeId) -> Result<(NodeId, NodeId)> {
+        self.cummax(input, 0)
+    }
+
+    /// Checked-in tinygrad's literal inverse → CumMax → inverse CumMin pair.
+    pub fn cummin(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let plan = cumulative_extrema_plan(input, &shape, dtype, axis)?;
+        let inverse = if dtype.is_float() {
+            self.neg(input)?
+        } else {
+            self.bitwise_not(input)?
+        };
+        let (values, indices) = self.lower_cummax(inverse, &plan)?;
+        let values = if dtype.is_float() {
+            self.neg(values)?
+        } else {
+            self.bitwise_not(values)?
+        };
+        Ok((values, indices))
+    }
+
+    /// Checked-in tinygrad's `Tensor.cummin()` default leading axis.
+    pub fn cummin_default(&mut self, input: NodeId) -> Result<(NodeId, NodeId)> {
+        self.cummin(input, 0)
     }
 
     /// Cumulative product along one signed axis.
@@ -2238,6 +2428,85 @@ mod tests {
             overflow.cumsum_default(overflow_input),
             Err(Error::ShapeOverflow(_))
         ));
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
+    fn cumextrema_defaults_keep_tinygrad_pair_structure_and_descriptors() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let (values, indices) = graph.cummax_default(input).unwrap();
+        assert_eq!(graph.shape(values).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(graph.dtype(values).unwrap(), DType::F32);
+        assert_eq!(graph.shape(indices).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(graph.dtype(indices).unwrap(), DType::I32);
+        assert!(graph.requires_grad(values).unwrap());
+        assert!(!graph.requires_grad(indices).unwrap());
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Compare { op: crate::CompareOp::Eq, .. }
+        )));
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Reduce { kind: ReduceKind::Max, .. }
+        )));
+        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+            crate::Op::Constant(data) => Some(data.len()),
+            _ => None,
+        }).all(|len| len == 1));
+
+        let (minimum, minimum_indices) = graph.cummin_default(input).unwrap();
+        assert_eq!(graph.dtype(minimum).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(minimum_indices).unwrap(), DType::I32);
+        assert!(matches!(graph.op(minimum).unwrap(), crate::Op::Unary {
+            op: crate::UnaryOp::Neg,
+            ..
+        }));
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let value = graph.input_dtype(format!("{dtype:?}_input"), [2], dtype);
+            let (maximum, indices) = graph.cummax(value, -1).unwrap();
+            assert_eq!(graph.dtype(maximum).unwrap(), dtype);
+            assert_eq!(graph.dtype(indices).unwrap(), DType::I32);
+        }
+
+        let scalar = graph.input_dtype("scalar", [], DType::I16);
+        let (scalar_values, scalar_indices) = graph.cummax_default(scalar).unwrap();
+        assert_eq!(scalar_values, scalar);
+        assert_eq!(graph.shape(scalar_indices).unwrap(), &Shape::from([]));
+        assert_eq!(graph.dtype(scalar_indices).unwrap(), DType::I32);
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("empty", [0, 2], DType::BF16);
+        let (values, indices) = empty.cummax_default(input).unwrap();
+        assert_eq!(empty.shape(values).unwrap(), &Shape::from([0, 2]));
+        assert_eq!(empty.shape(indices).unwrap(), &Shape::from([0, 2]));
+        assert_eq!(empty.dtype(indices).unwrap(), DType::I32);
+
+        let mut invalid = Graph::new();
+        let input = invalid.input("input", [2]);
+        let before = invalid.node_count();
+        assert!(invalid.cummin(input, 1).is_err());
+        assert_eq!(invalid.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(matches!(overflow.cummax_default(input), Err(Error::ShapeOverflow(_))));
         assert_eq!(overflow.node_count(), before);
     }
 
