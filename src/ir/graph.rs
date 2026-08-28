@@ -2607,6 +2607,16 @@ impl Graph {
         Ok(self.node(id)?.dtype)
     }
 
+    /// Read-only tinygrad `Tensor.nbytes()`: concrete element count times
+    /// storage item size. This never appends a graph node.
+    pub fn nbytes(&self, id: NodeId) -> Result<usize> {
+        let node = self.node(id)?;
+        node.shape
+            .numel()?
+            .checked_mul(node.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))
+    }
+
     /// Returns the typed operation for inspection without exposing graph
     /// storage internals.
     pub fn op(&self, id: NodeId) -> Result<&Op> {
