@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v10";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v11";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -2162,6 +2162,15 @@ fn emit(
                 // C11 `sin` preserves that operation boundary; narrow floats
                 // are quantized solely by the established storage stores.
                 crate::UnaryOp::Sin if ty.is_float() => format!("sin({a})"),
+                // CPU/generic evaluate floating Trunc after widening the
+                // storage lane to f64, then narrow only at the output store.
+                // C11's `trunc` has the same double contract and preserves
+                // signed zero, NaN, and infinities. Exact Bool/integer Trunc
+                // is an identity in the shared evaluator; calling C `trunc`
+                // there would introduce a lossy double round-trip for wide
+                // integers, so preserve the source storage lane directly.
+                crate::UnaryOp::Trunc if ty.is_float() => format!("trunc({a})"),
+                crate::UnaryOp::Trunc => a,
                 // tinygrad Sign is `ne(0).where(lt(0).where(-1, 1), 0)`.
                 // Keep its ordered comparisons: NaN is nonzero but unordered
                 // and therefore +1, while either signed zero takes the
@@ -2705,6 +2714,87 @@ mod tests {
         let loss = differentiated.sum_all(output).unwrap();
         let gradient = differentiated.grad(loss, input).unwrap();
         assert!(CpuJit::render(&crate::lower_graph_elementwise(&differentiated, gradient).unwrap()).unwrap().source.contains("sin("));
+    }
+
+    #[test]
+    fn trunc_emits_float_c11_and_exact_storage_identity_with_vector_fallback() {
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+            DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.trunc(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            if dtype.is_float() {
+                // C11 `trunc(double)` is the CPU/generic widened operation,
+                // including signed zero, finite fractions, NaN, and infinity.
+                assert!(scalar.source.contains("trunc("), "{dtype:?}");
+            } else {
+                // Bool/integer Trunc is storage-exact identity: do not route
+                // exact I64/U64 lanes through a lossy floating expression.
+                assert!(!scalar.source.contains("trunc("), "{dtype:?}");
+            }
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // B1 intentionally remains limited to Neg/Abs. Trunc therefore
+            // takes the deterministic scalar-expression-per-lane fallback.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            if dtype.is_float() {
+                assert!(vector.source.contains("trunc("), "{dtype:?}");
+            }
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_output = narrow.trunc(f16).unwrap();
+        let bf16_output = narrow.trunc(bf16).unwrap();
+        assert!(CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap()
+        )
+        .unwrap()
+        .source
+        .contains("rg_f32_to_f16(trunc("));
+        assert!(CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap()
+        )
+        .unwrap()
+        .source
+        .contains("rg_f32_to_bf16(trunc("));
+
+        // Floor, Ceil, Round, and float division modes source-literally use
+        // Trunc. Their generated graphs must now be admitted without changing
+        // any raw non-float division contract.
+        let mut composed = Graph::new();
+        let lhs = composed.input_dtype("lhs", Shape::from([1]), DType::F64);
+        let rhs = composed.input_dtype("rhs", Shape::from([1]), DType::F64);
+        for output in [
+            composed.floor(lhs).unwrap(),
+            composed.ceil(lhs).unwrap(),
+            composed.round(lhs).unwrap(),
+            composed.trunc_div(lhs, rhs).unwrap(),
+            composed.floor_div(lhs, rhs).unwrap(),
+        ] {
+            assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, output).unwrap())
+                .unwrap()
+                .source
+                .contains("trunc("));
+        }
+
+        // Reverse mode for Trunc is the existing explicit zero graph.
+        let output = composed.trunc(lhs).unwrap();
+        let loss = composed.sum_all(output).unwrap();
+        let gradient = composed.grad(loss, lhs).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap())
+            .is_ok());
     }
 
     #[test]
