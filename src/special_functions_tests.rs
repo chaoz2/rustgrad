@@ -933,6 +933,23 @@ fn softsign_uses_literal_sign_reciprocal_and_preflights() {
 }
 
 #[test]
+fn selu_scalar_matches_tinygrad_defaults_and_preflights_before_constants() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2], DType::F64);
+    let output = graph.selu_default(input).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+    assert_eq!(graph.nodes.iter().filter(|node| matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F64)).count(), 4);
+    let values = CpuBackend.execute(&graph, output, &HashMap::from([("x".into(), TensorData::from_scalars([2], DType::F64, [Scalar::F(-1.0), Scalar::F(1.0)]).unwrap())])).unwrap();
+    close(values.scalar_at(0).as_f64(), 1.0507 * 1.67326 * ((-1.0f64).exp() - 1.0), 1e-12);
+    close(values.scalar_at(1).as_f64(), 1.0507, 1e-12);
+    for dtype in [DType::F16,DType::BF16,DType::F32,DType::F64] { let mut g=Graph::new(); let x=g.input_dtype("x", [], dtype); let out=g.selu_scalar(x, 0.125, 0.5).unwrap(); assert_eq!(g.dtype(out).unwrap(), dtype); }
+    for dtype in [DType::Bool,DType::I8,DType::I16,DType::I32,DType::I64,DType::U8,DType::U16,DType::U32,DType::U64] { let mut g=Graph::new(); let x=g.input_dtype("x", [], dtype); let out=g.selu_scalar(x,0.125,0.5).unwrap(); assert_eq!(g.dtype(out).unwrap(),DType::F32); }
+    let mut malformed=Graph::new(); let before=malformed.node_count(); assert!(malformed.selu_default(crate::NodeId(usize::MAX)).is_err()); assert_eq!(malformed.node_count(),before);
+    let overflow=malformed.input_dtype("overflow",[usize::MAX],DType::F32); let before=malformed.node_count(); assert!(malformed.selu_default(overflow).is_err()); assert_eq!(malformed.node_count(),before);
+}
+
+#[test]
 fn hardsigmoid_supports_source_defaults_and_live_strict_relu_parameters() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", [7], DType::F64);

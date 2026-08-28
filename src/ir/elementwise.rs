@@ -70,6 +70,25 @@ struct EluScalarPlan {
     alpha: TensorData,
 }
 
+struct SeluPlan {
+    exp_dtype: DType,
+    condition_shape: Shape,
+    negative_shape: Shape,
+    negative_dtype: DType,
+    branch_shape: Shape,
+    branch_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+    zero_input: TensorData,
+    one_exp: TensorData,
+}
+
+struct SeluScalarPlan {
+    core: SeluPlan,
+    alpha: TensorData,
+    gamma: TensorData,
+}
+
 struct SwishPlan {
     shape: Shape,
     dtype: DType,
@@ -1273,6 +1292,39 @@ fn elu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: f64) -> Resul
         });
     }
     Ok(EluScalarPlan { core, alpha })
+}
+
+fn selu_plan(input_shape: &Shape, input_dtype: DType, alpha_shape: &Shape, alpha_dtype: DType, gamma_shape: &Shape, gamma_dtype: DType) -> Result<SeluPlan> {
+    let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+    extent(input_shape, input_dtype)?;
+    extent(alpha_shape, alpha_dtype)?;
+    extent(gamma_shape, gamma_dtype)?;
+    let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
+    let condition_shape = input_shape.clone();
+    let negative_raw_shape = input_shape.clone();
+    let negative_shape = negative_raw_shape.broadcast_with(alpha_shape)?;
+    let negative_dtype = exp_dtype.promote(alpha_dtype);
+    let branch_shape = input_shape.broadcast_with(&negative_shape)?;
+    let branch_dtype = input_dtype.promote(negative_dtype);
+    let output_shape = branch_shape.broadcast_with(gamma_shape)?;
+    let output_dtype = branch_dtype.promote(gamma_dtype);
+    for (shape, dtype) in [(&condition_shape,DType::Bool),(input_shape,exp_dtype),(&negative_raw_shape,exp_dtype),(&negative_shape,negative_dtype),(&branch_shape,branch_dtype),(&output_shape,output_dtype)] { extent(shape,dtype)?; }
+    let zero_input = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+    let one_exp = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
+    if zero_input.dtype()!=input_dtype || one_exp.dtype()!=exp_dtype || input_shape.broadcast_with(zero_input.shape())? != *input_shape || input_shape.broadcast_with(one_exp.shape())? != *input_shape || input_dtype.promote(zero_input.dtype())!=input_dtype || exp_dtype.promote(one_exp.dtype())!=exp_dtype || condition_shape.broadcast_with(&branch_shape)?!=branch_shape {
+        return Err(Error::InvalidElementwiseDType { op:"selu scalar promotion", actual:output_dtype });
+    }
+    Ok(SeluPlan { exp_dtype, condition_shape, negative_shape, negative_dtype, branch_shape, branch_dtype, output_shape, output_dtype, zero_input, one_exp })
+}
+
+fn selu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: f64, gamma: f64) -> Result<SeluScalarPlan> {
+    let dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let alpha = TensorData::scalar_with_dtype(Scalar::F(alpha), dtype);
+    let gamma = TensorData::scalar_with_dtype(Scalar::F(gamma), dtype);
+    let core = selu_plan(input_shape,input_dtype,alpha.shape(),alpha.dtype(),gamma.shape(),gamma.dtype())?;
+    for scalar in [&alpha,&gamma] { let bytes=scalar.shape().numel()?.checked_mul(scalar.dtype().itemsize()).ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?; if bytes != scalar.dtype().itemsize() || scalar.dtype()!=dtype || input_shape.broadcast_with(scalar.shape())? != *input_shape { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:dtype }); } }
+    if core.output_shape != *input_shape || core.output_dtype != dtype { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:dtype }); }
+    Ok(SeluScalarPlan { core, alpha, gamma })
 }
 
 fn leaky_relu_plan(
@@ -4133,60 +4185,40 @@ impl Graph {
         let alpha_dtype = alpha_node.dtype;
         let gamma_shape = gamma_node.shape.clone();
         let gamma_dtype = gamma_node.dtype;
-        let extent = |shape: &Shape, dtype: DType| {
-            shape
-                .numel()?
-                .checked_mul(dtype.itemsize())
-                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
-        };
-        extent(&input_shape, input_dtype)?;
-        extent(&alpha_shape, alpha_dtype)?;
-        extent(&gamma_shape, gamma_dtype)?;
+        let plan = selu_plan(&input_shape,input_dtype,&alpha_shape,alpha_dtype,&gamma_shape,gamma_dtype)?;
+        self.lower_selu(input, alpha, gamma, plan)
+    }
 
-        let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
-        let condition_shape = input_shape.clone();
-        let negative_raw_shape = input_shape.clone();
-        let negative_shape = negative_raw_shape.broadcast_with(&alpha_shape)?;
-        let negative_dtype = exp_dtype.promote(alpha_dtype);
-        let branch_shape = input_shape.broadcast_with(&negative_shape)?;
-        let branch_dtype = input_dtype.promote(negative_dtype);
-        let output_shape = branch_shape.broadcast_with(&gamma_shape)?;
-        let output_dtype = branch_dtype.promote(gamma_dtype);
-        for (shape, dtype) in [
-            (&condition_shape, DType::Bool),
-            (&input_shape, exp_dtype),
-            (&negative_raw_shape, exp_dtype),
-            (&negative_shape, negative_dtype),
-            (&branch_shape, branch_dtype),
-            (&output_shape, output_dtype),
-        ] {
-            extent(shape, dtype)?;
-        }
+    /// Scalar form of checked-in `Tensor.selu(alpha=..., gamma=...)`.
+    pub fn selu_scalar(&mut self, input: NodeId, alpha: f64, gamma: f64) -> Result<NodeId> {
+        let node = self.node(input)?;
+        let plan = selu_scalar_plan(&node.shape, node.dtype, alpha, gamma)?;
+        let alpha = self.constant(plan.alpha);
+        let gamma = self.constant(plan.gamma);
+        self.lower_selu(input, alpha, gamma, plan.core)
+    }
 
-        let zero_input = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
-        let one_exp = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
-        if zero_input.dtype() != input_dtype
-            || one_exp.dtype() != exp_dtype
-            || input_shape.broadcast_with(zero_input.shape())? != input_shape
-            || input_shape.broadcast_with(one_exp.shape())? != input_shape
-            || input_dtype.promote(zero_input.dtype()) != input_dtype
-            || exp_dtype.promote(one_exp.dtype()) != exp_dtype
-            || condition_shape.broadcast_with(&branch_shape)? != branch_shape
-        {
-            return Err(Error::InvalidElementwiseDType {
-                op: "selu scalar promotion",
-                actual: output_dtype,
-            });
-        }
+    /// Checked-in tinygrad's `Tensor.selu()` defaults.
+    pub fn selu_default(&mut self, input: NodeId) -> Result<NodeId> { self.selu_scalar(input, 1.67326, 1.0507) }
 
-        let zero_input = self.constant(zero_input);
+    fn lower_selu(&mut self, input: NodeId, alpha: NodeId, gamma: NodeId, plan: SeluPlan) -> Result<NodeId> {
+        let zero_input = self.constant(plan.zero_input);
         let condition = self.ge(input, zero_input)?;
         let exp = self.exp(input)?;
-        let one_exp = self.constant(one_exp);
+        let one_exp = self.constant(plan.one_exp);
         let negative_raw = self.sub(exp, one_exp)?;
         let negative = self.mul(alpha, negative_raw)?;
         let branch = self.select(condition, input, negative)?;
-        self.mul(gamma, branch)
+        debug_assert_eq!(self.dtype(exp).expect("SELU preflighted"), plan.exp_dtype);
+        debug_assert_eq!(self.shape(condition).expect("SELU preflighted"), &plan.condition_shape);
+        debug_assert_eq!(self.shape(negative).expect("SELU preflighted"), &plan.negative_shape);
+        debug_assert_eq!(self.dtype(negative).expect("SELU preflighted"), plan.negative_dtype);
+        debug_assert_eq!(self.shape(branch).expect("SELU preflighted"), &plan.branch_shape);
+        debug_assert_eq!(self.dtype(branch).expect("SELU preflighted"), plan.branch_dtype);
+        let output = self.mul(gamma, branch)?;
+        debug_assert_eq!(self.shape(output).expect("SELU preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("SELU preflighted"), plan.output_dtype);
+        Ok(output)
     }
     pub fn softplus(&mut self, input: NodeId, beta: NodeId) -> Result<NodeId> {
         // tinygrad spells softplus as `(1 / beta) * (x * beta).logaddexp(0)`.
