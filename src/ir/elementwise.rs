@@ -2026,7 +2026,47 @@ impl Graph {
         self.unary(UnaryOp::Sin, input)
     }
     pub fn cos(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Cos, input)
+        // Tensor.cos is `sin(pi/2 - x)`, with narrow floats widened to F32
+        // for the phase arithmetic and narrowed only after SIN. Keep raw COS
+        // available to low-level callers, but preflight this literal public
+        // composition before publishing a cast, constant, or unary node.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let work_dtype = output_dtype.promote(DType::F32);
+        let half_pi = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), work_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, output_dtype)?;
+        extent(&shape, work_dtype)?;
+        extent(half_pi.shape(), half_pi.dtype())?;
+        let phase_shape = half_pi.shape().broadcast_with(&shape)?;
+        let phase_dtype = half_pi.dtype().promote(work_dtype);
+        let sine_dtype = unary_dtype(UnaryOp::Sin, phase_dtype);
+        if ((!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype))
+            || (work_dtype != output_dtype.promote(DType::F32))
+            || half_pi.dtype() != work_dtype
+            || phase_shape != shape
+            || phase_dtype != work_dtype
+            || sine_dtype != work_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "cos phase-shift source promotion",
+                actual: sine_dtype,
+            });
+        }
+        let lifted = if input_dtype == output_dtype { input } else { self.cast(input, output_dtype)? };
+        let widened = if output_dtype == work_dtype { lifted } else { self.cast(lifted, work_dtype)? };
+        let phase = self.sub(self.constant(half_pi), widened)?;
+        let sine = self.sin(phase)?;
+        if work_dtype == output_dtype { Ok(sine) } else { self.cast(sine, output_dtype) }
     }
     pub fn tan(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Tan, input)
