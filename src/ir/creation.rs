@@ -353,6 +353,22 @@ mod tests {
     }
 
     #[test]
+    fn eye_is_lazy_range_equality_and_preflighted() {
+        let mut graph=Graph::new();
+        let square=graph.eye_default(3,None).unwrap();
+        let rectangular=graph.eye(2,Some(4),DType::I16).unwrap();
+        let empty=graph.eye(0,Some(3),DType::F64).unwrap();
+        assert_eq!(graph.shape(square).unwrap(),&Shape::new([3,3]));
+        assert_eq!(graph.dtype(square).unwrap(),DType::F32);
+        assert_eq!(graph.shape(rectangular).unwrap(),&Shape::new([2,4]));
+        assert_eq!(graph.shape(empty).unwrap(),&Shape::new([0,3]));
+        assert!((0..graph.node_count()).any(|n|matches!(graph.op(NodeId(n)).unwrap(),Op::Logical{..})));
+        assert!(graph.nodes.iter().filter_map(|node|match &node.op{Op::Constant(data)=>Some(data.len()),_=>None}).all(|len|len==1));
+        for dtype in [DType::Bool,DType::I8,DType::U8,DType::I16,DType::U16,DType::I32,DType::U32,DType::I64,DType::U64,DType::F16,DType::BF16,DType::F32,DType::F64] { let mut typed=Graph::new();let eye=typed.eye(1,None,dtype).unwrap();assert_eq!(typed.dtype(eye).unwrap(),dtype); }
+        let mut overflow=Graph::new();let before=overflow.node_count();assert!(overflow.eye(usize::MAX,Some(2),DType::F64).is_err());assert_eq!(overflow.node_count(),before);
+    }
+
+    #[test]
     fn one_hot_plan_tracks_default_range_width_and_i64_u64_bridge_without_publication() {
         if usize::BITS < 64 {
             return;
