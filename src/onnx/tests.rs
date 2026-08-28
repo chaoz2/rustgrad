@@ -6866,6 +6866,232 @@ fn reduce_mean_matches_tinygrad_typed_sum_true_division_and_preflights() {
 }
 
 #[test]
+fn reduce_sum_matches_tinygrad_typed_accumulation_and_preflights() {
+    let mut narrow = Graph::new();
+    let x = narrow.input_dtype("x", [3], DType::F16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut narrow,
+        Msg::new(&node("ReduceSum", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &narrow,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::F16,
+                    [Scalar::F(2048.0), Scalar::F(1.0), Scalar::F(1.0)],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F16);
+    assert_eq!(output.scalar_at(0).as_f64(), 2050.0);
+
+    let mut no_keep = Graph::new();
+    let x = no_keep.input("x", [2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap(),
+    )]);
+    let mut encoded = node("ReduceSum", &["x", "axes"], "out");
+    field(&mut encoded, 5, &int_attr("keepdims", 0));
+    lower(&mut no_keep, Msg::new(&encoded), &mut values, &mut constants).unwrap();
+    assert_eq!(no_keep.shape(values["out"]).unwrap().dims(), &[2]);
+
+    let mut scalar = Graph::new();
+    let x = scalar.input_dtype("x", [], DType::I16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut scalar,
+        Msg::new(&node("ReduceSum", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::I32);
+
+    for (input_dtype, output_dtype) in [
+        (DType::Bool, DType::I32),
+        (DType::I8, DType::I32),
+        (DType::I16, DType::I32),
+        (DType::I32, DType::I32),
+        (DType::I64, DType::I64),
+        (DType::U8, DType::U32),
+        (DType::U16, DType::U32),
+        (DType::U32, DType::U32),
+        (DType::U64, DType::U64),
+        (DType::F16, DType::F16),
+        (DType::BF16, DType::BF16),
+        (DType::F32, DType::F32),
+        (DType::F64, DType::F64),
+    ] {
+        let mut typed = Graph::new();
+        let input = typed.input_dtype("input", [2], input_dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::from([(
+            "axes".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+        )]);
+        lower(
+            &mut typed,
+            Msg::new(&node("ReduceSum", &["input", "axes"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[1]);
+        assert_eq!(typed.dtype(values["out"]).unwrap(), output_dtype);
+    }
+
+    let mut noop = Graph::new();
+    let x = noop.input_dtype("x", [2], DType::I8);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([0], DType::I64, []).unwrap(),
+    )]);
+    let mut encoded = node("ReduceSum", &["x", "axes"], "out");
+    field(&mut encoded, 5, &int_attr("noop_with_empty_axes", 1));
+    lower(&mut noop, Msg::new(&encoded), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &noop,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([2], DType::I8, [Scalar::I(-2), Scalar::I(3)]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I32);
+    assert_eq!(output.scalar_at(0).as_i64(), -2);
+    assert_eq!(output.scalar_at(1).as_i64(), 3);
+
+    let mut empty_domain = Graph::new();
+    let x = empty_domain.input("x", [2, 0]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+    )]);
+    lower(
+        &mut empty_domain,
+        Msg::new(&node("ReduceSum", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend.execute(&empty_domain, values["out"], &HashMap::new()).unwrap();
+    assert_eq!(output.values(), &[0.0, 0.0]);
+
+    let mut special = Graph::new();
+    let x = special.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut special,
+        Msg::new(&node("ReduceSum", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let zero = CpuBackend
+        .execute(
+            &special,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![-0.0, 0.0]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(zero.values()[0].to_bits(), 0.0f32.to_bits());
+    let nan = CpuBackend
+        .execute(
+            &special,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![f32::NAN, f32::INFINITY]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert!(nan.values()[0].is_nan());
+
+    let mut gradient = Graph::new();
+    let x = gradient.input_dtype_requires_grad("x", [2], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut gradient,
+        Msg::new(&node("ReduceSum", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let local = gradient.grad(values["out"], x).unwrap();
+    assert_eq!(gradient.dtype(local).unwrap(), DType::F32);
+
+    for invalid in [
+        node("ReduceSum", &[], "out"),
+        {
+            let mut encoded = node("ReduceSum", &["x"], "out");
+            field(&mut encoded, 5, &int_attr("axis", 0));
+            encoded
+        },
+        node("ReduceSum", &["missing"], "out"),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceSum", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2]);

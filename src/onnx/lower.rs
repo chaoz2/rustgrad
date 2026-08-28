@@ -2852,6 +2852,49 @@ fn reduce_mean_plan(
     })
 }
 
+/// Full source-level contract for `ReduceSum`. Tensor.sum accumulates at
+/// `sum_acc_dtype`, narrowing only after the reduction for F16/BF16, and it
+/// retains that accumulator result even when an empty axes list is a shape
+/// no-op for integral inputs.
+struct ReduceSumPlan {
+    reduction: ReducePlan,
+}
+
+fn reduce_sum_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReduceSumPlan> {
+    let source_shape = g.shape(x)?.clone();
+    let source_dtype = g.dtype(x)?;
+    let reduction = reduce_plan(g, x, ins, attrs, constants)?;
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("ReduceSum {what} byte extent overflow")))
+    };
+    extent(&source_shape, source_dtype, "input")?;
+    extent(
+        &source_shape,
+        reduction.sum_dtypes.accumulator,
+        "accumulator cast",
+    )?;
+    extent(
+        &reduction.output_shape,
+        reduction.sum_dtypes.accumulator,
+        "accumulator reduction",
+    )?;
+    extent(
+        &reduction.output_shape,
+        reduction.sum_dtypes.output,
+        "output",
+    )?;
+    Ok(ReduceSumPlan { reduction })
+}
+
 /// Fully resolved source contract for tinygrad's ONNX
 /// `LogSoftmax(X, axis) = m - log(sum(exp(m)))`, where
 /// `m = X - detach(max(X, axis, keepdim=True))`.  The source implements exp
@@ -5255,7 +5298,7 @@ pub(super) fn lower(
             };
             g.full_with_dtype(shape, value, dtype)?
         }
-        op @ ("ReduceSum" | "ReduceProd" | "ReduceMin" | "ReduceMax")
+        op @ ("ReduceProd" | "ReduceMin" | "ReduceMax")
             if (1..=2).contains(&ins.len()) =>
         {
             if attrs
@@ -5270,7 +5313,6 @@ pub(super) fn lower(
                 x
             } else {
                 let kind = match op {
-                    "ReduceSum" => ReduceKind::Sum,
                     "ReduceProd" => ReduceKind::Product,
                     "ReduceMin" => ReduceKind::Min,
                     "ReduceMax" => ReduceKind::Max,
@@ -5278,6 +5320,47 @@ pub(super) fn lower(
                 };
                 g.reduce(x, kind, Some(plan.axes), plan.keepdims)?
             }
+        }
+        "ReduceSum" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_sum_plan(g, x, &ins, &attrs, constants)?;
+            let output = if plan.reduction.noop {
+                // A source empty-axis Sum has no movement, but it still
+                // applies Tensor.sum's accumulator and narrow-output casts.
+                let accumulator = if g.dtype(x)? == plan.reduction.sum_dtypes.accumulator {
+                    x
+                } else {
+                    g.cast(x, plan.reduction.sum_dtypes.accumulator)?
+                };
+                if plan.reduction.sum_dtypes.accumulator == plan.reduction.sum_dtypes.output {
+                    accumulator
+                } else {
+                    g.cast(accumulator, plan.reduction.sum_dtypes.output)?
+                }
+            } else {
+                g.reduce_with_dtypes(
+                    x,
+                    ReduceKind::Sum,
+                    Some(plan.reduction.axes),
+                    plan.reduction.keepdims,
+                    plan.reduction.sum_dtypes,
+                )?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("ReduceSum shape preflighted"),
+                &plan.reduction.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("ReduceSum dtype preflighted"),
+                plan.reduction.sum_dtypes.output
+            );
+            output
         }
         "ReduceMean" if (1..=2).contains(&ins.len()) => {
             if attrs
