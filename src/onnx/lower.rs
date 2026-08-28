@@ -2263,6 +2263,125 @@ fn static_i32_i64_scalar(
     Ok(value.scalar_at(0).as_i64())
 }
 
+/// Static rank-one control arrays for tinygrad's ONNX Slice adapter.  The
+/// adapter receives Python lists, so checked I32 and I64 initializers are the
+/// complete locally representable integer source surface.
+fn static_slice_control(
+    constants: &BTreeMap<String, TensorData>,
+    name: &str,
+    control: &str,
+) -> Result<Vec<i64>> {
+    let value = constants
+        .get(name)
+        .ok_or_else(|| bad(format!("Slice {control} must be a constant initializer")))?;
+    if !matches!(value.dtype(), DType::I32 | DType::I64) {
+        return Err(bad(format!("Slice {control} must be I32 or I64")));
+    }
+    let shape = value.shape();
+    let numel = shape.numel()?;
+    numel
+        .checked_mul(value.dtype().itemsize())
+        .ok_or_else(|| bad(format!("Slice {control} byte extent overflow")))?;
+    if shape.rank() != 1 {
+        return Err(bad(format!("Slice {control} must be rank one")));
+    }
+    Ok((0..value.len())
+        .map(|index| value.scalar_at(index).as_i64())
+        .collect())
+}
+
+/// Every fallible fact in tinygrad's static ONNX Slice adapter.  In
+/// particular, Python's `slices[axis] = ...` overwrites repeats in source
+/// order, so only the final slice on each axis is normalized.
+struct SlicePlan {
+    slices: Vec<Slice>,
+    output_shape: Shape,
+    dtype: DType,
+}
+
+fn slice_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<SlicePlan> {
+    if !(3..=5).contains(&ins.len()) || !attrs.is_empty() {
+        return Err(bad("Slice requires three to five inputs and no attributes"));
+    }
+    let shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    shape.numel()?;
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Slice input byte extent overflow"))?;
+    let starts = static_slice_control(constants, ins[1], "starts")?;
+    let ends = static_slice_control(constants, ins[2], "ends")?;
+    let rank = shape.rank();
+    let axes = if ins.len() >= 4 && !ins[3].is_empty() {
+        let axes = static_slice_control(constants, ins[3], "axes")?;
+        if axes.is_empty() {
+            (0..rank).map(|axis| axis as i64).collect()
+        } else {
+            axes
+        }
+    } else {
+        (0..rank).map(|axis| axis as i64).collect()
+    };
+    let steps = if ins.len() == 5 && !ins[4].is_empty() {
+        let steps = static_slice_control(constants, ins[4], "steps")?;
+        if steps.is_empty() {
+            vec![1; rank]
+        } else {
+            steps
+        }
+    } else {
+        vec![1; rank]
+    };
+    if starts.len() < axes.len() || ends.len() < axes.len() || steps.len() < axes.len() {
+        return Err(bad("Slice controls are shorter than axes"));
+    }
+    let mut slices = vec![Slice {
+        start: None,
+        stop: None,
+        step: 1,
+    }; rank];
+    for index in 0..axes.len() {
+        // Python assignment validates each axis immediately, even if a later
+        // duplicate replaces its range.
+        let axis = axes_usize(&[axes[index]], rank)?[0];
+        slices[axis] = Slice {
+            start: Some(
+                isize::try_from(starts[index]).map_err(|_| bad("Slice start overflow"))?,
+            ),
+            stop: Some(isize::try_from(ends[index]).map_err(|_| bad("Slice end overflow"))?),
+            step: isize::try_from(steps[index]).map_err(|_| bad("Slice step overflow"))?,
+        };
+    }
+    let output_shape = Shape::new(
+        slices
+            .iter()
+            .zip(shape.dims())
+            .enumerate()
+            .map(|(axis, (slice, dim))| crate::ir::normalized_slice(*dim, *slice, axis))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(_, _, _, length)| length)
+            .collect(),
+    );
+    output_shape.numel()?;
+    output_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Slice output byte extent overflow"))?;
+    Ok(SlicePlan {
+        slices,
+        output_shape,
+        dtype,
+    })
+}
+
 /// All static facts required by the coupled ONNX TopK value/index result.
 ///
 /// The graph's stable-sort selectors are already an atomic producer pair, but
@@ -5338,56 +5457,14 @@ pub(super) fn lower(
         }
         "Slice" if (3..=5).contains(&ins.len()) && attrs.is_empty() => {
             let x = get(0)?;
-            let starts = const_i64(constants, ins[1])?;
-            let ends = const_i64(constants, ins[2])?;
-            if starts.len() != ends.len() {
-                return Err(bad("Slice starts/ends length mismatch"));
-            }
-            let axes = if ins.len() >= 4 && !ins[3].is_empty() {
-                const_i64(constants, ins[3])?
-            } else {
-                (0..starts.len()).map(|x| x as i64).collect()
-            };
-            let steps = if ins.len() == 5 && !ins[4].is_empty() {
-                const_i64(constants, ins[4])?
-            } else {
-                vec![1; starts.len()]
-            };
-            if axes.len() != starts.len() || steps.len() != starts.len() {
-                return Err(bad("Slice control lengths mismatch"));
-            }
-            let rank = g.shape(x)?.rank();
-            let axes = axes_usize(&axes, rank)?;
-            let mut seen = vec![false; rank];
-            let mut slices = vec![
-                crate::Slice {
-                    start: None,
-                    stop: None,
-                    step: 1
-                };
-                rank
-            ];
-            for ((axis, start), (end, step)) in axes
-                .into_iter()
-                .zip(starts)
-                .zip(ends.into_iter().zip(steps))
-            {
-                if step == 0 {
-                    return Err(bad("Slice step must be nonzero"));
-                }
-                let step = isize::try_from(step).map_err(|_| bad("Slice step overflow"))?;
-                let start = isize::try_from(start).map_err(|_| bad("Slice start overflow"))?;
-                let end = isize::try_from(end).map_err(|_| bad("Slice end overflow"))?;
-                if std::mem::replace(&mut seen[axis], true) {
-                    return Err(bad("duplicate Slice axis"));
-                }
-                slices[axis] = crate::Slice {
-                    start: Some(start),
-                    stop: Some(end),
-                    step,
-                };
-            }
-            g.stride(x, slices)?
+            let plan = slice_plan(g, x, &ins, &attrs, constants)?;
+            let output = g.stride(x, plan.slices)?;
+            debug_assert_eq!(
+                g.shape(output).expect("Slice shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(g.dtype(output).expect("Slice dtype preflighted"), plan.dtype);
+            output
         }
         "Pad" if (2..=3).contains(&ins.len()) => {
             if attrs.keys().any(|x| x != "mode") {

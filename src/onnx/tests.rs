@@ -1175,13 +1175,11 @@ fn transpose_preflights_closed_attributes_and_permutation_before_publication() {
 }
 
 #[test]
-fn slice_rejects_duplicate_axes_with_unit_steps_before_publication() {
+fn slice_matches_tinygrad_overwrite_and_static_control_semantics() {
     let mut g = Graph::new();
     let x = g.input("x", [4]);
     let mut values = BTreeMap::from([("x".into(), x)]);
-    let before_values = values.clone();
-    let before_nodes = g.node_count();
-    let mut invalid_constants = BTreeMap::from([
+    let mut duplicate_axes = BTreeMap::from([
         (
             "starts".into(),
             TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(1)]).unwrap(),
@@ -1199,19 +1197,24 @@ fn slice_rejects_duplicate_axes_with_unit_steps_before_publication() {
             TensorData::from_scalars([2], DType::I64, [Scalar::I(1), Scalar::I(1)]).unwrap(),
         ),
     ]);
-    let before_constants = invalid_constants.clone();
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&node("Slice", &["x", "starts", "ends", "axes", "steps"], "out")),
-            &mut values,
-            &mut invalid_constants,
+    lower(
+        &mut g,
+        Msg::new(&node("Slice", &["x", "starts", "ends", "axes", "steps"], "overwrite")),
+        &mut values,
+        &mut duplicate_axes,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["overwrite"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([4], vec![1., 2., 3., 4.]).unwrap(),
+            )]),
         )
-        .is_err()
-    );
-    assert_eq!(values, before_values);
-    assert_eq!(invalid_constants, before_constants);
-    assert_eq!(g.node_count(), before_nodes);
+        .unwrap();
+    assert_eq!(output.values(), &[2., 3., 4.]);
 
     let mut constants = BTreeMap::from([
         (
@@ -1249,6 +1252,125 @@ fn slice_rejects_duplicate_axes_with_unit_steps_before_publication() {
         )
         .unwrap();
     assert_eq!(output.values(), &[2., 3.]);
+}
+
+#[test]
+fn slice_preflights_negative_steps_defaults_and_failures() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype_requires_grad("x", [5], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([
+        (
+            "starts".into(),
+            TensorData::from_scalars([1], DType::I32, [Scalar::I(i32::MAX.into())]).unwrap(),
+        ),
+        (
+            "ends".into(),
+            TensorData::from_scalars([1], DType::I32, [Scalar::I(i32::MIN.into())]).unwrap(),
+        ),
+        (
+            "axes".into(),
+            TensorData::from_scalars([1], DType::I32, [Scalar::I(-1)]).unwrap(),
+        ),
+        (
+            "steps".into(),
+            TensorData::from_scalars([1], DType::I32, [Scalar::I(-2)]).unwrap(),
+        ),
+    ]);
+    lower(
+        &mut graph,
+        Msg::new(&node("Slice", &["x", "starts", "ends", "axes", "steps"], "reverse")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["reverse"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([5], vec![1., 2., 3., 4., 5.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[5., 3., 1.]);
+    assert_eq!(graph.dtype(values["reverse"]).unwrap(), DType::F32);
+    assert!(graph.grad(values["reverse"], x).is_ok());
+
+    let mut defaults = Graph::new();
+    let x = defaults.input("x", [3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([
+        (
+            "starts".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+        ),
+        (
+            "ends".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(3)]).unwrap(),
+        ),
+        ("axes".into(), TensorData::from_scalars([0], DType::I64, []).unwrap()),
+        ("steps".into(), TensorData::from_scalars([0], DType::I64, []).unwrap()),
+    ]);
+    lower(
+        &mut defaults,
+        Msg::new(&node("Slice", &["x", "starts", "ends", "axes", "steps"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(defaults.shape(values["out"]).unwrap().dims(), &[3]);
+
+    for controls in [
+        BTreeMap::from([
+            (
+                "starts".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+            ),
+            (
+                "ends".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+            ),
+            (
+                "steps".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+            ),
+        ]),
+        BTreeMap::from([
+            (
+                "starts".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+            ),
+            (
+                "ends".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+            ),
+        ]),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before_values = values.clone();
+        let before_nodes = malformed.node_count();
+        let mut controls = controls;
+        let before_constants = controls.clone();
+        let inputs: &[&str] = if controls.contains_key("steps") {
+            &["x", "starts", "ends", "", "steps"]
+        } else {
+            &["x", "starts", "ends", "missing"]
+        };
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&node("Slice", inputs, "out")),
+            &mut values,
+            &mut controls,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(controls, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
 }
 
 #[test]
