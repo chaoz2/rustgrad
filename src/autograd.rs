@@ -12,6 +12,73 @@ struct PowVjpPlan {
     ln2: TensorData,
 }
 
+/// Fully resolved local derivative for a direct tinygrad SQRT node. The
+/// source spells this as `upstream / (result * 2)`, where the weak integer
+/// literal adopts the result storage dtype rather than being an F32 scalar.
+struct SqrtVjpPlan {
+    two: TensorData,
+}
+
+fn sqrt_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) -> Result<SqrtVjpPlan> {
+    let input_data = graph.node(input)?;
+    let input_shape = input_data.shape.clone();
+    let input_dtype = input_data.dtype;
+    let result_data = graph.node(node)?;
+    let result_shape = result_data.shape.clone();
+    let result_dtype = result_data.dtype;
+    let upstream_data = graph.node(upstream)?;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    let fail = |actual| Error::InvalidElementwiseDType {
+        op: "sqrt vjp source promotion",
+        actual,
+    };
+
+    let expected_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    if result_shape != input_shape
+        || result_dtype != expected_dtype
+        || upstream_data.shape != result_shape
+        || !result_dtype.is_float()
+        || !upstream_data.dtype.is_float()
+    {
+        return Err(fail(result_dtype));
+    }
+    for (shape, dtype) in [
+        (&input_shape, input_dtype),
+        (&result_shape, result_dtype),
+        (&upstream_data.shape, upstream_data.dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+
+    let two = TensorData::scalar_with_dtype(Scalar::I(2), result_dtype);
+    extent(two.shape(), two.dtype())?;
+    let denominator_shape = result_shape.broadcast_with(two.shape())?;
+    let denominator_dtype = result_dtype.promote(two.dtype());
+    let gradient_shape = upstream_data.shape.broadcast_with(&denominator_shape)?;
+    let gradient_dtype = upstream_data.dtype.promote(denominator_dtype);
+    if two.dtype() != result_dtype
+        || denominator_shape != result_shape
+        || denominator_dtype != result_dtype
+        || gradient_shape != result_shape
+        || !gradient_dtype.is_float()
+    {
+        return Err(fail(gradient_dtype));
+    }
+    for (shape, dtype) in [
+        (&denominator_shape, denominator_dtype),
+        (&gradient_shape, gradient_dtype),
+        (&input_shape, gradient_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    Ok(SqrtVjpPlan { two })
+}
+
 fn pow_vjp_plan(graph: &Graph, node: NodeId, lhs: NodeId, rhs: NodeId, upstream: NodeId) -> Result<PowVjpPlan> {
     let lhs_node = graph.node(lhs)?;
     let lhs_shape = lhs_node.shape.clone();
@@ -259,7 +326,8 @@ impl Graph {
                             self.mul(upstream, scale)?
                         }
                         UnaryOp::Sqrt => {
-                            let two = self.constant(TensorData::scalar(2.0f32));
+                            let plan = sqrt_vjp_plan(self, node, input, upstream)?;
+                            let two = self.constant(plan.two);
                             let denominator = self.mul(node, two)?;
                             self.div(upstream, denominator)?
                         }

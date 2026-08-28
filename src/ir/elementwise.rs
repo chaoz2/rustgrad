@@ -1867,6 +1867,30 @@ impl Graph {
         self.unary(UnaryOp::Square, input)
     }
     pub fn sqrt(&mut self, input: NodeId) -> Result<NodeId> {
+        // Tensor.sqrt is the direct SQRT ALU primitive. It retains floating
+        // storage width, while the source unary lattice lifts every nonfloat
+        // input to F32. Validate both concrete descriptors before publishing
+        // the unary node so malformed extents cannot leave a partial graph.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Sqrt, input_dtype);
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(input_dtype)?;
+        extent(output_dtype)?;
+        if (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "sqrt source promotion",
+                actual: output_dtype,
+            });
+        }
         self.unary(UnaryOp::Sqrt, input)
     }
     pub fn rsqrt(&mut self, input: NodeId) -> Result<NodeId> {
