@@ -133,7 +133,8 @@ pub use linearize::{
 };
 pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
-    nll_loss, sparse_categorical_cross_entropy,
+    nll_loss, sparse_categorical_cross_entropy, sparse_categorical_cross_entropy_tinygrad,
+    SparseCategoricalCrossEntropyOptions,
 };
 pub use matmul::{
     MatmulBarrierKind, MatmulBarrierPhase, MatmulKernelPlan, MatmulPlanError,
