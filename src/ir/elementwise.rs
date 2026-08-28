@@ -715,7 +715,80 @@ impl Graph {
     }
 
     pub fn div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        self.binary(BinaryOp::Div, lhs, rhs)
+        // Tensor.div(rounding_mode=None) is true division, not the raw
+        // integer DIV op: `_broadcasted` first commits both branches to the
+        // source LUB (I64/U64 meets at F32), then only an integral/Bool
+        // dividend lifts to F32 and the literal result is
+        // `dividend * reciprocal(divisor)`. Plan every cast, unary, and Mul
+        // extent before a node is published. Floor/trunc helpers intentionally
+        // retain their raw BinaryOp contracts.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let source_promote = |left: DType, right: DType| {
+            if matches!(
+                (left, right),
+                (DType::I64, DType::U64) | (DType::U64, DType::I64)
+            ) {
+                DType::F32
+            } else {
+                left.promote(right)
+            }
+        };
+        let division_dtype = source_promote(lhs_dtype, rhs_dtype);
+        let dividend_dtype = if division_dtype.is_float() {
+            division_dtype
+        } else {
+            DType::F32
+        };
+        let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, division_dtype);
+        let output_dtype = source_promote(dividend_dtype, reciprocal_dtype);
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for (shape, dtype) in [
+            (&lhs_shape, lhs_dtype),
+            (&rhs_shape, rhs_dtype),
+            (&lhs_shape, division_dtype),
+            (&rhs_shape, division_dtype),
+            (&lhs_shape, dividend_dtype),
+            (&rhs_shape, reciprocal_dtype),
+            (&output_shape, output_dtype),
+        ] {
+            extent(shape, dtype)?;
+        }
+        if unary_dtype(UnaryOp::Reciprocal, division_dtype) != reciprocal_dtype
+            || source_promote(dividend_dtype, reciprocal_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "div scalar promotion",
+                actual: output_dtype,
+            });
+        }
+        let lhs = if lhs_dtype == division_dtype {
+            lhs
+        } else {
+            self.cast(lhs, division_dtype)?
+        };
+        let rhs = if rhs_dtype == division_dtype {
+            rhs
+        } else {
+            self.cast(rhs, division_dtype)?
+        };
+        let dividend = if division_dtype == dividend_dtype {
+            lhs
+        } else {
+            self.cast(lhs, dividend_dtype)?
+        };
+        let reciprocal = self.reciprocal(rhs)?;
+        self.mul(dividend, reciprocal)
     }
     pub fn pow(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Pow, lhs, rhs)
