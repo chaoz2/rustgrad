@@ -3648,6 +3648,7 @@ mod tests {
         for (dtype, op) in [
             (DType::Bool, crate::UnaryOp::Neg),
             (DType::U32, crate::UnaryOp::Abs),
+            (DType::F32, crate::UnaryOp::Sign),
             (DType::F16, crate::UnaryOp::Neg),
             (DType::F32, crate::UnaryOp::Exp),
             (DType::F64, crate::UnaryOp::Sqrt),

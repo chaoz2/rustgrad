@@ -2647,6 +2647,103 @@ fn sign_uses_tinygrad_ordered_nan_and_signed_zero_contract() {
 }
 
 #[test]
+fn abs_uses_tinygrad_sign_multiply_structure_special_values_and_vjp() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [5], DType::F64);
+    let output = graph.abs(input).unwrap();
+    let Op::Binary {
+        op: BinaryOp::Mul,
+        lhs,
+        rhs,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("tinygrad abs must end in Mul");
+    };
+    assert_eq!(*lhs, input);
+    assert!(matches!(graph.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Sign, input: signed }
+        if *signed == input));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "input".into(),
+        TensorData::from_scalars(
+            [5],
+            DType::F64,
+            [
+                Scalar::F(f64::NEG_INFINITY),
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::INFINITY),
+                Scalar::F(f64::NAN),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), f64::INFINITY);
+    assert_eq!(values.scalar_at(1).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(values.scalar_at(2).as_f64().to_bits(), 0.0f64.to_bits());
+    assert_eq!(values.scalar_at(3).as_f64(), f64::INFINITY);
+    assert!(values.scalar_at(4).as_f64().is_nan());
+    assert_eq!(
+        CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64(),
+        vec![-1.0, 0.0, 0.0, 1.0, 1.0]
+    );
+
+    let mut discrete = Graph::new();
+    let signed = discrete.input_dtype("signed", [1], DType::I8);
+    let unsigned = discrete.input_dtype("unsigned", [2], DType::U64);
+    let boolean = discrete.input_dtype("boolean", [2], DType::Bool);
+    let signed_output = discrete.abs(signed).unwrap();
+    let unsigned_output = discrete.abs(unsigned).unwrap();
+    let boolean_output = discrete.abs(boolean).unwrap();
+    let bindings = HashMap::from([
+        (
+            "signed".into(),
+            TensorData::from_scalars([1], DType::I8, [Scalar::I(i8::MIN as i64)]).unwrap(),
+        ),
+        (
+            "unsigned".into(),
+            TensorData::from_scalars([2], DType::U64, [Scalar::U(0), Scalar::U(u64::MAX)]).unwrap(),
+        ),
+        ("boolean".into(), bool_data([2], [false, true])),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&discrete, signed_output, &bindings).unwrap().storage(),
+        &crate::Storage::I8(vec![i8::MIN])
+    );
+    assert_eq!(
+        CpuBackend.execute(&discrete, unsigned_output, &bindings).unwrap().storage(),
+        &crate::Storage::U64(vec![0, u64::MAX])
+    );
+    assert_eq!(
+        CpuBackend.execute(&discrete, boolean_output, &bindings).unwrap().storage(),
+        &crate::Storage::Bool(vec![false, true])
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::F16);
+    let output = empty.abs(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.abs(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn lerp_preflights_all_operands_and_preserves_broadcast_vjps() {
     let mut graph = Graph::new();
     let start = graph.input("start", [2, 1]);

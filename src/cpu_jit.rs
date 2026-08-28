@@ -2463,6 +2463,15 @@ mod tests {
     }
 
     #[test]
+    fn public_abs_sign_composition_is_fail_closed_without_a_jit_sign_contract() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([1]), DType::F32);
+        let output = graph.abs(input).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        assert!(matches!(CpuJit::render(&uop), Err(JitError::Unsupported(_))));
+    }
+
+    #[test]
     fn source_is_deterministic_and_native_call_works() {
         let mut g = Graph::new();
         let a = g.input("a", Shape::from([3]));

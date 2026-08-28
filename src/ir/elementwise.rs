@@ -1692,7 +1692,36 @@ impl Graph {
         self.unary(UnaryOp::Log, input)
     }
     pub fn abs(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Abs, input)
+        // Tensor.abs is literally `x * x.sign()`, not the raw unary absolute
+        // value. This preserves a negative zero, tinygrad's NaN sign path,
+        // and wrapping signed minima. Prove the Sign and Mul descriptors
+        // before either node is published; UnaryOp::Abs remains available to
+        // lower-level callers that explicitly request its host semantics.
+        let input_node = self.node(input)?;
+        let shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let sign_dtype = unary_dtype(UnaryOp::Sign, input_dtype);
+        let output_dtype = input_dtype.promote(sign_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, sign_dtype)?;
+        extent(&shape, output_dtype)?;
+        if sign_dtype != input_dtype
+            || output_dtype != input_dtype
+            || shape.broadcast_with(&shape)? != shape
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "abs sign/mul promotion",
+                actual: output_dtype,
+            });
+        }
+        let sign = self.sign(input)?;
+        self.mul(input, sign)
     }
     pub fn reciprocal(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Reciprocal, input)
