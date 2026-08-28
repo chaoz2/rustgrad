@@ -16,6 +16,119 @@ struct LeakyReluPlan {
     zero: TensorData,
 }
 
+struct CeluPlan {
+    division_dtype: DType,
+    dividend_dtype: DType,
+    reciprocal_dtype: DType,
+    scaled_shape: Shape,
+    scaled_dtype: DType,
+    exp_dtype: DType,
+    negative_shape: Shape,
+    negative_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+    input_zero: TensorData,
+    one: TensorData,
+    negative_zero: TensorData,
+}
+
+fn celu_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    alpha_shape: &Shape,
+    alpha_dtype: DType,
+) -> Result<CeluPlan> {
+    // The only locally represented difference between RustGrad's ordinary
+    // lattice and tinygrad's weak source lattice is its I64/U64 default-F32
+    // bridge.  CELU's reciprocal normally moves later arithmetic to float,
+    // but retaining the source rule in the plan closes every stage.
+    let source_promote = |lhs: DType, rhs: DType| {
+        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+            DType::F32
+        } else {
+            lhs.promote(rhs)
+        }
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    extent(alpha_shape, alpha_dtype)?;
+    let scaled_shape = input_shape.broadcast_with(alpha_shape)?;
+    // Tensor.div first commits both operands to their common source dtype.
+    // It then lifts only an integer/bool dividend to F32 before multiplying
+    // by the reciprocal.  Taking the reciprocal of the original alpha would
+    // incorrectly widen e.g. F16 x / I32 alpha to F32.
+    let division_dtype = source_promote(input_dtype, alpha_dtype);
+    let dividend_dtype = if division_dtype.is_float() {
+        division_dtype
+    } else {
+        DType::F32
+    };
+    let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, division_dtype);
+    let scaled_dtype = source_promote(dividend_dtype, reciprocal_dtype);
+    let exp_dtype = unary_dtype(UnaryOp::Exp, scaled_dtype);
+    let negative_shape = scaled_shape.broadcast_with(alpha_shape)?;
+    let negative_dtype = source_promote(alpha_dtype, exp_dtype);
+    let output_shape = input_shape.broadcast_with(&negative_shape)?;
+    let output_dtype = source_promote(input_dtype, negative_dtype);
+    for (shape, dtype) in [
+        (input_shape, division_dtype),
+        (alpha_shape, division_dtype),
+        (input_shape, dividend_dtype),
+        (alpha_shape, reciprocal_dtype),
+        (&scaled_shape, scaled_dtype),
+        (&scaled_shape, exp_dtype),
+        (&negative_shape, negative_dtype),
+        (input_shape, input_dtype),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    let input_zero = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
+    let negative_zero = TensorData::scalar_with_dtype(Scalar::I(0), negative_dtype);
+    if input_zero.dtype() != input_dtype
+        || one.dtype() != exp_dtype
+        || negative_zero.dtype() != negative_dtype
+        || input_shape.broadcast_with(input_zero.shape())? != *input_shape
+        || scaled_shape.broadcast_with(one.shape())? != scaled_shape
+        || negative_shape.broadcast_with(negative_zero.shape())? != negative_shape
+        || source_promote(input_dtype, alpha_dtype) != division_dtype
+        || source_promote(dividend_dtype, reciprocal_dtype) != scaled_dtype
+        || source_promote(alpha_dtype, exp_dtype) != negative_dtype
+        || source_promote(input_dtype, negative_dtype) != output_dtype
+        || dividend_dtype.promote(reciprocal_dtype) != scaled_dtype
+        || alpha_dtype.promote(exp_dtype) != negative_dtype
+        || input_dtype.promote(negative_dtype) != output_dtype
+        || unary_dtype(UnaryOp::Reciprocal, division_dtype) != reciprocal_dtype
+        || unary_dtype(UnaryOp::Exp, scaled_dtype) != exp_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "celu scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(CeluPlan {
+        division_dtype,
+        dividend_dtype,
+        reciprocal_dtype,
+        scaled_shape,
+        scaled_dtype,
+        exp_dtype,
+        negative_shape,
+        negative_dtype,
+        output_shape,
+        output_dtype,
+        input_zero,
+        one,
+        negative_zero,
+    })
+}
+
 fn leaky_relu_plan(
     input_shape: &Shape,
     input_dtype: DType,
@@ -890,16 +1003,62 @@ impl Graph {
         self.sub(positive, negative)
     }
     pub fn celu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
-        self.broadcast_shape(input, alpha)?;
-        let zero = self.constant(TensorData::scalar(0.0f32));
-        let positive = self.maximum(input, zero)?;
-        let scaled = self.div(input, alpha)?;
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let alpha_node = self.node(alpha)?;
+        let alpha_shape = alpha_node.shape.clone();
+        let alpha_dtype = alpha_node.dtype;
+        let plan = celu_plan(&input_shape, input_dtype, &alpha_shape, alpha_dtype)?;
+
+        // tinygrad literally evaluates
+        // `x.maximum(0) + (alpha * ((x / alpha).exp() - 1)).minimum(0)`.
+        // Its division is reciprocal then multiply, and the shared extrema
+        // nodes retain tinygrad's ordered left payload on ties and NaNs.
+        let input_zero = self.constant(plan.input_zero);
+        let positive = self.maximum(input, input_zero)?;
+        let division_input = if input_dtype == plan.division_dtype {
+            input
+        } else {
+            self.cast(input, plan.division_dtype)?
+        };
+        let division_alpha = if alpha_dtype == plan.division_dtype {
+            alpha
+        } else {
+            self.cast(alpha, plan.division_dtype)?
+        };
+        let dividend = if plan.division_dtype == plan.dividend_dtype {
+            division_input
+        } else {
+            self.cast(division_input, plan.dividend_dtype)?
+        };
+        let reciprocal_alpha = self.reciprocal(division_alpha)?;
+        debug_assert_eq!(
+            self.dtype(reciprocal_alpha).expect("CELU preflighted"),
+            plan.reciprocal_dtype
+        );
+        let scaled = self.mul(dividend, reciprocal_alpha)?;
+        debug_assert_eq!(self.shape(scaled).expect("CELU preflighted"), &plan.scaled_shape);
+        debug_assert_eq!(self.dtype(scaled).expect("CELU preflighted"), plan.scaled_dtype);
         let exp = self.exp(scaled)?;
-        let one = self.constant(TensorData::scalar(1.0f32));
+        debug_assert_eq!(self.dtype(exp).expect("CELU preflighted"), plan.exp_dtype);
+        let one = self.constant(plan.one);
         let delta = self.sub(exp, one)?;
         let scaled_negative = self.mul(alpha, delta)?;
-        let negative = self.minimum(scaled_negative, zero)?;
-        self.add(positive, negative)
+        debug_assert_eq!(
+            self.shape(scaled_negative).expect("CELU preflighted"),
+            &plan.negative_shape
+        );
+        debug_assert_eq!(
+            self.dtype(scaled_negative).expect("CELU preflighted"),
+            plan.negative_dtype
+        );
+        let negative_zero = self.constant(plan.negative_zero);
+        let negative = self.minimum(scaled_negative, negative_zero)?;
+        let output = self.add(positive, negative)?;
+        debug_assert_eq!(self.shape(output).expect("CELU preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("CELU preflighted"), plan.output_dtype);
+        Ok(output)
     }
     pub fn selu(&mut self, input: NodeId, alpha: NodeId, gamma: NodeId) -> Result<NodeId> {
         // tinygrad SELU is `gamma * where(x >= 0, x, alpha * (exp(x) - 1))`.

@@ -1030,6 +1030,160 @@ fn leaky_relu_uses_tinygrad_ordered_live_slope_select() {
 }
 
 #[test]
+fn celu_uses_source_ordered_extrema_and_reciprocal_division() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [7], DType::F64);
+    let alpha = graph.input_dtype("alpha", [], DType::F64);
+    let output = graph.celu(input, alpha).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([7]));
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([
+        (
+            "x".into(),
+            TensorData::from_scalars(
+                [7],
+                DType::F64,
+                [
+                    Scalar::F(f64::NEG_INFINITY),
+                    Scalar::F(-1.0),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(f64::INFINITY),
+                    Scalar::F(1.0),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "alpha".into(),
+            TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F64),
+        ),
+    ]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), -1.0);
+    close(values.scalar_at(1).as_f64(), (-1.0f64).exp() - 1.0, 1e-12);
+    assert_eq!(values.scalar_at(2).as_f64().to_bits(), 0.0f64.to_bits());
+    assert_eq!(values.scalar_at(3).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!(values.scalar_at(4).as_f64().is_nan());
+    assert!(values.scalar_at(5).as_f64().is_infinite());
+    assert_eq!(values.scalar_at(6).as_f64(), 1.0);
+    let gradient = CpuBackend
+        .execute(&graph, input_gradient, &bindings)
+        .unwrap()
+        .to_vec_f64();
+    close(gradient[1], (-1.0f64).exp(), 1e-12);
+    assert_eq!(gradient[2], 1.0);
+    assert_eq!(gradient[3], 1.0);
+    assert_eq!(gradient[6], 1.0);
+
+    // The source formula evaluates its negative term even on positive lanes:
+    // zero and nonfinite alpha therefore remain observable rather than being
+    // hidden behind a conventional conditional activation helper.
+    for alpha_value in [0.0, f64::NAN, f64::INFINITY] {
+        let mut special = Graph::new();
+        let x = special.input_dtype("x", [], DType::F64);
+        let alpha = special.input_dtype("alpha", [], DType::F64);
+        let output = special.celu(x, alpha).unwrap();
+        let value = CpuBackend
+            .execute(
+                &special,
+                output,
+                &HashMap::from([
+                    (
+                        "x".into(),
+                        TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F64),
+                    ),
+                    (
+                        "alpha".into(),
+                        TensorData::scalar_with_dtype(Scalar::F(alpha_value), DType::F64),
+                    ),
+                ]),
+            )
+            .unwrap();
+        assert!(value.scalar_at(0).as_f64().is_nan());
+    }
+
+    let mut negative_alpha = Graph::new();
+    let x = negative_alpha.input_dtype("x", [], DType::F64);
+    let alpha = negative_alpha.input_dtype("alpha", [], DType::F64);
+    let output = negative_alpha.celu(x, alpha).unwrap();
+    let value = CpuBackend
+        .execute(
+            &negative_alpha,
+            output,
+            &HashMap::from([
+                (
+                    "x".into(),
+                    TensorData::scalar_with_dtype(Scalar::F(-1.0), DType::F64),
+                ),
+                (
+                    "alpha".into(),
+                    TensorData::scalar_with_dtype(Scalar::F(-1.0), DType::F64),
+                ),
+            ]),
+        )
+        .unwrap();
+    close(value.scalar_at(0).as_f64(), 1.0 - std::f64::consts::E, 1e-12);
+
+    let mut broadcast = Graph::new();
+    let x = broadcast.input_dtype("x", [2, 3], DType::F16);
+    let alpha = broadcast.input_dtype("alpha", [1, 3], DType::F32);
+    let output = broadcast.celu(x, alpha).unwrap();
+    assert_eq!(broadcast.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(broadcast.dtype(output).unwrap(), DType::F32);
+    let mut source_common = Graph::new();
+    let x = source_common.input_dtype("x", [], DType::F16);
+    let alpha = source_common.input_dtype("alpha", [], DType::I32);
+    let output = source_common.celu(x, alpha).unwrap();
+    assert_eq!(source_common.dtype(output).unwrap(), DType::F16);
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut narrow = Graph::new();
+        let x = narrow.input_dtype("x", [], dtype);
+        let alpha = narrow.input_dtype("alpha", [], dtype);
+        let output = narrow.celu(x, alpha).unwrap();
+        assert_eq!(narrow.dtype(output).unwrap(), dtype);
+    }
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+    ] {
+        let mut promoted = Graph::new();
+        let x = promoted.input_dtype("x", [], dtype);
+        let alpha = promoted.input_dtype("alpha", [], dtype);
+        let output = promoted.celu(x, alpha).unwrap();
+        assert_eq!(promoted.dtype(output).unwrap(), DType::F32);
+    }
+    let mut wide = Graph::new();
+    let x = wide.input_dtype("x", [], DType::I64);
+    let alpha = wide.input_dtype("alpha", [], DType::U64);
+    let output = wide.celu(x, alpha).unwrap();
+    assert_eq!(wide.dtype(output).unwrap(), DType::F32);
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0], DType::I32);
+    let alpha = empty.input_dtype("alpha", [], DType::F32);
+    let output = empty.celu(x, alpha).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F32);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2, 3]);
+    let alpha = malformed.input("alpha", [2, 2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.celu(x, alpha).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
 fn parameterized_composite_activations_preflight_broadcasts() {
     let mut leaky = Graph::new();
     let input = leaky.input("x", [2, 3]);
