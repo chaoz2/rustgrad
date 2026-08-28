@@ -5295,9 +5295,13 @@ fn reduce_l2_plan(
     })
 }
 
+#[derive(Clone)]
+enum QuantParameterPlan { Keep, Reshape(Shape), Repeat { repeats: isize, axis: isize, shape: Shape } }
+
 struct DequantizeLinearPlan {
-    x: NodeId, scale: NodeId, zero: Option<NodeId>, axis_shape: Option<Shape>,
-    subtract_dtype: DType, multiply_dtype: DType, output_dtype: DType, shape: Shape,
+    x: NodeId, scale: NodeId, zero: Option<NodeId>, scale_plan: QuantParameterPlan,
+    zero_plan: Option<QuantParameterPlan>, subtract_dtype: DType, multiply_dtype: DType,
+    output_dtype: DType, shape: Shape,
 }
 
 fn dequantize_dtype(lhs: DType, rhs: DType) -> DType {
@@ -5307,27 +5311,52 @@ fn dequantize_dtype(lhs: DType, rhs: DType) -> DType {
     if matches!((lhs, rhs), (DType::I32, DType::U64) | (DType::U64, DType::I32)) { DType::F32 } else { lhs.promote(rhs) }
 }
 
-fn dequantize_linear_plan(g: &Graph, inputs: &[NodeId], ins: &[&str], n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<DequantizeLinearPlan> {
-    if !(2..=3).contains(&inputs.len()) || ins.len() != inputs.len() || attrs.keys().any(|x| x != "axis") { return Err(bad("unsupported DequantizeLinear inputs or attributes")); }
-    let axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(1);
-    let x = inputs[0]; let scale = inputs[1]; let zero = inputs.get(2).copied();
-    let shape = g.shape(x)?.clone(); let xd = g.dtype(x)?; let sd = g.dtype(scale)?;
-    if !xd.is_integer() || !sd.is_float() { return Err(bad("DequantizeLinear requires integer X and floating scale")); }
-    if let Some(z) = zero { if g.dtype(z)? != xd || !g.dtype(z)?.is_integer() { return Err(bad("DequantizeLinear zero_point must match X integer dtype")); } }
-    for id in inputs { let s=g.shape(*id)?; s.numel()?.checked_mul(g.dtype(*id)?.itemsize()).ok_or_else(|| bad("DequantizeLinear input byte extent overflow"))?; }
-    let ss = g.shape(scale)?.clone();
-    let axis_shape = if ss.numel()? == 1 { None } else {
-        if ss.rank()!=1 || shape.rank()==0 { return Err(bad("DequantizeLinear scale must be scalar or rank-one")); }
-        let a=if axis<0 { axis.checked_add(shape.rank() as i64).ok_or_else(|| bad("invalid DequantizeLinear axis"))? } else { axis };
-        let a=usize::try_from(a).ok().filter(|a|*a<shape.rank()).ok_or_else(|| bad("invalid DequantizeLinear axis"))?;
-        if ss.dims()[0]!=shape.dims()[a] { return Err(bad("DequantizeLinear per-axis scale cardinality mismatch")); }
-        Some(Shape::new((0..shape.rank()).map(|i|if i==a {ss.dims()[0]} else {1}).collect::<Vec<_>>()))
+fn quant_parameter_plan(g: &Graph, parameter: NodeId, data_shape: &Shape, axis: i64, block_size: i64) -> Result<QuantParameterPlan> {
+    let shape = g.shape(parameter)?.clone();
+    let numel = shape.numel()?;
+    numel.checked_mul(g.dtype(parameter)?.itemsize()).ok_or_else(|| bad("DequantizeLinear parameter byte extent overflow"))?;
+    if numel == 1 { return Ok(QuantParameterPlan::Keep); }
+    let rank = data_shape.rank();
+    let normalized = if axis < 0 { axis.checked_add(i64::try_from(rank).map_err(|_| bad("DequantizeLinear rank overflow"))?).ok_or_else(|| bad("invalid DequantizeLinear axis"))? } else { axis };
+    let axis = usize::try_from(normalized).ok().filter(|axis| *axis < rank).ok_or_else(|| bad("invalid DequantizeLinear axis"))?;
+    let prepared = if block_size == 0 {
+        let target = Shape::new((0..rank).map(|dim| if dim == axis { data_shape.dims()[dim] } else { 1 }).collect::<Vec<_>>());
+        if numel != target.numel()? { return Err(bad("DequantizeLinear per-axis parameter cardinality mismatch")); }
+        QuantParameterPlan::Reshape(target)
+    } else {
+        let repeats = isize::try_from(block_size).map_err(|_| bad("invalid DequantizeLinear block_size"))?;
+        if repeats < 0 || axis >= shape.rank() { return Err(bad("invalid DequantizeLinear blocked parameter")); }
+        let mut dims = shape.dims().to_vec();
+        dims[axis] = dims[axis].checked_mul(usize::try_from(repeats).map_err(|_| bad("invalid DequantizeLinear block_size"))?).ok_or_else(|| bad("DequantizeLinear blocked extent overflow"))?;
+        QuantParameterPlan::Repeat { repeats, axis: axis as isize, shape: Shape::new(dims) }
     };
-    if let Some(z)=zero { let zs=g.shape(z)?; if zs.numel()? != 1 && (axis_shape.as_ref().is_none_or(|s| zs != s)) { return Err(bad("DequantizeLinear zero_point shape mismatch")); } }
+    let prepared_shape = match &prepared { QuantParameterPlan::Keep => shape, QuantParameterPlan::Reshape(s) => s.clone(), QuantParameterPlan::Repeat { shape, .. } => shape.clone() };
+    prepared_shape.numel()?.checked_mul(g.dtype(parameter)?.itemsize()).ok_or_else(|| bad("DequantizeLinear prepared parameter byte extent overflow"))?;
+    if prepared_shape.broadcast_with(data_shape)? != data_shape.clone() { return Err(bad("DequantizeLinear parameter cannot broadcast to X")); }
+    Ok(prepared)
+}
+
+fn dequantize_linear_plan(g: &Graph, inputs: &[NodeId], ins: &[&str], n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<DequantizeLinearPlan> {
+    if !(2..=3).contains(&inputs.len()) || ins.len() != inputs.len() || attrs.keys().any(|x| x != "axis" && x != "block_size") { return Err(bad("unsupported DequantizeLinear inputs or attributes")); }
+    let axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(1);
+    let block_size = strict_typed_scalar_i64_attr(n, "block_size")?.unwrap_or(0);
+    let x = inputs[0]; let scale = inputs[1]; let zero = inputs.get(2).copied();
+    let shape = g.shape(x)?.clone(); let sd = g.dtype(scale)?;
+    for id in inputs { let s=g.shape(*id)?; s.numel()?.checked_mul(g.dtype(*id)?.itemsize()).ok_or_else(|| bad("DequantizeLinear input byte extent overflow"))?; }
+    let scale_plan = quant_parameter_plan(g, scale, &shape, axis, block_size)?;
+    let zero_plan = zero.map(|z| quant_parameter_plan(g, z, &shape, axis, block_size)).transpose()?;
     let subtract_dtype=dequantize_dtype(DType::I32, zero.map(|z|g.dtype(z)).transpose()?.unwrap_or(DType::I32));
     let multiply_dtype=dequantize_dtype(subtract_dtype, sd);
     for (s,d) in [(&shape,DType::I32),(&shape,subtract_dtype),(&shape,multiply_dtype),(&shape,sd)] { s.numel()?.checked_mul(d.itemsize()).ok_or_else(|| bad("DequantizeLinear output byte extent overflow"))?; }
-    Ok(DequantizeLinearPlan{x,scale,zero,axis_shape,subtract_dtype,multiply_dtype,output_dtype:sd,shape})
+    Ok(DequantizeLinearPlan{x,scale,zero,scale_plan,zero_plan,subtract_dtype,multiply_dtype,output_dtype:sd,shape})
+}
+
+fn emit_quant_parameter(g: &mut Graph, parameter: NodeId, plan: QuantParameterPlan) -> Result<NodeId> {
+    match plan {
+        QuantParameterPlan::Keep => Ok(parameter),
+        QuantParameterPlan::Reshape(shape) => g.reshape(parameter, shape),
+        QuantParameterPlan::Repeat { repeats, axis, .. } => g.repeat_interleave(parameter, repeats, Some(axis)),
+    }
 }
 
 pub(super) fn lower(
@@ -8122,18 +8151,19 @@ pub(super) fn lower(
         "DequantizeLinear" if (2..=3).contains(&ins.len()) => {
             let inputs = (0..ins.len()).map(|i| get(i)).collect::<Result<Vec<_>>>()?;
             let plan = dequantize_linear_plan(g, &inputs, &ins, &n, &attrs)?;
+            let DequantizeLinearPlan { x: plan_x, scale: plan_scale, zero: plan_zero, scale_plan, zero_plan, subtract_dtype, multiply_dtype, output_dtype, shape } = plan;
             let cast = |g: &mut Graph, id: NodeId, dtype: DType| -> Result<NodeId> { if g.dtype(id)? == dtype { Ok(id) } else { g.cast(id, dtype) } };
-            let scale = if let Some(shape) = plan.axis_shape.clone() { g.reshape(plan.scale, shape)? } else { plan.scale };
-            let zero = match plan.zero { Some(z) => if let Some(shape)=plan.axis_shape { if g.shape(z)?.numel()? == 1 { z } else { g.reshape(z, shape)? } } else { z }, None => g.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32)) };
-            let x = cast(g, plan.x, DType::I32)?;
-            let x = cast(g, x, plan.subtract_dtype)?;
-            let zero = cast(g, zero, plan.subtract_dtype)?;
+            let scale = emit_quant_parameter(g, plan_scale, scale_plan)?;
+            let zero = match (plan_zero, zero_plan) { (Some(z), Some(parameter_plan)) => emit_quant_parameter(g, z, parameter_plan)?, (None, None) => g.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32)), _ => unreachable!("DequantizeLinear plan pairs zero with its preparation") };
+            let x = cast(g, plan_x, DType::I32)?;
+            let x = cast(g, x, subtract_dtype)?;
+            let zero = cast(g, zero, subtract_dtype)?;
             let difference = g.sub(x, zero)?;
-            let difference = cast(g, difference, plan.multiply_dtype)?;
-            let scale = cast(g, scale, plan.multiply_dtype)?;
+            let difference = cast(g, difference, multiply_dtype)?;
+            let scale = cast(g, scale, multiply_dtype)?;
             let output = g.mul(difference, scale)?;
-            let output = cast(g, output, plan.output_dtype)?;
-            debug_assert_eq!(g.shape(output).expect("DequantizeLinear shape preflighted"), &plan.shape);
+            let output = cast(g, output, output_dtype)?;
+            debug_assert_eq!(g.shape(output).expect("DequantizeLinear shape preflighted"), &shape);
             output
         }
         "Conv" if ins.len() == 2 || ins.len() == 3 => {

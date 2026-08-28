@@ -76,9 +76,24 @@ fn dequantize_linear_opset13_preflights_source_order_and_failures() {
     assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 3, 1]);
     assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
 
+    // tinygrad prepares each live blocked parameter independently. The
+    // source accepts parameter ranks wider than one when repeat_interleave
+    // can expand their axis to X's broadcast shape.
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 4], DType::F32);
+    let scale = graph.input_dtype("scale", [1, 2], DType::I16);
+    let zero = graph.input_dtype("zero", [1, 2], DType::U64);
+    let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale), ("zero".into(), zero)]);
+    let mut n = node("DequantizeLinear", &["x", "scale", "zero"], "out");
+    field(&mut n, 5, &typed_int_attr("axis", 1));
+    field(&mut n, 5, &typed_int_attr("block_size", 2));
+    lower(&mut graph, Msg::new(&n), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 4]);
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::I16);
+
     for bad_node in [
         node("DequantizeLinear", &["x"], "out"),
-        { let mut n=node("DequantizeLinear", &["x", "scale"], "out"); field(&mut n, 5, &typed_int_attr("block_size", 2)); n },
+        { let mut n=node("DequantizeLinear", &["x", "scale"], "out"); field(&mut n, 5, &typed_int_attr("block_size", -1)); n },
         { let mut n=node("DequantizeLinear", &["x", "scale"], "out"); field(&mut n, 5, &typed_int_attr("axis", 9)); n },
     ] {
         let mut graph=Graph::new(); let x=graph.input_dtype("x", [1, 2], DType::U8); let scale=graph.input_dtype("scale", [3], DType::F32);
