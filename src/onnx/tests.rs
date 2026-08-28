@@ -358,6 +358,16 @@ fn mod_uses_typed_fmod_selector_and_constant_zero_preflight() {
         lower(&mut graph, Msg::new(&modu(&attrs)), &mut values, &mut BTreeMap::new()).unwrap();
         assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 2]);
     }
+    // `_broadcasted` commits the otherwise-ambiguous I64/U64 pair to the
+    // default F32 dtype for both Python-mod and C-style fmod paths.
+    for attrs in [Vec::new(), vec![typed_int_attr("fmod", -1)]] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1], DType::I64);
+        let y = graph.input_dtype("y", [], DType::U64);
+        let mut values = BTreeMap::from([("x".into(), x), ("y".into(), y)]);
+        lower(&mut graph, Msg::new(&modu(&attrs)), &mut values, &mut BTreeMap::new()).unwrap();
+        assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+    }
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [1], DType::I32);
     let y = graph.input_dtype("y", [1], DType::I32);

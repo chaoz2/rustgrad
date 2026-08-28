@@ -1359,7 +1359,11 @@ fn mod_plan(
     let rhs_dtype = g.dtype(rhs)?;
     lhs_shape.numel()?.checked_mul(lhs_dtype.itemsize()).ok_or_else(|| bad("Mod lhs byte extent overflow"))?;
     rhs_shape.numel()?.checked_mul(rhs_dtype.itemsize()).ok_or_else(|| bad("Mod rhs byte extent overflow"))?;
-    let dtype = lhs_dtype.promote(rhs_dtype);
+    // Tensor.mod/fmod first use `_broadcasted`, whose I64/U64 meet is
+    // tinygrad's default F32 rather than RustGrad's generic F64 fallback.
+    // Keep the import plan's descriptor and byte checks aligned with the
+    // source casts that Graph::modulo/fmod will emit.
+    let dtype = prelu_dtype(lhs_dtype, rhs_dtype);
     let shape = lhs_shape.broadcast_with(&rhs_shape)?;
     shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad("Mod output byte extent overflow"))?;
     if dtype.is_integer() {
