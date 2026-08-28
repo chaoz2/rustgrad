@@ -400,6 +400,15 @@ fn swish_uses_typed_exp2_reciprocal_path_and_preflights() {
         assert_eq!(malformed.node_count(), before);
         assert!(!values.contains_key("out"));
     }
+    // The I8 source extent fits, but Swish's required F32 work tensors do
+    // not. This must fail before the first cast or scalar constant.
+    let mut overflow = Graph::new();
+    let x = overflow.input_dtype("x", [usize::MAX], DType::I8);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&swish(&[])), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(overflow.node_count(), before);
+    assert!(!values.contains_key("out"));
 }
 
 #[test]

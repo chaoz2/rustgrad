@@ -1654,13 +1654,23 @@ fn swish_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Ve
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Swish input byte extent overflow"))?;
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape.numel()?.checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Swish {what} byte extent overflow"))).map(|_| ())
+    };
+    extent(&shape, input_dtype, "input")?;
     let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Swish output byte extent overflow"))?;
+    // The source is `x * (x * alpha).sigmoid()`: after its nonfloat cast,
+    // each named elementwise sigmoid stage has the same output descriptor.
+    // Resolve them all before any cast or constant is published.
+    for what in ["cast/work", "inner multiply", "sigmoid exponent", "Exp2", "sigmoid denominator", "reciprocal", "outer multiply/output"] {
+        extent(&shape, output_dtype, what)?;
+    }
     let alpha = TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), output_dtype);
     let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
     let neg_inv_ln2 = TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), output_dtype);
     for scalar in [&alpha, &one, &neg_inv_ln2] {
+        extent(scalar.shape(), scalar.dtype(), "scalar")?;
         if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape { return Err(bad("Swish scalar promotion mismatch")); }
     }
     if output_dtype.promote(output_dtype) != output_dtype { return Err(bad("Swish output promotion mismatch")); }
