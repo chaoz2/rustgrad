@@ -2308,6 +2308,66 @@ struct FlattenPlan {
     identity: bool,
 }
 
+/// Fully resolved tinygrad ONNX Transpose descriptor.  The adapter uses
+/// `perm or reversed(range(rank))`, so an explicitly empty INTS attribute has
+/// the same source meaning as an omitted permutation.
+struct TransposePlan {
+    axes: Vec<usize>,
+    output_shape: Shape,
+    dtype: DType,
+    identity: bool,
+}
+
+fn transpose_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<TransposePlan> {
+    if ins.len() != 1 || attrs.keys().any(|name| name != "perm") {
+        return Err(bad("Transpose requires one input and only perm"));
+    }
+    let source_shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    source_shape.numel()?;
+    source_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Transpose input byte extent overflow"))?;
+    let raw_axes = strict_typed_packed_i64_attr(n, "perm")?;
+    let raw_axes = raw_axes.filter(|axes| !axes.is_empty()).unwrap_or_else(|| {
+        (0..source_shape.rank())
+            .rev()
+            .map(|axis| axis as i64)
+            .collect()
+    });
+    if raw_axes.len() != source_shape.rank() {
+        return Err(bad("Transpose permutation must match input rank"));
+    }
+    let axes = axes_usize(&raw_axes, source_shape.rank())?;
+    let mut sorted = axes.clone();
+    sorted.sort_unstable();
+    if sorted != (0..source_shape.rank()).collect::<Vec<_>>() {
+        return Err(bad("invalid Transpose permutation"));
+    }
+    let output_shape = Shape::new(
+        axes.iter()
+            .map(|&axis| source_shape.dims()[axis])
+            .collect::<Vec<_>>(),
+    );
+    output_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Transpose output byte extent overflow"))?;
+    Ok(TransposePlan {
+        identity: axes.iter().copied().eq(0..source_shape.rank()),
+        axes,
+        output_shape,
+        dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -4503,16 +4563,22 @@ pub(super) fn lower(
             output
         }
         "Transpose" if ins.len() == 1 => {
-            if attrs.keys().any(|name| name != "perm") {
-                return Err(bad("unsupported Transpose attribute"));
-            }
-            let rank = g.shape(get(0)?)?.rank();
-            let axes = attrs
-                .get("perm")
-                .map(|x| packed_i64(x))
-                .transpose()?
-                .unwrap_or_else(|| (0..rank).rev().map(|x| x as i64).collect());
-            g.permute(get(0)?, axes_usize(&axes, rank)?)?
+            let x = get(0)?;
+            let plan = transpose_plan(g, x, &ins, &n, &attrs)?;
+            let output = if plan.identity {
+                x
+            } else {
+                g.permute(x, plan.axes)?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("Transpose shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Transpose dtype preflighted"),
+                plan.dtype
+            );
+            output
         }
         "Flatten" if ins.len() == 1 => {
             let x = get(0)?;

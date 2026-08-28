@@ -1230,7 +1230,7 @@ fn reshape_matches_tinygrad_allowzero_and_static_inference() {
 }
 
 #[test]
-fn transpose_preflights_closed_attributes_and_permutation_before_publication() {
+fn transpose_matches_tinygrad_defaults_identity_and_preflights() {
     let mut g = Graph::new();
     let x = g.input("x", [2, 3]);
     let mut values = BTreeMap::from([("x".into(), x)]);
@@ -1238,8 +1238,9 @@ fn transpose_preflights_closed_attributes_and_permutation_before_publication() {
     let before_nodes = g.node_count();
 
     for (case, attribute) in [
-        ("unknown", int_attr("axis", 0)),
-        ("duplicate", ints_attr("perm", &[0, 0])),
+        ("unknown", typed_int_attr("axis", 0)),
+        ("untyped", ints_attr("perm", &[1, 0])),
+        ("duplicate", typed_ints_attr("perm", &[0, 0])),
     ] {
         let mut invalid = node("Transpose", &["x"], "out");
         field(&mut invalid, 5, &attribute);
@@ -1252,7 +1253,7 @@ fn transpose_preflights_closed_attributes_and_permutation_before_publication() {
     }
 
     let mut valid = node("Transpose", &["x"], "valid");
-    field(&mut valid, 5, &ints_attr("perm", &[1, 0]));
+    field(&mut valid, 5, &typed_ints_attr("perm", &[-1, 0]));
     lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
     let output = CpuBackend
         .execute(
@@ -1266,6 +1267,51 @@ fn transpose_preflights_closed_attributes_and_permutation_before_publication() {
         .unwrap();
     assert_eq!(output.shape().dims(), &[3, 2]);
     assert_eq!(output.values(), &[1., 4., 2., 5., 3., 6.]);
+
+    let mut identity = Graph::new();
+    let x = identity.input_dtype_requires_grad("x", [2, 3], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut encoded = node("Transpose", &["x"], "out");
+    field(&mut encoded, 5, &typed_ints_attr("perm", &[0, 1]));
+    let before_nodes = identity.node_count();
+    lower(
+        &mut identity,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(values["out"], x);
+    assert_eq!(identity.node_count(), before_nodes);
+    assert!(identity.grad(values["out"], x).is_ok());
+
+    let mut empty_perm = Graph::new();
+    let x = empty_perm.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut encoded = node("Transpose", &["x"], "out");
+    field(&mut encoded, 5, &typed_ints_attr("perm", &[]));
+    lower(
+        &mut empty_perm,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(empty_perm.shape(values["out"]).unwrap().dims(), &[3, 2]);
+
+    let mut scalar = Graph::new();
+    let x = scalar.input("x", []);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_nodes = scalar.node_count();
+    lower(
+        &mut scalar,
+        Msg::new(&node("Transpose", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(values["out"], x);
+    assert_eq!(scalar.node_count(), before_nodes);
 }
 
 #[test]
