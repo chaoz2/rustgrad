@@ -75,6 +75,17 @@ struct ArgmaxPlan {
     empty: bool,
 }
 
+enum ArgminInverse {
+    Negate,
+    LogicalNot,
+    BitwiseNot(TensorData),
+}
+
+struct ArgminPlan {
+    argmax: ArgmaxPlan,
+    inverse: ArgminInverse,
+}
+
 fn max_reduction_identity(dtype: DType) -> Scalar {
     match dtype {
         DType::Bool => Scalar::Bool(false),
@@ -472,6 +483,50 @@ fn argmax_plan(
     })
 }
 
+fn argmin_plan(
+    input: NodeId,
+    shape: &Shape,
+    dtype: DType,
+    axis: Option<isize>,
+    keepdim: bool,
+) -> Result<ArgminPlan> {
+    // Tensor.argmin is literally `self._inverse().argmax(...)`: floats are
+    // negated, while Bool and integral storage are bitwise-inverted. Plan the
+    // inversion before returning the ArgMax construction plan so the later
+    // primitive sequence cannot expose a partial graph.
+    let argmax = argmax_plan(input, shape, dtype, axis, keepdim)?;
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let inverse = if dtype.is_float() {
+        ArgminInverse::Negate
+    } else if dtype == DType::Bool {
+        ArgminInverse::LogicalNot
+    } else {
+        let inverse = match dtype {
+            DType::U8 => Scalar::U(u64::from(u8::MAX)),
+            DType::U16 => Scalar::U(u64::from(u16::MAX)),
+            DType::U32 => Scalar::U(u64::from(u32::MAX)),
+            DType::U64 => Scalar::U(u64::MAX),
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(-1),
+            DType::Bool | DType::F16 | DType::BF16 | DType::F32 | DType::F64 => unreachable!(),
+        };
+        let inverse = TensorData::scalar_with_dtype(inverse, dtype);
+        if inverse.dtype() != dtype
+            || shape.broadcast_with(inverse.shape())? != *shape
+            || dtype.promote(inverse.dtype()) != dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "argmin inverse promotion",
+                actual: dtype,
+            });
+        }
+        ArgminInverse::BitwiseNot(inverse)
+    };
+    Ok(ArgminPlan { argmax, inverse })
+}
+
 fn mean_plan(
     input: NodeId,
     shape: &Shape,
@@ -850,6 +905,59 @@ impl Graph {
         };
         debug_assert_eq!(self.shape(output).expect("argmax preflighted"), &plan.output_shape);
         debug_assert_eq!(self.dtype(output).expect("argmax preflighted"), DType::I32);
+        Ok(output)
+    }
+
+    /// Source-faithful public tinygrad-style ArgMin.
+    ///
+    /// tinygrad defines this as `inverse(input).argmax(...)`: floats negate,
+    /// Bool logically negates, and integer storage is bitwise-inverted before
+    /// the first-tie ArgMax path. `None` flattens and ignores `keepdim`.
+    /// The legacy [`Self::argmin`] remains the raw ArgReduce API.
+    pub fn argmin_with_axis(
+        &mut self,
+        input: NodeId,
+        axis: Option<isize>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let input_node = self.node(input)?;
+            (input_node.shape.clone(), input_node.dtype)
+        };
+        let plan = argmin_plan(input, &shape, dtype, axis, keepdim)?;
+        let output = if plan.argmax.empty {
+            self.full_with_dtype(
+                plan.argmax.output_shape.clone(),
+                Scalar::I(i32::MIN.into()),
+                DType::I32,
+            )?
+        } else {
+            let inverse = match plan.inverse {
+                ArgminInverse::Negate => self.neg(input)?,
+                ArgminInverse::LogicalNot => self.logical_not(input)?,
+                ArgminInverse::BitwiseNot(value) => {
+                    let value = self.constant(value);
+                    self.bit_xor(input, value)?
+                }
+            };
+            let source = if plan.argmax.flatten {
+                self.reshape(inverse, plan.argmax.work_shape.clone())?
+            } else {
+                inverse
+            };
+            let indices = self.argmax(source, Some(plan.argmax.axis), plan.argmax.keepdim)?;
+            let first = self.shrink(source, plan.argmax.first_bounds)?;
+            let first = if plan.argmax.keepdim {
+                first
+            } else {
+                self.squeeze(first, Some(plan.argmax.axis))?
+            };
+            let leading_nan = self.isnan(first)?;
+            let sentinel = self.constant(plan.argmax.sentinel);
+            self.select(leading_nan, sentinel, indices)?
+        };
+        debug_assert_eq!(self.shape(output).expect("argmin preflighted"), &plan.argmax.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("argmin preflighted"), DType::I32);
         Ok(output)
     }
 
@@ -1602,6 +1710,144 @@ mod tests {
         let nodes = malformed.node_count();
         assert!(malformed.argmax_with_axis(input, Some(-3), false).is_err());
         assert_eq!(malformed.node_count(), nodes);
+    }
+
+    #[test]
+    fn argmin_with_axis_uses_tinygrad_inverse_and_argmax_sentinels() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3, 3], DType::F64);
+        let output = graph.argmin_with_axis(input, Some(-1), false).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::from_scalars(
+                [3, 3],
+                DType::F64,
+                [
+                    Scalar::F(f64::NAN), Scalar::F(2.0), Scalar::F(-3.0),
+                    Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(1.0),
+                    Scalar::F(3.0), Scalar::F(f64::NAN), Scalar::F(-1.0),
+                ],
+            )
+            .unwrap(),
+        )]);
+        let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+        assert_eq!(values.to_vec_f64(), vec![3., 0., 2.]);
+        assert!(matches!(graph.grad(output, input), Err(Error::NoGradient(_))));
+
+        let mut flattened = Graph::new();
+        let input = flattened.input("input", [2, 2]);
+        let output = flattened.argmin_with_axis(input, None, true).unwrap();
+        assert_eq!(flattened.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(flattened.dtype(output).unwrap(), DType::I32);
+        let values = CpuBackend
+            .execute(
+                &flattened,
+                output,
+                &HashMap::from([("input".into(), data([2, 2], &[1., -4., -4., 0.]))]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![1.]);
+
+        let mut scalar = Graph::new();
+        let input = scalar.input("input", []);
+        let output = scalar.argmin_with_axis(input, None, false).unwrap();
+        assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(scalar.dtype(output).unwrap(), DType::I32);
+        let values = CpuBackend
+            .execute(
+                &scalar,
+                output,
+                &HashMap::from([("input".into(), data([], &[7.]))]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![0.]);
+
+        let mut boolean = Graph::new();
+        let input = boolean.input_dtype("input", [2], DType::Bool);
+        let output = boolean.argmin_with_axis(input, Some(0), false).unwrap();
+        let values = CpuBackend
+            .execute(
+                &boolean,
+                output,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![1.]);
+
+        let mut integer = Graph::new();
+        let input = integer.input_dtype("input", [2], DType::I64);
+        let output = integer.argmin_with_axis(input, Some(0), false).unwrap();
+        let values = CpuBackend
+            .execute(
+                &integer,
+                output,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::I64,
+                        [Scalar::I(i64::MIN), Scalar::I(-1)],
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![0.]);
+
+        let mut unsigned = Graph::new();
+        let input = unsigned.input_dtype("input", [2], DType::U64);
+        let output = unsigned.argmin_with_axis(input, Some(0), false).unwrap();
+        let values = CpuBackend
+            .execute(
+                &unsigned,
+                output,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::U64,
+                        [Scalar::U(1_u64 << 53), Scalar::U((1_u64 << 53) + 1)],
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![0.]);
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [2, 0]);
+        let output = empty.argmin_with_axis(input, Some(1), false).unwrap();
+        let values = CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), data([2, 0], &[]))]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![i32::MIN as f64; 2]);
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 2]);
+        let nodes = malformed.node_count();
+        assert!(malformed.argmin_with_axis(input, Some(-3), false).is_err());
+        assert_eq!(malformed.node_count(), nodes);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [usize::MAX, 2]);
+        let nodes = overflow.node_count();
+        assert!(matches!(
+            overflow.argmin_with_axis(input, None, false),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), nodes);
     }
 
     #[test]
