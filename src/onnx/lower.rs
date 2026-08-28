@@ -449,6 +449,42 @@ struct GlobalAveragePoolPlan {
 
 struct SoftplusPlan { input_dtype: DType, output_dtype: DType, shape: Shape, zero: TensorData, empty: bool }
 
+/// Source-level plan for `Tensor.softsign()`. Its `abs` is not RustGrad's
+/// hardware-style UnaryOp::Abs: tinygrad spells it `x * x.sign()`, preserving
+/// negative zero and signed-integer wrapping before reciprocal-based true
+/// division promotes exact storage to F32.
+struct SoftsignPlan {
+    input_dtype: DType,
+    output_dtype: DType,
+    shape: Shape,
+    one: TensorData,
+    empty: bool,
+}
+
+fn softsign_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SoftsignPlan> {
+    if !attrs.is_empty() { return Err(bad("unsupported Softsign attribute")); }
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Softsign input byte extent overflow"))?;
+
+    // `1 + x.abs()` stays at X's concrete storage dtype. Tensor.div then
+    // lowers literally to `x * reciprocal(denominator)`, so exact storage
+    // becomes F32 only at reciprocal for Bool/integer inputs.
+    let reciprocal_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let output_dtype = input_dtype.promote(reciprocal_dtype);
+    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Softsign output byte extent overflow"))?;
+    let one = TensorData::scalar_with_dtype(Scalar::I(1), input_dtype);
+    if one.dtype() != input_dtype
+        || shape.broadcast_with(one.shape())? != shape
+        || input_dtype.promote(input_dtype) != input_dtype
+        || input_dtype.promote(reciprocal_dtype) != output_dtype
+    {
+        return Err(bad("Softsign scalar promotion mismatch"));
+    }
+    Ok(SoftsignPlan { input_dtype, output_dtype, shape, one, empty: numel == 0 })
+}
+
 fn softplus_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SoftplusPlan> {
     if !attrs.is_empty() { return Err(bad("unsupported Softplus attribute")); }
     let shape = g.shape(input)?.clone();
@@ -2016,6 +2052,25 @@ pub(super) fn lower(
                 let output = g.logaddexp(x, g.constant(plan.zero))?;
                 debug_assert_eq!(g.shape(output).expect("Softplus shape preflighted"), &plan.shape);
                 debug_assert_eq!(g.dtype(output).expect("Softplus dtype preflighted"), plan.output_dtype);
+                output
+            }
+        }
+        "Softsign" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = softsign_plan(g, input, &attrs)?;
+            if plan.empty {
+                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+            } else {
+                let one = g.constant(plan.one);
+                // Keep tinygrad's literal `x / (1 + x.abs())` decomposition:
+                // abs is `x * sign(x)` and true division is reciprocal then
+                // multiply. Unary Abs and Graph::softsign erase those
+                // source-visible storage and signed-zero boundaries.
+                let absolute = g.mul(input, g.sign(input)?)?;
+                let denominator = g.add(one, absolute)?;
+                let output = g.mul(input, g.reciprocal(denominator)?)?;
+                debug_assert_eq!(g.shape(output).expect("Softsign shape preflighted"), &plan.shape);
+                debug_assert_eq!(g.dtype(output).expect("Softsign dtype preflighted"), plan.output_dtype);
                 output
             }
         }
