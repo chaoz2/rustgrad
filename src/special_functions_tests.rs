@@ -656,6 +656,87 @@ fn tanh_uses_typed_doubled_sigmoid_composition_and_preflights() {
 }
 
 #[test]
+fn softplus_uses_live_beta_stable_logaddexp_and_typed_reciprocal() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [5], DType::F64);
+    let beta = graph.input_dtype("beta", [], DType::F64);
+    let output = graph.softplus(input, beta).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([
+        (
+            "x".into(),
+            TensorData::from_scalars(
+                [5],
+                DType::F64,
+                [
+                    Scalar::F(f64::NEG_INFINITY),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(f64::INFINITY),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "beta".into(),
+            TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F64),
+        ),
+    ]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
+    close(values.scalar_at(1).as_f64(), std::f64::consts::LN_2, 1e-12);
+    close(values.scalar_at(2).as_f64(), std::f64::consts::LN_2, 1e-12);
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    assert_eq!(values.scalar_at(4).as_f64(), f64::INFINITY);
+    let gradient = CpuBackend
+        .execute(&graph, input_gradient, &bindings)
+        .unwrap()
+        .to_vec_f64();
+    close(gradient[1], 0.5, 1e-12);
+    close(gradient[2], 0.5, 1e-12);
+
+    let mut zero_beta = Graph::new();
+    let x = zero_beta.input_dtype("x", [], DType::F64);
+    let beta = zero_beta.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), DType::F64));
+    let output = zero_beta.softplus(x, beta).unwrap();
+    let value = CpuBackend
+        .execute(
+            &zero_beta,
+            output,
+            &HashMap::from([(
+                "x".into(),
+                TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F64),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(value.scalar_at(0).as_f64(), f64::INFINITY);
+
+    let mut broadcast = Graph::new();
+    let x = broadcast.input_dtype("x", [2, 3], DType::F16);
+    let beta = broadcast.input_dtype("beta", [1, 3], DType::F32);
+    let output = broadcast.softplus(x, beta).unwrap();
+    assert_eq!(broadcast.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(broadcast.dtype(output).unwrap(), DType::F32);
+
+    let mut nonfloat = Graph::new();
+    let x = nonfloat.input_dtype("x", [0], DType::I32);
+    let beta = nonfloat.input_dtype("beta", [], DType::I32);
+    let output = nonfloat.softplus(x, beta).unwrap();
+    assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
+    assert_eq!(nonfloat.shape(output).unwrap(), &Shape::new([0]));
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2, 3]);
+    let beta = malformed.input("beta", [2, 2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.softplus(x, beta).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
 fn parameterized_composite_activations_preflight_broadcasts() {
     let mut leaky = Graph::new();
     let input = leaky.input("x", [2, 3]);

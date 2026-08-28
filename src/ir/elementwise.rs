@@ -735,12 +735,110 @@ impl Graph {
         self.mul(gamma, branch)
     }
     pub fn softplus(&mut self, input: NodeId, beta: NodeId) -> Result<NodeId> {
-        self.broadcast_shape(input, beta)?;
-        let scaled = self.mul(input, beta)?;
-        let zero = self.constant(TensorData::scalar(0.0f32));
-        let logged = self.logaddexp(scaled, zero)?;
-        let one = self.constant(TensorData::scalar(1.0f32));
-        let inverse_beta = self.div(one, beta)?;
+        // tinygrad spells softplus as `(1 / beta) * (x * beta).logaddexp(0)`.
+        // Its zero and one are weak constants at their receiving operation's
+        // storage width; true division is reciprocal followed by multiply.
+        // Validate the entire stable composition before appending a cast,
+        // constant, or node.
+        let input_node = self.node(input)?;
+        let beta_node = self.node(beta)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let beta_shape = beta_node.shape.clone();
+        let beta_dtype = beta_node.dtype;
+        let source_promote = |lhs: DType, rhs: DType| {
+            if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+                DType::F32
+            } else {
+                lhs.promote(rhs)
+            }
+        };
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&input_shape, input_dtype)?;
+        extent(&beta_shape, beta_dtype)?;
+        let scaled_shape = input_shape.broadcast_with(&beta_shape)?;
+        let scaled_dtype = source_promote(input_dtype, beta_dtype);
+        // A weak floating zero retains a floating scaled dtype, but lifts an
+        // exact scaled value to tinygrad's default F32 width.
+        let log_dtype = if scaled_dtype.is_float() {
+            scaled_dtype
+        } else {
+            DType::F32
+        };
+        // `1 / beta` uses the same source policy: reciprocal arithmetic is
+        // float for exact beta storage and otherwise retains beta's width.
+        let inverse_dtype = if beta_dtype.is_float() {
+            beta_dtype
+        } else {
+            DType::F32
+        };
+        let output_shape = scaled_shape.broadcast_with(&beta_shape)?;
+        let output_dtype = source_promote(log_dtype, inverse_dtype);
+        for (shape, dtype) in [
+            (&scaled_shape, scaled_dtype),
+            (&scaled_shape, log_dtype),
+            (&beta_shape, inverse_dtype),
+            (&output_shape, output_dtype),
+        ] {
+            extent(shape, dtype)?;
+        }
+        let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), log_dtype);
+        let one = TensorData::scalar_with_dtype(Scalar::F(1.0), inverse_dtype);
+        if zero.dtype() != log_dtype
+            || one.dtype() != inverse_dtype
+            || scaled_shape.broadcast_with(zero.shape())? != scaled_shape
+            || beta_shape.broadcast_with(one.shape())? != beta_shape
+            || source_promote(log_dtype, zero.dtype()) != log_dtype
+            || source_promote(inverse_dtype, one.dtype()) != inverse_dtype
+            || unary_dtype(UnaryOp::Reciprocal, inverse_dtype) != inverse_dtype
+            || output_shape != scaled_shape
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "softplus scalar promotion",
+                actual: output_dtype,
+            });
+        }
+
+        let scaled_input = if input_dtype == scaled_dtype {
+            input
+        } else {
+            self.cast(input, scaled_dtype)?
+        };
+        let scaled_beta = if beta_dtype == scaled_dtype {
+            beta
+        } else {
+            self.cast(beta, scaled_dtype)?
+        };
+        let scaled = self.mul(scaled_input, scaled_beta)?;
+        let logged_input = if scaled_dtype == log_dtype {
+            scaled
+        } else {
+            self.cast(scaled, log_dtype)?
+        };
+        let zero = self.constant(zero);
+        let logged = self.logaddexp(logged_input, zero)?;
+        let inverse_beta_input = if beta_dtype == inverse_dtype {
+            beta
+        } else {
+            self.cast(beta, inverse_dtype)?
+        };
+        let one = self.constant(one);
+        let inverse_beta = self.mul(one, self.reciprocal(inverse_beta_input)?)?;
+        let logged = if log_dtype == output_dtype {
+            logged
+        } else {
+            self.cast(logged, output_dtype)?
+        };
+        let inverse_beta = if inverse_dtype == output_dtype {
+            inverse_beta
+        } else {
+            self.cast(inverse_beta, output_dtype)?
+        };
         self.mul(inverse_beta, logged)
     }
     pub fn mish(&mut self, input: NodeId) -> Result<NodeId> {
