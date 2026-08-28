@@ -2,7 +2,7 @@
 use crate::{
     DType, Error, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
 };
-use crate::ir::{logsigmoid_plan, source_lub, source_weak_scalar_dtype};
+use crate::ir::{logsigmoid_plan, one_hot_plan, source_lub, source_weak_scalar_dtype};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reduction {
@@ -89,7 +89,11 @@ fn sparse_categorical_cross_entropy_plan(
     if target_node.shape != target_shape {
         return Err(invalid("target shape must equal logits without final class axis"));
     }
-    i64::try_from(classes).map_err(|_| invalid("class count exceeds one-hot range"))?;
+    // Reuse the exact lazy default-I32/I64-upgrade descriptor that backs
+    // Graph::one_hot. This replaces the stale eager-I64 class-range sidecar
+    // and proves every input/range/compare/Select byte extent before
+    // LogSoftmax or any loss-local constant can publish.
+    one_hot_plan(graph, target, classes)?;
 
     // `log_softmax` promotes exact inputs to F32, but preserves every floating
     // storage width. These are the widths subsequently observed by tinygrad's
@@ -109,7 +113,6 @@ fn sparse_categorical_cross_entropy_plan(
     extent(&logits_node.shape, logits_node.dtype)?;
     extent(&target_shape, target_node.dtype)?;
     extent(&logits_node.shape, log_dtype)?;
-    extent(&Shape::new([classes]), DType::I64)?; // one-hot class arange
     extent(&logits_node.shape, DType::I32)?; // one-hot/select output
     extent(&target_shape, DType::Bool)?;
     extent(&target_shape, log_dtype)?;
@@ -682,90 +685,116 @@ pub fn sparse_categorical_cross_entropy(
     masked_reduce(graph, loss, mask, options.reduction)
 }
 
-/// Literal tinygrad `Tensor.sparse_categorical_crossentropy` lowering.
-///
-/// The source always uses the final logits axis as classes, treats `-1` as a
-/// disabled ignore-mask sentinel, and evaluates the smoothing branch even
-/// when its scalar is zero.  Keeping that latter branch is observable for
-/// empty class axes and NaN payloads.
+impl Graph {
+    /// Literal tinygrad `Tensor.sparse_categorical_crossentropy` lowering.
+    ///
+    /// The source always uses the final logits axis as classes, treats `-1`
+    /// as a disabled ignore-mask sentinel, and evaluates the smoothing branch
+    /// even when its scalar is zero. That latter branch is observable for
+    /// empty class axes and NaN payloads.
+    pub fn sparse_categorical_crossentropy(
+        &mut self,
+        logits: NodeId,
+        target: NodeId,
+        options: SparseCategoricalCrossEntropyOptions,
+    ) -> Result<NodeId> {
+        let plan = sparse_categorical_cross_entropy_plan(self, logits, target, options)?;
+
+        // `Graph::log_softmax`, `one_hot`, `mean_with_axes`, and
+        // `reduce_with_dtypes` each carry their own pure descriptor plans. The
+        // enclosing plan above proves their cross-operation shapes, widths,
+        // and scalar promotion contract before this first mutation.
+        let logp = self.log_softmax(logits, -1, None)?;
+        debug_assert_eq!(self.shape(logp).expect("sparse CE preflighted"), &plan.logits_shape);
+        debug_assert_eq!(self.dtype(logp).expect("sparse CE preflighted"), plan.log_dtype);
+        let hot = one_hot(self, logits, target, plan.class_axis)?;
+        let mask = if let Some(ignored) = plan.ignored {
+            let ignored = self.constant(ignored);
+            self.ne(target, ignored)?
+        } else {
+            self.full_with_dtype(plan.target_shape.clone(), Scalar::Bool(true), DType::Bool)?
+        };
+        let mut mask_shape = plan.target_shape.dims().to_vec();
+        mask_shape.insert(plan.class_axis, 1);
+        let mask = self.reshape(mask, Shape::new(mask_shape))?;
+        let masked_hot = self.mul(hot, mask)?;
+        let weighted = self.mul(logp, masked_hot)?;
+        let picked = self.reduce_with_dtypes(
+            weighted,
+            ReduceKind::Sum,
+            Some(vec![plan.class_axis as isize]),
+            false,
+            plan.selected_sum,
+        )?;
+        let mean = self.mean_with_axes(logp, Some(vec![plan.class_axis as isize]), false)?;
+        let flat_mask = self.reshape(mask, plan.target_shape.clone())?;
+        let mean_masked = self.mul(mean, flat_mask)?;
+        let hard_weight = self.constant(plan.hard_weight);
+        let hard = self.mul(hard_weight, picked)?;
+        let smoothing = self.constant(plan.smoothing);
+        let smooth = self.mul(smoothing, mean_masked)?;
+        let unreduced = self.add(hard, smooth)?;
+        let output = match options.reduction {
+            Reduction::None => self.neg(unreduced)?,
+            Reduction::Sum => {
+                let summed = self.reduce_with_dtypes(
+                    unreduced,
+                    ReduceKind::Sum,
+                    None,
+                    false,
+                    plan.total_sum,
+                )?;
+                self.neg(summed)?
+            }
+            Reduction::Mean => {
+                let numerator = self.reduce_with_dtypes(
+                    unreduced,
+                    ReduceKind::Sum,
+                    None,
+                    false,
+                    plan.total_sum,
+                )?;
+                let denominator = self.reduce_with_dtypes(
+                    flat_mask,
+                    ReduceKind::Sum,
+                    None,
+                    false,
+                    ReductionDType::sum_default(DType::Bool),
+                )?;
+                self.div(self.neg(numerator)?, denominator)?
+            }
+        };
+        let output_shape = match options.reduction {
+            Reduction::None => plan.selected_shape,
+            Reduction::Sum | Reduction::Mean => Shape::new([]),
+        };
+        debug_assert_eq!(self.shape(output).expect("sparse CE preflighted"), &output_shape);
+        Ok(output)
+    }
+
+    /// tinygrad's omitted sparse categorical-loss arguments.
+    pub fn sparse_categorical_crossentropy_default(
+        &mut self,
+        logits: NodeId,
+        target: NodeId,
+    ) -> Result<NodeId> {
+        self.sparse_categorical_crossentropy(
+            logits,
+            target,
+            SparseCategoricalCrossEntropyOptions::default(),
+        )
+    }
+}
+
+/// Backward-compatible free-function spelling for the source-literal Graph
+/// surface.
 pub fn sparse_categorical_cross_entropy_tinygrad(
     graph: &mut Graph,
     logits: NodeId,
     target: NodeId,
     options: SparseCategoricalCrossEntropyOptions,
 ) -> Result<NodeId> {
-    let plan = sparse_categorical_cross_entropy_plan(graph, logits, target, options)?;
-
-    // `Graph::log_softmax`, `one_hot`, `mean_with_axes`, and
-    // `reduce_with_dtypes` each carry their own pure descriptor plans. The
-    // enclosing plan above proves their cross-operation shapes, widths, and
-    // scalar promotion contract before this first mutation.
-    let logp = graph.log_softmax(logits, -1, None)?;
-    debug_assert_eq!(graph.shape(logp).expect("sparse CE preflighted"), &plan.logits_shape);
-    debug_assert_eq!(graph.dtype(logp).expect("sparse CE preflighted"), plan.log_dtype);
-    let hot = one_hot(graph, logits, target, plan.class_axis)?;
-    let mask = if let Some(ignored) = plan.ignored {
-        let ignored = graph.constant(ignored);
-        graph.ne(target, ignored)?
-    } else {
-        graph.full_with_dtype(plan.target_shape.clone(), Scalar::Bool(true), DType::Bool)?
-    };
-    let mut mask_shape = plan.target_shape.dims().to_vec();
-    mask_shape.insert(plan.class_axis, 1);
-    let mask = graph.reshape(mask, Shape::new(mask_shape))?;
-    let masked_hot = graph.mul(hot, mask)?;
-    let weighted = graph.mul(logp, masked_hot)?;
-    let picked = graph.reduce_with_dtypes(
-        weighted,
-        ReduceKind::Sum,
-        Some(vec![plan.class_axis as isize]),
-        false,
-        plan.selected_sum,
-    )?;
-    let mean = graph.mean_with_axes(logp, Some(vec![plan.class_axis as isize]), false)?;
-    let flat_mask = graph.reshape(mask, plan.target_shape.clone())?;
-    let mean_masked = graph.mul(mean, flat_mask)?;
-    let hard_weight = graph.constant(plan.hard_weight);
-    let hard = graph.mul(hard_weight, picked)?;
-    let smoothing = graph.constant(plan.smoothing);
-    let smooth = graph.mul(smoothing, mean_masked)?;
-    let unreduced = graph.add(hard, smooth)?;
-    let output = match options.reduction {
-        Reduction::None => graph.neg(unreduced)?,
-        Reduction::Sum => {
-            let summed = graph.reduce_with_dtypes(
-                unreduced,
-                ReduceKind::Sum,
-                None,
-                false,
-                plan.total_sum,
-            )?;
-            graph.neg(summed)?
-        }
-        Reduction::Mean => {
-            let numerator = graph.reduce_with_dtypes(
-                unreduced,
-                ReduceKind::Sum,
-                None,
-                false,
-                plan.total_sum,
-            )?;
-            let denominator = graph.reduce_with_dtypes(
-                flat_mask,
-                ReduceKind::Sum,
-                None,
-                false,
-                ReductionDType::sum_default(DType::Bool),
-            )?;
-            graph.div(graph.neg(numerator)?, denominator)?
-        }
-    };
-    let output_shape = match options.reduction {
-        Reduction::None => plan.selected_shape,
-        Reduction::Sum | Reduction::Mean => Shape::new([]),
-    };
-    debug_assert_eq!(graph.shape(output).expect("sparse CE preflighted"), &output_shape);
-    Ok(output)
+    graph.sparse_categorical_crossentropy(logits, target, options)
 }
 /// Cross entropy accepts integer targets or probability targets of the logits shape.
 pub fn cross_entropy(
@@ -1181,6 +1210,14 @@ mod tests {
         .unwrap();
         assert_eq!(graph.shape(masked).unwrap(), &Shape::from([2, 3]));
         assert!(graph.trace(masked).unwrap().to_string().contains("ne"));
+
+        // The public Graph spelling retains the source default options and
+        // delegates to the same final-axis, lazy-one-hot plan.
+        let default = graph
+            .sparse_categorical_crossentropy_default(logits, target)
+            .unwrap();
+        assert_eq!(graph.shape(default).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(default).unwrap(), crate::DType::F16);
     }
 
     #[test]

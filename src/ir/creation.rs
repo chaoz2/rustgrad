@@ -26,7 +26,7 @@ pub(crate) struct LazyArangePlan {
 /// source-default integer arange, then selects strong I32 one/zero scalars.
 /// Keep every descriptor and storage boundary here so no movement, range, or
 /// predicate node can leak from a malformed late shape or byte extent.
-struct OneHotPlan {
+pub(crate) struct OneHotPlan {
     value_shape: Shape,
     range: LazyArangePlan,
     class_shape: Shape,
@@ -50,7 +50,7 @@ fn one_hot_source_lub(lhs: DType, rhs: DType) -> DType {
     }
 }
 
-fn one_hot_plan(graph: &Graph, input: NodeId, classes: usize) -> Result<OneHotPlan> {
+pub(crate) fn one_hot_plan(graph: &Graph, input: NodeId, classes: usize) -> Result<OneHotPlan> {
     let source = graph.node(input)?;
     let input_shape = source.shape.clone();
     let input_dtype = source.dtype;
