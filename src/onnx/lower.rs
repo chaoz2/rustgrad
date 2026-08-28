@@ -205,6 +205,163 @@ struct HardmaxPlan {
     output_dtype: DType,
 }
 
+/// Complete source-level construction plan for tinygrad's ONNX ArgMax
+/// adapter. The public Graph ArgReduce is first-tie only, so the importer
+/// owns both the reversed last-tie form and tinygrad's leading-NaN sentinel.
+/// A zero reduction axis is also represented here as its fully known I64
+/// result, avoiding any change to Graph's explicit empty-reduction policy.
+struct ArgMaxPlan {
+    axis: isize,
+    keepdims: bool,
+    select_last: bool,
+    first_bounds: Vec<(usize, usize)>,
+    sentinel: TensorData,
+    last_offset: Option<TensorData>,
+    empty_axis_result: Option<TensorData>,
+}
+
+fn argmax_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<ArgMaxPlan> {
+    if attrs
+        .keys()
+        .any(|key| !matches!(key.as_str(), "axis" | "keepdims" | "select_last_index"))
+    {
+        return Err(bad("unsupported ArgMax attribute"));
+    }
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    let input_numel = shape.numel()?;
+    input_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("ArgMax input byte extent overflow"))?;
+    let rank = shape.rank();
+    if rank == 0 {
+        // tinygrad's adapter passes an explicit axis to Tensor.argmax, which
+        // resolves that axis before its scalar special case.
+        return Err(bad("ArgMax does not support scalar input"));
+    }
+    let rank_i64 = i64::try_from(rank).map_err(|_| bad("ArgMax rank overflow"))?;
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(0);
+    let axis = if raw_axis < 0 {
+        raw_axis
+            .checked_add(rank_i64)
+            .ok_or_else(|| bad("invalid ArgMax axis"))?
+    } else {
+        raw_axis
+    };
+    if axis < 0 || axis >= rank_i64 {
+        return Err(bad("invalid ArgMax axis"));
+    }
+    let axis = usize::try_from(axis).map_err(|_| bad("invalid ArgMax axis"))?;
+    let keepdims = strict_typed_scalar_i64_attr(n, "keepdims")?.unwrap_or(1) != 0;
+    let select_last = strict_typed_scalar_i64_attr(n, "select_last_index")?.unwrap_or(0) != 0;
+    let output_shape = reduction_shape(&shape, &[axis], keepdims);
+    let output_numel = output_shape.numel()?;
+    output_numel
+        .checked_mul(DType::I64.itemsize())
+        .ok_or_else(|| bad("ArgMax output byte extent overflow"))?;
+
+    let axis_extent = shape.dims()[axis];
+    let axis_extent_i64 = i64::try_from(axis_extent)
+        .map_err(|_| bad("ArgMax axis extent exceeds tinygrad arange range"))?;
+    if axis_extent == 0 {
+        // In tinygrad, `eq(max(empty))` and the reverse arange are empty;
+        // their I32 Max identity is then subtracted from the axis extent and
+        // finally cast to I64. Preserve that observable normal/last sentinel
+        // without weakening Graph::argmax's EmptyReduction contract.
+        let value = if select_last {
+            i64::from(i32::MAX)
+        } else {
+            i64::from(i32::MIN)
+        };
+        let data = TensorData::from_scalars(
+            output_shape,
+            DType::I64,
+            std::iter::repeat(Scalar::I(value)).take(output_numel),
+        )?;
+        return Ok(ArgMaxPlan {
+            axis: isize::try_from(axis).map_err(|_| bad("ArgMax axis overflow"))?,
+            keepdims,
+            select_last,
+            first_bounds: Vec::new(),
+            sentinel: TensorData::scalar_with_dtype(Scalar::I(0), DType::I32),
+            last_offset: None,
+            empty_axis_result: Some(data),
+        });
+    }
+
+    let arg_shape = output_shape.clone();
+    arg_shape
+        .numel()?
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| bad("ArgMax index byte extent overflow"))?;
+    let mut first_bounds = Vec::with_capacity(rank);
+    for (dimension, &extent) in shape.dims().iter().enumerate() {
+        first_bounds.push(if dimension == axis { (0, 1) } else { (0, extent) });
+    }
+    let first_shape = Shape::new(
+        first_bounds
+            .iter()
+            .map(|(start, end)| end - start)
+            .collect::<Vec<_>>(),
+    );
+    first_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("ArgMax first-lane byte extent overflow"))?;
+    let first_result_shape = if keepdims {
+        first_shape
+    } else {
+        Shape::new(
+            first_shape
+                .dims()
+                .iter()
+                .enumerate()
+                .filter_map(|(dimension, &extent)| (dimension != axis).then_some(extent))
+                .collect::<Vec<_>>(),
+        )
+    };
+    if first_result_shape != arg_shape {
+        return Err(bad("ArgMax first-lane shape does not match argmax"));
+    }
+    first_result_shape
+        .numel()?
+        .checked_mul(DType::Bool.itemsize())
+        .ok_or_else(|| bad("ArgMax NaN mask byte extent overflow"))?;
+
+    // `Tensor.arange` promotes beyond the default I32 range, but ArgMax
+    // explicitly casts its result to I32 before ONNX's final I64 cast.
+    let sentinel = TensorData::scalar_with_dtype(Scalar::I(axis_extent_i64), DType::I32);
+    if arg_shape.broadcast_with(sentinel.shape())? != arg_shape {
+        return Err(bad("ArgMax NaN sentinel cannot broadcast to indices"));
+    }
+    let last_offset = if select_last {
+        let offset = axis_extent_i64
+            .checked_sub(1)
+            .ok_or_else(|| bad("ArgMax last-index offset overflow"))?;
+        let data = TensorData::scalar_with_dtype(Scalar::I(offset), DType::I32);
+        if arg_shape.broadcast_with(data.shape())? != arg_shape {
+            return Err(bad("ArgMax last-index offset cannot broadcast"));
+        }
+        Some(data)
+    } else {
+        None
+    };
+    Ok(ArgMaxPlan {
+        axis: isize::try_from(axis).map_err(|_| bad("ArgMax axis overflow"))?,
+        keepdims,
+        select_last,
+        first_bounds,
+        sentinel,
+        last_offset,
+        empty_axis_result: None,
+    })
+}
+
 fn hardmax_plan(
     g: &Graph,
     input: NodeId,
@@ -4183,7 +4340,39 @@ pub(super) fn lower(
             let ln2 = g.constant(plan.ln2);
             g.mul(log2, ln2)?
         }
-        op @ ("ArgMax" | "ArgMin") if ins.len() == 1 => {
+        "ArgMax" if ins.len() == 1 => {
+            let x = get(0)?;
+            let plan = argmax_plan(g, x, &n, &attrs)?;
+            if let Some(data) = plan.empty_axis_result {
+                g.constant(data)
+            } else {
+                // The source's truthy last-index form flips before argmax;
+                // sample that same flipped first lane for its NaN sentinel.
+                let source = if plan.select_last {
+                    g.flip(x, [plan.axis])?
+                } else {
+                    x
+                };
+                let indices = g.argmax(source, Some(plan.axis), plan.keepdims)?;
+                let first = g.shrink(source, plan.first_bounds)?;
+                let first = if plan.keepdims {
+                    first
+                } else {
+                    g.squeeze(first, Some(plan.axis))?
+                };
+                let leading_nan = g.isnan(first)?;
+                let sentinel = g.constant(plan.sentinel);
+                let selected = g.select(leading_nan, sentinel, indices)?;
+                let selected = if let Some(offset) = plan.last_offset {
+                    let offset = g.constant(offset);
+                    g.sub(offset, selected)?
+                } else {
+                    selected
+                };
+                g.cast(selected, DType::I64)?
+            }
+        }
+        "ArgMin" if ins.len() == 1 => {
             if attrs
                 .keys()
                 .any(|x| !matches!(x.as_str(), "axis" | "keepdims" | "select_last_index"))
@@ -4214,11 +4403,7 @@ pub(super) fn lower(
             if !matches!(keepdims, 0 | 1) {
                 return Err(bad("Arg keepdims must be 0 or 1"));
             }
-            let value = if op == "ArgMax" {
-                g.argmax(x, Some(axis), keepdims == 1)?
-            } else {
-                g.argmin(x, Some(axis), keepdims == 1)?
-            };
+            let value = g.argmin(x, Some(axis), keepdims == 1)?;
             g.cast(value, DType::I64)?
         }
         "BatchNormalization" if ins.len() == 5 => {

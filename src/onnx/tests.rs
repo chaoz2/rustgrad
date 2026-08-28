@@ -3538,6 +3538,205 @@ fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
 }
 
 #[test]
+fn argmax_matches_tinygrad_last_ties_nan_sentinels_and_preflight() {
+    let argmax = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("ArgMax", &["x"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+    let source = TensorData::new(
+        [6, 3],
+        vec![
+            1., 3., 3., // first/last equal maximum
+            -0.0, 0.0, -1., // signed-zero tie
+            f32::NAN, 2., 3., // leading NaN for forward only
+            2., f32::NAN, 3., // later NaN is ignored
+            2., 3., f32::NAN, // leading NaN after flip only
+            f32::NAN, f32::NAN, f32::NAN,
+        ],
+    )
+    .unwrap();
+    let run = |attrs: &[Vec<u8>]| {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [6, 3]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut graph,
+            Msg::new(&argmax(attrs)),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([("x".into(), source.clone())]),
+            )
+            .unwrap();
+        (
+            graph,
+            values["out"],
+            (0..output.len())
+                .map(|index| output.scalar_at(index).as_i64())
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let (forward_graph, forward, forward_indices) = run(&[typed_int_attr("axis", 1)]);
+    assert_eq!(forward_graph.shape(forward).unwrap().dims(), &[6, 1]);
+    assert_eq!(forward_graph.dtype(forward).unwrap(), DType::I64);
+    assert_eq!(forward_indices, vec![1, 0, 3, 2, 1, 3]);
+    assert!(crate::schedule(&forward_graph, forward).is_err());
+
+    let (last_graph, last, last_indices) = run(&[
+        typed_int_attr("axis", -1),
+        typed_int_attr("keepdims", 2),
+        typed_int_attr("select_last_index", -7),
+    ]);
+    assert_eq!(last_graph.shape(last).unwrap().dims(), &[6, 1]);
+    assert_eq!(last_indices, vec![2, 1, 2, 2, -1, -1]);
+
+    let (reduced_graph, reduced, _) = run(&[
+        typed_int_attr("axis", 1),
+        typed_int_attr("keepdims", 0),
+    ]);
+    assert_eq!(reduced_graph.shape(reduced).unwrap().dims(), &[6]);
+
+    // Tinygrad's empty equality/range path reduces to its I32 MAX identity,
+    // then casts to ONNX I64. The reversed source path changes only that
+    // sentinel arithmetic, so both forms are fully static importer constants.
+    for (last, expected) in [(false, i64::from(i32::MIN)), (true, i64::from(i32::MAX))] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 0]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let attrs = if last {
+            vec![typed_int_attr("axis", 1), typed_int_attr("select_last_index", 1)]
+        } else {
+            vec![typed_int_attr("axis", 1)]
+        };
+        lower(&mut graph, Msg::new(&argmax(&attrs)), &mut values, &mut BTreeMap::new())
+            .unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::from_scalars([2, 0], DType::F32, []).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(output.shape().dims(), &[2, 1]);
+        assert_eq!(output.dtype(), DType::I64);
+        assert_eq!(output.scalar_at(0).as_i64(), expected);
+        assert_eq!(output.scalar_at(1).as_i64(), expected);
+    }
+
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1, 2], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut graph,
+            Msg::new(&argmax(&[typed_int_attr("axis", 1)])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[1, 1]);
+        assert_eq!(graph.dtype(values["out"]).unwrap(), DType::I64);
+    }
+
+    // The importer reaches the shared typed CPU ArgReduce path unchanged for
+    // wide integer data, including distinct lanes beyond f64 precision.
+    for (dtype, input) in [
+        (
+            DType::I64,
+            TensorData::from_scalars(
+                [1, 2],
+                DType::I64,
+                [Scalar::I(1_i64 << 53), Scalar::I((1_i64 << 53) + 1)],
+            )
+            .unwrap(),
+        ),
+        (
+            DType::U64,
+            TensorData::from_scalars(
+                [1, 2],
+                DType::U64,
+                [Scalar::U(1_u64 << 53), Scalar::U((1_u64 << 53) + 1)],
+            )
+            .unwrap(),
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1, 2], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut graph,
+            Msg::new(&argmax(&[typed_int_attr("axis", 1)])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(&graph, values["out"], &HashMap::from([("x".into(), input)]))
+            .unwrap();
+        assert_eq!(output.scalar_at(0).as_i64(), 1);
+    }
+
+    for invalid in [
+        node("ArgMax", &[], "out"),
+        node("ArgMax", &["x", "extra"], "out"),
+        argmax(&[int_attr("axis", 1)]),
+        argmax(&[float_attr("axis", 1.0)]),
+        argmax(&[typed_int_attr("unknown", 1)]),
+        argmax(&[typed_int_attr("axis", 1), typed_int_attr("axis", 0)]),
+        argmax(&[typed_int_attr("axis", 2)]),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before_values = values.clone();
+        let before_nodes = graph.node_count();
+        assert!(lower(&mut graph, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(graph.node_count(), before_nodes);
+    }
+
+    let mut scalar = Graph::new();
+    let x = scalar.input("x", []);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_nodes = scalar.node_count();
+    assert!(lower(
+        &mut scalar,
+        Msg::new(&argmax(&[])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(scalar.node_count(), before_nodes);
+    assert!(!values.contains_key("out"));
+}
+
+#[test]
 fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
     let mut g = Graph::new();
     let x = g.input("x", [1, 2, 1, 1]);
@@ -4280,7 +4479,7 @@ fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
     assert_eq!(output.scalar_at(0).as_i64(), 3);
 }
 #[test]
-fn reductions_and_arg_reject_dynamic_and_last_tie_controls() {
+fn reductions_and_arg_reject_dynamic_and_malformed_controls() {
     let mut g = Graph::new();
     let x = g.input("x", [2, 2]);
     let axes = g.input_dtype("axes", [1], DType::I64);
@@ -5846,8 +6045,8 @@ fn model_proto_constant_of_shape_rejects_bad_embedded_value_count_and_type() {
 fn model_proto_arg_reductions_keep_first_ties_normalize_axis_and_return_i64() {
     let x = raw_tensor("x", &[2, 3], 1, &f32_bytes(&[3., 3., 1., -2., -2., 4.]));
     let mut maximum = node("ArgMax", &["x"], "maximum");
-    field(&mut maximum, 5, &int64_attr("axis", -1));
-    field(&mut maximum, 5, &int_attr("keepdims", 0));
+    field(&mut maximum, 5, &typed_int_attr("axis", -1));
+    field(&mut maximum, 5, &typed_int_attr("keepdims", 0));
     let mut minimum = node("ArgMin", &["x"], "minimum");
     field(&mut minimum, 5, &int64_attr("axis", -1));
     field(&mut minimum, 5, &int_attr("keepdims", 1));
