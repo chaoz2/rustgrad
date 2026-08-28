@@ -149,6 +149,16 @@ struct SubScalarPlan {
     scalar: TensorData,
 }
 
+/// Descriptor and weak-scalar commitment for tinygrad `Tensor.mul` and its
+/// reflected Python form. The final MUL order is retained for raw payload and
+/// autodiff structure even though multiplication is mathematically symmetric.
+struct MulScalarPlan {
+    output_shape: Shape,
+    input_dtype: DType,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Resolves a Python-style scalar at the width tinygrad's `_broadcasted`
 /// commits after its weak scalar promotion. This is shared by scalar-right
 /// public elementwise forms; it intentionally does not model a live U64
@@ -479,6 +489,49 @@ fn sub_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<SubSca
         });
     }
     Ok(SubScalarPlan {
+        output_shape,
+        input_dtype,
+        output_dtype,
+        scalar,
+    })
+}
+
+fn mul_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<MulScalarPlan> {
+    let input_node = graph.node(input)?;
+    let output_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let scalar_dtype = source_weak_scalar_dtype(input_dtype, value);
+    let output_dtype = source_lub(input_dtype, scalar_dtype);
+    let scalar = TensorData::scalar_with_dtype(value, scalar_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    // Validate original storage, `_broadcasted` cast results, scalar
+    // broadcast, and final storage-width multiplication before publication.
+    for (shape, dtype) in [
+        (&output_shape, input_dtype),
+        (scalar.shape(), scalar.dtype()),
+        (&output_shape, output_dtype),
+        (scalar.shape(), output_dtype),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if scalar.shape() != &Shape::new([])
+        || scalar.dtype() != scalar_dtype
+        || scalar_dtype != output_dtype
+        || source_lub(input_dtype, scalar_dtype) != output_dtype
+        || output_shape.broadcast_with(scalar.shape())? != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "mul scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(MulScalarPlan {
         output_shape,
         input_dtype,
         output_dtype,
@@ -2396,6 +2449,41 @@ impl Graph {
             self.cast(rhs, output_dtype)?
         };
         self.binary(BinaryOp::Mul, lhs, rhs)
+    }
+
+    fn mul_scalar_with_order(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        reverse: bool,
+    ) -> Result<NodeId> {
+        let plan = mul_scalar_plan(self, input, value)?;
+        // Constants and any source-LUB cast are published only after the
+        // complete descriptor passes; reverse changes only the MUL inputs.
+        let scalar = self.constant(plan.scalar);
+        let input = if plan.input_dtype == plan.output_dtype {
+            input
+        } else {
+            self.cast(input, plan.output_dtype)?
+        };
+        let output = if reverse {
+            self.mul(scalar, input)?
+        } else {
+            self.mul(input, scalar)?
+        };
+        debug_assert_eq!(self.shape(output).expect("mul scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("mul scalar preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible `Tensor.mul(Python_scalar)` form.
+    pub fn mul_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.mul_scalar_with_order(input, value, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar * Tensor` form.
+    pub fn scalar_mul(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.mul_scalar_with_order(input, value, true)
     }
 
     pub fn div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
