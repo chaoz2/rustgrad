@@ -659,6 +659,44 @@ mod tests {
     }
 
     #[test]
+    fn kaiming_normal_implicit_preflights_fan_then_uses_source_normal() {
+        Graph::manual_seed(31);
+        let mut graph = Graph::new();
+        // Kaiming's tail product is empty for scalar and rank-one shapes.
+        let scalar = graph.kaiming_normal_implicit([], 0.25, DType::F16).unwrap();
+        let rank_one_empty = graph.kaiming_normal_default_a([0], DType::F64).unwrap();
+        let default = graph.kaiming_normal_default([2, 3]).unwrap();
+        let lifted_integer = graph.kaiming_normal_implicit([1], f64::NAN, DType::I16).unwrap();
+        // Unlike Uniform, a zero Normal std is valid: infinite `a` still
+        // invokes source Normal and therefore its ambient two-word stream.
+        let zero_std = graph.kaiming_normal_implicit([1], f64::INFINITY, DType::F32).unwrap();
+        assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
+        assert_eq!(graph.shape(rank_one_empty).unwrap(), &Shape::from([0]));
+        assert_eq!(graph.dtype(default).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(lifted_integer).unwrap(), DType::F32);
+        assert!(!graph.node(scalar).unwrap().requires_grad);
+
+        let Op::Binary { op: crate::BinaryOp::Add, lhs: multiply, .. } = graph.op(scalar).unwrap() else {
+            panic!("expected source mean Add");
+        };
+        let Op::Binary { op: crate::BinaryOp::Mul, .. } = graph.op(*multiply).unwrap() else {
+            panic!("expected source scalar-left std Mul");
+        };
+        assert!((0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
+            Op::Random { kind: RandomKind::Normal { mean, std }, .. } => *mean == 0.0 && *std == 1.0,
+            _ => false,
+        }));
+        assert!(matches!(graph.op(zero_std).unwrap(), Op::Binary { op: crate::BinaryOp::Add, .. }));
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(malformed.kaiming_normal_implicit([2, 0], 0.01, DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.kaiming_normal_implicit([1, usize::MAX, 2], 0.01, DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn linspace_is_source_literal_f32_lazy_and_preflighted() {
         let mut graph = Graph::new();
         let empty = graph.linspace(2.0, 5.0, 0, DType::F32).unwrap();
@@ -3449,6 +3487,48 @@ impl Graph {
     /// Omits tinygrad `Tensor.normal`'s mean/std/dtype defaults.
     pub fn normal_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
         self.normal_implicit(shape, 0.0, 1.0, DType::F32)
+    }
+
+    /// Source-literal ambient-stream `Tensor.kaiming_normal`.
+    ///
+    /// tinygrad computes `(2 / (1 + a**2) / prod(shape[1:]))**0.5` before it
+    /// invokes normal. Scalar and rank-one shapes use the empty-tail identity
+    /// of one; a zero tail fan fails before the Normal stream is reserved.
+    /// A zero standard deviation is valid for Normal (including from infinite
+    /// `a`), so this intentionally delegates to `normal_implicit` unchanged.
+    pub fn kaiming_normal_implicit(
+        &mut self,
+        shape: impl Into<Shape>,
+        a: f64,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let shape = shape.into();
+        let fan = checked_initializer_tail_fan(&shape)?;
+        if fan == 0 {
+            return Err(Error::InvalidRandom {
+                reason: "kaiming_normal has zero fan",
+            });
+        }
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let std = (2.0 / (1.0 + a * a) / fan as f64).sqrt();
+        self.normal_implicit(shape, 0.0, std, dtype)
+    }
+
+    /// Omits tinygrad `Tensor.kaiming_normal`'s `a=0.01` default.
+    pub fn kaiming_normal_default_a(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        self.kaiming_normal_implicit(shape, 0.01, dtype)
+    }
+
+    /// Omits tinygrad `Tensor.kaiming_normal`'s `a` and dtype defaults.
+    pub fn kaiming_normal_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
+        self.kaiming_normal_default_a(shape, DType::F32)
     }
 
     /// Implicit `rand` from an isolated numeric device stream. Device `0` is
