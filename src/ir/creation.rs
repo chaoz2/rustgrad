@@ -626,6 +626,39 @@ mod tests {
     }
 
     #[test]
+    fn kaiming_uniform_implicit_uses_empty_tail_identity_before_uniform() {
+        Graph::manual_seed(29);
+        let mut graph = Graph::new();
+        // Unlike the old seeded compatibility API, source Kaiming permits a
+        // scalar: `prod(shape[1:])` is Python's empty-product identity.
+        let scalar = graph.kaiming_uniform_implicit([], 0.25, DType::F16).unwrap();
+        let rank_one_empty = graph.kaiming_uniform_default_a([0], DType::F64).unwrap();
+        let default = graph.kaiming_uniform_default([2, 3]).unwrap();
+        let lifted_integer = graph.kaiming_uniform_implicit([1], f64::NAN, DType::I16).unwrap();
+        assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
+        assert_eq!(graph.shape(rank_one_empty).unwrap(), &Shape::from([0]));
+        assert_eq!(graph.dtype(default).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(lifted_integer).unwrap(), DType::F32);
+        assert!(!graph.node(scalar).unwrap().requires_grad);
+        assert!(matches!(graph.op(scalar).unwrap(), Op::Binary { op: crate::BinaryOp::Add, .. }));
+        assert!((0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
+            Op::Random { kind: RandomKind::Uniform { low, high }, .. } => *low == 0.0 && *high == 1.0,
+            _ => false,
+        }));
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        // A zero tail fan and a zero bound from infinite `a` both make source
+        // uniform reject before it can reserve a captured stream.
+        assert!(malformed.kaiming_uniform_implicit([2, 0], 0.01, DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.kaiming_uniform_implicit([2], f64::INFINITY, DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.kaiming_uniform_implicit([1, usize::MAX, 2], 0.01, DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn linspace_is_source_literal_f32_lazy_and_preflighted() {
         let mut graph = Graph::new();
         let empty = graph.linspace(2.0, 5.0, 0, DType::F32).unwrap();
@@ -1934,7 +1967,7 @@ fn stream_words(shape: &Shape, dtype: DType, multiplier: usize) -> Result<u64> {
 }
 
 fn checked_initializer_tail_fan(shape: &Shape) -> Result<usize> {
-    shape.dims()[1..].iter().try_fold(1usize, |fan, &dimension| {
+    shape.dims().get(1..).unwrap_or(&[]).iter().try_fold(1usize, |fan, &dimension| {
         fan.checked_mul(dimension)
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     })
@@ -3296,6 +3329,51 @@ impl Graph {
     /// Omits tinygrad `Tensor.glorot_uniform`'s dtype default.
     pub fn glorot_uniform_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
         self.glorot_uniform_implicit(shape, DType::F32)
+    }
+
+    /// Source-literal ambient-stream `Tensor.kaiming_uniform`.
+    ///
+    /// tinygrad computes `(6 / (1 + a**2) / prod(shape[1:]))**0.5` before it
+    /// calls `uniform`. In particular, scalar and rank-one shapes use the
+    /// empty-tail identity of one, while a zero tail fan fails before any
+    /// ambient stream reservation. The resulting random composition remains
+    /// the public source `uniform` graph rather than a ranged Random node.
+    pub fn kaiming_uniform_implicit(
+        &mut self,
+        shape: impl Into<Shape>,
+        a: f64,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let shape = shape.into();
+        let fan = checked_initializer_tail_fan(&shape)?;
+        // Python's ordered division raises for an integer zero denominator
+        // before `uniform` runs. Preserve that stream-atomic failure instead
+        // of allowing an infinite bound through the random helper.
+        if fan == 0 {
+            return Err(Error::InvalidRandom {
+                reason: "kaiming_uniform has zero fan",
+            });
+        }
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let bound = (6.0 / (1.0 + a * a) / fan as f64).sqrt();
+        self.uniform_implicit(shape, -bound, bound, dtype)
+    }
+
+    /// Omits tinygrad `Tensor.kaiming_uniform`'s `a=0.01` default.
+    pub fn kaiming_uniform_default_a(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        self.kaiming_uniform_implicit(shape, 0.01, dtype)
+    }
+
+    /// Omits tinygrad `Tensor.kaiming_uniform`'s `a` and dtype defaults.
+    pub fn kaiming_uniform_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
+        self.kaiming_uniform_default_a(shape, DType::F32)
     }
 
     /// Source-literal ambient-stream `Tensor.normal`.
