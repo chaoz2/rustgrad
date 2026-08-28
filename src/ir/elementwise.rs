@@ -3405,7 +3405,32 @@ impl Graph {
         }
     }
     pub fn floor(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Floor, input)
+        // Tensor.floor is `where(x < (b := trunc(x)), b - 1, b)`, rather
+        // than raw FLOOR. Its branch composition preserves source tracing and
+        // nondifferentiability while retaining the exact storage dtype.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let trunc_dtype = unary_dtype(UnaryOp::Trunc, dtype);
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for dtype in [dtype, trunc_dtype, DType::Bool, dtype, dtype] {
+            extent(&shape, dtype)?;
+        }
+        extent(one.shape(), one.dtype())?;
+        if trunc_dtype != dtype
+            || one.dtype() != dtype
+            || dtype.promote(dtype) != dtype
+            || shape.broadcast_with(one.shape())? != shape
+        {
+            return Err(Error::InvalidElementwiseDType { op: "floor trunc/compare/select source promotion", actual: dtype });
+        }
+        let truncated = self.trunc(input)?;
+        let condition = self.lt(input, truncated)?;
+        let decremented = self.sub(truncated, self.constant(one))?;
+        self.select(condition, decremented, truncated)
     }
     pub fn ceil(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Ceil, input)
