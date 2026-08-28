@@ -8233,3 +8233,101 @@ fn batchnorm_preflights_optional_reshapes_and_late_broadcast_overflow() {
     ));
     assert_eq!(overflow.node_count(), before);
 }
+
+#[test]
+fn source_dot_uses_tinygrad_typed_sum_and_source_layout() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 3], DType::F16);
+    let rhs = graph.input_dtype("rhs", [3, 4], DType::F16);
+    let output = graph.dot_default(lhs, rhs).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 4]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: false, .. } if axes == &vec![-1])
+            && node.dtype == DType::F32
+    }));
+    // Narrow products are accumulated in F32, then source-cast back.
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Cast { dtype: DType::F32, .. })));
+    assert!(matches!(graph.op(output).unwrap(), Op::Cast { dtype: DType::F16, .. }));
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, lhs).unwrap();
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 3]));
+    assert!(graph.grad(graph.sum_all(gradient).unwrap(), lhs).is_ok());
+
+    // The literal Mul then Sum sequence owns IEEE special propagation rather
+    // than inheriting a raw Matmul implementation.
+    let mut specials = Graph::new();
+    let lhs = specials.input("lhs", [2]);
+    let rhs = specials.input("rhs", [2]);
+    let output = specials.dot_default(lhs, rhs).unwrap();
+    let values = CpuBackend
+        .execute(
+            &specials,
+            output,
+            &HashMap::from([
+                ("lhs".into(), TensorData::new([2], vec![1.0, -1.0]).unwrap()),
+                ("rhs".into(), TensorData::new([2], vec![f32::INFINITY, f32::INFINITY]).unwrap()),
+            ]),
+        )
+        .unwrap()
+        .to_vec_f64();
+    assert!(values[0].is_nan());
+}
+
+#[test]
+fn source_dot_covers_vectors_batches_storage_and_empty_contractions() {
+    let mut vector = Graph::new();
+    let lhs = vector.input_dtype("lhs", [3], DType::I8);
+    let rhs = vector.input_dtype("rhs", [3], DType::I8);
+    let output = vector.dot_default(lhs, rhs).unwrap();
+    assert_eq!(vector.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(vector.dtype(output).unwrap(), DType::I8);
+    // I8 products reduce in I32 before the source-required final narrowing.
+    assert!(vector.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, .. }) && node.dtype == DType::I32
+    }));
+    assert!(matches!(vector.op(output).unwrap(), Op::Cast { dtype: DType::I8, .. }));
+
+    let mut bridged = Graph::new();
+    let lhs = bridged.input_dtype("lhs", [2, 3, 4], DType::I64);
+    let rhs = bridged.input_dtype("rhs", [1, 4, 5], DType::U64);
+    let output = bridged.dot_default(lhs, rhs).unwrap();
+    assert_eq!(bridged.shape(output).unwrap(), &Shape::new([2, 3, 5]));
+    assert_eq!(bridged.dtype(output).unwrap(), DType::F32);
+    assert!(bridged.nodes.iter().filter(|node| matches!(&node.op, Op::Cast { dtype: DType::F32, .. })).count() >= 2);
+
+    let mut explicit = Graph::new();
+    let lhs = explicit.input_dtype("lhs", [2, 0], DType::BF16);
+    let rhs = explicit.input_dtype("rhs", [0, 3], DType::BF16);
+    let output = explicit.dot(lhs, rhs, Some(DType::F64)).unwrap();
+    assert_eq!(explicit.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(explicit.dtype(output).unwrap(), DType::F64);
+    assert!(explicit.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, .. }) && node.dtype == DType::F64
+    }));
+}
+
+#[test]
+fn source_dot_preflights_invalid_and_overflow_contracts_atomically() {
+    let mut scalar = Graph::new();
+    let lhs = scalar.input_dtype("lhs", [], DType::F32);
+    let rhs = scalar.input_dtype("rhs", [1], DType::F32);
+    let before = scalar.node_count();
+    assert!(matches!(scalar.dot_default(lhs, rhs), Err(Error::InvalidMatmul { .. })));
+    assert_eq!(scalar.node_count(), before);
+
+    let mut mismatch = Graph::new();
+    let lhs = mismatch.input("lhs", [2, 3]);
+    let rhs = mismatch.input("rhs", [4, 2]);
+    let before = mismatch.node_count();
+    assert!(matches!(mismatch.dot_default(lhs, rhs), Err(Error::InvalidMatmul { .. })));
+    assert_eq!(mismatch.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let lhs = overflow.input_dtype("lhs", [usize::MAX / 2, 2], DType::F64);
+    let rhs = overflow.input_dtype("rhs", [2, 1], DType::F64);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.dot_default(lhs, rhs), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}

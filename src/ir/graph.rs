@@ -1,8 +1,8 @@
 use super::*;
 use crate::nn::{ParameterId, ParameterSnapshot};
 use crate::{
-    CompileTrace, DType, EinsumPlan, Error, Result, Scalar, Shape, SymbolicShape, SymbolicVar,
-    TensorData, TraceStep,
+    CompileTrace, DType, EinsumPlan, Error, ReduceKind, ReductionDType, Result, Scalar, Shape,
+    SymbolicShape, SymbolicVar, TensorData, TraceStep,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +49,149 @@ struct CatPlan {
 enum CatLowering {
     Stack,
     PadSum { paddings: Vec<Vec<(usize, usize)>> },
+}
+
+/// Descriptor-first lowering plan for tinygrad's public `Tensor.dot`.
+///
+/// The public source is deliberately not RustGrad's raw Matmul op: it reshapes
+/// both operands into a broadcastable contraction, multiplies in the source
+/// LUB, runs a typed Sum on the final axis, then casts the result back to the
+/// requested/default output storage.  QR and other composite linalg helpers
+/// rely on these accumulator boundaries being observable.
+#[derive(Clone, Debug)]
+struct SourceDotPlan {
+    lhs_shape: Shape,
+    rhs_reshape: Shape,
+    rhs_shape: Shape,
+    rhs_axis: isize,
+    operand_dtype: DType,
+    product_shape: Shape,
+    sum_dtypes: ReductionDType,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn source_dot_plan(
+    graph: &Graph,
+    lhs: NodeId,
+    rhs: NodeId,
+    dtype: Option<DType>,
+) -> Result<SourceDotPlan> {
+    let lhs_node = graph.node(lhs)?;
+    let lhs_source_shape = lhs_node.shape.clone();
+    let lhs_dtype = lhs_node.dtype;
+    let rhs_node = graph.node(rhs)?;
+    let rhs_source_shape = rhs_node.shape.clone();
+    let rhs_dtype = rhs_node.dtype;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(&lhs_source_shape, lhs_dtype)?;
+    extent(&rhs_source_shape, rhs_dtype)?;
+    if lhs_source_shape.rank() == 0 || rhs_source_shape.rank() == 0 {
+        return Err(Error::InvalidMatmul {
+            lhs: lhs_source_shape,
+            rhs: rhs_source_shape,
+        });
+    }
+    let rhs_axis = -(rhs_source_shape.rank().min(2) as isize);
+    let rhs_contract_axis = if rhs_source_shape.rank() == 1 {
+        0
+    } else {
+        rhs_source_shape.rank() - 2
+    };
+    if lhs_source_shape.dims()[lhs_source_shape.rank() - 1]
+        != rhs_source_shape.dims()[rhs_contract_axis]
+    {
+        return Err(Error::InvalidMatmul {
+            lhs: lhs_source_shape,
+            rhs: rhs_source_shape,
+        });
+    }
+
+    // Exact source reshape rule: each operand receives one singleton only
+    // when both original operands have a non-batch matrix axis.
+    let insert_singleton = lhs_source_shape.rank() > 1 && rhs_source_shape.rank() > 1;
+    let mut lhs_dims = lhs_source_shape.dims()[..lhs_source_shape.rank() - 1].to_vec();
+    if insert_singleton {
+        lhs_dims.push(1);
+    }
+    lhs_dims.push(lhs_source_shape.dims()[lhs_source_shape.rank() - 1]);
+    let lhs_shape = Shape::new(lhs_dims);
+
+    let mut rhs_dims = rhs_source_shape.dims()[..rhs_source_shape.rank().saturating_sub(2)].to_vec();
+    if insert_singleton {
+        rhs_dims.push(1);
+    }
+    if rhs_source_shape.rank() == 1 {
+        rhs_dims.push(rhs_source_shape.dims()[0]);
+    } else {
+        rhs_dims.extend_from_slice(&rhs_source_shape.dims()[rhs_source_shape.rank() - 2..]);
+    }
+    let rhs_reshaped = Shape::new(rhs_dims);
+    let mut rhs_transposed_dims = rhs_reshaped.dims().to_vec();
+    let rhs_last = rhs_transposed_dims.len() - 1;
+    let rhs_transpose_axis = if rhs_reshaped.rank() == 1 {
+        0
+    } else {
+        rhs_reshaped.rank() - 2
+    };
+    rhs_transposed_dims.swap(rhs_last, rhs_transpose_axis);
+    let rhs_shape = Shape::new(rhs_transposed_dims);
+    let product_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    let mut output_dims = product_shape.dims().to_vec();
+    output_dims.pop().expect("source dot inputs have rank at least one");
+    let output_shape = Shape::new(output_dims);
+    let operand_dtype = super::elementwise::source_lub(lhs_dtype, rhs_dtype);
+    let sum_dtypes = dtype
+        .map(|dtype| ReductionDType::new(dtype, dtype))
+        .unwrap_or_else(|| ReductionDType::sum_default(operand_dtype));
+    let output_dtype = dtype.unwrap_or(operand_dtype);
+
+    // Every source descriptor, source-LUB cast, elementwise product, typed
+    // reduction boundary, and final storage cast is checked before lowerer
+    // publication. The source Sum takes the product descriptor as input.
+    for (shape, storage) in [
+        (&lhs_source_shape, lhs_dtype),
+        (&rhs_source_shape, rhs_dtype),
+        (&lhs_shape, lhs_dtype),
+        (&rhs_reshaped, rhs_dtype),
+        (&rhs_shape, rhs_dtype),
+        (&lhs_shape, operand_dtype),
+        (&rhs_shape, operand_dtype),
+        (&product_shape, operand_dtype),
+        (&product_shape, sum_dtypes.accumulator),
+        (&output_shape, sum_dtypes.accumulator),
+        (&output_shape, sum_dtypes.output),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, storage)?;
+    }
+    if product_shape.rank() == 0
+        || product_shape.dims().last()
+            != Some(&lhs_source_shape.dims()[lhs_source_shape.rank() - 1])
+        || super::elementwise::source_lub(lhs_dtype, rhs_dtype) != operand_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "source dot promotion",
+            actual: operand_dtype,
+        });
+    }
+    Ok(SourceDotPlan {
+        lhs_shape,
+        rhs_reshape: rhs_reshaped,
+        rhs_shape,
+        rhs_axis,
+        operand_dtype,
+        product_shape,
+        sum_dtypes,
+        output_shape,
+        output_dtype,
+    })
 }
 
 fn cat_source_lub(lhs: DType, rhs: DType) -> DType {
@@ -2099,6 +2242,41 @@ impl Graph {
             Shape::from([size]),
             source.dtype,
         ))
+    }
+
+    /// Checked-in tinygrad's public `Tensor.dot(rhs, dtype)` composition.
+    ///
+    /// This intentionally does not route through raw [`Graph::matmul`]: dot
+    /// has a source-visible typed Sum accumulator and final storage cast.
+    pub fn dot(&mut self, lhs: NodeId, rhs: NodeId, dtype: Option<DType>) -> Result<NodeId> {
+        let plan = source_dot_plan(self, lhs, rhs, dtype)?;
+        let lhs = self.reshape(lhs, plan.lhs_shape.clone())?;
+        let rhs = self.reshape(rhs, plan.rhs_reshape.clone())?;
+        let rhs = self.transpose(rhs, -1, plan.rhs_axis)?;
+        let product = self.mul(lhs, rhs)?;
+        let reduced = self.reduce_with_dtypes(
+            product,
+            ReduceKind::Sum,
+            Some(vec![-1]),
+            false,
+            plan.sum_dtypes,
+        )?;
+        let output = if plan.sum_dtypes.output == plan.output_dtype {
+            reduced
+        } else {
+            self.cast(reduced, plan.output_dtype)?
+        };
+        debug_assert_eq!(self.shape(rhs).expect("source dot preflighted"), &plan.rhs_shape);
+        debug_assert_eq!(self.dtype(product).expect("source dot preflighted"), plan.operand_dtype);
+        debug_assert_eq!(self.shape(product).expect("source dot preflighted"), &plan.product_shape);
+        debug_assert_eq!(self.shape(output).expect("source dot preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("source dot preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Checked-in tinygrad's `Tensor.dot(rhs)` default typed accumulation.
+    pub fn dot_default(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.dot(lhs, rhs, None)
     }
 
     pub fn matmul(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
