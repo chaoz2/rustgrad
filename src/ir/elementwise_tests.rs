@@ -3321,6 +3321,18 @@ fn sqrt_preserves_direct_storage_width_special_values_and_typed_vjp() {
         let source = dtypes.input_dtype(name, [1], dtype);
         let output = dtypes.sqrt(source).unwrap();
         assert_eq!(dtypes.dtype(output).unwrap(), output_dtype);
+        let Op::Unary { op: UnaryOp::Sqrt, input: sqrt_input } = dtypes.op(output).unwrap() else {
+            panic!("public sqrt must end in its raw SQRT ALU");
+        };
+        if dtype.is_float() {
+            assert_eq!(*sqrt_input, source, "{dtype:?} stays a homogeneous SQRT");
+        } else {
+            assert!(matches!(dtypes.op(*sqrt_input).unwrap(), Op::Cast { input, dtype: DType::F32 }
+                if *input == source), "{dtype:?} must use Cast(F32) before SQRT");
+        }
+        // The public cast makes the nonfloat unary UOp homogeneous, while
+        // retaining the raw UnaryOp::Sqrt node for downstream backends.
+        assert!(crate::lower_graph_elementwise(&dtypes, output).is_ok(), "{dtype:?} lowers");
     }
 
     let mut scalar = Graph::new();

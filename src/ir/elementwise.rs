@@ -2011,10 +2011,11 @@ impl Graph {
         self.mul(input, input)
     }
     pub fn sqrt(&mut self, input: NodeId) -> Result<NodeId> {
-        // Tensor.sqrt is the direct SQRT ALU primitive. It retains floating
-        // storage width, while the source unary lattice lifts every nonfloat
-        // input to F32. Validate both concrete descriptors before publishing
-        // the unary node so malformed extents cannot leave a partial graph.
+        // Tensor.sqrt is the direct SQRT ALU primitive. Its source unary
+        // lattice first casts every nonfloat input to the default F32, then
+        // applies SQRT to homogeneous storage. Keep raw UnaryOp::Sqrt
+        // available, but make the public helper's cast boundary explicit so
+        // UOp validation and every fused backend see the same typed ALU.
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
@@ -2026,6 +2027,9 @@ impl Graph {
                 .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         extent(input_dtype)?;
+        if !input_dtype.is_float() {
+            extent(DType::F32)?;
+        }
         extent(output_dtype)?;
         if (!input_dtype.is_float() && output_dtype != DType::F32)
             || (input_dtype.is_float() && output_dtype != input_dtype)
@@ -2035,7 +2039,12 @@ impl Graph {
                 actual: output_dtype,
             });
         }
-        self.unary(UnaryOp::Sqrt, input)
+        let sqrt_input = if input_dtype.is_float() {
+            input
+        } else {
+            self.cast(input, DType::F32)?
+        };
+        self.unary(UnaryOp::Sqrt, sqrt_input)
     }
     pub fn rsqrt(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.rsqrt is intentionally not a raw RSQRT ALU op: tinygrad
