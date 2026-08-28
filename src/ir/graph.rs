@@ -88,6 +88,65 @@ struct QrPlan {
     stages: usize,
 }
 
+/// Concrete whole-operation contract for tinygrad's public
+/// `Tensor.newton_schulz(steps, params, eps)`.
+#[derive(Clone, Debug)]
+struct NewtonSchulzPlan {
+    input_shape: Shape,
+    dtype: DType,
+    transpose_input: bool,
+    iterations: usize,
+}
+
+fn newton_schulz_plan(
+    graph: &Graph,
+    input: NodeId,
+    steps: isize,
+    params: &[i64],
+) -> Result<NewtonSchulzPlan> {
+    let source = graph.node(input)?;
+    let input_shape = source.shape.clone();
+    let dtype = source.dtype;
+    input_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+    if input_shape.rank() < 2 {
+        return Err(Error::InvalidMatmul {
+            lhs: input_shape.clone(),
+            rhs: input_shape,
+        });
+    }
+    // Python's `range(negative)` simply skips the polynomial loop. Its
+    // `functools.reduce` is reached only for a positive iteration count, at
+    // which point an empty generator raises rather than supplying an identity.
+    let iterations = usize::try_from(steps).unwrap_or(0);
+    if iterations > 0 && params.is_empty() {
+        return Err(Error::InvalidRandom {
+            reason: "newton_schulz requires nonempty params for positive steps",
+        });
+    }
+    let rows = input_shape.dims()[input_shape.rank() - 2];
+    let columns = input_shape.dims()[input_shape.rank() - 1];
+    let transpose_input = rows > columns;
+    if transpose_input {
+        let mut transposed = input_shape.dims().to_vec();
+        let last = transposed.len() - 1;
+        transposed.swap(last, last - 1);
+        let transposed = Shape::new(transposed);
+        transposed
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(transposed))?;
+    }
+    Ok(NewtonSchulzPlan {
+        input_shape,
+        dtype,
+        transpose_input,
+        iterations,
+    })
+}
+
 fn qr_plan(graph: &Graph, input: NodeId) -> Result<QrPlan> {
     let source = graph.node(input)?;
     let r_shape = source.shape.clone();
@@ -2410,6 +2469,88 @@ impl Graph {
         debug_assert_eq!(staged.shape(staged_q).expect("qr stage preflighted"), &plan.q_shape);
         debug_assert_eq!(staged.shape(staged_r).expect("qr stage preflighted"), &plan.r_shape);
         self.lower_qr(input, &plan)
+    }
+
+    fn lower_newton_schulz(
+        &mut self,
+        input: NodeId,
+        plan: &NewtonSchulzPlan,
+        params: &[i64],
+        eps: f64,
+    ) -> Result<NodeId> {
+        // The source handles tall matrices through an exact transpose recurse
+        // shell; the working matrix is therefore always no taller than wide.
+        debug_assert_eq!(self.dtype(input).expect("newton_schulz preflighted"), plan.dtype);
+        let working = if plan.transpose_input {
+            self.transpose(input, -2, -1)?
+        } else {
+            input
+        };
+        // `G = self / (sqrt(sum(square(self), (-2,-1), keepdim=True)) + eps)`.
+        let norm = self.sqrt(self.sum_with_options(
+            self.square(working)?,
+            Some(vec![-2, -1]),
+            true,
+            None,
+        )?)?;
+        let mut g = self.div(working, self.add_scalar(norm, Scalar::F(eps))?)?;
+
+        for _ in 0..plan.iterations {
+            // `functools.reduce` has no initializer: the checked plan only
+            // reaches this loop with nonempty params. Preserve generator order
+            // and keep each `(y @ y.T) @ x` expansion separate as in source.
+            let base = g;
+            let mut next = None;
+            for (power, coefficient) in params.iter().copied().enumerate() {
+                let mut x = base;
+                for _ in 0..power {
+                    let gram = self.dot_default(base, self.transpose(base, -2, -1)?)?;
+                    x = self.dot_default(gram, x)?;
+                }
+                let term = self.scalar_mul(Scalar::I(coefficient), x)?;
+                next = Some(match next {
+                    Some(accumulator) => self.add(accumulator, term)?,
+                    None => term,
+                });
+            }
+            g = next.expect("positive Newton-Schulz step has checked params");
+        }
+        let output = if plan.transpose_input {
+            self.transpose(g, -2, -1)?
+        } else {
+            g
+        };
+        debug_assert_eq!(self.shape(output).expect("newton_schulz preflighted"), &plan.input_shape);
+        Ok(output)
+    }
+
+    /// Checked-in tinygrad's concrete static Newton--Schulz polynomial helper.
+    pub fn newton_schulz(
+        &mut self,
+        input: NodeId,
+        steps: isize,
+        params: &[i64],
+        eps: f64,
+    ) -> Result<NodeId> {
+        let plan = newton_schulz_plan(self, input, steps, params)?;
+        // The staging graph proves every iteration's reshape, typed reduction,
+        // scalar commitment, source Dot, broadcast, and byte extent before a
+        // live constant or node is emitted.
+        let mut staged = self.clone();
+        let staged_output = staged.lower_newton_schulz(input, &plan, params, eps)?;
+        debug_assert_eq!(staged.shape(staged_output).expect("newton_schulz staged"), &plan.input_shape);
+        self.lower_newton_schulz(input, &plan, params, eps)
+    }
+
+    /// Source-default epsilon (`1e-7`) form. Steps and polynomial parameters
+    /// are required by tinygrad and intentionally have no invented defaults.
+    pub fn newton_schulz_default_eps(
+        &mut self,
+        input: NodeId,
+        steps: isize,
+        params: &[i64],
+    ) -> Result<NodeId> {
+        self.newton_schulz(input, steps, params, 1.0e-7)
     }
 
     pub fn matmul(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {

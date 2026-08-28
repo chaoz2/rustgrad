@@ -8408,3 +8408,76 @@ fn qr_preflights_rank_and_extent_failures_without_publication() {
     assert!(matches!(overflow.qr(input), Err(Error::ShapeOverflow(_))));
     assert_eq!(overflow.node_count(), before);
 }
+
+#[test]
+fn newton_schulz_is_source_literal_typed_dot_polynomial() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 2], DType::F16);
+    let output = graph.newton_schulz_default_eps(input, 2, &[2, -1, 1]).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 2]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Unary { op: UnaryOp::Sqrt, .. })));
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: true, .. }
+            if axes == &vec![-2, -1])
+    }));
+    // Every polynomial Gram/update product is the typed Dot composite, not
+    // raw Matmul, and lazy/scalar construction never carries a dense payload.
+    assert!(!graph.nodes.iter().any(|node| matches!(&node.op, Op::Matmul { .. })));
+    assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+        Op::Constant(data) => Some(data.len()),
+        _ => None,
+    }).all(|len| len == 1));
+    assert!(graph.grad(graph.sum_all(output).unwrap(), input).is_ok());
+}
+
+#[test]
+fn newton_schulz_covers_rectangular_batches_steps_and_empty_shapes() {
+    let mut tall = Graph::new();
+    let input = tall.input_dtype("x", [3, 2], DType::F32);
+    let output = tall.newton_schulz(input, 1, &[1, -1], f64::INFINITY).unwrap();
+    assert_eq!(tall.shape(output).unwrap(), &Shape::new([3, 2]));
+    assert!(tall.nodes.iter().any(|node| matches!(&node.op, Op::Permute { .. })));
+
+    let mut batched = Graph::new();
+    let input = batched.input_dtype("x", [2, 2, 4], DType::I16);
+    let output = batched.newton_schulz(input, 1, &[2, -1], f64::NAN).unwrap();
+    assert_eq!(batched.shape(output).unwrap(), &Shape::new([2, 2, 4]));
+    assert_eq!(batched.dtype(output).unwrap(), DType::F32);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 3], DType::BF16);
+    let output = empty.newton_schulz_default_eps(input, 1, &[1]).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+
+    // Python `range(-1)` skips the reduce entirely, so empty params are not
+    // observed and the normalized G remains the result.
+    let mut negative = Graph::new();
+    let input = negative.input_dtype("x", [2, 3], DType::F32);
+    let output = negative.newton_schulz_default_eps(input, -1, &[]).unwrap();
+    assert_eq!(negative.shape(output).unwrap(), &Shape::new([2, 3]));
+}
+
+#[test]
+fn newton_schulz_preflights_rank_params_and_overflow_atomically() {
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("x", [], DType::F32);
+    let before = scalar.node_count();
+    assert!(matches!(scalar.newton_schulz_default_eps(input, 1, &[1]), Err(Error::InvalidMatmul { .. })));
+    assert_eq!(scalar.node_count(), before);
+
+    let mut empty_params = Graph::new();
+    let input = empty_params.input("x", [2, 2]);
+    let before = empty_params.node_count();
+    assert!(matches!(
+        empty_params.newton_schulz_default_eps(input, 1, &[]),
+        Err(Error::InvalidRandom { reason: "newton_schulz requires nonempty params for positive steps" })
+    ));
+    assert_eq!(empty_params.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F64);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.newton_schulz_default_eps(input, 1, &[1]), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}
