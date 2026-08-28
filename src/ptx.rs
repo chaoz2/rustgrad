@@ -23,7 +23,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v6";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v7";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -364,8 +364,8 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         return Err(PtxError::Unsupported("Store needs BufferIndex".into()));
     };
     // Narrow storage is deliberately not a generic elementwise capability.
-    // The only exceptions are completely validated public Sign and Abs roots;
-    // both have a source-proven, typed storage boundary.
+    // The only exceptions are completely validated public Sign, Abs, and Neg
+    // roots; each has a source-proven, typed storage boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
@@ -880,11 +880,13 @@ fn reject_sign_storage_dtype(dtype: DType) -> Result<(), PtxError> {
 enum ScopedStorageMode {
     Sign,
     Abs,
+    Neg,
+    NegBool,
 }
 
-/// Validates the only two roots allowed to use the narrow-storage ABI.  The
-/// Abs arm is the exact public `x * x.sign()` DAG, with the same shared Load
-/// on both branches; it is not a general narrow multiplication admission.
+/// Validates the only roots allowed to use the narrow-storage ABI.  The Abs
+/// arm is the exact public `x * x.sign()` DAG, with the same shared Load on
+/// both branches; it is not a general narrow multiplication admission.
 fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
@@ -911,6 +913,18 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             }
             (input, ScopedStorageMode::Abs)
         }
+        UOpKind::GraphUnary(crate::UnaryOp::Neg) => {
+            let [load] = value.sources() else {
+                return Err(PtxError::Unsupported("Neg must have one input".into()));
+            };
+            (load, ScopedStorageMode::Neg)
+        }
+        UOpKind::GraphLogical(crate::LogicalOp::Not) => {
+            let [load] = value.sources() else {
+                return Err(PtxError::Unsupported("logical Neg must have one input".into()));
+            };
+            (load, ScopedStorageMode::NegBool)
+        }
         _ => return Ok(None),
     };
     if !matches!(load.kind(), UOpKind::Load) || load.sources().len() != 1 {
@@ -922,13 +936,13 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         return Err(PtxError::Unsupported("Store without index".into()));
     };
     let Some(input_index) = load.sources().first() else {
-        return Err(PtxError::Unsupported("Sign load without index".into()));
+        return Err(PtxError::Unsupported("scoped load without index".into()));
     };
     if !matches!(output_index.kind(), UOpKind::Index)
         || !matches!(input_index.kind(), UOpKind::Index)
     {
         return Err(PtxError::Unsupported(
-            "Sign narrow-storage ABI requires typed indices".into(),
+            "scoped narrow-storage ABI requires typed indices".into(),
         ));
     }
     let dtype = value
@@ -940,6 +954,16 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     {
         return Err(PtxError::Unsupported(
             "Abs narrow-storage ABI requires a preserved Sign dtype".into(),
+        ));
+    }
+    if mode == ScopedStorageMode::NegBool && dtype != DType::Bool {
+        return Err(PtxError::Unsupported(
+            "logical Neg narrow-storage ABI requires Bool".into(),
+        ));
+    }
+    if mode == ScopedStorageMode::Neg && dtype == DType::Bool {
+        return Err(PtxError::Unsupported(
+            "numeric Neg narrow-storage ABI excludes Bool".into(),
         ));
     }
     if load.ty().map(|ty| ty.scalar) != Some(dtype)
@@ -980,7 +1004,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         ));
     }
     reject_sign_storage_dtype(dtype)?;
-    if dtype == DType::F16 && sm < 53 {
+    if dtype == DType::F16 && sm < 53 && mode != ScopedStorageMode::Neg {
         return Err(PtxError::Unsupported(
             "F16 scoped storage conversion requires sm_53 or newer".into(),
         ));
@@ -1113,6 +1137,12 @@ fn emit(
     };
     let dst = match ty {
         DType::F16 | DType::BF16
+            if storage_mode == Some(ScopedStorageMode::Neg)
+                && matches!(n.kind(), UOpKind::Load | UOpKind::GraphUnary(crate::UnaryOp::Neg)) =>
+        {
+            format!("%r{id}")
+        }
+        DType::F16 | DType::BF16
             if storage_mode == Some(ScopedStorageMode::Sign)
                 && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Sign)) =>
         {
@@ -1171,12 +1201,16 @@ fn emit(
             match ty {
                 DType::F16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
-                    lines.push(format!("  cvt.rn.f32.f16 {dst}, %r{id};"));
+                    if storage_mode != Some(ScopedStorageMode::Neg) {
+                        lines.push(format!("  cvt.rn.f32.f16 {dst}, %r{id};"));
+                    }
                 }
                 DType::BF16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
-                    lines.push(format!("  shl.b32 %r90, %r{id}, 16;"));
-                    lines.push(format!("  mov.b32 {dst}, %r90;"));
+                    if storage_mode != Some(ScopedStorageMode::Neg) {
+                        lines.push(format!("  shl.b32 %r90, %r{id}, 16;"));
+                        lines.push(format!("  mov.b32 {dst}, %r90;"));
+                    }
                 }
                 _ => lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty))),
             }
@@ -1195,6 +1229,29 @@ fn emit(
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
+            if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
+                match ty {
+                    DType::I8 | DType::I16 | DType::I32 => {
+                        lines.push(format!("  neg.s32 {dst}, {a};"));
+                    }
+                    DType::U8 | DType::U16 | DType::U32 => {
+                        lines.push(format!("  sub.u32 {dst}, 0, {a};"));
+                    }
+                    DType::I64 => lines.push(format!("  neg.s64 {dst}, {a};")),
+                    DType::U64 => lines.push(format!("  sub.u64 {dst}, 0, {a};")),
+                    DType::F16 | DType::BF16 => {
+                        lines.push(format!("  xor.b32 {dst}, {a}, 0x8000;"));
+                    }
+                    DType::F32 => {
+                        lines.push(format!("  xor.b32 {dst}, {a}, 0x80000000;"));
+                    }
+                    DType::F64 => {
+                        lines.push(format!("  xor.b64 {dst}, {a}, 0x8000000000000000;"));
+                    }
+                    DType::Bool => unreachable!(),
+                }
+                return Ok(dst);
+            }
             if *op == crate::UnaryOp::Sign {
                 // Sign is source-equivalent to ordered comparisons and
                 // selects, rather than PTX's host-dependent `sign` intrinsic.
@@ -1335,6 +1392,13 @@ fn emit(
                 "  setp.{pred}.{} %p1, {a}, {b};",
                 ptx_type(n.sources()[0].ty().unwrap().scalar)
             ));
+            lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+        }
+        UOpKind::GraphLogical(crate::LogicalOp::Not)
+            if storage_mode == Some(ScopedStorageMode::NegBool) =>
+        {
+            let a = child(0)?;
+            lines.push(format!("  setp.eq.u8 %p1, {a}, 0;"));
             lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
         }
         UOpKind::Ternary(crate::uop::Ternary::Where) => {
@@ -4052,6 +4116,94 @@ mod tests {
         assert!(matches!(
             &vjp.node(gradient).unwrap().op,
             &crate::Op::Constant(_)
+        ));
+    }
+
+    #[test]
+    fn public_neg_has_a_scoped_raw_storage_path() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, operation, store) in [
+            (DType::Bool, "setp.eq.u8", "st.global.u8"),
+            (DType::I8, "neg.s32", "st.global.s8"),
+            (DType::U8, "sub.u32", "st.global.u8"),
+            (DType::I16, "neg.s32", "st.global.s16"),
+            (DType::U16, "sub.u32", "st.global.u16"),
+            (DType::I32, "neg.s32", "st.global.s32"),
+            (DType::U32, "sub.u32", "st.global.u32"),
+            (DType::I64, "neg.s64", "st.global.s64"),
+            (DType::U64, "sub.u64", "st.global.u64"),
+            (DType::F16, "xor.b32", "st.global.b16"),
+            (DType::BF16, "xor.b32", "st.global.b16"),
+            (DType::F32, "xor.b32", "st.global.f32"),
+            (DType::F64, "xor.b64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], dtype);
+            let output = graph.neg(input).unwrap();
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(first.source.contains(operation), "{dtype:?} Neg operation");
+            assert!(first.source.contains(store), "{dtype:?} Neg store");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} Neg key");
+        }
+        let f16 = {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], DType::F16);
+            let output = graph.neg(input).unwrap();
+            renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap()
+                .source
+        };
+        assert!(f16.contains("xor.b32"));
+        assert!(!f16.contains("cvt.rn.f32.f16"));
+        let mut legacy_f16 = Graph::new();
+        let input = legacy_f16.input_dtype("x", [1], DType::F16);
+        let output = legacy_f16.neg(input).unwrap();
+        assert!(PtxRenderer::new(52)
+            .unwrap()
+            .render(&crate::lower_graph_elementwise(&legacy_f16, output).unwrap())
+            .is_ok());
+        let bf16 = {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], DType::BF16);
+            let output = graph.neg(input).unwrap();
+            renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap()
+                .source
+        };
+        assert!(bf16.contains("0x8000"));
+        assert!(!bf16.contains("shl.b32"));
+
+        // The raw-bit exception is root-scoped: no other narrow unary or
+        // compound expression inherits this admission.
+        assert!(matches!(
+            renderer.render(&unary_kernel(DType::F16, crate::UnaryOp::Abs, crate::Shape::new(vec![1]))),
+            Err(PtxError::Unsupported(_))
+        ));
+        let mut compound = Graph::new();
+        let input = compound.input_dtype("x", [1], DType::F16);
+        let negated = compound.neg(input).unwrap();
+        let combined = compound.add(input, negated).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+
+        // Numeric Neg retains its source-composed reverse rule; Bool is a
+        // logical predicate and remains outside differentiable paths.
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype("x", [], DType::F32);
+        let output = vjp.neg(input).unwrap();
+        let gradient = vjp.grad(output, input).unwrap();
+        assert!(matches!(
+            &vjp.node(gradient).unwrap().op,
+            &crate::Op::Unary { op: crate::UnaryOp::Neg, .. }
         ));
     }
 
