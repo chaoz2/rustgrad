@@ -5617,6 +5617,53 @@ fn lerp_preflights_all_operands_and_preserves_broadcast_vjps() {
 }
 
 #[test]
+fn lerp_u8_live_weight_uses_tinygrad_fixed_point_path() {
+    // The checked-in source has a non-generic U8/tensor-weight path. It must
+    // retain the I8 delta, I16 quantized weight, U16 rounding/shift, and final
+    // U8 cast rather than silently taking the ordinary lerp graph.
+    let mut graph = Graph::new();
+    let start = graph.input_dtype("start", [2, 1], DType::U8);
+    let end = graph.input_dtype("end", [3], DType::U8);
+    let weight = graph.input_dtype("weight", [2, 3], DType::I16);
+    let output = graph.lerp(start, end, weight).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::U8);
+
+    let Op::Cast { input: final_add, dtype } = graph.op(output).unwrap() else {
+        panic!("U8 lerp must finish with its source cast")
+    };
+    assert_eq!(*dtype, DType::U8);
+    let Op::Binary { op: BinaryOp::Add, rhs: shifted, .. } = graph.op(*final_add).unwrap() else {
+        panic!("U8 lerp must add the shifted fixed-point delta")
+    };
+    let Op::Binary { op: BinaryOp::Shr, rhs: shift, .. } = graph.op(*shifted).unwrap() else {
+        panic!("U8 lerp must use its fixed seven-bit shift")
+    };
+    assert!(matches!(
+        graph.op(*shift).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::U16 && data.scalar_at(0).as_u64() == 7
+    ));
+    let operations: Vec<_> = graph
+        .trace(output)
+        .unwrap()
+        .steps
+        .into_iter()
+        .map(|step| step.operation)
+        .collect();
+    assert!(operations.iter().any(|operation| operation.contains("I8")));
+    assert!(operations.iter().any(|operation| operation.contains("I16")));
+    assert!(operations.iter().any(|operation| operation.contains("F32")));
+
+    let mut empty = Graph::new();
+    let start = empty.input_dtype("start", [0, 1], DType::U8);
+    let end = empty.input_dtype("end", [3], DType::U8);
+    let weight = empty.input_dtype("weight", [0, 3], DType::F16);
+    let output = empty.lerp(start, end, weight).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::U8);
+}
+
+#[test]
 fn linear_matches_tinygrad_weight_layout_dtype_and_vjps() {
     let mut graph = Graph::new();
     let input = graph.input("input", [2, 2]);

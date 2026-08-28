@@ -136,6 +136,155 @@ struct CopysignPlan {
     reciprocal_zero: TensorData,
 }
 
+/// Fully resolved public `Tensor.lerp` descriptor. Tinygrad ordinarily uses
+/// `start + (end - start) * weight`, but has a separate fixed-point path when
+/// the start value is a live U8 tensor. The latter is intentionally planned
+/// here rather than approximated by the ordinary float/integer expression.
+struct LerpPlan {
+    special_u8: bool,
+    output_shape: Shape,
+    output_dtype: DType,
+    difference_dtype: DType,
+    weighted_dtype: DType,
+    weight_scale_dtype: DType,
+    weight_fraction_dtype: DType,
+    scale: Option<TensorData>,
+    half: Option<TensorData>,
+    rounding: Option<TensorData>,
+    shift: Option<TensorData>,
+}
+
+fn lerp_source_lub(lhs: DType, rhs: DType) -> DType {
+    if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
+}
+
+fn lerp_plan(
+    start_shape: &Shape,
+    start_dtype: DType,
+    end_shape: &Shape,
+    end_dtype: DType,
+    weight_shape: &Shape,
+    weight_dtype: DType,
+) -> Result<LerpPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    let difference_shape = end_shape.broadcast_with(start_shape)?;
+    let difference_dtype = lerp_source_lub(end_dtype, start_dtype);
+    let weighted_shape = difference_shape.broadcast_with(weight_shape)?;
+    let weighted_dtype = lerp_source_lub(difference_dtype, weight_dtype);
+    let output_shape = start_shape.broadcast_with(&weighted_shape)?;
+
+    for (shape, dtype) in [
+        (start_shape, start_dtype),
+        (end_shape, end_dtype),
+        (weight_shape, weight_dtype),
+        (&difference_shape, difference_dtype),
+        (&weighted_shape, weighted_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+
+    if start_dtype != DType::U8 {
+        let output_dtype = lerp_source_lub(start_dtype, weighted_dtype);
+        extent(&output_shape, output_dtype)?;
+        return Ok(LerpPlan {
+            special_u8: false,
+            output_shape,
+            output_dtype,
+            difference_dtype,
+            weighted_dtype,
+            weight_scale_dtype: weight_dtype,
+            weight_fraction_dtype: weight_dtype,
+            scale: None,
+            half: None,
+            rounding: None,
+            shift: None,
+        });
+    }
+
+    // tinygrad's U8/tensor-weight branch is:
+    // `(start + (((end-start).cast(I8) * w_i + 64).cast(U16) >> 7)).cast(U8)`
+    // where `w_i = (weight * 128 + .5).cast(I16)`. Weak 128 commits at the
+    // live weight width (Bool first resolves to default I32); weak .5 then
+    // commits at that float width or the default F32 after integer arithmetic.
+    let weight_scale_dtype = if weight_dtype == DType::Bool {
+        DType::I32
+    } else {
+        weight_dtype
+    };
+    let weight_fraction_dtype = if weight_dtype.is_float() {
+        weight_dtype
+    } else {
+        DType::F32
+    };
+    let fixed_difference_dtype = DType::I8;
+    let fixed_weight_dtype = DType::I16;
+    let fixed_accumulator_dtype = DType::U16;
+    let fixed_shape = difference_shape.broadcast_with(weight_shape)?;
+    let special_output_shape = start_shape.broadcast_with(&fixed_shape)?;
+    for (shape, dtype) in [
+        (&difference_shape, fixed_difference_dtype),
+        (weight_shape, weight_scale_dtype),
+        (weight_shape, weight_scale_dtype),
+        (weight_shape, weight_fraction_dtype),
+        (weight_shape, fixed_weight_dtype),
+        (&fixed_shape, fixed_weight_dtype),
+        (&fixed_shape, fixed_accumulator_dtype),
+        (&fixed_shape, fixed_accumulator_dtype),
+        (&special_output_shape, fixed_accumulator_dtype),
+        (&special_output_shape, DType::U8),
+    ] {
+        extent(shape, dtype)?;
+    }
+    let scale = TensorData::scalar_with_dtype(Scalar::I(128), weight_scale_dtype);
+    let half = TensorData::scalar_with_dtype(Scalar::F(0.5), weight_fraction_dtype);
+    let rounding = TensorData::scalar_with_dtype(Scalar::I(64), fixed_weight_dtype);
+    let shift = TensorData::scalar_with_dtype(Scalar::I(7), fixed_accumulator_dtype);
+    for scalar in [&scale, &half, &rounding, &shift] {
+        extent(scalar.shape(), scalar.dtype())?;
+    }
+    if difference_dtype != lerp_source_lub(end_dtype, start_dtype)
+        || weight_scale_dtype.promote(scale.dtype()) != weight_scale_dtype
+        || weight_fraction_dtype.promote(half.dtype()) != weight_fraction_dtype
+        || fixed_weight_dtype.promote(rounding.dtype()) != fixed_weight_dtype
+        || fixed_accumulator_dtype.promote(shift.dtype()) != fixed_accumulator_dtype
+        || weight_shape.broadcast_with(scale.shape())? != *weight_shape
+        || weight_shape.broadcast_with(half.shape())? != *weight_shape
+        || fixed_shape.broadcast_with(rounding.shape())? != fixed_shape
+        || fixed_shape.broadcast_with(shift.shape())? != fixed_shape
+        || lerp_source_lub(fixed_difference_dtype, fixed_weight_dtype) != fixed_weight_dtype
+        || lerp_source_lub(start_dtype, fixed_accumulator_dtype) != fixed_accumulator_dtype
+        || special_output_shape != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "lerp U8 fixed-point source promotion",
+            actual: weight_fraction_dtype,
+        });
+    }
+    Ok(LerpPlan {
+        special_u8: true,
+        output_shape,
+        output_dtype: DType::U8,
+        difference_dtype,
+        weighted_dtype: fixed_weight_dtype,
+        weight_scale_dtype,
+        weight_fraction_dtype,
+        scale: Some(scale),
+        half: Some(half),
+        rounding: Some(rounding),
+        shift: Some(shift),
+    })
+}
+
 fn copysign_plan(
     magnitude_shape: &Shape,
     magnitude_dtype: DType,
@@ -3949,11 +4098,70 @@ impl Graph {
         self.add(log, maximum)
     }
     pub fn lerp(&mut self, start: NodeId, end: NodeId, weight: NodeId) -> Result<NodeId> {
-        let start_end_shape = self.broadcast_shape(start, end)?;
-        start_end_shape.broadcast_with(&self.node(weight)?.shape)?;
-        let delta = self.sub(end, start)?;
-        let weighted = self.mul(delta, weight)?;
-        self.add(start, weighted)
+        let start_node = self.node(start)?;
+        let start_shape = start_node.shape.clone();
+        let start_dtype = start_node.dtype;
+        let end_node = self.node(end)?;
+        let end_shape = end_node.shape.clone();
+        let end_dtype = end_node.dtype;
+        let weight_node = self.node(weight)?;
+        let weight_shape = weight_node.shape.clone();
+        let weight_dtype = weight_node.dtype;
+        let plan = lerp_plan(
+            &start_shape,
+            start_dtype,
+            &end_shape,
+            end_dtype,
+            &weight_shape,
+            weight_dtype,
+        )?;
+
+        if !plan.special_u8 {
+            let delta = self.sub(end, start)?;
+            let weighted = self.mul(delta, weight)?;
+            let output = self.add(start, weighted)?;
+            debug_assert_eq!(self.shape(delta).expect("lerp preflighted"), &end_shape.broadcast_with(&start_shape).expect("lerp preflighted"));
+            debug_assert_eq!(self.dtype(delta).expect("lerp preflighted"), plan.difference_dtype);
+            debug_assert_eq!(self.dtype(weighted).expect("lerp preflighted"), plan.weighted_dtype);
+            debug_assert_eq!(self.shape(output).expect("lerp preflighted"), &plan.output_shape);
+            debug_assert_eq!(self.dtype(output).expect("lerp preflighted"), plan.output_dtype);
+            return Ok(output);
+        }
+
+        // Checked-in tinygrad has a tensor-weight U8 interpolation path that
+        // is deliberately fixed-point, not the generic `start + delta*w`
+        // expression. Keep every visible cast boundary: in particular, the
+        // width-local `weight * 128` happens before integer weights widen for
+        // the weak `.5` addition.
+        let difference = self.cast(self.sub(end, start)?, DType::I8)?;
+        let weight = if weight_dtype == plan.weight_scale_dtype {
+            weight
+        } else {
+            self.cast(weight, plan.weight_scale_dtype)?
+        };
+        let scaled = self.mul(weight, self.constant(plan.scale.clone().expect("lerp U8 plan")))?;
+        let scaled = if plan.weight_scale_dtype == plan.weight_fraction_dtype {
+            scaled
+        } else {
+            self.cast(scaled, plan.weight_fraction_dtype)?
+        };
+        let weight = self.cast(
+            self.add(scaled, self.constant(plan.half.clone().expect("lerp U8 plan")))?,
+            DType::I16,
+        )?;
+        let product = self.mul(difference, weight)?;
+        let rounded = self.add(
+            product,
+            self.constant(plan.rounding.clone().expect("lerp U8 plan")),
+        )?;
+        let shifted = self.shr(
+            self.cast(rounded, DType::U16)?,
+            self.constant(plan.shift.clone().expect("lerp U8 plan")),
+        )?;
+        let output = self.cast(self.add(start, shifted)?, DType::U8)?;
+        debug_assert_eq!(self.shape(output).expect("lerp preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("lerp preflighted"), plan.output_dtype);
+        Ok(output)
     }
     pub fn isclose(
         &mut self,
