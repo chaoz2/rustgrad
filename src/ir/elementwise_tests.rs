@@ -7737,21 +7737,21 @@ fn linear_matches_tinygrad_weight_layout_dtype_and_vjps() {
     assert_eq!(graph.dtype(input_gradient).unwrap(), DType::F32);
     assert_eq!(
         CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64(),
-        vec![5.5, 10.5, 11.5, 24.5]
+        vec![7.5, 9.5, 15.5, 21.5]
     );
     assert_eq!(
         CpuBackend
             .execute(&graph, input_gradient, &bindings)
             .unwrap()
             .to_vec_f64(),
-        vec![4.0, 6.0, 4.0, 6.0]
+        vec![3.0, 7.0, 3.0, 7.0]
     );
     assert_eq!(
         CpuBackend
             .execute(&graph, weight_gradient, &bindings)
             .unwrap()
             .to_vec_f64(),
-        vec![4.0, 6.0, 4.0, 6.0]
+        vec![4.0, 4.0, 6.0, 6.0]
     );
     assert_eq!(
         CpuBackend
@@ -7822,6 +7822,53 @@ fn linear_matches_tinygrad_weight_layout_dtype_and_vjps() {
         Err(Error::InvalidMatmul { .. })
     ));
     assert_eq!(malformed.node_count(), node_count);
+}
+
+#[test]
+fn linear_is_source_dot_not_raw_matmul_and_is_atomic() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F16);
+    // tinygrad passes this `[contract, output]` descriptor directly to dot.
+    let weight = graph.input_dtype("weight", [3, 4], DType::BF16);
+    let bias = graph.input_dtype("bias", [4], DType::I64);
+    let output = graph.linear(input, weight, Some(bias), Some(DType::F32)).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 4]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!((0..graph.node_count()).all(|node| !matches!(graph.op(NodeId(node)).unwrap(), Op::Matmul { .. })));
+    assert!((0..graph.node_count()).any(|node| matches!(graph.op(NodeId(node)).unwrap(), Op::Binary { op: BinaryOp::Mul, .. })));
+    assert!((0..graph.node_count()).any(|node| matches!(graph.op(NodeId(node)).unwrap(), Op::Reduce { kind: ReduceKind::Sum, .. })));
+    // Dot's sole transpose applies to its own reshaped rhs, never directly
+    // to the caller's weight as the stale conventional layout did.
+    assert!((0..graph.node_count()).filter_map(|node| match graph.op(NodeId(node)).unwrap() {
+        Op::Permute { input, .. } => Some(*input),
+        _ => None,
+    }).all(|input| matches!(graph.op(input).unwrap(), Op::Reshape { .. })));
+    let loss = graph.sum_all(output).unwrap();
+    assert_eq!(graph.shape(graph.grad(loss, input).unwrap()).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.shape(graph.grad(loss, weight).unwrap()).unwrap(), &Shape::new([3, 4]));
+    assert_eq!(graph.shape(graph.grad(loss, bias).unwrap()).unwrap(), &Shape::new([4]));
+
+    let mut rank_one = Graph::new();
+    let input = rank_one.input_dtype("input", [2, 3], DType::U8);
+    let weight = rank_one.input_dtype("weight", [3], DType::I16);
+    let output = rank_one.linear(input, weight, None, None).unwrap();
+    assert_eq!(rank_one.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert!((0..rank_one.node_count()).all(|node| !matches!(rank_one.op(NodeId(node)).unwrap(), Op::Reduce { .. } | Op::Matmul { .. })));
+
+    let mut zero = Graph::new();
+    let input = zero.input_dtype("input", [2, 0, 3], DType::F16);
+    let weight = zero.input_dtype("weight", [3, 4], DType::F16);
+    let output = zero.linear(input, weight, None, None).unwrap();
+    assert_eq!(zero.shape(output).unwrap(), &Shape::new([2, 0, 4]));
+
+    let mut malformed = Graph::new();
+    let input = malformed.input_dtype("input", [usize::MAX / 8, 1], DType::F32);
+    let weight = malformed.input_dtype("weight", [1, 3], DType::F32);
+    let before = malformed.node_count();
+    assert!(matches!(malformed.linear(input, weight, None, None), Err(Error::ShapeOverflow(_))));
+    assert_eq!(malformed.node_count(), before);
+    assert!(matches!(malformed.linear(NodeId(usize::MAX), weight, None, None), Err(Error::UnknownNode(_))));
+    assert_eq!(malformed.node_count(), before);
 }
 
 #[test]

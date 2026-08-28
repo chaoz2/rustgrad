@@ -72,6 +72,20 @@ struct SourceDotPlan {
     output_dtype: DType,
 }
 
+/// Whole-operation contract for tinygrad's public `Tensor.linear` helper.
+///
+/// Unlike a conventional framework linear layer, the source receives a
+/// weight already in `Tensor.dot` geometry. A requested dtype is an
+/// operand-storage cast followed by the ordinary default-Dot path, never an
+/// instruction to raw Matmul or to Dot's explicit accumulator override.
+#[derive(Clone, Debug)]
+struct LinearPlan {
+    dtype: Option<DType>,
+    rank_one_weight: bool,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
 /// Whole-operation descriptor contract for tinygrad's static Householder QR.
 ///
 /// The source unrolls exactly `min(m, n)` reflector updates over concrete
@@ -304,6 +318,84 @@ fn source_dot_plan(
         output_shape,
         output_dtype,
     })
+}
+
+fn linear_plan(
+    graph: &Graph,
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+    dtype: Option<DType>,
+) -> Result<LinearPlan> {
+    let input_node = graph.node(input)?;
+    let weight_node = graph.node(weight)?;
+    let bias_node = bias.map(|node| graph.node(node)).transpose()?;
+    if weight_node.shape.rank() == 0 {
+        return Err(Error::InvalidMatmul {
+            lhs: input_node.shape.clone(),
+            rhs: weight_node.shape.clone(),
+        });
+    }
+    let extent = |shape: &Shape, storage: DType| {
+        shape
+            .numel()?
+            .checked_mul(storage.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(&input_node.shape, input_node.dtype)?;
+    extent(&weight_node.shape, weight_node.dtype)?;
+    if let Some(bias) = bias_node {
+        extent(&bias.shape, bias.dtype)?;
+    }
+    if let Some(dtype) = dtype {
+        // `self.cast(dt).linear(weight.cast(dt), bias.cast(dt))`: all three
+        // cast descriptors must be valid before a source-Dot reshape or a
+        // scalar can appear in the caller graph.
+        extent(&input_node.shape, dtype)?;
+        extent(&weight_node.shape, dtype)?;
+        if let Some(bias) = bias_node {
+            extent(&bias.shape, dtype)?;
+        }
+    }
+
+    // The private clone is the complete remaining descriptor pass: Dot owns
+    // its source-LUB reshape/transpose/Mul/typed-Sum contract, and Add owns
+    // the final live bias broadcast. It leaves the caller graph unchanged on
+    // every late shape, dtype, or byte failure.
+    let mut rehearsal = graph.clone();
+    let output = lower_linear(&mut rehearsal, input, weight, bias, dtype)?;
+    let output_shape = rehearsal.shape(output)?.clone();
+    let output_dtype = rehearsal.dtype(output)?;
+    extent(&output_shape, output_dtype)?;
+    Ok(LinearPlan {
+        dtype,
+        rank_one_weight: weight_node.shape.rank() == 1,
+        output_shape,
+        output_dtype,
+    })
+}
+
+fn lower_linear(
+    graph: &mut Graph,
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+    dtype: Option<DType>,
+) -> Result<NodeId> {
+    let input = if let Some(dtype) = dtype { graph.cast(input, dtype)? } else { input };
+    let weight = if let Some(dtype) = dtype { graph.cast(weight, dtype)? } else { weight };
+    let bias = if let (Some(bias), Some(dtype)) = (bias, dtype) {
+        Some(graph.cast(bias, dtype)?)
+    } else {
+        bias
+    };
+    let output = if graph.shape(weight)?.rank() == 1 {
+        graph.mul(input, weight)?
+    } else {
+        graph.dot_default(input, weight)?
+    };
+    if let Some(bias) = bias { graph.add(output, bias) } else { Ok(output) }
 }
 
 fn cat_source_lub(lhs: DType, rhs: DType) -> DType {
@@ -2567,13 +2659,12 @@ impl Graph {
         Ok(self.push(Op::Matmul { lhs, rhs }, shape, dtype))
     }
 
-    /// Applies tinygrad's functional linear composition.
+    /// Applies checked-in tinygrad's functional linear composition.
     ///
-    /// A rank-one weight is multiplied elementwise. Otherwise, the final two
-    /// weight axes are exchanged before generalized matmul, so a conventional
-    /// `[out_features, in_features]` weight contracts its final axis with the
-    /// input's final axis. An optional `dtype` casts every operand before the
-    /// composition, matching tinygrad's explicit accumulation-dtype path.
+    /// Rank-one weights are elementwise multipliers; all other weights are
+    /// passed unchanged to source-literal [`Self::dot_default`]. In
+    /// particular this method does not transpose a conventional NN layout or
+    /// publish raw Matmul.
     pub fn linear(
         &mut self,
         input: NodeId,
@@ -2581,52 +2672,15 @@ impl Graph {
         bias: Option<NodeId>,
         dtype: Option<DType>,
     ) -> Result<NodeId> {
-        let input_shape = self.node(input)?.shape.clone();
-        let weight_shape = self.node(weight)?.shape.clone();
-        let bias_shape = bias.map(|bias| Ok(self.node(bias)?.shape.clone())).transpose()?;
-
-        if weight_shape.rank() == 0 {
-            return Err(Error::InvalidMatmul {
-                lhs: input_shape,
-                rhs: weight_shape,
-            });
-        }
-
-        let (output_shape, weight_permutation) = if weight_shape.rank() == 1 {
-            (input_shape.broadcast_with(&weight_shape)?, None)
-        } else {
-            let rank = weight_shape.rank();
-            let mut permutation = (0..rank).collect::<Vec<_>>();
-            permutation.swap(rank - 2, rank - 1);
-            let mut transposed = weight_shape.dims().to_vec();
-            transposed.swap(rank - 2, rank - 1);
-            let transposed = Shape::new(transposed);
-            let shape = matmul_shape(&input_shape, &transposed).ok_or_else(|| {
-                Error::InvalidMatmul {
-                    lhs: input_shape.clone(),
-                    rhs: transposed,
-                }
-            })?;
-            (shape, Some(permutation))
-        };
-        output_shape.numel()?;
-        if let Some(bias_shape) = &bias_shape {
-            output_shape.broadcast_with(bias_shape)?;
-        }
-
-        let input = dtype.map_or(Ok(input), |dtype| self.cast(input, dtype))?;
-        let weight = dtype.map_or(Ok(weight), |dtype| self.cast(weight, dtype))?;
-        let bias = bias
-            .map(|bias| dtype.map_or(Ok(bias), |dtype| self.cast(bias, dtype)))
-            .transpose()?;
-        let output = match weight_permutation {
-            Some(permutation) => {
-                let weight = self.permute(weight, permutation)?;
-                self.matmul(input, weight)?
-            }
-            None => self.mul(input, weight)?,
-        };
-        bias.map_or(Ok(output), |bias| self.add(output, bias))
+        let plan = linear_plan(self, input, weight, bias, dtype)?;
+        let output = lower_linear(self, input, weight, bias, plan.dtype)?;
+        debug_assert_eq!(self.shape(output).expect("linear preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("linear preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(weight).expect("linear preflighted").rank() == 1,
+            plan.rank_one_weight
+        );
+        Ok(output)
     }
 
     /// Adds a static dense Einstein summation node with NumPy/tinygrad-style
