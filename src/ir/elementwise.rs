@@ -76,6 +76,89 @@ struct ReluPlan {
     zero: TensorData,
 }
 
+/// The complete descriptor and weak-scalar commitment plan for tinygrad's
+/// public `Tensor.allclose`. The tolerance literals remain local to this
+/// helper: they are weak Python floats in source and commit at the dtype of
+/// `other.abs()`, not necessarily at the dtype of `self - other`.
+struct AllclosePlan {
+    output_shape: Shape,
+    tolerance_dtype: DType,
+    rtol: TensorData,
+    atol: TensorData,
+}
+
+fn allclose_plan(
+    lhs_shape: &Shape,
+    lhs_dtype: DType,
+    rhs_shape: &Shape,
+    rhs_dtype: DType,
+    rtol: f64,
+    atol: f64,
+) -> Result<AllclosePlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(lhs_shape, lhs_dtype)?;
+    extent(rhs_shape, rhs_dtype)?;
+
+    // `self - other` promotes both operands, whereas tinygrad independently
+    // computes `other.abs()` before multiplying it by the weak `rtol` float.
+    let output_shape = lhs_shape.broadcast_with(rhs_shape)?;
+    let difference_dtype = lhs_dtype.promote(rhs_dtype);
+    extent(&output_shape, difference_dtype)?; // subtraction
+    extent(&output_shape, difference_dtype)?; // absolute difference
+    extent(rhs_shape, rhs_dtype)?; // other.abs()
+
+    let tolerance_dtype = if rhs_dtype.is_float() { rhs_dtype } else { DType::F32 };
+    let rtol = TensorData::scalar_with_dtype(Scalar::F(rtol), tolerance_dtype);
+    let atol = TensorData::scalar_with_dtype(Scalar::F(atol), tolerance_dtype);
+    extent(rtol.shape(), rtol.dtype())?;
+    extent(atol.shape(), atol.dtype())?;
+    let relative_shape = rhs_shape.broadcast_with(rtol.shape())?;
+    let tolerance_shape = relative_shape.broadcast_with(atol.shape())?;
+    extent(&relative_shape, tolerance_dtype)?;
+    extent(&tolerance_shape, tolerance_dtype)?;
+
+    let near_shape = output_shape.broadcast_with(&tolerance_shape)?;
+    let comparison_dtype = difference_dtype.promote(tolerance_dtype);
+    extent(&near_shape, comparison_dtype)?;
+    extent(&near_shape, DType::Bool)?;
+    // Source emits isfinite, isinf, and isnan for both operands. Verify each
+    // predicate descriptor independently, then every Bool combination.
+    for _ in 0..3 {
+        extent(lhs_shape, DType::Bool)?;
+        extent(rhs_shape, DType::Bool)?;
+    }
+    for _ in 0..9 {
+        extent(&output_shape, DType::Bool)?;
+    }
+    let reduced_shape = Shape::new([]);
+    extent(&reduced_shape, DType::Bool)?;
+
+    if rtol.dtype() != tolerance_dtype
+        || atol.dtype() != tolerance_dtype
+        || relative_shape != *rhs_shape
+        || tolerance_shape != *rhs_shape
+        || near_shape != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "allclose scalar promotion",
+            actual: tolerance_dtype,
+        });
+    }
+
+    Ok(AllclosePlan {
+        output_shape,
+        tolerance_dtype,
+        rtol,
+        atol,
+    })
+}
+
 fn relu_plan(input_shape: &Shape, input_dtype: DType) -> Result<ReluPlan> {
     // tinygrad spells ReLU as `(x > 0).where(x, 0)`.  The scalar zero is weak
     // at x's storage dtype, and every intermediate is concrete: x and zero
@@ -3533,6 +3616,37 @@ impl Graph {
         } else {
             Ok(result)
         }
+    }
+
+    /// Reduces tinygrad's public elementwise `isclose` predicate to one Bool
+    /// scalar. Python float tolerances are committed at `rhs.abs()`'s source
+    /// width before any constant or graph node is published.
+    pub fn allclose(
+        &mut self,
+        lhs: NodeId,
+        rhs: NodeId,
+        rtol: f64,
+        atol: f64,
+        equal_nan: bool,
+    ) -> Result<NodeId> {
+        let (lhs_shape, lhs_dtype) = {
+            let source = self.node(lhs)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let (rhs_shape, rhs_dtype) = {
+            let source = self.node(rhs)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let plan = allclose_plan(&lhs_shape, lhs_dtype, &rhs_shape, rhs_dtype, rtol, atol)?;
+        let rtol = self.constant(plan.rtol);
+        let atol = self.constant(plan.atol);
+        let close = self.isclose(lhs, rhs, rtol, atol, equal_nan)?;
+        let output = self.all(close, None, false)?;
+        debug_assert_eq!(self.shape(close).expect("allclose preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.shape(output).expect("allclose preflighted"), &Shape::new([]));
+        debug_assert_eq!(self.dtype(output).expect("allclose preflighted"), DType::Bool);
+        debug_assert_eq!(self.dtype(rtol).expect("allclose preflighted"), plan.tolerance_dtype);
+        Ok(output)
     }
     pub fn floor(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.floor is `where(x < (b := trunc(x)), b - 1, b)`, rather

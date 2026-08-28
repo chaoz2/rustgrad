@@ -55,6 +55,121 @@ fn masked_fill_rejects_nonboolean_mask_without_allocating_a_node() {
 }
 
 #[test]
+fn allclose_matches_tinygrad_isclose_then_all_for_broadcast_special_and_empty_domains() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2, 1]);
+    let rhs = graph.input("rhs", [1, 3]);
+    let output = graph.allclose(lhs, rhs, 1e-5, 1e-8, false).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+    assert!(CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([
+                ("lhs".into(), TensorData::new([2, 1], vec![1.0, 1.0]).unwrap()),
+                (
+                    "rhs".into(),
+                    TensorData::new([1, 3], vec![1.0, 1.000_005, 1.0]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap()
+        .scalar_at(0)
+        .as_bool());
+
+    let mut specials = Graph::new();
+    let lhs = specials.input("lhs", [3]);
+    let rhs = specials.input("rhs", [3]);
+    let unequal_nan = specials.allclose(lhs, rhs, 0.0, 0.0, false).unwrap();
+    let equal_nan = specials.allclose(lhs, rhs, 0.0, 0.0, true).unwrap();
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars(
+                [3],
+                DType::F32,
+                [Scalar::F(f64::NAN), Scalar::F(f64::INFINITY), Scalar::F(-0.0)],
+            )
+            .unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars(
+                [3],
+                DType::F32,
+                [Scalar::F(f64::NAN), Scalar::F(f64::INFINITY), Scalar::F(0.0)],
+            )
+            .unwrap(),
+        ),
+    ]);
+    assert!(!CpuBackend
+        .execute(&specials, unequal_nan, &bindings)
+        .unwrap()
+        .scalar_at(0)
+        .as_bool());
+    assert!(CpuBackend
+        .execute(&specials, equal_nan, &bindings)
+        .unwrap()
+        .scalar_at(0)
+        .as_bool());
+
+    let mut empty = Graph::new();
+    let lhs = empty.input_dtype("lhs", [0, 3], DType::BF16);
+    let rhs = empty.input_dtype("rhs", [1, 3], DType::BF16);
+    let output = empty.allclose(lhs, rhs, 1e-5, 1e-8, false).unwrap();
+    assert!(CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars([0, 3], DType::BF16, []).unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [1, 3],
+                        DType::BF16,
+                        [Scalar::F(1.0), Scalar::F(-0.0), Scalar::F(f64::INFINITY)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap()
+        .scalar_at(0)
+        .as_bool());
+}
+
+#[test]
+fn allclose_commits_tolerances_at_rhs_width_and_preflights_before_constants() {
+    let mut narrow = Graph::new();
+    let lhs = narrow.input_dtype("lhs", [1], DType::F64);
+    let rhs = narrow.input_dtype("rhs", [1], DType::BF16);
+    let output = narrow.allclose(lhs, rhs, 0.125, 0.25, false).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::Bool);
+    assert!(narrow.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == DType::BF16)
+    }));
+
+    let mut malformed = Graph::new();
+    let lhs = malformed.input("lhs", [2]);
+    let rhs = malformed.input("rhs", [3]);
+    let before = malformed.node_count();
+    assert!(malformed.allclose(lhs, rhs, 1e-5, 1e-8, false).is_err());
+    assert_eq!(malformed.node_count(), before);
+
+    let overflow = malformed.input_dtype("overflow", [usize::MAX], DType::F64);
+    let scalar = malformed.input_dtype("scalar", [], DType::F64);
+    let before = malformed.node_count();
+    assert!(malformed.allclose(overflow, scalar, 1e-5, 1e-8, false).is_err());
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn select_uses_tinygrad_branch_lub_before_where() {
     let mut graph = Graph::new();
     let condition = graph.input_dtype("condition", [2, 1], DType::Bool);
