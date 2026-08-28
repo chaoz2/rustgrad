@@ -28,7 +28,16 @@ mod tests {
     fn chunk_matches_tinygrad_uneven_tail_and_preserves_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
+        let default_outputs = graph.chunk_default(input, 3).unwrap();
         let outputs = graph.chunk(input, 3, -1).unwrap();
+        assert_eq!(default_outputs.len(), 2);
+        assert_eq!(
+            default_outputs
+                .iter()
+                .map(|&output| graph.shape(output).unwrap().clone())
+                .collect::<Vec<_>>(),
+            vec![Shape::from([1, 5]), Shape::from([1, 5])]
+        );
         assert_eq!(outputs.len(), 3);
         assert_eq!(
             outputs
@@ -41,6 +50,10 @@ mod tests {
         let gradient = graph.grad(loss, input).unwrap();
         let values = TensorData::new([2, 5], (0..10).map(|x| x as f32).collect()).unwrap();
 
+        assert_eq!(
+            execute(&graph, default_outputs[1], values.clone()),
+            TensorData::new([1, 5], vec![5., 6., 7., 8., 9.]).unwrap()
+        );
         assert_eq!(
             execute(&graph, outputs[2], values.clone()),
             TensorData::new([2, 1], vec![4., 9.]).unwrap()

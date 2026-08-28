@@ -1275,6 +1275,13 @@ impl Graph {
         self.stride(input, slices)
     }
 
+    /// Splits along tinygrad's default axis zero.
+    ///
+    /// This is equivalent to `chunk(input, chunks, 0)`.
+    pub fn chunk_default(&mut self, input: NodeId, chunks: usize) -> Result<Vec<NodeId>> {
+        self.chunk(input, chunks, 0)
+    }
+
     /// Splits a concrete axis into at most `chunks` ordered, contiguous
     /// shrink views. Uneven nonempty axes use the tinygrad tail rule; a
     /// zero-sized axis returns exactly `chunks` empty views.
