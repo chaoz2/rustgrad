@@ -2684,6 +2684,118 @@ fn sign_uses_tinygrad_ordered_nan_and_signed_zero_contract() {
 }
 
 #[test]
+fn reciprocal_preserves_tinygrad_alu_dtype_special_and_vjp_contract() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [6], DType::F64);
+    let output = graph.reciprocal(input).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Unary { op: UnaryOp::Reciprocal, input: reciprocal }
+        if *reciprocal == input));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "input".into(),
+        TensorData::from_scalars(
+            [6],
+            DType::F64,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::INFINITY),
+                Scalar::F(f64::NEG_INFINITY),
+                Scalar::F(f64::NAN),
+                Scalar::F(2.0),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), f64::NEG_INFINITY);
+    assert_eq!(values.scalar_at(1).as_f64(), f64::INFINITY);
+    assert_eq!(values.scalar_at(2).as_f64().to_bits(), 0.0f64.to_bits());
+    assert_eq!(values.scalar_at(3).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert!(values.scalar_at(4).as_f64().is_nan());
+    assert_eq!(values.scalar_at(5).as_f64(), 0.5);
+
+    let mut differentiable = Graph::new();
+    let input = differentiable.input_dtype("input", [2], DType::F64);
+    let output = differentiable.reciprocal(input).unwrap();
+    let gradient = differentiable.grad(differentiable.sum_all(output).unwrap(), input).unwrap();
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &differentiable,
+                gradient,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([2], DType::F64, [Scalar::F(2.0), Scalar::F(-4.0)])
+                        .unwrap(),
+                )]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        vec![-0.25, -0.0625]
+    );
+
+    let mut nonfloat = Graph::new();
+    let boolean = nonfloat.input_dtype("boolean", [2], DType::Bool);
+    let signed = nonfloat.input_dtype("signed", [1], DType::I64);
+    let unsigned = nonfloat.input_dtype("unsigned", [1], DType::U64);
+    let boolean_output = nonfloat.reciprocal(boolean).unwrap();
+    let signed_output = nonfloat.reciprocal(signed).unwrap();
+    let unsigned_output = nonfloat.reciprocal(unsigned).unwrap();
+    assert_eq!(nonfloat.dtype(boolean_output).unwrap(), DType::F32);
+    assert_eq!(nonfloat.dtype(signed_output).unwrap(), DType::F32);
+    assert_eq!(nonfloat.dtype(unsigned_output).unwrap(), DType::F32);
+    let f16 = nonfloat.input_dtype("f16", [], DType::F16);
+    let bf16 = nonfloat.input_dtype("bf16", [], DType::BF16);
+    assert_eq!(nonfloat.dtype(nonfloat.reciprocal(f16).unwrap()).unwrap(), DType::F16);
+    assert_eq!(nonfloat.dtype(nonfloat.reciprocal(bf16).unwrap()).unwrap(), DType::BF16);
+    let bindings = HashMap::from([
+        ("boolean".into(), bool_data([2], [false, true])),
+        (
+            "signed".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(-2)]).unwrap(),
+        ),
+        (
+            "unsigned".into(),
+            TensorData::from_scalars([1], DType::U64, [Scalar::U(4)]).unwrap(),
+        ),
+    ]);
+    let boolean_values = CpuBackend.execute(&nonfloat, boolean_output, &bindings).unwrap();
+    assert_eq!(boolean_values.scalar_at(0).as_f64(), f64::INFINITY);
+    assert_eq!(boolean_values.scalar_at(1).as_f64(), 1.0);
+    assert_eq!(
+        CpuBackend.execute(&nonfloat, signed_output, &bindings).unwrap().to_vec_f64(),
+        vec![-0.5]
+    );
+    assert_eq!(
+        CpuBackend.execute(&nonfloat, unsigned_output, &bindings).unwrap().to_vec_f64(),
+        vec![0.25]
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::F16);
+    let output = empty.reciprocal(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.reciprocal(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn abs_uses_tinygrad_sign_multiply_structure_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [5], DType::F64);

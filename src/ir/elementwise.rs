@@ -1751,6 +1751,30 @@ impl Graph {
         self.mul(input, sign)
     }
     pub fn reciprocal(&mut self, input: NodeId) -> Result<NodeId> {
+        // Tensor.reciprocal is a direct RECIPROCAL ALU op, rather than a
+        // source-level `1 / x` composition. Preserve that operation and its
+        // nonfloat-to-F32 rule, but prove the input and output descriptors
+        // before publishing the unary node.
+        let input_node = self.node(input)?;
+        let shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Reciprocal, input_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, output_dtype)?;
+        if (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "reciprocal output dtype",
+                actual: output_dtype,
+            });
+        }
         self.unary(UnaryOp::Reciprocal, input)
     }
     pub fn square(&mut self, input: NodeId) -> Result<NodeId> {
