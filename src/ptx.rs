@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v18";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v19";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -366,8 +366,9 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
-    // Reciprocal, Mul, Add, Sub, Div, Eq, Ne, ordered-Lt, and direct-mask
-    // Select roots; each has a source-proven, typed storage boundary.
+    // Reciprocal, Mul, Add, Sub, Div, Eq, Ne, ordered-Lt, direct-mask Select,
+    // and the strict public ReLU root; each has a source-proven typed storage
+    // boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
@@ -898,6 +899,7 @@ enum ScopedStorageMode {
     OrderedLt,
     InclusiveLt,
     Select,
+    Relu,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
@@ -928,6 +930,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         return scoped_ordered_lt_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::Ternary(crate::uop::Ternary::Where)) {
+        if let Some(mode) = scoped_relu_plan(store, sm)? {
+            return Ok(Some(mode));
+        }
         return scoped_select_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add)) {
@@ -1464,6 +1469,122 @@ fn scoped_select_predicate_shape(
         }
         _ => Ok(None),
     }
+}
+
+/// ReLU is the one scalar-constant comparison/Select root admitted by this
+/// phase. The checked-in public helper literally lowers `zero < input` then
+/// `where(input, zero)`. Keeping the complete shape here prevents a generic
+/// scalar predicate or constant payload from inheriting the narrow ABI.
+fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    if store.sources().len() != 2 {
+        return Err(PtxError::Unsupported(
+            "public ReLU Store needs exactly an index and value".into(),
+        ));
+    }
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let UOpKind::Ternary(crate::uop::Ternary::Where) = value.kind() else {
+        return Ok(None);
+    };
+    let [condition, on_true, on_false] = value.sources() else {
+        return Err(PtxError::Unsupported("public ReLU needs three Select inputs".into()));
+    };
+    let Some(output) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public ReLU requires a concrete output buffer".into(),
+        ));
+    };
+    let output_dtype = output
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped public ReLU output".into()))?
+        .scalar;
+    if output.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || value.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported(
+            "public ReLU output descriptor is invalid".into(),
+        ));
+    }
+
+    let UOpKind::GraphCompare(crate::CompareOp::Lt) = condition.kind() else {
+        return Ok(None);
+    };
+    let [zero, input] = condition.sources() else {
+        return Err(PtxError::Unsupported(
+            "public ReLU ordered predicate needs two inputs".into(),
+        ));
+    };
+    if input != on_true || zero != on_false {
+        return Ok(None);
+    }
+    if condition.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || input.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || zero.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || on_true.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || on_false.ty().map(|ty| ty.scalar) != Some(output_dtype)
+    {
+        return Err(PtxError::Unsupported(
+            "public ReLU predicate/payload dtypes are invalid".into(),
+        ));
+    }
+    if !matches!(zero.kind(), UOpKind::Const)
+        || !matches!(zero.arg(), UArg::Scalar { dtype, bits: 0 } if *dtype == output_dtype)
+        || !zero.sources().is_empty()
+    {
+        return Ok(None);
+    }
+    let UOpKind::Load = input.kind() else {
+        return Ok(None);
+    };
+    let [input_index] = input.sources() else {
+        return Err(PtxError::Unsupported(
+            "public ReLU input load needs one index".into(),
+        ));
+    };
+    let UArg::BufferIndex {
+        elements: input_elements,
+        input_shape,
+        output_shape: input_output_shape,
+        ..
+    } = input_index.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public ReLU does not admit affine-view input".into(),
+        ));
+    };
+    if input_index.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || input_output_shape != output_shape
+        || input_shape != output_shape
+        || input_shape.numel().map_err(|_| PtxError::Overflow)? != *input_elements
+        || input_elements.checked_mul(output_dtype.itemsize()).is_none()
+        || output_shape
+            .numel()
+            .map_err(|_| PtxError::Overflow)?
+            .checked_mul(DType::Bool.itemsize())
+            .is_none()
+    {
+        return Err(PtxError::Unsupported(
+            "public ReLU input/predicate descriptor is invalid".into(),
+        ));
+    }
+    if output_dtype == DType::F16 && sm < 53 {
+        return Err(PtxError::Unsupported(
+            "F16 public ReLU conversion requires sm_53 or newer".into(),
+        ));
+    }
+    reject_sign_storage_dtype(output_dtype)?;
+    Ok(Some(ScopedStorageMode::Relu))
 }
 
 /// Public `where` is the only ternary root admitted through the narrow PTX
@@ -2237,7 +2358,12 @@ fn emit(
         {
             format!("%r{id}")
         }
-        DType::F16 | DType::BF16 if storage_mode == Some(ScopedStorageMode::Select) => {
+        DType::F16 | DType::BF16
+            if matches!(
+                storage_mode,
+                Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+            ) =>
+        {
             format!("%r{id}")
         }
         DType::I64 | DType::U64 if storage_mode.is_some() => format!("%rd{id}"),
@@ -2298,7 +2424,10 @@ fn emit(
                 DType::F16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
-                        && storage_mode != Some(ScopedStorageMode::Select)
+                        && !matches!(
+                            storage_mode,
+                            Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+                        )
                     {
                         lines.push(format!("  cvt.rn.f32.f16 {dst}, %r{id};"));
                     }
@@ -2306,7 +2435,10 @@ fn emit(
                 DType::BF16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
-                        && storage_mode != Some(ScopedStorageMode::Select)
+                        && !matches!(
+                            storage_mode,
+                            Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+                        )
                     {
                         lines.push(format!("  shl.b32 %r90, %r{id}, 16;"));
                         lines.push(format!("  mov.b32 {dst}, %r90;"));
@@ -2574,7 +2706,17 @@ fn emit(
         }
         UOpKind::GraphCompare(op) => {
             let (a, b) = (child(0)?, child(1)?);
-            if storage_mode == Some(ScopedStorageMode::Select) {
+            if matches!(
+                storage_mode,
+                Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+            ) {
+                if storage_mode == Some(ScopedStorageMode::Relu)
+                    && *op != crate::CompareOp::Lt
+                {
+                    return Err(PtxError::Unsupported(
+                        "public ReLU requires ordered zero < input".into(),
+                    ));
+                }
                 let operand_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped public Select predicate operand".into()))?
@@ -2708,7 +2850,10 @@ fn emit(
         UOpKind::Ternary(crate::uop::Ternary::Where) => {
             let (p, a, b) = (child(0)?, child(1)?, child(2)?);
             lines.push(format!("  setp.ne.u32 %p2, {p}, 0;"));
-            if storage_mode == Some(ScopedStorageMode::Select) {
+            if matches!(
+                storage_mode,
+                Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+            ) {
                 let select_type = match ty {
                     DType::F16 | DType::BF16 | DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32 | DType::U32 => "b32",
                     DType::I64 | DType::U64 => "b64",
@@ -6318,8 +6463,8 @@ mod tests {
         // NaN and either signed zero are governed by the exact predicate
         // emission above, while the selected direct narrow payload is copied
         // bitwise. Raw Le/Ge, arbitrary logical/nested masks, affine views,
-        // public scalar-zero ReLU roots, and source-inexact payload casts stay
-        // closed until each owns an equally strict whole-root proof.
+        // and source-inexact payload casts stay closed until each owns an
+        // equally strict whole-root proof.
         let mut raw_le = Graph::new();
         let lhs = raw_le.input_dtype("lhs", [1], DType::F16);
         let rhs = raw_le.input_dtype("rhs", [1], DType::F16);
@@ -6348,10 +6493,12 @@ mod tests {
         let output = logical.select(condition, on_true, on_false).unwrap();
         assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&logical, output).unwrap()), Err(PtxError::Unsupported(_))));
 
-        let mut relu_boundary = Graph::new();
-        let input = relu_boundary.input_dtype("input", [1], DType::F16);
-        let output = relu_boundary.relu(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&relu_boundary, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut reversed_scalar_relu = Graph::new();
+        let input = reversed_scalar_relu.input_dtype("input", [1], DType::F16);
+        let zero = reversed_scalar_relu.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let condition = reversed_scalar_relu.lt(input, zero).unwrap();
+        let output = reversed_scalar_relu.select(condition, input, zero).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&reversed_scalar_relu, output).unwrap()), Err(PtxError::Unsupported(_))));
 
         let mut viewed = Graph::new();
         let lhs = viewed.input_dtype("lhs", [2, 1], DType::F16);
@@ -6371,6 +6518,141 @@ mod tests {
         let on_false = gate.input_dtype("on_false", [1], DType::F16);
         let output = gate.select(condition, on_true, on_false).unwrap();
         assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn public_relu_has_a_scoped_typed_scalar_zero_root() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, predicate, select, store, zero) in [
+            (DType::Bool, "setp.lt.u8", "selp.b32", "st.global.u8", "mov.b8"),
+            (DType::I8, "setp.lt.s8", "selp.b32", "st.global.s8", "mov.b8"),
+            (DType::U8, "setp.lt.u8", "selp.b32", "st.global.u8", "mov.b8"),
+            (DType::I16, "setp.lt.s16", "selp.b32", "st.global.s16", "mov.b16"),
+            (DType::U16, "setp.lt.u16", "selp.b32", "st.global.u16", "mov.b16"),
+            (DType::I32, "setp.lt.s32", "selp.b32", "st.global.s32", "mov.b32"),
+            (DType::U32, "setp.lt.u32", "selp.b32", "st.global.u32", "mov.b32"),
+            (DType::I64, "setp.lt.s64", "selp.b64", "st.global.s64", "mov.b64"),
+            (DType::U64, "setp.lt.u64", "selp.b64", "st.global.u64", "mov.b64"),
+            (DType::F16, "setp.lt.f32", "selp.b32", "st.global.b16", "mov.b16"),
+            (DType::BF16, "setp.lt.f32", "selp.b32", "st.global.b16", "mov.b16"),
+            (DType::F32, "setp.lt.f32", "selp.f32", "st.global.f32", "mov.b32"),
+            (DType::F64, "setp.lt.f64", "selp.f64", "st.global.f64", "mov.b64"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2, 1], dtype);
+            let output = graph.relu(input).unwrap();
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            assert_eq!(graph.shape(output).unwrap(), &crate::Shape::from([2, 1]));
+            assert!(first.source.contains(PTX_RENDERER_VERSION), "{dtype:?} version");
+            assert!(first.source.contains(predicate), "{dtype:?} ordered zero < input");
+            assert!(first.source.contains(select), "{dtype:?} raw payload select");
+            assert!(first.source.contains(store), "{dtype:?} typed store");
+            assert!(first.source.contains(zero) && first.source.contains("0x00"), "{dtype:?} canonical zero Const");
+            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert_eq!(first.source, second.source, "{dtype:?} source");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+
+        // Scalar and empty descriptors retain the same complete root. The
+        // ordered predicate sends -0, +0 and NaN to the raw canonical-zero
+        // false payload, while positive infinity retains the input payload.
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::F64);
+        let output = scalar.relu(input).unwrap();
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&scalar, output).unwrap())
+                .unwrap()
+                .extent,
+            1
+        );
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0, 2], DType::BF16);
+        let output = empty.relu(input).unwrap();
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
+
+        // The Select VJP owns ReLU's strict boundary routing: predicates are
+        // nondifferentiable and only the selected input branch receives the
+        // cotangent. This admission changes no autograd construction.
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
+        let output = vjp.relu(input).unwrap();
+        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
+        assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+
+        // Strict rejection: reversed predicate/payloads, noncanonical or
+        // runtime zeros, raw Unary ReLU, and affine inputs cannot inherit the
+        // public scalar-root admission.
+        let mut reversed = Graph::new();
+        let input = reversed.input_dtype("input", [1], DType::F16);
+        let zero = reversed.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let condition = reversed.lt(input, zero).unwrap();
+        let output = reversed.select(condition, input, zero).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&reversed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut swapped = Graph::new();
+        let input = swapped.input_dtype("input", [1], DType::F16);
+        let zero = swapped.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let condition = swapped.gt(input, zero).unwrap();
+        let output = swapped.select(condition, zero, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut negative_zero = Graph::new();
+        let input = negative_zero.input_dtype("input", [1], DType::F16);
+        let zero = negative_zero.constant(
+            TensorData::from_storage(crate::Shape::new([]), crate::Storage::F16(vec![0x8000]))
+                .unwrap(),
+        );
+        let condition = negative_zero.gt(input, zero).unwrap();
+        let output = negative_zero.select(condition, input, zero).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&negative_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut nonzero = Graph::new();
+        let input = nonzero.input_dtype("input", [1], DType::F16);
+        let zero = nonzero.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::F16));
+        let condition = nonzero.gt(input, zero).unwrap();
+        let output = nonzero.select(condition, input, zero).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&nonzero, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut runtime_zero = Graph::new();
+        let input = runtime_zero.input_dtype("input", [1], DType::F16);
+        let zero = runtime_zero.input_dtype("zero", [1], DType::F16);
+        let condition = runtime_zero.gt(input, zero).unwrap();
+        let output = runtime_zero.select(condition, input, zero).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&runtime_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut raw = Graph::new();
+        let input = raw.input_dtype("input", [1], DType::F16);
+        let output = raw.unary(crate::UnaryOp::Relu, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut viewed = Graph::new();
+        let raw_input = viewed.input_dtype("input", [1, 2], DType::F16);
+        let input = viewed.permute(raw_input, [1, 0]).unwrap();
+        let output = viewed.relu(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut gate = Graph::new();
+        let input = gate.input_dtype("input", [1], DType::F16);
+        let output = gate.relu(input).unwrap();
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
