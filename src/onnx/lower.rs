@@ -2856,6 +2856,66 @@ fn greater_plan(
     })
 }
 
+/// Fully resolved source descriptor for ONNX `LessOrEqual`.  The source is
+/// not direct LE: it promotes `x > y` and then logically negates that Bool
+/// result, which deliberately turns an unordered NaN comparison into true.
+struct LessOrEqualPlan {
+    lhs: NodeId,
+    rhs: NodeId,
+    output_shape: Shape,
+    comparison_dtype: DType,
+}
+
+fn less_or_equal_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<LessOrEqualPlan> {
+    if ins.len() != 2 || !attrs.is_empty() {
+        return Err(bad("LessOrEqual requires exactly two inputs and no attributes"));
+    }
+    let inputs = ins
+        .iter()
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let lhs_shape = g.shape(inputs[0])?.clone();
+    let rhs_shape = g.shape(inputs[1])?.clone();
+    let lhs_dtype = g.dtype(inputs[0])?;
+    let rhs_dtype = g.dtype(inputs[1])?;
+    for (shape, dtype) in [(&lhs_shape, lhs_dtype), (&rhs_shape, rhs_dtype)] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("LessOrEqual input byte extent overflow"))?;
+    }
+    let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    let comparison_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
+    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast")] {
+        shape
+            .numel()?
+            .checked_mul(comparison_dtype.itemsize())
+            .ok_or_else(|| bad(format!("LessOrEqual {what} byte extent overflow")))?;
+    }
+    for what in ["comparison", "output"] {
+        output_shape
+            .numel()?
+            .checked_mul(DType::Bool.itemsize())
+            .ok_or_else(|| bad(format!("LessOrEqual {what} byte extent overflow")))?;
+    }
+    Ok(LessOrEqualPlan {
+        lhs: inputs[0],
+        rhs: inputs[1],
+        output_shape,
+        comparison_dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5374,7 +5434,36 @@ pub(super) fn lower(
             debug_assert_eq!(g.dtype(output).expect("Less dtype preflighted"), DType::Bool);
             output
         }
-        "LessOrEqual" if ins.len() == 2 && attrs.is_empty() => g.le(get(0)?, get(1)?)?,
+        "LessOrEqual" if ins.len() == 2 => {
+            let plan = less_or_equal_plan(g, &ins, &attrs, values)?;
+            let lhs = if g.dtype(plan.lhs).expect("LessOrEqual lhs preflighted")
+                == plan.comparison_dtype
+            {
+                plan.lhs
+            } else {
+                g.cast(plan.lhs, plan.comparison_dtype)?
+            };
+            let rhs = if g.dtype(plan.rhs).expect("LessOrEqual rhs preflighted")
+                == plan.comparison_dtype
+            {
+                plan.rhs
+            } else {
+                g.cast(plan.rhs, plan.comparison_dtype)?
+            };
+            // Tensor.__le__ is `(self > rhs).logical_not()`, not a direct
+            // ordered LE operation.  This retains tinygrad's unordered-NaN
+            // truth value and its literal nondifferentiable graph structure.
+            let output = g.logical_not(g.gt(lhs, rhs)?)?;
+            debug_assert_eq!(
+                g.shape(output).expect("LessOrEqual shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("LessOrEqual dtype preflighted"),
+                DType::Bool
+            );
+            output
+        }
         "Greater" if ins.len() == 2 => {
             let plan = greater_plan(g, &ins, &attrs, values)?;
             let lhs = if g.dtype(plan.lhs).expect("Greater lhs preflighted") == plan.comparison_dtype {
