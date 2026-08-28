@@ -1487,8 +1487,15 @@ fn global_average_pool_plan(g: &Graph, input: NodeId) -> Result<GlobalAveragePoo
     let mut output_dims = shape.dims().to_vec();
     for dim in output_dims.iter_mut().skip(2) { *dim = 1; }
     let output_shape = Shape::new(output_dims);
+    // `Tensor.mean` casts to its sum accumulator before the reduction, even
+    // when GlobalAveragePool's trailing spatial axis tuple is empty.  Validate
+    // every same-shaped stage before either a cast, reduction, or divisor
+    // constant can be published.
+    output_shape.numel()?.checked_mul(sum_dtypes.accumulator.itemsize()).ok_or_else(|| bad("GlobalAveragePool accumulator byte extent overflow"))?;
+    output_shape.numel()?.checked_mul(work_dtype.itemsize()).ok_or_else(|| bad("GlobalAveragePool division byte extent overflow"))?;
     output_shape.numel()?.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("GlobalAveragePool output byte extent overflow"))?;
     let divisor = TensorData::scalar_with_dtype(Scalar::F(count as f64), work_dtype);
+    divisor.shape().numel()?.checked_mul(divisor.dtype().itemsize()).ok_or_else(|| bad("GlobalAveragePool divisor byte extent overflow"))?;
     if output_shape.broadcast_with(divisor.shape())? != output_shape || output_dtype.promote(output_dtype) != output_dtype {
         return Err(bad("GlobalAveragePool scalar promotion mismatch"));
     }
@@ -7984,22 +7991,23 @@ pub(super) fn lower(
         "GlobalAveragePool" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;
             let plan = global_average_pool_plan(g, x)?;
-            if plan.axes.is_empty() {
-                if g.dtype(x)? == plan.output_dtype { x } else { g.cast(x, plan.output_dtype)? }
-            } else {
-                let summed = g.reduce_with_dtypes(
-                    x,
-                    ReduceKind::Sum,
-                    Some(plan.axes),
-                    true,
-                    ReductionDType::new(plan.sum_dtypes.accumulator, plan.sum_dtypes.accumulator),
-                )?;
-                let summed = if plan.work_dtype == plan.sum_dtypes.accumulator { summed } else { g.cast(summed, plan.work_dtype)? };
-                let average = g.div(summed, g.constant(plan.divisor))?;
-                let output = if plan.output_dtype == plan.work_dtype { average } else { g.cast(average, plan.output_dtype)? };
-                debug_assert_eq!(g.shape(output).expect("GlobalAveragePool shape preflighted"), &plan.output_shape);
-                output
-            }
+            // Do not special-case `axes=[]` as an identity.  The checked-in
+            // handler calls `Tensor.mean`, which still commits the source to
+            // `sum_acc_dtype`, reduces the empty tuple, and divides by the
+            // weak scalar one before its final output cast.
+            let summed = g.reduce_with_dtypes(
+                x,
+                ReduceKind::Sum,
+                Some(plan.axes),
+                true,
+                ReductionDType::new(plan.sum_dtypes.accumulator, plan.sum_dtypes.accumulator),
+            )?;
+            let summed = if plan.work_dtype == plan.sum_dtypes.accumulator { summed } else { g.cast(summed, plan.work_dtype)? };
+            let average = g.div(summed, g.constant(plan.divisor))?;
+            let output = if plan.output_dtype == plan.work_dtype { average } else { g.cast(average, plan.output_dtype)? };
+            debug_assert_eq!(g.shape(output).expect("GlobalAveragePool shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("GlobalAveragePool dtype preflighted"), plan.output_dtype);
+            output
         }
         "GlobalMaxPool" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;

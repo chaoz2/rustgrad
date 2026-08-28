@@ -2817,6 +2817,76 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
 }
 
 #[test]
+fn global_average_pool_uses_tinygrad_mean_accumulator_for_every_rank() {
+    // GlobalAveragePool is literally X.mean(range(2, X.ndim), keepdim=True).
+    // In particular, an empty trailing-axis tuple is not a NodeId identity:
+    // Tensor.mean still commits to sum_acc_dtype and divides by weak one.
+    for (shape, dtype, output_dtype) in [
+        (Shape::new(vec![]), DType::F16, DType::F16),
+        (Shape::new(vec![2]), DType::BF16, DType::BF16),
+        (Shape::new(vec![1, 2]), DType::I64, DType::F32),
+        (Shape::new(vec![1, 1, 2, 3]), DType::F64, DType::F64),
+        (Shape::new(vec![1, 1, 0, 3]), DType::U64, DType::F32),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", shape.clone(), dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before_nodes = graph.node_count();
+        lower(
+            &mut graph,
+            Msg::new(&node("GlobalAveragePool", &["x"], "out")),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let out = values["out"];
+        let mut expected_shape = shape.dims().to_vec();
+        for dim in expected_shape.iter_mut().skip(2) { *dim = 1; }
+        assert_eq!(graph.shape(out).unwrap().dims(), expected_shape.as_slice(), "{dtype:?}");
+        assert_eq!(graph.dtype(out).unwrap(), output_dtype, "{dtype:?}");
+        assert_ne!(out, x, "{dtype:?} rank {} must retain mean's staged graph", shape.rank());
+        // Sum/empty-sum, scalar divisor, and true division are all retained
+        // before a narrow output cast, so a later VJP follows the literal
+        // reduction rather than an importer-only identity shortcut.
+        assert!(graph.node_count() >= before_nodes + 3, "{dtype:?}");
+    }
+
+    // Strict closed arity/attribute handling must fail before any source cast,
+    // reduction, scalar constant, or output binding is published.
+    let mut unknown = node("GlobalAveragePool", &["x"], "out");
+    field(&mut unknown, 5, &typed_int_attr("axis", 2));
+    for invalid in [
+        node("GlobalAveragePool", &[], "out"),
+        node("GlobalAveragePool", &["x", "extra"], "out"),
+        unknown,
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [1, 1, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before_values = values.clone();
+        let before_nodes = graph.node_count();
+        assert!(lower(&mut graph, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(graph.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("GlobalAveragePool", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn cumsum_matches_tinygrad_static_axis_flags_and_scheduled_pad_boundary() {
     // Both permitted constant representations resolve to the same signed
     // axis.  Tinygrad treats every nonzero flag value as true.
