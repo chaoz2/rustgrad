@@ -985,6 +985,7 @@ mod tests {
 
         let first = graph.input("first", [2]);
         let second = graph.input("second", [2]);
+        let default_stacked = graph.stack_default([first, second]).unwrap();
         let stacked = graph.stack([first, second], -1).unwrap();
         let loss = graph.sum_all(stacked).unwrap();
         let gradient = graph.grad(loss, first).unwrap();
@@ -1000,9 +1001,36 @@ mod tests {
             TensorData::new([2, 2], vec![1., 3., 2., 4.]).unwrap()
         );
         assert_eq!(
+            CpuBackend.execute(&graph, default_stacked, &bindings).unwrap(),
+            TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap()
+        );
+        assert_eq!(
             CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
             TensorData::new([2], vec![1., 1.]).unwrap()
         );
+
+        let mut singleton = Graph::new();
+        let scalar = singleton.input_dtype("scalar", [], DType::F16);
+        let output = singleton.stack_default([scalar]).unwrap();
+        assert_eq!(singleton.shape(output).unwrap(), &Shape::from([1]));
+        assert_eq!(singleton.dtype(output).unwrap(), DType::F16);
+        let empty = singleton.input_dtype("empty", [0], DType::I8);
+        let output = singleton.stack([empty], -1).unwrap();
+        assert_eq!(singleton.shape(output).unwrap(), &Shape::from([0, 1]));
+
+        let mut promoted = Graph::new();
+        let signed = promoted.input_dtype("signed", [1], DType::I64);
+        let unsigned = promoted.input_dtype("unsigned", [1], DType::U64);
+        let output = promoted.stack_default([signed, unsigned]).unwrap();
+        assert_eq!(promoted.shape(output).unwrap(), &Shape::from([2, 1]));
+        assert_eq!(promoted.dtype(output).unwrap(), DType::F32);
+
+        let mut overflow = Graph::new();
+        let first = overflow.input_dtype("first", [usize::MAX], DType::Bool);
+        let second = overflow.input_dtype("second", [usize::MAX], DType::Bool);
+        let node_count = overflow.node_count();
+        assert!(overflow.stack_default([first, second]).is_err());
+        assert_eq!(overflow.node_count(), node_count);
     }
 }
 
@@ -1052,6 +1080,99 @@ fn device_key(device: u32) -> u32 {
         0x14B8_1119
     } else {
         device.wrapping_mul(0x9E37_79B9).rotate_left(13) ^ 0xA5A5_5A5A
+    }
+}
+
+/// Concrete descriptor plan for tinygrad's `Tensor.stack` before it publishes
+/// any inserted-axis view or concat node.
+struct StackPlan {
+    axis: usize,
+    output_shape: Shape,
+    output_dtype: DType,
+    input_dtypes: Vec<DType>,
+}
+
+fn stack_source_lub(lhs: DType, rhs: DType) -> DType {
+    if matches!(
+        (lhs, rhs),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
+}
+
+impl StackPlan {
+    fn new(graph: &Graph, inputs: &[NodeId], axis: isize) -> Result<Self> {
+        if inputs.is_empty() {
+            return Err(Error::InvalidRandom {
+                reason: "stack requires at least one tensor",
+            });
+        }
+        let descriptors = inputs
+            .iter()
+            .map(|&input| {
+                let node = graph.node(input)?;
+                node.shape
+                    .numel()?
+                    .checked_mul(node.dtype.itemsize())
+                    .ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))?;
+                Ok((node.shape.clone(), node.dtype))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let shapes = descriptors
+            .iter()
+            .map(|(shape, _)| shape.clone())
+            .collect::<Vec<_>>();
+        let output_rank = shapes[0]
+            .rank()
+            .checked_add(1)
+            .ok_or_else(|| Error::ShapeOverflow(shapes[0].clone()))?;
+        let rank = isize::try_from(output_rank)
+            .map_err(|_| Error::ShapeOverflow(shapes[0].clone()))?;
+        let axis = if axis < 0 {
+            axis.checked_add(rank).ok_or(Error::InvalidAxis {
+                node: inputs[0],
+                axis: usize::MAX,
+                rank: rank as usize,
+            })?
+        } else {
+            axis
+        };
+        if axis < 0 || axis >= rank {
+            return Err(Error::InvalidAxis {
+                node: inputs[0],
+                axis: usize::MAX,
+                rank: rank as usize,
+            });
+        }
+        if shapes.iter().any(|shape| shape != &shapes[0]) {
+            return Err(Error::InvalidConcat {
+                axis: axis as usize,
+                shapes,
+            });
+        }
+        let axis = axis as usize;
+        let mut output_dims = shapes[0].dims().to_vec();
+        output_dims.insert(axis, inputs.len());
+        let output_shape = Shape::new(output_dims);
+        let output_dtype = descriptors
+            .iter()
+            .skip(1)
+            .fold(descriptors[0].1, |dtype, (_, next)| {
+                stack_source_lub(dtype, *next)
+            });
+        output_shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        Ok(Self {
+            axis,
+            output_shape,
+            output_dtype,
+            input_dtypes: descriptors.into_iter().map(|(_, dtype)| dtype).collect(),
+        })
     }
 }
 
@@ -1206,45 +1327,42 @@ impl Graph {
         }
     }
 
+    /// Stacks along tinygrad's default new leading axis.
+    ///
+    /// This is equivalent to `stack(inputs, 0)`.
+    pub fn stack_default(&mut self, inputs: impl Into<Vec<NodeId>>) -> Result<NodeId> {
+        self.stack(inputs, 0)
+    }
+
+    /// Stacks equal-shaped inputs along a signed newly inserted axis.
     pub fn stack(&mut self, inputs: impl Into<Vec<NodeId>>, axis: isize) -> Result<NodeId> {
         let inputs = inputs.into();
-        if inputs.is_empty() {
-            return Err(Error::InvalidRandom {
-                reason: "stack requires at least one tensor",
-            });
-        }
-        let shapes = inputs
-            .iter()
-            .map(|&input| Ok(self.shape(input)?.clone()))
+        let plan = StackPlan::new(self, &inputs, axis)?;
+        let inputs = inputs
+            .into_iter()
+            .zip(plan.input_dtypes.iter().copied())
+            .map(|(input, dtype)| {
+                if dtype == plan.output_dtype {
+                    Ok(input)
+                } else {
+                    self.cast(input, plan.output_dtype)
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
-        let rank = shapes[0].rank() as isize + 1;
-        let axis = if axis < 0 {
-            axis.checked_add(rank).ok_or(Error::InvalidAxis {
-                node: inputs[0],
-                axis: usize::MAX,
-                rank: rank as usize,
-            })?
-        } else {
-            axis
-        };
-        if axis < 0 || axis >= rank {
-            return Err(Error::InvalidAxis {
-                node: inputs[0],
-                axis: usize::MAX,
-                rank: rank as usize,
-            });
-        }
-        if shapes.iter().any(|shape| shape != &shapes[0]) {
-            return Err(Error::InvalidConcat {
-                axis: axis as usize,
-                shapes,
-            });
+        if inputs.len() == 1 {
+            let output = self.unsqueeze(inputs[0], plan.axis as isize)?;
+            debug_assert_eq!(self.shape(output).ok(), Some(&plan.output_shape));
+            debug_assert_eq!(self.dtype(output).ok(), Some(plan.output_dtype));
+            return Ok(output);
         }
         let mut expanded = Vec::with_capacity(inputs.len());
         for input in inputs {
-            expanded.push(self.unsqueeze(input, axis)?);
+            expanded.push(self.unsqueeze(input, plan.axis as isize)?);
         }
-        self.concat(expanded, axis as usize)
+        let output = self.concat(expanded, plan.axis)?;
+        debug_assert_eq!(self.shape(output).ok(), Some(&plan.output_shape));
+        debug_assert_eq!(self.dtype(output).ok(), Some(plan.output_dtype));
+        Ok(output)
     }
 
     /// Concrete public `Tensor.unfold(dim, size, step)` windows.
