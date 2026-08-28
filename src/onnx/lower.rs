@@ -5808,6 +5808,23 @@ pub(super) fn lower(
             debug_assert_eq!(g.dtype(output).expect("BitwiseOr dtype preflighted"), plan.output_dtype);
             output
         }
+        "BitwiseXor" if ins.len() == 2 => {
+            let plan = bitwise_binary_plan(g, &ins, &attrs, values, "BitwiseXor")?;
+            let lhs = if g.dtype(plan.lhs).expect("BitwiseXor lhs preflighted") == plan.output_dtype {
+                plan.lhs
+            } else {
+                g.cast(plan.lhs, plan.output_dtype)?
+            };
+            let rhs = if g.dtype(plan.rhs).expect("BitwiseXor rhs preflighted") == plan.output_dtype {
+                plan.rhs
+            } else {
+                g.cast(plan.rhs, plan.output_dtype)?
+            };
+            let output = g.bit_xor(lhs, rhs)?;
+            debug_assert_eq!(g.shape(output).expect("BitwiseXor shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("BitwiseXor dtype preflighted"), plan.output_dtype);
+            output
+        }
         "Div" if ins.len() == 2 => {
             let plan = div_plan(g, &ins, &attrs, values)?;
             let lhs = if g.dtype(plan.lhs).expect("Div lhs preflighted") == plan.work_dtype {
