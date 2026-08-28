@@ -3120,7 +3120,7 @@ fn modulo_uses_tinygrad_floor_composition_lub_and_zero_sentinel() {
     let output = graph.modulo(lhs, rhs).unwrap();
 
     assert_eq!(graph.dtype(output).unwrap(), DType::I32);
-    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Sub, .. }));
+    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
     let bindings = HashMap::from([
         (
             "lhs".into(),
@@ -3245,6 +3245,74 @@ fn modulo_scalar_preserves_floor_composition_and_reflected_roles() {
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
     assert!(matches!(malformed.scalar_modulo(Scalar::F(0.0), overflow), Err(Error::ShapeOverflow(_))));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
+fn fmod_scalar_preserves_non_reflected_trunc_composition() {
+    for (dtype, value) in [
+        (DType::Bool, Scalar::Bool(true)), (DType::I8, Scalar::I(-1)),
+        (DType::I16, Scalar::I(-1)), (DType::I32, Scalar::I(-1)),
+        (DType::I64, Scalar::I(-1)), (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)), (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)), (DType::F16, Scalar::F(-0.0)),
+        (DType::BF16, Scalar::F(-0.0)), (DType::F32, Scalar::F(-0.0)),
+        (DType::F64, Scalar::F(-0.0)),
+    ] {
+        let expected = if dtype.is_integer() || dtype.is_float() { dtype } else { DType::F32 };
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let output = graph.fmod_scalar(input, value).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), expected);
+        assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    }
+
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [], DType::Bool);
+    let integral = mixed.input_dtype("integral", [], DType::I16);
+    let narrow = mixed.input_dtype("narrow", [], DType::F16);
+    assert_eq!(mixed.dtype(mixed.fmod_scalar(boolean, Scalar::I(1)).unwrap()).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(mixed.fmod_scalar(integral, Scalar::F(-0.0)).unwrap()).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(mixed.fmod_scalar(narrow, Scalar::I(1)).unwrap()).unwrap(), DType::F16);
+
+    let mut bridge = Graph::new();
+    let lhs = bridge.input_dtype("lhs", [2], DType::I64);
+    let rhs = bridge.input_dtype("rhs", [2], DType::U64);
+    assert_eq!(bridge.dtype(bridge.fmod(lhs, rhs).unwrap()).unwrap(), DType::F32);
+
+    let mut sentinel = Graph::new();
+    let input = sentinel.input_dtype("input", [2], DType::I16);
+    let output = sentinel.fmod_scalar(input, Scalar::I(0)).unwrap();
+    assert!(matches!(sentinel.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    assert!((0..sentinel.node_count()).any(|index| matches!(sentinel.op(NodeId(index)).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::I16 && data.scalar_at(0).as_i64() == 0)));
+    assert!(matches!(sentinel.grad(output, input), Err(Error::NoGradient(_))));
+
+    let mut specials = Graph::new();
+    let input = specials.input_dtype("input", [2, 1], DType::F64);
+    let negative_zero = specials.fmod_scalar(input, Scalar::F(-0.0)).unwrap();
+    let infinity = specials.fmod_scalar(input, Scalar::F(f64::INFINITY)).unwrap();
+    let nan = specials.fmod_scalar(input, Scalar::F(f64::NAN)).unwrap();
+    assert!(matches!(specials.op(negative_zero).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    assert!(matches!(specials.op(infinity).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    assert!(matches!(specials.op(nan).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    let loss = specials.sum_all(negative_zero).unwrap();
+    let gradient = specials.grad(loss, input).unwrap();
+    assert_eq!(specials.shape(gradient).unwrap(), &Shape::new([2, 1]));
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::BF16);
+    let output = empty.fmod_scalar(input, Scalar::F(-0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(malformed.fmod_scalar(NodeId(usize::MAX), Scalar::F(0.0)), Err(Error::UnknownNode(_))));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(malformed.fmod_scalar(overflow, Scalar::F(0.0)), Err(Error::ShapeOverflow(_))));
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -3374,7 +3442,7 @@ fn fmod_uses_tinygrad_trunc_composition_lub_and_zero_sentinel() {
     let output = graph.fmod(lhs, rhs).unwrap();
 
     assert_eq!(graph.dtype(output).unwrap(), DType::I32);
-    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Sub, .. }));
+    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
     let bindings = HashMap::from([
         (
             "lhs".into(),
