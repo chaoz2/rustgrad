@@ -1,4 +1,140 @@
-use crate::{BinaryOp, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp};
+use crate::{BinaryOp, DType, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp};
+
+/// Fully resolved descriptor for tinygrad's Pow VJP. This deliberately leaves
+/// Pow forward semantics alone: it only proves that the already-built Pow
+/// node can receive tinygrad's literal, weak-constant backward expansion.
+struct PowVjpPlan {
+    zero_lhs: TensorData,
+    zero_rhs: TensorData,
+    one_rhs: TensorData,
+    negative_inf: TensorData,
+    zero_output: TensorData,
+    ln2: TensorData,
+}
+
+fn pow_vjp_plan(graph: &Graph, node: NodeId, lhs: NodeId, rhs: NodeId, upstream: NodeId) -> Result<PowVjpPlan> {
+    let lhs_node = graph.node(lhs)?;
+    let lhs_shape = lhs_node.shape.clone();
+    let lhs_dtype = lhs_node.dtype;
+    let rhs_node = graph.node(rhs)?;
+    let rhs_shape = rhs_node.shape.clone();
+    let rhs_dtype = rhs_node.dtype;
+    let node_data = graph.node(node)?;
+    let output_shape = node_data.shape.clone();
+    let output_dtype = node_data.dtype;
+    let upstream_data = graph.node(upstream)?;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    let source_promote = |left: DType, right: DType| {
+        if matches!(
+            (left, right),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
+            DType::F32
+        } else {
+            left.promote(right)
+        }
+    };
+    let fail = |actual| Error::InvalidElementwiseDType {
+        op: "pow vjp source promotion",
+        actual,
+    };
+
+    // The forward node must retain the raw Pow descriptor it was built with;
+    // this phase intentionally does not reinterpret or repair it.
+    let pow_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    let pow_dtype = lhs_dtype.promote(rhs_dtype);
+    if output_shape != pow_shape || output_dtype != pow_dtype || upstream_data.shape != output_shape {
+        return Err(fail(output_dtype));
+    }
+    for (shape, dtype) in [
+        (&lhs_shape, lhs_dtype),
+        (&rhs_shape, rhs_dtype),
+        (&output_shape, output_dtype),
+        (&upstream_data.shape, upstream_data.dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if !output_dtype.is_float() || !upstream_data.dtype.is_float() {
+        return Err(fail(output_dtype));
+    }
+
+    // Python literals in the source are weak: comparison/subtraction literals
+    // adopt their lhs storage, while ret.const_like and the final ln(2) tail
+    // use the result/tail storage.
+    let zero_lhs = TensorData::scalar_with_dtype(Scalar::I(0), lhs_dtype);
+    let zero_rhs = TensorData::scalar_with_dtype(Scalar::I(0), rhs_dtype);
+    let one_rhs = TensorData::scalar_with_dtype(Scalar::I(1), rhs_dtype);
+    let negative_inf = TensorData::scalar_with_dtype(Scalar::F(f64::NEG_INFINITY), output_dtype);
+    let zero_output = TensorData::scalar_with_dtype(Scalar::I(0), output_dtype);
+    let log_dtype = if lhs_dtype.is_float() { lhs_dtype } else { DType::F32 };
+    let log_shape = lhs_shape.clone();
+    let tail_dtype = source_promote(output_dtype, log_dtype);
+    let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), tail_dtype);
+    for scalar in [&zero_lhs, &zero_rhs, &one_rhs, &negative_inf, &zero_output, &ln2] {
+        extent(scalar.shape(), scalar.dtype())?;
+    }
+    if zero_lhs.dtype() != lhs_dtype
+        || zero_rhs.dtype() != rhs_dtype
+        || one_rhs.dtype() != rhs_dtype
+        || negative_inf.dtype() != output_dtype
+        || zero_output.dtype() != output_dtype
+        || ln2.dtype() != tail_dtype
+    {
+        return Err(fail(tail_dtype));
+    }
+
+    let rhs_minus_one_shape = rhs_shape.broadcast_with(one_rhs.shape())?;
+    let rhs_minus_one_dtype = source_promote(rhs_dtype, one_rhs.dtype());
+    let power_shape = lhs_shape.broadcast_with(&rhs_minus_one_shape)?;
+    let power_dtype = lhs_dtype.promote(rhs_minus_one_dtype);
+    let base_local_shape = rhs_shape.broadcast_with(&power_shape)?;
+    let base_local_dtype = source_promote(rhs_dtype, power_dtype);
+    let zero_local_shape = rhs_shape.broadcast_with(negative_inf.shape())?.broadcast_with(zero_output.shape())?;
+    let zero_local_dtype = source_promote(output_dtype, output_dtype);
+    let tail_shape = output_shape.broadcast_with(&log_shape)?;
+    let final_shape = lhs_shape.broadcast_with(&zero_local_shape)?.broadcast_with(&tail_shape)?;
+    let final_dtype = source_promote(zero_local_dtype, tail_dtype);
+    let lhs_grad_dtype = source_promote(upstream_data.dtype, base_local_dtype);
+    let rhs_grad_dtype = source_promote(upstream_data.dtype, final_dtype);
+    if rhs_minus_one_shape != rhs_shape
+        || rhs_minus_one_dtype != rhs_dtype
+        || power_shape != output_shape
+        || power_dtype != output_dtype
+        || base_local_shape != output_shape
+        || base_local_dtype != output_dtype
+        || zero_local_dtype != output_dtype
+        || tail_shape != output_shape
+        || final_shape != output_shape
+        || lhs_shape.broadcast_with(&output_shape)? != output_shape
+        || rhs_shape.broadcast_with(&output_shape)? != output_shape
+    {
+        return Err(fail(output_dtype));
+    }
+    for (shape, dtype) in [
+        (&rhs_minus_one_shape, rhs_minus_one_dtype),
+        (&power_shape, power_dtype),
+        (&base_local_shape, base_local_dtype),
+        (&zero_local_shape, zero_local_dtype),
+        (&log_shape, log_dtype),
+        (&tail_shape, tail_dtype),
+        (&final_shape, final_dtype),
+        (&output_shape, lhs_grad_dtype),
+        (&output_shape, rhs_grad_dtype),
+        (&lhs_shape, lhs_grad_dtype),
+        (&rhs_shape, rhs_grad_dtype),
+        (&output_shape, DType::Bool),
+        (&lhs_shape, DType::Bool),
+        (&rhs_shape, DType::Bool),
+    ] {
+        extent(shape, dtype)?;
+    }
+    Ok(PowVjpPlan { zero_lhs, zero_rhs, one_rhs, negative_inf, zero_output, ln2 })
+}
 
 impl Graph {
     /// Appends the reverse-mode derivative of a one-element `loss` with
@@ -271,22 +407,27 @@ impl Graph {
                             (lhs_grad, rhs_grad)
                         }
                         BinaryOp::Pow => {
-                            let zero = self.constant(TensorData::scalar(0.0f32));
-                            let one = self.constant(TensorData::scalar(1.0f32));
-                            let exponent_is_zero = self.eq(rhs, zero)?;
-                            let exponent_minus_one = self.sub(rhs, one)?;
+                            // Do not let one fallible VJP branch publish a
+                            // prefix of another: the plan validates every
+                            // source-literal branch before its first constant.
+                            let plan = pow_vjp_plan(self, node, lhs, rhs, upstream)?;
+                            let zero_lhs = self.constant(plan.zero_lhs);
+                            let zero_rhs = self.constant(plan.zero_rhs);
+                            let one_rhs = self.constant(plan.one_rhs);
+                            let exponent_is_zero = self.eq(rhs, zero_rhs)?;
+                            let exponent_minus_one = self.sub(rhs, one_rhs)?;
                             let power = self.pow(lhs, exponent_minus_one)?;
                             let base_local = self.mul(rhs, power)?;
                             let base_local = self.select(exponent_is_zero, rhs, base_local)?;
                             let lhs_grad = self.mul(upstream, base_local)?;
-                            let base_is_zero = self.eq(lhs, zero)?;
-                            let exponent_negative = self.lt(rhs, zero)?;
-                            let negative_inf = self.constant(TensorData::scalar(f32::NEG_INFINITY));
-                            let exponent_zero = self.constant(TensorData::scalar(0.0f32));
+                            let base_is_zero = self.eq(lhs, zero_lhs)?;
+                            let exponent_negative = self.lt(rhs, zero_rhs)?;
+                            let negative_inf = self.constant(plan.negative_inf);
+                            let exponent_zero = self.constant(plan.zero_output);
                             let zero_local =
                                 self.select(exponent_negative, negative_inf, exponent_zero)?;
                             let logarithm = self.log2(lhs)?;
-                            let ln2 = self.constant(TensorData::scalar(std::f32::consts::LN_2));
+                            let ln2 = self.constant(plan.ln2);
                             let exponent_local = self.mul(node, logarithm)?;
                             let exponent_local = self.mul(exponent_local, ln2)?;
                             let exponent_local =
@@ -1292,6 +1433,75 @@ mod tests {
             CpuBackend.execute(&ties, dr, &inputs).unwrap(),
             data([2], &[0.5, 0.0])
         );
+    }
+
+    #[test]
+    fn pow_vjp_uses_source_width_weak_constants_and_preflights() {
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let base = graph.input_dtype("base", [2, 1], dtype);
+            let exponent = graph.input_dtype("exponent", [2], dtype);
+            let output = graph.pow(base, exponent).unwrap();
+            let loss = graph.sum_all(output).unwrap();
+            let base_grad = graph.grad(loss, base).unwrap();
+            let exponent_grad = graph.grad(loss, exponent).unwrap();
+            assert_eq!(graph.shape(base_grad).unwrap(), &Shape::new([2, 1]));
+            assert_eq!(graph.shape(exponent_grad).unwrap(), &Shape::new([2]));
+            let scalar_dtypes = (0..graph.node_count())
+                .filter_map(|index| match &graph.node(NodeId::from_index(index)).unwrap().op {
+                    Op::Constant(data) if data.shape().rank() == 0 => Some(data.dtype()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            // The seed/reduction may introduce additional F32 constants, but
+            // every Pow-local weak literal must exist at the source storage
+            // width: lhs zero; rhs zero/one; result -inf/zero; and ln(2).
+            assert!(scalar_dtypes.iter().filter(|&&actual| actual == dtype).count() >= 6);
+        }
+
+        let mut graph = Graph::new();
+        let base = graph.input_dtype("base", [3], DType::F64);
+        let exponent = graph.input_dtype("exponent", [3], DType::F64);
+        let output = graph.pow(base, exponent).unwrap();
+        let loss = graph.sum_all(output).unwrap();
+        let exponent_grad = graph.grad(loss, exponent).unwrap();
+        let values = CpuBackend
+            .execute(
+                &graph,
+                exponent_grad,
+                &HashMap::from([
+                    (
+                        "base".into(),
+                        TensorData::from_scalars(
+                            [3],
+                            DType::F64,
+                            [Scalar::F(0.0), Scalar::F(2.0), Scalar::F(f64::NAN)],
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        "exponent".into(),
+                        TensorData::from_scalars(
+                            [3],
+                            DType::F64,
+                            [Scalar::F(-1.0), Scalar::F(0.0), Scalar::F(1.0)],
+                        )
+                        .unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(values.scalar_at(0).as_f64(), f64::NEG_INFINITY);
+        assert_eq!(values.scalar_at(1).as_f64(), 2.0f64.ln());
+        assert!(values.scalar_at(2).as_f64().is_nan());
+
+        let mut overflow = Graph::new();
+        let lhs = overflow.input_dtype("lhs", [usize::MAX, 2], DType::F64);
+        let rhs = overflow.input_dtype("rhs", [usize::MAX, 2], DType::F64);
+        let output = overflow.pow(lhs, rhs).unwrap();
+        let node_count = overflow.node_count();
+        assert!(matches!(pow_vjp_plan(&overflow, output, lhs, rhs, output), Err(Error::ShapeOverflow(_))));
+        assert_eq!(overflow.node_count(), node_count);
     }
 
     #[test]
