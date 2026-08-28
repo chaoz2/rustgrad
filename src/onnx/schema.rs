@@ -191,6 +191,55 @@ pub(super) fn strict_typed_scalar_i64_attr(n: &Msg<'_>, wanted: &str) -> Result<
     }
     Ok(out)
 }
+
+/// Reads one named ONNX STRING attribute whose declared AttributeProto type
+/// is STRING. This is deliberately narrower than the legacy raw attribute
+/// map: movement adapters must not treat an INT/FLOAT/TENSOR wire payload as
+/// a UTF-8 mode string.
+pub(super) fn strict_typed_string_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<String>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let [(_, _, ty)] = types.as_slice() else {
+            return Err(bad("ONNX string attribute must declare STRING type"));
+        };
+        let mut at = 0;
+        if var(ty, &mut at)? != 3 || at != ty.len() {
+            return Err(bad("ONNX attribute is not STRING"));
+        }
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(id, wire, value)] = values.as_slice() else {
+            return Err(bad("ONNX string attribute must have one STRING value"));
+        };
+        if *id != 4 || *wire != 2 {
+            return Err(bad("ONNX attribute is not STRING"));
+        }
+        out = Some(
+            std::str::from_utf8(value)
+                .map_err(|_| bad("ONNX string attribute is not UTF-8"))?
+                .to_owned(),
+        );
+    }
+    Ok(out)
+}
 pub(super) fn packed_i64(b: &[u8]) -> Result<Vec<i64>> {
     let mut at = 0;
     let mut x = vec![];

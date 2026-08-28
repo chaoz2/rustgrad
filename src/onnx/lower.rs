@@ -5,7 +5,7 @@ use super::{
     schema::{
         attrs, axes_usize, const_i64, conv_pads, conv_pair, conv_same_padding, onnx_pool_options,
         packed_i64, reshape_dims, scalar_f32, scalar_i64, strict_typed_scalar_i64_attr,
-        typed_scalar_f32_attr,
+        strict_typed_string_attr, typed_scalar_f32_attr,
         typed_scalar_i64_attr,
     },
     tensor::{onnx_dtype, tensor_data},
@@ -342,6 +342,115 @@ struct SpaceToDepthPlan {
     first_shape: Shape,
     output_shape: Shape,
     identity: bool,
+}
+
+/// The two literal branches in tinygrad's DepthToSpace adapter. Any UTF-8
+/// mode other than exactly `CRD` follows the default DCR branch.
+enum DepthToSpaceMode {
+    Dcr,
+    Crd,
+}
+
+struct DepthToSpacePlan {
+    first_shape: Shape,
+    permutation: [usize; 6],
+    output_shape: Shape,
+    identity: bool,
+}
+
+fn depth_to_space_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<DepthToSpacePlan> {
+    if attrs.keys().any(|key| key != "blocksize" && key != "mode") {
+        return Err(bad("unsupported DepthToSpace attribute"));
+    }
+    let raw_blocksize = strict_typed_scalar_i64_attr(n, "blocksize")?
+        .ok_or_else(|| bad("DepthToSpace requires blocksize"))?;
+    let blocksize = usize::try_from(raw_blocksize)
+        .map_err(|_| bad("DepthToSpace blocksize must be positive"))?;
+    if blocksize == 0 {
+        return Err(bad("DepthToSpace blocksize must be positive"));
+    }
+    let mode = match strict_typed_string_attr(n, "mode")?.as_deref() {
+        Some("CRD") => DepthToSpaceMode::Crd,
+        _ => DepthToSpaceMode::Dcr,
+    };
+
+    let input_shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    if input_shape.rank() != 4 {
+        return Err(bad("DepthToSpace requires rank-four NCHW input"));
+    }
+    let [batch, channels, height, width]: [usize; 4] = input_shape
+        .dims()
+        .try_into()
+        .expect("rank-four input preflighted");
+    // tinygrad's `reshape` infers Cout by dividing through B*H*W*s*s. It
+    // therefore rejects these otherwise representable empty domains before
+    // it can construct the rearrange views.
+    if batch == 0 || height == 0 || width == 0 {
+        return Err(bad("DepthToSpace source reshape rejects empty batch or spatial extent"));
+    }
+    let input_numel = input_shape.numel()?;
+    input_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("DepthToSpace input byte extent overflow"))?;
+    let block_area = blocksize
+        .checked_mul(blocksize)
+        .ok_or_else(|| bad("DepthToSpace block area overflow"))?;
+    if channels % block_area != 0 {
+        return Err(bad("DepthToSpace channels must be divisible by blocksize squared"));
+    }
+    let output_channels = channels / block_area;
+    let output_height = height
+        .checked_mul(blocksize)
+        .ok_or_else(|| bad("DepthToSpace output height overflow"))?;
+    let output_width = width
+        .checked_mul(blocksize)
+        .ok_or_else(|| bad("DepthToSpace output width overflow"))?;
+
+    let (first_shape, permutation) = match mode {
+        // b (h1 w1 c) h w -> b c (h h1) (w w1)
+        DepthToSpaceMode::Dcr => (
+            Shape::new([batch, blocksize, blocksize, output_channels, height, width]),
+            [0, 3, 4, 1, 5, 2],
+        ),
+        // b (c h1 w1) h w -> b c (h h1) (w w1)
+        DepthToSpaceMode::Crd => (
+            Shape::new([batch, output_channels, blocksize, blocksize, height, width]),
+            [0, 1, 4, 2, 5, 3],
+        ),
+    };
+    let first_numel = first_shape.numel()?;
+    if first_numel != input_numel {
+        return Err(bad("DepthToSpace intermediate reshape changes element count"));
+    }
+    first_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("DepthToSpace intermediate byte extent overflow"))?;
+    let mut sorted = permutation;
+    sorted.sort_unstable();
+    if sorted != [0, 1, 2, 3, 4, 5] {
+        return Err(bad("invalid DepthToSpace permutation"));
+    }
+
+    let output_shape = Shape::new([batch, output_channels, output_height, output_width]);
+    let output_numel = output_shape.numel()?;
+    if output_numel != input_numel {
+        return Err(bad("DepthToSpace output reshape changes element count"));
+    }
+    output_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("DepthToSpace output byte extent overflow"))?;
+    Ok(DepthToSpacePlan {
+        first_shape,
+        permutation,
+        output_shape,
+        identity: blocksize == 1,
+    })
 }
 
 fn space_to_depth_plan(
@@ -1147,6 +1256,22 @@ pub(super) fn lower(
                 debug_assert_eq!(
                     g.dtype(output).expect("SpaceToDepth dtype preflighted"),
                     g.dtype(input).expect("SpaceToDepth input dtype")
+                );
+                output
+            }
+        }
+        "DepthToSpace" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = depth_to_space_plan(g, input, &n, &attrs)?;
+            if plan.identity {
+                input
+            } else {
+                let first = g.reshape(input, plan.first_shape)?;
+                let permuted = g.permute(first, plan.permutation)?;
+                let output = g.reshape(permuted, plan.output_shape)?;
+                debug_assert_eq!(
+                    g.dtype(output).expect("DepthToSpace dtype preflighted"),
+                    g.dtype(input).expect("DepthToSpace input dtype")
                 );
                 output
             }
