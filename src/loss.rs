@@ -2,7 +2,7 @@
 use crate::{
     DType, Error, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
 };
-use crate::ir::{source_lub, source_weak_scalar_dtype};
+use crate::ir::{logsigmoid_plan, source_lub, source_weak_scalar_dtype};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reduction {
@@ -180,16 +180,6 @@ fn target_shape(graph: &Graph, logits: NodeId, target: NodeId, axis: usize) -> R
     }
     Ok(())
 }
-fn binary_target(graph: &Graph, input: NodeId, target: NodeId) -> Result<()> {
-    if !graph.dtype(input)?.is_float() || !graph.dtype(target)?.is_float() {
-        return Err(invalid("binary loss input and target must be float"));
-    }
-    if graph.shape(input)? != graph.shape(target)? {
-        return Err(invalid("binary loss input and target shapes must match"));
-    }
-    Ok(())
-}
-
 /// Descriptor-only literal for tinygrad `Tensor.binary_crossentropy`.
 ///
 /// The two live inputs are independently promoted at every source consumer;
@@ -200,6 +190,137 @@ struct BinaryCrossEntropyPlan {
     loss_dtype: DType,
     output_shape: Shape,
     output_dtype: DType,
+}
+
+/// Descriptor-only literal for tinygrad `Tensor.binary_crossentropy_logits`.
+/// It covers both independent LogSigmoid calls, the optional live
+/// `pos_weight` branch, weak `1` commitments, and final source reduction
+/// before a nested helper can publish any graph state.
+struct BinaryCrossEntropyLogitsPlan {
+    loss_shape: Shape,
+    loss_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn binary_crossentropy_logits_plan(
+    graph: &Graph,
+    logits: NodeId,
+    target: NodeId,
+    pos_weight: Option<NodeId>,
+    reduction: Reduction,
+) -> Result<BinaryCrossEntropyLogitsPlan> {
+    let logits_node = graph.node(logits)?;
+    let target_node = graph.node(target)?;
+    let logits_shape = logits_node.shape.clone();
+    let target_shape = target_node.shape.clone();
+    let logits_dtype = logits_node.dtype;
+    let target_dtype = target_node.dtype;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(&logits_shape, logits_dtype)?;
+    extent(&target_shape, target_dtype)?;
+
+    // `self.logsigmoid()` and `(-self).logsigmoid()`. The shared pure
+    // LogSigmoid descriptor proves its own outer negation, Softplus literal,
+    // typed weak constants, and final negation. The explicit source `-self`
+    // between the two calls has the original storage width.
+    logsigmoid_plan(&logits_shape, logits_dtype)?;
+    extent(&logits_shape, logits_dtype)?;
+    if logits_dtype == DType::Bool {
+        extent(&Shape::new([]), DType::Bool)?;
+        extent(&logits_shape, DType::Bool)?;
+    }
+    logsigmoid_plan(&logits_shape, logits_dtype)?;
+    let log_dtype = if logits_dtype.is_float() { logits_dtype } else { DType::F32 };
+    extent(&logits_shape, log_dtype)?;
+
+    // `(1 if pos_weight is None else pos_weight) * Y * log_p`.
+    let (weight_shape, weight_dtype) = if let Some(weight) = pos_weight {
+        let weight_node = graph.node(weight)?;
+        extent(&weight_node.shape, weight_node.dtype)?;
+        (weight_node.shape.clone(), weight_node.dtype)
+    } else {
+        let dtype = source_weak_scalar_dtype(target_dtype, Scalar::I(1));
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), dtype);
+        extent(one.shape(), one.dtype())?;
+        if one.shape() != &Shape::new([]) || one.dtype() != dtype {
+            return Err(invalid("binary logits implicit pos_weight promotion"));
+        }
+        (Shape::new([]), dtype)
+    };
+    let weighted_target_shape = weight_shape.broadcast_with(&target_shape)?;
+    let weighted_target_dtype = source_lub(weight_dtype, target_dtype);
+    extent(&weight_shape, weighted_target_dtype)?;
+    extent(&target_shape, weighted_target_dtype)?;
+    extent(&weighted_target_shape, weighted_target_dtype)?;
+    let positive_shape = weighted_target_shape.broadcast_with(&logits_shape)?;
+    let positive_dtype = source_lub(weighted_target_dtype, log_dtype);
+    extent(&weighted_target_shape, positive_dtype)?;
+    extent(&logits_shape, positive_dtype)?;
+    extent(&positive_shape, positive_dtype)?;
+
+    // `(1-Y) * log_1_minus_p`, where this source `1` is a separate weak
+    // scalar commitment from the absent-pos-weight one above.
+    let complement_one_dtype = source_weak_scalar_dtype(target_dtype, Scalar::I(1));
+    let complement_dtype = source_lub(complement_one_dtype, target_dtype);
+    let complement_one = TensorData::scalar_with_dtype(Scalar::I(1), complement_one_dtype);
+    for (shape, dtype) in [
+        (complement_one.shape(), complement_one.dtype()),
+        (&target_shape, complement_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if complement_one.shape() != &Shape::new([])
+        || complement_one.dtype() != complement_one_dtype
+        || target_shape.broadcast_with(complement_one.shape())? != target_shape
+    {
+        return Err(invalid("binary logits complement promotion"));
+    }
+    let negative_shape = target_shape.broadcast_with(&logits_shape)?;
+    let negative_dtype = source_lub(complement_dtype, log_dtype);
+    extent(&target_shape, negative_dtype)?;
+    extent(&logits_shape, negative_dtype)?;
+    extent(&negative_shape, negative_dtype)?;
+
+    // `-(positive + negative)` then `_do_reduction(reduction)`.
+    let loss_shape = positive_shape.broadcast_with(&negative_shape)?;
+    let loss_dtype = source_lub(positive_dtype, negative_dtype);
+    extent(&positive_shape, loss_dtype)?;
+    extent(&negative_shape, loss_dtype)?;
+    extent(&loss_shape, loss_dtype)?; // ADD then outer Neg
+    let scalar = Shape::new([]);
+    let (output_shape, output_dtype) = match reduction {
+        Reduction::None => (loss_shape.clone(), loss_dtype),
+        Reduction::Sum => {
+            let dtypes = ReductionDType::sum_default(loss_dtype);
+            extent(&loss_shape, dtypes.accumulator)?;
+            extent(&scalar, dtypes.accumulator)?;
+            extent(&scalar, dtypes.output)?;
+            (scalar, dtypes.output)
+        }
+        Reduction::Mean => {
+            let dtypes = ReductionDType::sum_default(loss_dtype);
+            let division_dtype = if dtypes.accumulator.is_float() { dtypes.accumulator } else { DType::F32 };
+            let output_dtype = if loss_dtype.is_float() { loss_dtype } else { DType::F32 };
+            extent(&loss_shape, dtypes.accumulator)?;
+            extent(&scalar, dtypes.accumulator)?;
+            extent(&scalar, division_dtype)?;
+            extent(&scalar, output_dtype)?;
+            let divisor = TensorData::scalar_with_dtype(
+                Scalar::F(loss_shape.numel()? as f64),
+                division_dtype,
+            );
+            extent(divisor.shape(), divisor.dtype())?;
+            (scalar, output_dtype)
+        }
+    };
+    Ok(BinaryCrossEntropyLogitsPlan { loss_shape, loss_dtype, output_shape, output_dtype })
 }
 
 fn binary_crossentropy_plan(
@@ -443,6 +564,51 @@ impl Graph {
     ) -> Result<NodeId> {
         self.binary_crossentropy(input, target, Reduction::Mean)
     }
+
+    /// Checked-in tinygrad `Tensor.binary_crossentropy_logits(Y, reduction,
+    /// pos_weight)`. This is intentionally separate from probability BCE:
+    /// its two source LogSigmoid branches operate on the unbounded logits.
+    pub fn binary_crossentropy_logits(
+        &mut self,
+        logits: NodeId,
+        target: NodeId,
+        reduction: Reduction,
+        pos_weight: Option<NodeId>,
+    ) -> Result<NodeId> {
+        let plan = binary_crossentropy_logits_plan(self, logits, target, pos_weight, reduction)?;
+        let log_p = self.logsigmoid(logits)?;
+        let neg_logits = self.neg(logits)?;
+        let log_1_minus_p = self.logsigmoid(neg_logits)?;
+        let weighted_target = match pos_weight {
+            Some(weight) => self.mul(weight, target)?,
+            None => self.scalar_mul(Scalar::I(1), target)?,
+        };
+        let positive = self.mul(weighted_target, log_p)?;
+        let complement = self.scalar_sub(Scalar::I(1), target)?;
+        let negative = self.mul(complement, log_1_minus_p)?;
+        let sum = self.add(positive, negative)?;
+        let loss = self.neg(sum)?;
+        let output = match reduction {
+            Reduction::None => loss,
+            Reduction::Sum => self.sum_default(loss)?,
+            Reduction::Mean => self.mean_default(loss)?,
+        };
+        debug_assert_eq!(self.shape(loss).expect("binary logits preflighted"), &plan.loss_shape);
+        debug_assert_eq!(self.dtype(loss).expect("binary logits preflighted"), plan.loss_dtype);
+        debug_assert_eq!(self.shape(output).expect("binary logits preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("binary logits preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// tinygrad's omitted logits-BCE reduction defaults to `"mean"`.
+    pub fn binary_crossentropy_logits_default(
+        &mut self,
+        logits: NodeId,
+        target: NodeId,
+        pos_weight: Option<NodeId>,
+    ) -> Result<NodeId> {
+        self.binary_crossentropy_logits(logits, target, Reduction::Mean, pos_weight)
+    }
 }
 
 /// Probability-target binary cross entropy, matching tinygrad's unclamped log contract.
@@ -464,22 +630,7 @@ pub fn binary_cross_entropy_with_logits(
     pos_weight: Option<NodeId>,
     reduction: Reduction,
 ) -> Result<NodeId> {
-    binary_target(graph, logits, target)?;
-    if let Some(pos_weight) = pos_weight {
-        graph.shape(pos_weight)?.broadcast_with(graph.shape(target)?)?;
-    }
-    let log_p = graph.logsigmoid(logits)?;
-    let neg = graph.neg(logits)?;
-    let log_q = graph.logsigmoid(neg)?;
-    let pw = pos_weight.unwrap_or_else(|| graph.constant(TensorData::scalar(1.)));
-    let weighted_target = graph.mul(pw, target)?;
-    let positive = graph.mul(weighted_target, log_p)?;
-    let one = graph.constant(TensorData::scalar(1.));
-    let complement = graph.sub(one, target)?;
-    let negative = graph.mul(complement, log_q)?;
-    let total = graph.add(positive, negative)?;
-    let loss = graph.neg(total)?;
-    reduce(graph, loss, reduction)
+    graph.binary_crossentropy_logits(logits, target, reduction, pos_weight)
 }
 /// Sparse categorical CE with an explicitly selected class axis.
 pub fn sparse_categorical_cross_entropy(
@@ -783,14 +934,11 @@ mod tests {
         assert_eq!(graph.shape(broadcast).unwrap(), &Shape::from([2, 2]));
         let logits = graph.input("logits", [2]);
         let integer_target = graph.input_dtype("labels", [2], crate::DType::I32);
-        assert!(binary_cross_entropy_with_logits(
-            &mut graph,
-            logits,
-            integer_target,
-            None,
-            Reduction::Mean,
-        )
-        .is_err());
+        let integer_loss = graph
+            .binary_crossentropy_logits(logits, integer_target, Reduction::Mean, None)
+            .unwrap();
+        assert_eq!(graph.shape(integer_loss).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(integer_loss).unwrap(), DType::F32);
     }
 
     #[test]
@@ -903,6 +1051,48 @@ mod tests {
             Err(Error::BroadcastMismatch { .. })
         ));
         assert_eq!(malformed.node_count(), node_count);
+    }
+
+    #[test]
+    fn binary_crossentropy_logits_is_literal_and_preflights_live_promotion() {
+        let mut graph = Graph::new();
+        let logits = graph.input_dtype("logits", [2, 1], DType::F16);
+        let target = graph.input_dtype("target", [2], DType::I64);
+        let weight = graph.input_dtype("weight", [1, 2], DType::U64);
+        let loss = graph
+            .binary_crossentropy_logits(logits, target, Reduction::None, Some(weight))
+            .unwrap();
+        assert_eq!(graph.shape(loss).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(graph.dtype(loss).unwrap(), DType::F32);
+        assert!(matches!(graph.op(loss).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, .. }));
+        let default = graph
+            .binary_crossentropy_logits_default(logits, target, None)
+            .unwrap();
+        assert_eq!(graph.shape(default).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(default).unwrap(), DType::F16);
+        let gradient = graph.grad(loss, logits).unwrap();
+        assert_eq!(graph.shape(gradient).unwrap(), &Shape::from([2, 1]));
+
+        let mut empty = Graph::new();
+        let logits = empty.input_dtype("logits", [0], DType::F32);
+        let target = empty.input_dtype("target", [0], DType::Bool);
+        let output = empty
+            .binary_crossentropy_logits(logits, target, Reduction::Sum, None)
+            .unwrap();
+        assert_eq!(empty.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(empty.dtype(output).unwrap(), DType::F32);
+
+        // Inputs independently fit, but the final live broadcast cannot.
+        // Planning must fail before either LogSigmoid, weak one, or cast node.
+        let mut overflow = Graph::new();
+        let logits = overflow.input_dtype("logits", [usize::MAX / 4, 1], DType::F32);
+        let target = overflow.input_dtype("target", [1, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(matches!(
+            overflow.binary_crossentropy_logits(logits, target, Reduction::None, None),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), nodes);
     }
 
     #[test]

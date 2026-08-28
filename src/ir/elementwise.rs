@@ -1288,7 +1288,7 @@ struct Log10Plan {
 /// Tinygrad defines LogSigmoid as `-(-x).softplus()`, not as an eager
 /// `-log(1 + exp(-x))`. This plan proves the nested default-beta Softplus
 /// construction and final Neg before it can publish the first inner node.
-struct LogsigmoidPlan {
+pub(crate) struct LogsigmoidPlan {
     shape: Shape,
     negated_dtype: DType,
     output_dtype: DType,
@@ -1688,7 +1688,7 @@ fn copysign_scalar_plan(graph: &Graph, magnitude: NodeId, sign: Scalar) -> Resul
     })
 }
 
-fn logsigmoid_plan(input_shape: &Shape, input_dtype: DType) -> Result<LogsigmoidPlan> {
+pub(crate) fn logsigmoid_plan(input_shape: &Shape, input_dtype: DType) -> Result<LogsigmoidPlan> {
     let source_promote = |lhs: DType, rhs: DType| {
         if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
             DType::F32
