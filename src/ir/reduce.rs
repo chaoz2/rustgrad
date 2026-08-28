@@ -1354,6 +1354,12 @@ impl Graph {
         Ok(output)
     }
 
+    /// Checked-in tinygrad's `Tensor.argmax()` defaults: flatten all source
+    /// dimensions and omit reduced dimensions from the scalar I32 result.
+    pub fn argmax_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.argmax_with_axis(input, None, false)
+    }
+
     /// Source-faithful public tinygrad-style ArgMin.
     ///
     /// tinygrad defines this as `inverse(input).argmax(...)`: floats negate,
@@ -1405,6 +1411,12 @@ impl Graph {
         debug_assert_eq!(self.shape(output).expect("argmin preflighted"), &plan.argmax.output_shape);
         debug_assert_eq!(self.dtype(output).expect("argmin preflighted"), DType::I32);
         Ok(output)
+    }
+
+    /// Checked-in tinygrad's `Tensor.argmin()` defaults: source-width inverse
+    /// followed by flattened first-tie ArgMax.
+    pub fn argmin_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.argmin_with_axis(input, None, false)
     }
 
     /// Reduces multiple axes. Axes refer to the original input rank.
@@ -2496,6 +2508,58 @@ mod tests {
             overflow.argmin_with_axis(input, None, false),
             Err(Error::ShapeOverflow(_))
         ));
+        assert_eq!(overflow.node_count(), nodes);
+    }
+
+    #[test]
+    fn argextrema_default_wrappers_preserve_flattened_i32_sentinel_structure() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F64);
+        let maximum = graph.argmax_default(input).unwrap();
+        let minimum = graph.argmin_default(input).unwrap();
+        for output in [maximum, minimum] {
+            assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+            assert_eq!(graph.dtype(output).unwrap(), DType::I32);
+            // The explicit source plan keeps first-tie ArgReduce and its
+            // leading-NaN sentinel as a Select over the flattened operand.
+            assert!(matches!(graph.op(output).unwrap(), crate::Op::Select { .. }));
+            assert!(matches!(graph.grad(output, input), Err(Error::NoGradient(_))));
+        }
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Reshape { shape, .. } if shape == &Shape::new([6])
+        )));
+        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+            crate::Op::Constant(data) => Some((data.dtype(), data.scalar_at(0))),
+            _ => None,
+        }).any(|(dtype, value)| dtype == DType::I32 && value.as_i64() == 6));
+        // ArgMin is source-literal inverse → ArgMax, not raw ArgMin.
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
+        )));
+
+        let scalar = graph.input_dtype("scalar", [], DType::U64);
+        let scalar_max = graph.argmax_default(scalar).unwrap();
+        let scalar_min = graph.argmin_default(scalar).unwrap();
+        assert_eq!(graph.shape(scalar_max).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(scalar_min).unwrap(), DType::I32);
+
+        let mut empty = Graph::new();
+        let empty_input = empty.input_dtype("empty", [0, 3], DType::I16);
+        let empty_max = empty.argmax_default(empty_input).unwrap();
+        let empty_min = empty.argmin_default(empty_input).unwrap();
+        assert_eq!(empty.shape(empty_max).unwrap(), &Shape::new([]));
+        assert_eq!(empty.shape(empty_min).unwrap(), &Shape::new([]));
+        assert_eq!(empty.dtype(empty_max).unwrap(), DType::I32);
+        assert_eq!(empty.dtype(empty_min).unwrap(), DType::I32);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("overflow", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(matches!(overflow.argmax_default(input), Err(Error::ShapeOverflow(_))));
+        assert_eq!(overflow.node_count(), nodes);
+        assert!(matches!(overflow.argmin_default(input), Err(Error::ShapeOverflow(_))));
         assert_eq!(overflow.node_count(), nodes);
     }
 
