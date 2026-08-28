@@ -87,6 +87,62 @@ struct AllclosePlan {
     atol: TensorData,
 }
 
+/// The concrete public `Tensor.logaddexp` graph is not a raw binary ALU: the
+/// two source operands first commit to one LUB storage dtype, then that shared
+/// pair feeds Max and both centered Exp paths. Retaining the casted values
+/// matters at narrow rounding boundaries as well as for graph structure.
+struct LogaddexpPlan {
+    shape: Shape,
+    operand_dtype: DType,
+    exp_dtype: DType,
+    output_dtype: DType,
+}
+
+fn logaddexp_plan(
+    lhs_shape: &Shape,
+    lhs_dtype: DType,
+    rhs_shape: &Shape,
+    rhs_dtype: DType,
+) -> Result<LogaddexpPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(lhs_shape, lhs_dtype)?;
+    extent(rhs_shape, rhs_dtype)?;
+    let shape = lhs_shape.broadcast_with(rhs_shape)?;
+    let operand_dtype = lhs_dtype.promote(rhs_dtype);
+    let exp_dtype = unary_dtype(UnaryOp::Exp, operand_dtype);
+    let output_dtype = exp_dtype.promote(operand_dtype);
+
+    // Source `_broadcasted` casts each operand once, then reuses those typed
+    // values for Max and the two ordered subtracts. Exp and Log retain the
+    // source float storage dtype, including the nonfloat-to-F32 lift.
+    extent(lhs_shape, operand_dtype)?;
+    extent(rhs_shape, operand_dtype)?;
+    for dtype in [operand_dtype, operand_dtype, operand_dtype, exp_dtype, exp_dtype, exp_dtype, exp_dtype, output_dtype] {
+        extent(&shape, dtype)?;
+    }
+    if (!operand_dtype.is_float() && exp_dtype != DType::F32)
+        || (operand_dtype.is_float() && exp_dtype != operand_dtype)
+        || output_dtype != exp_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "logaddexp source promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(LogaddexpPlan {
+        shape,
+        operand_dtype,
+        exp_dtype,
+        output_dtype,
+    })
+}
+
 fn allclose_plan(
     lhs_shape: &Shape,
     lhs_dtype: DType,
@@ -3558,6 +3614,25 @@ impl Graph {
         self.mul(log, scale)
     }
     pub fn logaddexp(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        let (lhs_shape, lhs_dtype) = {
+            let source = self.node(lhs)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let (rhs_shape, rhs_dtype) = {
+            let source = self.node(rhs)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let plan = logaddexp_plan(&lhs_shape, lhs_dtype, &rhs_shape, rhs_dtype)?;
+        let lhs = if lhs_dtype == plan.operand_dtype {
+            lhs
+        } else {
+            self.cast(lhs, plan.operand_dtype)?
+        };
+        let rhs = if rhs_dtype == plan.operand_dtype {
+            rhs
+        } else {
+            self.cast(rhs, plan.operand_dtype)?
+        };
         let maximum = self.maximum(lhs, rhs)?;
         let left = self.sub(lhs, maximum)?;
         let right = self.sub(rhs, maximum)?;
@@ -3565,7 +3640,12 @@ impl Graph {
         let right_exp = self.exp(right)?;
         let sum = self.add(left_exp, right_exp)?;
         let log = self.log(sum)?;
-        self.add(log, maximum)
+        let output = self.add(log, maximum)?;
+        debug_assert_eq!(self.shape(output).expect("logaddexp preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(left_exp).expect("logaddexp preflighted"), plan.exp_dtype);
+        debug_assert_eq!(self.dtype(right_exp).expect("logaddexp preflighted"), plan.exp_dtype);
+        debug_assert_eq!(self.dtype(output).expect("logaddexp preflighted"), plan.output_dtype);
+        Ok(output)
     }
     pub fn logaddexp2(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let maximum = self.maximum(lhs, rhs)?;

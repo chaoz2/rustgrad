@@ -170,6 +170,119 @@ fn allclose_commits_tolerances_at_rhs_width_and_preflights_before_constants() {
 }
 
 #[test]
+fn logaddexp_reuses_tinygrad_lub_operands_and_preserves_stable_composition() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1, 2], DType::I64);
+    let rhs = graph.input_dtype("rhs", [1], DType::U64);
+    let output = graph.logaddexp(lhs, rhs).unwrap();
+
+    // Mixed I64/U64 follows tinygrad's F32 bridge once per source operand;
+    // the same casted values feed Max and both centered paths.
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([1, 2]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(matches!(graph.op(NodeId(2)).unwrap(), Op::Cast { input, dtype }
+        if *input == lhs && *dtype == DType::F32));
+    assert!(matches!(graph.op(NodeId(3)).unwrap(), Op::Cast { input, dtype }
+        if *input == rhs && *dtype == DType::F32));
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars([1, 2], DType::I64, [Scalar::I(0), Scalar::I(0)]).unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars([1], DType::U64, [Scalar::U(0)]).unwrap(),
+        ),
+    ]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert!((values.scalar_at(0).as_f64() - std::f64::consts::LN_2).abs() < 1e-5);
+    assert!((values.scalar_at(1).as_f64() - std::f64::consts::LN_2).abs() < 1e-5);
+
+    let mut differentiable = Graph::new();
+    let lhs = differentiable.input("lhs", [1, 2]);
+    let rhs = differentiable.input("rhs", [1]);
+    let output = differentiable.logaddexp(lhs, rhs).unwrap();
+    let gradient = differentiable.grad(differentiable.sum_all(output).unwrap(), lhs).unwrap();
+    assert_eq!(differentiable.shape(gradient).unwrap(), &Shape::new([1, 2]));
+
+    let mut specials = Graph::new();
+    let lhs = specials.input("lhs", [2]);
+    let rhs = specials.input("rhs", [2]);
+    let output = specials.logaddexp(lhs, rhs).unwrap();
+    let values = CpuBackend
+        .execute(
+            &specials,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::F32,
+                        [Scalar::F(f64::INFINITY), Scalar::F(f64::NAN)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::F32,
+                        [Scalar::F(f64::INFINITY), Scalar::F(-0.0)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert!(values.scalar_at(0).as_f64().is_nan());
+    assert!(values.scalar_at(1).as_f64().is_nan());
+
+    let mut empty = Graph::new();
+    let lhs = empty.input_dtype("lhs", [0, 3], DType::F16);
+    let rhs = empty.input_dtype("rhs", [1, 3], DType::F16);
+    let output = empty.logaddexp(lhs, rhs).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+    assert!(CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([
+                ("lhs".into(), TensorData::from_scalars([0, 3], DType::F16, []).unwrap()),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [1, 3],
+                        DType::F16,
+                        [Scalar::F(-0.0), Scalar::F(f64::INFINITY), Scalar::F(f64::NAN)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap()
+        .to_vec_f64()
+        .is_empty());
+}
+
+#[test]
+fn logaddexp_preflights_broadcast_and_byte_overflow_before_casts_or_nodes() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2]);
+    let rhs = graph.input("rhs", [3]);
+    let before = graph.node_count();
+    assert!(graph.logaddexp(lhs, rhs).is_err());
+    assert_eq!(graph.node_count(), before);
+
+    let overflow = graph.input_dtype("overflow", [usize::MAX], DType::F64);
+    let scalar = graph.input_dtype("scalar", [], DType::F64);
+    let before = graph.node_count();
+    assert!(graph.logaddexp(overflow, scalar).is_err());
+    assert_eq!(graph.node_count(), before);
+}
+
+#[test]
 fn select_uses_tinygrad_branch_lub_before_where() {
     let mut graph = Graph::new();
     let condition = graph.input_dtype("condition", [2, 1], DType::Bool);
