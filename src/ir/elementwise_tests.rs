@@ -962,6 +962,149 @@ fn add_preflights_source_casts_before_mutation() {
 }
 
 #[test]
+fn sub_uses_tinygrad_branch_lub_before_ordered_subtraction() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1, 3], DType::I64);
+    let rhs = graph.input_dtype("rhs", [2, 1], DType::U64);
+
+    let output = graph.sub(lhs, rhs).unwrap();
+
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+    let Op::Binary {
+        op: BinaryOp::Sub,
+        lhs: subtracted_lhs,
+        rhs: subtracted_rhs,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("expected Sub");
+    };
+    assert!(matches!(graph.op(*subtracted_lhs).unwrap(), Op::Cast { input, dtype }
+        if *input == lhs && *dtype == DType::F32));
+    assert!(matches!(graph.op(*subtracted_rhs).unwrap(), Op::Cast { input, dtype }
+        if *input == rhs && *dtype == DType::F32));
+}
+
+#[test]
+fn sub_matches_tinygrad_bool_negation_and_float_broadcast_vjp() {
+    let mut booleans = Graph::new();
+    let lhs = booleans.input_dtype("lhs", [4], DType::Bool);
+    let rhs = booleans.input_dtype("rhs", [4], DType::Bool);
+    let output = booleans.sub(lhs, rhs).unwrap();
+    let Op::Binary {
+        op: BinaryOp::Add,
+        lhs: added_lhs,
+        rhs: added_rhs,
+    } = booleans.op(output).unwrap()
+    else {
+        panic!("expected Bool Add");
+    };
+    assert_eq!(*added_lhs, lhs);
+    assert!(matches!(booleans.op(*added_rhs).unwrap(), Op::Logical { op: LogicalOp::Not, lhs: input, rhs: None }
+        if *input == rhs));
+    let values = CpuBackend
+        .execute(
+            &booleans,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    bool_data([4], [false, false, true, true]),
+                ),
+                (
+                    "rhs".into(),
+                    bool_data([4], [false, true, false, true]),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        (0..4).map(|index| values.scalar_at(index).as_bool()).collect::<Vec<_>>(),
+        vec![true, false, true, true]
+    );
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1, 3], DType::F64);
+    let rhs = graph.input_dtype("rhs", [2, 1], DType::F64);
+    let output = graph.sub(lhs, rhs).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let lhs_gradient = graph.grad(loss, lhs).unwrap();
+    let rhs_gradient = graph.grad(loss, rhs).unwrap();
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars(
+                [1, 3],
+                DType::F64,
+                [Scalar::F(-0.0), Scalar::F(f64::NAN), Scalar::F(f64::INFINITY)],
+            )
+            .unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars(
+                [2, 1],
+                DType::F64,
+                [Scalar::F(0.0), Scalar::F(f64::INFINITY)],
+            )
+            .unwrap(),
+        ),
+    ]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert!(values.scalar_at(1).as_f64().is_nan());
+    assert_eq!(values.scalar_at(2).as_f64(), f64::INFINITY);
+    assert_eq!(values.scalar_at(3).as_f64(), f64::NEG_INFINITY);
+    assert!(values.scalar_at(4).as_f64().is_nan());
+    assert!(values.scalar_at(5).as_f64().is_nan());
+    assert_eq!(
+        CpuBackend.execute(&graph, lhs_gradient, &bindings).unwrap().to_vec_f64(),
+        vec![2.0, 2.0, 2.0]
+    );
+    assert_eq!(
+        CpuBackend.execute(&graph, rhs_gradient, &bindings).unwrap().to_vec_f64(),
+        vec![-3.0, -3.0]
+    );
+
+    let mut mixed = Graph::new();
+    let lhs = mixed.input_dtype("lhs", [], DType::I16);
+    let rhs = mixed.input_dtype("rhs", [], DType::U16);
+    let output = mixed.sub(lhs, rhs).unwrap();
+    assert_eq!(mixed.dtype(output).unwrap(), DType::I32);
+    let values = CpuBackend
+        .execute(
+            &mixed,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::scalar_with_dtype(Scalar::I(-1), DType::I16),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::scalar_with_dtype(Scalar::U(2), DType::U16),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_i64(), -3);
+}
+
+#[test]
+fn sub_preflights_source_casts_before_mutation() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I64);
+    let rhs = graph.input_dtype("rhs", [3], DType::U64);
+    let node_count = graph.node_count();
+
+    assert!(matches!(
+        graph.sub(lhs, rhs),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn clip_is_a_clamp_alias_with_the_existing_vjp() {
     let mut graph = Graph::new();
     let input = graph.input("x", [3]);
