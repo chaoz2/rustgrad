@@ -1,6 +1,86 @@
 use super::*;
 use crate::{DType, Error, Result, TensorData};
 
+struct HardsigmoidPlan {
+    product_shape: Shape,
+    product_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+    zero: TensorData,
+    one: TensorData,
+}
+
+fn hardsigmoid_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    alpha_shape: &Shape,
+    alpha_dtype: DType,
+    beta_shape: &Shape,
+    beta_dtype: DType,
+) -> Result<HardsigmoidPlan> {
+    // tinygrad's weak promotion has one local disagreement with RustGrad's
+    // generic lattice: the I64/U64 pair resolves through default F32.
+    let source_promote = |lhs: DType, rhs: DType| {
+        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+            DType::F32
+        } else {
+            lhs.promote(rhs)
+        }
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    extent(alpha_shape, alpha_dtype)?;
+    extent(beta_shape, beta_dtype)?;
+    let product_shape = input_shape.broadcast_with(alpha_shape)?;
+    let product_dtype = source_promote(input_dtype, alpha_dtype);
+    let output_shape = product_shape.broadcast_with(beta_shape)?;
+    let output_dtype = source_promote(product_dtype, beta_dtype);
+    for (shape, dtype) in [
+        (input_shape, product_dtype),
+        (alpha_shape, product_dtype),
+        (&product_shape, product_dtype),
+        (&product_shape, output_dtype),
+        (beta_shape, output_dtype),
+        (&output_shape, output_dtype),
+        (&output_shape, DType::Bool),
+        (&output_shape, output_dtype),
+        (&output_shape, output_dtype),
+        (&output_shape, DType::Bool),
+        (&output_shape, output_dtype),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    let zero = TensorData::scalar_with_dtype(Scalar::I(0), output_dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::I(1), output_dtype);
+    if zero.dtype() != output_dtype
+        || one.dtype() != output_dtype
+        || output_shape.broadcast_with(zero.shape())? != output_shape
+        || output_shape.broadcast_with(one.shape())? != output_shape
+        || source_promote(product_dtype, beta_dtype) != output_dtype
+        || source_promote(output_dtype, zero.dtype()) != output_dtype
+        || source_promote(output_dtype, one.dtype()) != output_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "hardsigmoid scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(HardsigmoidPlan {
+        product_shape,
+        product_dtype,
+        output_shape,
+        output_dtype,
+        zero,
+        one,
+    })
+}
+
 impl Graph {
     pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Add, lhs, rhs)
@@ -441,13 +521,96 @@ impl Graph {
         self.mul(input, sigmoid)
     }
     pub fn hardsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
-        let three = self.constant(TensorData::scalar(3.0f32));
-        let six = self.constant(TensorData::scalar(6.0f32));
-        let shifted = self.add(input, three)?;
-        let zero = self.constant(TensorData::scalar(0.0f32));
-        let clipped = self.clamp(shifted, Some(zero), Some(six))?;
-        let divisor = self.constant(TensorData::scalar(6.0f32));
-        self.div(clipped, divisor)
+        // Preserve the original convenience API using tinygrad's public
+        // defaults, while planning the defaults before publishing constants.
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let parameter_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
+        let alpha = TensorData::scalar_with_dtype(Scalar::F(1.0 / 6.0), parameter_dtype);
+        let beta = TensorData::scalar_with_dtype(Scalar::F(0.5), parameter_dtype);
+        let plan = hardsigmoid_plan(
+            &input_shape,
+            input_dtype,
+            alpha.shape(),
+            alpha.dtype(),
+            beta.shape(),
+            beta.dtype(),
+        )?;
+        let alpha = self.constant(alpha);
+        let beta = self.constant(beta);
+        self.lower_hardsigmoid(input, alpha, beta, plan)
+    }
+
+    /// Applies tinygrad's source Hardsigmoid formula with live parameters:
+    /// `relu(alpha * x + beta) - relu(alpha * x + beta - 1)`.
+    pub fn hardsigmoid_with(
+        &mut self,
+        input: NodeId,
+        alpha: NodeId,
+        beta: NodeId,
+    ) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let alpha_node = self.node(alpha)?;
+        let beta_node = self.node(beta)?;
+        let plan = hardsigmoid_plan(
+            &input_node.shape,
+            input_node.dtype,
+            &alpha_node.shape,
+            alpha_node.dtype,
+            &beta_node.shape,
+            beta_node.dtype,
+        )?;
+        self.lower_hardsigmoid(input, alpha, beta, plan)
+    }
+
+    fn lower_hardsigmoid(
+        &mut self,
+        input: NodeId,
+        alpha: NodeId,
+        beta: NodeId,
+        plan: HardsigmoidPlan,
+    ) -> Result<NodeId> {
+        let input = if self.node(input)?.dtype == plan.product_dtype {
+            input
+        } else {
+            self.cast(input, plan.product_dtype)?
+        };
+        let alpha = if self.node(alpha)?.dtype == plan.product_dtype {
+            alpha
+        } else {
+            self.cast(alpha, plan.product_dtype)?
+        };
+        let product = self.mul(alpha, input)?;
+        debug_assert_eq!(
+            self.shape(product).expect("Hardsigmoid preflighted"),
+            &plan.product_shape
+        );
+        let product = if plan.product_dtype == plan.output_dtype {
+            product
+        } else {
+            self.cast(product, plan.output_dtype)?
+        };
+        let beta = if self.node(beta)?.dtype == plan.output_dtype {
+            beta
+        } else {
+            self.cast(beta, plan.output_dtype)?
+        };
+        let scaled = self.add(product, beta)?;
+        let zero = self.constant(plan.zero);
+        let one = self.constant(plan.one);
+        // ReLU is source-strict: equality and NaN take the typed-zero branch.
+        let positive = self.select(self.gt(scaled, zero)?, scaled, zero)?;
+        let shifted = self.sub(scaled, one)?;
+        let negative = self.select(self.gt(shifted, zero)?, shifted, zero)?;
+        let output = self.sub(positive, negative)?;
+        debug_assert_eq!(self.shape(output).expect("Hardsigmoid preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("Hardsigmoid preflighted"), plan.output_dtype);
+        Ok(output)
     }
     pub fn hardtanh(&mut self, input: NodeId, min: NodeId, max: NodeId) -> Result<NodeId> {
         self.clamp(input, Some(min), Some(max))
