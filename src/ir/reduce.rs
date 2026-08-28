@@ -296,6 +296,106 @@ struct CumExtremaPlan {
     index_offset: Option<TensorData>,
 }
 
+/// Descriptor-only contract for tinygrad's `Tensor.cumprod(axis)`.
+///
+/// Tinygrad implements the scan through `_cumalu(Ops.MUL)`: every inclusive
+/// prefix retains the input storage width, is reduced with Product, and the
+/// resulting singleton-axis lanes are concatenated.  RustGrad represents the
+/// same concrete composition with checked Shrink/Product/Concat nodes.  Keep
+/// all of those descriptors here so a malformed late prefix cannot publish
+/// an earlier movement or reduction node.
+struct CumprodPlan {
+    axis: Option<usize>,
+    prefixes: Vec<Vec<(usize, usize)>>,
+    dtypes: ReductionDType,
+}
+
+fn cumulative_product_plan(
+    input: NodeId,
+    shape: &Shape,
+    dtype: DType,
+    axis: isize,
+) -> Result<CumprodPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    let dtypes = ReductionDType::product_default(dtype);
+    extent(shape, dtype)?;
+    if !valid_reduction_dtypes(ReduceKind::Product, dtype, dtypes) {
+        return Err(Error::InvalidElementwiseDType {
+            op: "cumprod product storage",
+            actual: dtypes.output,
+        });
+    }
+    if shape.rank() == 0 {
+        // `_split_cumalu` resolves the axis before its rank-zero identity
+        // branch; `_resolve_dim` admits exactly -1 and 0 at rank zero.
+        if !matches!(axis, -1 | 0) {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank: 0,
+            });
+        }
+        return Ok(CumprodPlan {
+            axis: None,
+            prefixes: Vec::new(),
+            dtypes,
+        });
+    }
+    let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
+    // `_split_cumalu` is an identity for every zero-extent descriptor after
+    // signed-axis resolution. The source extent above is still checked.
+    if shape.dims().contains(&0) {
+        return Ok(CumprodPlan {
+            axis: None,
+            prefixes: Vec::new(),
+            dtypes,
+        });
+    }
+
+    let mut prefixes = Vec::with_capacity(shape.dims()[axis]);
+    for end in 1..=shape.dims()[axis] {
+        let bounds = shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(dimension, &dimension_extent)| {
+                if dimension == axis {
+                    (0, end)
+                } else {
+                    (0, dimension_extent)
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut prefix_dims = shape.dims().to_vec();
+        prefix_dims[axis] = end;
+        let prefix_shape = Shape::new(prefix_dims);
+        let mut reduced_dims = prefix_shape.dims().to_vec();
+        reduced_dims[axis] = 1;
+        let reduced_shape = Shape::new(reduced_dims);
+        // Product has no widening/narrowing boundary, but validate both the
+        // accumulator and final descriptor explicitly so this remains true
+        // if the shared dtype representation evolves.
+        extent(&prefix_shape, dtype)?;
+        extent(&prefix_shape, dtypes.accumulator)?;
+        extent(&reduced_shape, dtypes.accumulator)?;
+        extent(&reduced_shape, dtypes.output)?;
+        prefixes.push(bounds);
+    }
+    // The concatenated singleton lanes reconstruct the original descriptor.
+    extent(shape, dtypes.output)?;
+    Ok(CumprodPlan {
+        axis: Some(axis),
+        prefixes,
+        dtypes,
+    })
+}
+
 /// Concrete whole-operation plan for tinygrad's stable
 /// `Tensor.logcumsumexp(axis)`.  The source builds the cumulative maxima and
 /// lower-triangle predicate explicitly, rather than using a scan primitive.
@@ -1380,41 +1480,14 @@ impl Graph {
             let source = self.node(input)?;
             (source.shape.clone(), source.dtype)
         };
-        shape.numel()?;
-        let dtypes = ReductionDType::product_default(dtype);
-        if shape.rank() == 0 {
-            if !matches!(axis, -1 | 0) {
-                return Err(Error::InvalidAxis {
-                    node: input,
-                    axis: usize::MAX,
-                    rank: 0,
-                });
-            }
+        let plan = cumulative_product_plan(input, &shape, dtype, axis)?;
+        let Some(axis) = plan.axis else {
             return Ok(input);
-        }
-        let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
-        if shape.dims().contains(&0) {
-            return Ok(input);
-        }
+        };
+        let dtypes = plan.dtypes;
 
-        let prefixes = (0..shape.dims()[axis])
-            .map(|end| {
-                shape
-                    .dims()
-                    .iter()
-                    .enumerate()
-                    .map(|(dimension, &extent)| {
-                        if dimension == axis {
-                            (0, end + 1)
-                        } else {
-                            (0, extent)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        let values = prefixes
+        let values = plan
+            .prefixes
             .into_iter()
             .map(|bounds| {
                 let prefix = self.shrink(input, bounds)?;
@@ -3103,6 +3176,7 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("input", [2, 3]);
         let cumulative = graph.cumprod(input, -1).unwrap();
+        assert!(matches!(graph.op(cumulative).unwrap(), crate::Op::Concat { axis: 1, .. }));
         let loss = graph.sum_all(cumulative).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         let inputs = HashMap::from([(
@@ -3159,6 +3233,39 @@ mod tests {
         let before_nodes = invalid.node_count();
         assert!(invalid.cumprod(input, 1).is_err());
         assert_eq!(invalid.node_count(), before_nodes);
+
+        // Product has no accumulator widening: source Bool/integer/floating
+        // storage is retained in every checked prefix reduction.
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let mut typed = Graph::new();
+            let input = typed.input_dtype("typed", [2, 2], dtype);
+            let output = typed.cumprod(input, -1).unwrap();
+            assert_eq!(typed.shape(output).unwrap(), &Shape::from([2, 2]));
+            assert_eq!(typed.dtype(output).unwrap(), dtype);
+            assert!(matches!(typed.op(output).unwrap(), crate::Op::Concat { axis: 1, .. }));
+        }
+
+        // The descriptor-first plan rejects byte overflow before a Shrink or
+        // Product reduction can be appended.
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+        let before_nodes = overflow.node_count();
+        assert!(matches!(overflow.cumprod(input, 0), Err(Error::ShapeOverflow(_))));
+        assert_eq!(overflow.node_count(), before_nodes);
     }
 
     #[test]
