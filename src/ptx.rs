@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v25";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v26";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -900,6 +900,7 @@ enum ScopedStorageMode {
     Eq,
     Ne,
     LogicalNot,
+    IsInf,
     OrderedLt,
     InclusiveLt,
     Select,
@@ -936,6 +937,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Lt)) {
         return scoped_ordered_lt_plan(store, sm);
+    }
+    if matches!(value.kind(), UOpKind::GraphUnary(crate::UnaryOp::IsInf)) {
+        return scoped_isinf_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::Ternary(crate::uop::Ternary::Where)) {
         if let Some(mode) = scoped_relu_plan(store, sm)? {
@@ -1568,6 +1572,52 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
     }
     reject_sign_storage_dtype(input_dtype)?;
     Ok(Some(ScopedStorageMode::LogicalNot))
+}
+
+/// Public IsInf is one direct raw predicate root. Its F16/BF16/F32/F64
+/// classification is performed from storage bits by the renderer, so NaN
+/// payloads cannot be confused with either infinity and integers stay false.
+fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(output) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let Some(value) = store.sources().get(1) else { return Ok(None) };
+    let UOpKind::GraphUnary(crate::UnaryOp::IsInf) = value.kind() else { return Ok(None) };
+    let [load] = value.sources() else { return Ok(None) };
+    if !matches!(load.kind(), UOpKind::Load)
+        || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+    {
+        return Ok(None);
+    }
+    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output.arg() else {
+        return Err(PtxError::Unsupported("public IsInf requires a concrete output buffer".into()));
+    };
+    if output.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public IsInf output descriptor is invalid".into()));
+    }
+    let [input] = load.sources() else {
+        return Err(PtxError::Unsupported("public IsInf load needs one index".into()));
+    };
+    let input_dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped public IsInf input".into()))?.scalar;
+    let UArg::BufferIndex { elements, input_shape, output_shape: input_output, .. } = input.arg() else {
+        return Err(PtxError::Unsupported("public IsInf does not admit affine-view inputs".into()));
+    };
+    if input.ty().map(|ty| ty.scalar) != Some(input_dtype)
+        || input_shape != output_shape
+        || input_output != output_shape
+        || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+        || elements.checked_mul(input_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public IsInf input descriptor is invalid".into()));
+    }
+    if input_dtype == DType::F16 && sm < 53 {
+        return Err(PtxError::Unsupported("F16 public IsInf conversion requires sm_53 or newer".into()));
+    }
+    reject_sign_storage_dtype(input_dtype)?;
+    Ok(Some(ScopedStorageMode::IsInf))
 }
 
 fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
@@ -2697,6 +2747,37 @@ fn emit_logical_not_bool_cast(
     lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
 }
 
+/// Classify infinities from the exact input storage encoding. This is stricter
+/// than a floating comparison: all exponent-all-ones NaN payloads are rejected
+/// before the Bool result is formed, and integral source lanes never convert.
+fn emit_isinf_predicate(lines: &mut Vec<String>, dst: &str, source: String, dtype: DType) {
+    match dtype {
+        DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32 | DType::U32 | DType::I64 | DType::U64 => {
+            lines.push(format!("  mov.u32 {dst}, 0;"));
+            return;
+        }
+        DType::F16 => {
+            lines.push(format!("  and.b32 %r60, {source}, 0x7fff;"));
+            lines.push("  setp.eq.u32 %p1, %r60, 0x7c00;".into());
+        }
+        DType::BF16 => {
+            lines.push(format!("  and.b32 %r60, {source}, 0x7fff;"));
+            lines.push("  setp.eq.u32 %p1, %r60, 0x7f80;".into());
+        }
+        DType::F32 => {
+            lines.push(format!("  mov.b32 %r60, {source};"));
+            lines.push("  and.b32 %r60, %r60, 0x7fffffff;".into());
+            lines.push("  setp.eq.u32 %p1, %r60, 0x7f800000;".into());
+        }
+        DType::F64 => {
+            lines.push(format!("  mov.b64 %rd60, {source};"));
+            lines.push("  and.b64 %rd60, %rd60, 0x7fffffffffffffff;".into());
+            lines.push("  setp.eq.u64 %p1, %rd60, 0x7ff0000000000000;".into());
+        }
+    }
+    lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+}
+
 /// Select payload casts observe the same logical storage boundary as the
 /// fused interpreter, but narrow destinations remain encoded bits so `selp`
 /// can forward an unchosen NaN payload or signed zero without decode/reencode.
@@ -2982,6 +3063,12 @@ fn emit(
             format!("%r{id}")
         }
         DType::F16 | DType::BF16
+            if storage_mode == Some(ScopedStorageMode::IsInf)
+                && matches!(n.kind(), UOpKind::Load) =>
+        {
+            format!("%r{id}")
+        }
+        DType::F16 | DType::BF16
             if matches!(
                 storage_mode,
                 Some(
@@ -3053,6 +3140,7 @@ fn emit(
                 DType::F16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
+                        && storage_mode != Some(ScopedStorageMode::IsInf)
                         && !matches!(
                             storage_mode,
                             Some(
@@ -3070,6 +3158,7 @@ fn emit(
                 DType::BF16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
+                        && storage_mode != Some(ScopedStorageMode::IsInf)
                         && !matches!(
                             storage_mode,
                             Some(
@@ -3130,6 +3219,17 @@ fn emit(
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
+            if *op == crate::UnaryOp::IsInf && storage_mode == Some(ScopedStorageMode::IsInf) {
+                let source_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped public IsInf source".into()))?
+                    .scalar;
+                if ty != DType::Bool {
+                    return Err(PtxError::Unsupported("public IsInf must produce Bool".into()));
+                }
+                emit_isinf_predicate(lines, &dst, a, source_dtype);
+                return Ok(dst);
+            }
             if *op == crate::UnaryOp::Reciprocal
                 && matches!(
                     storage_mode,
@@ -7267,6 +7367,88 @@ mod tests {
         let input = finite.input_dtype("input", [1], DType::F32);
         let output = finite.isfinite(input).unwrap();
         assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&finite, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn public_isinf_has_a_scoped_storage_bit_classification_root() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, required) in [
+            (DType::Bool, "mov.u32"),
+            (DType::I8, "mov.u32"),
+            (DType::U8, "mov.u32"),
+            (DType::I16, "mov.u32"),
+            (DType::U16, "mov.u32"),
+            (DType::I32, "mov.u32"),
+            (DType::U32, "mov.u32"),
+            (DType::I64, "mov.u32"),
+            (DType::U64, "mov.u32"),
+            (DType::F16, "0x7c00"),
+            (DType::BF16, "0x7f80"),
+            (DType::F32, "0x7f800000"),
+            (DType::F64, "0x7ff0000000000000"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let output = graph.isinf(input).unwrap();
+            assert!(matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::IsInf, input: source } if *source == input));
+            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(first.source.contains(required), "{dtype:?} exact classifier");
+            assert!(first.source.contains("st.global.u8"), "{dtype:?} Bool store");
+            assert!(first.source.contains(PTX_RENDERER_VERSION));
+            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+        }
+
+        // The masked exact encodings classify both infinity signs while
+        // rejecting all exponent-all-ones NaNs, including signaling/payload
+        // variants, without decoding a narrow lane through a float compare.
+        let mut f16 = Graph::new();
+        let input = f16.input_dtype("input", [1], DType::F16);
+        let output = f16.isinf(input).unwrap();
+        let source = renderer.render(&crate::lower_graph_elementwise(&f16, output).unwrap()).unwrap().source;
+        assert!(source.contains("and.b32") && source.contains("0x7fff") && source.contains("0x7c00"));
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&f16, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::F64);
+        let output = scalar.isinf(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0], DType::BF16);
+        let output = empty.isinf(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        // The direct raw IsInf predicate is public-equivalent. Casted/raw
+        // compounds, IsNan/IsFinite, sign-select composition, and views do
+        // not inherit this one-load root exception.
+        let mut mixed = Graph::new();
+        let input = mixed.input_dtype("input", [1], DType::F32);
+        let input = mixed.cast(input, DType::F64).unwrap();
+        let output = mixed.unary(crate::UnaryOp::IsInf, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&mixed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut isnan = Graph::new();
+        let input = isnan.input_dtype("input", [1], DType::F32);
+        let output = isnan.isnan(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut finite = Graph::new();
+        let input = finite.input_dtype("input", [1], DType::F32);
+        let output = finite.isfinite(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&finite, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut signs = Graph::new();
+        let input = signs.input_dtype("input", [1], DType::F32);
+        let output = signs.isinf_with_signs(input, true, false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&signs, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut viewed = Graph::new();
+        let input = viewed.input_dtype("input", [1, 1], DType::F32);
+        let input = viewed.permute(input, [1, 0]).unwrap();
+        let output = viewed.isinf(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
+        let output = vjp.isinf(input).unwrap();
+        assert!(matches!(vjp.grad(output, input), Err(crate::Error::NoGradient(_))));
     }
 
     #[test]
