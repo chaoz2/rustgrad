@@ -2069,7 +2069,38 @@ impl Graph {
         if work_dtype == output_dtype { Ok(sine) } else { self.cast(sine, output_dtype) }
     }
     pub fn tan(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Tan, input)
+        // Tensor.tan is literally `self.sin() / self.cos()`. Plan both
+        // source-aligned branches and their true-division result before any
+        // node can be published; raw TAN remains a lower-level primitive.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let sin_dtype = unary_dtype(UnaryOp::Sin, input_dtype);
+        let cos_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let output_dtype = sin_dtype.promote(cos_dtype);
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(input_dtype)?;
+        extent(sin_dtype)?;
+        extent(cos_dtype)?;
+        extent(output_dtype)?;
+        if ((!input_dtype.is_float() && (sin_dtype != DType::F32 || cos_dtype != DType::F32))
+            || (input_dtype.is_float() && (sin_dtype != input_dtype || cos_dtype != input_dtype)))
+            || shape.broadcast_with(&shape)? != shape
+            || output_dtype != sin_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "tan sin/cos division source promotion",
+                actual: output_dtype,
+            });
+        }
+        let numerator = self.sin(input)?;
+        let denominator = self.cos(input)?;
+        self.div(numerator, denominator)
     }
     pub fn sinh(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Sinh, input)
