@@ -2135,7 +2135,37 @@ impl Graph {
         self.div(self.sub(positive, negative)?, self.constant(two))
     }
     pub fn cosh(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Cosh, input)
+        // Tensor.cosh is `(exp(x) + exp(-x)) / 2`, not raw COSH. As with
+        // Sinh, negation deliberately occurs at input storage before Exp's
+        // source floating promotion.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let neg_dtype = unary_dtype(UnaryOp::Neg, input_dtype);
+        let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
+        let two = TensorData::scalar_with_dtype(Scalar::I(2), output_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        for dtype in [neg_dtype, exp_dtype, exp_dtype, output_dtype, output_dtype] {
+            extent(&shape, dtype)?;
+        }
+        extent(two.shape(), two.dtype())?;
+        if ((!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype))
+            || neg_dtype != input_dtype
+            || exp_dtype != output_dtype
+            || two.dtype() != output_dtype
+            || shape.broadcast_with(two.shape())? != shape
+            || output_dtype.promote(output_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType { op: "cosh exp/add/div source promotion", actual: output_dtype });
+        }
+        let positive = self.exp(input)?;
+        let negative = self.exp(self.neg(input)?)?;
+        self.div(self.add(positive, negative)?, self.constant(two))
     }
     pub fn tanh(&mut self, input: NodeId) -> Result<NodeId> {
         // tinygrad spells tanh as `2 * sigmoid(2 * x) - 1`, with sigmoid
