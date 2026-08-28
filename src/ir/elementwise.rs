@@ -1864,7 +1864,30 @@ impl Graph {
         self.unary(UnaryOp::Reciprocal, input)
     }
     pub fn square(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Square, input)
+        // Tensor.square is literally `self * self`. Keep raw SQUARE available
+        // to lower-level callers, but use the source multiplication so its
+        // storage-width arithmetic and binary VJP structure are preserved.
+        // Prove the full self-broadcast/result descriptor before publication.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_shape = shape.broadcast_with(&shape)?;
+        let output_dtype = input_dtype.promote(input_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&output_shape, output_dtype)?;
+        if output_shape != shape || output_dtype != input_dtype {
+            return Err(Error::InvalidElementwiseDType {
+                op: "square self multiplication promotion",
+                actual: output_dtype,
+            });
+        }
+        self.mul(input, input)
     }
     pub fn sqrt(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.sqrt is the direct SQRT ALU primitive. It retains floating

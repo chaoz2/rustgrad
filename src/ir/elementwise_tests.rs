@@ -3314,6 +3314,150 @@ fn rsqrt_uses_tinygrad_sqrt_then_reciprocal_structure_and_preflight() {
 }
 
 #[test]
+fn square_uses_tinygrad_self_multiplication_structure_and_preflight() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [7], DType::F64);
+    let output = graph.square(input).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Mul, lhs, rhs }
+        if *lhs == input && *rhs == input));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(-2.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                        Scalar::F(3.0),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), 4.0);
+    assert_eq!(values.scalar_at(1).as_f64().to_bits(), 0.0f64.to_bits());
+    assert_eq!(values.scalar_at(2).as_f64().to_bits(), 0.0f64.to_bits());
+    assert_eq!(values.scalar_at(3).as_f64(), f64::INFINITY);
+    assert_eq!(values.scalar_at(4).as_f64(), f64::INFINITY);
+    assert!(values.scalar_at(5).as_f64().is_nan());
+    assert_eq!(values.scalar_at(6).as_f64(), 9.0);
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::F64);
+    assert!(
+        (0..graph.node_count()).all(|index| {
+            !matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Square, .. })
+        }),
+        "the public VJP must retain self-multiplication rather than raw Square"
+    );
+
+    let mut dtypes = Graph::new();
+    for (name, dtype) in [
+        ("bool", DType::Bool),
+        ("i8", DType::I8),
+        ("u8", DType::U8),
+        ("i16", DType::I16),
+        ("u16", DType::U16),
+        ("i32", DType::I32),
+        ("u32", DType::U32),
+        ("i64", DType::I64),
+        ("u64", DType::U64),
+        ("f16", DType::F16),
+        ("bf16", DType::BF16),
+        ("f32", DType::F32),
+        ("f64", DType::F64),
+    ] {
+        let source = dtypes.input_dtype(name, [1], dtype);
+        let output = dtypes.square(source).unwrap();
+        assert_eq!(dtypes.dtype(output).unwrap(), dtype);
+        assert!(matches!(dtypes.op(output).unwrap(), Op::Binary { op: BinaryOp::Mul, lhs, rhs }
+            if *lhs == source && *rhs == source));
+    }
+    let signed_min = dtypes.input_dtype("signed_min", [1], DType::I64);
+    let unsigned = dtypes.input_dtype("unsigned_wrap", [1], DType::U64);
+    let signed_output = dtypes.square(signed_min).unwrap();
+    let unsigned_output = dtypes.square(unsigned).unwrap();
+    let integer_values = CpuBackend
+        .execute(
+            &dtypes,
+            signed_output,
+            &HashMap::from([
+                (
+                    "signed_min".into(),
+                    TensorData::from_scalars([1], DType::I64, [Scalar::I(i64::MIN)]).unwrap(),
+                ),
+                (
+                    "unsigned_wrap".into(),
+                    TensorData::from_scalars([1], DType::U64, [Scalar::U(u64::MAX)]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(integer_values.scalar_at(0).as_i64(), 0);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &dtypes,
+                unsigned_output,
+                &HashMap::from([
+                    (
+                        "signed_min".into(),
+                        TensorData::from_scalars([1], DType::I64, [Scalar::I(i64::MIN)]).unwrap(),
+                    ),
+                    (
+                        "unsigned_wrap".into(),
+                        TensorData::from_scalars([1], DType::U64, [Scalar::U(u64::MAX)]).unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap()
+            .scalar_at(0)
+            .as_u64(),
+        1
+    );
+
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("input", [], DType::F16);
+    let output = scalar.square(input).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::BF16);
+    let output = empty.square(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.square(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.square(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [7], DType::F64);
