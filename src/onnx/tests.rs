@@ -5791,6 +5791,172 @@ fn reduce_l1_matches_tinygrad_abs_then_typed_sum_and_preflights() {
 }
 
 #[test]
+fn abs_matches_tinygrad_sign_times_input_and_preflights_before_publication() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [6]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_nodes = graph.node_count();
+    lower(
+        &mut graph,
+        Msg::new(&node("Abs", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    // The source VJP is represented by the Sign/Mul composition, not a
+    // UnaryOp::Abs node with a potentially different local derivative.
+    assert_eq!(graph.node_count(), before_nodes + 2);
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new(
+                    [6],
+                    vec![-0.0, 0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -3.0],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[1].to_bits(), 0.0f32.to_bits());
+    assert!(output.values()[2].is_nan());
+    assert_eq!(output.values()[3], f32::INFINITY);
+    assert_eq!(output.values()[4], f32::INFINITY);
+    assert_eq!(output.values()[5], 3.0);
+
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let mut typed = Graph::new();
+        let input = typed.input_dtype("input", [], dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut typed,
+            Msg::new(&node("Abs", &["input"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert_eq!(typed.dtype(values["out"]).unwrap(), dtype);
+    }
+
+    let mut empty = Graph::new();
+    let x = empty.input("x", [0, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut empty,
+        Msg::new(&node("Abs", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(empty.shape(values["out"]).unwrap().dims(), &[0, 2]);
+
+    let mut signed_min = Graph::new();
+    let x = signed_min.input_dtype("x", [1], DType::I64);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut signed_min,
+        Msg::new(&node("Abs", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &signed_min,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(i64::MIN)]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.scalar_at(0).as_i64(), i64::MIN);
+
+    let mut gradient = Graph::new();
+    let x = gradient.input_dtype_requires_grad("x", [], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut gradient,
+        Msg::new(&node("Abs", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let local = gradient.grad(values["out"], x).unwrap();
+    assert_eq!(gradient.dtype(local).unwrap(), DType::F32);
+    assert_eq!(gradient.shape(local).unwrap().dims(), &[]);
+
+    for invalid in [
+        node("Abs", &[], "out"),
+        {
+            let mut encoded = node("Abs", &["x"], "out");
+            field(&mut encoded, 5, &int_attr("axis", 0));
+            encoded
+        },
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Abs", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2]);

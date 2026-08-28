@@ -301,6 +301,38 @@ fn clip_plan(
     })
 }
 
+/// Source descriptor for ONNX `Abs`, which tinygrad lowers literally as
+/// `x * x.sign()`.  Keep it separate from Graph::abs: the product preserves
+/// negative zero and signed-integer wrapping that a unary absolute helper
+/// intentionally does not expose.
+struct AbsPlan {
+    shape: Shape,
+    dtype: DType,
+}
+
+fn abs_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<AbsPlan> {
+    if ins.len() != 1 {
+        return Err(bad("Abs requires exactly one input"));
+    }
+    if !attrs.is_empty() {
+        return Err(bad("Abs does not accept attributes"));
+    }
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    for what in ["input", "sign", "output"] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Abs {what} byte extent overflow")))?;
+    }
+    Ok(AbsPlan { shape, dtype })
+}
+
 /// Data-only contract for tinygrad's ONNX OneHot adapter.  The adapter is not
 /// the public `Tensor.one_hot` helper: it casts arbitrary indices to I32,
 /// adjusts negative indices once, and selects from a live `[off, on, ..]`
@@ -4252,7 +4284,18 @@ pub(super) fn lower(
             g.shape(input)?.numel()?;
             g.atanh(input)?
         }
-        "Abs" if ins.len() == 1 && attrs.is_empty() => g.abs(get(0)?)?,
+        "Abs" => {
+            let input = get(0)?;
+            let plan = abs_plan(g, input, &ins, &attrs)?;
+            // tinygrad defines abs as source-storage `x * x.sign()`, not a
+            // unary magnitude operation.  In particular, -0 * +0 is -0 and
+            // signed-minimum multiplication wraps at the input width.
+            let sign = g.sign(input)?;
+            let output = g.mul(input, sign)?;
+            debug_assert_eq!(g.shape(output).expect("Abs shape preflighted"), &plan.shape);
+            debug_assert_eq!(g.dtype(output).expect("Abs dtype preflighted"), plan.dtype);
+            output
+        }
         "Neg" if ins.len() == 1 && attrs.is_empty() => g.neg(get(0)?)?,
         "LeakyRelu" if ins.len() == 1 => {
             if attrs.keys().any(|x| x != "alpha") {
