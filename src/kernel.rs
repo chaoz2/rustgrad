@@ -415,7 +415,15 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
             load(graph, id, out, range, None)?
         } else {
             match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-                Op::Input { .. } | Op::Constant(_) => load(graph, id, out, range, None)?,
+                Op::Input { .. } => load(graph, id, out, range, None)?,
+                // A rank-0 graph constant is dependency-free once its typed
+                // storage payload is present in the UOp. Keep all non-scalar
+                // constants as buffer loads: their allocation, scheduling,
+                // capture, and replay ownership remains unchanged.
+                Op::Constant(data) if data.shape().rank() == 0 => {
+                    UOp::scalar_constant(data.dtype(), crate::uop::raw_literal_bits(data)?, ty)
+                }
+                Op::Constant(_) => load(graph, id, out, range, None)?,
                 Op::Random { .. } => return Err(UOpError::InvalidArgument),
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
@@ -1401,6 +1409,42 @@ mod tests {
             let uop = lower_graph_elementwise(&graph, output).unwrap();
             uop.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn scalar_graph_constants_lower_to_typed_uop_payloads_without_buffer_dependencies() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::Bool);
+        let truth = graph.constant(TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool));
+        let output = graph.ne(input, truth).unwrap();
+        let uop = lower_graph_elementwise(&graph, output).unwrap();
+        let nodes = uop.topological().unwrap();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), UOpKind::Const)
+            && matches!(node.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })));
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
+            && matches!(node.arg(), UArg::BufferIndex { buffer, .. } if *buffer == truth.index() as u64)));
+
+        // Exact scalar payloads are carried through the UOp rather than host
+        // floating conversion, including an F32 NaN bit pattern.
+        let mut payload = Graph::new();
+        let input = payload.input_dtype("input", [], DType::F32);
+        let nan = payload.constant(
+            TensorData::from_storage(Shape::new([]), Storage::F32(vec![f32::from_bits(0x7f80_0001)])).unwrap(),
+        );
+        let output = payload.eq(input, nan).unwrap();
+        let nodes = lower_graph_elementwise(&payload, output).unwrap().topological().unwrap();
+        assert!(nodes.iter().any(|node| matches!(node.arg(), UArg::Scalar { dtype: DType::F32, bits: 0x7f80_0001 })));
+
+        // A rank-one singleton is not a scalar provenance value: it remains a
+        // bound constant buffer and therefore preserves existing scheduling
+        // and capture ownership.
+        let mut nonscalar = Graph::new();
+        let input = nonscalar.input_dtype("input", [2], DType::F32);
+        let constant = nonscalar.constant(TensorData::from_scalars([1], DType::F32, [Scalar::F(1.0)]).unwrap());
+        let output = nonscalar.add(input, constant).unwrap();
+        let nodes = lower_graph_elementwise(&nonscalar, output).unwrap().topological().unwrap();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
+            && matches!(node.arg(), UArg::BufferIndex { buffer, .. } if *buffer == constant.index() as u64)));
     }
 
     #[test]

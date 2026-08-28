@@ -1261,7 +1261,11 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
 
 /// Lowers a scalar-expression pilot from the high-level graph. It is
 /// inspectable metadata only; execution remains with the CPU backend.
-fn raw_literal_bits(data: &crate::TensorData) -> Result<u64, UOpError> {
+/// Returns the exact storage payload of a graph-owned scalar constant.  This
+/// is shared by scalar metadata lowering and fused elementwise lowering so a
+/// constant never loses its F16/BF16/float NaN or signed-zero bits at either
+/// boundary.
+pub(crate) fn raw_literal_bits(data: &crate::TensorData) -> Result<u64, UOpError> {
     if data.len() != 1 {
         return Err(UOpError::InvalidArgument);
     }
