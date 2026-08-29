@@ -1,6 +1,9 @@
 use crate::{Error, Result};
 
-use super::{scalar::Scalar, storage::Storage};
+use super::{
+    scalar::{Scalar, bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16},
+    storage::Storage,
+};
 
 /// Scalar element types understood by RustGrad's IR.
 ///
@@ -134,6 +137,91 @@ impl DType {
             value => value,
         };
         Storage::from_scalars(self, [value]).scalar(0)
+    }
+
+    /// Converts a source scalar into this dtype's host storage scalar format.
+    ///
+    /// F16 carries its rounded floating value, while BF16 carries its low
+    /// sixteen storage bits. All other concrete dtypes retain the input scalar
+    /// exactly, matching tinygrad's storage helper boundary.
+    pub fn to_storage_scalar(self, value: Scalar) -> Scalar {
+        match self {
+            Self::F16 => Scalar::F(f16_to_f32(f32_to_f16(value.as_f64() as f32)) as f64),
+            Self::BF16 => Scalar::U(f32_to_bf16(value.as_f64() as f32) as u64),
+            _ => value,
+        }
+    }
+
+    /// Converts this dtype's host storage scalar format back to a source scalar.
+    pub fn from_storage_scalar(self, value: Scalar) -> Scalar {
+        match self {
+            Self::BF16 => Scalar::F(bf16_to_f32(value.as_u64() as u16) as f64),
+            _ => value,
+        }
+    }
+
+    /// Reinterprets one concrete host scalar through equal-width storage.
+    ///
+    /// This is deliberately independent of TensorData's byte parser: Bool
+    /// follows the source struct-unpack rule, where every nonzero byte is true.
+    pub fn bitcast_scalar(self, value: Scalar, output: Self) -> Result<Scalar> {
+        if self.itemsize() != output.itemsize() {
+            return Err(Error::BitcastItemsizeMismatch {
+                input: self,
+                output,
+            });
+        }
+        let packed = self.pack_storage_scalar(value);
+        Ok(output.unpack_storage_scalar(packed))
+    }
+
+    fn pack_storage_scalar(self, value: Scalar) -> [u8; 8] {
+        let value = self.to_storage_scalar(value);
+        let mut packed = [0; 8];
+        match self {
+            Self::Bool => packed[0] = u8::from(value.as_bool()),
+            Self::I8 => packed[0] = value.as_i64() as i8 as u8,
+            Self::U8 => packed[0] = value.as_u64() as u8,
+            Self::I16 => packed[..2].copy_from_slice(&(value.as_i64() as i16).to_le_bytes()),
+            Self::U16 => packed[..2].copy_from_slice(&(value.as_u64() as u16).to_le_bytes()),
+            Self::I32 => packed[..4].copy_from_slice(&(value.as_i64() as i32).to_le_bytes()),
+            Self::U32 => packed[..4].copy_from_slice(&(value.as_u64() as u32).to_le_bytes()),
+            Self::I64 => packed.copy_from_slice(&value.as_i64().to_le_bytes()),
+            Self::U64 => packed.copy_from_slice(&value.as_u64().to_le_bytes()),
+            Self::F16 => packed[..2]
+                .copy_from_slice(&f32_to_f16(value.as_f64() as f32).to_le_bytes()),
+            Self::BF16 => packed[..2].copy_from_slice(&(value.as_u64() as u16).to_le_bytes()),
+            Self::F32 => packed[..4].copy_from_slice(&(value.as_f64() as f32).to_le_bytes()),
+            Self::F64 => packed.copy_from_slice(&value.as_f64().to_le_bytes()),
+        }
+        packed
+    }
+
+    fn unpack_storage_scalar(self, packed: [u8; 8]) -> Scalar {
+        let value = match self {
+            Self::Bool => Scalar::Bool(packed[0] != 0),
+            Self::I8 => Scalar::I((packed[0] as i8) as i64),
+            Self::U8 => Scalar::U(packed[0] as u64),
+            Self::I16 => Scalar::I(i16::from_le_bytes([packed[0], packed[1]]) as i64),
+            Self::U16 => Scalar::U(u16::from_le_bytes([packed[0], packed[1]]) as u64),
+            Self::I32 => Scalar::I(
+                i32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as i64,
+            ),
+            Self::U32 => Scalar::U(
+                u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as u64,
+            ),
+            Self::I64 => Scalar::I(i64::from_le_bytes(packed)),
+            Self::U64 => Scalar::U(u64::from_le_bytes(packed)),
+            Self::F16 => Scalar::F(
+                f16_to_f32(u16::from_le_bytes([packed[0], packed[1]])) as f64,
+            ),
+            Self::BF16 => Scalar::U(u16::from_le_bytes([packed[0], packed[1]]) as u64),
+            Self::F32 => Scalar::F(
+                f32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as f64,
+            ),
+            Self::F64 => Scalar::F(f64::from_le_bytes(packed)),
+        };
+        self.from_storage_scalar(value)
     }
 
     /// Returns the concrete float work dtype used by tinygrad's source helpers.
@@ -414,5 +502,151 @@ mod tests {
                 ReductionDType::new(accumulator, output)
             );
         }
+    }
+
+    #[test]
+    fn storage_scalar_helpers_match_half_and_bfloat16_source_formats() {
+        let value = Scalar::F(1.0006);
+        assert_scalar_eq(
+            DType::F16.to_storage_scalar(value),
+            Scalar::F(1.000_976_562_5),
+        );
+        assert_scalar_eq(
+            DType::F16.from_storage_scalar(Scalar::F(1.000_976_562_5)),
+            Scalar::F(1.000_976_562_5),
+        );
+
+        let bf16_storage = DType::BF16.to_storage_scalar(Scalar::F(1.003));
+        assert_scalar_eq(bf16_storage, Scalar::U(0x3f80));
+        assert_scalar_eq(
+            DType::BF16.from_storage_scalar(bf16_storage),
+            Scalar::F(1.0),
+        );
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F32,
+            DType::F64,
+        ] {
+            let value = Scalar::I(-7);
+            assert_scalar_eq(dtype.to_storage_scalar(value), value);
+            assert_scalar_eq(dtype.from_storage_scalar(value), value);
+        }
+    }
+
+    #[test]
+    fn scalar_bitcast_accepts_every_equal_width_dtype_pair() {
+        const BYTE: [DType; 3] = [DType::Bool, DType::I8, DType::U8];
+        const WORD: [DType; 4] = [DType::I16, DType::U16, DType::F16, DType::BF16];
+        const DWORD: [DType; 3] = [DType::I32, DType::U32, DType::F32];
+        const QWORD: [DType; 3] = [DType::I64, DType::U64, DType::F64];
+        for (dtypes, value) in [
+            (&BYTE[..], Scalar::U(0xff)),
+            (&WORD[..], Scalar::U(0x8001)),
+            (&DWORD[..], Scalar::U(0x8000_0001)),
+            (&QWORD[..], Scalar::U(0x8000_0000_0000_0001)),
+        ] {
+            for input in dtypes {
+                for output in dtypes {
+                    assert!(
+                        input.bitcast_scalar(value, *output).is_ok(),
+                        "{input:?} -> {output:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_bitcast_preserves_representative_raw_lanes_and_special_floats() {
+        assert_scalar_eq(
+            DType::I8.bitcast_scalar(Scalar::I(-1), DType::U8).unwrap(),
+            Scalar::U(0xff),
+        );
+        assert_scalar_eq(
+            DType::U8.bitcast_scalar(Scalar::U(0x80), DType::I8).unwrap(),
+            Scalar::I(i8::MIN as i64),
+        );
+        assert_scalar_eq(
+            DType::I16.bitcast_scalar(Scalar::I(-2), DType::U16).unwrap(),
+            Scalar::U(0xfffe),
+        );
+        assert_scalar_eq(
+            DType::U16.bitcast_scalar(Scalar::U(0x8000), DType::I16).unwrap(),
+            Scalar::I(i16::MIN as i64),
+        );
+        assert_scalar_eq(
+            DType::I32
+                .bitcast_scalar(Scalar::I(i32::MIN as i64), DType::U32)
+                .unwrap(),
+            Scalar::U(0x8000_0000),
+        );
+        assert_scalar_eq(
+            DType::U64
+                .bitcast_scalar(Scalar::U(0x8000_0000_0000_0000), DType::I64)
+                .unwrap(),
+            Scalar::I(i64::MIN),
+        );
+
+        assert_scalar_eq(
+            DType::F16
+                .bitcast_scalar(Scalar::F(f16_to_f32(0x7e01) as f64), DType::U16)
+                .unwrap(),
+            Scalar::U(0x7e01),
+        );
+        assert_scalar_eq(
+            DType::BF16
+                .bitcast_scalar(Scalar::F(bf16_to_f32(0x7fc1) as f64), DType::U16)
+                .unwrap(),
+            Scalar::U(0x7fc1),
+        );
+        assert_scalar_eq(
+            DType::U32
+                .bitcast_scalar(Scalar::U(0x8000_0000), DType::F32)
+                .unwrap(),
+            Scalar::F((-0.0f32) as f64),
+        );
+        assert!(DType::U32
+            .bitcast_scalar(Scalar::U(0x7fc0_1234), DType::F32)
+            .unwrap()
+            .as_f64()
+            .is_nan());
+        assert!(DType::U64
+            .bitcast_scalar(Scalar::U(0x7ff8_0000_0000_1234), DType::F64)
+            .unwrap()
+            .as_f64()
+            .is_nan());
+        assert!(DType::U64
+            .bitcast_scalar(Scalar::U(0x7ff0_0000_0000_0000), DType::F64)
+            .unwrap()
+            .as_f64()
+            .is_infinite());
+    }
+
+    #[test]
+    fn scalar_bitcast_uses_struct_bool_truthiness_and_rejects_mismatched_widths() {
+        assert_scalar_eq(
+            DType::U8.bitcast_scalar(Scalar::U(2), DType::Bool).unwrap(),
+            Scalar::Bool(true),
+        );
+        assert_scalar_eq(
+            DType::U8.bitcast_scalar(Scalar::U(0), DType::Bool).unwrap(),
+            Scalar::Bool(false),
+        );
+        assert!(matches!(
+            DType::F32.bitcast_scalar(Scalar::F(1.0), DType::U16),
+            Err(Error::BitcastItemsizeMismatch {
+                input: DType::F32,
+                output: DType::U16,
+            })
+        ));
     }
 }

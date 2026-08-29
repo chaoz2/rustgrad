@@ -91,6 +91,10 @@ pub enum Error {
     InvalidDTypeFinfo {
         dtype: DType,
     },
+    BitcastItemsizeMismatch {
+        input: DType,
+        output: DType,
+    },
     DivisionByZero {
         op: &'static str,
     },
@@ -331,6 +335,12 @@ impl fmt::Display for Error {
             Self::InvalidDTypeFinfo { dtype } => {
                 write!(f, "{dtype:?} is not a floating point type")
             }
+            Self::BitcastItemsizeMismatch { input, output } => write!(
+                f,
+                "cannot bitcast {input:?} ({}) to {output:?} ({})",
+                input.itemsize(),
+                output.itemsize()
+            ),
             Self::DivisionByZero { op } => write!(f, "{op} by zero"),
             Self::InvalidShiftCount { count, bits } => {
                 write!(f, "shift count {count} is invalid for {bits}-bit values")
