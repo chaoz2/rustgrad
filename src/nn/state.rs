@@ -68,6 +68,60 @@ impl From<StateDict> for BTreeMap<String, TensorData> {
     }
 }
 
+/// Ordered live parameter handles collected from an explicit module traversal.
+///
+/// Entries retain declaration order. Repeated names replace their prior value
+/// in place, while tied handles under different names remain distinct entries.
+#[derive(Clone, Debug, Default)]
+pub struct LiveStateDict {
+    entries: Vec<(String, Parameter)>,
+}
+impl LiveStateDict {
+    pub fn get(&self, name: &str) -> Option<&Parameter> {
+        self.entries
+            .iter()
+            .find_map(|(entry_name, parameter)| (entry_name == name).then_some(parameter))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = (&str, &Parameter)> {
+        self.entries
+            .iter()
+            .map(|(name, parameter)| (name.as_str(), parameter))
+    }
+
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.entries.iter().map(|(name, _)| name.as_str())
+    }
+
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &Parameter> {
+        self.entries.iter().map(|(_, parameter)| parameter)
+    }
+
+    pub fn into_entries(self) -> Vec<(String, Parameter)> {
+        self.entries
+    }
+
+    fn insert(&mut self, name: String, parameter: Parameter) {
+        if let Some((_, existing)) = self
+            .entries
+            .iter_mut()
+            .find(|(entry_name, _)| entry_name.as_str() == name.as_str())
+        {
+            *existing = parameter;
+        } else {
+            self.entries.push((name, parameter));
+        }
+    }
+}
+
 /// Rust-native explicit state traversal. Implementors call `visit` for fields,
 /// nested modules, vectors, and options in their declared deterministic order.
 pub trait Module {
@@ -191,15 +245,28 @@ pub trait Module {
     }
 }
 
-/// Returns every host parameter handle visited by a module in declaration order.
+/// Returns live parameter handles in tinygrad's explicit state-dict traversal order.
 ///
-/// This is the explicit-module analogue of tinygrad's `get_parameters`: buffers
-/// and repeated/tied handles remain present, and cloning a handle neither reads
-/// its value nor snapshots or locks it.
+/// This is exactly the values of [`get_state_dict`] at zero prefix.
 pub fn get_parameters(module: &dyn Module) -> Vec<Parameter> {
-    let mut parameters = Vec::new();
-    module.visit("", &mut |_, parameter, _| parameters.push(parameter.clone()));
-    parameters
+    get_state_dict(module, "")
+        .into_entries()
+        .into_iter()
+        .map(|(_, parameter)| parameter)
+        .collect()
+}
+
+/// Collects live module handles with tinygrad's raw prefix and dict semantics.
+///
+/// The prefix is concatenated directly onto each name emitted by a zero-prefix
+/// visit. Collection clones handles only: it does not snapshot, lock, sort, or
+/// deduplicate them.
+pub fn get_state_dict(module: &dyn Module, prefix: &str) -> LiveStateDict {
+    let mut state = LiveStateDict::default();
+    module.visit("", &mut |name, parameter, _| {
+        state.insert(format!("{prefix}{name}"), parameter.clone());
+    });
+    state
 }
 
 /// The only load-time shape adaptation accepted by tinygrad state loading.

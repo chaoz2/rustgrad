@@ -192,6 +192,154 @@ impl Module for Stateless {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
 }
 
+struct DuplicateNames {
+    first: Parameter,
+    replacement: Parameter,
+    middle: Parameter,
+}
+impl Module for DuplicateNames {
+    fn visit(&self, _: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        v("first".into(), &self.first, StateKind::Parameter);
+        v("duplicate".into(), &self.first, StateKind::Parameter);
+        v("middle".into(), &self.middle, StateKind::Buffer);
+        v("duplicate".into(), &self.replacement, StateKind::Parameter);
+    }
+}
+
+#[test]
+fn live_get_state_dict_preserves_prefix_order_buffers_and_tied_liveness() {
+    let mut graph = Graph::new();
+    let left = Linear::new(&mut graph, 2, 2, false, 1).unwrap();
+    let running = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), false);
+    let tied = Tied {
+        right: left.weight.clone(),
+        left,
+        running: running.clone(),
+    };
+    let state = get_state_dict(&tied, "root.");
+    assert_eq!(state.len(), 3);
+    assert!(!state.is_empty());
+    assert_eq!(
+        state.keys().collect::<Vec<_>>(),
+        vec!["root.layers.0.weight", "root.layers.1.weight", "root.running"]
+    );
+    assert_eq!(
+        state
+            .entries()
+            .map(|(name, parameter)| (name, parameter.id()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("root.layers.0.weight", tied.left.weight.id()),
+            ("root.layers.1.weight", tied.right.id()),
+            ("root.running", running.id()),
+        ]
+    );
+    assert_eq!(
+        state.get("root.layers.0.weight").unwrap().id(),
+        state.get("root.layers.1.weight").unwrap().id()
+    );
+    tied.left
+        .weight
+        .replace(TensorData::new([2, 2], vec![3.; 4]).unwrap())
+        .unwrap();
+    assert_eq!(
+        state
+            .get("root.layers.1.weight")
+            .unwrap()
+            .value()
+            .unwrap(),
+        TensorData::new([2, 2], vec![3.; 4]).unwrap()
+    );
+
+    let one = OneParameter(Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true));
+    assert_eq!(
+        get_state_dict(&one, "root")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["rootvalue"]
+    );
+    assert_eq!(
+        get_state_dict(&one, "root.")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["root.value"]
+    );
+    let first = Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true);
+    let second = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let mut nested = Sequential::default();
+    nested.push(OneParameter(second));
+    let mut sequence = Sequential::default();
+    sequence.push(OneParameter(first));
+    sequence.push(nested);
+    assert_eq!(
+        get_state_dict(&sequence, "")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["0.value", "1.0.value"]
+    );
+    assert!(get_state_dict(&Stateless, "root.").is_empty());
+}
+
+#[test]
+fn live_get_state_dict_keeps_duplicate_key_position_and_refactors_get_parameters() {
+    let first = Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true);
+    let replacement = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let middle = Parameter::new(TensorData::new([1], vec![3.]).unwrap(), false);
+    let duplicate = DuplicateNames {
+        first: first.clone(),
+        replacement: replacement.clone(),
+        middle: middle.clone(),
+    };
+    let state = get_state_dict(&duplicate, "");
+    assert_eq!(state.keys().collect::<Vec<_>>(), vec!["first", "duplicate", "middle"]);
+    assert_eq!(state.get("duplicate").unwrap().id(), replacement.id());
+    assert_eq!(
+        state.values().map(Parameter::id).collect::<Vec<_>>(),
+        vec![first.id(), replacement.id(), middle.id()]
+    );
+    assert_eq!(
+        state
+            .clone()
+            .into_entries()
+            .into_iter()
+            .map(|(name, parameter)| (name, parameter.id()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("first".into(), first.id()),
+            ("duplicate".into(), replacement.id()),
+            ("middle".into(), middle.id()),
+        ]
+    );
+    assert_eq!(
+        get_parameters(&duplicate)
+            .iter()
+            .map(Parameter::id)
+            .collect::<Vec<_>>(),
+        state.values().map(Parameter::id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn live_get_state_dict_never_snapshots_locks_or_mutates_handles() {
+    let parameter = Parameter::new(TensorData::new([1], vec![4.]).unwrap(), true);
+    let module = OneParameter(parameter.clone());
+    let version = parameter.version().unwrap();
+    let value = parameter.value().unwrap();
+    let state = get_state_dict(&module, "");
+    assert_eq!(state.get("value").unwrap().id(), parameter.id());
+    assert_eq!(parameter.version().unwrap(), version);
+    assert_eq!(parameter.value().unwrap(), value);
+
+    parameter.poison_for_test();
+    let poisoned = get_state_dict(&module, "");
+    assert_eq!(poisoned.len(), 1);
+    assert_eq!(poisoned.get("value").unwrap().id(), parameter.id());
+    assert!(matches!(
+        parameter.snapshot(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+}
+
 #[test]
 fn get_parameters_preserves_declared_order_buffers_and_tied_handles() {
     let mut graph = Graph::new();
