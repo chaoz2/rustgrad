@@ -87,6 +87,22 @@ impl TensorData {
         Ok(self.scalar_at(0))
     }
 
+    /// Replaces this realized value's owned storage with an exact source
+    /// clone. Shapes must match exactly, but the source storage family may
+    /// differ. This is deliberately a dense-value operation: it does not
+    /// represent a Graph/device/effectful replacement boundary.
+    pub fn replace(&mut self, source: &TensorData) -> Result<&mut Self> {
+        if self.shape != source.shape {
+            return Err(Error::ShapeMismatch {
+                op: "replace",
+                lhs: self.shape.clone(),
+                rhs: source.shape.clone(),
+            });
+        }
+        self.storage = source.storage.clone();
+        Ok(self)
+    }
+
     /// Returns this already-realized dense value as tinygrad-style nested
     /// Python-list data. Rank zero is a single typed scalar leaf; every other
     /// rank nests one list per concrete shape dimension in row-major order.
@@ -411,6 +427,24 @@ mod tests {
         }
     }
 
+    fn assert_same_storage_bits(actual: &Storage, expected: &Storage) {
+        match (actual, expected) {
+            (Storage::F32(actual), Storage::F32(expected)) => {
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+            (Storage::F64(actual), Storage::F64(expected)) => {
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+            _ => assert_eq!(actual, expected),
+        }
+    }
+
     #[test]
     fn tolist_preserves_rank_zero_row_major_nesting_and_storage() {
         let scalar = TensorData::scalar_with_dtype(Scalar::I(-7), DType::I32);
@@ -536,6 +570,71 @@ mod tests {
             assert!(leaf(&values[1]).as_f64().is_nan());
             assert_eq!(data, before);
         }
+    }
+
+    #[test]
+    fn replace_changes_storage_family_and_returns_the_same_receiver() {
+        let mut destination = TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap();
+        let source = TensorData::from_storage([2], Storage::U64(vec![u64::MAX, 7])).unwrap();
+        let source_before = source.clone();
+        let destination_address: *mut TensorData = &mut destination;
+
+        let returned = destination.replace(&source).unwrap();
+        assert_eq!(returned as *mut TensorData, destination_address);
+        assert_eq!(returned.dtype(), DType::U64);
+        assert_eq!(returned.storage(), source.storage());
+        assert_eq!(source, source_before);
+    }
+
+    #[test]
+    fn replace_copies_raw_float_payloads_and_supports_scalar_and_empty_shapes() {
+        for source in [
+            TensorData::from_storage([2], Storage::F16(vec![0x8000, 0x7e01])).unwrap(),
+            TensorData::from_storage([2], Storage::BF16(vec![0x8000, 0x7fc1])).unwrap(),
+            TensorData::from_storage(
+                [2],
+                Storage::F32(vec![-0.0, f32::from_bits(0x7f80_0001)]),
+            )
+            .unwrap(),
+            TensorData::from_storage(
+                [2],
+                Storage::F64(vec![-0.0, f64::from_bits(0x7ff0_0000_0000_0001)]),
+            )
+            .unwrap(),
+        ] {
+            let source_before = source.clone();
+            let mut destination = TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap();
+            destination.replace(&source).unwrap();
+            assert_same_storage_bits(destination.storage(), source.storage());
+            assert_same_storage_bits(source.storage(), source_before.storage());
+        }
+
+        let scalar_source = TensorData::scalar_with_dtype(Scalar::I(-7), DType::I32);
+        let mut scalar_destination = TensorData::scalar_with_dtype(Scalar::Bool(false), DType::Bool);
+        scalar_destination.replace(&scalar_source).unwrap();
+        assert_eq!(scalar_destination.storage(), scalar_source.storage());
+
+        let empty_source = TensorData::from_storage([2, 0, 3], Storage::F16(vec![])).unwrap();
+        let mut empty_destination = TensorData::from_storage([2, 0, 3], Storage::U8(vec![])).unwrap();
+        empty_destination.replace(&empty_source).unwrap();
+        assert_eq!(empty_destination.storage(), empty_source.storage());
+    }
+
+    #[test]
+    fn replace_rejects_shape_mismatch_without_mutating_destination() {
+        let mut destination = TensorData::from_storage([2, 1], Storage::I32(vec![1, 2])).unwrap();
+        let source = TensorData::from_storage([2], Storage::U64(vec![3, 4])).unwrap();
+        let before = destination.clone();
+
+        assert_eq!(
+            destination.replace(&source).unwrap_err(),
+            Error::ShapeMismatch {
+                op: "replace",
+                lhs: Shape::new([2, 1]),
+                rhs: Shape::new([2]),
+            }
+        );
+        assert_eq!(destination, before);
     }
 
     #[test]
