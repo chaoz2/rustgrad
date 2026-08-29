@@ -47,6 +47,10 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
             rhs: rhs.zeroed(),
             axis: *axis,
         },
+        FuzzCase::ConcatMany { inputs, axis } => FuzzCase::ConcatMany {
+            inputs: inputs.iter().map(|input| input.zeroed()).collect(),
+            axis: *axis,
+        },
         FuzzCase::Matmul { lhs, rhs } => FuzzCase::Matmul {
             lhs: lhs.zeroed(),
             rhs: rhs.zeroed(),
@@ -145,6 +149,8 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
         // Tensor.T admits rank two only, so scalarization would stop being a
         // valid source program and is deliberately omitted.
         FuzzCase::TensorT { .. } => None,
+        // Raw Concat owns a rank/axis contract, including its input arity.
+        FuzzCase::Concat { .. } | FuzzCase::ConcatMany { .. } => None,
         // Pad can remain scalar only when its rank-zero padding contract is
         // already valid. Higher-rank padding cannot follow scalarization.
         FuzzCase::Pad {

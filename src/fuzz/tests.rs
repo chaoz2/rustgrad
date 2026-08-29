@@ -393,55 +393,153 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
 #[test]
 fn generated_concat_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
-    let mut lhs_zero = false;
-    let mut rhs_zero = false;
-    let mut lhs_nonzero = false;
-    let mut rhs_nonzero = false;
+    let mut arities = std::collections::BTreeSet::new();
+    let mut zero_width = false;
+    let mut nonzero_width = false;
     let mut axis_zero = false;
     let mut axis_one = false;
-    let mut f32 = false;
-    let mut i32 = false;
-    let mut f16 = false;
-    let mut boolean = false;
+    let mut dtypes = std::collections::BTreeSet::new();
+    let mut zero_non_axis = false;
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index in 0..256 {
+        for index in 0..1024 {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
-            let FuzzCase::Concat { lhs, rhs, axis } = case else {
+            let FuzzCase::ConcatMany { inputs, axis } = case else {
                 continue;
             };
             found = true;
-            assert!(!lhs.shape.is_empty());
-            assert_eq!(lhs.dtype, rhs.dtype);
-            assert_eq!(lhs.shape.len(), rhs.shape.len());
-            assert!(axis < lhs.shape.len());
-            for dimension in 0..lhs.shape.len() {
-                if dimension != axis {
-                    assert_eq!(lhs.shape[dimension], rhs.shape[dimension]);
+            assert!((2..=4).contains(&inputs.len()));
+            let first = &inputs[0];
+            assert!((1..=3).contains(&first.shape.len()));
+            assert!(axis < first.shape.len());
+            for input in &inputs {
+                assert_eq!(input.dtype, first.dtype);
+                assert_eq!(input.shape.len(), first.shape.len());
+                for dimension in 0..first.shape.len() {
+                    if dimension != axis {
+                        assert_eq!(input.shape[dimension], first.shape[dimension]);
+                    }
                 }
+                zero_width |= input.shape[axis] == 0;
+                nonzero_width |= input.shape[axis] != 0;
             }
-            lhs_zero |= lhs.shape[axis] == 0;
-            rhs_zero |= rhs.shape[axis] == 0;
-            lhs_nonzero |= lhs.shape[axis] != 0;
-            rhs_nonzero |= rhs.shape[axis] != 0;
+            arities.insert(inputs.len());
             axis_zero |= axis == 0;
-            axis_one |= lhs.shape.len() >= 2 && axis == 1;
-            match lhs.dtype {
-                DType::F32 => f32 = true,
-                DType::I32 => i32 = true,
-                DType::F16 => f16 = true,
-                DType::Bool => boolean = true,
-                _ => unreachable!("concat generator selects only native-supported dtypes"),
-            }
+            axis_one |= first.shape.len() >= 2 && axis == 1;
+            zero_non_axis |= first
+                .shape
+                .iter()
+                .enumerate()
+                .any(|(dimension, extent)| dimension != axis && *extent == 0);
+            dtypes.insert(first.dtype);
         }
     }
 
     assert!(found);
-    assert!(lhs_zero && rhs_zero && lhs_nonzero && rhs_nonzero);
+    assert_eq!(arities, std::collections::BTreeSet::from([2, 3, 4]));
+    assert!(zero_width && nonzero_width && zero_non_axis);
     assert!(axis_zero && axis_one);
-    assert!(f32 && i32 && f16 && boolean);
+    assert_eq!(dtypes.len(), 13);
+}
+
+#[test]
+fn concat_many_cases_preserve_arity_order_and_raw_payloads() {
+    let many = FuzzCase::ConcatMany {
+        inputs: vec![
+            FuzzTensor::from_tensor(
+                &TensorData::from_storage([1, 2], Storage::F16(vec![0x8000, 0x7e01])).unwrap(),
+            ),
+            FuzzTensor::from_tensor(&TensorData::from_storage([1, 0], Storage::F16(vec![])).unwrap()),
+            FuzzTensor::from_tensor(
+                &TensorData::from_storage([1, 2], Storage::F16(vec![0x7c00, 0x3c00])).unwrap(),
+            ),
+        ],
+        axis: 1,
+    };
+    let encoded = serde_json::to_value(&many).unwrap();
+    assert_eq!(encoded["kind"], "concat_many");
+    assert_eq!(serde_json::from_value::<FuzzCase>(encoded.clone()).unwrap(), many);
+    let mut unknown = encoded;
+    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    // The original two-input tag remains decodable without schema migration.
+    let legacy = FuzzCase::Concat {
+        lhs: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::U64(vec![7])).unwrap()),
+        rhs: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::U64(vec![9])).unwrap()),
+        axis: 0,
+    };
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(serde_json::to_value(&legacy).unwrap()).unwrap(),
+        legacy
+    );
+    let too_few = FuzzCase::ConcatMany {
+        inputs: vec![FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::Bool(vec![true])).unwrap(),
+        )],
+        axis: 0,
+    };
+    assert!(too_few.validate().is_err());
+    let mismatched = FuzzCase::ConcatMany {
+        inputs: vec![
+            FuzzTensor::from_tensor(
+                &TensorData::from_storage([1, 1], Storage::I32(vec![1])).unwrap(),
+            ),
+            FuzzTensor::from_tensor(
+                &TensorData::from_storage([2, 1], Storage::I32(vec![2, 3])).unwrap(),
+            ),
+        ],
+        axis: 1,
+    };
+    assert!(mismatched.validate().is_err());
+
+    let built = many.build().unwrap();
+    assert_eq!(
+        built.ordered.keys().cloned().collect::<Vec<_>>(),
+        vec!["input0".to_string(), "input1".to_string(), "input2".to_string()]
+    );
+    let Op::Concat { inputs, axis } = built.graph.op(built.output).unwrap() else {
+        panic!("concat_many must retain raw Concat")
+    };
+    assert_eq!(*axis, 1);
+    assert_eq!(inputs.len(), 3);
+    assert_eq!(built.graph.shape(built.output).unwrap(), &crate::Shape::from([1, 4]));
+    assert_eq!(built.graph.dtype(built.output).unwrap(), DType::F16);
+    let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+    let MovementKernelKind::Concat { inputs: planned, axis } = &plan.kind else {
+        panic!("raw Concat must use a movement plan")
+    };
+    assert_eq!(*axis, 1);
+    assert_eq!(planned.len(), 3);
+    let scheduled = schedule(&built.graph, built.output).unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert!(matches!(scheduled.items[0].kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Concat { inputs, .. } if inputs.len() == 3)));
+    let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+    assert!(scalar.source.contains("else if"));
+    assert!(scalar.source.contains("uint16_t"));
+    assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+    let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+    let bytes = captured.to_bytes().unwrap();
+    assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+
+    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    assert_eq!(
+        FuzzTensor::from_tensor(&output),
+        FuzzTensor::from_tensor(&TensorData::from_storage([1, 4], Storage::F16(vec![0x8000, 0x7e01, 0x7c00, 0x3c00])).unwrap()),
+    );
+    let artifact = FuzzFailureArtifact::new(
+        17, 29, many.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&output),
+        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic concat_many mismatch".into() },
+    ).unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&many, |candidate| {
+        matches!(candidate, FuzzCase::ConcatMany { inputs, axis: 1 }
+            if inputs.len() == 3 && inputs.iter().all(|input| input.bytes.iter().all(|byte| *byte == 0)))
+    });
+    assert!(matches!(zeroed, FuzzCase::ConcatMany { ref inputs, axis: 1 } if inputs.len() == 3));
 }
 
 #[test]

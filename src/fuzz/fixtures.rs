@@ -245,6 +245,62 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             rhs: tensor(vec![2, 3], Storage::I32(vec![0; 6])),
             axis: 1,
         },
+        FuzzCase::ConcatMany {
+            // Three inputs keep their source order across a zero-width middle.
+            inputs: vec![
+                tensor(vec![1, 2], Storage::I64(vec![1, 2])),
+                tensor(vec![1, 0], Storage::I64(vec![])),
+                tensor(vec![1, 2], Storage::I64(vec![3, 4])),
+            ],
+            axis: 1,
+        },
+        FuzzCase::ConcatMany {
+            // Four raw F32 lanes retain negative zero, NaN, and infinity.
+            inputs: vec![
+                tensor(vec![1], Storage::F32(vec![f32::from_bits(0x8000_0000)])),
+                tensor(vec![0], Storage::F32(vec![])),
+                tensor(vec![1], Storage::F32(vec![f32::from_bits(0x7fc0_0001)])),
+                tensor(vec![1], Storage::F32(vec![f32::INFINITY])),
+            ],
+            axis: 0,
+        },
+        FuzzCase::ConcatMany {
+            // Half lanes retain their raw storage payload across a middle
+            // zero-width input rather than a scalar conversion.
+            inputs: vec![
+                tensor(vec![1, 1], Storage::F16(vec![0x8000])),
+                tensor(vec![1, 0], Storage::F16(vec![])),
+                tensor(vec![1, 2], Storage::F16(vec![0x7e01, 0x7c00])),
+            ],
+            axis: 1,
+        },
+        FuzzCase::ConcatMany {
+            // F64 remains a raw lane copy path, including its IEEE specials.
+            inputs: vec![
+                tensor(vec![1], Storage::F64(vec![f64::from_bits(0x8000_0000_0000_0000)])),
+                tensor(vec![0], Storage::F64(vec![])),
+                tensor(vec![1], Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001)])),
+                tensor(vec![1], Storage::F64(vec![f64::INFINITY])),
+            ],
+            axis: 0,
+        },
+        FuzzCase::ConcatMany {
+            // Zero non-axis geometry remains a valid rank-three movement plan.
+            inputs: vec![
+                tensor(vec![2, 0, 1], Storage::BF16(vec![])),
+                tensor(vec![2, 0, 2], Storage::BF16(vec![])),
+                tensor(vec![2, 0, 0], Storage::BF16(vec![])),
+            ],
+            axis: 2,
+        },
+        FuzzCase::ConcatMany {
+            inputs: vec![
+                tensor(vec![1, 2], Storage::Bool(vec![true, false])),
+                tensor(vec![1, 1], Storage::Bool(vec![true])),
+                tensor(vec![1, 1], Storage::Bool(vec![false])),
+            ],
+            axis: 1,
+        },
         FuzzCase::Matmul {
             // F32 must round each product and running sum: the middle one is
             // lost before the final cancellation, unlike a double accumulator.

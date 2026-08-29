@@ -209,6 +209,12 @@ pub enum FuzzCase {
         rhs: FuzzTensor,
         axis: usize,
     },
+    /// Additive arbitrary-arity raw `Graph::concat` coverage. The legacy
+    /// two-input `concat` tag remains unchanged for persisted artifacts.
+    ConcatMany {
+        inputs: Vec<FuzzTensor>,
+        axis: usize,
+    },
     Matmul {
         lhs: FuzzTensor,
         rhs: FuzzTensor,
@@ -296,6 +302,7 @@ impl FuzzCase {
             // Raw Graph::pad stores its fill in the movement plan, not as a
             // caller-owned graph buffer. `build` validates it explicitly.
             Self::Pad { input, .. } => vec![input],
+            Self::ConcatMany { inputs, .. } => inputs.iter().collect(),
         }
     }
 
@@ -392,6 +399,30 @@ impl FuzzCase {
                 graph
                     .concat([lhs, rhs], *axis)
                     .map_err(|error| error.to_string())?
+            }
+            Self::ConcatMany { inputs, axis } => {
+                if inputs.len() < 2 {
+                    return Err("raw fuzz concat_many requires at least two inputs".into());
+                }
+                let first = &inputs[0];
+                if first.shape.is_empty()
+                    || *axis >= first.shape.len()
+                    || inputs.iter().any(|input| {
+                        input.dtype != first.dtype
+                            || input.shape.len() != first.shape.len()
+                            || input.shape.iter().enumerate().any(|(dimension, extent)| {
+                                dimension != *axis && *extent != first.shape[dimension]
+                            })
+                    })
+                {
+                    return Err("invalid homogeneous raw fuzz concat_many geometry".into());
+                }
+                let ids = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(position, input)| bind(&mut graph, &format!("input{position}"), input))
+                    .collect::<Result<Vec<_>, _>>()?;
+                graph.concat(ids, *axis).map_err(|error| error.to_string())?
             }
             Self::Matmul { lhs, rhs } => {
                 let lhs = bind(&mut graph, "lhs", lhs)?;

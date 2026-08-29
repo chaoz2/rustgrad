@@ -162,27 +162,29 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             }
         }
         5 => {
-            // Concat is a homogeneous movement kernel in captured/native
-            // replay. Keep every non-axis extent identical and independently
-            // vary both axis widths, including zero, within the global bounds.
+            // Raw Concat is a homogeneous movement kernel in captured/native
+            // replay. Preserve the legacy pair schema, but generate the
+            // additive many-input surface across every local storage dtype.
             let rank = 1 + rng.pick(3);
             let axis = rng.pick(rank);
-            let dtype = [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)];
-            let mut lhs_shape = Vec::with_capacity(rank);
-            let mut rhs_shape = Vec::with_capacity(rank);
+            let dtype = [
+                DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
+                DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+                DType::F64,
+            ][rng.pick(13)];
+            let arity = 2 + rng.pick(3);
+            let mut base_shape = Vec::with_capacity(rank);
             for dimension in 0..rank {
-                if dimension == axis {
-                    lhs_shape.push([0, 1, 2, 3][rng.pick(4)]);
-                    rhs_shape.push([0, 1, 2, 3][rng.pick(4)]);
-                } else {
-                    let extent = [0, 1, 2, 3][rng.pick(4)];
-                    lhs_shape.push(extent);
-                    rhs_shape.push(extent);
-                }
+                base_shape.push(if dimension == axis { 0 } else { [0, 1, 2, 3][rng.pick(4)] });
             }
-            FuzzCase::Concat {
-                lhs: tensor(&mut rng, lhs_shape, dtype),
-                rhs: tensor(&mut rng, rhs_shape, dtype),
+            FuzzCase::ConcatMany {
+                inputs: (0..arity)
+                    .map(|_| {
+                        let mut shape = base_shape.clone();
+                        shape[axis] = [0, 1, 2, 3][rng.pick(4)];
+                        tensor(&mut rng, shape, dtype)
+                    })
+                    .collect(),
                 axis,
             }
         }
