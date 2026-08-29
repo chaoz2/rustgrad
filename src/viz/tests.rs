@@ -48,6 +48,24 @@ fn typed_trace_visualization_is_deterministic_and_fail_closed() {
 }
 
 #[test]
+fn cuda_trace_visualization_preserves_typed_submission_order() {
+    let device = crate::DeviceId::new("cuda:0").unwrap();
+    let collective = vec![
+        crate::CudaCollectiveTrace { action_id: 1, operation: "copy", device: device.clone(), range: crate::LogicalRange { start: 0, len: 0 }, cache_key: None },
+        crate::CudaCollectiveTrace { action_id: 2, operation: "add", device, range: crate::LogicalRange { start: 4, len: 8 }, cache_key: Some("cache".into()) },
+    ];
+    let dot = crate::cuda_collective_trace_viz(&collective).unwrap().to_dot();
+    for field in ["operation=copy", "operation=add", "device=cuda:0", "range=0:0", "range=4:8", "cache_key=none", "cache_key=cache", "order:next"] { assert!(dot.contains(field), "{field}"); }
+    assert!(crate::cuda_collective_trace_viz(&[]).unwrap().nodes().is_empty());
+    assert!(matches!(crate::cuda_collective_trace_viz(&[collective[0].clone(), collective[0].clone()]), Err(VizError::DuplicateNode(_))));
+    let stages = vec![crate::ShardedCudaExecutionTrace { stage: 1, action: "run", skipped: false }, crate::ShardedCudaExecutionTrace { stage: 2, action: "skip", skipped: true }];
+    let dot = crate::sharded_cuda_execution_trace_viz(&stages).unwrap().to_dot();
+    assert!(dot.contains("action=run") && dot.contains("skipped=false") && dot.contains("action=skip") && dot.contains("skipped=true"));
+    assert!(crate::sharded_cuda_execution_trace_viz(&[]).unwrap().nodes().is_empty());
+    assert!(matches!(crate::sharded_cuda_execution_trace_viz(&[stages[0].clone(), stages[0].clone()]), Err(VizError::DuplicateNode(_))));
+}
+
+#[test]
 fn malformed_models_and_invalid_graph_nodes_fail_closed() {
     assert!(matches!(
         VizGraph::try_new(
