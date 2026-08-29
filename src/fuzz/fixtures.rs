@@ -237,6 +237,31 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             index: tensor(vec![3], Storage::I32(vec![1, 0, 2])),
             axis: 0,
         },
+        FuzzCase::Gather {
+            input: tensor(vec![3], Storage::F16(vec![0x8000, 0x7e01, 0x7c00])),
+            index: tensor(vec![3], Storage::I64(vec![1, 0, 2])),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            input: tensor(vec![3], Storage::BF16(vec![0x8000, 0x7fc1, 0x7f80])),
+            index: tensor(vec![3], Storage::I32(vec![2, 1, 0])),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            input: tensor(vec![3], Storage::F64(vec![f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0x7ff8_0000_0000_0001), f64::INFINITY])),
+            index: tensor(vec![3], Storage::I64(vec![1, 0, 2])),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            input: tensor(vec![3], Storage::I8(vec![i8::MIN, -1, i8::MAX])),
+            index: tensor(vec![3], Storage::I32(vec![2, 0, 1])),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            input: tensor(vec![3], Storage::U64(vec![0, 1, u64::MAX])),
+            index: tensor(vec![3], Storage::I64(vec![2, 0, 1])),
+            axis: 0,
+        },
         FuzzCase::Scatter {
             // Row-major later duplicate updates replace the earlier lane.
             base: tensor(vec![1, 4], Storage::F32(vec![10.0, 20.0, 30.0, 40.0])),

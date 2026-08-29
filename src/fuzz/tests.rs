@@ -998,10 +998,7 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
 #[test]
 fn generated_gather_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
-    let mut f32 = false;
-    let mut i32 = false;
-    let mut f16 = false;
-    let mut boolean = false;
+    let mut dtypes = std::collections::BTreeSet::new();
     let mut index_i32 = false;
     let mut index_i64 = false;
     let mut axes = std::collections::BTreeSet::new();
@@ -1009,7 +1006,7 @@ fn generated_gather_cases_are_valid_diverse_and_deterministic() {
     let mut duplicate = false;
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index_number in 0..512 {
+        for index_number in 0..1024 {
             let case = generate_case(seed, index_number);
             assert_eq!(case, generate_case(seed, index_number));
             case.validate().unwrap();
@@ -1037,20 +1034,15 @@ fn generated_gather_cases_are_valid_diverse_and_deterministic() {
             }
             empty |= input.shape.iter().any(|extent| *extent == 0) || index.shape.iter().any(|extent| *extent == 0);
             axes.insert((input.shape.len(), axis));
-            match input.dtype {
-                DType::F32 => f32 = true,
-                DType::I32 => i32 = true,
-                DType::F16 => f16 = true,
-                DType::Bool => boolean = true,
-                _ => unreachable!("Gather generator selects movement dtypes only"),
-            }
+            dtypes.insert(input.dtype);
             index_i32 |= index.dtype == DType::I32;
             index_i64 |= index.dtype == DType::I64;
         }
     }
 
     assert!(found);
-    assert!(f32 && i32 && f16 && boolean && index_i32 && index_i64);
+    assert_eq!(dtypes.len(), 13);
+    assert!(index_i32 && index_i64);
     assert!(empty && duplicate);
     assert!(axes.contains(&(1, 0)) && axes.iter().any(|(rank, axis)| *rank >= 2 && *axis == 1));
 }
@@ -1145,6 +1137,90 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         FuzzTensor::from_tensor(&ieee_output),
         FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0, f32::INFINITY])).unwrap()),
     );
+
+    // Raw Gather selects storage lanes directly through MovementKernelPlan;
+    // unlike scalar helpers, no value commitment occurs between input and
+    // output. These finite lanes also retain exact CPU-oracle payloads.
+    let dtype_cases = vec![
+        (DType::Bool, Storage::Bool(vec![true, false, true]), "uint8_t"),
+        (DType::I8, Storage::I8(vec![i8::MIN, -1, i8::MAX]), "int8_t"),
+        (DType::U8, Storage::U8(vec![0, 1, u8::MAX]), "uint8_t"),
+        (DType::I16, Storage::I16(vec![i16::MIN, -1, i16::MAX]), "int16_t"),
+        (DType::U16, Storage::U16(vec![0, 1, u16::MAX]), "uint16_t"),
+        (DType::I32, Storage::I32(vec![i32::MIN, -1, i32::MAX]), "int32_t"),
+        (DType::U32, Storage::U32(vec![0, 1, u32::MAX]), "uint32_t"),
+        (DType::I64, Storage::I64(vec![i64::MIN, -1, i64::MAX]), "int64_t"),
+        (DType::U64, Storage::U64(vec![0, 1, u64::MAX]), "uint64_t"),
+        (DType::F16, Storage::F16(vec![0x3c00, 0x4000, 0x4200]), "uint16_t"),
+        (DType::BF16, Storage::BF16(vec![0x3f80, 0x4000, 0x4040]), "uint16_t"),
+        (DType::F32, Storage::F32(vec![1.0, 2.0, 3.0]), "float"),
+        (DType::F64, Storage::F64(vec![1.0, 2.0, 3.0]), "double"),
+    ];
+    for (position, (dtype, storage, native_type)) in dtype_cases.into_iter().enumerate() {
+        let input = FuzzTensor::from_tensor(&TensorData::from_storage([3], storage).unwrap());
+        let index = FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [3],
+                if position % 2 == 0 {
+                    Storage::I32(vec![2, 0, 1])
+                } else {
+                    Storage::I64(vec![2, 0, 1])
+                },
+            )
+            .unwrap(),
+        );
+        let case = FuzzCase::Gather {
+            input: input.clone(),
+            index: index.clone(),
+            axis: 0,
+        };
+        let built = case.build().unwrap();
+        let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        let MovementKernelKind::Gather { input: planned, index: planned_index, .. } = &plan.kind else {
+            unreachable!("Gather plan")
+        };
+        assert_eq!(plan.dtype, dtype);
+        assert_eq!(planned.dtype, dtype);
+        assert_eq!(planned_index.dtype, index.dtype);
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+        assert!(scalar.source.contains(native_type));
+        assert!(scalar.source.contains("rg_selected < 0"));
+        assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        let selected = plan.execute(&[input.to_tensor().unwrap(), index.to_tensor().unwrap()]).unwrap();
+        let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        let expected = [
+            &input.bytes[2 * dtype.itemsize()..3 * dtype.itemsize()],
+            &input.bytes[..dtype.itemsize()],
+            &input.bytes[dtype.itemsize()..2 * dtype.itemsize()],
+        ]
+        .concat();
+        assert_eq!(FuzzTensor::from_tensor(&selected).bytes, expected);
+        assert_eq!(FuzzTensor::from_tensor(&oracle).bytes, expected);
+    }
+
+    for (dtype, storage) in [
+        (DType::F16, Storage::F16(vec![0x8000, 0x7e01, 0x7c00])),
+        (DType::BF16, Storage::BF16(vec![0x8000, 0x7fc1, 0x7f80])),
+        (DType::F32, Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])),
+        (DType::F64, Storage::F64(vec![f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0x7ff8_0000_0000_0001), f64::INFINITY])),
+    ] {
+        let input = FuzzTensor::from_tensor(&TensorData::from_storage([3], storage).unwrap());
+        let index = FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I64(vec![1, 0, 2])).unwrap());
+        let built = FuzzCase::Gather { input: input.clone(), index: index.clone(), axis: 0 }.build().unwrap();
+        let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        let selected = plan.execute(&[input.to_tensor().unwrap(), index.to_tensor().unwrap()]).unwrap();
+        let expected = [
+            &input.bytes[dtype.itemsize()..2 * dtype.itemsize()],
+            &input.bytes[..dtype.itemsize()],
+            &input.bytes[2 * dtype.itemsize()..3 * dtype.itemsize()],
+        ]
+        .concat();
+        assert_eq!(FuzzTensor::from_tensor(&selected).bytes, expected);
+    }
 
     let bad_dtype = FuzzCase::Gather {
         input: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap()),
