@@ -90,7 +90,7 @@
       "subject": "Concrete Graph descriptor queries",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Read-only concrete Graph descriptor queries include `len_tinygrad`: rank>=1 returns the leading extent including zero, rank-0 yields the typed source-equivalent rejection, and unknown IDs propagate. Queries never publish nodes; overflow-shaped descriptors remain length-queryable without computing numel. No symbolic/device realization claim."
+        "Acceptance requirement": "Read-only concrete Graph descriptor queries include `len_tinygrad`: rank>=1 returns the leading extent including zero, rank-0 yields the typed source-equivalent rejection, and unknown IDs propagate. `bool_tinygrad` validates IDs first, then unconditionally returns the typed `__bool__ on Tensor is not defined` error for every valid shape/dtype without publishing a node or computing descriptor products or payloads. Overflow-shaped descriptors remain length-queryable without computing numel. No symbolic/device realization claim."
       }
     },
     {
