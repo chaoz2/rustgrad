@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v13";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v14";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -1827,15 +1827,19 @@ fn emit_vector_insts(
                 let a = input(0)?;
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable cast type".into()))?;
+                let value = if ty == DType::Bool {
+                    format!("((uint8_t)(({}[l])!=0))", a)
+                } else {
+                    format!("(({}){}[l])", ctype(ty), a)
+                };
                 lines.push(format!(
-                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=({}){}[l];",
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
                     ctype(ty),
                     d,
                     usize::from(program.lanes),
                     active,
                     d,
-                    ctype(ty),
-                    a
+                    value
                 ));
             }
             crate::VectorInstKind::Store { buffer } => {
@@ -2411,6 +2415,7 @@ fn expr_ctype(d: DType) -> &'static str {
 /// expression consumes the value. The helpers use raw payload-aware encoding.
 fn cast_expression(dtype: DType, value: String) -> String {
     match dtype {
+        DType::Bool => format!("((uint8_t)(({value})!=0))"),
         DType::F16 => format!("rg_f16_to_f32(rg_f32_to_f16((float)({value})))"),
         DType::BF16 => format!("rg_bf16_to_f32(rg_f32_to_bf16((float)({value})))"),
         _ => format!("(({})({value}))", expr_ctype(dtype)),
@@ -2576,7 +2581,9 @@ fn last_error() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, Graph, Scalar, Shape, SymbolicExpr, TensorData};
+    use crate::{
+        Backend, CompareOp, CpuBackend, Graph, Op, Scalar, Shape, SymbolicExpr, TensorData,
+    };
     use std::collections::{BTreeMap, HashMap};
 
     #[test]
@@ -2598,6 +2605,49 @@ mod tests {
         assert!(minimum.contains(">"));
         assert!(!maximum.contains("fmax"));
         assert!(!minimum.contains("fmin"));
+    }
+
+    #[test]
+    fn public_logical_not_keeps_cast_then_ne_and_renders_bool_truthiness() {
+        for dtype in [DType::F32, DType::I32] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([4]), dtype);
+            let output = graph.logical_not(input).unwrap();
+            let Op::Compare {
+                op: CompareOp::Ne,
+                lhs,
+                ..
+            } = graph.op(output).unwrap()
+            else {
+                panic!("logical_not must retain its source Ne root");
+            };
+            assert!(matches!(
+                graph.op(*lhs).unwrap(),
+                Op::Cast {
+                    input: cast_input,
+                    dtype: DType::Bool,
+                } if *cast_input == input
+            ));
+
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let topological = uop.topological().unwrap();
+            assert!(topological.iter().any(|node| {
+                matches!(node.kind(), UOpKind::Cast) && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
+            }));
+            assert!(topological.iter().any(|node| {
+                matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne))
+            }));
+
+            // `!=0` is the source truthiness predicate: it keeps fractional
+            // nonzero F32 values, NaNs, and infinities true while both zeros
+            // are false, unlike a numeric C cast to uint8_t.
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains("!=0"), "{dtype:?}");
+            assert!(scalar.source.contains("uint8_t"), "{dtype:?}");
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert!(vector.source.contains("!=0"), "{dtype:?}");
+        }
     }
 
     #[test]
