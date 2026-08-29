@@ -39,6 +39,46 @@ fn tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> FuzzTensor {
     )
 }
 
+// Raw integer reduction in native C is exact for this bounded domain: it
+// avoids signed overflow while still exercising each storage family and the
+// graph's output/accumulator dtype policy. Product uses only -1/0/1 (or 0/1
+// unsigned) so its complete reduction domain remains defined at every width.
+fn reduction_tensor(
+    rng: &mut SplitMix64,
+    shape: Vec<usize>,
+    dtype: DType,
+    reduction: FuzzReduction,
+) -> FuzzTensor {
+    let elements = Shape::new(shape.clone())
+        .numel()
+        .expect("bounded generated reduction shape");
+    let values = (0..elements).map(|index| {
+        let raw = rng.next().wrapping_add(index as u64);
+        match dtype {
+            DType::Bool => Scalar::Bool(raw & 1 != 0),
+            DType::U8 | DType::U16 | DType::U32 | DType::U64 => {
+                let value = if reduction == FuzzReduction::Product {
+                    raw & 1
+                } else {
+                    raw % 3
+                };
+                Scalar::U(value)
+            }
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => {
+                Scalar::I((raw % 3) as i64 - 1)
+            }
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+                let value = (raw % 3) as i64 - 1;
+                Scalar::F(value as f64)
+            }
+        }
+    });
+    FuzzTensor::from_tensor(
+        &TensorData::from_scalars(shape, dtype, values)
+            .expect("generated reduction tensor geometry"),
+    )
+}
+
 // Raw C casts outside this domain can differ from the TensorData oracle for
 // non-finite/out-of-range float-to-int values or signed overflow. Keep the
 // generated Cast matrix in values that every concrete storage conversion can
@@ -170,8 +210,23 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                     FuzzReduction::Min,
                 ][rng.pick(5)]
             };
+            let dtype = [
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ][rng.pick(13)];
             FuzzCase::Reduction {
-                input: tensor(&mut rng, shape, DType::F32),
+                input: reduction_tensor(&mut rng, shape, dtype, reduction),
                 reduction,
                 axis,
                 keepdim: rng.pick(2) == 0,

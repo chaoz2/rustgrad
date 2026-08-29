@@ -93,6 +93,7 @@ fn generated_cases_are_valid_bounded_and_order_independent() {
 fn generated_reduction_cases_cover_portable_kinds_and_geometry() {
     let mut kinds = std::collections::BTreeSet::new();
     let mut ranks = std::collections::BTreeSet::new();
+    let mut dtypes = std::collections::BTreeSet::new();
     let mut nonzero_axis = false;
     let mut zero_domain = false;
     let mut scalar_output = false;
@@ -128,6 +129,7 @@ fn generated_reduction_cases_cover_portable_kinds_and_geometry() {
             .unwrap();
             kinds.insert(reduction);
             ranks.insert(input.shape.len());
+            dtypes.insert(input.dtype);
             nonzero_axis |= input.shape[axis] != 0;
             zero_domain |= input.shape[axis] == 0;
             scalar_output |= built.graph.shape(built.output).unwrap().rank() == 0;
@@ -147,6 +149,7 @@ fn generated_reduction_cases_cover_portable_kinds_and_geometry() {
         ])
     );
     assert_eq!(ranks, std::collections::BTreeSet::from([1, 2, 3]));
+    assert_eq!(dtypes.len(), 13);
     assert!(nonzero_axis && zero_domain && scalar_output && keepdim && dropdim);
 }
 
@@ -388,6 +391,156 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
     let min_value = CpuBackend.execute(&min_built.graph, min_built.output, &min_built.oracle).unwrap();
     let Scalar::F(minimum) = min_value.scalar_at(0) else { panic!("F32 min output") };
     assert_eq!((minimum as f32).to_bits(), 0x8000_0000);
+
+    for (dtype, reduction, storage) in [
+        (
+            DType::F32,
+            FuzzReduction::Max,
+            Storage::F32(vec![f32::from_bits(0x7fc0_0001), f32::INFINITY]),
+        ),
+        (
+            DType::F64,
+            FuzzReduction::Min,
+            Storage::F64(vec![-0.0, 0.0, f64::INFINITY]),
+        ),
+        (
+            DType::F16,
+            FuzzReduction::Max,
+            Storage::F16(vec![0x8000, 0x0000, 0x7c00]),
+        ),
+        (
+            DType::BF16,
+            FuzzReduction::Min,
+            Storage::BF16(vec![0x8000, 0x0000, 0x7f80]),
+        ),
+    ] {
+        let case = FuzzCase::Reduction {
+            input: FuzzTensor::from_tensor(&TensorData::from_storage([storage.len()], storage).unwrap()),
+            reduction,
+            axis: 0,
+            keepdim: false,
+        };
+        let built = case.build().unwrap();
+        let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(
+            crate::execute_elementwise(&built.graph, built.output, &built.oracle)
+                .unwrap()
+                .storage(),
+            oracle.storage(),
+            "{dtype:?} {reduction:?} special-lane ordering",
+        );
+    }
+}
+
+#[test]
+fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_paths() {
+    let dtypes = [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+    let reductions = [
+        (FuzzReduction::Sum, ReduceKind::Sum),
+        (FuzzReduction::Mean, ReduceKind::Mean),
+        (FuzzReduction::Product, ReduceKind::Product),
+        (FuzzReduction::Max, ReduceKind::Max),
+        (FuzzReduction::Min, ReduceKind::Min),
+    ];
+
+    for dtype in dtypes {
+        let values = (0..6).map(|index| match dtype {
+            DType::Bool => Scalar::Bool(index % 2 != 0),
+            DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U((index % 3) as u64),
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I((index % 3) as i64 - 1),
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F((index % 3) as f64 - 1.0),
+        });
+        let input = FuzzTensor::from_tensor(
+            &TensorData::from_scalars([2, 3], dtype, values).unwrap(),
+        );
+
+        for (reduction, kind) in reductions {
+            let case = FuzzCase::Reduction {
+                input: input.clone(),
+                reduction,
+                axis: 1,
+                keepdim: reduction != FuzzReduction::Mean,
+            };
+            let encoded = serde_json::to_value(&case).unwrap();
+            assert_eq!(encoded["kind"], "reduction");
+            assert_eq!(serde_json::from_value::<FuzzCase>(encoded).unwrap(), case);
+            let built = case.build().unwrap();
+            let expected_dtype = match reduction {
+                FuzzReduction::Sum => match dtype {
+                    DType::Bool | DType::I8 | DType::I16 => DType::I32,
+                    DType::U8 | DType::U16 => DType::U32,
+                    _ => dtype,
+                },
+                FuzzReduction::Mean if !dtype.is_float() => DType::F32,
+                FuzzReduction::Mean
+                | FuzzReduction::Product
+                | FuzzReduction::Max
+                | FuzzReduction::Min => dtype,
+            };
+            assert_eq!(built.graph.dtype(built.output).unwrap(), expected_dtype, "{dtype:?} {reduction:?}");
+            let Op::Reduce { kind: actual, .. } = built.graph.op(built.output).unwrap() else {
+                panic!("raw fuzz reduction must retain an Op::Reduce root");
+            };
+            assert_eq!(*actual, kind);
+            let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(
+                crate::execute_elementwise(&built.graph, built.output, &built.oracle)
+                    .unwrap()
+                    .storage(),
+                oracle.storage(),
+                "captured {dtype:?} {reduction:?}",
+            );
+            let scheduled = schedule(&built.graph, built.output).unwrap();
+            assert!(scheduled.items[0]
+                .kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|node| matches!(node.kind(), UOpKind::ReduceFinalize)));
+            assert!(CpuJit::render(&scheduled.items[0].kernel).is_ok(), "{dtype:?} {reduction:?}");
+            assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok(), "{dtype:?} {reduction:?}");
+            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let bytes = captured.to_bytes().unwrap();
+            assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        }
+
+        for reduction in [FuzzReduction::Sum, FuzzReduction::Mean, FuzzReduction::Product] {
+            let empty = FuzzCase::Reduction {
+                input: FuzzTensor::from_tensor(
+                    &TensorData::from_scalars([2, 0], dtype, std::iter::empty::<Scalar>()).unwrap(),
+                ),
+                reduction,
+                axis: 1,
+                keepdim: false,
+            };
+            let built = empty.build().unwrap();
+            let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(
+                crate::execute_elementwise(&built.graph, built.output, &built.oracle)
+                    .unwrap()
+                    .storage(),
+                oracle.storage(),
+                "empty {dtype:?} {reduction:?}",
+            );
+            let scheduled = schedule(&built.graph, built.output).unwrap();
+            assert!(CpuJit::render(&scheduled.items[0].kernel).is_ok());
+            assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+        }
+    }
 }
 
 #[test]
