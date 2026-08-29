@@ -1,4 +1,6 @@
-use super::{FuzzBinaryOp, FuzzCase, FuzzReduction, FuzzTensor, FuzzUnaryOp};
+use super::{
+    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzReduction, FuzzTensor, FuzzUnaryOp,
+};
 use crate::{DType, Scalar, Storage, TensorData};
 
 fn tensor(shape: impl Into<Vec<usize>>, storage: Storage) -> FuzzTensor {
@@ -64,6 +66,34 @@ pub fn regression_cases() -> Vec<FuzzCase> {
                     2.0,
                 ]),
             ),
+        },
+        FuzzCase::Compare {
+            // IEEE partial comparison makes NaN unequal to itself, while
+            // signed zero remains equal to positive zero.
+            op: FuzzCompareOp::Eq,
+            lhs: tensor(
+                vec![4],
+                Storage::F32(vec![
+                    f32::from_bits(0x7fc0_0001),
+                    f32::from_bits(0x8000_0000),
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                ]),
+            ),
+            rhs: tensor(
+                vec![4],
+                Storage::F32(vec![f32::NAN, 0.0, f32::INFINITY, f32::INFINITY]),
+            ),
+        },
+        FuzzCase::Compare {
+            // Ordered comparisons retain the same NaN false-lane rule and
+            // treat negative and positive zero as equal.
+            op: FuzzCompareOp::Le,
+            lhs: tensor(
+                vec![3],
+                Storage::F32(vec![f32::from_bits(0x8000_0000), f32::NAN, f32::INFINITY]),
+            ),
+            rhs: tensor(vec![3], Storage::F32(vec![0.0, 0.0, f32::INFINITY])),
         },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),

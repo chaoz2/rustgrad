@@ -29,7 +29,7 @@ pub use artifact::{
     FuzzArtifactError, FuzzComparisonPolicy, FuzzFailureArtifact, FuzzOutcome, FuzzPath,
     MAX_FUZZ_ARTIFACT_FILE_BYTES,
 };
-pub use case::{FuzzBinaryOp, FuzzCase, FuzzReduction, FuzzTensor, FuzzUnaryOp};
+pub use case::{FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzReduction, FuzzTensor, FuzzUnaryOp};
 pub use corpus::{
     FuzzCorpusMode, FuzzCorpusRecord, FuzzCorpusReport, FuzzCorpusState, read_failure_artifact,
     reconcile_regression_corpus, write_failure_artifact_atomic,

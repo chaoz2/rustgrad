@@ -55,6 +55,11 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
             op: *op,
             input: input.zeroed(),
         },
+        FuzzCase::Compare { op, lhs, rhs } => FuzzCase::Compare {
+            op: *op,
+            lhs: lhs.zeroed(),
+            rhs: rhs.zeroed(),
+        },
     }
 }
 
@@ -81,6 +86,11 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
         FuzzCase::Unary { op, input } => Some(FuzzCase::Unary {
             op: *op,
             input: input.scalar_prefix()?,
+        }),
+        FuzzCase::Compare { op, lhs, rhs } => Some(FuzzCase::Compare {
+            op: *op,
+            lhs: lhs.scalar_prefix()?,
+            rhs: rhs.scalar_prefix()?,
         }),
         _ => None,
     }

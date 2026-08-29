@@ -1,6 +1,6 @@
 use crate::{
-    Backend, BinaryOp, CpuBackend, DType, Graph, NodeId, ReduceKind, Scalar, Shape, Storage,
-    TensorData, UnaryOp,
+    Backend, BinaryOp, CompareOp, CpuBackend, DType, Graph, NodeId, ReduceKind, Scalar, Shape,
+    Storage, TensorData, UnaryOp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +23,17 @@ pub enum FuzzBinaryOp {
 pub enum FuzzUnaryOp {
     Neg,
     Abs,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzCompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -189,6 +200,11 @@ pub enum FuzzCase {
         op: FuzzUnaryOp,
         input: FuzzTensor,
     },
+    Compare {
+        op: FuzzCompareOp,
+        lhs: FuzzTensor,
+        rhs: FuzzTensor,
+    },
 }
 
 pub(super) struct BuiltCase {
@@ -207,7 +223,8 @@ impl FuzzCase {
         match self {
             Self::Binary { lhs, rhs, .. }
             | Self::Concat { lhs, rhs, .. }
-            | Self::Matmul { lhs, rhs } => vec![lhs, rhs],
+            | Self::Matmul { lhs, rhs }
+            | Self::Compare { lhs, rhs, .. } => vec![lhs, rhs],
             Self::Select {
                 condition,
                 on_true,
@@ -328,6 +345,24 @@ impl FuzzCase {
                     FuzzUnaryOp::Abs => graph.unary(UnaryOp::Abs, input),
                 }
                 .map_err(|error| error.to_string())?
+            }
+            Self::Compare { op, lhs, rhs } => {
+                let lhs = bind(&mut graph, "lhs", lhs)?;
+                let rhs = bind(&mut graph, "rhs", rhs)?;
+                graph
+                    .compare(
+                        match op {
+                            FuzzCompareOp::Eq => CompareOp::Eq,
+                            FuzzCompareOp::Ne => CompareOp::Ne,
+                            FuzzCompareOp::Lt => CompareOp::Lt,
+                            FuzzCompareOp::Le => CompareOp::Le,
+                            FuzzCompareOp::Gt => CompareOp::Gt,
+                            FuzzCompareOp::Ge => CompareOp::Ge,
+                        },
+                        lhs,
+                        rhs,
+                    )
+                    .map_err(|error| error.to_string())?
             }
         };
         let oracle = ordered.clone().into_iter().collect();

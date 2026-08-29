@@ -1,5 +1,8 @@
 use super::*;
-use crate::{Backend, CpuBackend, DType, Op, Scalar, Storage, TensorData, UnaryOp};
+use crate::{
+    Backend, CapturedSchedule, CompareOp, CpuBackend, DType, Op, Scalar, Storage, TensorData,
+    UOpKind, UnaryOp, schedule,
+};
 use std::{
     fs::{self, File},
     sync::atomic::{AtomicU64, Ordering},
@@ -175,6 +178,175 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
 }
 
 #[test]
+fn generated_compare_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut ops = std::collections::BTreeSet::new();
+    let mut f32 = false;
+    let mut i32 = false;
+    let mut scalar = false;
+    let mut empty = false;
+    let mut scalar_rhs = false;
+    let mut matching_rhs = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..512 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Compare { op, lhs, rhs } = case else {
+                continue;
+            };
+            found = true;
+            ops.insert(op);
+            f32 |= lhs.dtype == DType::F32;
+            i32 |= lhs.dtype == DType::I32;
+            scalar |= lhs.shape.is_empty();
+            empty |= lhs.shape.iter().any(|extent| *extent == 0);
+            scalar_rhs |= rhs.shape.is_empty();
+            matching_rhs |= rhs.shape == lhs.shape;
+            assert_eq!(lhs.dtype, rhs.dtype);
+            assert!(matches!(lhs.dtype, DType::F32 | DType::I32));
+        }
+    }
+
+    assert!(found);
+    assert_eq!(ops.len(), 6);
+    assert!(f32 && i32 && scalar && empty && scalar_rhs && matching_rhs);
+}
+
+#[test]
+fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
+    let compare = FuzzCase::Compare {
+        op: FuzzCompareOp::Ge,
+        lhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [2],
+                Storage::F32(vec![f32::from_bits(0x7fc0_0001), f32::from_bits(0x8000_0000)]),
+            )
+            .unwrap(),
+        ),
+        rhs: FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::F(0.0), DType::F32)),
+    };
+    let value = serde_json::to_value(&compare).unwrap();
+    assert_eq!(value["kind"], "compare");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), compare);
+    let mut unknown = value;
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    let legacy = regression_cases().remove(0);
+    let legacy_value = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(legacy_value["kind"], "binary");
+    assert_eq!(serde_json::from_value::<FuzzCase>(legacy_value).unwrap(), legacy);
+
+    for (op, graph_op, lhs, rhs) in [
+        (
+            FuzzCompareOp::Eq,
+            CompareOp::Eq,
+            FuzzTensor::from_tensor(
+                &TensorData::from_storage([2], Storage::F32(vec![f32::NAN, -0.0])).unwrap(),
+            ),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::F(0.0), DType::F32)),
+        ),
+        (
+            FuzzCompareOp::Ne,
+            CompareOp::Ne,
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(1), DType::I32)),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(2), DType::I32)),
+        ),
+        (
+            FuzzCompareOp::Lt,
+            CompareOp::Lt,
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(1), DType::I32)),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(2), DType::I32)),
+        ),
+        (
+            FuzzCompareOp::Le,
+            CompareOp::Le,
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(1), DType::I32)),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(2), DType::I32)),
+        ),
+        (
+            FuzzCompareOp::Gt,
+            CompareOp::Gt,
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(2), DType::I32)),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(1), DType::I32)),
+        ),
+        (
+            FuzzCompareOp::Ge,
+            CompareOp::Ge,
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(2), DType::I32)),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(1), DType::I32)),
+        ),
+    ] {
+        let case = FuzzCase::Compare { op, lhs, rhs };
+        let built = case.build().unwrap();
+        assert!(matches!(
+            built.graph.op(built.output).unwrap(),
+            Op::Compare { .. }
+        ));
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert!(scheduled.items.iter().any(|item| {
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|uop| matches!(uop.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op))
+        }));
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        assert_eq!(captured.items.len(), scheduled.items.len());
+        assert!(captured.items.iter().any(|item| {
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|uop| matches!(uop.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op))
+        }));
+    }
+
+    let built = compare.build().unwrap();
+    assert!(matches!(
+        built.graph.op(built.output).unwrap(),
+        Op::Compare {
+            op: CompareOp::Ge,
+            ..
+        }
+    ));
+    let expected = FuzzOutcome::value(
+        &CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap(),
+    );
+    let artifact = FuzzFailureArtifact::new(
+        8,
+        12,
+        compare.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        expected,
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic compare mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&compare, |candidate| {
+        matches!(candidate, FuzzCase::Compare { lhs, rhs, .. }
+            if lhs.bytes == vec![0; 8] && rhs.bytes == vec![0; 4])
+    });
+    assert!(matches!(zeroed, FuzzCase::Compare { ref lhs, ref rhs, .. }
+        if lhs.bytes == vec![0; 8] && rhs.bytes == vec![0; 4]));
+    let scalarized = minimize_case(&compare, |_| true);
+    assert!(matches!(scalarized, FuzzCase::Compare { ref lhs, ref rhs, .. }
+        if lhs.shape.is_empty() && rhs.shape.is_empty()));
+    scalarized.validate().unwrap();
+}
+
+#[test]
 fn unary_cases_round_trip_minimize_and_build_as_direct_graph_unaries() {
     let unary = FuzzCase::Unary {
         op: FuzzUnaryOp::Abs,
@@ -321,7 +493,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 10);
+    assert_eq!(cases.len(), 12);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(
