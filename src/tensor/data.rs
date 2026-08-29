@@ -1,6 +1,18 @@
 use super::{dtype::DType, scalar::Scalar, shape::Shape, storage::Storage};
 use crate::{Error, Result};
 
+/// A recursive, row-major host representation for [`TensorData::tolist`].
+///
+/// Leaves retain RustGrad's typed [`Scalar`] boundary values. In particular,
+/// half and bfloat16 storage is converted through its existing F32 decoding
+/// path before becoming a floating scalar, matching tinygrad's Python-list
+/// conversion rather than exposing raw storage bits.
+#[derive(Clone, Debug)]
+pub enum TensorList {
+    Scalar(Scalar),
+    List(Vec<TensorList>),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TensorData {
     shape: Shape,
@@ -73,6 +85,32 @@ impl TensorData {
             return Err(Error::NonScalarItem(self.shape.clone()));
         }
         Ok(self.scalar_at(0))
+    }
+
+    /// Returns this already-realized dense value as tinygrad-style nested
+    /// Python-list data. Rank zero is a single typed scalar leaf; every other
+    /// rank nests one list per concrete shape dimension in row-major order.
+    ///
+    /// This is a read-only storage conversion. It neither realizes a graph
+    /// value nor changes this value's shape, dtype, or backing storage.
+    pub fn tolist(&self) -> TensorList {
+        fn build<I: Iterator<Item = Scalar>>(dims: &[usize], values: &mut I) -> TensorList {
+            match dims.split_first() {
+                None => TensorList::Scalar(
+                    values
+                        .next()
+                        .expect("TensorData shape/storage invariant validated at construction"),
+                ),
+                Some((&extent, tail)) => {
+                    TensorList::List((0..extent).map(|_| build(tail, values)).collect())
+                }
+            }
+        }
+
+        build(
+            self.shape.dims(),
+            &mut (0..self.len()).map(|index| self.scalar_at(index)),
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -353,6 +391,152 @@ fn assigned_storage(destination: &Storage, source: &Storage, offsets: &[usize]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leaf(list: &TensorList) -> Scalar {
+        let TensorList::Scalar(value) = list else {
+            panic!("expected a scalar TensorList leaf");
+        };
+        *value
+    }
+
+    fn assert_same_scalar(actual: Scalar, expected: Scalar, dtype: DType) {
+        match (actual, expected) {
+            (Scalar::Bool(actual), Scalar::Bool(expected)) => assert_eq!(actual, expected, "{dtype:?}"),
+            (Scalar::I(actual), Scalar::I(expected)) => assert_eq!(actual, expected, "{dtype:?}"),
+            (Scalar::U(actual), Scalar::U(expected)) => assert_eq!(actual, expected, "{dtype:?}"),
+            (Scalar::F(actual), Scalar::F(expected)) => {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{dtype:?}")
+            }
+            (actual, expected) => panic!("tolist changed scalar kind for {dtype:?}: {actual:?} != {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn tolist_preserves_rank_zero_row_major_nesting_and_storage() {
+        let scalar = TensorData::scalar_with_dtype(Scalar::I(-7), DType::I32);
+        assert_same_scalar(leaf(&scalar.tolist()), Scalar::I(-7), DType::I32);
+
+        let one_dim = TensorData::from_scalars(
+            [3],
+            DType::I32,
+            [Scalar::I(10), Scalar::I(20), Scalar::I(30)],
+        )
+        .unwrap();
+        let TensorList::List(values) = one_dim.tolist() else {
+            panic!("rank-one TensorData must become a list");
+        };
+        assert_same_scalar(leaf(&values[0]), Scalar::I(10), DType::I32);
+        assert_same_scalar(leaf(&values[1]), Scalar::I(20), DType::I32);
+        assert_same_scalar(leaf(&values[2]), Scalar::I(30), DType::I32);
+
+        let two_dim = TensorData::from_scalars(
+            [2, 2],
+            DType::I32,
+            [Scalar::I(10), Scalar::I(20), Scalar::I(30), Scalar::I(40)],
+        )
+        .unwrap();
+        let TensorList::List(rows) = two_dim.tolist() else {
+            panic!("rank-two TensorData must become nested lists");
+        };
+        let TensorList::List(first_row) = &rows[0] else {
+            panic!("rank-two TensorData must contain row lists");
+        };
+        let TensorList::List(second_row) = &rows[1] else {
+            panic!("rank-two TensorData must contain row lists");
+        };
+        assert_same_scalar(leaf(&first_row[0]), Scalar::I(10), DType::I32);
+        assert_same_scalar(leaf(&first_row[1]), Scalar::I(20), DType::I32);
+        assert_same_scalar(leaf(&second_row[0]), Scalar::I(30), DType::I32);
+        assert_same_scalar(leaf(&second_row[1]), Scalar::I(40), DType::I32);
+
+        let data = TensorData::from_scalars(
+            [2, 2, 2],
+            DType::I32,
+            (0..8).map(Scalar::I),
+        )
+        .unwrap();
+        let before = data.clone();
+        let TensorList::List(outer) = data.tolist() else {
+            panic!("rank-three TensorData must become nested lists");
+        };
+        assert_eq!(outer.len(), 2);
+        for (outer_index, expected) in [[0, 1, 2, 3], [4, 5, 6, 7]].into_iter().enumerate() {
+            let TensorList::List(rows) = &outer[outer_index] else {
+                panic!("rank-three outer lane must contain rows");
+            };
+            assert_eq!(rows.len(), 2);
+            for (row_index, values) in expected.chunks_exact(2).enumerate() {
+                let TensorList::List(columns) = &rows[row_index] else {
+                    panic!("rank-three row must contain columns");
+                };
+                assert_eq!(columns.len(), 2);
+                assert_same_scalar(leaf(&columns[0]), Scalar::I(values[0]), DType::I32);
+                assert_same_scalar(leaf(&columns[1]), Scalar::I(values[1]), DType::I32);
+            }
+        }
+        assert_eq!(data, before);
+    }
+
+    #[test]
+    fn tolist_retains_zero_extent_nesting_and_every_dtype_leaf() {
+        let first_zero = TensorData::from_scalars([0, 3], DType::U8, []).unwrap();
+        let TensorList::List(values) = first_zero.tolist() else {
+            panic!("rank-two empty TensorData must remain a list");
+        };
+        assert!(values.is_empty());
+
+        let inner_zero = TensorData::from_scalars([2, 0, 3], DType::U8, []).unwrap();
+        let TensorList::List(outer) = inner_zero.tolist() else {
+            panic!("rank-three TensorData must remain a list");
+        };
+        assert_eq!(outer.len(), 2);
+        for value in outer {
+            let TensorList::List(inner) = value else {
+                panic!("zero middle extent must preserve the outer dimension");
+            };
+            assert!(inner.is_empty());
+        }
+
+        let cases = [
+            (DType::Bool, Scalar::Bool(true)),
+            (DType::I8, Scalar::I(-7)),
+            (DType::I16, Scalar::I(-300)),
+            (DType::I32, Scalar::I(-70_000)),
+            (DType::I64, Scalar::I(i64::MIN)),
+            (DType::U8, Scalar::U(250)),
+            (DType::U16, Scalar::U(60_000)),
+            (DType::U32, Scalar::U(4_000_000_000)),
+            (DType::U64, Scalar::U(u64::MAX)),
+            (DType::F16, Scalar::F(1.5)),
+            (DType::BF16, Scalar::F(1.5)),
+            (DType::F32, Scalar::F(1.5)),
+            (DType::F64, Scalar::F(1.5)),
+        ];
+        for (dtype, input) in cases {
+            let data = TensorData::from_scalars([1], dtype, [input]).unwrap();
+            let TensorList::List(values) = data.tolist() else {
+                panic!("rank-one TensorData must become a list");
+            };
+            assert_eq!(values.len(), 1);
+            assert_same_scalar(leaf(&values[0]), input, dtype);
+        }
+    }
+
+    #[test]
+    fn tolist_converts_half_and_bfloat16_leaves_without_storage_mutation() {
+        for data in [
+            TensorData::from_storage([2], Storage::F16(vec![0x8000, 0x7e01])).unwrap(),
+            TensorData::from_storage([2], Storage::BF16(vec![0x8000, 0x7fc1])).unwrap(),
+        ] {
+            let before = data.clone();
+            let TensorList::List(values) = data.tolist() else {
+                panic!("rank-one half TensorData must become a list");
+            };
+            assert_eq!(leaf(&values[0]).as_f64().to_bits(), (-0.0f64).to_bits());
+            assert!(leaf(&values[1]).as_f64().is_nan());
+            assert_eq!(data, before);
+        }
+    }
 
     #[test]
     fn item_returns_the_only_typed_value_for_every_storage_family() {
