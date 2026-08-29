@@ -441,7 +441,7 @@
       "subject": "Layers, activations, losses and normalization",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain."
+        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. The rank-two-or-greater `BatchNorm` implementation is publicly aliased as both `BatchNorm2d` and `BatchNorm3d`, with shared module/state semantics; no `BatchNorm1d` claim is made. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain."
       }
     },
     {
