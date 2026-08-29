@@ -412,14 +412,20 @@ pub fn load_safetensors_state_only(bytes: &[u8]) -> Result<StateDict> {
     load_safetensors_state(bytes, data_start, header.tensors)
 }
 
-/// Serializes a deterministic, name-sorted state dictionary.
-pub fn save_safetensors(tensors: &StateDict, metadata: &Metadata) -> Result<Vec<u8>> {
+fn checked_raw_metadata(metadata: Option<&Value>) -> Result<Option<Value>> {
+    match metadata {
+        None => Ok(None),
+        Some(Value::Object(object)) if object.is_empty() => Ok(None),
+        Some(Value::Object(_)) => Ok(metadata.cloned()),
+        Some(_) => Err(ser("metadata must be a JSON object")),
+    }
+}
+
+fn serialize_safetensors(tensors: &StateDict, metadata: Option<&Value>) -> Result<Vec<u8>> {
+    let metadata = checked_raw_metadata(metadata)?;
     let mut header = serde_json::Map::new();
-    if !metadata.is_empty() {
-        header.insert(
-            "__metadata__".into(),
-            serde_json::to_value(metadata).map_err(|e| ser(e.to_string()))?,
-        );
+    if let Some(metadata) = metadata {
+        header.insert("__metadata__".into(), metadata);
     }
     let mut payload = Vec::new();
     for (name, tensor) in tensors {
@@ -452,17 +458,29 @@ pub fn save_safetensors(tensors: &StateDict, metadata: &Metadata) -> Result<Vec<
     Ok(out)
 }
 
+/// Serializes a deterministic, name-sorted state dictionary and string metadata.
+pub fn save_safetensors(tensors: &StateDict, metadata: &Metadata) -> Result<Vec<u8>> {
+    let metadata = serde_json::to_value(metadata).map_err(|e| ser(e.to_string()))?;
+    serialize_safetensors(tensors, Some(&metadata))
+}
+
+/// Serializes a state dictionary with optional raw JSON object metadata.
+///
+/// Empty metadata and `None` omit `__metadata__`. Non-object metadata is
+/// rejected before tensor or payload serialization begins.
+pub fn save_safetensors_with_json_metadata(
+    tensors: &StateDict,
+    metadata: Option<&Value>,
+) -> Result<Vec<u8>> {
+    serialize_safetensors(tensors, metadata)
+}
+
 pub fn load_safetensors_file(path: impl AsRef<Path>) -> Result<(StateDict, Metadata)> {
     load_safetensors(&fs::read(path).map_err(|e| ser(e.to_string()))?)
 }
-/// Atomically replaces `path` after constructing the whole file in memory.
-pub fn save_safetensors_file(
-    path: impl AsRef<Path>,
-    tensors: &StateDict,
-    metadata: &Metadata,
-) -> Result<()> {
+
+fn save_safetensors_file_bytes(path: impl AsRef<Path>, bytes: Vec<u8>) -> Result<()> {
     let path = path.as_ref();
-    let bytes = save_safetensors(tensors, metadata)?;
     let file_name = path
         .file_name()
         .and_then(|x| x.to_str())
@@ -473,6 +491,24 @@ pub fn save_safetensors_file(
         let _ = fs::remove_file(&temp);
         ser(e.to_string())
     })
+}
+
+/// Atomically replaces `path` after constructing the whole file in memory.
+pub fn save_safetensors_file(
+    path: impl AsRef<Path>,
+    tensors: &StateDict,
+    metadata: &Metadata,
+) -> Result<()> {
+    save_safetensors_file_bytes(path, save_safetensors(tensors, metadata)?)
+}
+
+/// Atomically saves a state dictionary with optional raw JSON object metadata.
+pub fn save_safetensors_file_with_json_metadata(
+    path: impl AsRef<Path>,
+    tensors: &StateDict,
+    metadata: Option<&Value>,
+) -> Result<()> {
+    save_safetensors_file_bytes(path, save_safetensors_with_json_metadata(tensors, metadata)?)
 }
 
 #[cfg(test)]
@@ -557,6 +593,82 @@ mod tests {
 
         assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
         assert_eq!(load_safetensors(&bytes).unwrap(), (tensors, metadata));
+    }
+
+    #[test]
+    fn raw_json_metadata_save_round_trips_state_and_preserves_bytes() {
+        let tensors = StateDict::from([(
+            "x".into(),
+            raw([2], Storage::F16(vec![0x8000, 0x7e55])),
+        )]);
+        let metadata = serde_json::json!({
+            "nested": {"flags": [true, null], "count": 7},
+            "number": 1.5
+        });
+        let original_tensors = tensors.clone();
+        let original_metadata = metadata.clone();
+
+        let bytes = save_safetensors_with_json_metadata(&tensors, Some(&metadata)).unwrap();
+        assert_eq!(
+            inspect_safetensors_metadata(&bytes).unwrap().header["__metadata__"],
+            metadata
+        );
+        assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
+        assert!(load_safetensors(&bytes).is_err());
+        assert_eq!(bytes, save_safetensors_with_json_metadata(&tensors, Some(&metadata)).unwrap());
+        assert_eq!(tensors, original_tensors);
+        assert_eq!(metadata, original_metadata);
+
+        let empty = serde_json::json!({});
+        let absent = save_safetensors_with_json_metadata(&tensors, None).unwrap();
+        assert_eq!(
+            absent,
+            save_safetensors_with_json_metadata(&tensors, Some(&empty)).unwrap()
+        );
+        assert!(inspect_safetensors_metadata(&absent)
+            .unwrap()
+            .header
+            .get("__metadata__")
+            .is_none());
+    }
+
+    #[test]
+    fn raw_json_metadata_save_matches_legacy_strings_and_fails_before_tensors() {
+        let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![9])))]);
+        let metadata = Metadata::from([("source".into(), "tinygrad".into())]);
+        let raw_metadata = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(
+            save_safetensors(&tensors, &metadata).unwrap(),
+            save_safetensors_with_json_metadata(&tensors, Some(&raw_metadata)).unwrap()
+        );
+
+        let invalid_tensors = StateDict::from([("".into(), raw([], Storage::U8(vec![1])))]);
+        let non_object = serde_json::json!(false);
+        assert!(matches!(
+            save_safetensors_with_json_metadata(&invalid_tensors, Some(&non_object)),
+            Err(Error::Serialization { reason }) if reason == "metadata must be a JSON object"
+        ));
+        assert!(save_safetensors_with_json_metadata(&invalid_tensors, None).is_err());
+        assert_eq!(invalid_tensors[""].to_le_bytes().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn raw_json_metadata_file_save_is_atomic_wrapper() {
+        let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![4])))]);
+        let metadata = serde_json::json!({"nested": [1, true]});
+        let directory = std::env::temp_dir().join(format!("rustgrad-safe-json-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.safetensors");
+
+        save_safetensors_file_with_json_metadata(&path, &tensors, Some(&metadata)).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            inspect_safetensors_metadata(&bytes).unwrap().header["__metadata__"],
+            metadata
+        );
+        assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]
