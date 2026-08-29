@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v17";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v18";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -1733,8 +1733,17 @@ fn emit_vector_insts(
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty.is_float() => {
                         format!("-{}[l]", a)
                     }
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
+                        format!("!{}[l]", a)
+                    }
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Abs) if ty.is_float() => {
                         format!("fabs({}[l])", a)
+                    }
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs)
+                        if ty == DType::Bool
+                            || matches!(ty.category(), crate::DTypeCategory::Unsigned) =>
+                    {
+                        format!("{}[l]", a)
                     }
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) => {
                         wrap_expr(ty, format!("0-({}){}[l]", unsigned_ctype(ty)?, a))?
@@ -2176,8 +2185,40 @@ fn emit(
                 .scalar;
             let a = s(0)?;
             let x = match op {
-                crate::UnaryOp::Neg => format!("-({a})"),
-                crate::UnaryOp::Abs => format!("fabs({a})"),
+                crate::UnaryOp::Neg if input_ty.is_float() => format!("-({a})"),
+                // Raw GraphUnary Bool negation is storage-level logical-not.
+                // Public Graph::neg deliberately uses its own source-literal
+                // logical_not composition and does not depend on this arm.
+                crate::UnaryOp::Neg if input_ty == DType::Bool => {
+                    format!("((uint8_t)!({a}))")
+                }
+                // Negating exact integer storage must never ask C to negate a
+                // signed minimum. Subtract from zero in the corresponding
+                // unsigned width, then restore the source storage lane.
+                crate::UnaryOp::Neg => wrap_expr(
+                    input_ty,
+                    format!("0-({})({a})", unsigned_ctype(input_ty)?),
+                )?,
+                crate::UnaryOp::Abs if input_ty.is_float() => format!("fabs({a})"),
+                crate::UnaryOp::Abs if input_ty == DType::Bool => a,
+                crate::UnaryOp::Abs
+                    if matches!(input_ty.category(), crate::DTypeCategory::Unsigned) =>
+                {
+                    a
+                }
+                // Match B2's exact-width signed formula: test the signed
+                // lane, do any negation in unsigned storage, and wrap it back
+                // so every signed minimum follows wrapping_abs rather than an
+                // f64/fabs conversion or signed-overflow UB.
+                crate::UnaryOp::Abs
+                    if matches!(input_ty.category(), crate::DTypeCategory::Signed) =>
+                {
+                    let unsigned = unsigned_ctype(input_ty)?;
+                    wrap_expr(
+                        input_ty,
+                        format!("({a})<0 ? 0-({unsigned})({a}) : ({unsigned})({a})"),
+                    )?
+                }
                 // CPU/generic evaluate arithmetic after widening a typed
                 // storage lane to f64. Keep that working-value contract for
                 // the direct multiply instead of letting C evaluate two
@@ -2677,6 +2718,158 @@ mod tests {
             let vector = CpuJit::render_vectorized(&uop).unwrap();
             assert!(vector.source.contains("B2 VectorProgram"), "{dtype:?}");
             assert!(vector.source.contains("!=0"), "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v18");
+
+        let signed = [
+            (DType::I8, "uint8_t", "rg_i8"),
+            (DType::I16, "uint16_t", "rg_i16"),
+            (DType::I32, "uint32_t", "rg_i32"),
+            (DType::I64, "uint64_t", "rg_i64"),
+        ];
+        for (dtype, unsigned, helper) in signed {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([2]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, input).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
+            assert!(matches!(graph.op(neg).unwrap(), Op::Unary { op: crate::UnaryOp::Neg, .. }));
+            assert!(matches!(graph.op(abs).unwrap(), Op::Unary { op: crate::UnaryOp::Abs, .. }));
+
+            let neg_uop = crate::lower_graph_elementwise(&graph, neg).unwrap();
+            let abs_uop = crate::lower_graph_elementwise(&graph, abs).unwrap();
+            let neg_source = CpuJit::render(&neg_uop).unwrap();
+            let abs_source = CpuJit::render(&abs_uop).unwrap();
+            assert!(neg_source.source.contains(RENDERER_VERSION));
+            assert!(neg_source.source.contains(&format!("0-({unsigned})")), "{dtype:?}");
+            assert!(neg_source.source.contains(helper), "{dtype:?}");
+            assert!(abs_source.source.contains(&format!("<0 ? 0-({unsigned})")), "{dtype:?}");
+            assert!(abs_source.source.contains(helper), "{dtype:?}");
+            assert!(!abs_source.source.contains("fabs("), "{dtype:?}");
+            assert_eq!(neg_source.cache_key, CpuJit::render(&neg_uop).unwrap().cache_key);
+            let neg_vector = CpuJit::render_vectorized(&neg_uop).unwrap();
+            let abs_vector = CpuJit::render_vectorized(&abs_uop).unwrap();
+            assert!(neg_vector.source.contains("B2 VectorProgram"));
+            assert!(abs_vector.source.contains("B2 VectorProgram"));
+            assert!(neg_vector.source.contains("rg_i"), "{dtype:?}");
+            assert!(abs_vector.source.contains(&format!("<0 ? 0-({unsigned})")), "{dtype:?}");
+        }
+
+        for dtype in [DType::U8, DType::U16, DType::U32, DType::U64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([2]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, input).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
+            let neg_source = CpuJit::render(&crate::lower_graph_elementwise(&graph, neg).unwrap()).unwrap();
+            let abs_source = CpuJit::render(&crate::lower_graph_elementwise(&graph, abs).unwrap()).unwrap();
+            assert!(neg_source.source.contains("0-(uint"), "{dtype:?}");
+            assert!(!abs_source.source.contains("fabs("), "{dtype:?}");
+            let neg_vector = CpuJit::render_vectorized(&crate::lower_graph_elementwise(&graph, neg).unwrap()).unwrap();
+            let abs_vector = CpuJit::render_vectorized(&crate::lower_graph_elementwise(&graph, abs).unwrap()).unwrap();
+            assert!(neg_vector.source.contains("B2 VectorProgram"));
+            assert!(abs_vector.source.contains("B2 VectorProgram"));
+            assert!(neg_vector.source.contains("0-(uint"), "{dtype:?}");
+        }
+
+        let mut bool_graph = Graph::new();
+        let bool_input = bool_graph.input_dtype("input", Shape::from([2]), DType::Bool);
+        let bool_neg = bool_graph.unary(crate::UnaryOp::Neg, bool_input).unwrap();
+        let bool_abs = bool_graph.unary(crate::UnaryOp::Abs, bool_input).unwrap();
+        let bool_neg_source = CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_neg).unwrap()).unwrap();
+        let bool_abs_source = CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap()).unwrap();
+        assert!(bool_neg_source.source.contains("((uint8_t)!("));
+        assert!(!bool_abs_source.source.contains("fabs("));
+        assert!(CpuJit::render_vectorized(&crate::lower_graph_elementwise(&bool_graph, bool_neg).unwrap()).unwrap().source.contains("B2 VectorProgram"));
+        assert!(CpuJit::render_vectorized(&crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap()).unwrap().source.contains("B2 VectorProgram"));
+        let bool_bindings = HashMap::from([(
+            "input".to_string(),
+            TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend.execute(&bool_graph, bool_neg, &bool_bindings).unwrap(),
+            TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap()
+        );
+        assert_eq!(
+            CpuBackend.execute(&bool_graph, bool_abs, &bool_bindings).unwrap(),
+            TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap()
+        );
+
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([2]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, input).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
+            let neg_uop = crate::lower_graph_elementwise(&graph, neg).unwrap();
+            let abs_uop = crate::lower_graph_elementwise(&graph, abs).unwrap();
+            assert!(CpuJit::render(&neg_uop).unwrap().source.contains("-(("), "{dtype:?}");
+            assert!(CpuJit::render(&abs_uop).unwrap().source.contains("fabs("), "{dtype:?}");
+            let neg_vector = CpuJit::render_vectorized(&neg_uop).unwrap();
+            let abs_vector = CpuJit::render_vectorized(&abs_uop).unwrap();
+            if matches!(dtype, DType::F16 | DType::BF16) {
+                assert!(!neg_vector.source.contains("B2 VectorProgram"));
+                assert!(!abs_vector.source.contains("B2 VectorProgram"));
+            } else {
+                assert!(neg_vector.source.contains("B2 VectorProgram"));
+                assert!(abs_vector.source.contains("B2 VectorProgram"));
+            }
+        }
+
+        // Raw U64 lanes stay integer-width: no f64/fabs path is permitted
+        // for values above 2^53, and signed minima retain wrapping behavior.
+        for (dtype, input, negated, absolute) in [
+            (DType::I8, TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap()),
+            (DType::I16, TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap()),
+            (DType::I32, TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap()),
+            (DType::I64, TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap()),
+            (DType::U64, TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap(), TensorData::from_storage([1], Storage::U64(vec![u64::MAX - (1u64 << 53)])).unwrap(), TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap()),
+        ] {
+            let mut graph = Graph::new();
+            let source = graph.input_dtype("input", Shape::from([1]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, source).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, source).unwrap();
+            let bindings = HashMap::from([("input".to_string(), input)]);
+            assert_eq!(CpuBackend.execute(&graph, neg, &bindings).unwrap(), negated);
+            assert_eq!(CpuBackend.execute(&graph, abs, &bindings).unwrap(), absolute);
+        }
+
+        // Maxima take the ordinary exact-width path while minima wrap.  In
+        // particular this also proves the scalar renderer never needs an
+        // f64 detour to represent I64 arithmetic.
+        for (dtype, input, negated) in [
+            (DType::I8, TensorData::from_storage([1], Storage::I8(vec![i8::MAX])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![-i8::MAX])).unwrap()),
+            (DType::I16, TensorData::from_storage([1], Storage::I16(vec![i16::MAX])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![-i16::MAX])).unwrap()),
+            (DType::I32, TensorData::from_storage([1], Storage::I32(vec![i32::MAX])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![-i32::MAX])).unwrap()),
+            (DType::I64, TensorData::from_storage([1], Storage::I64(vec![i64::MAX])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![-i64::MAX])).unwrap()),
+        ] {
+            let mut graph = Graph::new();
+            let source = graph.input_dtype("input", Shape::from([1]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, source).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, source).unwrap();
+            let bindings = HashMap::from([("input".to_string(), input.clone())]);
+            assert_eq!(CpuBackend.execute(&graph, neg, &bindings).unwrap(), negated);
+            assert_eq!(CpuBackend.execute(&graph, abs, &bindings).unwrap(), input);
+        }
+
+        for (dtype, input) in [
+            (DType::F32, TensorData::from_storage([3], Storage::F32(vec![-0.0, f32::NAN, f32::INFINITY])).unwrap()),
+            (DType::F64, TensorData::from_storage([3], Storage::F64(vec![-0.0, f64::NAN, f64::INFINITY])).unwrap()),
+        ] {
+            let mut graph = Graph::new();
+            let source = graph.input_dtype("input", Shape::from([3]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, source).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, source).unwrap();
+            let bindings = HashMap::from([("input".to_string(), input)]);
+            let negated = CpuBackend.execute(&graph, neg, &bindings).unwrap();
+            let absolute = CpuBackend.execute(&graph, abs, &bindings).unwrap();
+            assert!(negated.scalar_at(0).as_f64().is_sign_positive());
+            assert!(absolute.scalar_at(0).as_f64().is_sign_positive());
+            assert!(negated.scalar_at(1).as_f64().is_nan());
+            assert!(absolute.scalar_at(1).as_f64().is_nan());
+            assert!(negated.scalar_at(2).as_f64().is_infinite());
+            assert!(absolute.scalar_at(2).as_f64().is_infinite());
         }
     }
 
