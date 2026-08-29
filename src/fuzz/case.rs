@@ -220,6 +220,9 @@ pub enum FuzzCase {
     LogicalNot {
         input: FuzzTensor,
     },
+    TensorT {
+        input: FuzzTensor,
+    },
 }
 
 pub(super) struct BuiltCase {
@@ -250,7 +253,8 @@ impl FuzzCase {
             | Self::AffineView { input, .. }
             | Self::Reduction { input, .. }
             | Self::Unary { input, .. }
-            | Self::LogicalNot { input } => vec![input],
+            | Self::LogicalNot { input }
+            | Self::TensorT { input } => vec![input],
         }
     }
 
@@ -393,6 +397,10 @@ impl FuzzCase {
             Self::LogicalNot { input } => {
                 let input = bind(&mut graph, "input", input)?;
                 graph.logical_not(input).map_err(|error| error.to_string())?
+            }
+            Self::TensorT { input } => {
+                let input = bind(&mut graph, "input", input)?;
+                graph.t_tinygrad(input).map_err(|error| error.to_string())?
             }
         };
         let oracle = ordered.clone().into_iter().collect();

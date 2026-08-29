@@ -68,6 +68,9 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
         FuzzCase::LogicalNot { input } => FuzzCase::LogicalNot {
             input: input.zeroed(),
         },
+        FuzzCase::TensorT { input } => FuzzCase::TensorT {
+            input: input.zeroed(),
+        },
     }
 }
 
@@ -108,6 +111,9 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
         FuzzCase::LogicalNot { input } => Some(FuzzCase::LogicalNot {
             input: input.scalar_prefix()?,
         }),
+        // Tensor.T admits rank two only, so scalarization would stop being a
+        // valid source program and is deliberately omitted.
+        FuzzCase::TensorT { .. } => None,
         _ => None,
     }
 }

@@ -130,6 +130,13 @@ pub fn regression_cases() -> Vec<FuzzCase> {
         FuzzCase::LogicalNot {
             input: tensor(vec![3], Storage::I32(vec![0, -1, 2])),
         },
+        FuzzCase::TensorT {
+            // Row-major [2, 3] payload becomes [0, 3, 1, 4, 2, 5].
+            input: tensor(vec![2, 3], Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0])),
+        },
+        FuzzCase::TensorT {
+            input: tensor(vec![0, 3], Storage::F16(vec![])),
+        },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),
             rhs: tensor(vec![2, 3], Storage::I32(vec![0; 6])),

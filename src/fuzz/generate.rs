@@ -46,7 +46,7 @@ fn static_shape(rng: &mut SplitMix64) -> Vec<usize> {
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(11) {
+    match rng.pick(12) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = if rng.pick(2) == 0 {
@@ -218,6 +218,15 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             let dtype = [DType::Bool, DType::I32, DType::F32][rng.pick(3)];
             let shape = static_shape(&mut rng);
             FuzzCase::LogicalNot {
+                input: tensor(&mut rng, shape, dtype),
+            }
+        }
+        10 => {
+            // Tensor.T is a rank-two literal Permute([1, 0]), never the
+            // identity Input alias that blocks the broader Permute surface.
+            let shape = vec![[0, 1, 2, 3][rng.pick(4)], [0, 1, 2, 3][rng.pick(4)]];
+            let dtype = [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)];
+            FuzzCase::TensorT {
                 input: tensor(&mut rng, shape, dtype),
             }
         }

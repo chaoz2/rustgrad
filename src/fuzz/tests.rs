@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    Backend, CapturedSchedule, CompareOp, CpuBackend, DType, LogicalOp, Op, Scalar, Storage,
-    TensorData, UOpKind, UnaryOp, schedule,
+    Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, Op, Scalar,
+    Storage, TensorData, UArg, UOpKind, UnaryOp, schedule,
 };
 use std::{
     fs::{self, File},
@@ -298,6 +298,145 @@ fn generated_logical_not_cases_are_valid_diverse_and_deterministic() {
 
     assert!(found);
     assert!(boolean && i32 && f32 && zero && nonzero && scalar && empty);
+}
+
+#[test]
+fn generated_tensor_t_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut f32 = false;
+    let mut i32 = false;
+    let mut f16 = false;
+    let mut boolean = false;
+    let mut square = false;
+    let mut rectangular = false;
+    let mut zero_rows = false;
+    let mut zero_columns = false;
+    let mut all_zero = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..512 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::TensorT { input } = case else {
+                continue;
+            };
+            found = true;
+            assert_eq!(input.shape.len(), 2);
+            square |= input.shape[0] == input.shape[1];
+            rectangular |= input.shape[0] != input.shape[1];
+            zero_rows |= input.shape[0] == 0;
+            zero_columns |= input.shape[1] == 0;
+            all_zero |= input.shape == vec![0, 0];
+            match input.dtype {
+                DType::F32 => f32 = true,
+                DType::I32 => i32 = true,
+                DType::F16 => f16 = true,
+                DType::Bool => boolean = true,
+                _ => unreachable!("Tensor.T generator selects movement dtypes only"),
+            }
+        }
+    }
+
+    assert!(found);
+    assert!(f32 && i32 && f16 && boolean);
+    assert!(square && rectangular && zero_rows && zero_columns && all_zero);
+}
+
+#[test]
+fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
+    let tensor_t = FuzzCase::TensorT {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2, 3], Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+                .unwrap(),
+        ),
+    };
+    let value = serde_json::to_value(&tensor_t).unwrap();
+    assert_eq!(value["kind"], "tensor_t");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), tensor_t);
+    let mut unknown = value;
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    for input in [
+        tensor_t_input(&tensor_t),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage([2, 2], Storage::I32(vec![0, 1, 2, 3])).unwrap(),
+        ),
+        FuzzTensor::from_tensor(&TensorData::from_storage([0, 3], Storage::F16(vec![])).unwrap()),
+    ] {
+        let case = FuzzCase::TensorT { input };
+        let built = case.build().unwrap();
+        let Op::Permute {
+            input: source,
+            axes,
+        } = built.graph.op(built.output).unwrap()
+        else {
+            panic!("Tensor.T must retain its literal Permute root");
+        };
+        assert_eq!(axes, &vec![1, 0]);
+        assert_eq!(
+            built.graph.shape(built.output).unwrap().dims(),
+            &[built.graph.shape(*source).unwrap().dims()[1], built.graph.shape(*source).unwrap().dims()[0]]
+        );
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        for item in &scheduled.items {
+            assert!(item.boundary.is_none());
+            assert!(item.kernel.topological().unwrap().iter().any(|node| {
+                matches!(node.arg(), UArg::ViewBufferIndex { .. })
+            }));
+            assert!(CpuJit::render(&item.kernel).is_ok());
+            assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
+        }
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+        assert_eq!(decoded.items.len(), scheduled.items.len());
+    }
+
+    let built = tensor_t.build().unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
+    assert_eq!(output.storage(), &Storage::F32(vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]));
+    let expected = FuzzOutcome::value(&output);
+    let artifact = FuzzFailureArtifact::new(
+        11,
+        15,
+        tensor_t.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        expected,
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic Tensor.T mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&tensor_t, |candidate| {
+        matches!(candidate, FuzzCase::TensorT { input }
+            if input.shape == vec![2, 3] && input.bytes == vec![0; 24])
+    });
+    assert!(matches!(zeroed, FuzzCase::TensorT { ref input }
+        if input.shape == vec![2, 3] && input.bytes == vec![0; 24]));
+    assert_eq!(minimize_case(&tensor_t, |_| true), zeroed);
+
+    let malformed = FuzzCase::TensorT {
+        input: FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F32)),
+    };
+    assert!(malformed.validate().is_err());
+}
+
+fn tensor_t_input(case: &FuzzCase) -> FuzzTensor {
+    match case {
+        FuzzCase::TensorT { input } => input.clone(),
+        _ => unreachable!("constructed as Tensor.T"),
+    }
 }
 
 #[test]
@@ -792,7 +931,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 17);
+    assert_eq!(cases.len(), 19);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(
