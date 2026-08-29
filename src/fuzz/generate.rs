@@ -264,7 +264,11 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             // Raw Pad is a self-contained homogeneous movement plan. It is
             // intentionally distinct from source-level signed/mode-aware pad.
             let rank = rng.pick(4);
-            let dtype = [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)];
+            let dtype = [
+                DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
+                DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+                DType::F64,
+            ][rng.pick(13)];
             let shape = (0..rank)
                 .map(|_| [0, 1, 2, 3][rng.pick(4)])
                 .collect::<Vec<_>>();

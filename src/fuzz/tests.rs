@@ -746,10 +746,7 @@ fn generated_tensor_t_cases_are_valid_diverse_and_deterministic() {
 #[test]
 fn generated_pad_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
-    let mut f32 = false;
-    let mut i32 = false;
-    let mut f16 = false;
-    let mut boolean = false;
+    let mut dtypes = std::collections::BTreeSet::new();
     let mut scalar = false;
     let mut empty = false;
     let mut before = false;
@@ -757,7 +754,7 @@ fn generated_pad_cases_are_valid_diverse_and_deterministic() {
     let mut asymmetric = false;
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index in 0..512 {
+        for index in 0..1024 {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
@@ -778,18 +775,12 @@ fn generated_pad_cases_are_valid_diverse_and_deterministic() {
             before |= padding.iter().any(|(before, _)| *before != 0);
             after |= padding.iter().any(|(_, after)| *after != 0);
             asymmetric |= padding.iter().any(|(before, after)| before != after);
-            match input.dtype {
-                DType::F32 => f32 = true,
-                DType::I32 => i32 = true,
-                DType::F16 => f16 = true,
-                DType::Bool => boolean = true,
-                _ => unreachable!("Pad generator selects movement dtypes only"),
-            }
+            dtypes.insert(input.dtype);
         }
     }
 
     assert!(found);
-    assert!(f32 && i32 && f16 && boolean);
+    assert_eq!(dtypes.len(), 13);
     assert!(scalar && empty && before && after && asymmetric);
 }
 
@@ -882,6 +873,107 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
         unreachable!("Pad plan")
     };
     assert!(f32::from_bits(fill_bits as u32).is_nan());
+
+    // A raw Pad copies finite input lanes at their storage width. Its scalar
+    // fill is deliberately a separate commitment through `scalar_at` and
+    // `MovementKernelPlan::fill_bits`, so raw half-NaN input/fill payload
+    // identity is not claimed here.
+    let dtype_cases = vec![
+        (DType::Bool, Storage::Bool(vec![false]), Storage::Bool(vec![true]), 1, "uint8_t"),
+        (DType::I8, Storage::I8(vec![i8::MIN]), Storage::I8(vec![-1]), 0xff, "int8_t"),
+        (DType::U8, Storage::U8(vec![u8::MAX]), Storage::U8(vec![u8::MAX]), 0xff, "uint8_t"),
+        (DType::I16, Storage::I16(vec![i16::MIN]), Storage::I16(vec![-1]), 0xffff, "int16_t"),
+        (DType::U16, Storage::U16(vec![u16::MAX]), Storage::U16(vec![u16::MAX]), 0xffff, "uint16_t"),
+        (DType::I32, Storage::I32(vec![i32::MIN]), Storage::I32(vec![-1]), 0xffff_ffff, "int32_t"),
+        (DType::U32, Storage::U32(vec![u32::MAX]), Storage::U32(vec![u32::MAX]), 0xffff_ffff, "uint32_t"),
+        (DType::I64, Storage::I64(vec![i64::MIN]), Storage::I64(vec![-1]), u64::MAX, "int64_t"),
+        (DType::U64, Storage::U64(vec![u64::MAX]), Storage::U64(vec![u64::MAX]), u64::MAX, "uint64_t"),
+        (DType::F16, Storage::F16(vec![0x3c00]), Storage::F16(vec![0x8000]), 0x8000, "uint16_t"),
+        (DType::BF16, Storage::BF16(vec![0x3f80]), Storage::BF16(vec![0x8000]), 0x8000, "uint16_t"),
+        (DType::F32, Storage::F32(vec![1.0]), Storage::F32(vec![-0.0]), 0x8000_0000, "float"),
+        (DType::F64, Storage::F64(vec![1.0]), Storage::F64(vec![-0.0]), 0x8000_0000_0000_0000, "double"),
+    ];
+    for (dtype, input_storage, fill_storage, expected_bits, native_type) in dtype_cases {
+        let input = FuzzTensor::from_tensor(&TensorData::from_storage([1], input_storage).unwrap());
+        let fill = FuzzTensor::from_tensor(&TensorData::from_storage([], fill_storage).unwrap());
+        let case = FuzzCase::Pad { input: input.clone(), padding: vec![(1, 0)], fill };
+        let built = case.build().unwrap();
+        let MovementKernelKind::Pad { fill_bits, .. } = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap().kind else {
+            unreachable!("Pad plan")
+        };
+        assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
+        assert_eq!(fill_bits, expected_bits);
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+        assert!(scalar.source.contains(native_type));
+        match dtype {
+            DType::Bool => assert!(scalar.source.contains("((uint8_t)1)")),
+            DType::F16 | DType::BF16 => assert!(scalar.source.contains("0x8000u")),
+            DType::F32 => assert!(scalar.source.contains("0x80000000u")),
+            DType::F64 => assert!(scalar.source.contains("0x8000000000000000")),
+            _ => assert!(scalar.source.contains("UINT64_C")),
+        }
+        assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        let output = FuzzTensor::from_tensor(&output);
+        assert_eq!(&output.bytes[dtype.itemsize()..], input.bytes.as_slice());
+    }
+
+    for (dtype, fill, expect_nan) in [
+        (DType::F16, 0x7e01_u16, true),
+        (DType::F16, 0x7c00_u16, false),
+        (DType::BF16, 0x7fc1_u16, true),
+        (DType::BF16, 0x7f80_u16, false),
+    ] {
+        let input = FuzzTensor::from_tensor(&TensorData::from_scalars([1], dtype, [Scalar::F(1.0)]).unwrap());
+        let fill = FuzzTensor::from_tensor(&TensorData::from_storage([], if dtype == DType::F16 { Storage::F16(vec![fill]) } else { Storage::BF16(vec![fill]) }).unwrap());
+        let built = FuzzCase::Pad { input, padding: vec![(1, 0)], fill }.build().unwrap();
+        let MovementKernelKind::Pad { fill_bits, .. } = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap().kind else {
+            unreachable!("Pad plan")
+        };
+        let committed = if dtype == DType::F16 {
+            crate::f16_to_f32(fill_bits as u16)
+        } else {
+            crate::bf16_to_f32(fill_bits as u16)
+        };
+        assert!(if expect_nan { committed.is_nan() } else { committed.is_infinite() });
+    }
+
+    for (dtype, fill, expect_nan) in [
+        (DType::F32, Storage::F32(vec![f32::from_bits(0x7fc0_0001)]), true),
+        (DType::F32, Storage::F32(vec![f32::INFINITY]), false),
+        (DType::F64, Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001)]), true),
+        (DType::F64, Storage::F64(vec![f64::INFINITY]), false),
+    ] {
+        let input = FuzzTensor::from_tensor(
+            &TensorData::from_scalars([1], dtype, [Scalar::F(1.0)]).unwrap(),
+        );
+        let fill = FuzzTensor::from_tensor(&TensorData::from_storage([], fill).unwrap());
+        let built = FuzzCase::Pad {
+            input,
+            padding: vec![(1, 0)],
+            fill,
+        }
+        .build()
+        .unwrap();
+        let MovementKernelKind::Pad { fill_bits, .. } =
+            MovementKernelPlan::from_graph(&built.graph, built.output).unwrap().kind
+        else {
+            unreachable!("Pad plan")
+        };
+        let committed = if dtype == DType::F32 {
+            f32::from_bits(fill_bits as u32).is_nan()
+        } else {
+            f64::from_bits(fill_bits).is_nan()
+        };
+        assert_eq!(committed, expect_nan);
+        if !expect_nan {
+            assert_eq!(fill_bits, if dtype == DType::F32 { f32::INFINITY.to_bits() as u64 } else { f64::INFINITY.to_bits() });
+        }
+    }
 
     let bad_shape = FuzzCase::Pad {
         input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),

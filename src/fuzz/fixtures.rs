@@ -185,6 +185,35 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             padding: vec![],
             fill: tensor(vec![], Storage::Bool(vec![false])),
         },
+        FuzzCase::Pad {
+            // Half scalar fills commit at storage width; the input lane stays
+            // a raw movement operand rather than a scalar fill conversion.
+            input: tensor(vec![1], Storage::F16(vec![0x3c00])),
+            padding: vec![(1, 1)],
+            fill: tensor(vec![], Storage::F16(vec![0x8000])),
+        },
+        FuzzCase::Pad {
+            // BF16 NaN fill is committed through the scalar bridge; its raw
+            // input storage is deliberately not conflated with fill identity.
+            input: tensor(vec![1], Storage::BF16(vec![0x3f80])),
+            padding: vec![(1, 1)],
+            fill: tensor(vec![], Storage::BF16(vec![0x7fc1])),
+        },
+        FuzzCase::Pad {
+            input: tensor(vec![1], Storage::F64(vec![f64::INFINITY])),
+            padding: vec![(1, 0)],
+            fill: tensor(vec![], Storage::F64(vec![-0.0])),
+        },
+        FuzzCase::Pad {
+            input: tensor(vec![1], Storage::I64(vec![i64::MIN])),
+            padding: vec![(1, 0)],
+            fill: tensor(vec![], Storage::I64(vec![-1])),
+        },
+        FuzzCase::Pad {
+            input: tensor(vec![1], Storage::U64(vec![u64::MAX])),
+            padding: vec![(0, 1)],
+            fill: tensor(vec![], Storage::U64(vec![u64::MAX])),
+        },
         FuzzCase::Gather {
             // Axis-one duplicate/reorder selection is intentionally obvious.
             input: tensor(vec![2, 4], Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
