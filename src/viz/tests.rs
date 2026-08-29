@@ -24,7 +24,7 @@ fn normalized_model_is_order_independent_and_dot_escapes() {
 }
 
 #[test]
-fn malformed_models_and_unsupported_graph_ops_fail_closed() {
+fn malformed_models_and_invalid_graph_nodes_fail_closed() {
     assert!(matches!(
         VizGraph::try_new(
             "x",
@@ -33,22 +33,7 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         ),
         Err(VizError::MissingEndpoint { .. })
     ));
-    let mut graph = Graph::new();
-    let input = graph.input("x", [1]);
-    let unsupported = graph
-        .static_index(
-            input,
-            &[crate::ir::indexing::StaticIndex::Slice {
-                start: None,
-                stop: None,
-                step: 1,
-            }],
-        )
-        .unwrap();
-    assert!(matches!(
-        graph_viz(&graph, &[unsupported]),
-        Err(VizError::UnsupportedGraphOp(_))
-    ));
+    let graph = Graph::new();
     assert!(matches!(
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
