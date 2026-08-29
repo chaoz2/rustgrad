@@ -34,10 +34,11 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         Err(VizError::MissingEndpoint { .. })
     ));
     let mut graph = Graph::new();
-    let lhs = graph.input("lhs", [1, 1]);
-    let rhs = graph.input("rhs", [1, 1]);
-    let upstream = graph.input("upstream", [1, 1]);
-    let unsupported = graph.matmul_grad(upstream, lhs, rhs, true).unwrap();
+    let input = graph.input("x", [1]);
+    let upstream = graph.input("upstream", []);
+    let unsupported = graph
+        .reduce_grad(input, upstream, crate::ReduceKind::Sum, vec![0], false)
+        .unwrap();
     assert!(matches!(
         graph_viz(&graph, &[unsupported]),
         Err(VizError::UnsupportedGraphOp(_))
@@ -46,6 +47,43 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn matmul_grad_graph_visualization_preserves_batched_vector_and_vjp_roles() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2, 1, 3, 4]);
+    let rhs = graph.input("rhs", [1, 5, 4, 6]);
+    let upstream = graph.input("upstream", [2, 5, 3, 6]);
+    let gradient = graph.matmul_grad(upstream, lhs, rhs, true).unwrap();
+    let cotangent = graph.input("cotangent", [2, 1, 3, 4]);
+    let vjp = graph
+        .matmul_grad_vjp(cotangent, upstream, lhs, rhs, true, 2)
+        .unwrap();
+
+    let vector = graph.input("vector", [4]);
+    let matrix = graph.input("matrix", [2, 4, 3]);
+    let vector_upstream = graph.input("vector_upstream", [2, 3]);
+    let vector_gradient = graph
+        .matmul_grad(vector_upstream, vector, matrix, false)
+        .unwrap();
+
+    let first = graph_viz(&graph, &[gradient, vjp, vector_gradient]).unwrap();
+    let second = graph_viz(&graph, &[gradient, vjp, vector_gradient]).unwrap();
+    assert_eq!(first, second);
+    let dot = first.to_dot();
+    assert!(dot.contains("matmul_grad\\nkind=graph_op"));
+    assert!(dot.contains("matmul_grad_vjp\\nkind=graph_op"));
+    assert!(dot.contains("target=lhs"));
+    assert!(dot.contains("target=rhs"));
+    assert!(dot.contains("wrt=2"));
+    assert!(dot.contains("data:0:upstream"));
+    assert!(dot.contains("data:1:lhs"));
+    assert!(dot.contains("data:2:rhs"));
+    assert!(dot.contains("data:0:cotangent"));
+    assert!(dot.contains("shape=[2,1,3,4]"));
+    assert!(dot.contains("shape=[1,5,4,6]"));
+    assert!(dot.contains("shape=[2,4,3]"));
 }
 
 #[test]

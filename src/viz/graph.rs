@@ -272,6 +272,25 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
             .chain(std::iter::once(dependency("upstream", *upstream)))
             .chain(operand_dependencies(inputs))
             .collect(),
+        Op::MatmulGrad {
+            upstream, lhs, rhs, ..
+        } => vec![
+            dependency("upstream", *upstream),
+            dependency("lhs", *lhs),
+            dependency("rhs", *rhs),
+        ],
+        Op::MatmulGradVjp {
+            cotangent,
+            upstream,
+            lhs,
+            rhs,
+            ..
+        } => vec![
+            dependency("cotangent", *cotangent),
+            dependency("upstream", *upstream),
+            dependency("lhs", *lhs),
+            dependency("rhs", *rhs),
+        ],
         Op::Conv2d {
             input, weight, bias, ..
         }
@@ -498,6 +517,15 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("output_labels", einsum_labels(&plan.output_labels))
             .field("contracted_labels", einsum_labels(&plan.contracted_labels))
             .field("target_operand", target.to_string())
+            .field("wrt", wrt.to_string()),
+        Op::MatmulGrad { lhs_gradient, .. } => node.field(
+            "target",
+            if *lhs_gradient { "lhs" } else { "rhs" },
+        ),
+        Op::MatmulGradVjp {
+            lhs_gradient, wrt, ..
+        } => node
+            .field("target", if *lhs_gradient { "lhs" } else { "rhs" })
             .field("wrt", wrt.to_string()),
         Op::Conv2d { options, .. } => conv2d_geometry(node, *options),
         Op::Conv2dGrad {
