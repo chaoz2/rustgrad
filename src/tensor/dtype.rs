@@ -37,6 +37,30 @@ pub enum DTypeCategory {
 }
 
 impl DType {
+    /// tinygrad's concrete `(uint8, int8)` inventory tuple.
+    pub const INT8S: [Self; 2] = [Self::U8, Self::I8];
+    /// tinygrad's concrete `(uint16, int16)` inventory tuple.
+    pub const INT16S: [Self; 2] = [Self::U16, Self::I16];
+    /// tinygrad's concrete `(uint32, int32)` inventory tuple.
+    pub const INT32S: [Self; 2] = [Self::U32, Self::I32];
+    /// tinygrad's concrete `(uint64, int64)` inventory tuple.
+    pub const INT64S: [Self; 2] = [Self::U64, Self::I64];
+    /// tinygrad's concrete unsigned integer inventory tuple.
+    pub const UINTS: [Self; 4] = [Self::U8, Self::U16, Self::U32, Self::U64];
+    /// tinygrad's concrete signed integer inventory tuple.
+    pub const SINTS: [Self; 4] = [Self::I8, Self::I16, Self::I32, Self::I64];
+    /// tinygrad's concrete integer inventory: unsigned entries then signed entries.
+    pub const INTS: [Self; 8] = [
+        Self::U8,
+        Self::U16,
+        Self::U32,
+        Self::U64,
+        Self::I8,
+        Self::I16,
+        Self::I32,
+        Self::I64,
+    ];
+
     pub const fn category(self) -> DTypeCategory {
         match self {
             Self::Bool => DTypeCategory::Bool,
@@ -54,6 +78,11 @@ impl DType {
             Self::I32 | Self::U32 | Self::F32 => 32,
             Self::I64 | Self::U64 | Self::F64 => 64,
         }
+    }
+
+    /// Alias for tinygrad's public `bitsize` field.
+    pub const fn bitsize(self) -> u8 {
+        self.bits()
     }
 
     pub const fn itemsize(self) -> usize {
@@ -129,6 +158,11 @@ impl DType {
             self.category(),
             DTypeCategory::Signed | DTypeCategory::Unsigned
         )
+    }
+
+    /// Alias for tinygrad's public `DTypes.is_int` predicate.
+    pub const fn is_int(self) -> bool {
+        self.is_integer()
     }
 
     pub const fn is_signed_integer(self) -> bool {
@@ -480,6 +514,56 @@ mod tests {
             DType::BF16.tinygrad_source_name(),
             DType::BF16.canonical_tinygrad_name()
         );
+    }
+
+    #[test]
+    fn tinygrad_integer_inventory_and_aliases_cover_only_concrete_integers() {
+        assert_eq!(DType::INT8S, [DType::U8, DType::I8]);
+        assert_eq!(DType::INT16S, [DType::U16, DType::I16]);
+        assert_eq!(DType::INT32S, [DType::U32, DType::I32]);
+        assert_eq!(DType::INT64S, [DType::U64, DType::I64]);
+        assert_eq!(DType::UINTS, [DType::U8, DType::U16, DType::U32, DType::U64]);
+        assert_eq!(DType::SINTS, [DType::I8, DType::I16, DType::I32, DType::I64]);
+        assert_eq!(
+            DType::INTS,
+            [
+                DType::U8,
+                DType::U16,
+                DType::U32,
+                DType::U64,
+                DType::I8,
+                DType::I16,
+                DType::I32,
+                DType::I64,
+            ]
+        );
+        assert_eq!(&DType::INTS[..4], DType::UINTS.as_slice());
+        assert_eq!(&DType::INTS[4..], DType::SINTS.as_slice());
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            assert_eq!(dtype.bitsize(), dtype.bits(), "{dtype:?}");
+            assert_eq!(dtype.is_int(), dtype.is_integer(), "{dtype:?}");
+            assert_eq!(DType::INTS.contains(&dtype), dtype.is_integer(), "{dtype:?}");
+        }
+        assert!(!DType::INTS.contains(&DType::Bool));
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            assert!(!DType::INTS.contains(&dtype));
+            assert!(!dtype.is_int());
+        }
     }
 
     #[test]
