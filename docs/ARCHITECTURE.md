@@ -147,9 +147,9 @@ validated model. Model construction sorts node IDs, fields, and edges before a
 dependency-free DOT renderer escapes labels, so construction order cannot leak
 into snapshots. Graph-local node IDs and portable buffer, item, artifact, and
 cache identities remain explicit; pointer identities, compiled modules, runtime
-handles, profiling samples, and `Debug` text are not inputs. Unsupported Graph
-operation families fail with a typed visualization error instead of being
-silently flattened.
+handles, profiling samples, and `Debug` text are not inputs. Every current
+typed Graph Op family is normalized; future unsupported operation families fail
+with a typed visualization error instead of being silently flattened.
 
 `ir::indexing` is the pure static-indexing boundary: it normalizes immutable
 integer/slice/newaxis/ellipsis and constant advanced-index specifications into
