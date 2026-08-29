@@ -79,6 +79,29 @@ impl VectorProgram {
         }
         for inst in &self.instructions {
             let ty = inst.payload.ty.map(|ty| ty.scalar);
+            // B2 physically represents narrow lanes as raw u16 values, while
+            // the source-correct scalar renderer must decode to float for
+            // every arithmetic/select operation and encode again at storage
+            // boundaries. Reject every instruction that consumes or produces
+            // a narrow register, including Load/Store whose payload type can
+            // be absent, until B2 has a tagged half-vector ABI.
+            let narrow_register = |operand: &VectorOperand| {
+                matches!(
+                    operand,
+                    VectorOperand::Register {
+                        dtype: crate::DType::F16 | crate::DType::BF16,
+                        ..
+                    }
+                )
+            };
+            if matches!(ty, Some(crate::DType::F16 | crate::DType::BF16))
+                || inst.dst.as_ref().is_some_and(narrow_register)
+                || inst.inputs.iter().any(narrow_register)
+            {
+                return Err(VectorIrError::Unsupported(
+                    "portable narrow vector ABI needs tagged float lanes".into(),
+                ));
+            }
             if !matches!(
                 inst.kind,
                 VectorInstKind::Splat
@@ -132,23 +155,6 @@ impl VectorProgram {
             if matches!(inst.payload.arg, crate::UArg::ViewBufferIndex { .. }) {
                 return Err(VectorIrError::Unsupported(
                     "portable vector instruction ABI does not encode affine view offsets".into(),
-                ));
-            }
-            // B1's narrow registers are raw u16 lanes. A typed Cast must
-            // encode and decode before its consumer, so retain the proven
-            // scalar-per-lane renderer until B1 grows tagged float lanes.
-            if matches!(inst.kind, VectorInstKind::Cast)
-                && (matches!(ty, Some(crate::DType::F16 | crate::DType::BF16))
-                    || inst.inputs.iter().any(|input| matches!(
-                        input,
-                        VectorOperand::Register {
-                            dtype: crate::DType::F16 | crate::DType::BF16,
-                            ..
-                        }
-                    )))
-            {
-                return Err(VectorIrError::Unsupported(
-                    "portable narrow Cast needs tagged float lanes".into(),
                 ));
             }
             // The physical B1 emitter intentionally supports a narrower

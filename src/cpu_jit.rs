@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v16";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v17";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -3773,7 +3773,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_b2_exact_and_narrow_float_vectors_execute() {
+    fn portable_b2_exact_vectors_execute() {
         for dtype in [
             DType::Bool,
             DType::I8,
@@ -3784,8 +3784,6 @@ mod tests {
             DType::U16,
             DType::U32,
             DType::U64,
-            DType::F16,
-            DType::BF16,
         ] {
             for len in [0usize, 1, 3, 4, 5, 8, 17] {
                 let mut graph = Graph::new();
@@ -3855,6 +3853,60 @@ mod tests {
                 );
                 assert_eq!(native.storage(), expected.storage(), "{dtype:?} len={len}");
             }
+        }
+    }
+
+    #[test]
+    fn narrow_select_and_cast_vector_requests_use_legacy_per_lane_rendering() {
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let condition = graph.input_dtype("condition", Shape::from([5]), DType::Bool);
+            let on_true = graph.input_dtype("on_true", Shape::from([5]), dtype);
+            let on_false = graph.input_dtype("on_false", Shape::from([5]), dtype);
+            // Keep a live Select branch and both widening/narrowing Casts so
+            // raw F16/BF16 signed-zero, NaN/infinity, and fractional lanes
+            // must traverse the source-correct conversion helpers.
+            let selected = graph.select(condition, on_true, on_false).unwrap();
+            let widened = graph.cast(selected, DType::F32).unwrap();
+            let output = graph.cast(widened, dtype).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains(decode), "{dtype:?}");
+            assert!(scalar.source.contains(encode), "{dtype:?}");
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert!(vector.source.contains(decode), "{dtype:?}");
+            assert!(vector.source.contains(encode), "{dtype:?}");
+            assert_eq!(vector.cache_key, CpuJit::render_vectorized(&uop).unwrap().cache_key);
+
+            let linear = CpuJit::linearize(&uop).unwrap();
+            let spaces = crate::MemorySpacePlan::from_linear(&linear).unwrap();
+            let program = crate::VectorProgram::from_linear(&linear, &spaces).unwrap();
+            assert!(matches!(
+                program.b1_eligibility(),
+                Err(crate::VectorIrError::Unsupported(reason))
+                    if reason == "portable narrow vector ABI needs tagged float lanes"
+            ));
+        }
+
+        for dtype in [DType::F32, DType::I32] {
+            let mut graph = Graph::new();
+            let condition = graph.input_dtype("condition", Shape::from([5]), DType::Bool);
+            let on_true = graph.input_dtype("on_true", Shape::from([5]), dtype);
+            let on_false = graph.input_dtype("on_false", Shape::from([5]), dtype);
+            let output = graph.select(condition, on_true, on_false).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            assert!(
+                CpuJit::render_vectorized(&uop)
+                    .unwrap()
+                    .source
+                    .contains("B2 VectorProgram"),
+                "{dtype:?} Select remains B2-eligible"
+            );
         }
     }
 
