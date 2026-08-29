@@ -152,6 +152,56 @@ fn operand_dependencies(inputs: &[NodeId]) -> Vec<(String, NodeId)> {
         .collect()
 }
 
+fn convolution_dependencies(
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+) -> Vec<(String, NodeId)> {
+    let mut dependencies = vec![dependency("input", input), dependency("weight", weight)];
+    if let Some(bias) = bias {
+        dependencies.push(dependency("bias", bias));
+    }
+    dependencies
+}
+
+fn convolution_gradient_dependencies(
+    upstream: NodeId,
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+) -> Vec<(String, NodeId)> {
+    let mut dependencies = vec![dependency("upstream", upstream)];
+    dependencies.extend(convolution_dependencies(input, weight, bias));
+    dependencies
+}
+
+fn convolution_gradient_vjp_dependencies(
+    cotangent: NodeId,
+    upstream: NodeId,
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+) -> Vec<(String, NodeId)> {
+    let mut dependencies = vec![dependency("cotangent", cotangent)];
+    dependencies.extend(convolution_gradient_dependencies(upstream, input, weight, bias));
+    dependencies
+}
+
+fn conv2d_geometry(node: VizNode, options: crate::Conv2dOptions) -> VizNode {
+    node.field("groups", options.groups.to_string())
+        .field("stride", usize_list(&options.stride))
+        .field("dilation", usize_list(&options.dilation))
+        .field("padding", usize_list(&options.padding))
+}
+
+fn conv_transpose2d_geometry(node: VizNode, options: crate::ConvTranspose2dOptions) -> VizNode {
+    node.field("groups", options.groups.to_string())
+        .field("stride", usize_list(&options.stride))
+        .field("dilation", usize_list(&options.dilation))
+        .field("padding", usize_list(&options.padding))
+        .field("output_padding", usize_list(&options.output_padding))
+}
+
 fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
     Ok(match op {
         Op::Input { .. } | Op::Constant(_) | Op::Random { .. } | Op::RandomPermutation { .. } => {
@@ -222,6 +272,42 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
             .chain(std::iter::once(dependency("upstream", *upstream)))
             .chain(operand_dependencies(inputs))
             .collect(),
+        Op::Conv2d {
+            input, weight, bias, ..
+        }
+        | Op::ConvTranspose2d {
+            input, weight, bias, ..
+        } => convolution_dependencies(*input, *weight, *bias),
+        Op::Conv2dGrad {
+            upstream,
+            input,
+            weight,
+            bias,
+            ..
+        }
+        | Op::ConvTranspose2dGrad {
+            upstream,
+            input,
+            weight,
+            bias,
+            ..
+        } => convolution_gradient_dependencies(*upstream, *input, *weight, *bias),
+        Op::Conv2dGradVjp {
+            cotangent,
+            upstream,
+            input,
+            weight,
+            bias,
+            ..
+        }
+        | Op::ConvTranspose2dGradVjp {
+            cotangent,
+            upstream,
+            input,
+            weight,
+            bias,
+            ..
+        } => convolution_gradient_vjp_dependencies(*cotangent, *upstream, *input, *weight, *bias),
         Op::StaticIndexUpdateGrad { cotangent, .. } => vec![dependency("cotangent", *cotangent)],
         _ => return Err(unsupported(op)),
     })
@@ -412,6 +498,24 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("output_labels", einsum_labels(&plan.output_labels))
             .field("contracted_labels", einsum_labels(&plan.contracted_labels))
             .field("target_operand", target.to_string())
+            .field("wrt", wrt.to_string()),
+        Op::Conv2d { options, .. } => conv2d_geometry(node, *options),
+        Op::Conv2dGrad {
+            options, target, ..
+        } => conv2d_geometry(node, *options).field("target", target.to_string()),
+        Op::Conv2dGradVjp {
+            options, target, wrt, ..
+        } => conv2d_geometry(node, *options)
+            .field("target", target.to_string())
+            .field("wrt", wrt.to_string()),
+        Op::ConvTranspose2d { options, .. } => conv_transpose2d_geometry(node, *options),
+        Op::ConvTranspose2dGrad {
+            options, target, ..
+        } => conv_transpose2d_geometry(node, *options).field("target", target.to_string()),
+        Op::ConvTranspose2dGradVjp {
+            options, target, wrt, ..
+        } => conv_transpose2d_geometry(node, *options)
+            .field("target", target.to_string())
             .field("wrt", wrt.to_string()),
         Op::Detach { .. } | Op::Select { .. } | Op::Matmul { .. } => node,
         _ => return Err(unsupported(op)),

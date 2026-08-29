@@ -34,11 +34,10 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         Err(VizError::MissingEndpoint { .. })
     ));
     let mut graph = Graph::new();
-    let input = graph.input("x", [1, 1, 1, 1]);
-    let weight = graph.input("weight", [1, 1, 1, 1]);
-    let unsupported = graph
-        .conv2d(input, weight, None, crate::Conv2dOptions::default())
-        .unwrap();
+    let lhs = graph.input("lhs", [1, 1]);
+    let rhs = graph.input("rhs", [1, 1]);
+    let upstream = graph.input("upstream", [1, 1]);
+    let unsupported = graph.matmul_grad(upstream, lhs, rhs, true).unwrap();
     assert!(matches!(
         graph_viz(&graph, &[unsupported]),
         Err(VizError::UnsupportedGraphOp(_))
@@ -47,6 +46,97 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn convolution_graph_visualization_preserves_roles_geometry_and_derivatives() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [1, 2, 5, 6]);
+    let weight = graph.input("weight", [2, 1, 2, 3]);
+    let bias = graph.input("bias", [2]);
+    let options = crate::Conv2dOptions {
+        groups: 2,
+        stride: [2, 1],
+        dilation: [1, 2],
+        padding: [1, 0, 2, 1],
+    };
+    let forward = graph.conv2d(input, weight, Some(bias), options).unwrap();
+    let upstream = graph.input("upstream", [1, 2, 3, 5]);
+    let gradient = graph
+        .conv2d_grad(upstream, input, weight, Some(bias), options, 1)
+        .unwrap();
+    let cotangent = graph.input("cotangent", [2, 1, 2, 3]);
+    let vjp = graph
+        .conv2d_grad_vjp(cotangent, upstream, input, weight, Some(bias), options, 1, 0)
+        .unwrap();
+
+    let transpose_input = graph.input("transpose_input", [1, 2, 3, 4]);
+    let transpose_weight = graph.input("transpose_weight", [2, 1, 2, 3]);
+    let transpose_options = crate::ConvTranspose2dOptions {
+        groups: 2,
+        stride: [2, 2],
+        dilation: [1, 2],
+        padding: [1, 0, 2, 1],
+        output_padding: [1, 1],
+    };
+    let transpose = graph
+        .conv_transpose2d(transpose_input, transpose_weight, None, transpose_options)
+        .unwrap();
+    let transpose_upstream = graph.input("transpose_upstream", [1, 2, 6, 9]);
+    let transpose_gradient = graph
+        .conv_transpose2d_grad(
+            transpose_upstream,
+            transpose_input,
+            transpose_weight,
+            None,
+            transpose_options,
+            0,
+        )
+        .unwrap();
+    let transpose_cotangent = graph.input("transpose_cotangent", [1, 2, 3, 4]);
+    let transpose_vjp = graph
+        .conv_transpose2d_grad_vjp(
+            transpose_cotangent,
+            transpose_upstream,
+            transpose_input,
+            transpose_weight,
+            None,
+            transpose_options,
+            0,
+            1,
+        )
+        .unwrap();
+
+    let first = graph_viz(
+        &graph,
+        &[forward, gradient, vjp, transpose, transpose_gradient, transpose_vjp],
+    )
+    .unwrap();
+    let second = graph_viz(
+        &graph,
+        &[forward, gradient, vjp, transpose, transpose_gradient, transpose_vjp],
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let dot = first.to_dot();
+    assert!(dot.contains("conv2d\\nkind=graph_op"));
+    assert!(dot.contains("conv_transpose2d\\nkind=graph_op"));
+    assert!(dot.contains("groups=2"));
+    assert!(dot.contains("stride=[2,1]"));
+    assert!(dot.contains("dilation=[1,2]"));
+    assert!(dot.contains("padding=[1,0,2,1]"));
+    assert!(dot.contains("output_padding=[1,1]"));
+    assert!(dot.contains("target=1"));
+    assert!(dot.contains("wrt=0"));
+    assert!(dot.contains("target=0"));
+    assert!(dot.contains("wrt=1"));
+    assert!(dot.contains("data:0:input"));
+    assert!(dot.contains("data:1:weight"));
+    assert!(dot.contains("data:2:bias"));
+    assert!(dot.contains("data:0:upstream"));
+    assert!(dot.contains("data:0:cotangent"));
+    assert!(dot.contains("shape=[1,2,3,5]"));
+    assert!(dot.contains("shape=[1,2,6,9]"));
 }
 
 #[test]
