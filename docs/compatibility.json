@@ -87,6 +87,15 @@
     {
       "section": "Tensor surface",
       "subject_header": "Capability",
+      "subject": "Concrete Graph descriptor queries",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Read-only concrete Graph descriptor queries include `len_tinygrad`: rank>=1 returns the leading extent including zero, rank-0 yields the typed source-equivalent rejection, and unknown IDs propagate. Queries never publish nodes; overflow-shaped descriptors remain length-queryable without computing numel. No symbolic/device realization claim."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
       "subject": "Realized host values and mutation",
       "status": "partial",
       "fields": {
