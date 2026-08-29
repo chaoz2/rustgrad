@@ -43,7 +43,7 @@ fn static_shape(rng: &mut SplitMix64) -> Vec<usize> {
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(6) {
+    match rng.pick(7) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = if rng.pick(2) == 0 {
@@ -128,6 +128,31 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 reduction,
                 axis: 1,
                 keepdim: rng.pick(2) == 0,
+            }
+        }
+        5 => {
+            // Concat is a homogeneous movement kernel in captured/native
+            // replay. Keep every non-axis extent identical and independently
+            // vary both axis widths, including zero, within the global bounds.
+            let rank = 1 + rng.pick(3);
+            let axis = rng.pick(rank);
+            let dtype = [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)];
+            let mut lhs_shape = Vec::with_capacity(rank);
+            let mut rhs_shape = Vec::with_capacity(rank);
+            for dimension in 0..rank {
+                if dimension == axis {
+                    lhs_shape.push([0, 1, 2, 3][rng.pick(4)]);
+                    rhs_shape.push([0, 1, 2, 3][rng.pick(4)]);
+                } else {
+                    let extent = [0, 1, 2, 3][rng.pick(4)];
+                    lhs_shape.push(extent);
+                    rhs_shape.push(extent);
+                }
+            }
+            FuzzCase::Concat {
+                lhs: tensor(&mut rng, lhs_shape, dtype),
+                rhs: tensor(&mut rng, rhs_shape, dtype),
+                axis,
             }
         }
         _ => {

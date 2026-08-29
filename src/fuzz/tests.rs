@@ -86,6 +86,60 @@ fn generated_cases_are_valid_bounded_and_order_independent() {
 }
 
 #[test]
+fn generated_concat_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut lhs_zero = false;
+    let mut rhs_zero = false;
+    let mut lhs_nonzero = false;
+    let mut rhs_nonzero = false;
+    let mut axis_zero = false;
+    let mut axis_one = false;
+    let mut f32 = false;
+    let mut i32 = false;
+    let mut f16 = false;
+    let mut boolean = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..256 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Concat { lhs, rhs, axis } = case else {
+                continue;
+            };
+            found = true;
+            assert!(!lhs.shape.is_empty());
+            assert_eq!(lhs.dtype, rhs.dtype);
+            assert_eq!(lhs.shape.len(), rhs.shape.len());
+            assert!(axis < lhs.shape.len());
+            for dimension in 0..lhs.shape.len() {
+                if dimension != axis {
+                    assert_eq!(lhs.shape[dimension], rhs.shape[dimension]);
+                }
+            }
+            lhs_zero |= lhs.shape[axis] == 0;
+            rhs_zero |= rhs.shape[axis] == 0;
+            lhs_nonzero |= lhs.shape[axis] != 0;
+            rhs_nonzero |= rhs.shape[axis] != 0;
+            axis_zero |= axis == 0;
+            axis_one |= lhs.shape.len() >= 2 && axis == 1;
+            match lhs.dtype {
+                DType::F32 => f32 = true,
+                DType::I32 => i32 = true,
+                DType::F16 => f16 = true,
+                DType::Bool => boolean = true,
+                _ => unreachable!("concat generator selects only native-supported dtypes"),
+            }
+        }
+    }
+
+    assert!(found);
+    assert!(lhs_zero && rhs_zero && lhs_nonzero && rhs_nonzero);
+    assert!(axis_zero && axis_one);
+    assert!(f32 && i32 && f16 && boolean);
+}
+
+#[test]
 fn fixed_campaigns_match_interpreter_and_strict_native() {
     let interpreter = run_campaign(FuzzConfig {
         seed: 7,
