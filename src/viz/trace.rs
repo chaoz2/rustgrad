@@ -40,8 +40,17 @@ pub fn sharded_cuda_execution_trace_viz(trace: &[ShardedCudaExecutionTrace]) -> 
 }
 
 pub fn captured_replay_trace_viz(trace: &CapturedReplayTrace) -> Result<VizGraph, VizError> {
-    let nodes = trace.items.iter().enumerate().map(|(sequence, item)| VizNode::new(format!("cr{}:{}", item.invocation, item.item), "captured_replay_trace", "item").field("sequence", sequence.to_string()).field("backend", backend_name(item.backend)).field("schedule_cache_key", item.schedule_cache_key.to_string()).field("native_cache_key", item.native_cache_key.clone().unwrap_or_else(|| "none".into())).field("cache_hit", item.cache_hit.to_string()).field("lanes", item.lanes.to_string()).field("vector_main", item.vector_main.to_string()).field("vector_tail", item.vector_tail.to_string()).field("packed_weight_bytes", item.packed_weight_bytes.to_string()).field("reason", item.reason.clone())).collect();
-    let edges = trace.items.windows(2).map(|p| VizEdge::new(format!("cr{}:{}", p[0].invocation,p[0].item),format!("cr{}:{}",p[1].invocation,p[1].item),"order","next")).collect(); VizGraph::try_new("rustgrad_captured_replay_trace",nodes,edges)
+    let nodes = trace.items.iter().enumerate().map(|(sequence, item)| {
+        VizNode::new(format!("cr{}:{}", item.invocation, item.item), "captured_replay_trace", "item")
+            .field("sequence", sequence.to_string()).field("backend", backend_name(item.backend))
+            .field("schedule_cache_key", item.schedule_cache_key.to_string())
+            .field("native_cache_key", item.native_cache_key.clone().unwrap_or_else(|| "none".into()))
+            .field("cache_hit", item.cache_hit.to_string()).field("lanes", item.lanes.to_string())
+            .field("vector_main", item.vector_main.to_string()).field("vector_tail", item.vector_tail.to_string())
+            .field("packed_weight_bytes", item.packed_weight_bytes.to_string()).field("reason", item.reason.clone())
+    }).collect();
+    let edges = trace.items.windows(2).map(|pair| VizEdge::new(format!("cr{}:{}", pair[0].invocation, pair[0].item), format!("cr{}:{}", pair[1].invocation, pair[1].item), "order", "next")).collect();
+    VizGraph::try_new("rustgrad_captured_replay_trace", nodes, edges)
 }
 pub fn captured_specialization_trace_viz(trace: &CapturedSpecializationTrace) -> Result<VizGraph, VizError> { VizGraph::try_new("rustgrad_captured_specialization_trace", vec![VizNode::new("specialization","captured_specialization_trace","specialization").field("source_identity",trace.source_identity.to_string()).field("concrete_identity",trace.concrete_identity.to_string()).field("bindings",format!("[{}]",trace.bindings.iter().map(|(a,b)|format!("{a}:{b}")).collect::<Vec<_>>().join(","))).field("cache_hit",trace.cache_hit.to_string())],vec![]) }
 pub fn native_mixed_replay_trace_viz(trace: &NativeMixedReplayTrace) -> Result<VizGraph, VizError> { VizGraph::try_new("rustgrad_native_mixed_replay_trace",vec![VizNode::new("mixed_replay","native_mixed_replay_trace","summary").field("identity",trace.identity.to_string()).field("artifact_identity",trace.artifact_identity.to_string()).field("vectorized",trace.vectorized.to_string()).field("pure_item_cache_keys",u64_list(&trace.pure_item_cache_keys))],vec![]) }

@@ -66,6 +66,19 @@ fn cuda_trace_visualization_preserves_typed_submission_order() {
 }
 
 #[test]
+fn replay_trace_visualization_preserves_typed_fields_and_duplicates() {
+    let trace = crate::CapturedReplayTrace { items: vec![
+        crate::CapturedItemTrace { invocation: 0, item: 1, backend: crate::ItemBackend::Interpreter, schedule_cache_key: 1, native_cache_key: None, cache_hit: false, lanes: 4, vector_main: 3, vector_tail: 1, packed_weight_bytes: 8, reason: "tail".into() },
+        crate::CapturedItemTrace { invocation: 1, item: 1, backend: crate::ItemBackend::NativeJit, schedule_cache_key: 2, native_cache_key: Some("native".into()), cache_hit: true, lanes: 4, vector_main: 4, vector_tail: 0, packed_weight_bytes: 0, reason: "full".into() },
+        crate::CapturedItemTrace { invocation: 1, item: 2, backend: crate::ItemBackend::JitFallback, schedule_cache_key: 3, native_cache_key: None, cache_hit: false, lanes: 1, vector_main: 0, vector_tail: 1, packed_weight_bytes: 0, reason: "fallback".into() },
+    ]};
+    let dot = crate::captured_replay_trace_viz(&trace).unwrap().to_dot();
+    for field in ["backend=interpreter", "backend=native_jit", "backend=jit_fallback", "cache_hit=true", "native_cache_key=native", "vector_tail=1", "packed_weight_bytes=8", "order:next"] { assert!(dot.contains(field)); }
+    assert!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace::default()).unwrap().nodes().is_empty());
+    assert!(matches!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace { items: vec![trace.items[0].clone(), trace.items[0].clone()] }), Err(VizError::DuplicateNode(_))));
+}
+
+#[test]
 fn malformed_models_and_invalid_graph_nodes_fail_closed() {
     assert!(matches!(
         VizGraph::try_new(
