@@ -188,97 +188,131 @@ struct Header {
     tensors: BTreeMap<String, Entry>,
 }
 
+struct StateHeader {
+    tensors: BTreeMap<String, Entry>,
+}
+
+fn parse_header_map<'de, A: MapAccess<'de>>(
+    mut map: A,
+    strict_metadata: bool,
+) -> std::result::Result<Header, A::Error> {
+    let mut metadata = Metadata::new();
+    let mut tensors = BTreeMap::new();
+    while let Some((name, value)) = map.next_entry::<String, Value>()? {
+        if name == "__metadata__" {
+            if strict_metadata {
+                let object = value
+                    .as_object()
+                    .ok_or_else(|| de::Error::custom("__metadata__ must be an object"))?;
+                for (k, v) in object {
+                    metadata.insert(
+                        k.clone(),
+                        v.as_str()
+                            .ok_or_else(|| de::Error::custom("metadata values must be strings"))?
+                            .to_owned(),
+                    );
+                }
+            }
+        } else {
+            if name.is_empty() {
+                return Err(de::Error::custom("tensor name must not be empty"));
+            }
+            if tensors.contains_key(&name) {
+                return Err(de::Error::custom("duplicate tensor name"));
+            }
+            let object = value
+                .as_object()
+                .ok_or_else(|| de::Error::custom("tensor entry must be an object"))?;
+            if object.len() != 3
+                || !object.contains_key("dtype")
+                || !object.contains_key("shape")
+                || !object.contains_key("data_offsets")
+            {
+                return Err(de::Error::custom(
+                    "tensor entry must contain only dtype, shape, and data_offsets",
+                ));
+            }
+            let dtype = dtype_from_tag(
+                object["dtype"]
+                    .as_str()
+                    .ok_or_else(|| de::Error::custom("dtype must be a string"))?,
+            )
+            .map_err(de::Error::custom)?;
+            let shape = object["shape"]
+                .as_array()
+                .ok_or_else(|| de::Error::custom("shape must be an array"))?
+                .iter()
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|x| usize::try_from(x).ok())
+                        .ok_or_else(|| de::Error::custom("shape dimensions must be usize integers"))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let offsets = object["data_offsets"]
+                .as_array()
+                .ok_or_else(|| de::Error::custom("data_offsets must be an array"))?;
+            if offsets.len() != 2 {
+                return Err(de::Error::custom("data_offsets must have two values"));
+            }
+            let offset = |v: &Value| {
+                v.as_u64()
+                    .and_then(|x| usize::try_from(x).ok())
+                    .ok_or_else(|| de::Error::custom("offset must be a usize integer"))
+            };
+            tensors.insert(
+                name,
+                Entry {
+                    dtype,
+                    shape,
+                    offsets: [offset(&offsets[0])?, offset(&offsets[1])?],
+                },
+            );
+        }
+    }
+    Ok(Header { metadata, tensors })
+}
+
 impl<'de> Deserialize<'de> for Header {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         struct HeaderVisitor;
         impl<'de> Visitor<'de> for HeaderVisitor {
             type Value = Header;
+
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("a safetensors header object")
             }
+
             fn visit_map<A: MapAccess<'de>>(
                 self,
-                mut map: A,
+                map: A,
             ) -> std::result::Result<Header, A::Error> {
-                let mut metadata = Metadata::new();
-                let mut tensors = BTreeMap::new();
-                while let Some((name, value)) = map.next_entry::<String, Value>()? {
-                    if name == "__metadata__" {
-                        let object = value
-                            .as_object()
-                            .ok_or_else(|| de::Error::custom("__metadata__ must be an object"))?;
-                        for (k, v) in object {
-                            metadata.insert(
-                                k.clone(),
-                                v.as_str()
-                                    .ok_or_else(|| {
-                                        de::Error::custom("metadata values must be strings")
-                                    })?
-                                    .to_owned(),
-                            );
-                        }
-                    } else {
-                        if name.is_empty() {
-                            return Err(de::Error::custom("tensor name must not be empty"));
-                        }
-                        if tensors.contains_key(&name) {
-                            return Err(de::Error::custom("duplicate tensor name"));
-                        }
-                        let object = value
-                            .as_object()
-                            .ok_or_else(|| de::Error::custom("tensor entry must be an object"))?;
-                        if object.len() != 3
-                            || !object.contains_key("dtype")
-                            || !object.contains_key("shape")
-                            || !object.contains_key("data_offsets")
-                        {
-                            return Err(de::Error::custom(
-                                "tensor entry must contain only dtype, shape, and data_offsets",
-                            ));
-                        }
-                        let dtype = dtype_from_tag(
-                            object["dtype"]
-                                .as_str()
-                                .ok_or_else(|| de::Error::custom("dtype must be a string"))?,
-                        )
-                        .map_err(de::Error::custom)?;
-                        let shape = object["shape"]
-                            .as_array()
-                            .ok_or_else(|| de::Error::custom("shape must be an array"))?
-                            .iter()
-                            .map(|v| {
-                                v.as_u64()
-                                    .and_then(|x| usize::try_from(x).ok())
-                                    .ok_or_else(|| {
-                                        de::Error::custom("shape dimensions must be usize integers")
-                                    })
-                            })
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
-                        let offsets = object["data_offsets"]
-                            .as_array()
-                            .ok_or_else(|| de::Error::custom("data_offsets must be an array"))?;
-                        if offsets.len() != 2 {
-                            return Err(de::Error::custom("data_offsets must have two values"));
-                        }
-                        let offset = |v: &Value| {
-                            v.as_u64()
-                                .and_then(|x| usize::try_from(x).ok())
-                                .ok_or_else(|| de::Error::custom("offset must be a usize integer"))
-                        };
-                        tensors.insert(
-                            name,
-                            Entry {
-                                dtype,
-                                shape,
-                                offsets: [offset(&offsets[0])?, offset(&offsets[1])?],
-                            },
-                        );
-                    }
-                }
-                Ok(Header { metadata, tensors })
+                parse_header_map(map, true)
             }
         }
         deserializer.deserialize_map(HeaderVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for StateHeader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct StateHeaderVisitor;
+        impl<'de> Visitor<'de> for StateHeaderVisitor {
+            type Value = StateHeader;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a safetensors header object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<StateHeader, A::Error> {
+                Ok(StateHeader {
+                    tensors: parse_header_map(map, false)?.tensors,
+                })
+            }
+        }
+        deserializer.deserialize_map(StateHeaderVisitor)
     }
 }
 
@@ -318,13 +352,13 @@ fn dtype_tag(dtype: DType) -> &'static str {
     }
 }
 
-/// Loads an ordered state dictionary and string metadata from an in-memory file.
-pub fn load_safetensors(bytes: &[u8]) -> Result<(StateDict, Metadata)> {
-    let (header_bytes, data_start) = safetensors_header_prefix(bytes)?;
-    let header: Header = serde_json::from_slice(header_bytes)
-        .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
+fn load_safetensors_state(
+    bytes: &[u8],
+    data_start: usize,
+    tensors: BTreeMap<String, Entry>,
+) -> Result<StateDict> {
     let data = &bytes[data_start..];
-    let mut entries: Vec<_> = header.tensors.into_iter().collect();
+    let mut entries: Vec<_> = tensors.into_iter().collect();
     entries.sort_by_key(|(_, entry)| entry.offsets[0]);
     let mut expected_offset = 0usize;
     let mut result = StateDict::new();
@@ -353,7 +387,29 @@ pub fn load_safetensors(bytes: &[u8]) -> Result<(StateDict, Metadata)> {
     if expected_offset != data.len() {
         return Err(ser("data section contains unreferenced bytes"));
     }
-    Ok((result, header.metadata))
+    Ok(result)
+}
+
+/// Loads an ordered state dictionary and string metadata from an in-memory file.
+pub fn load_safetensors(bytes: &[u8]) -> Result<(StateDict, Metadata)> {
+    let (header_bytes, data_start) = safetensors_header_prefix(bytes)?;
+    let header: Header = serde_json::from_slice(header_bytes)
+        .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
+    let state = load_safetensors_state(bytes, data_start, header.tensors)?;
+    Ok((state, header.metadata))
+}
+
+/// Loads safetensors tensor entries while deliberately ignoring `__metadata__`.
+///
+/// Tensor descriptors, offsets, payload layout, and dense bytes receive the
+/// same validation as [`load_safetensors`]. Unlike that strict compatibility
+/// loader, this state-only entry point accepts any JSON value for the reserved
+/// metadata field.
+pub fn load_safetensors_state_only(bytes: &[u8]) -> Result<StateDict> {
+    let (header_bytes, data_start) = safetensors_header_prefix(bytes)?;
+    let header: StateHeader = serde_json::from_slice(header_bytes)
+        .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
+    load_safetensors_state(bytes, data_start, header.tensors)
 }
 
 /// Serializes a deterministic, name-sorted state dictionary.
@@ -476,6 +532,60 @@ mod tests {
         let mut invalid_json = 1u64.to_le_bytes().to_vec();
         invalid_json.push(b'{');
         assert!(inspect_safetensors_metadata(&invalid_json).is_err());
+    }
+
+    #[test]
+    fn state_only_load_ignores_raw_metadata_but_preserves_tensor_lanes() {
+        let header = br#"{"__metadata__":{"nested":[1,true],"number":7},"x":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#;
+        let payload = [0x00, 0x80, 0x55, 0x7e];
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&payload);
+        let original = bytes.clone();
+
+        let state = load_safetensors_state_only(&bytes).unwrap();
+        assert_eq!(state["x"].to_le_bytes().unwrap(), payload);
+        assert!(load_safetensors(&bytes).is_err());
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn state_only_and_strict_loaders_agree_for_string_metadata() {
+        let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![9])))]);
+        let metadata = Metadata::from([("source".into(), "tinygrad".into())]);
+        let bytes = save_safetensors(&tensors, &metadata).unwrap();
+
+        assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
+        assert_eq!(load_safetensors(&bytes).unwrap(), (tensors, metadata));
+    }
+
+    #[test]
+    fn state_only_loader_rejects_non_object_headers_and_bad_tensor_layouts() {
+        let top_level_array = br#"[]"#;
+        let mut non_object = (top_level_array.len() as u64).to_le_bytes().to_vec();
+        non_object.extend_from_slice(top_level_array);
+        assert!(load_safetensors_state_only(&non_object).is_err());
+        assert!(load_safetensors(&non_object).is_err());
+
+        let bad_descriptor = br#"{"x":{"dtype":"NOPE","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut descriptor = (bad_descriptor.len() as u64).to_le_bytes().to_vec();
+        descriptor.extend_from_slice(bad_descriptor);
+        descriptor.push(0);
+        assert!(load_safetensors_state_only(&descriptor).is_err());
+        assert!(load_safetensors(&descriptor).is_err());
+
+        let bad_offsets = br#"{"x":{"dtype":"U8","shape":[2],"data_offsets":[0,1]}}"#;
+        let mut offsets = (bad_offsets.len() as u64).to_le_bytes().to_vec();
+        offsets.extend_from_slice(bad_offsets);
+        offsets.push(0);
+        assert!(load_safetensors_state_only(&offsets).is_err());
+        assert!(load_safetensors(&offsets).is_err());
+
+        let valid_header = br#"{"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut truncated_payload = (valid_header.len() as u64).to_le_bytes().to_vec();
+        truncated_payload.extend_from_slice(valid_header);
+        assert!(load_safetensors_state_only(&truncated_payload).is_err());
+        assert!(load_safetensors(&truncated_payload).is_err());
     }
 
     #[test]
