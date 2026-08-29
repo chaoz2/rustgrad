@@ -87,6 +87,15 @@
     {
       "section": "Tensor surface",
       "subject_header": "Capability",
+      "subject": "Realized host values and mutation",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`TensorData::item` accepts exactly one stored element independent of rank and returns the typed `Scalar`; exported recursive `TensorList`/`tolist` preserves row-major concrete nesting and zero extents with F16/BF16 decoded through the established float conversion; `replace` atomically swaps same-shape owned storage while allowing dtype changes; `assign`/`assign_from` perform source-order broadcast-before-dtype validation, exact same-dtype raw-lane broadcast copies, and transactional mutation. No live Graph/device realization API, borrowed typed memoryview/zero-copy data view, NumPy ndarray interop, gradient/device-aware clone/replace/transfer, weak/symbolic host values, or view-alias mutation claim."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
       "subject": "NumPy-style broadcasting",
       "status": "verified",
       "fields": {
