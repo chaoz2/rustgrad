@@ -63,6 +63,9 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
+    InvalidTensorIo {
+        reason: &'static str,
+    },
     ShapeOverflow(Shape),
     InvalidIndex,
     UnknownNode(NodeId),
@@ -285,6 +288,7 @@ impl fmt::Display for Error {
             } => {
                 write!(f, "shape {shape} needs {expected} values, got {actual}")
             }
+            Self::InvalidTensorIo { reason } => write!(f, "invalid TensorData IO: {reason}"),
             Self::UnsupportedDType { dtype } => {
                 write!(f, "unsupported CUDA collective add dtype {dtype:?}")
             }

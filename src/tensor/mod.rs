@@ -9,7 +9,7 @@ mod storage;
 pub(crate) mod artifact;
 mod creation;
 
-pub use data::{TensorData, TensorList};
+pub use data::{TensorData, TensorDataReader, TensorList};
 pub use dtype::{DType, DTypeCategory};
 pub use scalar::Scalar;
 pub use shape::Shape;

@@ -201,7 +201,7 @@ pub use symbolic::{
     SymbolicVar,
 };
 pub use symbolic_shape::{SymbolicDim, SymbolicShape};
-pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData, TensorList};
+pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData, TensorDataReader, TensorList};
 pub use torch::{extract_tar_files, load_legacy_torch_state_dict, load_torch_state_dict};
 pub use trace::{CompileTrace, TraceStep};
 pub use training_checkpoint::{PortableTrainingCheckpoint, TrainingCheckpoint};

@@ -1,5 +1,6 @@
 use super::{dtype::DType, scalar::Scalar, shape::Shape, storage::Storage};
 use crate::{Error, Result};
+use std::io::{self, Read, Seek, SeekFrom};
 
 /// A recursive, row-major host representation for [`TensorData::tolist`].
 ///
@@ -17,6 +18,80 @@ pub enum TensorList {
 pub struct TensorData {
     shape: Shape,
     storage: Storage,
+}
+
+/// A borrowed, read-only byte stream over a rank-one U8 [`TensorData`].
+///
+/// This mirrors tinygrad's `nn.state.TensorIO` at RustGrad's realized-value
+/// boundary. Reads copy only the requested interval into the caller's buffer;
+/// the adapter never exposes a storage view, realizes a graph value, or
+/// supports writes.
+#[derive(Debug)]
+pub struct TensorDataReader<'a> {
+    data: &'a TensorData,
+    position: usize,
+}
+
+impl<'a> TensorDataReader<'a> {
+    /// Creates a read-only TensorIO-compatible stream.
+    ///
+    /// The rank check intentionally precedes dtype validation, matching the
+    /// left-to-right admission of tinygrad's `t.ndim != 1 or t.dtype != uint8`.
+    pub fn new(data: &'a TensorData) -> Result<Self> {
+        if data.shape.rank() != 1 {
+            return Err(Error::InvalidTensorIo {
+                reason: "TensorIO requires a rank-one TensorData",
+            });
+        }
+        if data.dtype() != DType::U8 {
+            return Err(Error::InvalidTensorIo {
+                reason: "TensorIO requires U8 storage",
+            });
+        }
+        Ok(Self { data, position: 0 })
+    }
+
+    /// Returns the clamped byte position maintained by this reader.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    fn bytes(&self) -> &[u8] {
+        let Storage::U8(bytes) = self.data.storage() else {
+            unreachable!("TensorDataReader validates U8 storage at construction")
+        };
+        bytes
+    }
+
+    fn seek_position(&self, offset: i128, origin: i128) -> usize {
+        let end = self.bytes().len() as i128;
+        (origin.saturating_add(offset).clamp(0, end)) as usize
+    }
+}
+
+impl Read for TensorDataReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let position = self.position;
+        let count = {
+            let bytes = self.bytes();
+            let count = bytes.len().saturating_sub(position).min(buffer.len());
+            buffer[..count].copy_from_slice(&bytes[position..position + count]);
+            count
+        };
+        self.position = position + count;
+        Ok(count)
+    }
+}
+
+impl Seek for TensorDataReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.position = match position {
+            SeekFrom::Start(offset) => self.seek_position(i128::from(offset), 0),
+            SeekFrom::Current(offset) => self.seek_position(i128::from(offset), self.position as i128),
+            SeekFrom::End(offset) => self.seek_position(i128::from(offset), self.bytes().len() as i128),
+        };
+        Ok(self.position as u64)
+    }
 }
 
 impl TensorData {
@@ -69,6 +144,12 @@ impl TensorData {
 
     pub fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    /// Returns a borrowed, read-only TensorIO-compatible stream for this
+    /// realized rank-one U8 value.
+    pub fn byte_reader(&self) -> Result<TensorDataReader<'_>> {
+        TensorDataReader::new(self)
     }
 
     pub fn scalar_at(&self, index: usize) -> Scalar {
@@ -418,6 +499,7 @@ fn assigned_storage(destination: &Storage, source: &Storage, offsets: &[usize]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
 
     fn leaf(list: &TensorList) -> Scalar {
         let TensorList::Scalar(value) = list else {
@@ -454,6 +536,77 @@ mod tests {
             }
             _ => assert_eq!(actual, expected),
         }
+    }
+
+    #[test]
+    fn tensor_data_reader_reads_requested_ranges_and_read_to_end_without_mutation() {
+        let data = TensorData::from_storage([5], Storage::U8(vec![3, 1, 4, 1, 5])).unwrap();
+        let before = data.clone();
+        let mut reader = data.byte_reader().unwrap();
+
+        let mut prefix = [0u8; 3];
+        assert_eq!(reader.read(&mut prefix).unwrap(), 3);
+        assert_eq!(prefix, [3, 1, 4]);
+        assert_eq!(reader.position(), 3);
+
+        let mut suffix = Vec::new();
+        assert_eq!(reader.read_to_end(&mut suffix).unwrap(), 2);
+        assert_eq!(suffix, vec![1, 5]);
+        assert_eq!(reader.read(&mut prefix).unwrap(), 0);
+        assert_eq!(data, before);
+    }
+
+    #[test]
+    fn tensor_data_reader_seek_clamps_all_origins_and_handles_empty_input() {
+        let data = TensorData::from_storage([4], Storage::U8(vec![10, 20, 30, 40])).unwrap();
+        let mut reader = TensorDataReader::new(&data).unwrap();
+        let mut bytes = [0u8; 2];
+
+        assert_eq!(reader.seek(SeekFrom::Start(2)).unwrap(), 2);
+        assert_eq!(reader.read(&mut bytes).unwrap(), 2);
+        assert_eq!(bytes, [30, 40]);
+        assert_eq!(reader.seek(SeekFrom::Current(-99)).unwrap(), 0);
+        assert_eq!(reader.read(&mut bytes).unwrap(), 2);
+        assert_eq!(bytes, [10, 20]);
+        assert_eq!(reader.seek(SeekFrom::End(-1)).unwrap(), 3);
+        assert_eq!(reader.read(&mut bytes).unwrap(), 1);
+        assert_eq!(bytes[0], 40);
+        assert_eq!(reader.seek(SeekFrom::Start(u64::MAX)).unwrap(), 4);
+        assert_eq!(reader.read(&mut bytes).unwrap(), 0);
+
+        let empty = TensorData::from_storage([0], Storage::U8(vec![])).unwrap();
+        let mut empty_reader = empty.byte_reader().unwrap();
+        let mut end = Vec::new();
+        assert_eq!(empty_reader.read_to_end(&mut end).unwrap(), 0);
+        assert!(end.is_empty());
+        assert_eq!(empty_reader.seek(SeekFrom::End(-1)).unwrap(), 0);
+    }
+
+    #[test]
+    fn tensor_data_reader_validates_rank_before_dtype() {
+        let rank_and_dtype = TensorData::from_storage([1, 1], Storage::F32(vec![1.0])).unwrap();
+        assert_eq!(
+            rank_and_dtype.byte_reader().unwrap_err(),
+            Error::InvalidTensorIo {
+                reason: "TensorIO requires a rank-one TensorData",
+            }
+        );
+
+        let wrong_dtype = TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap();
+        assert_eq!(
+            TensorDataReader::new(&wrong_dtype).unwrap_err(),
+            Error::InvalidTensorIo {
+                reason: "TensorIO requires U8 storage",
+            }
+        );
+
+        let scalar = TensorData::from_storage([], Storage::U8(vec![7])).unwrap();
+        assert!(matches!(
+            scalar.byte_reader(),
+            Err(Error::InvalidTensorIo {
+                reason: "TensorIO requires a rank-one TensorData"
+            })
+        ));
     }
 
     #[test]
