@@ -180,7 +180,7 @@
       "subject": "Reshape, permute, expand, shrink, stride and contiguous views",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Materialized reshape/permute/expand, signed `unsqueeze`/`squeeze`/`flatten`, compositional `stack`, checked shrink, signed stride, and reverse-mode movement mappings exist. `ScatterPositionsVjp` closes second-order static shrink/pad/stride movement adjoints; true views and remaining movement ops remain."
+        "Acceptance requirement": "Materialized reshape/permute/expand, signed `unsqueeze`/`squeeze`/`flatten`, compositional `stack`, concrete source-literal `unfold`, checked shrink, signed stride, and reverse-mode movement mappings exist. `Graph::t_tinygrad` maps checked-in `Tensor.T` exactly to a rank-two literal `[1, 0]` permute with dtype/payload/VJP and zero-extent preservation plus descriptor-byte preflight; unchanged `transpose_default` retains the broader `Tensor.transpose()` default-axis contract. `ScatterPositionsVjp` closes second-order static shrink/pad/stride movement adjoints; true views and remaining movement ops remain."
       }
     },
     {
