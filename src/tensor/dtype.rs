@@ -261,6 +261,50 @@ impl DType {
         }
     }
 
+    /// Parses one supported tinygrad concrete dtype name or alias.
+    ///
+    /// Names are ASCII-case-insensitive but deliberately not whitespace
+    /// normalized. This is distinct from safetensors' uppercase wire tags.
+    pub fn parse_tinygrad_name(name: &str) -> Result<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "bool" => Ok(Self::Bool),
+            "int8" | "char" => Ok(Self::I8),
+            "uint8" | "uchar" => Ok(Self::U8),
+            "int16" | "short" => Ok(Self::I16),
+            "uint16" | "ushort" => Ok(Self::U16),
+            "int32" | "int" => Ok(Self::I32),
+            "uint32" | "uint" => Ok(Self::U32),
+            "int64" | "long" => Ok(Self::I64),
+            "uint64" | "ulong" => Ok(Self::U64),
+            "float16" | "half" => Ok(Self::F16),
+            "bfloat16" => Ok(Self::BF16),
+            "float32" | "float" => Ok(Self::F32),
+            "float64" | "double" => Ok(Self::F64),
+            _ => Err(Error::InvalidTinygradDTypeName {
+                name: name.to_owned(),
+            }),
+        }
+    }
+
+    /// Returns tinygrad's inverse-dtype dictionary spelling for this dtype.
+    pub const fn canonical_tinygrad_name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::I8 => "char",
+            Self::U8 => "uchar",
+            Self::I16 => "short",
+            Self::U16 => "ushort",
+            Self::I32 => "int",
+            Self::U32 => "uint",
+            Self::I64 => "long",
+            Self::U64 => "ulong",
+            Self::F16 => "half",
+            Self::BF16 => "bfloat16",
+            Self::F32 => "float",
+            Self::F64 => "double",
+        }
+    }
+
     /// A compact, deterministic promotion lattice for supported scalar dtypes.
     /// It follows tinygrad's widening intent; fp8/weak/pointer dtypes are not
     /// implemented yet.
@@ -648,5 +692,72 @@ mod tests {
                 output: DType::U16,
             })
         ));
+    }
+
+    #[test]
+    fn tinygrad_dtype_names_cover_every_supported_alias_and_canonical_spelling() {
+        let aliases = [
+            (DType::Bool, &["bool"][..]),
+            (DType::I8, &["int8", "char"][..]),
+            (DType::U8, &["uint8", "uchar"][..]),
+            (DType::I16, &["int16", "short"][..]),
+            (DType::U16, &["uint16", "ushort"][..]),
+            (DType::I32, &["int32", "int"][..]),
+            (DType::U32, &["uint32", "uint"][..]),
+            (DType::I64, &["int64", "long"][..]),
+            (DType::U64, &["uint64", "ulong"][..]),
+            (DType::F16, &["float16", "half"][..]),
+            (DType::BF16, &["bfloat16"][..]),
+            (DType::F32, &["float32", "float"][..]),
+            (DType::F64, &["float64", "double"][..]),
+        ];
+        let canonical = [
+            "bool", "char", "uchar", "short", "ushort", "int", "uint", "long", "ulong",
+            "half", "bfloat16", "float", "double",
+        ];
+
+        for ((dtype, names), canonical) in aliases.into_iter().zip(canonical) {
+            for &name in names {
+                assert_eq!(DType::parse_tinygrad_name(name).unwrap(), dtype, "{name}");
+                assert_eq!(
+                    DType::parse_tinygrad_name(&name.to_ascii_uppercase()).unwrap(),
+                    dtype,
+                    "{name} case-folding"
+                );
+            }
+            assert_eq!(dtype.canonical_tinygrad_name(), canonical);
+            assert_eq!(DType::parse_tinygrad_name(canonical).unwrap(), dtype);
+        }
+    }
+
+    #[test]
+    fn tinygrad_dtype_name_parser_rejects_whitespace_and_unsupported_surfaces() {
+        for name in [
+            " float",
+            "float ",
+            "float\t",
+            "",
+            "weakint",
+            "weakfloat",
+            "void",
+            "fp8e4m3",
+            "float8_e5m2",
+            "ptr",
+            "pointer",
+            "image",
+            "custom",
+            "F32",
+        ] {
+            let result = DType::parse_tinygrad_name(name);
+            assert!(matches!(
+                result,
+                Err(Error::InvalidTinygradDTypeName { name: rejected }) if rejected == name
+            ));
+        }
+        let error = DType::parse_tinygrad_name(" void").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported tinygrad dtype name \" void\""
+        );
     }
 }

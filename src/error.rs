@@ -91,6 +91,9 @@ pub enum Error {
     InvalidDTypeFinfo {
         dtype: DType,
     },
+    InvalidTinygradDTypeName {
+        name: String,
+    },
     BitcastItemsizeMismatch {
         input: DType,
         output: DType,
@@ -334,6 +337,9 @@ impl fmt::Display for Error {
             }
             Self::InvalidDTypeFinfo { dtype } => {
                 write!(f, "{dtype:?} is not a floating point type")
+            }
+            Self::InvalidTinygradDTypeName { name } => {
+                write!(f, "unsupported tinygrad dtype name {name:?}")
             }
             Self::BitcastItemsizeMismatch { input, output } => write!(
                 f,
