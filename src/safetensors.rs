@@ -31,6 +31,17 @@ pub struct SafetensorsMetadata<'a> {
     pub header: Value,
 }
 
+/// Owned safetensors prefix information read from a file without tensor validation.
+#[derive(Debug, PartialEq)]
+pub struct OwnedSafetensorsMetadata {
+    /// The complete original safetensors file bytes.
+    pub source: Vec<u8>,
+    /// Byte offset at which the data section begins.
+    pub data_start: usize,
+    /// The unvalidated JSON header value.
+    pub header: Value,
+}
+
 fn ser(reason: impl Into<String>) -> Error {
     Error::Serialization {
         reason: reason.into(),
@@ -66,6 +77,25 @@ pub fn inspect_safetensors_metadata(bytes: &[u8]) -> Result<SafetensorsMetadata<
         .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
     Ok(SafetensorsMetadata {
         source: bytes,
+        data_start,
+        header,
+    })
+}
+
+/// Reads and inspects only a safetensors file's prefix and raw JSON header.
+///
+/// The result owns the file bytes so that its header is not self-referential.
+/// It performs no tensor descriptor, dtype, offset, or payload validation.
+pub fn inspect_safetensors_metadata_file(
+    path: impl AsRef<Path>,
+) -> Result<OwnedSafetensorsMetadata> {
+    let source = fs::read(path).map_err(|e| ser(e.to_string()))?;
+    let (data_start, header) = {
+        let metadata = inspect_safetensors_metadata(&source)?;
+        (metadata.data_start, metadata.header)
+    };
+    Ok(OwnedSafetensorsMetadata {
+        source,
         data_start,
         header,
     })
@@ -412,6 +442,11 @@ pub fn load_safetensors_state_only(bytes: &[u8]) -> Result<StateDict> {
     load_safetensors_state(bytes, data_start, header.tensors)
 }
 
+/// Reads a safetensors file and loads its tensor entries while ignoring metadata.
+pub fn load_safetensors_state_only_file(path: impl AsRef<Path>) -> Result<StateDict> {
+    load_safetensors_state_only(&fs::read(path).map_err(|e| ser(e.to_string()))?)
+}
+
 fn checked_raw_metadata(metadata: Option<&Value>) -> Result<Option<Value>> {
     match metadata {
         None => Ok(None),
@@ -668,6 +703,56 @@ mod tests {
         );
         assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
         fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn state_only_file_and_owned_metadata_inspection_preserve_file_boundaries() {
+        let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![4])))]);
+        let metadata = serde_json::json!({"nested": [1, true], "number": 3});
+        let directory = std::env::temp_dir().join(format!("rustgrad-safe-load-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let valid = directory.join("valid.safetensors");
+        save_safetensors_file_with_json_metadata(&valid, &tensors, Some(&metadata)).unwrap();
+        let original = fs::read(&valid).unwrap();
+
+        let inspection = inspect_safetensors_metadata_file(&valid).unwrap();
+        assert_eq!(inspection.source, original);
+        assert_eq!(inspection.data_start, 8 + u64::from_le_bytes(original[..8].try_into().unwrap()) as usize);
+        assert_eq!(inspection.header["__metadata__"], metadata);
+        assert_eq!(load_safetensors_state_only_file(&valid).unwrap(), tensors);
+        assert!(load_safetensors(&inspection.source).is_err());
+
+        let array_header = br#"["raw",{"header":true}]"#;
+        let array = directory.join("array.safetensors");
+        let mut array_bytes = (array_header.len() as u64).to_le_bytes().to_vec();
+        array_bytes.extend_from_slice(array_header);
+        fs::write(&array, &array_bytes).unwrap();
+        assert_eq!(
+            inspect_safetensors_metadata_file(&array).unwrap().header,
+            serde_json::json!(["raw", {"header": true}])
+        );
+        assert!(load_safetensors_state_only_file(&array).is_err());
+
+        let truncated = directory.join("truncated.safetensors");
+        fs::write(&truncated, 4u64.to_le_bytes()).unwrap();
+        assert!(inspect_safetensors_metadata_file(&truncated).is_err());
+        assert!(load_safetensors_state_only_file(&truncated).is_err());
+
+        let invalid_json = directory.join("invalid-json.safetensors");
+        let mut invalid_json_bytes = 1u64.to_le_bytes().to_vec();
+        invalid_json_bytes.push(b'{');
+        fs::write(&invalid_json, invalid_json_bytes).unwrap();
+        assert!(inspect_safetensors_metadata_file(&invalid_json).is_err());
+        assert!(load_safetensors_state_only_file(&invalid_json).is_err());
+
+        let missing = directory.join("missing.safetensors");
+        assert!(inspect_safetensors_metadata_file(&missing).is_err());
+        assert!(load_safetensors_state_only_file(&missing).is_err());
+        fs::remove_file(valid).unwrap();
+        fs::remove_file(array).unwrap();
+        fs::remove_file(truncated).unwrap();
+        fs::remove_file(invalid_json).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 

@@ -170,8 +170,10 @@ pub use ptx::{
     PtxLaunchGeometry, PtxRenderer, RenderedPtx,
 };
 pub use safetensors::{
-    Metadata, SafetensorsMetadata, StateDict, inspect_safetensors_metadata, load_safetensors,
-    load_safetensors_file, load_safetensors_state_only, save_safetensors,
+    Metadata, OwnedSafetensorsMetadata, SafetensorsMetadata, StateDict,
+    inspect_safetensors_metadata, inspect_safetensors_metadata_file, load_safetensors,
+    load_safetensors_file, load_safetensors_state_only, load_safetensors_state_only_file,
+    save_safetensors,
     save_safetensors_file, save_safetensors_file_with_json_metadata,
     save_safetensors_with_json_metadata,
 };
