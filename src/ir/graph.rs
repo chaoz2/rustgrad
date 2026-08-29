@@ -4272,6 +4272,16 @@ impl Graph {
             .ok_or(Error::InvalidTensorLen { node: id })
     }
 
+    /// Read-only checked-in tinygrad `Tensor.__bool__`.
+    ///
+    /// Tensor truthiness is deliberately undefined for every valid tensor.
+    /// Validate the graph reference first so an invalid node remains observable
+    /// as `UnknownNode`; do not inspect descriptors or append a graph node.
+    pub fn bool_tinygrad(&self, id: NodeId) -> Result<bool> {
+        self.node(id)?;
+        Err(Error::TensorBoolNotDefined)
+    }
+
     /// Read-only tinygrad `Tensor.size()` without a dimension.
     ///
     /// The owned `Shape` keeps this query independent of the graph's internal

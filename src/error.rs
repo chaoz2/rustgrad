@@ -97,6 +97,7 @@ pub enum Error {
     InvalidTensorLen {
         node: NodeId,
     },
+    TensorBoolNotDefined,
     BitcastItemsizeMismatch {
         input: DType,
         output: DType,
@@ -345,6 +346,7 @@ impl fmt::Display for Error {
                 write!(f, "unsupported tinygrad dtype name {name:?}")
             }
             Self::InvalidTensorLen { .. } => write!(f, "len() of a 0-d tensor"),
+            Self::TensorBoolNotDefined => write!(f, "__bool__ on Tensor is not defined"),
             Self::BitcastItemsizeMismatch { input, output } => write!(
                 f,
                 "cannot bitcast {input:?} ({}) to {output:?} ({})",

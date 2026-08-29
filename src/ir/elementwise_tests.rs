@@ -159,6 +159,30 @@ fn descriptor_queries_are_read_only_and_source_axis_checked() {
 }
 
 #[test]
+fn tensor_bool_tinygrad_is_always_undefined_after_node_validation() {
+    let mut graph = Graph::new();
+    let scalar = graph.input_dtype("scalar", [], DType::Bool);
+    let vector = graph.input_dtype("vector", [2], DType::I32);
+    let empty = graph.input_dtype("empty", [0, 3], DType::F16);
+    let overflow = graph.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = graph.node_count();
+
+    for id in [scalar, vector, empty, overflow] {
+        let error = graph.bool_tinygrad(id).unwrap_err();
+        assert_eq!(error, Error::TensorBoolNotDefined);
+        assert_eq!(error.to_string(), "__bool__ on Tensor is not defined");
+        assert_eq!(graph.node_count(), before);
+    }
+
+    let unknown = NodeId::from_index(usize::MAX);
+    assert!(matches!(
+        graph.bool_tinygrad(unknown),
+        Err(Error::UnknownNode(node)) if node == unknown
+    ));
+    assert_eq!(graph.node_count(), before);
+}
+
+#[test]
 fn sequential_is_heterogeneous_ordered_and_preserves_prefix_failures() {
     let mut graph = Graph::new();
     let input = graph.input_dtype_requires_grad("x", [], DType::F32, true);
