@@ -19,6 +19,81 @@ struct BitwiseBinaryPlan {
     output_dtype: DType,
 }
 
+/// The two source-defined ordered folds exposed by tinygrad.  This stays
+/// deliberately narrower than a general variadic reducer: `usum` and
+/// `uprod` choose their operator once from the receiver's original dtype.
+#[derive(Clone, Copy)]
+enum UfoldKind {
+    Sum,
+    Prod,
+}
+
+/// Descriptor result for one source `usum`/`uprod` fold.  The clone rehearsal
+/// below owns every intermediate source-LUB/broadcast check; this plan only
+/// records the receiver-selected operator family and final descriptor.
+struct UfoldPlan {
+    bool_operator: bool,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn ufold_plan(
+    graph: &Graph,
+    input: NodeId,
+    inputs: &[NodeId],
+    kind: UfoldKind,
+) -> Result<UfoldPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    let receiver = graph.node(input)?;
+    let bool_operator = receiver.dtype == DType::Bool;
+    extent(&receiver.shape, receiver.dtype)?;
+    for &next in inputs {
+        let node = graph.node(next)?;
+        extent(&node.shape, node.dtype)?;
+    }
+
+    // Every fallible staged cast, promotion, broadcast, and intermediate byte
+    // extent belongs to the established binary helper.  Rehearse that exact
+    // ordered lowering before the caller can append its first live node.
+    let mut rehearsal = graph.clone();
+    let output = lower_ufold(&mut rehearsal, input, inputs, kind, bool_operator)?;
+    let output_shape = rehearsal.shape(output)?.clone();
+    let output_dtype = rehearsal.dtype(output)?;
+    extent(&output_shape, output_dtype)?;
+    Ok(UfoldPlan {
+        bool_operator,
+        output_shape,
+        output_dtype,
+    })
+}
+
+fn lower_ufold(
+    graph: &mut Graph,
+    input: NodeId,
+    inputs: &[NodeId],
+    kind: UfoldKind,
+    bool_operator: bool,
+) -> Result<NodeId> {
+    let mut output = input;
+    for &next in inputs {
+        output = match (kind, bool_operator) {
+            // tinygrad chooses `operator.or_`/`operator.and_` once from the
+            // original receiver dtype, not from a promoted intermediate.
+            (UfoldKind::Sum, true) => graph.bitwise_or(output, next)?,
+            (UfoldKind::Prod, true) => graph.bitwise_and(output, next)?,
+            (UfoldKind::Sum, false) => graph.add(output, next)?,
+            (UfoldKind::Prod, false) => graph.mul(output, next)?,
+        };
+    }
+    Ok(output)
+}
+
 fn bitwise_binary_plan(
     lhs_shape: &Shape,
     lhs_dtype: DType,
@@ -3154,6 +3229,28 @@ impl Graph {
         invstd: NodeId,
     ) -> Result<NodeId> {
         self.batchnorm(input, weight, bias, mean, invstd, 1)
+    }
+
+    /// Source-literal tinygrad `usum`: fold `inputs` from left to right,
+    /// starting at `input`.  A Bool receiver selects bitwise OR for the
+    /// complete fold; every other receiver selects ordinary source-LUB Add.
+    pub fn usum(&mut self, input: NodeId, inputs: &[NodeId]) -> Result<NodeId> {
+        let plan = ufold_plan(self, input, inputs, UfoldKind::Sum)?;
+        let output = lower_ufold(self, input, inputs, UfoldKind::Sum, plan.bool_operator)?;
+        debug_assert_eq!(self.shape(output).expect("usum preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("usum preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-literal tinygrad `uprod`: fold `inputs` from left to right,
+    /// starting at `input`.  A Bool receiver selects bitwise AND for the
+    /// complete fold; every other receiver selects ordinary source-LUB Mul.
+    pub fn uprod(&mut self, input: NodeId, inputs: &[NodeId]) -> Result<NodeId> {
+        let plan = ufold_plan(self, input, inputs, UfoldKind::Prod)?;
+        let output = lower_ufold(self, input, inputs, UfoldKind::Prod, plan.bool_operator)?;
+        debug_assert_eq!(self.shape(output).expect("uprod preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("uprod preflighted"), plan.output_dtype);
+        Ok(output)
     }
 
     pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {

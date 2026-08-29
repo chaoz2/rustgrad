@@ -9075,3 +9075,84 @@ fn tinygrad_matmul_wrappers_cover_rank_families_dtype_and_atomic_errors() {
     assert!(matches!(overflow.matmul_tinygrad_default(lhs, rhs), Err(Error::ShapeOverflow(_))));
     assert_eq!(overflow.node_count(), before);
 }
+
+#[test]
+fn tinygrad_usum_and_uprod_are_ordered_receiver_selected_folds() {
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [2], DType::F32);
+    let before = empty.node_count();
+    assert_eq!(empty.usum(input, &[]).unwrap(), input);
+    assert_eq!(empty.uprod(input, &[]).unwrap(), input);
+    assert_eq!(empty.node_count(), before);
+
+    let mut numeric = Graph::new();
+    let first = numeric.input_dtype_requires_grad("first", [2, 1], DType::F32, true);
+    let second = numeric.input_dtype("second", [1, 3], DType::F32);
+    let third = numeric.input_dtype("third", [2, 3], DType::F32);
+    let single = numeric.usum(first, &[second]).unwrap();
+    assert!(matches!(numeric.op(single).unwrap(), Op::Binary { op: BinaryOp::Add, lhs, rhs }
+        if *lhs == first && *rhs == second));
+    let sum = numeric.usum(first, &[second, third]).unwrap();
+    let Op::Binary { op: BinaryOp::Add, lhs: sum_prefix, rhs } = numeric.op(sum).unwrap() else {
+        panic!("usum must finish with its final source-order Add");
+    };
+    assert_eq!(*rhs, third);
+    assert!(matches!(numeric.op(*sum_prefix).unwrap(), Op::Binary { op: BinaryOp::Add, lhs, rhs }
+        if *lhs == first && *rhs == second));
+    assert_eq!(numeric.shape(sum).unwrap(), &Shape::new([2, 3]));
+    assert!(numeric.grad(numeric.sum_all(sum).unwrap(), first).is_ok());
+
+    let product = numeric.uprod(first, &[second, third]).unwrap();
+    let Op::Binary { op: BinaryOp::Mul, lhs: product_prefix, rhs } = numeric.op(product).unwrap() else {
+        panic!("uprod must finish with its final source-order Mul");
+    };
+    assert_eq!(*rhs, third);
+    assert!(matches!(numeric.op(*product_prefix).unwrap(), Op::Binary { op: BinaryOp::Mul, lhs, rhs }
+        if *lhs == first && *rhs == second));
+    assert!(numeric.grad(numeric.sum_all(product).unwrap(), first).is_ok());
+
+    let mut boolean = Graph::new();
+    let first = boolean.input_dtype("first", [2], DType::Bool);
+    let second = boolean.input_dtype("second", [1], DType::Bool);
+    let third = boolean.input_dtype("third", [2], DType::Bool);
+    let sum = boolean.usum(first, &[second, third]).unwrap();
+    assert!(matches!(boolean.op(sum).unwrap(), Op::Binary { op: BinaryOp::BitOr, rhs, .. } if *rhs == third));
+    let product = boolean.uprod(first, &[second, third]).unwrap();
+    assert!(matches!(boolean.op(product).unwrap(), Op::Binary { op: BinaryOp::BitAnd, rhs, .. } if *rhs == third));
+}
+
+#[test]
+fn tinygrad_usum_and_uprod_preserve_source_lub_and_are_atomic() {
+    let mut promoted = Graph::new();
+    let signed = promoted.input_dtype("signed", [], DType::I64);
+    let unsigned = promoted.input_dtype("unsigned", [2], DType::U64);
+    let sum = promoted.usum(signed, &[unsigned]).unwrap();
+    let product = promoted.uprod(signed, &[unsigned]).unwrap();
+    assert_eq!(promoted.dtype(sum).unwrap(), DType::F32);
+    assert_eq!(promoted.dtype(product).unwrap(), DType::F32);
+    assert_eq!(promoted.shape(sum).unwrap(), &Shape::new([2]));
+    assert!(promoted.nodes.iter().any(|node| matches!(&node.op, Op::Cast { dtype: DType::F32, .. })));
+
+    let mut unknown = Graph::new();
+    let input = unknown.input_dtype("input", [2], DType::F32);
+    let valid = unknown.input_dtype("valid", [2], DType::F32);
+    let before = unknown.node_count();
+    assert!(matches!(unknown.usum(input, &[valid, NodeId::from_index(usize::MAX)]), Err(Error::UnknownNode(_))));
+    assert_eq!(unknown.node_count(), before);
+
+    let mut mismatch = Graph::new();
+    let input = mismatch.input_dtype("input", [2, 2], DType::F32);
+    let valid = mismatch.input_dtype("valid", [2, 2], DType::F32);
+    let late = mismatch.input_dtype("late", [3], DType::F32);
+    let before = mismatch.node_count();
+    assert!(mismatch.uprod(input, &[valid, late]).is_err());
+    assert_eq!(mismatch.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX / 8, 1], DType::F64);
+    let valid = overflow.input_dtype("valid", [1], DType::F64);
+    let late = overflow.input_dtype("late", [1, 2], DType::F64);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.usum(input, &[valid, late]), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}
