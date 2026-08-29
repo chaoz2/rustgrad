@@ -35,7 +35,8 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
     ));
     let mut graph = Graph::new();
     let input = graph.input("x", [2]);
-    let unsupported = graph.argmax(input, Some(0), false).unwrap();
+    let mask = graph.input_dtype("mask", [2], DType::Bool);
+    let unsupported = graph.masked_select(input, mask, 1, crate::Scalar::I(0)).unwrap();
     assert!(matches!(
         graph_viz(&graph, &[unsupported]),
         Err(VizError::UnsupportedGraphOp(_))
@@ -44,6 +45,27 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn arg_reduce_graph_visualization_preserves_normalized_axes_and_index_contract() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 3]);
+    let reduced = graph.argmin(input, Some(-1), true).unwrap();
+    let first = graph_viz(&graph, &[reduced]).unwrap();
+    let second = graph_viz(&graph, &[reduced]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"arg_reduce\\nkind=graph_op\\naxes=[1]\\ndtype=i32\\nkeepdim=true\\nnode=1\\nreduction=argmin\\nshape=[2,1]\"];\n  \"g0\" -> \"g1\" [label=\"data:0:input\"];\n}\n"
+    );
+
+    let scalar = graph.input("scalar", []);
+    let global = graph.argmax(scalar, None, false).unwrap();
+    let global_dot = graph_viz(&graph, &[global]).unwrap().to_dot();
+    assert!(global_dot.contains("axes=all"));
+    assert!(global_dot.contains("dtype=i32"));
+    assert!(global_dot.contains("shape=[]"));
 }
 
 #[test]

@@ -88,6 +88,7 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }
+        | Op::ArgReduce { input, .. }
         | Op::Sort { input, .. }
         | Op::Reshape { input, .. }
         | Op::Permute { input, .. }
@@ -207,6 +208,18 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
         } => node
             .field("reduction", reduce_name(*kind))
             .field("axes", usize_list(axes))
+            .field("keepdim", keepdim.to_string()),
+        Op::ArgReduce {
+            max,
+            axis,
+            keepdim,
+            ..
+        } => node
+            .field("reduction", if *max { "argmax" } else { "argmin" })
+            .field(
+                "axes",
+                axis.map_or_else(|| "all".to_owned(), |axis| format!("[{axis}]")),
+            )
             .field("keepdim", keepdim.to_string()),
         Op::Sort {
             axis, descending, ..
