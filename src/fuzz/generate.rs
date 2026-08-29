@@ -91,11 +91,7 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     match rng.pick(15) {
         0 => {
             let shape = static_shape(&mut rng);
-            let dtype = if rng.pick(2) == 0 {
-                DType::F32
-            } else {
-                DType::I32
-            };
+            let dtype = [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64][rng.pick(13)];
             let rhs_shape = if rng.pick(3) == 0 {
                 vec![]
             } else {

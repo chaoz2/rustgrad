@@ -972,6 +972,200 @@ fn generated_cast_cases_reach_every_concrete_dtype_on_the_safe_domain() {
 }
 
 #[test]
+fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
+    const DTYPES: [DType; 13] = [
+        DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32,
+        DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64,
+    ];
+    let ops = [
+        (FuzzBinaryOp::Add, crate::BinaryOp::Add),
+        (FuzzBinaryOp::Sub, crate::BinaryOp::Sub),
+        (FuzzBinaryOp::Mul, crate::BinaryOp::Mul),
+        (FuzzBinaryOp::Maximum, crate::BinaryOp::Maximum),
+    ];
+
+    for (op_index, (fuzz_op, raw_op)) in ops.into_iter().enumerate() {
+        for (dtype_index, dtype) in DTYPES.into_iter().enumerate() {
+            let shape = match (op_index + dtype_index) % 3 {
+                0 => vec![],
+                1 => vec![0],
+                _ => vec![2],
+            };
+            let rhs_shape = if (op_index + dtype_index) % 2 == 0 {
+                vec![]
+            } else {
+                shape.clone()
+            };
+            let values = (0..shape.iter().product::<usize>()).map(|lane| match dtype {
+                DType::Bool => Scalar::Bool(lane != 0),
+                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(lane as f64),
+                _ => Scalar::I(lane as i64),
+            });
+            let rhs_values = (0..rhs_shape.iter().product::<usize>()).map(|_| match dtype {
+                DType::Bool => Scalar::Bool(true),
+                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(1.0),
+                _ => Scalar::I(1),
+            });
+            let case = FuzzCase::Binary {
+                op: fuzz_op,
+                lhs: FuzzTensor::from_tensor(&TensorData::from_scalars(shape.clone(), dtype, values).unwrap()),
+                rhs: FuzzTensor::from_tensor(&TensorData::from_scalars(rhs_shape, dtype, rhs_values).unwrap()),
+            };
+            let built = case.build().unwrap();
+            assert!(matches!(built.graph.op(built.output).unwrap(), Op::Binary { op, .. } if *op == raw_op));
+            assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
+            assert_eq!(built.graph.shape(built.output).unwrap().dims(), shape.as_slice());
+            let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(output.dtype(), dtype);
+
+            let scheduled = schedule(&built.graph, built.output).unwrap();
+            assert_eq!(scheduled.items.len(), 1);
+            assert_eq!(
+                scheduled.items[0].kernel.topological().unwrap().iter()
+                    .filter(|node| matches!(node.kind(), UOpKind::GraphBinary(op) if *op == raw_op))
+                    .count(),
+                1,
+            );
+            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let bytes = captured.to_bytes().unwrap();
+            assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+
+            let uop = crate::lower_graph_elementwise(&built.graph, built.output).unwrap();
+            assert!(CpuJit::render(&uop).is_ok(), "{fuzz_op:?} {dtype:?}");
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            if matches!(dtype, DType::F16 | DType::BF16) || fuzz_op == FuzzBinaryOp::Maximum {
+                assert!(!vector.source.contains("B2 VectorProgram"), "{fuzz_op:?} {dtype:?}");
+            }
+        }
+    }
+
+    for (dtype, storage, expected) in [
+        (DType::I8, Storage::I8(vec![i8::MAX]), Storage::I8(vec![i8::MIN])),
+        (DType::U8, Storage::U8(vec![u8::MAX]), Storage::U8(vec![0])),
+        (DType::I16, Storage::I16(vec![i16::MAX]), Storage::I16(vec![i16::MIN])),
+        (DType::U16, Storage::U16(vec![u16::MAX]), Storage::U16(vec![0])),
+        (DType::I32, Storage::I32(vec![i32::MAX]), Storage::I32(vec![i32::MIN])),
+        (DType::U32, Storage::U32(vec![u32::MAX]), Storage::U32(vec![0])),
+        (DType::I64, Storage::I64(vec![i64::MAX]), Storage::I64(vec![i64::MIN])),
+        (DType::U64, Storage::U64(vec![u64::MAX]), Storage::U64(vec![0])),
+    ] {
+        let lhs = TensorData::from_storage([1], storage).unwrap();
+        let rhs = TensorData::from_scalars([1], dtype, [Scalar::I(1)]).unwrap();
+        let case = FuzzCase::Binary {
+            op: FuzzBinaryOp::Add,
+            lhs: FuzzTensor::from_tensor(&lhs),
+            rhs: FuzzTensor::from_tensor(&rhs),
+        };
+        let built = case.build().unwrap();
+        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([1], expected).unwrap()));
+    }
+
+    // Finite/signed-zero/infinity arithmetic is storage-exact here. Arbitrary
+    // half-NaN arithmetic or payload identity remains intentionally unclaimed.
+    for (dtype, lhs, rhs, expected) in [
+        (DType::F16, Storage::F16(vec![0x8000, 0x7c00]), Storage::F16(vec![0x8000, 0x3c00]), Storage::F16(vec![0x8000, 0x7c00])),
+        (DType::BF16, Storage::BF16(vec![0x8000, 0x7f80]), Storage::BF16(vec![0x8000, 0x3f80]), Storage::BF16(vec![0x8000, 0x7f80])),
+        (DType::F32, Storage::F32(vec![-0.0, f32::INFINITY]), Storage::F32(vec![-0.0, 1.0]), Storage::F32(vec![-0.0, f32::INFINITY])),
+        (DType::F64, Storage::F64(vec![-0.0, f64::INFINITY]), Storage::F64(vec![-0.0, 1.0]), Storage::F64(vec![-0.0, f64::INFINITY])),
+    ] {
+        let case = FuzzCase::Binary {
+            op: FuzzBinaryOp::Add,
+            lhs: FuzzTensor::from_tensor(&TensorData::from_storage([2], lhs).unwrap()),
+            rhs: FuzzTensor::from_tensor(&TensorData::from_storage([2], rhs).unwrap()),
+        };
+        let built = case.build().unwrap();
+        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([2], expected).unwrap()));
+        assert_eq!(output.dtype(), dtype);
+    }
+
+    for (dtype, lhs, rhs, expected) in [
+        (DType::F32, Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0]), Storage::F32(vec![1.0, 0.0]), Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0])),
+        (DType::F64, Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001), -0.0]), Storage::F64(vec![1.0, 0.0]), Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001), -0.0])),
+    ] {
+        let case = FuzzCase::Binary {
+            op: FuzzBinaryOp::Maximum,
+            lhs: FuzzTensor::from_tensor(&TensorData::from_storage([2], lhs).unwrap()),
+            rhs: FuzzTensor::from_tensor(&TensorData::from_storage([2], rhs).unwrap()),
+        };
+        let built = case.build().unwrap();
+        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([2], expected).unwrap()));
+        assert_eq!(output.dtype(), dtype);
+    }
+
+    let bool_lhs = TensorData::from_storage([4], Storage::Bool(vec![true, true, false, false])).unwrap();
+    let bool_rhs = TensorData::from_storage([4], Storage::Bool(vec![true, false, true, false])).unwrap();
+    for (op, expected) in [
+        (FuzzBinaryOp::Add, vec![true, true, true, false]),
+        (FuzzBinaryOp::Sub, vec![false, true, true, false]),
+        (FuzzBinaryOp::Mul, vec![true, false, false, false]),
+        (FuzzBinaryOp::Maximum, vec![true, true, true, false]),
+    ] {
+        let case = FuzzCase::Binary { op, lhs: FuzzTensor::from_tensor(&bool_lhs), rhs: FuzzTensor::from_tensor(&bool_rhs) };
+        let built = case.build().unwrap();
+        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([4], Storage::Bool(expected)).unwrap()));
+    }
+
+    for dtype in [DType::F32, DType::I32] {
+        let mut b2_graph = crate::Graph::new();
+        let b2_lhs = b2_graph.input_dtype("lhs", [2], dtype);
+        let b2_rhs = b2_graph.input_dtype("rhs", [2], dtype);
+        for op in [crate::BinaryOp::Add, crate::BinaryOp::Sub, crate::BinaryOp::Mul] {
+            let output = b2_graph.binary(op, b2_lhs, b2_rhs).unwrap();
+            assert!(CpuJit::render_vectorized(&crate::lower_graph_elementwise(&b2_graph, output).unwrap()).unwrap().source.contains("B2 VectorProgram"));
+        }
+    }
+
+    let artifact_case = FuzzCase::Binary {
+        op: FuzzBinaryOp::Sub,
+        lhs: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I16(vec![3, 1])).unwrap()),
+        rhs: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::I16(vec![1])).unwrap()),
+    };
+    let json = serde_json::to_value(&artifact_case).unwrap();
+    assert_eq!(serde_json::from_value::<FuzzCase>(json).unwrap(), artifact_case);
+    let built = artifact_case.build().unwrap();
+    let expected = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let artifact = FuzzFailureArtifact::new(47, 53, artifact_case.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes, FuzzOutcome::value(&expected), FuzzOutcome::Error { class: "execute".into(), detail: "synthetic raw binary mismatch".into() }).unwrap();
+    let artifact_bytes = artifact.to_bytes().unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap().to_bytes().unwrap(), artifact_bytes);
+    let minimized = minimize_case(&artifact_case, |candidate| matches!(candidate,
+        FuzzCase::Binary { op: FuzzBinaryOp::Sub, lhs, rhs }
+            if lhs.dtype == DType::I16 && rhs.dtype == DType::I16
+                && lhs.shape == vec![2] && rhs.shape.is_empty()
+                && lhs.bytes.iter().all(|byte| *byte == 0)
+                && rhs.bytes.iter().all(|byte| *byte == 0)
+    ));
+    assert!(matches!(minimized, FuzzCase::Binary { op: FuzzBinaryOp::Sub, ref lhs, ref rhs }
+        if lhs.dtype == DType::I16 && rhs.dtype == DType::I16
+            && lhs.shape == vec![2] && rhs.shape.is_empty()));
+}
+
+#[test]
+fn generated_binary_cases_reach_all_ops_dtypes_and_broadcast_geometries() {
+    let mut pairs = std::collections::BTreeSet::new();
+    let mut scalar_rhs = false;
+    let mut scalar = false;
+    let mut empty = false;
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..16_384 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Binary { op, lhs, rhs } = case else { continue };
+            pairs.insert((op, lhs.dtype));
+            scalar_rhs |= rhs.shape.is_empty();
+            scalar |= lhs.shape.is_empty();
+            empty |= lhs.shape.iter().any(|extent| *extent == 0);
+        }
+    }
+    assert_eq!(pairs.len(), 52);
+    assert!(scalar_rhs && scalar && empty);
+}
+
+#[test]
 fn generated_pad_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
     let mut dtypes = std::collections::BTreeSet::new();
