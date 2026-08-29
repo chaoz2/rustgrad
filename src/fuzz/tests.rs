@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, Op, Scalar,
-    MovementKernelKind, MovementKernelPlan, ReduceKind, Storage, TensorData, UArg, UOpKind, UnaryOp,
+    MovementKernelKind, MovementKernelPlan, ReduceKind, Storage, TensorData, Ternary, UArg, UOpKind, UnaryOp,
     schedule,
 };
 use std::{
@@ -785,17 +785,45 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
         assert!(CpuJit::render(&uop).is_ok());
         let vector = CpuJit::render_vectorized(&uop).unwrap();
         if matches!(dtype, DType::F16 | DType::BF16) { assert!(!vector.source.contains("B2 VectorProgram")); } else if matches!(dtype, DType::F32 | DType::I32) { assert!(vector.source.contains("B2 VectorProgram")); }
+        let scheduled = schedule(&graph, output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        assert_eq!(
+            scheduled.items[0]
+                .kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .filter(|node| matches!(node.kind(), UOpKind::Ternary(Ternary::Where)))
+                .count(),
+            1
+        );
+        let captured = CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
     }
     let case = FuzzCase::Select {
         condition: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::Bool(vec![true, false, true])).unwrap()),
         on_true: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::INFINITY, 3.0])).unwrap()),
-        on_false: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![1.0, f32::from_bits(0x7fc0_0001), 2.0])).unwrap()),
+        on_false: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::F32(vec![f32::from_bits(0x7fc0_0001)])).unwrap()),
     };
     let encoded = serde_json::to_value(&case).unwrap();
     assert_eq!(serde_json::from_value::<FuzzCase>(encoded).unwrap(), case);
     let built = case.build().unwrap();
     let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
     assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), 3.0])).unwrap()));
+    let artifact = FuzzFailureArtifact::new(31, 37, case.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes, FuzzOutcome::value(&output), FuzzOutcome::Error { class: "execute".into(), detail: "synthetic select mismatch".into() }).unwrap();
+    let artifact_bytes = artifact.to_bytes().unwrap();
+    let decoded_artifact = FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap();
+    assert_eq!(decoded_artifact, artifact);
+    assert_eq!(decoded_artifact.to_bytes().unwrap(), artifact_bytes);
+    let zeroed = minimize_case(&case, |candidate| matches!(candidate, FuzzCase::Select { condition, on_true, on_false } if condition.shape == vec![3] && on_true.shape == vec![3] && on_false.shape.is_empty() && condition.dtype == DType::Bool && on_true.dtype == DType::F32 && on_false.dtype == DType::F32 && condition.bytes.iter().all(|byte| *byte == 0) && on_true.bytes.iter().all(|byte| *byte == 0) && on_false.bytes.iter().all(|byte| *byte == 0)));
+    assert!(matches!(zeroed, FuzzCase::Select { ref condition, ref on_true, ref on_false }
+        if condition.shape == vec![3]
+            && on_true.shape == vec![3]
+            && on_false.shape.is_empty()
+            && condition.dtype == DType::Bool
+            && on_true.dtype == DType::F32
+            && on_false.dtype == DType::F32));
     let malformed = FuzzCase::Select { condition: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I32(vec![1, 0])).unwrap()), on_true: case.on_true.clone(), on_false: case.on_false.clone() };
     assert!(malformed.validate().is_err());
 }
