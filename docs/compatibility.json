@@ -117,7 +117,7 @@
       "subject": "Bool, integer, fp16/bf16/fp32/fp64 and special dtypes",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Dense tagged storage and a bool/i8-u64/f16/bf16/f32/f64 taxonomy exist. CPU supports explicit casts and mixed binary promotion; fp8, weak/pointer/image dtypes, complete tinygrad promotion/accumulation rules, and device ABI lowering remain."
+        "Acceptance requirement": "Dense tagged storage and a bool/i8-u64/f16/bf16/f32/f64 taxonomy exist. Concrete `DType` predicates, typed source min/max bounds, exact F16/BF16/F32/F64 exponent/mantissa `finfo`, and storage-backed scalar commitment cover Bool truthiness, integer-width wrapping, float rounding, negative zero, and NaN. CPU supports explicit casts and mixed binary promotion; fp8, weak/pointer/image dtypes, complete tinygrad promotion/accumulation rules, and device ABI lowering remain."
       }
     },
     {
