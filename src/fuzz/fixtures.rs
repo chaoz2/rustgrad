@@ -246,6 +246,28 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             axis: 1,
         },
         FuzzCase::Matmul {
+            // F32 must round each product and running sum: the middle one is
+            // lost before the final cancellation, unlike a double accumulator.
+            lhs: tensor(vec![1, 3], Storage::F32(vec![1.0e10, 1.0, -1.0e10])),
+            rhs: tensor(vec![3, 1], Storage::F32(vec![1.0, 1.0, 1.0])),
+        },
+        FuzzCase::Matmul {
+            // Raw F64 remains its native double-width contraction path.
+            lhs: tensor(vec![3], Storage::F64(vec![1.0, -2.0, 0.5])),
+            rhs: tensor(vec![3], Storage::F64(vec![4.0, 8.0, 16.0])),
+        },
+        FuzzCase::Matmul {
+            // Vector-matrix form preserves its rank-one lhs geometry.
+            lhs: tensor(vec![3], Storage::F32(vec![1.0, 2.0, 3.0])),
+            rhs: tensor(vec![3, 2], Storage::F32(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])),
+        },
+        FuzzCase::Matmul {
+            // Right-aligned batch broadcasting exercises generalized output
+            // geometry without changing the raw Matmul operation.
+            lhs: tensor(vec![2, 1, 1, 2], Storage::F64(vec![1.0, 2.0, 3.0, 4.0])),
+            rhs: tensor(vec![3, 2, 1], Storage::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+        },
+        FuzzCase::Matmul {
             lhs: tensor(vec![3, 0], Storage::F32(vec![])),
             rhs: tensor(vec![0, 5], Storage::F32(vec![])),
         },

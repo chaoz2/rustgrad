@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v15";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v16";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -942,13 +942,25 @@ fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> 
         "    size_t rg_batch=rg_q;".into(),
         format!("    size_t rg_lbatch={lhs_batch};"),
         format!("    size_t rg_rbatch={rhs_batch};"),
-        "    double rg_acc=0.0;".into(),
-        format!("    for (size_t rg_k=0; rg_k<{}u; ++rg_k) rg_acc += (double)rg_lhs[{lhs_offset}] * (double)rg_rhs[{rhs_offset}];", plan.k),
-        format!("    rg_out[rg_i]=({storage})rg_acc;"),
-        "  }".into(),
-        "  return 0;".into(),
-        "}".into(),
     ]);
+    if plan.dtype == DType::F32 {
+        // The CPU oracle commits both the product and running sum through
+        // binary_scalar at F32 storage width on every contraction step.
+        // Keep the C temporaries explicit so a compiler cannot retain a wider
+        // accumulator across the loop.
+        lines.extend([
+            "    float rg_acc=0.0f;".into(),
+            format!("    for (size_t rg_k=0; rg_k<{}u; ++rg_k) {{ float rg_product=(float)(rg_lhs[{lhs_offset}]*rg_rhs[{rhs_offset}]); rg_acc=(float)(rg_acc+rg_product); }}", plan.k),
+            "    rg_out[rg_i]=rg_acc;".into(),
+        ]);
+    } else {
+        lines.extend([
+            "    double rg_acc=0.0;".into(),
+            format!("    for (size_t rg_k=0; rg_k<{}u; ++rg_k) rg_acc += rg_lhs[{lhs_offset}] * rg_rhs[{rhs_offset}];", plan.k),
+            "    rg_out[rg_i]=rg_acc;".into(),
+        ]);
+    }
+    lines.extend(["  }".into(), "  return 0;".into(), "}".into()]);
     let source = lines.join("\n") + "\n";
     let cache_key = native_cache_key(&plan.cache_key.to_string(), &source);
     Ok(RenderedC {
@@ -2599,7 +2611,8 @@ fn last_error() -> String {
 mod tests {
     use super::*;
     use crate::{
-        Backend, CompareOp, CpuBackend, Graph, Op, Scalar, Shape, SymbolicExpr, TensorData,
+        Backend, CompareOp, CpuBackend, Graph, Op, Scalar, Shape, Storage, SymbolicExpr,
+        TensorData,
     };
     use std::collections::{BTreeMap, HashMap};
 
@@ -3968,5 +3981,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(native.storage(), expected.storage());
+    }
+
+    #[test]
+    fn raw_matmul_uses_dtype_width_accumulators_and_renderer_v16() {
+        let mut f32_graph = Graph::new();
+        let f32_lhs = f32_graph.input_dtype("lhs", Shape::from([1, 3]), DType::F32);
+        let f32_rhs = f32_graph.input_dtype("rhs", Shape::from([3, 1]), DType::F32);
+        let f32_output = f32_graph.matmul(f32_lhs, f32_rhs).unwrap();
+        let f32_kernel = crate::lower_graph_matmul(&f32_graph, f32_output).unwrap();
+        let f32_rendered = CpuJit::render(&f32_kernel).unwrap();
+        assert!(f32_rendered.source.contains(RENDERER_VERSION));
+        assert!(f32_rendered.source.contains("float rg_acc=0.0f;"));
+        assert!(f32_rendered.source.contains("float rg_product=(float)"));
+        assert!(f32_rendered.source.contains("rg_acc=(float)(rg_acc+rg_product);"));
+        assert!(!f32_rendered.source.contains("double rg_acc=0.0;"));
+        assert_eq!(f32_rendered.cache_key, CpuJit::render(&f32_kernel).unwrap().cache_key);
+
+        // This adversarial contraction distinguishes per-step F32 storage
+        // rounding from a double accumulator narrowed only at the end.
+        let oracle = CpuBackend
+            .execute(
+                &f32_graph,
+                f32_output,
+                &HashMap::from([
+                    (
+                        "lhs".into(),
+                        TensorData::from_storage(
+                            [1, 3],
+                            Storage::F32(vec![1.0e10, 1.0, -1.0e10]),
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        "rhs".into(),
+                        TensorData::from_storage([3, 1], Storage::F32(vec![1.0; 3])).unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        let Scalar::F(value) = oracle.scalar_at(0) else {
+            panic!("F32 matmul must retain F32 scalar storage")
+        };
+        assert_eq!((value as f32).to_bits(), 0.0f32.to_bits());
+
+        let mut f64_graph = Graph::new();
+        let f64_lhs = f64_graph.input_dtype("lhs", Shape::from([3]), DType::F64);
+        let f64_rhs = f64_graph.input_dtype("rhs", Shape::from([3]), DType::F64);
+        let f64_output = f64_graph.matmul(f64_lhs, f64_rhs).unwrap();
+        let f64_rendered = CpuJit::render(
+            &crate::lower_graph_matmul(&f64_graph, f64_output).unwrap(),
+        )
+        .unwrap();
+        assert!(f64_rendered.source.contains("double rg_acc=0.0;"));
+        assert!(!f64_rendered.source.contains("float rg_product=(float)"));
     }
 }

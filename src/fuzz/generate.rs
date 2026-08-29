@@ -350,12 +350,32 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             }
         }
         _ => {
+            // Raw Matmul is portable only for homogeneous F32/F64. Exercise
+            // every generalized rank form accepted by the static plan:
+            // vectors, matrix/vector variants, matrices, and right-aligned
+            // broadcast batches. All extents remain deliberately small.
             let m = [0, 1, 2, 3][rng.pick(4)];
             let n = [0, 1, 3, 5][rng.pick(4)];
             let k = [0, 1, 3, 8][rng.pick(4)];
+            let dtype = [DType::F32, DType::F64][rng.pick(2)];
+            let (lhs_shape, rhs_shape) = match rng.pick(5) {
+                0 => (vec![k], vec![k]),
+                1 => (vec![m, k], vec![k]),
+                2 => (vec![k], vec![k, n]),
+                3 => (vec![m, k], vec![k, n]),
+                _ => {
+                    let outer = [0, 1, 2][rng.pick(3)];
+                    let inner = [0, 1, 2][rng.pick(3)];
+                    if rng.pick(2) == 0 {
+                        (vec![outer, 1, m, k], vec![inner, k, n])
+                    } else {
+                        (vec![outer, inner, m, k], vec![1, inner, k, n])
+                    }
+                }
+            };
             FuzzCase::Matmul {
-                lhs: tensor(&mut rng, vec![m, k], DType::F32),
-                rhs: tensor(&mut rng, vec![k, n], DType::F32),
+                lhs: tensor(&mut rng, lhs_shape, dtype),
+                rhs: tensor(&mut rng, rhs_shape, dtype),
             }
         }
     }

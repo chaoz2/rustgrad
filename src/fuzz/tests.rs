@@ -151,6 +151,137 @@ fn generated_reduction_cases_cover_portable_kinds_and_geometry() {
 }
 
 #[test]
+fn generated_matmul_cases_cover_portable_generalized_geometry() {
+    let mut f32 = false;
+    let mut f64 = false;
+    let mut vector_vector = false;
+    let mut matrix_vector = false;
+    let mut vector_matrix = false;
+    let mut matrix_matrix = false;
+    let mut batched = false;
+    let mut zero_k = false;
+    let mut zero_geometry = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..4096 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Matmul { lhs, rhs } = case else {
+                continue;
+            };
+            assert_eq!(lhs.dtype, rhs.dtype);
+            assert!(matches!(lhs.dtype, DType::F32 | DType::F64));
+            f32 |= lhs.dtype == DType::F32;
+            f64 |= lhs.dtype == DType::F64;
+            vector_vector |= lhs.shape.len() == 1 && rhs.shape.len() == 1;
+            matrix_vector |= lhs.shape.len() == 2 && rhs.shape.len() == 1;
+            vector_matrix |= lhs.shape.len() == 1 && rhs.shape.len() == 2;
+            matrix_matrix |= lhs.shape.len() == 2 && rhs.shape.len() == 2;
+            batched |= lhs.shape.len() > 2 || rhs.shape.len() > 2;
+            zero_k |= lhs.shape.last() == Some(&0);
+            zero_geometry |= lhs.shape.contains(&0) || rhs.shape.contains(&0);
+        }
+    }
+
+    assert!(f32 && f64);
+    assert!(vector_vector && matrix_vector && vector_matrix && matrix_matrix && batched);
+    assert!(zero_k && zero_geometry);
+}
+
+#[test]
+fn matmul_cases_round_trip_capture_and_keep_f32_storage_rounding() {
+    let f32 = FuzzCase::Matmul {
+        lhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 3], Storage::F32(vec![1.0e10, 1.0, -1.0e10]))
+                .unwrap(),
+        ),
+        rhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3, 1], Storage::F32(vec![1.0; 3])).unwrap(),
+        ),
+    };
+    let f64_vector = FuzzCase::Matmul {
+        lhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::F64(vec![1.0, -2.0, 0.5])).unwrap(),
+        ),
+        rhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::F64(vec![4.0, 8.0, 16.0])).unwrap(),
+        ),
+    };
+    let batched = FuzzCase::Matmul {
+        lhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2, 1, 1, 2], Storage::F64(vec![1.0, 2.0, 3.0, 4.0]))
+                .unwrap(),
+        ),
+        rhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3, 2, 1], Storage::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+                .unwrap(),
+        ),
+    };
+
+    let value = serde_json::to_value(&f32).unwrap();
+    assert_eq!(value["kind"], "matmul");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), f32);
+    let mut unknown = value;
+    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    for case in [f32.clone(), f64_vector, batched] {
+        let built = case.build().unwrap();
+        assert!(matches!(built.graph.op(built.output).unwrap(), Op::Matmul { .. }));
+        let plan = crate::MatmulKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        assert_eq!(plan.output_shape, built.graph.shape(built.output).unwrap().clone());
+        assert!(plan.lhs_vector == (plan.lhs_shape.rank() == 1));
+        assert!(plan.rhs_vector == (plan.rhs_shape.rank() == 1));
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        let item = &scheduled.items[0];
+        assert!(matches!(item.kernel.kind(), UOpKind::Matmul));
+        assert!(matches!(item.kernel.arg(), UArg::Matmul(rendered) if rendered.m == plan.m && rendered.n == plan.n && rendered.k == plan.k && rendered.batch_shape == plan.batch_shape));
+        let rendered = CpuJit::render(&item.kernel).unwrap();
+        if plan.dtype == DType::F32 {
+            assert!(rendered.source.contains("float rg_acc=0.0f;"));
+            assert!(rendered.source.contains("float rg_product=(float)"));
+        } else {
+            assert!(rendered.source.contains("double rg_acc=0.0;"));
+        }
+        // Matmul's vector request intentionally has a scalar contraction
+        // plan, but it remains a supported strict-native render path.
+        assert_eq!(
+            rendered.source,
+            CpuJit::render_vectorized(&item.kernel).unwrap().source
+        );
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+    }
+
+    let built = f32.build().unwrap();
+    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let Scalar::F(value) = output.scalar_at(0) else {
+        panic!("F32 matmul output")
+    };
+    assert_eq!((value as f32).to_bits(), 0.0f32.to_bits());
+    let artifact = FuzzFailureArtifact::new(
+        16,
+        24,
+        f32.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&output),
+        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic F32 matmul rounding mismatch".into() },
+    )
+    .unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&f32, |candidate| {
+        matches!(candidate, FuzzCase::Matmul { lhs, rhs }
+            if lhs.bytes == vec![0; 12] && rhs.bytes == vec![0; 12])
+    });
+    assert!(matches!(zeroed, FuzzCase::Matmul { ref lhs, ref rhs }
+        if lhs.bytes == vec![0; 12] && rhs.bytes == vec![0; 12]));
+}
+
+#[test]
 fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
     let cases = [
         (FuzzReduction::Sum, ReduceKind::Sum, true),
