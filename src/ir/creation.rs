@@ -36,6 +36,17 @@ pub(crate) struct OneHotPlan {
     zero: Option<TensorData>,
 }
 
+/// Concrete source contract for public `Tensor.multinomial` before it touches
+/// an ambient random stream.
+#[derive(Clone, Debug)]
+struct MultinomialPlan {
+    rank: usize,
+    samples: usize,
+    replacement: bool,
+    weight_shape: Shape,
+    output_shape: Shape,
+}
+
 /// Complete concrete descriptor contract for public tinygrad `Tensor.roll`.
 /// The existing one-axis `roll`, `roll_axes`, and `roll_flattened` APIs remain
 /// raw/backward-compatible building blocks; this records Python's scalar /
@@ -740,6 +751,52 @@ mod tests {
             malformed.randn_like_implicit(overflow, Some(DType::U8)),
             Err(Error::ShapeOverflow(_))
         ));
+        assert_eq!(malformed.node_count(), overflow_before);
+    }
+
+    #[test]
+    fn multinomial_is_source_literal_and_stream_atomic() {
+        Graph::manual_seed(37);
+        let mut graph = Graph::new();
+        let vector = graph.input_dtype_requires_grad("vector", [4], DType::F32, true);
+        let matrix = graph.input_dtype("matrix", [2, 3], DType::I16);
+        let replacement = graph.multinomial(vector, 3, true).unwrap();
+        let single = graph.multinomial(matrix, 1, false).unwrap();
+        let without_replacement = graph.multinomial(matrix, 2, false).unwrap();
+        assert_eq!(graph.shape(replacement).unwrap(), &Shape::from([3]));
+        assert_eq!(graph.shape(single).unwrap(), &Shape::from([2, 1]));
+        assert_eq!(graph.shape(without_replacement).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(graph.dtype(replacement).unwrap(), DType::I32);
+        assert!(!graph.node(replacement).unwrap().requires_grad);
+        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Random {
+            kind: RandomKind::Uniform { low, high }, ..
+        } if *low == 0.0 && *high == 1.0)));
+        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Unary {
+            op: crate::UnaryOp::Log2, ..
+        })));
+        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Sort {
+            output: crate::SortOutput::Indices, ..
+        })));
+
+        let mut malformed = Graph::new();
+        let weights = malformed.input_dtype("weights", [2, 3], DType::F32);
+        let before = malformed.node_count();
+        assert!(malformed.multinomial(weights, 0, false).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.multinomial(weights, 4, false).is_err());
+        assert_eq!(malformed.node_count(), before);
+        let empty = malformed.input_dtype("empty", [0], DType::F32);
+        let before_empty = malformed.node_count();
+        assert!(malformed.multinomial(empty, 1, true).is_err());
+        assert_eq!(malformed.node_count(), before_empty);
+        assert!(matches!(
+            malformed.multinomial(NodeId(usize::MAX), 1, true),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), before_empty);
+        let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F32);
+        let overflow_before = malformed.node_count();
+        assert!(matches!(malformed.multinomial(overflow, 1, true), Err(Error::ShapeOverflow(_))));
         assert_eq!(malformed.node_count(), overflow_before);
     }
 
@@ -2220,6 +2277,96 @@ fn random_like_plan(
     // this validates that two-row F32 descriptor without materializing it.
     stream_words(&shape, internal_dtype, stream_multiplier)?;
     Ok((shape, output_dtype))
+}
+
+fn multinomial_plan(graph: &Graph, input: NodeId, num_samples: isize, replacement: bool) -> Result<MultinomialPlan> {
+    let source = graph.node(input)?;
+    let rank = source.shape.rank();
+    if !(1..=2).contains(&rank) || num_samples <= 0 {
+        return Err(Error::InvalidRandom {
+            reason: "multinomial requires rank one or two and positive samples",
+        });
+    }
+    let samples = usize::try_from(num_samples).map_err(|_| Error::InvalidRandom {
+        reason: "multinomial samples do not fit graph extents",
+    })?;
+    source
+        .shape
+        .numel()?
+        .checked_mul(source.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+    let weight_shape = if rank == 1 {
+        Shape::new([1, source.shape.dims()[0]])
+    } else {
+        source.shape.clone()
+    };
+    let categories = weight_shape.dims()[1];
+    // Both source paths either assert this (without replacement) or index the
+    // final CDF entry (with replacement), which is impossible for zero classes.
+    if categories == 0 || (!replacement && samples > categories) {
+        return Err(Error::InvalidRandom {
+            reason: "multinomial samples exceed population",
+        });
+    }
+    let output_shape = if rank == 1 {
+        Shape::new([samples])
+    } else {
+        Shape::new([weight_shape.dims()[0], samples])
+    };
+    output_shape
+        .numel()?
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    // Replacement samples are F32 [samples, batch, 1]; the other path uses a
+    // F32 random tensor shaped like the normalized two-dimensional weights.
+    let random_shape = if replacement || samples == 1 {
+        Shape::new([samples, weight_shape.dims()[0], 1])
+    } else {
+        weight_shape.clone()
+    };
+    random_shape
+        .numel()?
+        .checked_mul(DType::F32.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(random_shape.clone()))?;
+    Ok(MultinomialPlan { rank, samples, replacement, weight_shape, output_shape })
+}
+
+fn lower_multinomial(
+    graph: &mut Graph,
+    input: NodeId,
+    plan: &MultinomialPlan,
+    ambient: bool,
+) -> Result<NodeId> {
+    let weight = if plan.rank == 1 { graph.unsqueeze(input, 0)? } else { input };
+    let indices = if plan.replacement || plan.samples == 1 {
+        let cumulative = graph.cumsum(weight, 1)?;
+        let cdf = graph.to_f32(cumulative)?;
+        let last = graph.shrink(
+            cdf,
+            vec![(0, plan.weight_shape.dims()[0]), (plan.weight_shape.dims()[1] - 1, plan.weight_shape.dims()[1])],
+        )?;
+        let cdf = graph.div(cdf, last)?;
+        let random_shape = Shape::new([plan.samples, plan.weight_shape.dims()[0], 1]);
+        let random = if ambient {
+            graph.rand_implicit(random_shape, DType::F32)?
+        } else {
+            graph.rand(random_shape, DType::F32, 0)?
+        };
+        let thresholds = graph.ge(random, cdf)?;
+        let sums = graph.sum_with_options(thresholds, Some(vec![2]), false, None)?;
+        graph.permute(sums, vec![1, 0])?
+    } else {
+        let random = if ambient {
+            graph.rand_like_implicit(weight, Some(DType::F32))?
+        } else {
+            graph.rand(plan.weight_shape.clone(), DType::F32, 0)?
+        };
+        let log_random = graph.log2(random)?;
+        let scores = graph.div(log_random, weight)?;
+        graph.topk(scores, plan.samples, 1, true, true)?.1
+    };
+    let indices = if plan.rank == 1 { graph.squeeze(indices, Some(0))? } else { indices };
+    graph.to_i32(indices)
 }
 
 fn checked_initializer_tail_fan(shape: &Shape) -> Result<usize> {
@@ -3837,6 +3984,34 @@ impl Graph {
         } else {
             self.cast(standard, output_dtype)
         }
+    }
+
+    /// Source-literal ambient-stream `Tensor.multinomial(num_samples=1,
+    /// replacement=False)`.
+    pub fn multinomial(
+        &mut self,
+        input: NodeId,
+        num_samples: isize,
+        replacement: bool,
+    ) -> Result<NodeId> {
+        let plan = multinomial_plan(self, input, num_samples, replacement)?;
+        // The rehearsal uses an explicit stream, so it proves all later graph
+        // stages without advancing the process-wide ambient random counter.
+        let mut rehearsal = self.clone();
+        let rehearsed = lower_multinomial(&mut rehearsal, input, &plan, false)?;
+        if rehearsal.shape(rehearsed)? != &plan.output_shape || rehearsal.dtype(rehearsed)? != DType::I32 {
+            return Err(Error::InvalidRandom {
+                reason: "multinomial output descriptor changed during preflight",
+            });
+        }
+        plan.output_shape
+            .numel()?
+            .checked_mul(DType::I32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(plan.output_shape.clone()))?;
+        let output = lower_multinomial(self, input, &plan, true)?;
+        debug_assert_eq!(self.shape(output).expect("multinomial preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("multinomial preflighted"), DType::I32);
+        Ok(output)
     }
 
     pub fn randn_implicit_on_device(
