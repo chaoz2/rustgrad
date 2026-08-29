@@ -76,6 +76,29 @@ fn tinygrad_full_plan(
     })
 }
 
+/// Receiver-side descriptor boundary for tinygrad's concrete `*_like` fills.
+/// The receiver contributes shape and default dtype only; it is never an
+/// operand of the resulting constant graph.
+struct TinygradLikePlan {
+    shape: Shape,
+    dtype: DType,
+}
+
+fn tinygrad_like_plan(graph: &Graph, input: NodeId, dtype: Option<DType>) -> Result<TinygradLikePlan> {
+    let source = graph.node(input)?;
+    let shape = source.shape.clone();
+    shape
+        .numel()?
+        .checked_mul(source.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let dtype = dtype.unwrap_or(source.dtype);
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    Ok(TinygradLikePlan { shape, dtype })
+}
+
 /// Whole-operation descriptor for tinygrad's public `Tensor.one_hot`.
 ///
 /// The literal first unsqueezes integer indices, compares them with a
@@ -588,6 +611,84 @@ mod tests {
         assert_eq!(malformed.node_count(), before);
         assert!(matches!(
             malformed.full_tinygrad([usize::MAX], Scalar::I(0), Some(DType::F64), true),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
+    fn tinygrad_fill_family_keeps_like_descriptors_independent_and_atomic() {
+        let mut graph = Graph::new();
+        let receiver = graph.input_dtype_requires_grad("receiver", [2, 0, 3], DType::BF16, true);
+        let zeros = graph.zeros_tinygrad([2], None, false).unwrap();
+        let ones = graph.ones_tinygrad([2], None, false).unwrap();
+        assert_eq!(graph.dtype(zeros).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(ones).unwrap(), DType::F32);
+
+        let inherited = graph
+            .full_like_tinygrad(receiver, Scalar::F(-0.0), None, false)
+            .unwrap();
+        let override_dtype = graph
+            .zeros_like_tinygrad(receiver, Some(DType::U32), true)
+            .unwrap();
+        let inherited_one = graph.ones_like_tinygrad(receiver, None, false).unwrap();
+        assert_eq!(graph.shape(inherited).unwrap(), &Shape::from([2, 0, 3]));
+        assert_eq!(graph.dtype(inherited).unwrap(), DType::BF16);
+        assert_eq!(graph.dtype(override_dtype).unwrap(), DType::U32);
+        assert_eq!(graph.dtype(inherited_one).unwrap(), DType::BF16);
+        assert!(!graph.node(inherited).unwrap().requires_grad);
+        assert!(matches!(graph.op(override_dtype).unwrap(), Op::Constant(data) if data.len() == 0));
+        let Op::Expand { input: inherited_scalar, .. } = graph.op(inherited).unwrap() else {
+            panic!("expected scalar-backed full_like");
+        };
+        assert!(matches!(graph.op(*inherited_scalar).unwrap(), Op::Constant(data)
+            if data.len() == 1 && data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits()));
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let output = graph.ones_tinygrad([0], Some(dtype), true).unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+        }
+
+        let scalar_receiver = graph.input_dtype("scalar", [], DType::I16);
+        let scalar = graph
+            .full_like_tinygrad(scalar_receiver, Scalar::F(f64::NAN), Some(DType::F16), false)
+            .unwrap();
+        assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
+        assert!(matches!(graph.op(scalar).unwrap(), Op::Constant(data)
+            if data.len() == 1 && data.scalar_at(0).as_f64().is_nan()));
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.full_like_tinygrad(NodeId(usize::MAX), Scalar::I(0), None, false),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+        let source_overflow = malformed.input_dtype("source_overflow", [usize::MAX, 2], DType::Bool);
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.ones_like_tinygrad(source_overflow, Some(DType::Bool), false),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+        let output_overflow = malformed.input_dtype("output_overflow", [usize::MAX], DType::Bool);
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.zeros_like_tinygrad(output_overflow, Some(DType::F64), true),
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(malformed.node_count(), before);
@@ -3142,6 +3243,62 @@ impl Graph {
                 plan.dtype,
             ))
         }
+    }
+
+    /// Concrete source-literal tinygrad `Tensor.zeros(shape, dtype=None,
+    /// buffer=True)`. The Python `0.0` argument makes its omitted dtype F32.
+    pub fn zeros_tinygrad(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: Option<DType>,
+        buffer: bool,
+    ) -> Result<NodeId> {
+        self.full_tinygrad(shape, Scalar::F(0.0), dtype, buffer)
+    }
+
+    /// Concrete source-literal tinygrad `Tensor.ones(shape, dtype=None,
+    /// buffer=True)`. The Python `1.0` argument makes its omitted dtype F32.
+    pub fn ones_tinygrad(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: Option<DType>,
+        buffer: bool,
+    ) -> Result<NodeId> {
+        self.full_tinygrad(shape, Scalar::F(1.0), dtype, buffer)
+    }
+
+    /// Concrete source-literal tinygrad `Tensor.full_like`. The receiver
+    /// supplies only its validated descriptor and default dtype; no value or
+    /// VJP edge is retained.
+    pub fn full_like_tinygrad(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        dtype: Option<DType>,
+        buffer: bool,
+    ) -> Result<NodeId> {
+        let plan = tinygrad_like_plan(self, input, dtype)?;
+        self.full_tinygrad(plan.shape, value, Some(plan.dtype), buffer)
+    }
+
+    /// Concrete source-literal tinygrad `Tensor.zeros_like`.
+    pub fn zeros_like_tinygrad(
+        &mut self,
+        input: NodeId,
+        dtype: Option<DType>,
+        buffer: bool,
+    ) -> Result<NodeId> {
+        self.full_like_tinygrad(input, Scalar::I(0), dtype, buffer)
+    }
+
+    /// Concrete source-literal tinygrad `Tensor.ones_like`.
+    pub fn ones_like_tinygrad(
+        &mut self,
+        input: NodeId,
+        dtype: Option<DType>,
+        buffer: bool,
+    ) -> Result<NodeId> {
+        self.full_like_tinygrad(input, Scalar::I(1), dtype, buffer)
     }
 
     /// Creates a graph-resident typed fill without materializing its payload.
