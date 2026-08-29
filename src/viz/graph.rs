@@ -1,5 +1,5 @@
 use super::{VizEdge, VizError, VizGraph, VizNode};
-use crate::{DType, Graph, NodeId, Op, RandomKind, ReduceKind, Scalar, Shape};
+use crate::{DType, EinsumLabel, EinsumPlan, Graph, NodeId, Op, RandomKind, ReduceKind, Scalar, Shape};
 use std::collections::BTreeSet;
 
 pub(super) fn dtype_name(dtype: DType) -> &'static str {
@@ -86,11 +86,73 @@ fn reduce_name(kind: ReduceKind) -> &'static str {
     }
 }
 
+fn einsum_label_name(label: &EinsumLabel) -> String {
+    match label {
+        EinsumLabel::Named(label) => label.to_string(),
+        EinsumLabel::Ellipsis(axis) => format!("...{axis}"),
+    }
+}
+
+fn einsum_labels(labels: &[EinsumLabel]) -> String {
+    format!(
+        "[{}]",
+        labels
+            .iter()
+            .map(einsum_label_name)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn einsum_operand_labels(operands: &[Vec<EinsumLabel>]) -> String {
+    format!(
+        "[{}]",
+        operands
+            .iter()
+            .map(|labels| einsum_labels(labels))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn einsum_extents(plan: &EinsumPlan) -> String {
+    format!(
+        "[{}]",
+        plan.label_extents
+            .iter()
+            .map(|(label, extent)| format!("{}:{extent}", einsum_label_name(label)))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn einsum_plan_key(plan: &EinsumPlan) -> String {
+    format!(
+        "operands={};extents={};output={};contracted={}",
+        einsum_operand_labels(&plan.operand_labels),
+        einsum_extents(plan),
+        einsum_labels(&plan.output_labels),
+        einsum_labels(&plan.contracted_labels),
+    )
+}
+
 fn unsupported(op: &Op) -> VizError {
     VizError::UnsupportedGraphOp(op_class(op).into())
 }
 
-fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
+fn dependency(role: impl Into<String>, id: NodeId) -> (String, NodeId) {
+    (role.into(), id)
+}
+
+fn operand_dependencies(inputs: &[NodeId]) -> Vec<(String, NodeId)> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(index, id)| dependency(format!("operand_{index}"), *id))
+        .collect()
+}
+
+fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
     Ok(match op {
         Op::Input { .. } | Op::Constant(_) | Op::Random { .. } | Op::RandomPermutation { .. } => {
             vec![]
@@ -106,34 +168,61 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
         | Op::Expand { input, .. }
         | Op::Shrink { input, .. }
         | Op::Pad { input, .. }
-        | Op::Stride { input, .. } => vec![("input", *input)],
-        Op::ScatterPositions { input, .. } => vec![("input", *input)],
-        Op::ScatterPositionsVjp { cotangent, .. } => vec![("cotangent", *cotangent)],
+        | Op::Stride { input, .. } => vec![dependency("input", *input)],
+        Op::ScatterPositions { input, .. } => vec![dependency("input", *input)],
+        Op::ScatterPositionsVjp { cotangent, .. } => vec![dependency("cotangent", *cotangent)],
         Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } | Op::Matmul { lhs, rhs } => {
-            vec![("lhs", *lhs), ("rhs", *rhs)]
+            vec![dependency("lhs", *lhs), dependency("rhs", *rhs)]
         }
-        Op::Logical { lhs, rhs, .. } => std::iter::once(("lhs", *lhs))
-            .chain(rhs.iter().copied().map(|id| ("rhs", id)))
+        Op::Logical { lhs, rhs, .. } => std::iter::once(dependency("lhs", *lhs))
+            .chain(rhs.iter().copied().map(|id| dependency("rhs", id)))
             .collect(),
         Op::Select {
             condition,
             on_true,
             on_false,
         } => vec![
-            ("condition", *condition),
-            ("true", *on_true),
-            ("false", *on_false),
+            dependency("condition", *condition),
+            dependency("true", *on_true),
+            dependency("false", *on_false),
         ],
-        Op::Concat { inputs, .. } => inputs.iter().copied().map(|id| ("input", id)).collect(),
-        Op::Gather { input, index, .. } => vec![("input", *input), ("index", *index)],
+        Op::Concat { inputs, .. } => inputs
+            .iter()
+            .copied()
+            .map(|id| dependency("input", id))
+            .collect(),
+        Op::Gather { input, index, .. } => {
+            vec![dependency("input", *input), dependency("index", *index)]
+        }
         Op::Scatter {
             base,
             index,
             updates,
             ..
-        } => vec![("base", *base), ("index", *index), ("updates", *updates)],
-        Op::MaskedSelect { input, mask, .. } => vec![("input", *input), ("mask", *mask)],
-        Op::StaticIndexUpdateGrad { cotangent, .. } => vec![("cotangent", *cotangent)],
+        } => vec![
+            dependency("base", *base),
+            dependency("index", *index),
+            dependency("updates", *updates),
+        ],
+        Op::MaskedSelect { input, mask, .. } => {
+            vec![dependency("input", *input), dependency("mask", *mask)]
+        }
+        Op::Einsum { inputs, .. } => operand_dependencies(inputs),
+        Op::EinsumGrad {
+            upstream, inputs, ..
+        } => std::iter::once(dependency("upstream", *upstream))
+            .chain(operand_dependencies(inputs))
+            .collect(),
+        Op::EinsumGradVjp {
+            cotangent,
+            upstream,
+            inputs,
+            ..
+        } => std::iter::once(dependency("cotangent", *cotangent))
+            .chain(std::iter::once(dependency("upstream", *upstream)))
+            .chain(operand_dependencies(inputs))
+            .collect(),
+        Op::StaticIndexUpdateGrad { cotangent, .. } => vec![dependency("cotangent", *cotangent)],
         _ => return Err(unsupported(op)),
     })
 }
@@ -304,6 +393,26 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("size", size.to_string())
             .field("fill", scalar_name(*fill))
             .field("dynamic_counterpart", "runtime_rank1"),
+        Op::Einsum { plan, .. } => node
+            .field("plan_key", einsum_plan_key(plan))
+            .field("operand_labels", einsum_operand_labels(&plan.operand_labels))
+            .field("output_labels", einsum_labels(&plan.output_labels))
+            .field("contracted_labels", einsum_labels(&plan.contracted_labels)),
+        Op::EinsumGrad { plan, target, .. } => node
+            .field("plan_key", einsum_plan_key(plan))
+            .field("operand_labels", einsum_operand_labels(&plan.operand_labels))
+            .field("output_labels", einsum_labels(&plan.output_labels))
+            .field("contracted_labels", einsum_labels(&plan.contracted_labels))
+            .field("target_operand", target.to_string()),
+        Op::EinsumGradVjp {
+            plan, target, wrt, ..
+        } => node
+            .field("plan_key", einsum_plan_key(plan))
+            .field("operand_labels", einsum_operand_labels(&plan.operand_labels))
+            .field("output_labels", einsum_labels(&plan.output_labels))
+            .field("contracted_labels", einsum_labels(&plan.contracted_labels))
+            .field("target_operand", target.to_string())
+            .field("wrt", wrt.to_string()),
         Op::Detach { .. } | Op::Select { .. } | Op::Matmul { .. } => node,
         _ => return Err(unsupported(op)),
     })

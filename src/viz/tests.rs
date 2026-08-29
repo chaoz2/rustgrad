@@ -34,8 +34,11 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         Err(VizError::MissingEndpoint { .. })
     ));
     let mut graph = Graph::new();
-    let input = graph.input("x", [1]);
-    let unsupported = graph.einsum("i,i->", &[input, input]).unwrap();
+    let input = graph.input("x", [1, 1, 1, 1]);
+    let weight = graph.input("weight", [1, 1, 1, 1]);
+    let unsupported = graph
+        .conv2d(input, weight, None, crate::Conv2dOptions::default())
+        .unwrap();
     assert!(matches!(
         graph_viz(&graph, &[unsupported]),
         Err(VizError::UnsupportedGraphOp(_))
@@ -44,6 +47,50 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn einsum_graph_visualization_preserves_normalized_plan_and_derivative_roles() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2, 3]);
+    let rhs = graph.input("rhs", [3, 4]);
+    let forward = graph.einsum("ij,jk->ik", &[lhs, rhs]).unwrap();
+    let upstream = graph.input("upstream", [2, 4]);
+    let plan = crate::EinsumPlan::parse(
+        "ij,jk->ik",
+        &[Shape::from([2, 3]), Shape::from([3, 4])],
+    )
+    .unwrap();
+    let gradient = graph
+        .einsum_grad(upstream, &[lhs, rhs], plan.clone(), 0)
+        .unwrap();
+    let cotangent = graph.input("cotangent", [2, 3]);
+    let vjp = graph
+        .einsum_grad_vjp(cotangent, upstream, &[lhs, rhs], plan, 0, 1)
+        .unwrap();
+
+    let first = graph_viz(&graph, &[forward, gradient, vjp]).unwrap();
+    let second = graph_viz(&graph, &[forward, gradient, vjp]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=lhs\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=rhs\\nnode=1\\nshape=[3,4]\"];\n  \"g2\" [label=\"einsum\\nkind=graph_op\\ncontracted_labels=[j]\\ndtype=f32\\nnode=2\\noperand_labels=[[i,j],[j,k]]\\noutput_labels=[i,k]\\nplan_key=operands=[[i,j],[j,k]];extents=[i:2,j:3,k:4];output=[i,k];contracted=[j]\\nshape=[2,4]\"];\n  \"g3\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=upstream\\nnode=3\\nshape=[2,4]\"];\n  \"g4\" [label=\"einsum_grad\\nkind=graph_op\\ncontracted_labels=[j]\\ndtype=f32\\nnode=4\\noperand_labels=[[i,j],[j,k]]\\noutput_labels=[i,k]\\nplan_key=operands=[[i,j],[j,k]];extents=[i:2,j:3,k:4];output=[i,k];contracted=[j]\\nshape=[2,3]\\ntarget_operand=0\"];\n  \"g5\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=cotangent\\nnode=5\\nshape=[2,3]\"];\n  \"g6\" [label=\"einsum_grad_vjp\\nkind=graph_op\\ncontracted_labels=[j]\\ndtype=f32\\nnode=6\\noperand_labels=[[i,j],[j,k]]\\noutput_labels=[i,k]\\nplan_key=operands=[[i,j],[j,k]];extents=[i:2,j:3,k:4];output=[i,k];contracted=[j]\\nshape=[3,4]\\ntarget_operand=0\\nwrt=1\"];\n  \"g0\" -> \"g2\" [label=\"data:0:operand_0\"];\n  \"g0\" -> \"g4\" [label=\"data:1:operand_0\"];\n  \"g0\" -> \"g6\" [label=\"data:2:operand_0\"];\n  \"g1\" -> \"g2\" [label=\"data:1:operand_1\"];\n  \"g1\" -> \"g4\" [label=\"data:2:operand_1\"];\n  \"g1\" -> \"g6\" [label=\"data:3:operand_1\"];\n  \"g3\" -> \"g4\" [label=\"data:0:upstream\"];\n  \"g3\" -> \"g6\" [label=\"data:1:upstream\"];\n  \"g5\" -> \"g6\" [label=\"data:0:cotangent\"];\n}\n"
+    );
+
+    let ellipsis_lhs = graph.input("ellipsis_lhs", [2, 3, 4]);
+    let ellipsis_rhs = graph.input("ellipsis_rhs", [4]);
+    let ellipsis = graph
+        .einsum("...i,i->...", &[ellipsis_lhs, ellipsis_rhs])
+        .unwrap();
+    let diagonal = graph.input("diagonal", [3, 3]);
+    let trace = graph.einsum("ii->", &[diagonal]).unwrap();
+    let metadata = format!(
+        "{}{}",
+        graph_viz(&graph, &[ellipsis]).unwrap().to_dot(),
+        graph_viz(&graph, &[trace]).unwrap().to_dot(),
+    );
+    assert!(metadata.contains("...0"));
+    assert!(metadata.contains("operand_labels=[[i,i]]"));
 }
 
 #[test]
