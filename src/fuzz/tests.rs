@@ -739,15 +739,15 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
 fn generated_compare_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
     let mut ops = std::collections::BTreeSet::new();
-    let mut f32 = false;
-    let mut i32 = false;
+    let mut dtypes = std::collections::BTreeSet::new();
     let mut scalar = false;
     let mut empty = false;
     let mut scalar_rhs = false;
     let mut matching_rhs = false;
+    let mut right_aligned_rhs = false;
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index in 0..512 {
+        for index in 0..4096 {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
@@ -756,20 +756,22 @@ fn generated_compare_cases_are_valid_diverse_and_deterministic() {
             };
             found = true;
             ops.insert(op);
-            f32 |= lhs.dtype == DType::F32;
-            i32 |= lhs.dtype == DType::I32;
+            dtypes.insert(lhs.dtype);
             scalar |= lhs.shape.is_empty();
             empty |= lhs.shape.iter().any(|extent| *extent == 0);
             scalar_rhs |= rhs.shape.is_empty();
             matching_rhs |= rhs.shape == lhs.shape;
+            right_aligned_rhs |= !rhs.shape.is_empty()
+                && rhs.shape != lhs.shape
+                && lhs.shape.ends_with(&rhs.shape);
             assert_eq!(lhs.dtype, rhs.dtype);
-            assert!(matches!(lhs.dtype, DType::F32 | DType::I32));
         }
     }
 
     assert!(found);
     assert_eq!(ops.len(), 6);
-    assert!(f32 && i32 && scalar && empty && scalar_rhs && matching_rhs);
+    assert_eq!(dtypes.len(), 13);
+    assert!(scalar && empty && scalar_rhs && matching_rhs && right_aligned_rhs);
 }
 
 #[test]
@@ -2498,6 +2500,180 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
     assert!(matches!(scalarized, FuzzCase::Compare { ref lhs, ref rhs, .. }
         if lhs.shape.is_empty() && rhs.shape.is_empty()));
     scalarized.validate().unwrap();
+}
+
+#[test]
+fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths() {
+    let dtypes = [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+    let operations = [
+        (FuzzCompareOp::Eq, CompareOp::Eq),
+        (FuzzCompareOp::Ne, CompareOp::Ne),
+        (FuzzCompareOp::Lt, CompareOp::Lt),
+        (FuzzCompareOp::Le, CompareOp::Le),
+        (FuzzCompareOp::Gt, CompareOp::Gt),
+        (FuzzCompareOp::Ge, CompareOp::Ge),
+    ];
+
+    for dtype in dtypes {
+        let lane_values = |right| -> Vec<Scalar> {
+            match dtype {
+                DType::Bool => (if right {
+                    [true, false, true]
+                } else {
+                    [false, true, false]
+                })
+                    .into_iter()
+                    .cycle()
+                    .take(if right { 3 } else { 6 })
+                    .map(Scalar::Bool)
+                    .collect(),
+                DType::I8 | DType::I16 | DType::I32 => (if right {
+                    [0, -1, 1]
+                } else {
+                    [-1, 0, 1]
+                })
+                    .into_iter()
+                    .cycle()
+                    .take(if right { 3 } else { 6 })
+                    .map(Scalar::I)
+                    .collect(),
+                DType::U8 | DType::U16 | DType::U32 => (if right {
+                    [1_u64, 0, 2]
+                } else {
+                    [0, 1, 2]
+                })
+                    .into_iter()
+                    .cycle()
+                    .take(if right { 3 } else { 6 })
+                    .map(Scalar::U)
+                    .collect(),
+                DType::I64 => (if right {
+                    [-(1_i64 << 53), -((1_i64 << 53) + 1), i64::MIN]
+                } else {
+                    [-((1_i64 << 53) + 1), -(1_i64 << 53), i64::MAX]
+                })
+                .into_iter()
+                .cycle()
+                .take(if right { 3 } else { 6 })
+                .map(Scalar::I)
+                .collect(),
+                DType::U64 => (if right {
+                    [1_u64 << 53, (1_u64 << 53) + 1, 0]
+                } else {
+                    [(1_u64 << 53) + 1, 1_u64 << 53, u64::MAX]
+                })
+                    .into_iter()
+                    .cycle()
+                    .take(if right { 3 } else { 6 })
+                    .map(Scalar::U)
+                    .collect(),
+                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => (if right {
+                    [f64::NAN, 0.0, f64::NEG_INFINITY]
+                } else {
+                    [f64::NAN, -0.0, f64::INFINITY]
+                })
+                .into_iter()
+                .cycle()
+                .take(if right { 3 } else { 6 })
+                .map(Scalar::F)
+                .collect(),
+            }
+        };
+        let lhs = FuzzTensor::from_tensor(
+            &TensorData::from_scalars([2, 1, 3], dtype, lane_values(false)).unwrap(),
+        );
+        let rhs = FuzzTensor::from_tensor(
+            &TensorData::from_scalars([1, 3], dtype, lane_values(true)).unwrap(),
+        );
+
+        for (op, graph_op) in operations {
+            let case = FuzzCase::Compare {
+                op,
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+            };
+            let value = serde_json::to_value(&case).unwrap();
+            assert_eq!(value["kind"], "compare");
+            assert_eq!(serde_json::from_value::<FuzzCase>(value).unwrap(), case);
+            let built = case.build().unwrap();
+            assert_eq!(built.graph.dtype(built.output).unwrap(), DType::Bool);
+            assert_eq!(built.graph.shape(built.output).unwrap(), &crate::Shape::from([2, 1, 3]));
+            assert!(matches!(built.graph.op(built.output).unwrap(), Op::Compare { op: actual, .. } if *actual == graph_op));
+            let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(
+                crate::execute_elementwise(&built.graph, built.output, &built.oracle)
+                    .unwrap()
+                    .storage(),
+                oracle.storage(),
+                "captured {dtype:?} {op:?}",
+            );
+            let scheduled = schedule(&built.graph, built.output).unwrap();
+            assert!(scheduled.items[0]
+                .kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|node| matches!(node.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op)));
+            let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+            let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
+            if matches!(dtype, DType::F16 | DType::BF16) {
+                assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+                assert!(scalar.source.contains("rg_f"), "{dtype:?}");
+            } else if matches!(dtype, DType::F32 | DType::I32) {
+                assert!(vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            }
+            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let bytes = captured.to_bytes().unwrap();
+            assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        }
+    }
+
+    let artifact_case = FuzzCase::Compare {
+        op: FuzzCompareOp::Gt,
+        lhs: FuzzTensor::from_tensor(
+            &TensorData::from_scalars([2], DType::U64, [Scalar::U((1_u64 << 53) + 1), Scalar::U(0)]).unwrap(),
+        ),
+        rhs: FuzzTensor::from_tensor(
+            &TensorData::scalar_with_dtype(Scalar::U(1_u64 << 53), DType::U64),
+        ),
+    };
+    let built = artifact_case.build().unwrap();
+    let expected = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let artifact = FuzzFailureArtifact::new(
+        19,
+        31,
+        artifact_case.clone(),
+        FuzzPath::NativeVector,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&expected),
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic wide comparison mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&artifact_case, |candidate| {
+        matches!(candidate, FuzzCase::Compare { lhs, rhs, op: FuzzCompareOp::Gt }
+            if lhs.bytes == vec![0; 16] && rhs.bytes == vec![0; 8])
+    });
+    assert!(matches!(zeroed, FuzzCase::Compare { ref lhs, ref rhs, op: FuzzCompareOp::Gt }
+        if lhs.dtype == DType::U64 && rhs.dtype == DType::U64
+            && lhs.shape == vec![2] && rhs.shape.is_empty()));
 }
 
 #[test]

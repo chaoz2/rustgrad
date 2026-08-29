@@ -277,15 +277,41 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             }
         }
         7 => {
-            // Raw GraphCompare is portable for F32 and small I32 through the
-            // CPU oracle, captured elementwise lowering, and strict native
-            // replay. A scalar RHS deliberately exercises right broadcasting.
-            let dtype = [DType::F32, DType::I32][rng.pick(2)];
-            let shape = static_shape(&mut rng);
-            let rhs_shape = if rng.pick(2) == 0 {
-                vec![]
-            } else {
-                shape.clone()
+            // Raw GraphCompare is homogeneous here: CPU, captured UOps, and
+            // C compare each stored kind directly, including I64/U64 rather
+            // than projecting through f64. Exercise scalar, equal, and
+            // right-aligned broadcast geometry without source promotion.
+            let dtype = [
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ][rng.pick(13)];
+            let shape = [
+                vec![],
+                vec![0],
+                vec![1],
+                vec![3],
+                vec![2, 3],
+                vec![0, 3],
+                vec![2, 1, 3],
+                vec![0, 1, 3],
+            ][rng.pick(8)]
+            .clone();
+            let rhs_shape = match rng.pick(3) {
+                0 => vec![],
+                1 => shape.clone(),
+                _ if shape.len() >= 2 => vec![1, *shape.last().unwrap()],
+                _ => shape.clone(),
             };
             let op = [
                 FuzzCompareOp::Eq,
