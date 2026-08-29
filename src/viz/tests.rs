@@ -56,6 +56,34 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
 }
 
 #[test]
+fn static_index_graph_visualization_preserves_normalized_output_geometry() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [3, 4]);
+    let indexed = graph
+        .static_index(
+            input,
+            &[
+                crate::ir::indexing::StaticIndex::Slice {
+                    start: Some(-3),
+                    stop: None,
+                    step: 2,
+                },
+                crate::ir::indexing::StaticIndex::Advanced {
+                    shape: Shape::from([2]),
+                    values: vec![1, 1],
+                },
+            ],
+        )
+        .unwrap();
+    let first = graph_viz(&graph, &[indexed]).unwrap();
+    assert_eq!(first, graph_viz(&graph, &[indexed]).unwrap());
+    let dot = first.to_dot();
+    assert!(dot.contains("static_index\\nkind=graph_op"));
+    assert!(dot.contains("index_shape=[2,2]"));
+    assert!(dot.contains("data:0:input"));
+}
+
+#[test]
 fn reduction_derivative_graph_visualization_preserves_axes_and_sum_to_target() {
     let mut graph = Graph::new();
     let input = graph.input("input", [2, 3, 4]);

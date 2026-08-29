@@ -305,6 +305,12 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
             dependency("input", *input),
             dependency("upstream", *upstream),
         ],
+        Op::StaticIndex { input, .. } => vec![dependency("input", *input)],
+        Op::StaticIndexGrad { cotangent, .. } => vec![dependency("cotangent", *cotangent)],
+        Op::StaticIndexUpdate { base, value, .. } => {
+            vec![dependency("base", *base), dependency("value", *value)]
+        }
+        Op::StaticIndexUpdateGrad { cotangent, .. } => vec![dependency("cotangent", *cotangent)],
         Op::Conv2d {
             input, weight, bias, ..
         }
@@ -341,7 +347,6 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
             bias,
             ..
         } => convolution_gradient_vjp_dependencies(*cotangent, *upstream, *input, *weight, *bias),
-        Op::StaticIndexUpdateGrad { cotangent, .. } => vec![dependency("cotangent", *cotangent)],
         _ => return Err(unsupported(op)),
     })
 }
@@ -562,6 +567,26 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("keepdim", keepdim.to_string())
             .field("wrt", wrt.to_string()),
         Op::SumTo { shape, .. } => node.field("target_shape", shape_name(shape)),
+        Op::StaticIndex { plan, .. } => node.field("index_shape", shape_name(plan.output_shape())),
+        Op::StaticIndexGrad {
+            input_shape, plan, ..
+        } => node
+            .field("input_shape", shape_name(input_shape))
+            .field("index_shape", shape_name(plan.output_shape())),
+        Op::StaticIndexUpdate { plan, .. } => {
+            node.field("index_shape", shape_name(plan.output_shape()))
+        }
+        Op::StaticIndexUpdateGrad {
+            base_shape,
+            value_shape,
+            plan,
+            wrt,
+            ..
+        } => node
+            .field("base_shape", shape_name(base_shape))
+            .field("value_shape", shape_name(value_shape))
+            .field("index_shape", shape_name(plan.output_shape()))
+            .field("wrt", format!("{wrt:?}")),
         Op::Conv2d { options, .. } => conv2d_geometry(node, *options),
         Op::Conv2dGrad {
             options, target, ..
