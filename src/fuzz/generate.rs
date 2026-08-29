@@ -93,18 +93,19 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
         }
         1 => {
             let shape = static_shape(&mut rng);
-            let dtype = if rng.pick(2) == 0 {
-                DType::F32
-            } else {
-                DType::I32
-            };
+            let dtype = [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64][rng.pick(13)];
             let false_shape = if rng.pick(2) == 0 {
                 vec![]
             } else {
                 shape.clone()
             };
+            let condition_shape = match rng.pick(3) {
+                0 => vec![],
+                1 if shape.len() >= 2 => vec![1, *shape.last().unwrap()],
+                _ => shape.clone(),
+            };
             FuzzCase::Select {
-                condition: tensor(&mut rng, shape.clone(), DType::Bool),
+                condition: tensor(&mut rng, condition_shape, DType::Bool),
                 on_true: tensor(&mut rng, shape.clone(), dtype),
                 on_false: tensor(&mut rng, false_shape, dtype),
             }

@@ -744,6 +744,32 @@ fn generated_tensor_t_cases_are_valid_diverse_and_deterministic() {
 }
 
 #[test]
+fn generated_select_cases_cover_homogeneous_dtypes_and_broadcasts() {
+    let mut dtypes = std::collections::BTreeSet::new();
+    let mut scalar_condition = false;
+    let mut scalar_branch = false;
+    let mut aligned_condition = false;
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..1024 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Select { condition, on_true, on_false } = case else { continue };
+            assert_eq!(on_true.dtype, on_false.dtype);
+            assert_eq!(condition.dtype, DType::Bool);
+            dtypes.insert(on_true.dtype);
+            scalar_condition |= condition.shape.is_empty();
+            scalar_branch |= on_false.shape.is_empty();
+            aligned_condition |= condition.shape.len() == 2 && condition.shape[0] == 1;
+            let built = FuzzCase::Select { condition, on_true, on_false }.build().unwrap();
+            assert!(matches!(built.graph.op(built.output).unwrap(), Op::Select { .. }));
+        }
+    }
+    assert_eq!(dtypes.len(), 13);
+    assert!(scalar_condition && scalar_branch && aligned_condition);
+}
+
+#[test]
 fn generated_pad_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
     let mut dtypes = std::collections::BTreeSet::new();
