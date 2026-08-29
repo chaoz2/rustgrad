@@ -1,4 +1,4 @@
-use super::{FuzzBinaryOp, FuzzCase, FuzzReduction, FuzzTensor};
+use super::{FuzzBinaryOp, FuzzCase, FuzzReduction, FuzzTensor, FuzzUnaryOp};
 use crate::{DType, Scalar, Storage, TensorData};
 
 fn tensor(shape: impl Into<Vec<usize>>, storage: Storage) -> FuzzTensor {
@@ -52,6 +52,18 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             reduction: FuzzReduction::Product,
             axis: 1,
             keepdim: true,
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Abs,
+            input: tensor(
+                vec![4],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::NEG_INFINITY,
+                    2.0,
+                ]),
+            ),
         },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),

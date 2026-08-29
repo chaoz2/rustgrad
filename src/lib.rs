@@ -106,6 +106,7 @@ pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompo
 pub use fuzz::{
     FuzzArtifactError, FuzzBinaryOp, FuzzCampaign, FuzzCase, FuzzComparison, FuzzComparisonPolicy,
     FuzzConfig, FuzzFailureArtifact, FuzzOutcome, FuzzPath, FuzzReduction, FuzzTensor,
+    FuzzUnaryOp,
     generate_case, minimize_case, regression_cases, replay_failure, run_campaign, run_case,
 };
 pub use gradcheck::{

@@ -51,6 +51,10 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
             lhs: lhs.zeroed(),
             rhs: rhs.zeroed(),
         },
+        FuzzCase::Unary { op, input } => FuzzCase::Unary {
+            op: *op,
+            input: input.zeroed(),
+        },
     }
 }
 
@@ -73,6 +77,10 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
         FuzzCase::Cast { input, to } => Some(FuzzCase::Cast {
             input: input.scalar_prefix()?,
             to: *to,
+        }),
+        FuzzCase::Unary { op, input } => Some(FuzzCase::Unary {
+            op: *op,
+            input: input.scalar_prefix()?,
         }),
         _ => None,
     }

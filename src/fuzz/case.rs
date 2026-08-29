@@ -1,6 +1,6 @@
 use crate::{
     Backend, BinaryOp, CpuBackend, DType, Graph, NodeId, ReduceKind, Scalar, Shape, Storage,
-    TensorData,
+    TensorData, UnaryOp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -16,6 +16,13 @@ pub enum FuzzBinaryOp {
     Sub,
     Mul,
     Maximum,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzUnaryOp {
+    Neg,
+    Abs,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,6 +185,10 @@ pub enum FuzzCase {
         lhs: FuzzTensor,
         rhs: FuzzTensor,
     },
+    Unary {
+        op: FuzzUnaryOp,
+        input: FuzzTensor,
+    },
 }
 
 pub(super) struct BuiltCase {
@@ -204,7 +215,8 @@ impl FuzzCase {
             } => vec![condition, on_true, on_false],
             Self::Cast { input, .. }
             | Self::AffineView { input, .. }
-            | Self::Reduction { input, .. } => vec![input],
+            | Self::Reduction { input, .. }
+            | Self::Unary { input, .. } => vec![input],
         }
     }
 
@@ -304,6 +316,18 @@ impl FuzzCase {
                 let lhs = bind(&mut graph, "lhs", lhs)?;
                 let rhs = bind(&mut graph, "rhs", rhs)?;
                 graph.matmul(lhs, rhs).map_err(|error| error.to_string())?
+            }
+            Self::Unary { op, input } => {
+                let input = bind(&mut graph, "input", input)?;
+                match op {
+                    FuzzUnaryOp::Neg => graph.neg(input),
+                    // `Graph::abs` is the source-level sign/mul composition.
+                    // This portable fuzz family instead exercises the existing
+                    // direct GraphUnary Abs path shared by captured/native
+                    // replay, just as Neg does for its numeric inputs.
+                    FuzzUnaryOp::Abs => graph.unary(UnaryOp::Abs, input),
+                }
+                .map_err(|error| error.to_string())?
             }
         };
         let oracle = ordered.clone().into_iter().collect();

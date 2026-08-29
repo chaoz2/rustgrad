@@ -1,4 +1,4 @@
-use super::{FuzzBinaryOp, FuzzCase, FuzzReduction, FuzzTensor};
+use super::{FuzzBinaryOp, FuzzCase, FuzzReduction, FuzzTensor, FuzzUnaryOp};
 use crate::{DType, Scalar, Shape, TensorData};
 
 #[derive(Clone, Copy)]
@@ -43,7 +43,7 @@ fn static_shape(rng: &mut SplitMix64) -> Vec<usize> {
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(7) {
+    match rng.pick(8) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = if rng.pick(2) == 0 {
@@ -153,6 +153,18 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 lhs: tensor(&mut rng, lhs_shape, dtype),
                 rhs: tensor(&mut rng, rhs_shape, dtype),
                 axis,
+            }
+        }
+        6 => {
+            // Direct GraphUnary Neg/Abs have a complete bounded CPU,
+            // captured, and strict-native path for F32 and small I32 lanes.
+            // Do not claim Bool/narrow-float coverage through this raw path.
+            let dtype = [DType::F32, DType::I32][rng.pick(2)];
+            let op = [FuzzUnaryOp::Neg, FuzzUnaryOp::Abs][rng.pick(2)];
+            let shape = static_shape(&mut rng);
+            FuzzCase::Unary {
+                op,
+                input: tensor(&mut rng, shape, dtype),
             }
         }
         _ => {

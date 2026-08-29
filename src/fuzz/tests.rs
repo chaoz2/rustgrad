@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Backend, CpuBackend, DType, Scalar, Storage, TensorData};
+use crate::{Backend, CpuBackend, DType, Op, Scalar, Storage, TensorData, UnaryOp};
 use std::{
     fs::{self, File},
     sync::atomic::{AtomicU64, Ordering},
@@ -140,6 +140,133 @@ fn generated_concat_cases_are_valid_diverse_and_deterministic() {
 }
 
 #[test]
+fn generated_unary_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut neg = false;
+    let mut abs = false;
+    let mut f32 = false;
+    let mut i32 = false;
+    let mut scalar = false;
+    let mut empty = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..256 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Unary { op, input } = case else {
+                continue;
+            };
+            found = true;
+            neg |= op == FuzzUnaryOp::Neg;
+            abs |= op == FuzzUnaryOp::Abs;
+            f32 |= input.dtype == DType::F32;
+            i32 |= input.dtype == DType::I32;
+            scalar |= input.shape.is_empty();
+            empty |= input.shape.iter().any(|extent| *extent == 0);
+            assert!(matches!(input.dtype, DType::F32 | DType::I32));
+        }
+    }
+
+    assert!(found);
+    assert!(neg && abs);
+    assert!(f32 && i32);
+    assert!(scalar && empty);
+}
+
+#[test]
+fn unary_cases_round_trip_minimize_and_build_as_direct_graph_unaries() {
+    let unary = FuzzCase::Unary {
+        op: FuzzUnaryOp::Abs,
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [2],
+                Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001)]),
+            )
+            .unwrap(),
+        ),
+    };
+    let value = serde_json::to_value(&unary).unwrap();
+    assert_eq!(value["kind"], "unary");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), unary);
+    let mut unknown = value;
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    let legacy = regression_cases().remove(0);
+    let legacy_value = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(legacy_value["kind"], "binary");
+    assert_eq!(serde_json::from_value::<FuzzCase>(legacy_value).unwrap(), legacy);
+
+    let built = unary.build().unwrap();
+    assert!(matches!(
+        built.graph.op(built.output).unwrap(),
+        Op::Unary {
+            op: UnaryOp::Abs,
+            ..
+        }
+    ));
+    let negated = FuzzCase::Unary {
+        op: FuzzUnaryOp::Neg,
+        input: match &unary {
+            FuzzCase::Unary { input, .. } => input.clone(),
+            _ => unreachable!("constructed as unary"),
+        },
+    };
+    let negated = negated.build().unwrap();
+    assert!(matches!(
+        negated.graph.op(negated.output).unwrap(),
+        Op::Unary {
+            op: UnaryOp::Neg,
+            ..
+        }
+    ));
+    let expected = FuzzOutcome::value(
+        &CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap(),
+    );
+    let artifact = FuzzFailureArtifact::new(
+        7,
+        11,
+        unary.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        expected,
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic unary mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+
+    let zeroed = minimize_case(&unary, |candidate| {
+        matches!(candidate, FuzzCase::Unary { input, .. }
+            if input.shape.as_slice() == [2] && input.bytes == vec![0; 8])
+    });
+    assert!(matches!(
+        zeroed,
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Abs,
+            ref input,
+        } if input.bytes == vec![0; 8]
+    ));
+    let scalarized = minimize_case(&unary, |_| true);
+    assert!(matches!(
+        scalarized,
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Abs,
+            ref input,
+        } if input.shape.is_empty() && input.bytes == vec![0; 4]
+    ));
+    scalarized.validate().unwrap();
+}
+
+#[test]
 fn fixed_campaigns_match_interpreter_and_strict_native() {
     let interpreter = run_campaign(FuzzConfig {
         seed: 7,
@@ -194,7 +321,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 9);
+    assert_eq!(cases.len(), 10);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(
