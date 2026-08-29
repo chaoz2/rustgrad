@@ -1049,17 +1049,32 @@ mod tests {
     fn unfold_matches_tinygrad_window_geometry_and_preflights() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
-        let output = graph.unfold(input, -1, 2, 2).unwrap();
+        let output = graph.unfold_tinygrad(input, -1, 2, 2).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 2, 2]));
         assert_eq!(
             execute(&graph, output, TensorData::new([2, 5], (0..10).map(|x| x as f32).collect()).unwrap()).to_vec_f64(),
             vec![0., 1., 2., 3., 5., 6., 7., 8.]
         );
+        assert!(graph.grad(graph.sum_all(output).unwrap(), input).is_ok());
         let mut invalid = Graph::new();
         let source = invalid.input("x", [3]);
         let nodes = invalid.node_count();
         assert!(invalid.unfold(source, 0, 4, 1).is_err());
         assert_eq!(invalid.node_count(), nodes);
+
+        let zero = graph.input_dtype("zero", [0], DType::I16);
+        let zero_output = graph.unfold_tinygrad(zero, 0, 0, 1).unwrap();
+        assert_eq!(graph.shape(zero_output).unwrap(), &Shape::new([1, 0]));
+        assert_eq!(graph.dtype(zero_output).unwrap(), DType::I16);
+
+        let scalar = invalid.input("scalar", []);
+        let before = invalid.node_count();
+        assert!(invalid.unfold_tinygrad(scalar, 0, 0, 1).is_err());
+        assert_eq!(invalid.node_count(), before);
+        assert!(invalid.unfold_tinygrad(source, 0, -1, 1).is_err());
+        assert!(invalid.unfold_tinygrad(source, 0, 1, 0).is_err());
+        assert!(invalid.unfold_tinygrad(source, 1, 1, 1).is_err());
+        assert_eq!(invalid.node_count(), before);
     }
 
     #[test]
@@ -2722,7 +2737,14 @@ impl Graph {
         output_dims[axis] = windows;
         output_dims.push(size);
         let output_shape = Shape::new(output_dims);
-        for (candidate, candidate_dtype) in [(&shape, dtype), (&output_shape, dtype)] {
+        let mut window_dims = shape.dims().to_vec();
+        window_dims[axis] = size;
+        let window_shape = Shape::new(window_dims);
+        let mut stacked_dims = window_shape.dims().to_vec();
+        stacked_dims.insert(axis, windows);
+        let stacked_shape = Shape::new(stacked_dims);
+        for candidate in [&shape, &window_shape, &stacked_shape, &output_shape] {
+            let candidate_dtype = dtype;
             candidate.numel()?.checked_mul(candidate_dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(candidate.clone()))?;
         }
         let bounds = (0..windows)
@@ -2742,6 +2764,38 @@ impl Graph {
         let windows = bounds.into_iter().map(|bound| self.shrink(input, bound)).collect::<Result<Vec<_>>>()?;
         let stacked = self.stack(windows, axis as isize)?;
         self.permute(stacked, permutation)
+    }
+
+    /// Exact signed-control tinygrad `Tensor.unfold(dim, size, step)` surface.
+    ///
+    /// The existing [`Self::unfold`] remains a backward-compatible unsigned
+    /// movement helper; this wrapper represents Python's negative controls so
+    /// they reject before any view is published.
+    pub fn unfold_tinygrad(
+        &mut self,
+        input: NodeId,
+        dim: isize,
+        size: isize,
+        step: isize,
+    ) -> Result<NodeId> {
+        self.node(input)?;
+        if size < 0 {
+            return Err(Error::InvalidRandom {
+                reason: "unfold size must be non-negative",
+            });
+        }
+        if step <= 0 {
+            return Err(Error::InvalidRandom {
+                reason: "unfold step must be positive",
+            });
+        }
+        let size = usize::try_from(size).map_err(|_| Error::InvalidRandom {
+            reason: "unfold size does not fit graph extents",
+        })?;
+        let step = usize::try_from(step).map_err(|_| Error::InvalidRandom {
+            reason: "unfold step does not fit graph extents",
+        })?;
+        self.unfold(input, dim, size, step)
     }
 
     /// Internal `_one_hot_along_dim` Bool predicate used by tinygrad loss
