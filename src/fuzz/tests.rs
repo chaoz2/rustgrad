@@ -1239,11 +1239,9 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
 #[test]
 fn generated_scatter_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
-    let mut replace_f32 = false;
-    let mut replace_i32 = false;
-    let mut replace_f16 = false;
-    let mut replace_bool = false;
+    let mut replace_dtypes = std::collections::BTreeSet::new();
     let mut add_f32 = false;
+    let mut add_f64 = false;
     let mut index_i32 = false;
     let mut index_i64 = false;
     let mut zero_axis = false;
@@ -1252,7 +1250,7 @@ fn generated_scatter_cases_are_valid_diverse_and_deterministic() {
     let mut axes = std::collections::BTreeSet::new();
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index_number in 0..512 {
+        for index_number in 0..1024 {
             let case = generate_case(seed, index_number);
             assert_eq!(case, generate_case(seed, index_number));
             case.validate().unwrap();
@@ -1301,23 +1299,19 @@ fn generated_scatter_cases_are_valid_diverse_and_deterministic() {
             index_i32 |= index.dtype == DType::I32;
             index_i64 |= index.dtype == DType::I64;
             match op {
-                FuzzScatterOp::Replace => match base.dtype {
-                    DType::F32 => replace_f32 = true,
-                    DType::I32 => replace_i32 = true,
-                    DType::F16 => replace_f16 = true,
-                    DType::Bool => replace_bool = true,
-                    _ => unreachable!("replacement generator selects movement dtypes only"),
-                },
+                FuzzScatterOp::Replace => { replace_dtypes.insert(base.dtype); },
                 FuzzScatterOp::Add => {
-                    assert_eq!(base.dtype, DType::F32);
-                    add_f32 = true;
+                    assert!(matches!(base.dtype, DType::F32 | DType::F64));
+                    add_f32 |= base.dtype == DType::F32;
+                    add_f64 |= base.dtype == DType::F64;
                 }
             }
         }
     }
 
     assert!(found);
-    assert!(replace_f32 && replace_i32 && replace_f16 && replace_bool && add_f32);
+    assert_eq!(replace_dtypes.len(), 13);
+    assert!(add_f32 && add_f64);
     assert!(index_i32 && index_i64 && zero_axis && empty && duplicate);
     assert!(axes.contains(&(1, 0)) && axes.iter().any(|(rank, axis)| *rank >= 2 && *axis == 1));
 }
@@ -1358,6 +1352,13 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
                 &TensorData::from_storage([1, 3], Storage::F32(vec![0.25, 0.5, 4.0])).unwrap(),
             ),
             axis: 1,
+            op: FuzzScatterOp::Add,
+        },
+        FuzzCase::Scatter {
+            base: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F64(vec![1.0, 10.0])).unwrap()),
+            index: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I64(vec![1, 1])).unwrap()),
+            updates: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F64(vec![0.5, 4.0])).unwrap()),
+            axis: 0,
             op: FuzzScatterOp::Add,
         },
         FuzzCase::Scatter {

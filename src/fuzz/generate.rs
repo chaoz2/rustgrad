@@ -318,15 +318,15 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
         }
         13 => {
             // Raw Scatter is a self-contained homogeneous movement kernel.
-            // Replacement covers every portable movement dtype; Add stays
-            // F32 because the plan intentionally rejects narrow/integer add.
+            // Replacement covers every portable movement dtype; Add is the
+            // explicitly portable F32/F64 raw arithmetic subset.
             let rank = 1 + rng.pick(3);
             let axis = rng.pick(rank);
             let op = [FuzzScatterOp::Replace, FuzzScatterOp::Add][rng.pick(2)];
             let dtype = if op == FuzzScatterOp::Add {
-                DType::F32
+                [DType::F32, DType::F64][rng.pick(2)]
             } else {
-                [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)]
+                [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64][rng.pick(13)]
             };
             let base_shape = (0..rank)
                 .map(|_| [0, 1, 2, 3][rng.pick(4)])

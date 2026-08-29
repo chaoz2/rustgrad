@@ -531,13 +531,12 @@ impl FuzzCase {
                 if !matches!(index.dtype, DType::I32 | DType::I64) {
                     return Err("raw fuzz scatter index dtype must be I32 or I64".into());
                 }
-                if !matches!(base.dtype, DType::F32 | DType::I32 | DType::F16 | DType::Bool)
-                    || updates.dtype != base.dtype
+                if updates.dtype != base.dtype
                 {
                     return Err("raw fuzz scatter requires homogeneous portable data dtypes".into());
                 }
-                if *op == FuzzScatterOp::Add && base.dtype != DType::F32 {
-                    return Err("raw fuzz scatter_add is portable for F32 only".into());
+                if *op == FuzzScatterOp::Add && !matches!(base.dtype, DType::F32 | DType::F64) {
+                    return Err("raw fuzz scatter_add is portable for F32/F64 only".into());
                 }
                 if base.shape.is_empty()
                     || index.shape.len() != base.shape.len()
