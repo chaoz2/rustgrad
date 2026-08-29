@@ -43,6 +43,14 @@ pub enum FuzzLogicalOp {
     Or,
 }
 
+/// Closed raw movement scatter modes with a complete portable fuzz path.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzScatterOp {
+    Replace,
+    Add,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FuzzReduction {
@@ -233,6 +241,13 @@ pub enum FuzzCase {
         index: FuzzTensor,
         axis: usize,
     },
+    Scatter {
+        base: FuzzTensor,
+        index: FuzzTensor,
+        updates: FuzzTensor,
+        axis: usize,
+        op: FuzzScatterOp,
+    },
 }
 
 pub(super) struct BuiltCase {
@@ -259,6 +274,12 @@ impl FuzzCase {
                 index: rhs,
                 ..
             } => vec![lhs, rhs],
+            Self::Scatter {
+                base,
+                index,
+                updates,
+                ..
+            } => vec![base, index, updates],
             Self::Select {
                 condition,
                 on_true,
@@ -464,6 +485,59 @@ impl FuzzCase {
                 graph
                     .gather(input, index, *axis)
                     .map_err(|error| error.to_string())?
+            }
+            Self::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                op,
+            } => {
+                if !matches!(index.dtype, DType::I32 | DType::I64) {
+                    return Err("raw fuzz scatter index dtype must be I32 or I64".into());
+                }
+                if !matches!(base.dtype, DType::F32 | DType::I32 | DType::F16 | DType::Bool)
+                    || updates.dtype != base.dtype
+                {
+                    return Err("raw fuzz scatter requires homogeneous portable data dtypes".into());
+                }
+                if *op == FuzzScatterOp::Add && base.dtype != DType::F32 {
+                    return Err("raw fuzz scatter_add is portable for F32 only".into());
+                }
+                if base.shape.is_empty()
+                    || index.shape.len() != base.shape.len()
+                    || updates.shape.len() != index.shape.len()
+                    || *axis >= base.shape.len()
+                    || base
+                        .shape
+                        .iter()
+                        .zip(&index.shape)
+                        .enumerate()
+                        .any(|(dimension, (base, index))| dimension != *axis && index > base)
+                    || updates
+                        .shape
+                        .iter()
+                        .zip(&index.shape)
+                        .any(|(update, index)| update < index)
+                {
+                    return Err("invalid raw fuzz scatter geometry".into());
+                }
+                let extent = base.shape[*axis];
+                let index_value = index.to_tensor()?;
+                if (0..index_value.len()).any(|position| match index_value.scalar_at(position) {
+                    Scalar::I(value) => usize::try_from(value).map_or(true, |value| value >= extent),
+                    _ => true,
+                }) {
+                    return Err("raw fuzz scatter index is negative or out of range".into());
+                }
+                let base = bind(&mut graph, "base", base)?;
+                let index = bind(&mut graph, "index", index)?;
+                let updates = bind(&mut graph, "updates", updates)?;
+                match op {
+                    FuzzScatterOp::Replace => graph.scatter(base, index, updates, *axis),
+                    FuzzScatterOp::Add => graph.scatter_add(base, index, updates, *axis),
+                }
+                .map_err(|error| error.to_string())?
             }
         };
         let oracle = ordered.clone().into_iter().collect();

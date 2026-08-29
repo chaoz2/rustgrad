@@ -1,6 +1,6 @@
 use super::{
     FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzTensor,
-    FuzzUnaryOp,
+    FuzzScatterOp, FuzzUnaryOp,
 };
 use crate::{DType, Scalar, Storage, TensorData};
 
@@ -186,6 +186,38 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             input: tensor(vec![3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])),
             index: tensor(vec![3], Storage::I32(vec![1, 0, 2])),
             axis: 0,
+        },
+        FuzzCase::Scatter {
+            // Row-major later duplicate updates replace the earlier lane.
+            base: tensor(vec![1, 4], Storage::F32(vec![10.0, 20.0, 30.0, 40.0])),
+            index: tensor(vec![1, 3], Storage::I32(vec![2, 1, 2])),
+            updates: tensor(vec![1, 3], Storage::F32(vec![1.0, 2.0, 3.0])),
+            axis: 1,
+            op: FuzzScatterOp::Replace,
+        },
+        FuzzCase::Scatter {
+            // Raw Add follows the same row-major duplicate order.
+            base: tensor(vec![1, 3], Storage::F32(vec![1.0, 10.0, 100.0])),
+            index: tensor(vec![1, 3], Storage::I32(vec![1, 1, 1])),
+            updates: tensor(vec![1, 3], Storage::F32(vec![0.25, 0.5, 4.0])),
+            axis: 1,
+            op: FuzzScatterOp::Add,
+        },
+        FuzzCase::Scatter {
+            // I64 indices and a zero scatter axis remain a valid empty plan.
+            base: tensor(vec![2, 0], Storage::I32(vec![])),
+            index: tensor(vec![2, 0], Storage::I64(vec![])),
+            updates: tensor(vec![2, 0], Storage::I32(vec![])),
+            axis: 1,
+            op: FuzzScatterOp::Replace,
+        },
+        FuzzCase::Scatter {
+            // Replacement preserves payload bits without scalar conversion.
+            base: tensor(vec![3], Storage::F32(vec![0.0, 1.0, 2.0])),
+            index: tensor(vec![3], Storage::I32(vec![2, 0, 1])),
+            updates: tensor(vec![3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])),
+            axis: 0,
+            op: FuzzScatterOp::Replace,
         },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),

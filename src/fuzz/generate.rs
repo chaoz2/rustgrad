@@ -1,6 +1,6 @@
 use super::{
     FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzTensor,
-    FuzzUnaryOp,
+    FuzzScatterOp, FuzzUnaryOp,
 };
 use crate::{DType, Scalar, Shape, TensorData};
 
@@ -66,7 +66,7 @@ fn gather_index(
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(14) {
+    match rng.pick(15) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = if rng.pick(2) == 0 {
@@ -296,6 +296,49 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 input: tensor(&mut rng, input_shape, dtype),
                 index,
                 axis,
+            }
+        }
+        13 => {
+            // Raw Scatter is a self-contained homogeneous movement kernel.
+            // Replacement covers every portable movement dtype; Add stays
+            // F32 because the plan intentionally rejects narrow/integer add.
+            let rank = 1 + rng.pick(3);
+            let axis = rng.pick(rank);
+            let op = [FuzzScatterOp::Replace, FuzzScatterOp::Add][rng.pick(2)];
+            let dtype = if op == FuzzScatterOp::Add {
+                DType::F32
+            } else {
+                [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)]
+            };
+            let base_shape = (0..rank)
+                .map(|_| [0, 1, 2, 3][rng.pick(4)])
+                .collect::<Vec<_>>();
+            let mut index_shape = Vec::with_capacity(rank);
+            for dimension in 0..rank {
+                if dimension == axis {
+                    let source = base_shape[dimension];
+                    index_shape.push(if source == 0 { 0 } else { rng.pick(4) });
+                } else {
+                    index_shape.push(rng.pick(base_shape[dimension] + 1));
+                }
+            }
+            let updates_shape = index_shape
+                .iter()
+                .map(|extent| extent + rng.pick(2))
+                .collect::<Vec<_>>();
+            let index_dtype = [DType::I32, DType::I64][rng.pick(2)];
+            let index = gather_index(
+                &mut rng,
+                index_shape,
+                base_shape[axis],
+                index_dtype,
+            );
+            FuzzCase::Scatter {
+                base: tensor(&mut rng, base_shape, dtype),
+                index,
+                updates: tensor(&mut rng, updates_shape, dtype),
+                axis,
+                op,
             }
         }
         _ => {

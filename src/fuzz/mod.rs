@@ -31,7 +31,7 @@ pub use artifact::{
 };
 pub use case::{
     FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzTensor,
-    FuzzUnaryOp,
+    FuzzScatterOp, FuzzUnaryOp,
 };
 pub use corpus::{
     FuzzCorpusMode, FuzzCorpusRecord, FuzzCorpusReport, FuzzCorpusState, read_failure_artifact,

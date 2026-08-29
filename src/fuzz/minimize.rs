@@ -87,6 +87,21 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
             index: index.zeroed(),
             axis: *axis,
         },
+        FuzzCase::Scatter {
+            base,
+            index,
+            updates,
+            axis,
+            op,
+        } => FuzzCase::Scatter {
+            base: base.zeroed(),
+            // Zero remains in range whenever an index lane exists; an empty
+            // scatter axis necessarily carries an empty index domain.
+            index: index.zeroed(),
+            updates: updates.zeroed(),
+            axis: *axis,
+            op: *op,
+        },
     }
 }
 
@@ -145,6 +160,8 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
         // Rank and axis are part of Gather's static admission, so reducing it
         // to scalars would turn a valid case into a different program.
         FuzzCase::Gather { .. } => None,
+        // Scatter similarly owns rank, axis, and index geometry.
+        FuzzCase::Scatter { .. } => None,
         _ => None,
     }
 }

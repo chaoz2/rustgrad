@@ -670,6 +670,248 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
 }
 
 #[test]
+fn generated_scatter_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut replace_f32 = false;
+    let mut replace_i32 = false;
+    let mut replace_f16 = false;
+    let mut replace_bool = false;
+    let mut add_f32 = false;
+    let mut index_i32 = false;
+    let mut index_i64 = false;
+    let mut zero_axis = false;
+    let mut empty = false;
+    let mut duplicate = false;
+    let mut axes = std::collections::BTreeSet::new();
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index_number in 0..512 {
+            let case = generate_case(seed, index_number);
+            assert_eq!(case, generate_case(seed, index_number));
+            case.validate().unwrap();
+            let FuzzCase::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                op,
+            } = case
+            else {
+                continue;
+            };
+            found = true;
+            assert!((1..=3).contains(&base.shape.len()));
+            assert_eq!(index.shape.len(), base.shape.len());
+            assert_eq!(updates.shape.len(), index.shape.len());
+            assert!(axis < base.shape.len());
+            assert_eq!(base.dtype, updates.dtype);
+            assert!(matches!(index.dtype, DType::I32 | DType::I64));
+            for (dimension, ((&base, &index), &updates)) in base
+                .shape
+                .iter()
+                .zip(&index.shape)
+                .zip(&updates.shape)
+                .enumerate()
+            {
+                if dimension != axis {
+                    assert!(index <= base);
+                }
+                assert!(updates >= index);
+            }
+            let lanes = index.to_tensor().unwrap();
+            let mut values = std::collections::BTreeSet::new();
+            for position in 0..lanes.len() {
+                let Scalar::I(value) = lanes.scalar_at(position) else {
+                    panic!("generated scatter indices are signed integer lanes")
+                };
+                assert!(value >= 0 && (value as usize) < base.shape[axis]);
+                duplicate |= !values.insert(value);
+            }
+            empty |= base.shape.iter().any(|extent| *extent == 0)
+                || index.shape.iter().any(|extent| *extent == 0);
+            zero_axis |= base.shape[axis] == 0;
+            axes.insert((base.shape.len(), axis));
+            index_i32 |= index.dtype == DType::I32;
+            index_i64 |= index.dtype == DType::I64;
+            match op {
+                FuzzScatterOp::Replace => match base.dtype {
+                    DType::F32 => replace_f32 = true,
+                    DType::I32 => replace_i32 = true,
+                    DType::F16 => replace_f16 = true,
+                    DType::Bool => replace_bool = true,
+                    _ => unreachable!("replacement generator selects movement dtypes only"),
+                },
+                FuzzScatterOp::Add => {
+                    assert_eq!(base.dtype, DType::F32);
+                    add_f32 = true;
+                }
+            }
+        }
+    }
+
+    assert!(found);
+    assert!(replace_f32 && replace_i32 && replace_f16 && replace_bool && add_f32);
+    assert!(index_i32 && index_i64 && zero_axis && empty && duplicate);
+    assert!(axes.contains(&(1, 0)) && axes.iter().any(|(rank, axis)| *rank >= 2 && *axis == 1));
+}
+
+#[test]
+fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
+    let replace = FuzzCase::Scatter {
+        base: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 4], Storage::F32(vec![10.0, 20.0, 30.0, 40.0]))
+                .unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 3], Storage::I32(vec![2, 1, 2])).unwrap(),
+        ),
+        updates: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 3], Storage::F32(vec![1.0, 2.0, 3.0])).unwrap(),
+        ),
+        axis: 1,
+        op: FuzzScatterOp::Replace,
+    };
+    let value = serde_json::to_value(&replace).unwrap();
+    assert_eq!(value["kind"], "scatter");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), replace);
+    let mut unknown = value;
+    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    for case in [
+        replace.clone(),
+        FuzzCase::Scatter {
+            base: FuzzTensor::from_tensor(
+                &TensorData::from_storage([1, 3], Storage::F32(vec![1.0, 10.0, 100.0])).unwrap(),
+            ),
+            index: FuzzTensor::from_tensor(
+                &TensorData::from_storage([1, 3], Storage::I64(vec![1, 1, 1])).unwrap(),
+            ),
+            updates: FuzzTensor::from_tensor(
+                &TensorData::from_storage([1, 3], Storage::F32(vec![0.25, 0.5, 4.0])).unwrap(),
+            ),
+            axis: 1,
+            op: FuzzScatterOp::Add,
+        },
+        FuzzCase::Scatter {
+            base: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap()),
+            index: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::I32(vec![])).unwrap()),
+            updates: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap()),
+            axis: 1,
+            op: FuzzScatterOp::Replace,
+        },
+    ] {
+        let built = case.build().unwrap();
+        let Op::Scatter { axis, add, .. } = built.graph.op(built.output).unwrap() else {
+            panic!("raw Scatter case must retain its Scatter root");
+        };
+        let FuzzCase::Scatter { axis: expected, op, .. } = &case else {
+            unreachable!("constructed as Scatter")
+        };
+        assert_eq!(axis, expected);
+        assert_eq!(*add, *op == FuzzScatterOp::Add);
+        let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        let MovementKernelKind::Scatter { axis: planned, add: planned_add, .. } = &plan.kind else {
+            panic!("Scatter root must use a Scatter movement plan");
+        };
+        assert_eq!(planned, expected);
+        assert_eq!(*planned_add, *op == FuzzScatterOp::Add);
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        let item = &scheduled.items[0];
+        assert!(item.boundary.is_none());
+        assert!(matches!(item.kernel.kind(), UOpKind::Movement));
+        assert!(matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Scatter { .. })));
+        let scalar = CpuJit::render(&item.kernel).unwrap();
+        assert!(scalar.source.contains("memcpy(") && scalar.source.contains("rg_selected < 0") && scalar.source.contains("failure[1]=3"));
+        if *op == FuzzScatterOp::Add {
+            assert!(scalar.source.contains("] += ((const"));
+        } else {
+            assert!(scalar.source.contains("] = ((const"));
+        }
+        assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+    }
+
+    let built = replace.build().unwrap();
+    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    assert_eq!(
+        FuzzTensor::from_tensor(&output),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 4], Storage::F32(vec![10.0, 2.0, 3.0, 40.0])).unwrap(),
+        ),
+    );
+    let add = FuzzCase::Scatter {
+        base: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 3], Storage::F32(vec![1.0, 10.0, 100.0])).unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 3], Storage::I32(vec![1, 1, 1])).unwrap(),
+        ),
+        updates: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 3], Storage::F32(vec![0.25, 0.5, 4.0])).unwrap(),
+        ),
+        axis: 1,
+        op: FuzzScatterOp::Add,
+    };
+    let add_built = add.build().unwrap();
+    let add_output = CpuBackend.execute(&add_built.graph, add_built.output, &add_built.oracle).unwrap();
+    assert_eq!(
+        FuzzTensor::from_tensor(&add_output),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 3], Storage::F32(vec![1.0, 14.75, 100.0])).unwrap(),
+        ),
+    );
+    let artifact = FuzzFailureArtifact::new(
+        14, 19, replace.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&output),
+        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Scatter mismatch".into() },
+    ).unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&replace, |candidate| {
+        matches!(candidate, FuzzCase::Scatter { base, index, updates, axis, op }
+            if base.bytes == vec![0; 16] && index.bytes == vec![0; 12]
+                && updates.bytes == vec![0; 12] && *axis == 1 && *op == FuzzScatterOp::Replace)
+    });
+    assert!(matches!(zeroed, FuzzCase::Scatter { ref base, ref index, ref updates, axis, op }
+        if base.bytes == vec![0; 16] && index.bytes == vec![0; 12]
+            && updates.bytes == vec![0; 12] && axis == 1 && op == FuzzScatterOp::Replace));
+
+    let ieee = FuzzCase::Scatter {
+        base: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![0.0, 1.0, 2.0])).unwrap()),
+        index: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I32(vec![2, 0, 1])).unwrap()),
+        updates: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])).unwrap()),
+        axis: 0,
+        op: FuzzScatterOp::Replace,
+    };
+    let ieee_built = ieee.build().unwrap();
+    let ieee_output = CpuBackend.execute(&ieee_built.graph, ieee_built.output, &ieee_built.oracle).unwrap();
+    assert_eq!(
+        FuzzTensor::from_tensor(&ieee_output),
+        FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x7fc0_0001), f32::INFINITY, -0.0])).unwrap()),
+    );
+
+    let bad_add = FuzzCase::Scatter {
+        base: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I32(vec![1, 2])).unwrap()),
+        index: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I32(vec![0])).unwrap()),
+        updates: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I32(vec![3])).unwrap()),
+        axis: 0,
+        op: FuzzScatterOp::Add,
+    };
+    let bad_index = FuzzCase::Scatter {
+        base: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap()),
+        index: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I64(vec![-1])).unwrap()),
+        updates: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![3.0])).unwrap()),
+        axis: 0,
+        op: FuzzScatterOp::Replace,
+    };
+    assert!(bad_add.validate().is_err());
+    assert!(bad_index.validate().is_err());
+}
+
+#[test]
 fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
     let tensor_t = FuzzCase::TensorT {
         input: FuzzTensor::from_tensor(
@@ -1257,7 +1499,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 27);
+    assert_eq!(cases.len(), 31);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(
