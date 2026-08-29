@@ -7446,9 +7446,29 @@ impl Graph {
         self.convenience_cast(input, DType::F16)
     }
 
+    /// Source-literal tinygrad `Tensor.bfloat16()` convenience cast.
+    pub fn to_bf16(&mut self, input: NodeId) -> Result<NodeId> {
+        self.convenience_cast(input, DType::BF16)
+    }
+
+    /// Source-literal tinygrad `Tensor.double()` convenience cast.
+    pub fn to_f64(&mut self, input: NodeId) -> Result<NodeId> {
+        self.convenience_cast(input, DType::F64)
+    }
+
     /// Source-literal tinygrad `Tensor.int()` convenience cast.
     pub fn to_i32(&mut self, input: NodeId) -> Result<NodeId> {
         self.convenience_cast(input, DType::I32)
+    }
+
+    /// Source-literal tinygrad `Tensor.long()` convenience cast.
+    pub fn to_i64(&mut self, input: NodeId) -> Result<NodeId> {
+        self.convenience_cast(input, DType::I64)
+    }
+
+    /// Source-literal tinygrad `Tensor.short()` convenience cast.
+    pub fn to_i16(&mut self, input: NodeId) -> Result<NodeId> {
+        self.convenience_cast(input, DType::I16)
     }
 
     /// Source-literal tinygrad `Tensor.bool()` convenience cast.

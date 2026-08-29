@@ -13,6 +13,9 @@ fn dtype_conveniences_alias_source_cast_and_are_atomic() {
     let mut graph = Graph::new();
     let f32_input = graph.input_dtype_requires_grad("f32", [], DType::F32, true);
     let f16_empty = graph.input_dtype_requires_grad("f16_empty", [0, 2], DType::F16, true);
+    let bf16_empty = graph.input_dtype_requires_grad("bf16_empty", [0], DType::BF16, true);
+    let f64_scalar = graph.input_dtype_requires_grad("f64_scalar", [], DType::F64, true);
+    let i16_scalar = graph.input_dtype("i16_scalar", [], DType::I16);
     let integer = graph.input_dtype("integer", [2], DType::I64);
     let boolean = graph.input_dtype("boolean", [1], DType::Bool);
     let before = graph.node_count();
@@ -22,6 +25,10 @@ fn dtype_conveniences_alias_source_cast_and_are_atomic() {
     assert!(!graph.is_floating_point(integer).unwrap());
     assert!(!graph.is_floating_point(boolean).unwrap());
     assert_eq!(graph.to_f32(f32_input).unwrap(), f32_input);
+    assert_eq!(graph.to_bf16(bf16_empty).unwrap(), bf16_empty);
+    assert_eq!(graph.to_f64(f64_scalar).unwrap(), f64_scalar);
+    assert_eq!(graph.to_i64(integer).unwrap(), integer);
+    assert_eq!(graph.to_i16(i16_scalar).unwrap(), i16_scalar);
 
     let widened = graph.to_f32(f16_empty).unwrap();
     assert_eq!(graph.shape(widened).unwrap(), &Shape::new([0, 2]));
@@ -30,25 +37,47 @@ fn dtype_conveniences_alias_source_cast_and_are_atomic() {
     assert!(graph.grad(widened, f16_empty).is_ok());
 
     let half = graph.to_f16(integer).unwrap();
+    let bfloat = graph.to_bf16(f32_input).unwrap();
+    let double = graph.to_f64(f16_empty).unwrap();
     let int = graph.to_i32(f32_input).unwrap();
+    let long = graph.to_i64(boolean).unwrap();
+    let short = graph.to_i16(integer).unwrap();
     let bool_value = graph.to_bool(integer).unwrap();
     assert_eq!(graph.dtype(half).unwrap(), DType::F16);
+    assert_eq!(graph.dtype(bfloat).unwrap(), DType::BF16);
+    assert_eq!(graph.dtype(double).unwrap(), DType::F64);
     assert_eq!(graph.dtype(int).unwrap(), DType::I32);
+    assert_eq!(graph.dtype(long).unwrap(), DType::I64);
+    assert_eq!(graph.dtype(short).unwrap(), DType::I16);
     assert_eq!(graph.dtype(bool_value).unwrap(), DType::Bool);
     assert!(matches!(graph.op(half).unwrap(), Op::Cast { input, dtype: DType::F16 } if *input == integer));
+    assert!(matches!(graph.op(bfloat).unwrap(), Op::Cast { input, dtype: DType::BF16 } if *input == f32_input));
+    assert!(matches!(graph.op(double).unwrap(), Op::Cast { input, dtype: DType::F64 } if *input == f16_empty));
     assert!(matches!(graph.op(int).unwrap(), Op::Cast { input, dtype: DType::I32 } if *input == f32_input));
+    assert!(matches!(graph.op(long).unwrap(), Op::Cast { input, dtype: DType::I64 } if *input == boolean));
+    assert!(matches!(graph.op(short).unwrap(), Op::Cast { input, dtype: DType::I16 } if *input == integer));
     assert!(matches!(graph.op(bool_value).unwrap(), Op::Cast { input, dtype: DType::Bool } if *input == integer));
+    assert!(graph.grad(bfloat, f32_input).is_ok());
+    assert!(graph.grad(double, f16_empty).is_ok());
     assert!(graph.node_count() > before);
 
     let unknown = NodeId::from_index(usize::MAX);
     let failed_before = graph.node_count();
     assert!(matches!(graph.is_floating_point(unknown), Err(Error::UnknownNode(_))));
     assert!(matches!(graph.to_f32(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.to_bf16(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.to_f64(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.to_i64(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.to_i16(unknown), Err(Error::UnknownNode(_))));
     assert_eq!(graph.node_count(), failed_before);
 
     let overflow = graph.input_dtype("overflow", [usize::MAX, 2], DType::F32);
     let overflow_before = graph.node_count();
     assert!(matches!(graph.to_f16(overflow), Err(Error::ShapeOverflow(_))));
+    assert!(matches!(graph.to_bf16(overflow), Err(Error::ShapeOverflow(_))));
+    assert!(matches!(graph.to_f64(overflow), Err(Error::ShapeOverflow(_))));
+    assert!(matches!(graph.to_i64(overflow), Err(Error::ShapeOverflow(_))));
+    assert!(matches!(graph.to_i16(overflow), Err(Error::ShapeOverflow(_))));
     assert_eq!(graph.node_count(), overflow_before);
 }
 
