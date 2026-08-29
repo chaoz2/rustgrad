@@ -829,6 +829,149 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
 }
 
 #[test]
+fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts() {
+    const DTYPES: [DType; 13] = [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+
+    for from in DTYPES {
+        for to in DTYPES {
+            // 0 and 1 are exactly representable and in range for every pair.
+            // This intentionally does not claim non-finite/out-of-range
+            // float-to-int or implementation-defined signed-overflow parity.
+            let source = TensorData::from_scalars(
+                [2],
+                from,
+                [Scalar::I(0), Scalar::I(1)],
+            )
+            .unwrap();
+            let case = FuzzCase::Cast {
+                input: FuzzTensor::from_tensor(&source),
+                to,
+            };
+            let built = case.build().unwrap();
+            assert!(matches!(
+                built.graph.op(built.output).unwrap(),
+                Op::Cast { dtype, .. } if *dtype == to
+            ));
+            let oracle = CpuBackend
+                .execute(&built.graph, built.output, &built.oracle)
+                .unwrap();
+            assert_eq!(FuzzTensor::from_tensor(&oracle), FuzzTensor::from_tensor(&source.cast(to)));
+
+            let scheduled = schedule(&built.graph, built.output).unwrap();
+            assert_eq!(scheduled.items.len(), 1);
+            assert_eq!(
+                scheduled.items[0]
+                    .kernel
+                    .topological()
+                    .unwrap()
+                    .iter()
+                    .filter(|node| matches!(node.kind(), UOpKind::Cast))
+                    .count(),
+                1,
+            );
+            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let capture_bytes = captured.to_bytes().unwrap();
+            assert_eq!(CapturedSchedule::from_bytes(&capture_bytes).unwrap().to_bytes().unwrap(), capture_bytes);
+
+            let uop = crate::lower_graph_elementwise(&built.graph, built.output).unwrap();
+            assert!(CpuJit::render(&uop).is_ok(), "{from:?} -> {to:?}");
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            if matches!(from, DType::F16 | DType::BF16)
+                || matches!(to, DType::F16 | DType::BF16)
+            {
+                assert!(!vector.source.contains("B2 VectorProgram"), "{from:?} -> {to:?}");
+                assert!(vector.source.contains("C11 ABI v2"), "{from:?} -> {to:?}");
+            }
+        }
+    }
+
+    // Representative non-half pairs still use B2, while every half endpoint
+    // remains on the v17 legacy scalar-per-lane path rather than claiming a
+    // tagged half-vector ABI.
+    let mut b2_graph = crate::Graph::new();
+    let b2_input = b2_graph.input_dtype("input", [2], DType::F32);
+    let b2_output = b2_graph.cast(b2_input, DType::I32).unwrap();
+    let b2_uop = crate::lower_graph_elementwise(&b2_graph, b2_output).unwrap();
+    assert!(CpuJit::render_vectorized(&b2_uop).unwrap().source.contains("B2 VectorProgram"));
+
+    // Finite fractional truncation and unsigned conversion stay in the safe
+    // nonnegative domain. Arbitrary half NaN payload identity is not claimed.
+    for to in [DType::I32, DType::U32] {
+        let input = TensorData::from_storage([3], Storage::F32(vec![0.0, 1.5, 2.5])).unwrap();
+        let case = FuzzCase::Cast {
+            input: FuzzTensor::from_tensor(&input),
+            to,
+        };
+        let built = case.build().unwrap();
+        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&input.cast(to)));
+    }
+
+    let artifact_case = FuzzCase::Cast {
+        input: FuzzTensor::from_tensor(&TensorData::from_scalars([2], DType::BF16, [Scalar::I(0), Scalar::I(1)]).unwrap()),
+        to: DType::U64,
+    };
+    let built = artifact_case.build().unwrap();
+    let expected = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let artifact = FuzzFailureArtifact::new(
+        41,
+        43,
+        artifact_case.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&expected),
+        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic safe cast mismatch".into() },
+    )
+    .unwrap();
+    let artifact_bytes = artifact.to_bytes().unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap().to_bytes().unwrap(), artifact_bytes);
+    let minimized = minimize_case(&artifact_case, |candidate| matches!(candidate,
+        FuzzCase::Cast { input, to: DType::U64 }
+            if input.dtype == DType::BF16
+                && input.shape == vec![2]
+                && input.bytes.iter().all(|byte| *byte == 0)
+    ));
+    assert!(matches!(minimized, FuzzCase::Cast { ref input, to: DType::U64 }
+        if input.dtype == DType::BF16 && input.shape == vec![2]));
+}
+
+#[test]
+fn generated_cast_cases_reach_every_concrete_dtype_on_the_safe_domain() {
+    let mut sources = std::collections::BTreeSet::new();
+    let mut targets = std::collections::BTreeSet::new();
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..16_384 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            let FuzzCase::Cast { input, to } = case else { continue };
+            input.validate().unwrap();
+            let values = input.to_tensor().unwrap();
+            for lane in 0..values.len() {
+                assert!([0.0, 1.0, 2.0].contains(&values.scalar_at(lane).as_f64()));
+            }
+            sources.insert(input.dtype);
+            targets.insert(to);
+        }
+    }
+    assert_eq!(sources.len(), 13);
+    assert_eq!(targets.len(), 13);
+}
+
+#[test]
 fn generated_pad_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
     let mut dtypes = std::collections::BTreeSet::new();

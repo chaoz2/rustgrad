@@ -39,6 +39,28 @@ fn tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> FuzzTensor {
     )
 }
 
+// Raw C casts outside this domain can differ from the TensorData oracle for
+// non-finite/out-of-range float-to-int values or signed overflow. Keep the
+// generated Cast matrix in values that every concrete storage conversion can
+// represent exactly; focused acceptance covers finite truncation separately.
+fn cast_tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> FuzzTensor {
+    let elements = Shape::new(shape.clone())
+        .numel()
+        .expect("bounded generated cast shape");
+    let values = (0..elements).map(|index| {
+        let value = (rng.next().wrapping_add(index as u64) % 3) as i64;
+        match dtype {
+            DType::Bool => Scalar::Bool(value != 0),
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(value as f64),
+            _ => Scalar::I(value),
+        }
+    });
+    FuzzTensor::from_tensor(
+        &TensorData::from_scalars(shape, dtype, values)
+            .expect("generated cast tensor geometry"),
+    )
+}
+
 fn static_shape(rng: &mut SplitMix64) -> Vec<usize> {
     [vec![], vec![0], vec![1], vec![3], vec![17], vec![2, 3]][rng.pick(6)].clone()
 }
@@ -112,14 +134,11 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
         }
         2 => {
             let shape = static_shape(&mut rng);
-            let choices = [DType::Bool, DType::I32, DType::F16, DType::BF16, DType::F32];
+            let choices = [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64];
             let from = choices[rng.pick(choices.len())];
-            let mut to = choices[rng.pick(choices.len())];
-            if to == from {
-                to = DType::F32;
-            }
+            let to = choices[rng.pick(choices.len())];
             FuzzCase::Cast {
-                input: tensor(&mut rng, shape, from),
+                input: cast_tensor(&mut rng, shape, from),
                 to,
             }
         }
