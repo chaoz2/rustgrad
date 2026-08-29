@@ -20,6 +20,62 @@ pub(crate) struct LazyArangePlan {
     pub(crate) offset: TensorData,
 }
 
+/// Descriptor-first contract for concrete tinygrad `Tensor.full`.
+///
+/// The source first commits its Python scalar to either an explicit dtype or
+/// its `from_py` default, then makes a scalar and expands it. `buffer=True`
+/// materializes that value afterwards; `buffer=False` retains the scalar
+/// expansion. Keep both storage boundaries prepared before Graph publication.
+struct TinygradFullPlan {
+    shape: Shape,
+    dtype: DType,
+    scalar: TensorData,
+    dense: Option<TensorData>,
+}
+
+fn tinygrad_full_plan(
+    shape: Shape,
+    value: Scalar,
+    dtype: Option<DType>,
+    buffer: bool,
+) -> Result<TinygradFullPlan> {
+    // tinygrad `dtypes.from_py`: Python bool, int, and float become Bool,
+    // default integer (I32), and default float (F32), respectively.
+    let dtype = dtype.unwrap_or(match value {
+        Scalar::Bool(_) => DType::Bool,
+        Scalar::I(_) | Scalar::U(_) => DType::I32,
+        Scalar::F(_) => DType::F32,
+    });
+    let extent = |shape: &Shape| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(&shape)?;
+
+    let scalar = TensorData::scalar_with_dtype(value, dtype);
+    extent(scalar.shape())?;
+    if scalar.shape().broadcast_with(&shape).as_ref() != Ok(&shape) {
+        return Err(Error::InvalidExpand {
+            from: scalar.shape().clone(),
+            to: shape,
+        });
+    }
+
+    // Dense payload construction remains wholly before `constant`, so a
+    // malformed descriptor cannot publish a prefix node. The lazy route
+    // retains only the already committed scalar storage above.
+    let dense = buffer.then(|| TensorData::full_with_dtype(shape.clone(), value, dtype)).transpose()?;
+    Ok(TinygradFullPlan {
+        shape,
+        dtype,
+        scalar,
+        dense,
+    })
+}
+
 /// Whole-operation descriptor for tinygrad's public `Tensor.one_hot`.
 ///
 /// The literal first unsqueezes integer indices, compares them with a
@@ -462,6 +518,79 @@ mod tests {
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(invalid.node_count(), before);
+    }
+
+    #[test]
+    fn full_tinygrad_commits_python_scalars_and_preserves_buffer_boundary() {
+        let mut graph = Graph::new();
+        let inferred_bool = graph.full_tinygrad([2], Scalar::Bool(true), None, true).unwrap();
+        let inferred_int = graph.full_tinygrad([2], Scalar::I(-7), None, true).unwrap();
+        let inferred_uint = graph.full_tinygrad([1], Scalar::U(u64::MAX), None, true).unwrap();
+        let inferred_float = graph.full_tinygrad([2], Scalar::F(1.5), None, true).unwrap();
+        assert_eq!(graph.dtype(inferred_bool).unwrap(), DType::Bool);
+        assert_eq!(graph.dtype(inferred_int).unwrap(), DType::I32);
+        assert_eq!(graph.dtype(inferred_uint).unwrap(), DType::I32);
+        assert_eq!(graph.dtype(inferred_float).unwrap(), DType::F32);
+        assert!(matches!(graph.op(inferred_uint).unwrap(), Op::Constant(data)
+            if matches!(data.scalar_at(0), Scalar::I(-1))));
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let output = graph.full_tinygrad([0, 3], Scalar::I(-1), Some(dtype), true).unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            assert!(matches!(graph.op(output).unwrap(), Op::Constant(data) if data.len() == 0));
+        }
+
+        let dense = graph.full_tinygrad([2, 3], Scalar::I(9), Some(DType::I16), true).unwrap();
+        let lazy = graph.full_tinygrad([2, 3], Scalar::I(9), Some(DType::I16), false).unwrap();
+        assert!(matches!(graph.op(dense).unwrap(), Op::Constant(data) if data.len() == 6));
+        let Op::Expand { input: lazy_scalar, .. } = graph.op(lazy).unwrap() else {
+            panic!("expected buffer=False scalar Expand");
+        };
+        assert!(matches!(graph.op(*lazy_scalar).unwrap(), Op::Constant(data) if data.len() == 1));
+
+        let signed_zero = graph.full_tinygrad([1], Scalar::F(-0.0), Some(DType::F32), false).unwrap();
+        let nan = graph.full_tinygrad([1], Scalar::F(f64::NAN), Some(DType::F16), false).unwrap();
+        let Op::Expand { input: signed_zero, .. } = graph.op(signed_zero).unwrap() else {
+            panic!("expected scalar signed-zero Expand");
+        };
+        let Op::Expand { input: nan, .. } = graph.op(nan).unwrap() else {
+            panic!("expected scalar NaN Expand");
+        };
+        assert!(matches!(graph.op(*signed_zero).unwrap(), Op::Constant(data)
+            if data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits()));
+        assert!(matches!(graph.op(*nan).unwrap(), Op::Constant(data)
+            if data.scalar_at(0).as_f64().is_nan()));
+
+        let scalar = graph.full_tinygrad([], Scalar::F(f64::INFINITY), None, false).unwrap();
+        assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
+        assert!(matches!(graph.op(scalar).unwrap(), Op::Constant(data) if data.len() == 1));
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.full_tinygrad([usize::MAX, 2], Scalar::I(0), Some(DType::F64), false),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+        assert!(matches!(
+            malformed.full_tinygrad([usize::MAX], Scalar::I(0), Some(DType::F64), true),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
     }
 
     #[test]
@@ -2975,6 +3104,44 @@ impl Graph {
         dtype: DType,
     ) -> Result<NodeId> {
         Ok(self.constant(TensorData::full_with_dtype(shape, value, dtype)?))
+    }
+
+    /// Concrete source-literal tinygrad `Tensor.full(shape, value, dtype=None,
+    /// buffer=True)`.
+    ///
+    /// `dtype=None` follows tinygrad's concrete Python-value defaults: Bool
+    /// for Bool, I32 for either signed or unsigned integer Scalars, and F32
+    /// for floating Scalars. `buffer=true` publishes one dense typed Constant;
+    /// `buffer=false` publishes one typed scalar Constant and an Expand.
+    /// Existing `full` and `full_with_dtype` APIs intentionally retain their
+    /// backwards-compatible contracts.
+    pub fn full_tinygrad(
+        &mut self,
+        shape: impl Into<Shape>,
+        value: Scalar,
+        dtype: Option<DType>,
+        buffer: bool,
+    ) -> Result<NodeId> {
+        let plan = tinygrad_full_plan(shape.into(), value, dtype, buffer)?;
+        if let Some(dense) = plan.dense {
+            return Ok(self.constant(dense));
+        }
+        let scalar = self.constant(plan.scalar);
+        if plan.shape.rank() == 0 {
+            Ok(scalar)
+        } else {
+            // The plan has already checked the scalar-to-output broadcast and
+            // both byte boundaries. Push directly so this post-publication
+            // lowering cannot encounter a late fallible movement check.
+            Ok(self.push(
+                Op::Expand {
+                    input: scalar,
+                    shape: plan.shape.clone(),
+                },
+                plan.shape,
+                plan.dtype,
+            ))
+        }
     }
 
     /// Creates a graph-resident typed fill without materializing its payload.
