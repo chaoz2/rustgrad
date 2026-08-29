@@ -88,6 +88,9 @@ pub enum Error {
         op: &'static str,
         actual: DType,
     },
+    InvalidDTypeFinfo {
+        dtype: DType,
+    },
     DivisionByZero {
         op: &'static str,
     },
@@ -324,6 +327,9 @@ impl fmt::Display for Error {
             }
             Self::InvalidElementwiseDType { op, actual } => {
                 write!(f, "{op} does not accept {actual:?} tensors")
+            }
+            Self::InvalidDTypeFinfo { dtype } => {
+                write!(f, "{dtype:?} is not a floating point type")
             }
             Self::DivisionByZero { op } => write!(f, "{op} by zero"),
             Self::InvalidShiftCount { count, bits } => {

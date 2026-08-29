@@ -1,3 +1,7 @@
+use crate::{Error, Result};
+
+use super::{scalar::Scalar, storage::Storage};
+
 /// Scalar element types understood by RustGrad's IR.
 ///
 /// `F16` and `BF16` storage uses IEEE bit patterns. This keeps the storage
@@ -64,6 +68,74 @@ impl DType {
         )
     }
 
+    pub const fn is_signed_integer(self) -> bool {
+        matches!(self.category(), DTypeCategory::Signed)
+    }
+
+    pub const fn is_unsigned(self) -> bool {
+        matches!(self.category(), DTypeCategory::Unsigned)
+    }
+
+    pub const fn is_bool(self) -> bool {
+        matches!(self.category(), DTypeCategory::Bool)
+    }
+
+    /// Returns the source-visible lower bound in this dtype's scalar family.
+    pub const fn min(self) -> Scalar {
+        match self {
+            Self::Bool => Scalar::Bool(false),
+            Self::I8 => Scalar::I(i8::MIN as i64),
+            Self::U8 => Scalar::U(u8::MIN as u64),
+            Self::I16 => Scalar::I(i16::MIN as i64),
+            Self::U16 => Scalar::U(u16::MIN as u64),
+            Self::I32 => Scalar::I(i32::MIN as i64),
+            Self::U32 => Scalar::U(u32::MIN as u64),
+            Self::I64 => Scalar::I(i64::MIN),
+            Self::U64 => Scalar::U(u64::MIN),
+            Self::F16 | Self::BF16 | Self::F32 | Self::F64 => Scalar::F(f64::NEG_INFINITY),
+        }
+    }
+
+    /// Returns the source-visible upper bound in this dtype's scalar family.
+    pub const fn max(self) -> Scalar {
+        match self {
+            Self::Bool => Scalar::Bool(true),
+            Self::I8 => Scalar::I(i8::MAX as i64),
+            Self::U8 => Scalar::U(u8::MAX as u64),
+            Self::I16 => Scalar::I(i16::MAX as i64),
+            Self::U16 => Scalar::U(u16::MAX as u64),
+            Self::I32 => Scalar::I(i32::MAX as i64),
+            Self::U32 => Scalar::U(u32::MAX as u64),
+            Self::I64 => Scalar::I(i64::MAX),
+            Self::U64 => Scalar::U(u64::MAX),
+            Self::F16 | Self::BF16 | Self::F32 | Self::F64 => Scalar::F(f64::INFINITY),
+        }
+    }
+
+    /// Returns the IEEE exponent and mantissa widths for a supported float dtype.
+    pub const fn finfo(self) -> Result<(u8, u8)> {
+        match self {
+            Self::F16 => Ok((5, 10)),
+            Self::BF16 => Ok((8, 7)),
+            Self::F32 => Ok((8, 23)),
+            Self::F64 => Ok((11, 52)),
+            _ => Err(Error::InvalidDTypeFinfo { dtype: self }),
+        }
+    }
+
+    /// Commits a concrete scalar through this dtype's established storage path.
+    ///
+    /// Integer lanes follow their storage-width casts, Bool uses scalar
+    /// truthiness, and float lanes round to their storage width. NaNs are
+    /// canonicalized before that storage conversion; negative zero is retained.
+    pub fn commit_scalar(self, value: Scalar) -> Scalar {
+        let value = match value {
+            Scalar::F(value) if value.is_nan() => Scalar::F(f64::NAN),
+            value => value,
+        };
+        Storage::from_scalars(self, [value]).scalar(0)
+    }
+
     /// A compact, deterministic promotion lattice for supported scalar dtypes.
     /// It follows tinygrad's widening intent; fp8/weak/pointer dtypes are not
     /// implemented yet.
@@ -124,11 +196,110 @@ const fn integer_dtype(signed: bool, bits: u8) -> DType {
 mod tests {
     use super::*;
 
+    fn assert_scalar_eq(actual: Scalar, expected: Scalar) {
+        match (actual, expected) {
+            (Scalar::Bool(actual), Scalar::Bool(expected)) => assert_eq!(actual, expected),
+            (Scalar::I(actual), Scalar::I(expected)) => assert_eq!(actual, expected),
+            (Scalar::U(actual), Scalar::U(expected)) => assert_eq!(actual, expected),
+            (Scalar::F(actual), Scalar::F(expected)) => {
+                assert_eq!(actual.to_bits(), expected.to_bits())
+            }
+            (actual, expected) => panic!("scalar kind mismatch: {actual:?} != {expected:?}"),
+        }
+    }
+
     #[test]
     fn dtype_metadata_and_promotion() {
         assert_eq!(DType::F16.itemsize(), 2);
         assert_eq!(DType::I8.promote(DType::U8), DType::I16);
         assert_eq!(DType::I32.promote(DType::F32), DType::F32);
         assert_eq!(DType::U64.promote(DType::I64), DType::F64);
+    }
+
+    #[test]
+    fn dtype_category_bounds_and_finfo_cover_every_local_dtype() {
+        let signed = [DType::I8, DType::I16, DType::I32, DType::I64];
+        let unsigned = [DType::U8, DType::U16, DType::U32, DType::U64];
+        let floats = [DType::F16, DType::BF16, DType::F32, DType::F64];
+        for dtype in signed {
+            assert!(dtype.is_signed_integer());
+            assert!(!dtype.is_unsigned());
+            assert!(!dtype.is_bool());
+            assert!(matches!(dtype.min(), Scalar::I(_)));
+            assert!(matches!(dtype.max(), Scalar::I(_)));
+        }
+        for dtype in unsigned {
+            assert!(!dtype.is_signed_integer());
+            assert!(dtype.is_unsigned());
+            assert!(!dtype.is_bool());
+            assert!(matches!(dtype.min(), Scalar::U(0)));
+            assert!(matches!(dtype.max(), Scalar::U(_)));
+        }
+        assert_scalar_eq(DType::Bool.min(), Scalar::Bool(false));
+        assert_scalar_eq(DType::Bool.max(), Scalar::Bool(true));
+        assert!(DType::Bool.is_bool());
+        assert_scalar_eq(DType::I8.min(), Scalar::I(i8::MIN as i64));
+        assert_scalar_eq(DType::I64.max(), Scalar::I(i64::MAX));
+        assert_scalar_eq(DType::U8.max(), Scalar::U(u8::MAX as u64));
+        assert_scalar_eq(DType::U64.max(), Scalar::U(u64::MAX));
+        for dtype in floats {
+            assert!(dtype.min().as_f64().is_infinite());
+            assert!(dtype.min().as_f64().is_sign_negative());
+            assert!(dtype.max().as_f64().is_infinite());
+            assert!(dtype.max().as_f64().is_sign_positive());
+        }
+        assert_eq!(DType::F16.finfo(), Ok((5, 10)));
+        assert_eq!(DType::BF16.finfo(), Ok((8, 7)));
+        assert_eq!(DType::F32.finfo(), Ok((8, 23)));
+        assert_eq!(DType::F64.finfo(), Ok((11, 52)));
+        assert!(matches!(
+            DType::I32.finfo(),
+            Err(Error::InvalidDTypeFinfo { dtype: DType::I32 })
+        ));
+    }
+
+    #[test]
+    fn scalar_commitment_uses_existing_storage_width_conversions() {
+        assert_scalar_eq(DType::Bool.commit_scalar(Scalar::I(-1)), Scalar::Bool(true));
+        assert_scalar_eq(DType::Bool.commit_scalar(Scalar::F(-0.0)), Scalar::Bool(false));
+        assert_scalar_eq(DType::I8.commit_scalar(Scalar::I(257)), Scalar::I(1));
+        assert_scalar_eq(
+            DType::U8.commit_scalar(Scalar::I(-1)),
+            Scalar::U(u8::MAX as u64),
+        );
+        assert_scalar_eq(
+            DType::I16.commit_scalar(Scalar::U(u16::MAX as u64)),
+            Scalar::I(-1),
+        );
+        assert_scalar_eq(
+            DType::U16.commit_scalar(Scalar::I(-1)),
+            Scalar::U(u16::MAX as u64),
+        );
+        assert_scalar_eq(
+            DType::I32.commit_scalar(Scalar::U(u32::MAX as u64)),
+            Scalar::I(-1),
+        );
+        assert_scalar_eq(
+            DType::U32.commit_scalar(Scalar::I(-1)),
+            Scalar::U(u32::MAX as u64),
+        );
+        assert_scalar_eq(DType::I64.commit_scalar(Scalar::U(u64::MAX)), Scalar::I(-1));
+        assert_scalar_eq(DType::U64.commit_scalar(Scalar::I(-1)), Scalar::U(u64::MAX));
+
+        let f16 = DType::F16.commit_scalar(Scalar::F(1.0006)).as_f64();
+        assert_eq!(f16, 1.000_976_562_5);
+        assert_scalar_eq(DType::BF16.commit_scalar(Scalar::F(1.003)), Scalar::F(1.0));
+        assert_scalar_eq(
+            DType::F32.commit_scalar(Scalar::F(1.1)),
+            Scalar::F(1.1_f32 as f64)
+        );
+        assert_scalar_eq(DType::F64.commit_scalar(Scalar::F(1.1)), Scalar::F(1.1));
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let zero = dtype.commit_scalar(Scalar::F(-0.0)).as_f64();
+            assert_eq!(zero.to_bits(), (-0.0f64).to_bits());
+            assert!(dtype.commit_scalar(Scalar::F(f64::from_bits(0x7ff8_0000_0000_1234)))
+                .as_f64()
+                .is_nan());
+        }
     }
 }
