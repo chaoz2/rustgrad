@@ -601,9 +601,9 @@
       "section": "Public elementwise helper audit",
       "subject_header": "tinygrad helper(s)",
       "subject": "`maximum/minimum`, `where`, `masked_fill`, `clamp/clip`",
-      "status": "partial",
+      "status": "verified",
       "fields": {
-        "RustGrad Graph method(s)": "`maximum/minimum`, `select` (and `select` composition), `clamp`"
+        "RustGrad Graph method(s)": "`maximum/minimum`, `select` (and `select` composition), `masked_fill`, `clamp`"
       }
     },
     {
@@ -654,10 +654,28 @@
     {
       "section": "Public elementwise helper audit",
       "subject_header": "tinygrad helper(s)",
-      "subject": "`alu/ufix/usum/uprod/detach/contiguous/contiguous_backward/threefry`",
+      "subject": "`usum/uprod`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "`usum/uprod`"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`detach`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "`detach`"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`alu/ufix/contiguous/contiguous_backward/threefry`",
       "status": "not_started",
       "fields": {
-        "RustGrad Graph method(s)": "no public Graph equivalent"
+        "RustGrad Graph method(s)": "no direct public Graph equivalent (dispatcher/materialization/random infrastructure, not claimed numeric wrapper parity)"
       }
     }
   ]

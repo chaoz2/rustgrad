@@ -135,11 +135,13 @@ from both surfaces**.
 | `erf`, `copysign`, `logaddexp`, `isclose`, `lerp` | same-named methods | ✅ |
 | `isnan/isinf/isfinite`, `ceil/floor/round/sign/abs/relu` | same-named methods | ✅ |
 | activations: `sigmoid/relu6/hardswish/hardsigmoid/hardtanh/leaky_relu/tanh/quick_gelu/gelu/swish/silu/elu/celu/selu/softplus/mish/logsigmoid/softsign/rsqrt` | same-named methods; `gelu("tanh"|"none")` | ✅ |
-| `alu/ufix/usum/uprod/detach/contiguous/contiguous_backward/threefry` | no public Graph equivalent | ⬜ (IR/runtime/internal, not scalar helper parity) |
+| `usum/uprod` | `usum/uprod` | ✅ |
+| `detach` | `detach` | ✅ |
+| `alu/ufix/contiguous/contiguous_backward/threefry` | no direct public Graph equivalent (dispatcher/materialization/random infrastructure, not claimed numeric wrapper parity) | ⬜ |
 
-The only scalar-style checked-in helper without a direct named Graph wrapper is
-`masked_fill`; it is representable as `select(condition, fill, input)`. No
-other public numeric helper is silently omitted from this inventory.
+No scalar-style numeric or selection helper is missing a direct public Graph
+wrapper in this inventory. The listed dispatcher/materialization/random
+infrastructure helpers remain explicit gaps rather than claimed numeric parity.
 
 Every checked-in tinygrad family must map to Rust tests or an explicit exclusion:
 
