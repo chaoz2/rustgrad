@@ -16,10 +16,59 @@ pub type StateDict = BTreeMap<String, TensorData>;
 /// Safetensors' reserved `__metadata__` object, whose values are strings.
 pub type Metadata = BTreeMap<String, String>;
 
+/// Borrowed safetensors prefix information without tensor-descriptor validation.
+///
+/// `header` is the raw JSON value from the file prefix. It intentionally does
+/// not require a safetensors tensor-map shape: use [`load_safetensors`] when
+/// the tensor descriptors and payload must be validated.
+#[derive(Debug, PartialEq)]
+pub struct SafetensorsMetadata<'a> {
+    /// The original complete safetensors byte slice.
+    pub source: &'a [u8],
+    /// Byte offset at which the data section begins.
+    pub data_start: usize,
+    /// The unvalidated JSON header value.
+    pub header: Value,
+}
+
 fn ser(reason: impl Into<String>) -> Error {
     Error::Serialization {
         reason: reason.into(),
     }
+}
+
+/// Validates the shared 8-byte safetensors prefix and borrows its JSON bytes.
+fn safetensors_header_prefix(bytes: &[u8]) -> Result<(&[u8], usize)> {
+    if bytes.len() < 8 {
+        return Err(ser("file is shorter than the 8-byte header length"));
+    }
+    let header_len = usize::try_from(u64::from_le_bytes(
+        bytes[..8].try_into().expect("eight bytes"),
+    ))
+    .map_err(|_| ser("header length does not fit usize"))?;
+    let data_start = 8usize
+        .checked_add(header_len)
+        .ok_or_else(|| ser("header length overflows usize"))?;
+    if data_start > bytes.len() {
+        return Err(ser("truncated header"));
+    }
+    Ok((&bytes[8..data_start], data_start))
+}
+
+/// Inspects only the borrowed safetensors prefix and raw JSON header.
+///
+/// This matches tinygrad's metadata inspection boundary: it checks the
+/// length-prefixed header, parses JSON, and deliberately leaves tensor
+/// descriptor, dtype, offset, and payload validation to [`load_safetensors`].
+pub fn inspect_safetensors_metadata(bytes: &[u8]) -> Result<SafetensorsMetadata<'_>> {
+    let (header_bytes, data_start) = safetensors_header_prefix(bytes)?;
+    let header = serde_json::from_slice(header_bytes)
+        .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
+    Ok(SafetensorsMetadata {
+        source: bytes,
+        data_start,
+        header,
+    })
 }
 
 impl TensorData {
@@ -271,20 +320,8 @@ fn dtype_tag(dtype: DType) -> &'static str {
 
 /// Loads an ordered state dictionary and string metadata from an in-memory file.
 pub fn load_safetensors(bytes: &[u8]) -> Result<(StateDict, Metadata)> {
-    if bytes.len() < 8 {
-        return Err(ser("file is shorter than the 8-byte header length"));
-    }
-    let header_len = usize::try_from(u64::from_le_bytes(
-        bytes[..8].try_into().expect("eight bytes"),
-    ))
-    .map_err(|_| ser("header length does not fit usize"))?;
-    let data_start = 8usize
-        .checked_add(header_len)
-        .ok_or_else(|| ser("header length overflows usize"))?;
-    if data_start > bytes.len() {
-        return Err(ser("truncated header"));
-    }
-    let header: Header = serde_json::from_slice(&bytes[8..data_start])
+    let (header_bytes, data_start) = safetensors_header_prefix(bytes)?;
+    let header: Header = serde_json::from_slice(header_bytes)
         .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
     let data = &bytes[data_start..];
     let mut entries: Vec<_> = header.tensors.into_iter().collect();
@@ -388,6 +425,59 @@ mod tests {
     fn raw(shape: impl Into<Shape>, storage: Storage) -> TensorData {
         TensorData::from_storage(shape, storage).unwrap()
     }
+
+    #[test]
+    fn metadata_inspection_borrows_raw_json_without_validating_tensors() {
+        let header = br#"{"__metadata__":{"producer":"tinygrad"},"x":{"dtype":"NOT_A_DTYPE","shape":"unchecked","data_offsets":[9]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[7, 8, 9]);
+        let original = bytes.clone();
+
+        let metadata = inspect_safetensors_metadata(&bytes).unwrap();
+        assert_eq!(metadata.source.as_ptr(), bytes.as_ptr());
+        assert_eq!(metadata.source, original.as_slice());
+        assert_eq!(metadata.data_start, 8 + header.len());
+        assert_eq!(
+            metadata.header,
+            serde_json::json!({
+                "__metadata__": {"producer": "tinygrad"},
+                "x": {"dtype": "NOT_A_DTYPE", "shape": "unchecked", "data_offsets": [9]}
+            })
+        );
+        assert_eq!(bytes, original);
+        assert!(load_safetensors(&bytes).is_err());
+    }
+
+    #[test]
+    fn metadata_inspection_accepts_arbitrary_json_header_shape() {
+        let header = br#"[{"metadata":{"nested":true}},["tensor",0]]"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+
+        let metadata = inspect_safetensors_metadata(&bytes).unwrap();
+        assert_eq!(metadata.data_start, bytes.len());
+        assert_eq!(
+            metadata.header,
+            serde_json::json!([{"metadata": {"nested": true}}, ["tensor", 0]])
+        );
+    }
+
+    #[test]
+    fn metadata_inspection_rejects_invalid_prefixes_and_json() {
+        assert!(inspect_safetensors_metadata(&[0; 7]).is_err());
+
+        let mut truncated = 4u64.to_le_bytes().to_vec();
+        truncated.extend_from_slice(b"{}");
+        assert!(inspect_safetensors_metadata(&truncated).is_err());
+
+        assert!(inspect_safetensors_metadata(&u64::MAX.to_le_bytes()).is_err());
+
+        let mut invalid_json = 1u64.to_le_bytes().to_vec();
+        invalid_json.push(b'{');
+        assert!(inspect_safetensors_metadata(&invalid_json).is_err());
+    }
+
     #[test]
     fn portable_bytes_round_trip_all_dtypes() {
         let values = vec![

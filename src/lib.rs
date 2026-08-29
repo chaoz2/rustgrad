@@ -170,8 +170,8 @@ pub use ptx::{
     PtxLaunchGeometry, PtxRenderer, RenderedPtx,
 };
 pub use safetensors::{
-    Metadata, StateDict, load_safetensors, load_safetensors_file, save_safetensors,
-    save_safetensors_file,
+    Metadata, SafetensorsMetadata, StateDict, inspect_safetensors_metadata, load_safetensors,
+    load_safetensors_file, save_safetensors, save_safetensors_file,
 };
 pub use schedule::{
     BufferDesc, QuantizedScheduleInputBinding, Schedule, ScheduleBoundary, ScheduleError,
