@@ -119,6 +119,7 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
             updates,
             ..
         } => vec![("base", *base), ("index", *index), ("updates", *updates)],
+        Op::MaskedSelect { input, mask, .. } => vec![("input", *input), ("mask", *mask)],
         Op::StaticIndexUpdateGrad { cotangent, .. } => vec![("cotangent", *cotangent)],
         _ => return Err(unsupported(op)),
     })
@@ -259,6 +260,17 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
         Op::Scatter { axis, add, .. } => node
             .field("axis", axis.to_string())
             .field("mode", if *add { "add" } else { "replace" }),
+        // The static graph Op is explicitly a fixed-size, pad/truncate
+        // selection. The unbounded counterpart lives in Graph's separate
+        // dynamic-result arena and is rank-one at realization; graph_viz does
+        // not claim to execute or differentiate that dynamic result.
+        Op::MaskedSelect {
+            size, fill, ..
+        } => node
+            .field("result_policy", "fixed_size_pad_truncate")
+            .field("size", size.to_string())
+            .field("fill", scalar_name(*fill))
+            .field("dynamic_counterpart", "runtime_rank1"),
         Op::Detach { .. } | Op::Select { .. } | Op::Matmul { .. } => node,
         _ => return Err(unsupported(op)),
     })

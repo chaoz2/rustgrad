@@ -34,9 +34,10 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         Err(VizError::MissingEndpoint { .. })
     ));
     let mut graph = Graph::new();
-    let input = graph.input("x", [2]);
-    let mask = graph.input_dtype("mask", [2], DType::Bool);
-    let unsupported = graph.masked_select(input, mask, 1, crate::Scalar::I(0)).unwrap();
+    let input = graph.input("x", [1]);
+    let unsupported = graph
+        .scatter_positions(input, Shape::from([2]), vec![0], vec![1])
+        .unwrap();
     assert!(matches!(
         graph_viz(&graph, &[unsupported]),
         Err(VizError::UnsupportedGraphOp(_))
@@ -45,6 +46,31 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn masked_select_graph_visualization_preserves_fixed_and_dynamic_contracts() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 3]);
+    let mask = graph.input_dtype("mask", [1, 3], DType::Bool);
+    let selected = graph
+        .masked_select(input, mask, 4, crate::Scalar::F(-0.0))
+        .unwrap();
+    let first = graph_viz(&graph, &[selected]).unwrap();
+    let second = graph_viz(&graph, &[selected]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=bool\\nname=mask\\nnode=1\\nshape=[1,3]\"];\n  \"g2\" [label=\"masked_select\\nkind=graph_op\\ndtype=f32\\ndynamic_counterpart=runtime_rank1\\nfill=f:0x8000000000000000\\nnode=2\\nresult_policy=fixed_size_pad_truncate\\nshape=[4]\\nsize=4\"];\n  \"g0\" -> \"g2\" [label=\"data:0:input\"];\n  \"g1\" -> \"g2\" [label=\"data:1:mask\"];\n}\n"
+    );
+
+    let empty = graph
+        .masked_select(input, mask, 0, crate::Scalar::I(7))
+        .unwrap();
+    let empty_dot = graph_viz(&graph, &[empty]).unwrap().to_dot();
+    assert!(empty_dot.contains("fill=i:7"));
+    assert!(empty_dot.contains("result_policy=fixed_size_pad_truncate"));
+    assert!(empty_dot.contains("shape=[0]"));
 }
 
 #[test]
