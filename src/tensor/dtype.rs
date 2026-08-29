@@ -442,6 +442,25 @@ impl DType {
     }
 }
 
+/// Tinygrad's concrete dtype string representation for RustGrad's supported
+/// dtype inventory. This intentionally differs from `Debug`, safetensors wire
+/// tags, renderer names, and `tinygrad_source_name`.
+impl std::fmt::Display for DType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "dtypes.{}", self.canonical_tinygrad_name())
+    }
+}
+
+/// Parses tinygrad's supported concrete dtype aliases without whitespace
+/// normalization, exactly delegating to the explicit public parser.
+impl std::str::FromStr for DType {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        Self::parse_tinygrad_name(name)
+    }
+}
+
 const fn integer_dtype(signed: bool, bits: u8) -> DType {
     match (signed, bits) {
         (true, 0..=8) => DType::I8,
@@ -939,5 +958,45 @@ mod tests {
             error.to_string(),
             "unsupported tinygrad dtype name \" void\""
         );
+    }
+
+    #[test]
+    fn tinygrad_dtype_display_and_from_str_delegate_without_changing_debug() {
+        let cases = [
+            (DType::Bool, "dtypes.bool", &["bool"][..], "Bool"),
+            (DType::I8, "dtypes.char", &["int8", "char"][..], "I8"),
+            (DType::U8, "dtypes.uchar", &["uint8", "uchar"][..], "U8"),
+            (DType::I16, "dtypes.short", &["int16", "short"][..], "I16"),
+            (DType::U16, "dtypes.ushort", &["uint16", "ushort"][..], "U16"),
+            (DType::I32, "dtypes.int", &["int32", "int"][..], "I32"),
+            (DType::U32, "dtypes.uint", &["uint32", "uint"][..], "U32"),
+            (DType::I64, "dtypes.long", &["int64", "long"][..], "I64"),
+            (DType::U64, "dtypes.ulong", &["uint64", "ulong"][..], "U64"),
+            (DType::F16, "dtypes.half", &["float16", "half"][..], "F16"),
+            (DType::BF16, "dtypes.bfloat16", &["bfloat16"][..], "BF16"),
+            (DType::F32, "dtypes.float", &["float32", "float"][..], "F32"),
+            (DType::F64, "dtypes.double", &["float64", "double"][..], "F64"),
+        ];
+        for (dtype, display, aliases, debug) in cases {
+            assert_eq!(dtype.to_string(), display);
+            assert_eq!(format!("{dtype:?}"), debug);
+            assert_eq!(display[7..].parse::<DType>().unwrap(), dtype);
+            for &alias in aliases {
+                assert_eq!(alias.parse::<DType>().unwrap(), dtype, "{alias}");
+                assert_eq!(alias.to_ascii_uppercase().parse::<DType>().unwrap(), dtype);
+            }
+        }
+
+        for rejected in [" float", "float ", "weakint", "void", "fp8e4m3", "custom"] {
+            let error = rejected.parse::<DType>().unwrap_err();
+            assert!(matches!(
+                &error,
+                Error::InvalidTinygradDTypeName { name } if name.as_str() == rejected
+            ));
+            assert_eq!(
+                error.to_string(),
+                format!("unsupported tinygrad dtype name {rejected:?}")
+            );
+        }
     }
 }
