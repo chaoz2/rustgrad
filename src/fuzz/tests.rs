@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    Backend, CapturedSchedule, CompareOp, CpuBackend, DType, Op, Scalar, Storage, TensorData,
-    UOpKind, UnaryOp, schedule,
+    Backend, CapturedSchedule, CompareOp, CpuBackend, DType, LogicalOp, Op, Scalar, Storage,
+    TensorData, UOpKind, UnaryOp, schedule,
 };
 use std::{
     fs::{self, File},
@@ -212,6 +212,136 @@ fn generated_compare_cases_are_valid_diverse_and_deterministic() {
     assert!(found);
     assert_eq!(ops.len(), 6);
     assert!(f32 && i32 && scalar && empty && scalar_rhs && matching_rhs);
+}
+
+#[test]
+fn generated_logical_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut and = false;
+    let mut or = false;
+    let mut true_lane = false;
+    let mut false_lane = false;
+    let mut scalar = false;
+    let mut empty = false;
+    let mut scalar_rhs = false;
+    let mut matching_rhs = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..512 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Logical { op, lhs, rhs } = case else {
+                continue;
+            };
+            found = true;
+            and |= op == FuzzLogicalOp::And;
+            or |= op == FuzzLogicalOp::Or;
+            true_lane |= lhs.bytes.contains(&1) || rhs.bytes.contains(&1);
+            false_lane |= lhs.bytes.contains(&0) || rhs.bytes.contains(&0);
+            scalar |= lhs.shape.is_empty();
+            empty |= lhs.shape.iter().any(|extent| *extent == 0);
+            scalar_rhs |= rhs.shape.is_empty();
+            matching_rhs |= rhs.shape == lhs.shape;
+            assert_eq!(lhs.dtype, DType::Bool);
+            assert_eq!(rhs.dtype, DType::Bool);
+        }
+    }
+
+    assert!(found);
+    assert!(and && or && true_lane && false_lane);
+    assert!(scalar && empty && scalar_rhs && matching_rhs);
+}
+
+#[test]
+fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
+    let logical = FuzzCase::Logical {
+        op: FuzzLogicalOp::Or,
+        lhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap(),
+        ),
+        rhs: FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool)),
+    };
+    let value = serde_json::to_value(&logical).unwrap();
+    assert_eq!(value["kind"], "logical");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), logical);
+    let mut unknown = value;
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    for (op, graph_op, lhs, rhs) in [
+        (
+            FuzzLogicalOp::And,
+            LogicalOp::And,
+            FuzzTensor::from_tensor(
+                &TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap(),
+            ),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool)),
+        ),
+        (
+            FuzzLogicalOp::Or,
+            LogicalOp::Or,
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::Bool(false), DType::Bool)),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool)),
+        ),
+    ] {
+        let case = FuzzCase::Logical { op, lhs, rhs };
+        let built = case.build().unwrap();
+        assert!(matches!(
+            built.graph.op(built.output).unwrap(),
+            Op::Logical { op: actual, rhs: Some(_), .. } if *actual == graph_op
+        ));
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert!(scheduled.items.iter().any(|item| {
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|uop| matches!(uop.kind(), UOpKind::GraphLogical(actual) if *actual == graph_op))
+        }));
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        assert!(captured.items.iter().any(|item| {
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|uop| matches!(uop.kind(), UOpKind::GraphLogical(actual) if *actual == graph_op))
+        }));
+    }
+
+    let built = logical.build().unwrap();
+    let expected = FuzzOutcome::value(
+        &CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap(),
+    );
+    let artifact = FuzzFailureArtifact::new(
+        9,
+        13,
+        logical.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        expected,
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic logical mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&logical, |candidate| {
+        matches!(candidate, FuzzCase::Logical { lhs, rhs, .. }
+            if lhs.bytes == vec![0; 2] && rhs.bytes == vec![0])
+    });
+    assert!(matches!(zeroed, FuzzCase::Logical { ref lhs, ref rhs, .. }
+        if lhs.bytes == vec![0; 2] && rhs.bytes == vec![0]));
+    let scalarized = minimize_case(&logical, |_| true);
+    assert!(matches!(scalarized, FuzzCase::Logical { ref lhs, ref rhs, .. }
+        if lhs.shape.is_empty() && rhs.shape.is_empty()));
+    scalarized.validate().unwrap();
 }
 
 #[test]
@@ -493,7 +623,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 12);
+    assert_eq!(cases.len(), 14);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(

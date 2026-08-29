@@ -1,4 +1,7 @@
-use super::{FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzReduction, FuzzTensor, FuzzUnaryOp};
+use super::{
+    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzTensor,
+    FuzzUnaryOp,
+};
 use crate::{DType, Scalar, Shape, TensorData};
 
 #[derive(Clone, Copy)]
@@ -43,7 +46,7 @@ fn static_shape(rng: &mut SplitMix64) -> Vec<usize> {
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(9) {
+    match rng.pick(10) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = if rng.pick(2) == 0 {
@@ -190,6 +193,22 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 op,
                 lhs: tensor(&mut rng, shape, dtype),
                 rhs: tensor(&mut rng, rhs_shape, dtype),
+            }
+        }
+        8 => {
+            // Direct GraphLogical And/Or is a Bool-only elementwise kernel
+            // through the CPU oracle, captured replay, and strict native path.
+            let shape = static_shape(&mut rng);
+            let rhs_shape = if rng.pick(2) == 0 {
+                vec![]
+            } else {
+                shape.clone()
+            };
+            let op = [FuzzLogicalOp::And, FuzzLogicalOp::Or][rng.pick(2)];
+            FuzzCase::Logical {
+                op,
+                lhs: tensor(&mut rng, shape, DType::Bool),
+                rhs: tensor(&mut rng, rhs_shape, DType::Bool),
             }
         }
         _ => {

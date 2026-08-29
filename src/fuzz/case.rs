@@ -36,6 +36,13 @@ pub enum FuzzCompareOp {
     Ge,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzLogicalOp {
+    And,
+    Or,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FuzzReduction {
@@ -205,6 +212,11 @@ pub enum FuzzCase {
         lhs: FuzzTensor,
         rhs: FuzzTensor,
     },
+    Logical {
+        op: FuzzLogicalOp,
+        lhs: FuzzTensor,
+        rhs: FuzzTensor,
+    },
 }
 
 pub(super) struct BuiltCase {
@@ -224,7 +236,8 @@ impl FuzzCase {
             Self::Binary { lhs, rhs, .. }
             | Self::Concat { lhs, rhs, .. }
             | Self::Matmul { lhs, rhs }
-            | Self::Compare { lhs, rhs, .. } => vec![lhs, rhs],
+            | Self::Compare { lhs, rhs, .. }
+            | Self::Logical { lhs, rhs, .. } => vec![lhs, rhs],
             Self::Select {
                 condition,
                 on_true,
@@ -363,6 +376,15 @@ impl FuzzCase {
                         rhs,
                     )
                     .map_err(|error| error.to_string())?
+            }
+            Self::Logical { op, lhs, rhs } => {
+                let lhs = bind(&mut graph, "lhs", lhs)?;
+                let rhs = bind(&mut graph, "rhs", rhs)?;
+                match op {
+                    FuzzLogicalOp::And => graph.logical_and(lhs, rhs),
+                    FuzzLogicalOp::Or => graph.logical_or(lhs, rhs),
+                }
+                .map_err(|error| error.to_string())?
             }
         };
         let oracle = ordered.clone().into_iter().collect();

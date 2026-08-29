@@ -1,5 +1,6 @@
 use super::{
-    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzReduction, FuzzTensor, FuzzUnaryOp,
+    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzTensor,
+    FuzzUnaryOp,
 };
 use crate::{DType, Scalar, Storage, TensorData};
 
@@ -94,6 +95,18 @@ pub fn regression_cases() -> Vec<FuzzCase> {
                 Storage::F32(vec![f32::from_bits(0x8000_0000), f32::NAN, f32::INFINITY]),
             ),
             rhs: tensor(vec![3], Storage::F32(vec![0.0, 0.0, f32::INFINITY])),
+        },
+        FuzzCase::Logical {
+            // Full And truth table in row-major Bool storage.
+            op: FuzzLogicalOp::And,
+            lhs: tensor(vec![4], Storage::Bool(vec![true, true, false, false])),
+            rhs: tensor(vec![4], Storage::Bool(vec![true, false, true, false])),
+        },
+        FuzzCase::Logical {
+            // A scalar RHS exercises the same direct Or kernel's broadcast.
+            op: FuzzLogicalOp::Or,
+            lhs: tensor(vec![3], Storage::Bool(vec![false, true, false])),
+            rhs: tensor(vec![], Storage::Bool(vec![true])),
         },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),
