@@ -2444,6 +2444,43 @@ impl Graph {
         self.transpose(input, 1, 0)
     }
 
+    /// Checked-in tinygrad `Tensor.T`: the rank-two-only public transpose
+    /// surface, lowered as the literal `transpose(1, 0)` permutation.
+    ///
+    /// This is deliberately distinct from [`Self::transpose_default`], whose
+    /// legacy/general transpose contract remains available for higher ranks.
+    /// Input and output typed byte extents are completely checked before the
+    /// Permute node is published.
+    pub fn t_tinygrad(&mut self, input: NodeId) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let input_shape = source.shape.clone();
+        let dtype = source.dtype;
+        if input_shape.rank() != 2 {
+            return Err(Error::InvalidMovementRank {
+                op: "Tensor.T",
+                expected: 2,
+                actual: input_shape.rank(),
+            });
+        }
+        input_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        let output_shape = Shape::new([input_shape.dims()[1], input_shape.dims()[0]]);
+        output_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        Ok(self.push(
+            Op::Permute {
+                input,
+                axes: vec![1, 0],
+            },
+            output_shape,
+            dtype,
+        ))
+    }
+
     /// Replaces one signed axis with concrete extents and, at most, one
     /// source-compatible inferred extent.
     ///

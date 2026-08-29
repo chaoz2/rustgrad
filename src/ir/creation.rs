@@ -2031,6 +2031,48 @@ mod tests {
     }
 
     #[test]
+    fn tensor_t_tinygrad_is_rank_two_literal_permute_and_preflighted() {
+        let mut graph = Graph::new();
+        let rectangular = graph.input("rectangular", [2, 3]);
+        let square = graph.input("square", [2, 2]);
+        let empty = graph.input_dtype("empty", [0, 3], DType::F16);
+        let transposed = graph.t_tinygrad(rectangular).unwrap();
+        let square_transposed = graph.t_tinygrad(square).unwrap();
+        let empty_transposed = graph.t_tinygrad(empty).unwrap();
+        assert_eq!(graph.shape(transposed).unwrap(), &Shape::from([3, 2]));
+        assert_eq!(graph.shape(square_transposed).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(graph.shape(empty_transposed).unwrap(), &Shape::from([3, 0]));
+        assert_eq!(graph.dtype(empty_transposed).unwrap(), DType::F16);
+        assert!(matches!(graph.op(transposed).unwrap(), Op::Permute { input, axes }
+            if *input == rectangular && axes == &vec![1, 0]));
+        let loss = graph.sum_all(transposed).unwrap();
+        let gradient = graph.grad(loss, rectangular).unwrap();
+        assert_eq!(
+            execute(
+                &graph,
+                gradient,
+                TensorData::new([2, 3], vec![1f32; 6]).unwrap(),
+            ),
+            TensorData::new([2, 3], vec![1f32; 6]).unwrap()
+        );
+
+        let mut malformed = Graph::new();
+        for shape in [Shape::new([]), Shape::new([2]), Shape::new([2, 3, 4])] {
+            let input = malformed.input_dtype("invalid_rank", shape, DType::F32);
+            let before = malformed.node_count();
+            assert!(matches!(
+                malformed.t_tinygrad(input),
+                Err(Error::InvalidMovementRank { op: "Tensor.T", expected: 2, .. })
+            ));
+            assert_eq!(malformed.node_count(), before);
+        }
+        let overflow = malformed.input_dtype("overflow", [usize::MAX, 1], DType::F64);
+        let before = malformed.node_count();
+        assert!(matches!(malformed.t_tinygrad(overflow), Err(Error::ShapeOverflow(_))));
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn reshape_with_extents_matches_tinygrad_infer_copy_identity_and_vjp() {
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("x", [], DType::BF16);
