@@ -35,15 +35,41 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
     ));
     let mut graph = Graph::new();
     let input = graph.input("x", [2]);
-    let padded = graph.pad(input, [(1, 1)], crate::Scalar::F(0.0)).unwrap();
+    let unsupported = graph.argmax(input, Some(0), false).unwrap();
     assert!(matches!(
-        graph_viz(&graph, &[padded]),
+        graph_viz(&graph, &[unsupported]),
         Err(VizError::UnsupportedGraphOp(_))
     ));
     assert!(matches!(
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn pad_graph_visualization_preserves_geometry_fill_and_dependency() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 0]);
+    let padded = graph
+        .pad(input, [(1, 0), (0, 2)], crate::Scalar::F(-0.0))
+        .unwrap();
+    let first = graph_viz(&graph, &[padded]).unwrap();
+    let second = graph_viz(&graph, &[padded]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,0]\"];\n  \"g1\" [label=\"pad\\nkind=graph_op\\ndtype=f32\\nfill=f:0x8000000000000000\\nnode=1\\npadding=[1:0,0:2]\\nshape=[3,2]\"];\n  \"g0\" -> \"g1\" [label=\"data:0:input\"];\n}\n"
+    );
+
+    // Signed public padding lowers crop first, then the raw Pad geometry;
+    // both movements remain inspectable without extending Pad's unsigned IR.
+    let signed = graph
+        .pad_signed(input, [(-1, 2), (0, 0)], crate::Scalar::I(0))
+        .unwrap();
+    let signed_dot = graph_viz(&graph, &[signed]).unwrap().to_dot();
+    assert!(signed_dot.contains("shrink"));
+    assert!(signed_dot.contains("bounds=[1:2,0:0]"));
+    assert!(signed_dot.contains("padding=[0:2,0:0]"));
 }
 
 #[test]

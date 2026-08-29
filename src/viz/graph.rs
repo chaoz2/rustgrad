@@ -1,5 +1,5 @@
 use super::{VizEdge, VizError, VizGraph, VizNode};
-use crate::{DType, Graph, NodeId, Op, RandomKind, ReduceKind, Shape};
+use crate::{DType, Graph, NodeId, Op, RandomKind, ReduceKind, Scalar, Shape};
 use std::collections::BTreeSet;
 
 pub(super) fn dtype_name(dtype: DType) -> &'static str {
@@ -54,6 +54,17 @@ pub(super) fn i64_list(values: &[i64]) -> String {
     )
 }
 
+fn scalar_name(value: Scalar) -> String {
+    match value {
+        Scalar::Bool(value) => format!("bool:{value}"),
+        Scalar::I(value) => format!("i:{value}"),
+        Scalar::U(value) => format!("u:{value}"),
+        // Preserve signed zero and NaN payload identity rather than relying
+        // on the platform's floating-point display formatting.
+        Scalar::F(value) => format!("f:0x{:016x}", value.to_bits()),
+    }
+}
+
 fn reduce_name(kind: ReduceKind) -> &'static str {
     match kind {
         ReduceKind::Sum => "sum",
@@ -82,6 +93,7 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
         | Op::Permute { input, .. }
         | Op::Expand { input, .. }
         | Op::Shrink { input, .. }
+        | Op::Pad { input, .. }
         | Op::Stride { input, .. } => vec![("input", *input)],
         Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } | Op::Matmul { lhs, rhs } => {
             vec![("lhs", *lhs), ("rhs", *rhs)]
@@ -216,6 +228,19 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
                     .join(",")
             ),
         ),
+        Op::Pad { padding, fill, .. } => node
+            .field(
+                "padding",
+                format!(
+                    "[{}]",
+                    padding
+                        .iter()
+                        .map(|(before, after)| format!("{before}:{after}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            )
+            .field("fill", scalar_name(*fill)),
         Op::Stride { slices, .. } => node.field("rank", slices.len().to_string()),
         Op::Concat { axis, .. } | Op::Gather { axis, .. } => node.field("axis", axis.to_string()),
         Op::Scatter { axis, add, .. } => node
