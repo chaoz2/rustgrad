@@ -156,7 +156,9 @@ impl Graph {
         sizes: &BTreeMap<String, usize>,
     ) -> Result<NodeId> {
         let parsed = RearrangePattern::parse(pattern)?;
-        let source_shape = self.node(input)?.shape.clone();
+        let source = self.node(input)?;
+        let source_shape = source.shape.clone();
+        let source_dtype = source.dtype;
         let (left, right) = expand_ellipsis(&parsed, source_shape.rank())?;
         let mut supplied = sizes.clone();
         let mut names = BTreeSet::new();
@@ -232,7 +234,6 @@ impl Graph {
         }
         let intermediate_shape =
             Shape::new(elementary.iter().map(|name| dims[name]).collect::<Vec<_>>());
-        let mut node = self.reshape(input, intermediate_shape)?;
         let order = right_names
             .iter()
             .map(|name| {
@@ -242,7 +243,6 @@ impl Graph {
                     .ok_or_else(|| rearrange_err(pattern, "axis mismatch"))
             })
             .collect::<Result<Vec<_>>>()?;
-        node = self.permute(node, order)?;
         let output_shape = Shape::new(
             right
                 .iter()
@@ -254,6 +254,28 @@ impl Graph {
                 })
                 .collect::<Result<Vec<_>>>()?,
         );
+        let permuted_shape = Shape::new(
+            order
+                .iter()
+                .map(|&axis| intermediate_shape.dims()[axis])
+                .collect::<Vec<_>>(),
+        );
+        let extent = |shape: &Shape| {
+            shape
+                .numel()?
+                .checked_mul(source_dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                .map(|_| ())
+        };
+        // Tinygrad's literal is unflatten → permute → flatten. Validate every
+        // concrete view descriptor before the first reshape so malformed
+        // factors and late merged-byte overflow cannot publish a prefix.
+        extent(&source_shape)?;
+        extent(&intermediate_shape)?;
+        extent(&permuted_shape)?;
+        extent(&output_shape)?;
+        let node = self.reshape(input, intermediate_shape)?;
+        let node = self.permute(node, order)?;
         self.reshape(node, output_shape)
     }
 
@@ -468,4 +490,64 @@ fn resolve_axis(axis: isize, rank: usize) -> Result<usize> {
         .ok()
         .filter(|x| *x < rank)
         .ok_or(Error::InvalidIndex)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DType, Error};
+
+    #[test]
+    fn rearrange_matches_concrete_tinygrad_terms_and_preflights_every_view() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype_requires_grad("x", [2, 1, 6], DType::F32, true);
+        let mut sizes = BTreeMap::new();
+        sizes.insert("h".into(), 2);
+        let output = graph
+            .rearrange(input, "b 1 (h w) -> w b h", &sizes)
+            .unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([3, 2, 2]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        assert!(graph.grad(graph.sum_all(output).unwrap(), input).is_ok());
+
+        let ellipsis = graph.input_dtype("ellipsis", [2, 0, 3], DType::I16);
+        let ellipsis_output = graph
+            .rearrange(ellipsis, "b ... c -> ... b c", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(graph.shape(ellipsis_output).unwrap(), &Shape::new([0, 2, 3]));
+        assert_eq!(graph.dtype(ellipsis_output).unwrap(), DType::I16);
+
+        let mut malformed = Graph::new();
+        let source = malformed.input_dtype("source", [2, 6], DType::F64);
+        let before = malformed.node_count();
+        assert!(malformed
+            .rearrange(source, "b (h w) -> h b w", &BTreeMap::new())
+            .is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed
+            .rearrange(source, "b b -> b", &BTreeMap::new())
+            .is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed
+            .rearrange(source, "b c -> (b c)", &{
+                let mut unused = BTreeMap::new();
+                unused.insert("unused".into(), 1);
+                unused
+            })
+            .is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(matches!(
+            malformed.rearrange(NodeId::from_index(usize::MAX), "b c -> c b", &BTreeMap::new()),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+
+        let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+        let overflow_before = malformed.node_count();
+        assert!(matches!(
+            malformed.rearrange(overflow, "b c -> (b c)", &BTreeMap::new()),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), overflow_before);
+    }
 }
