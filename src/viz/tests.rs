@@ -76,6 +76,14 @@ fn replay_trace_visualization_preserves_typed_fields_and_duplicates() {
     for field in ["backend=interpreter", "backend=native_jit", "backend=jit_fallback", "cache_hit=true", "native_cache_key=native", "vector_tail=1", "packed_weight_bytes=8", "order:next"] { assert!(dot.contains(field)); }
     assert!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace::default()).unwrap().nodes().is_empty());
     assert!(matches!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace { items: vec![trace.items[0].clone(), trace.items[0].clone()] }), Err(VizError::DuplicateNode(_))));
+    assert!(matches!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace { items: vec![crate::CapturedItemTrace { lanes: 2, vector_main: 2, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
+    let specialization = crate::CapturedSpecializationTrace { source_identity: 1, concrete_identity: 2, bindings: vec![(9, -1), (3, 4)], cache_hit: true };
+    assert!(crate::captured_specialization_trace_viz(&specialization).unwrap().to_dot().contains("bindings=[9:-1,3:4]"));
+    let replay = crate::NativeMixedReplayTrace { identity: 1, artifact_identity: 2, vectorized: true, pure_item_cache_keys: vec![3, 4] };
+    assert!(crate::native_mixed_replay_trace_viz(&replay).unwrap().to_dot().contains("pure_item_cache_keys=[3,4]"));
+    let batch = crate::NativeMixedBatchTrace { identity: 1, batch_identity: 2, vectorized: false, binding_count: 2, binding_schema_keys: vec![5, 6], pure_item_cache_keys: vec![7] };
+    assert!(crate::native_mixed_batch_trace_viz(&batch).unwrap().to_dot().contains("binding_schema_keys=[5,6]"));
+    assert!(matches!(crate::native_mixed_batch_trace_viz(&crate::NativeMixedBatchTrace { binding_count: 1, ..batch }), Err(VizError::InvalidSchedule(_))));
 }
 
 #[test]

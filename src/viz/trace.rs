@@ -40,6 +40,9 @@ pub fn sharded_cuda_execution_trace_viz(trace: &[ShardedCudaExecutionTrace]) -> 
 }
 
 pub fn captured_replay_trace_viz(trace: &CapturedReplayTrace) -> Result<VizGraph, VizError> {
+    if trace.items.iter().any(|item| item.vector_main.checked_add(item.vector_tail) != Some(item.lanes)) {
+        return Err(VizError::InvalidSchedule("vector geometry does not match lanes".into()));
+    }
     let nodes = trace.items.iter().enumerate().map(|(sequence, item)| {
         VizNode::new(format!("cr{}:{}", item.invocation, item.item), "captured_replay_trace", "item")
             .field("sequence", sequence.to_string()).field("backend", backend_name(item.backend))
@@ -52,6 +55,16 @@ pub fn captured_replay_trace_viz(trace: &CapturedReplayTrace) -> Result<VizGraph
     let edges = trace.items.windows(2).map(|pair| VizEdge::new(format!("cr{}:{}", pair[0].invocation, pair[0].item), format!("cr{}:{}", pair[1].invocation, pair[1].item), "order", "next")).collect();
     VizGraph::try_new("rustgrad_captured_replay_trace", nodes, edges)
 }
-pub fn captured_specialization_trace_viz(trace: &CapturedSpecializationTrace) -> Result<VizGraph, VizError> { VizGraph::try_new("rustgrad_captured_specialization_trace", vec![VizNode::new("specialization","captured_specialization_trace","specialization").field("source_identity",trace.source_identity.to_string()).field("concrete_identity",trace.concrete_identity.to_string()).field("bindings",format!("[{}]",trace.bindings.iter().map(|(a,b)|format!("{a}:{b}")).collect::<Vec<_>>().join(","))).field("cache_hit",trace.cache_hit.to_string())],vec![]) }
-pub fn native_mixed_replay_trace_viz(trace: &NativeMixedReplayTrace) -> Result<VizGraph, VizError> { VizGraph::try_new("rustgrad_native_mixed_replay_trace",vec![VizNode::new("mixed_replay","native_mixed_replay_trace","summary").field("identity",trace.identity.to_string()).field("artifact_identity",trace.artifact_identity.to_string()).field("vectorized",trace.vectorized.to_string()).field("pure_item_cache_keys",u64_list(&trace.pure_item_cache_keys))],vec![]) }
-pub fn native_mixed_batch_trace_viz(trace: &NativeMixedBatchTrace) -> Result<VizGraph, VizError> { if trace.binding_count != trace.binding_schema_keys.len() { return Err(VizError::InvalidSchedule("binding count does not match schema keys".into())); } VizGraph::try_new("rustgrad_native_mixed_batch_trace",vec![VizNode::new("mixed_batch","native_mixed_batch_trace","summary").field("identity",trace.identity.to_string()).field("batch_identity",trace.batch_identity.to_string()).field("vectorized",trace.vectorized.to_string()).field("binding_count",trace.binding_count.to_string()).field("binding_schema_keys",u64_list(&trace.binding_schema_keys)).field("pure_item_cache_keys",u64_list(&trace.pure_item_cache_keys))],vec![]) }
+pub fn captured_specialization_trace_viz(trace: &CapturedSpecializationTrace) -> Result<VizGraph, VizError> {
+    let node = VizNode::new("specialization", "captured_specialization_trace", "specialization").field("source_identity", trace.source_identity.to_string()).field("concrete_identity", trace.concrete_identity.to_string()).field("bindings", format!("[{}]", trace.bindings.iter().map(|(a, b)| format!("{a}:{b}")).collect::<Vec<_>>().join(","))).field("cache_hit", trace.cache_hit.to_string());
+    VizGraph::try_new("rustgrad_captured_specialization_trace", vec![node], vec![])
+}
+pub fn native_mixed_replay_trace_viz(trace: &NativeMixedReplayTrace) -> Result<VizGraph, VizError> {
+    let node = VizNode::new("mixed_replay", "native_mixed_replay_trace", "summary").field("identity", trace.identity.to_string()).field("artifact_identity", trace.artifact_identity.to_string()).field("vectorized", trace.vectorized.to_string()).field("pure_item_cache_keys", u64_list(&trace.pure_item_cache_keys));
+    VizGraph::try_new("rustgrad_native_mixed_replay_trace", vec![node], vec![])
+}
+pub fn native_mixed_batch_trace_viz(trace: &NativeMixedBatchTrace) -> Result<VizGraph, VizError> {
+    if trace.binding_count != trace.binding_schema_keys.len() { return Err(VizError::InvalidSchedule("binding count does not match schema keys".into())); }
+    let node = VizNode::new("mixed_batch", "native_mixed_batch_trace", "summary").field("identity", trace.identity.to_string()).field("batch_identity", trace.batch_identity.to_string()).field("vectorized", trace.vectorized.to_string()).field("binding_count", trace.binding_count.to_string()).field("binding_schema_keys", u64_list(&trace.binding_schema_keys)).field("pure_item_cache_keys", u64_list(&trace.pure_item_cache_keys));
+    VizGraph::try_new("rustgrad_native_mixed_batch_trace", vec![node], vec![])
+}
