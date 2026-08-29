@@ -1076,6 +1076,7 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 crate::ReduceKind::Max => Scalar::F(f64::NEG_INFINITY),
                 crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
             };
+            let mut extrema_seen = false;
             for reduce_linear in 0..reduction_len {
                 let next = eval(
                     value,
@@ -1088,17 +1089,17 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                         binary(acc, next, dtype, BinaryOp::Add)?
                     }
                     crate::ReduceKind::Product => binary(acc, next, dtype, BinaryOp::Mul)?,
-                    crate::ReduceKind::Max
-                        if !next.as_f64().is_nan() && next.as_f64() > acc.as_f64() =>
-                    {
-                        next
+                    crate::ReduceKind::Max | crate::ReduceKind::Min => {
+                        let replace = !extrema_seen
+                            || reduction_extrema_is_better(
+                                dtype,
+                                matches!(kind, crate::ReduceKind::Max),
+                                next,
+                                acc,
+                            );
+                        extrema_seen = true;
+                        if replace { next } else { acc }
                     }
-                    crate::ReduceKind::Min
-                        if !next.as_f64().is_nan() && next.as_f64() < acc.as_f64() =>
-                    {
-                        next
-                    }
-                    crate::ReduceKind::Max | crate::ReduceKind::Min => acc,
                 };
             }
             if *mean {
@@ -1111,6 +1112,28 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
             Ok(FusedValue::typed(acc, dtype))
         }
         _ => Err(Error::InvalidIndex),
+    }
+}
+
+/// Match the CPU oracle's stored-lane extrema ordering. A leading NaN and
+/// equal signed-zero lanes keep their first payload, while I64/U64 lanes are
+/// compared without a lossy floating projection.
+fn reduction_extrema_is_better(dtype: DType, max: bool, candidate: Scalar, best: Scalar) -> bool {
+    use std::cmp::Ordering;
+
+    let ordering = if dtype.is_float() {
+        candidate.as_f64().partial_cmp(&best.as_f64())
+    } else if matches!(dtype.category(), crate::DTypeCategory::Unsigned) {
+        Some(candidate.as_u64().cmp(&best.as_u64()))
+    } else if dtype == DType::Bool {
+        Some(candidate.as_bool().cmp(&best.as_bool()))
+    } else {
+        Some(candidate.as_i64().cmp(&best.as_i64()))
+    };
+    if max {
+        ordering == Some(Ordering::Greater)
+    } else {
+        ordering == Some(Ordering::Less)
     }
 }
 fn cast_scalar(x: Scalar, dtype: DType) -> Scalar {
@@ -1708,6 +1731,46 @@ mod tests {
             execute_elementwise(&graph, output, &inputs).unwrap().storage(),
             CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
         );
+    }
+
+    #[test]
+    fn captured_reductions_match_cpu_extrema_lane_order_for_floats_and_wide_integers() {
+        let cases = [
+            (
+                DType::F32,
+                crate::ReduceKind::Max,
+                vec![Scalar::F(f32::NAN as f64), Scalar::F(f32::INFINITY as f64)],
+            ),
+            (
+                DType::F32,
+                crate::ReduceKind::Min,
+                vec![Scalar::F(-0.0), Scalar::F(0.0)],
+            ),
+            (
+                DType::U64,
+                crate::ReduceKind::Max,
+                vec![Scalar::U((1_u64 << 53) + 1), Scalar::U(1_u64 << 53)],
+            ),
+            (
+                DType::I64,
+                crate::ReduceKind::Min,
+                vec![Scalar::I(-((1_i64 << 53) + 1)), Scalar::I(-(1_i64 << 53))],
+            ),
+        ];
+        for (dtype, kind, values) in cases {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [values.len()], dtype);
+            let output = graph.reduce(input, kind, Some(vec![0]), false).unwrap();
+            let inputs = HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([values.len()], dtype, values).unwrap(),
+            )]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "{dtype:?} {kind:?}",
+            );
+        }
     }
 
     #[test]

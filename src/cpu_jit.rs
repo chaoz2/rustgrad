@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v18";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v19";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -1955,11 +1955,6 @@ fn render_reduction(
             "native C reduction kind is not implemented".into(),
         ));
     }
-    if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) && !out.dtype.is_float() {
-        return Err(JitError::Unsupported(
-            "native extrema reduction currently requires floating point".into(),
-        ));
-    }
     let value_node = update
         .sources()
         .get(1)
@@ -1975,9 +1970,9 @@ fn render_reduction(
         "  for (size_t rg_out = 0; rg_out < {out_len}u; ++rg_out) {{"
     ));
     let acc = accumulator_type(out.dtype);
-    let initial = if matches!(kind, crate::ReduceKind::Max) {
+    let initial = if matches!(kind, crate::ReduceKind::Max) && out.dtype.is_float() {
         "-INFINITY"
-    } else if matches!(kind, crate::ReduceKind::Min) {
+    } else if matches!(kind, crate::ReduceKind::Min) && out.dtype.is_float() {
         "INFINITY"
     } else if matches!(kind, crate::ReduceKind::Product) {
         "1"
@@ -2000,13 +1995,21 @@ fn render_reduction(
         ));
         let mut map = BTreeMap::new();
         let value = emit(value_node, ids, &mut map, lines)?;
-        if matches!(kind, crate::ReduceKind::Max) {
+        if matches!(kind, crate::ReduceKind::Max) && out.dtype.is_float() {
             lines.push(format!(
                 "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
             ));
-        } else if matches!(kind, crate::ReduceKind::Min) {
+        } else if matches!(kind, crate::ReduceKind::Min) && out.dtype.is_float() {
             lines.push(format!(
                 "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
+            ));
+        } else if matches!(kind, crate::ReduceKind::Max) {
+            lines.push(format!(
+                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
+            ));
+        } else if matches!(kind, crate::ReduceKind::Min) {
+            lines.push(format!(
+                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
             ));
         } else if out.dtype == DType::Bool {
             let operator = if matches!(kind, crate::ReduceKind::Product) {
@@ -2723,7 +2726,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v18");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v19");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -3787,6 +3790,22 @@ mod tests {
         assert!(extrema_scalar.contains("int rg_seen = 0;"));
         assert!(extrema_scalar.contains("if (!rg_seen)"));
         assert!(extrema_scalar.contains("!isnan(rg_acc)"));
+
+        for (dtype, kind, comparison) in [
+            (DType::Bool, crate::ReduceKind::Max, "> rg_acc"),
+            (DType::I64, crate::ReduceKind::Min, "< rg_acc"),
+            (DType::U64, crate::ReduceKind::Max, "> rg_acc"),
+        ] {
+            let mut integral = Graph::new();
+            let input = integral.input_dtype("input", Shape::from([1, 3]), dtype);
+            let output = integral.reduce(input, kind, Some(vec![1]), false).unwrap();
+            let uop = crate::lower_graph_reduction(&integral, output).unwrap();
+            let rendered = CpuJit::render(&uop).unwrap();
+            assert!(rendered.source.contains("int rg_seen = 0;"), "{dtype:?}");
+            assert!(rendered.source.contains(comparison), "{dtype:?}");
+            assert!(!rendered.source.contains("isnan((uint64_t)"), "{dtype:?}");
+            assert!(CpuJit::render_vectorized(&uop).is_ok(), "{dtype:?}");
+        }
     }
 
     #[test]
