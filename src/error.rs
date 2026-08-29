@@ -211,6 +211,8 @@ pub enum Error {
         dim: usize,
     },
     NonDifferentiableIndexing(&'static str),
+    /// `TensorData::item` requires exactly one stored element, regardless of rank.
+    NonScalarItem(Shape),
     NonScalarLoss(Shape),
     /// A reverse-mode target must be a floating, gradient-tracked graph value.
     NonDifferentiableTarget(NodeId),
@@ -430,6 +432,9 @@ impl fmt::Display for Error {
                 f,
                 "{op} is deliberately nondifferentiable in the current graph"
             ),
+            Self::NonScalarItem(shape) => {
+                write!(f, "item requires exactly one element, got {shape}")
+            }
             Self::NonScalarLoss(shape) => {
                 write!(f, "backward requires a one-element loss, got {shape}")
             }

@@ -63,6 +63,18 @@ impl TensorData {
         self.storage.scalar(index)
     }
 
+    /// Returns the sole stored value as a typed scalar.
+    ///
+    /// Like tinygrad's `Tensor.item`, rank is irrelevant: scalar tensors and
+    /// singleton tensors of any rank are accepted, while zero- and
+    /// multi-element tensors fail without inspecting or modifying storage.
+    pub fn item(&self) -> Result<Scalar> {
+        if self.len() != 1 {
+            return Err(Error::NonScalarItem(self.shape.clone()));
+        }
+        Ok(self.scalar_at(0))
+    }
+
     pub fn len(&self) -> usize {
         self.storage.len()
     }
@@ -341,6 +353,83 @@ fn assigned_storage(destination: &Storage, source: &Storage, offsets: &[usize]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_returns_the_only_typed_value_for_every_storage_family() {
+        let cases = [
+            (DType::Bool, Scalar::Bool(true), Scalar::Bool(true)),
+            (DType::I8, Scalar::I(-7), Scalar::I(-7)),
+            (DType::I16, Scalar::I(-300), Scalar::I(-300)),
+            (DType::I32, Scalar::I(-70_000), Scalar::I(-70_000)),
+            (DType::I64, Scalar::I(i64::MIN), Scalar::I(i64::MIN)),
+            (DType::U8, Scalar::U(250), Scalar::U(250)),
+            (DType::U16, Scalar::U(60_000), Scalar::U(60_000)),
+            (DType::U32, Scalar::U(4_000_000_000), Scalar::U(4_000_000_000)),
+            (DType::U64, Scalar::U(u64::MAX), Scalar::U(u64::MAX)),
+            (DType::F16, Scalar::F(-0.0), Scalar::F(-0.0)),
+            (DType::BF16, Scalar::F(-0.0), Scalar::F(-0.0)),
+            (DType::F32, Scalar::F(-0.0), Scalar::F(-0.0)),
+            (DType::F64, Scalar::F(-0.0), Scalar::F(-0.0)),
+        ];
+        for (dtype, input, expected) in cases {
+            let data = TensorData::from_scalars([1, 1], dtype, [input]).unwrap();
+            let actual = data.item().unwrap();
+            match (actual, expected) {
+                (Scalar::Bool(actual), Scalar::Bool(expected)) => {
+                    assert_eq!(actual, expected, "{dtype:?}");
+                }
+                (Scalar::I(actual), Scalar::I(expected)) => {
+                    assert_eq!(actual, expected, "{dtype:?}");
+                }
+                (Scalar::U(actual), Scalar::U(expected)) => {
+                    assert_eq!(actual, expected, "{dtype:?}");
+                }
+                (Scalar::F(actual), Scalar::F(expected)) => {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "{dtype:?}");
+                }
+                (actual, expected) => {
+                    panic!("item changed scalar kind for {dtype:?}: {actual:?} != {expected:?}")
+                }
+            }
+        }
+
+        let scalar = TensorData::scalar_with_dtype(Scalar::I(42), DType::I32);
+        assert!(matches!(scalar.item(), Ok(Scalar::I(42))));
+    }
+
+    #[test]
+    fn item_preserves_float_nan_and_signed_zero_observability() {
+        let half_nan = TensorData::from_storage([1], Storage::F16(vec![0x7e01])).unwrap();
+        let bf16_nan = TensorData::from_storage([1], Storage::BF16(vec![0x7fc1])).unwrap();
+        assert!(half_nan.item().unwrap().as_f64().is_nan());
+        assert!(bf16_nan.item().unwrap().as_f64().is_nan());
+
+        for data in [
+            TensorData::from_storage([1], Storage::F16(vec![0x8000])).unwrap(),
+            TensorData::from_storage([1], Storage::BF16(vec![0x8000])).unwrap(),
+            TensorData::from_storage([1], Storage::F32(vec![-0.0])).unwrap(),
+            TensorData::from_storage([1], Storage::F64(vec![-0.0])).unwrap(),
+        ] {
+            assert_eq!(data.item().unwrap().as_f64().to_bits(), (-0.0f64).to_bits());
+        }
+    }
+
+    #[test]
+    fn item_rejects_non_singletons_without_mutating_storage() {
+        for data in [
+            TensorData::from_storage([0], Storage::U8(vec![])).unwrap(),
+            TensorData::from_storage([2], Storage::U8(vec![3, 4])).unwrap(),
+        ] {
+            let before = data.clone();
+            let error = data.item().unwrap_err();
+            assert_eq!(error, Error::NonScalarItem(data.shape().clone()));
+            assert_eq!(
+                error.to_string(),
+                format!("item requires exactly one element, got {}", data.shape())
+            );
+            assert_eq!(data, before);
+        }
+    }
 
     #[test]
     fn storage_preserves_integer_and_bool_values() {
