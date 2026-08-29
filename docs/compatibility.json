@@ -504,7 +504,7 @@
       "subject": "Graph/kernel visualization and profiling",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "The dependency-free `viz` facade normalizes every current typed Graph Op family, Schedule/CapturedSchedule DAGs, shared UOp DAGs, and Linear/MemorySpace/Vector plans into a validated canonical model with stable DOT rendering. Snapshots cover fused elementwise graphs, schedule dependencies/materializations/cache identities, affine views, reduction/movement/matmul metadata, shared UOps, escaping, malformed inputs, and artifact round trips. It does not invoke Graphviz, retain runtime objects, cover future unsupported Graph Op families, or claim runtime profiling."
+        "Acceptance requirement": "The dependency-free `viz` facade normalizes every current typed Graph Op family, CompileTrace/RealizationTrace records, Schedule/CapturedSchedule DAGs, shared UOp DAGs, and Linear/MemorySpace/Vector plans into a validated canonical model with stable DOT rendering. It does not invoke Graphviz, retain live runtime objects, or claim runtime launch profiling."
       }
     },
     {
