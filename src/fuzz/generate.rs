@@ -135,21 +135,29 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             }
         }
         4 => {
-            let rows = [0, 1, 2, 3][rng.pick(4)];
-            let columns = [0, 1, 3, 8][rng.pick(4)];
-            let reduction = if columns == 0 {
-                [FuzzReduction::Sum, FuzzReduction::Product][rng.pick(2)]
+            // All raw reduction kinds share the typed ReduceFinalize path.
+            // Extrema require a nonempty reduced axis; Sum/Product/Mean keep
+            // their defined zero-domain identities in this bounded family.
+            let rank = 1 + rng.pick(3);
+            let axis = rng.pick(rank);
+            let shape = (0..rank)
+                .map(|_| [0, 1, 2, 3][rng.pick(4)])
+                .collect::<Vec<_>>();
+            let reduction = if shape[axis] == 0 {
+                [FuzzReduction::Sum, FuzzReduction::Mean, FuzzReduction::Product][rng.pick(3)]
             } else {
                 [
                     FuzzReduction::Sum,
                     FuzzReduction::Mean,
                     FuzzReduction::Product,
-                ][rng.pick(3)]
+                    FuzzReduction::Max,
+                    FuzzReduction::Min,
+                ][rng.pick(5)]
             };
             FuzzCase::Reduction {
-                input: tensor(&mut rng, vec![rows, columns], DType::F32),
+                input: tensor(&mut rng, shape, DType::F32),
                 reduction,
-                axis: 1,
+                axis,
                 keepdim: rng.pick(2) == 0,
             }
         }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, Op, Scalar,
-    MovementKernelKind, MovementKernelPlan, Storage, TensorData, UArg, UOpKind, UnaryOp,
+    MovementKernelKind, MovementKernelPlan, ReduceKind, Storage, TensorData, UArg, UOpKind, UnaryOp,
     schedule,
 };
 use std::{
@@ -87,6 +87,176 @@ fn generated_cases_are_valid_bounded_and_order_independent() {
             .map(|index| generate_case(0x1235, index))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn generated_reduction_cases_cover_portable_kinds_and_geometry() {
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut ranks = std::collections::BTreeSet::new();
+    let mut nonzero_axis = false;
+    let mut zero_domain = false;
+    let mut scalar_output = false;
+    let mut keepdim = false;
+    let mut dropdim = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..512 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Reduction {
+                input,
+                reduction,
+                axis,
+                keepdim: case_keepdim,
+            } = case
+            else {
+                continue;
+            };
+            assert!((1..=3).contains(&input.shape.len()));
+            assert!(axis < input.shape.len());
+            if matches!(reduction, FuzzReduction::Max | FuzzReduction::Min) {
+                assert_ne!(input.shape[axis], 0);
+            }
+            let built = FuzzCase::Reduction {
+                input: input.clone(),
+                reduction,
+                axis,
+                keepdim: case_keepdim,
+            }
+            .build()
+            .unwrap();
+            kinds.insert(reduction);
+            ranks.insert(input.shape.len());
+            nonzero_axis |= input.shape[axis] != 0;
+            zero_domain |= input.shape[axis] == 0;
+            scalar_output |= built.graph.shape(built.output).unwrap().rank() == 0;
+            keepdim |= case_keepdim;
+            dropdim |= !case_keepdim;
+        }
+    }
+
+    assert_eq!(
+        kinds,
+        std::collections::BTreeSet::from([
+            FuzzReduction::Sum,
+            FuzzReduction::Mean,
+            FuzzReduction::Product,
+            FuzzReduction::Max,
+            FuzzReduction::Min,
+        ])
+    );
+    assert_eq!(ranks, std::collections::BTreeSet::from([1, 2, 3]));
+    assert!(nonzero_axis && zero_domain && scalar_output && keepdim && dropdim);
+}
+
+#[test]
+fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
+    let cases = [
+        (FuzzReduction::Sum, ReduceKind::Sum, true),
+        (FuzzReduction::Mean, ReduceKind::Mean, false),
+        (FuzzReduction::Product, ReduceKind::Product, true),
+        (FuzzReduction::Max, ReduceKind::Max, false),
+        (FuzzReduction::Min, ReduceKind::Min, true),
+    ]
+    .map(|(reduction, _kind, keepdim)| FuzzCase::Reduction {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2, 3], Storage::F32(vec![1.0, -0.0, 2.0, 3.0, 4.0, 5.0]))
+                .unwrap(),
+        ),
+        reduction,
+        axis: 1,
+        keepdim,
+    });
+    let value = serde_json::to_value(&cases[2]).unwrap();
+    assert_eq!(value["kind"], "reduction");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), cases[2]);
+    let mut unknown = value;
+    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    for (case, expected_kind) in cases.iter().cloned().zip([
+        ReduceKind::Sum,
+        ReduceKind::Mean,
+        ReduceKind::Product,
+        ReduceKind::Max,
+        ReduceKind::Min,
+    ]) {
+        let built = case.build().unwrap();
+        let Op::Reduce { kind, axes, keepdim, .. } = built.graph.op(built.output).unwrap() else {
+            panic!("raw reduction case must retain its Reduce root");
+        };
+        assert_eq!(*kind, expected_kind);
+        assert_eq!(axes, &vec![1]);
+        let FuzzCase::Reduction { keepdim: expected_keepdim, .. } = &case else {
+            unreachable!("constructed as Reduction")
+        };
+        assert_eq!(*keepdim, *expected_keepdim);
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        let item = &scheduled.items[0];
+        assert!(item.boundary.is_none());
+        assert!(item.kernel.topological().unwrap().iter().any(|uop| {
+            matches!(uop.kind(), UOpKind::ReduceFinalize)
+        }));
+        assert!(CpuJit::render(&item.kernel).is_ok());
+        assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+    }
+
+    for reduction in [FuzzReduction::Sum, FuzzReduction::Mean, FuzzReduction::Product] {
+        let empty = FuzzCase::Reduction {
+            input: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::F32(vec![])).unwrap()),
+            reduction,
+            axis: 1,
+            keepdim: false,
+        };
+        let built = empty.build().unwrap();
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert!(CpuJit::render(&scheduled.items[0].kernel).is_ok());
+    }
+
+    let product = cases[2].clone();
+    let product_built = product.build().unwrap();
+    let product_output = CpuBackend.execute(&product_built.graph, product_built.output, &product_built.oracle).unwrap();
+    let artifact = FuzzFailureArtifact::new(
+        15, 23, product.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&product_output),
+        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Product mismatch".into() },
+    ).unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&product, |candidate| {
+        matches!(candidate, FuzzCase::Reduction { input, reduction: FuzzReduction::Product, axis: 1, keepdim: true }
+            if input.bytes == vec![0; 24])
+    });
+    assert!(matches!(zeroed, FuzzCase::Reduction { ref input, reduction: FuzzReduction::Product, axis: 1, keepdim: true }
+        if input.bytes == vec![0; 24]));
+
+    let max = FuzzCase::Reduction {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([5], Storage::F32(vec![f32::NEG_INFINITY, f32::NAN, -0.0, 0.0, f32::INFINITY])).unwrap(),
+        ),
+        reduction: FuzzReduction::Max,
+        axis: 0,
+        keepdim: false,
+    };
+    let max_built = max.build().unwrap();
+    let max_value = CpuBackend.execute(&max_built.graph, max_built.output, &max_built.oracle).unwrap();
+    assert_eq!(max_value.scalar_at(0), Scalar::F(f32::INFINITY as f64));
+    let min = FuzzCase::Reduction {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), 0.0, f32::INFINITY])).unwrap(),
+        ),
+        reduction: FuzzReduction::Min,
+        axis: 0,
+        keepdim: false,
+    };
+    let min_built = min.build().unwrap();
+    let min_value = CpuBackend.execute(&min_built.graph, min_built.output, &min_built.oracle).unwrap();
+    let Scalar::F(minimum) = min_value.scalar_at(0) else { panic!("F32 min output") };
+    assert_eq!((minimum as f32).to_bits(), 0x8000_0000);
 }
 
 #[test]
@@ -1499,7 +1669,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 31);
+    assert_eq!(cases.len(), 33);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(

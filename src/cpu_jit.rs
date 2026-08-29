@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v14";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v15";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -1926,6 +1926,7 @@ fn render_reduction(
         kind,
         crate::ReduceKind::Sum
             | crate::ReduceKind::Mean
+            | crate::ReduceKind::Product
             | crate::ReduceKind::Max
             | crate::ReduceKind::Min
     ) {
@@ -1957,10 +1958,17 @@ fn render_reduction(
         "-INFINITY"
     } else if matches!(kind, crate::ReduceKind::Min) {
         "INFINITY"
+    } else if matches!(kind, crate::ReduceKind::Product) {
+        "1"
     } else {
         "0"
     };
     lines.push(format!("    {acc} rg_acc = {initial};"));
+    if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) {
+        // CpuBackend accepts the first stored lane unconditionally. This is
+        // observable for a leading NaN and for equal signed-zero lanes.
+        lines.push("    int rg_seen = 0;".into());
+    }
     if reduce_len != 0 {
         lines.push(format!(
             "    for (size_t rg_r = 0; rg_r < {reduce_len}u; ++rg_r) {{"
@@ -1973,14 +1981,23 @@ fn render_reduction(
         let value = emit(value_node, ids, &mut map, lines)?;
         if matches!(kind, crate::ReduceKind::Max) {
             lines.push(format!(
-                "      if (!isnan(({acc})({value})) && ({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
+                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
             ));
         } else if matches!(kind, crate::ReduceKind::Min) {
             lines.push(format!(
-                "      if (!isnan(({acc})({value})) && ({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
+                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
             ));
         } else if out.dtype == DType::Bool {
-            lines.push(format!("      rg_acc = (uint8_t)(rg_acc || ({value}));"));
+            let operator = if matches!(kind, crate::ReduceKind::Product) {
+                "&&"
+            } else {
+                "||"
+            };
+            lines.push(format!("      rg_acc = (uint8_t)(rg_acc {operator} ({value}));"));
+        } else if matches!(kind, crate::ReduceKind::Product) {
+            lines.push(format!(
+                "      rg_acc = ({acc})(rg_acc * ({acc})({value}));"
+            ));
         } else {
             lines.push(format!(
                 "      rg_acc = ({acc})(rg_acc + ({acc})({value}));"
@@ -3510,6 +3527,60 @@ mod tests {
                 assert!(expected.to_vec_f64().iter().all(|v| v.is_nan()));
             }
         }
+    }
+
+    #[test]
+    fn reduction_renderer_product_bool_and_extrema_preserve_typed_contracts() {
+        let mut numeric = Graph::new();
+        let input = numeric.input_dtype("input", Shape::from([2, 3]), DType::F32);
+        let product = numeric
+            .reduce(input, crate::ReduceKind::Product, Some(vec![1]), false)
+            .unwrap();
+        let product_uop = crate::lower_graph_reduction(&numeric, product).unwrap();
+        let product_scalar = CpuJit::render(&product_uop).unwrap();
+        assert!(product_scalar.source.contains(RENDERER_VERSION));
+        assert!(product_scalar.source.contains("rg_acc = 1;"));
+        assert!(product_scalar.source.contains("rg_acc *"));
+        assert_eq!(product_scalar.cache_key, CpuJit::render(&product_uop).unwrap().cache_key);
+        assert!(CpuJit::render_vectorized(&product_uop).is_ok());
+
+        for (dtype, conversion) in [
+            (DType::F16, "rg_f32_to_f16"),
+            (DType::BF16, "rg_f32_to_bf16"),
+        ] {
+            let mut narrow = Graph::new();
+            let input = narrow.input_dtype("input", Shape::from([1, 2]), dtype);
+            let product = narrow
+                .reduce(input, crate::ReduceKind::Product, Some(vec![1]), false)
+                .unwrap();
+            let source = CpuJit::render(&crate::lower_graph_reduction(&narrow, product).unwrap())
+                .unwrap()
+                .source;
+            assert!(source.contains(conversion), "{dtype:?}");
+        }
+
+        let mut boolean = Graph::new();
+        let input = boolean.input_dtype("input", Shape::from([2, 2]), DType::Bool);
+        let product = boolean
+            .reduce(input, crate::ReduceKind::Product, Some(vec![1]), true)
+            .unwrap();
+        let bool_uop = crate::lower_graph_reduction(&boolean, product).unwrap();
+        let bool_scalar = CpuJit::render(&bool_uop).unwrap();
+        assert!(bool_scalar.source.contains("uint8_t rg_acc = 1;"));
+        assert!(bool_scalar.source.contains("rg_acc &&"));
+        assert!(CpuJit::render_vectorized(&bool_uop).is_ok());
+
+        let mut extrema = Graph::new();
+        let input = extrema.input_dtype("input", Shape::from([1, 3]), DType::F32);
+        let maximum = extrema
+            .reduce(input, crate::ReduceKind::Max, Some(vec![1]), false)
+            .unwrap();
+        let extrema_scalar = CpuJit::render(&crate::lower_graph_reduction(&extrema, maximum).unwrap())
+            .unwrap()
+            .source;
+        assert!(extrema_scalar.contains("int rg_seen = 0;"));
+        assert!(extrema_scalar.contains("if (!rg_seen)"));
+        assert!(extrema_scalar.contains("!isnan(rg_acc)"));
     }
 
     #[test]

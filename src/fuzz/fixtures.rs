@@ -56,6 +56,27 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             axis: 1,
             keepdim: true,
         },
+        FuzzCase::Reduction {
+            // A non-leading NaN is filtered by raw Max; finite/infinite
+            // candidates retain the source first-tie ordering contract.
+            input: tensor(
+                vec![1, 5],
+                Storage::F32(vec![f32::NEG_INFINITY, f32::NAN, -0.0, 0.0, f32::INFINITY]),
+            ),
+            reduction: FuzzReduction::Max,
+            axis: 1,
+            keepdim: false,
+        },
+        FuzzCase::Reduction {
+            // Equal signed zeros retain the first payload for raw Min.
+            input: tensor(
+                vec![1, 3],
+                Storage::F32(vec![f32::from_bits(0x8000_0000), 0.0, f32::INFINITY]),
+            ),
+            reduction: FuzzReduction::Min,
+            axis: 1,
+            keepdim: true,
+        },
         FuzzCase::Unary {
             op: FuzzUnaryOp::Abs,
             input: tensor(

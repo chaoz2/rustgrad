@@ -51,12 +51,14 @@ pub enum FuzzScatterOp {
     Add,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FuzzReduction {
     Sum,
     Mean,
     Product,
+    Max,
+    Min,
 }
 
 /// Portable little-endian tensor bytes used by generated cases and failures.
@@ -376,6 +378,8 @@ impl FuzzCase {
                             FuzzReduction::Sum => ReduceKind::Sum,
                             FuzzReduction::Mean => ReduceKind::Mean,
                             FuzzReduction::Product => ReduceKind::Product,
+                            FuzzReduction::Max => ReduceKind::Max,
+                            FuzzReduction::Min => ReduceKind::Min,
                         },
                         Some(vec![*axis as isize]),
                         *keepdim,
