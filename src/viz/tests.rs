@@ -35,9 +35,15 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
     ));
     let mut graph = Graph::new();
     let input = graph.input("x", [1]);
-    let upstream = graph.input("upstream", []);
     let unsupported = graph
-        .reduce_grad(input, upstream, crate::ReduceKind::Sum, vec![0], false)
+        .static_index(
+            input,
+            &[crate::ir::indexing::StaticIndex::Slice {
+                start: None,
+                stop: None,
+                step: 1,
+            }],
+        )
         .unwrap();
     assert!(matches!(
         graph_viz(&graph, &[unsupported]),
@@ -47,6 +53,75 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn reduction_derivative_graph_visualization_preserves_axes_and_sum_to_target() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2, 3, 4]);
+    let upstream = graph.input("upstream", [2, 1, 1]);
+    let gradient = graph
+        .reduce_grad(
+            input,
+            upstream,
+            crate::ReduceKind::Mean,
+            vec![1, 2],
+            true,
+        )
+        .unwrap();
+    let cotangent = graph.input("cotangent", [2, 3, 4]);
+    let vjp = graph
+        .reduce_grad_vjp(
+            cotangent,
+            input,
+            upstream,
+            crate::ReduceKind::Mean,
+            vec![1, 2],
+            true,
+            1,
+        )
+        .unwrap();
+    let compact_upstream = graph.input("compact_upstream", [2]);
+    let compact_gradient = graph
+        .reduce_grad(
+            input,
+            compact_upstream,
+            crate::ReduceKind::Sum,
+            vec![1, 2],
+            false,
+        )
+        .unwrap();
+    let scalar = graph.input("scalar", []);
+    let scalar_sum = graph.sum_to(scalar, Shape::from([])).unwrap();
+    let broadcast = graph.input("broadcast", [2, 3, 4]);
+    let summed = graph.sum_to(broadcast, Shape::from([1, 3, 1])).unwrap();
+
+    let first = graph_viz(
+        &graph,
+        &[gradient, vjp, compact_gradient, scalar_sum, summed],
+    )
+    .unwrap();
+    let second = graph_viz(
+        &graph,
+        &[gradient, vjp, compact_gradient, scalar_sum, summed],
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let dot = first.to_dot();
+    assert!(dot.contains("reduce_grad\\nkind=graph_op"));
+    assert!(dot.contains("reduce_grad_vjp\\nkind=graph_op"));
+    assert!(dot.contains("reduction=mean"));
+    assert!(dot.contains("axes=[1,2]"));
+    assert!(dot.contains("keepdim=true"));
+    assert!(dot.contains("keepdim=false"));
+    assert!(dot.contains("wrt=1"));
+    assert!(dot.contains("data:0:input"));
+    assert!(dot.contains("data:1:upstream"));
+    assert!(dot.contains("data:0:cotangent"));
+    assert!(dot.contains("sum_to\\nkind=graph_op"));
+    assert!(dot.contains("target_shape=[]"));
+    assert!(dot.contains("target_shape=[1,3,1]"));
+    assert!(dot.contains("shape=[2,3,4]"));
 }
 
 #[test]

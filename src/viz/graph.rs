@@ -212,6 +212,7 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }
         | Op::ArgReduce { input, .. }
+        | Op::SumTo { input, .. }
         | Op::Sort { input, .. }
         | Op::Reshape { input, .. }
         | Op::Permute { input, .. }
@@ -290,6 +291,19 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
             dependency("upstream", *upstream),
             dependency("lhs", *lhs),
             dependency("rhs", *rhs),
+        ],
+        Op::ReduceGrad {
+            input, upstream, ..
+        } => vec![dependency("input", *input), dependency("upstream", *upstream)],
+        Op::ReduceGradVjp {
+            cotangent,
+            input,
+            upstream,
+            ..
+        } => vec![
+            dependency("cotangent", *cotangent),
+            dependency("input", *input),
+            dependency("upstream", *upstream),
         ],
         Op::Conv2d {
             input, weight, bias, ..
@@ -527,6 +541,27 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
         } => node
             .field("target", if *lhs_gradient { "lhs" } else { "rhs" })
             .field("wrt", wrt.to_string()),
+        Op::ReduceGrad {
+            kind,
+            axes,
+            keepdim,
+            ..
+        } => node
+            .field("reduction", reduce_name(*kind))
+            .field("axes", usize_list(axes))
+            .field("keepdim", keepdim.to_string()),
+        Op::ReduceGradVjp {
+            kind,
+            axes,
+            keepdim,
+            wrt,
+            ..
+        } => node
+            .field("reduction", reduce_name(*kind))
+            .field("axes", usize_list(axes))
+            .field("keepdim", keepdim.to_string())
+            .field("wrt", wrt.to_string()),
+        Op::SumTo { shape, .. } => node.field("target_shape", shape_name(shape)),
         Op::Conv2d { options, .. } => conv2d_geometry(node, *options),
         Op::Conv2dGrad {
             options, target, ..
