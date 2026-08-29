@@ -4179,6 +4179,24 @@ impl Graph {
         self.node(id)?.shape.numel()
     }
 
+    /// Read-only tinygrad `Tensor.ndim`. RustGrad stores only concrete shapes,
+    /// so this is the concrete descriptor rank.
+    pub fn ndim(&self, id: NodeId) -> Result<usize> {
+        Ok(self.node(id)?.shape.rank())
+    }
+
+    /// Read-only tinygrad `Tensor.max_shape` in RustGrad's concrete-shape
+    /// model. There are no symbolic extents to substitute, so it is an owned
+    /// copy of the concrete shape.
+    pub fn max_shape(&self, id: NodeId) -> Result<Shape> {
+        Ok(self.node(id)?.shape.clone())
+    }
+
+    /// Read-only tinygrad `Tensor.max_numel` for a concrete RustGrad shape.
+    pub fn max_numel(&self, id: NodeId) -> Result<usize> {
+        self.node(id)?.shape.numel()
+    }
+
     /// Read-only tinygrad `Tensor.size()` without a dimension.
     ///
     /// The owned `Shape` keeps this query independent of the graph's internal

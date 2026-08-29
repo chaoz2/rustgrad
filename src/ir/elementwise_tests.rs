@@ -60,8 +60,14 @@ fn descriptor_queries_are_read_only_and_source_axis_checked() {
     let before = graph.node_count();
 
     assert_eq!(graph.numel(scalar).unwrap(), 1);
+    assert_eq!(graph.ndim(scalar).unwrap(), 0);
+    assert_eq!(graph.max_shape(scalar).unwrap(), Shape::new([]));
+    assert_eq!(graph.max_numel(scalar).unwrap(), 1);
     assert_eq!(graph.size(scalar).unwrap(), Shape::new([]));
     assert_eq!(graph.numel(zero_extent).unwrap(), 0);
+    assert_eq!(graph.ndim(zero_extent).unwrap(), 3);
+    assert_eq!(graph.max_shape(zero_extent).unwrap(), Shape::new([2, 0, 3]));
+    assert_eq!(graph.max_numel(zero_extent).unwrap(), 0);
     assert_eq!(graph.size(zero_extent).unwrap(), Shape::new([2, 0, 3]));
     assert_eq!(graph.size_dim(zero_extent, -3).unwrap(), 2);
     assert_eq!(graph.size_dim(zero_extent, -1).unwrap(), 3);
@@ -92,6 +98,9 @@ fn descriptor_queries_are_read_only_and_source_axis_checked() {
     assert!(matches!(graph.size_dim(zero_extent, 3), Err(Error::InvalidAxis { .. })));
     let unknown = NodeId::from_index(usize::MAX);
     assert!(matches!(graph.numel(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.ndim(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.max_shape(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.max_numel(unknown), Err(Error::UnknownNode(_))));
     assert!(matches!(graph.size(unknown), Err(Error::UnknownNode(_))));
     assert!(matches!(graph.size_dim(unknown, 0), Err(Error::UnknownNode(_))));
     assert!(matches!(graph.element_size(unknown), Err(Error::UnknownNode(_))));
@@ -100,6 +109,9 @@ fn descriptor_queries_are_read_only_and_source_axis_checked() {
     let overflow = graph.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let overflow_before = graph.node_count();
     assert!(matches!(graph.numel(overflow), Err(Error::ShapeOverflow(_))));
+    assert_eq!(graph.ndim(overflow).unwrap(), 2);
+    assert_eq!(graph.max_shape(overflow).unwrap(), Shape::new([usize::MAX, 2]));
+    assert!(matches!(graph.max_numel(overflow), Err(Error::ShapeOverflow(_))));
     assert!(matches!(graph.nbytes(overflow), Err(Error::ShapeOverflow(_))));
     assert_eq!(graph.node_count(), overflow_before);
 }
