@@ -2485,6 +2485,29 @@ impl Graph {
                     reason: "unflatten cannot infer through zero extent product",
                 });
             }
+            // `unflatten` delegates to `reshape` with the surrounding axes
+            // intact.  tinygrad's `-prod(old) // prod(new_shape)` therefore
+            // rejects an inferred extent whenever any *other* output axis is
+            // zero, rather than allowing the whole-tensor zero product to
+            // mask an invalid split of the selected axis.
+            let inference_denominator = shape.dims()[..axis]
+                .iter()
+                .chain(sizes.iter().filter_map(|size| match size {
+                    crate::UnflattenExtent::Exact(size) => Some(size),
+                    crate::UnflattenExtent::Infer => None,
+                }))
+                .chain(shape.dims()[axis + 1..].iter())
+                .try_fold(1usize, |product, extent| {
+                    product
+                        .checked_mul(*extent)
+                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                })?;
+            if inference_denominator == 0 || source_extent % known_product != 0 {
+                return Err(Error::InvalidReshape {
+                    from: shape.clone(),
+                    to: Shape::new(Vec::new()),
+                });
+            }
             Some(source_extent / known_product)
         };
         let output_capacity = shape

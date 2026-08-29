@@ -2139,6 +2139,13 @@ mod tests {
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(malformed.node_count(), original_nodes);
+        let zero_elsewhere = malformed.input("zero_elsewhere", [0, 6]);
+        let zero_elsewhere_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.unflatten(zero_elsewhere, 1, [Infer, Exact(4)]),
+            Err(Error::InvalidReshape { .. })
+        ));
+        assert_eq!(malformed.node_count(), zero_elsewhere_nodes);
     }
 
     #[test]
