@@ -211,7 +211,7 @@ pub use uop::{
 pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
 pub use viz::{
     VizEdge, VizError, VizGraph, VizNode, captured_schedule_viz, graph_viz, linear_viz,
-    compile_trace_viz, cuda_collective_trace_viz, memory_space_viz, realization_trace_viz, schedule_viz, sharded_cuda_execution_trace_viz, uop_viz, vector_viz,
+    captured_replay_trace_viz, captured_specialization_trace_viz, compile_trace_viz, cuda_collective_trace_viz, memory_space_viz, native_mixed_batch_trace_viz, native_mixed_replay_trace_viz, realization_trace_viz, schedule_viz, sharded_cuda_execution_trace_viz, uop_viz, vector_viz,
 };
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ pub use graph::graph_viz;
 pub use kernel::{linear_viz, memory_space_viz, vector_viz};
 pub use model::{VizEdge, VizError, VizGraph, VizNode};
 pub use schedule::{captured_schedule_viz, schedule_viz};
-pub use trace::{compile_trace_viz, cuda_collective_trace_viz, realization_trace_viz, sharded_cuda_execution_trace_viz};
+pub use trace::{captured_replay_trace_viz, captured_specialization_trace_viz, compile_trace_viz, cuda_collective_trace_viz, native_mixed_batch_trace_viz, native_mixed_replay_trace_viz, realization_trace_viz, sharded_cuda_execution_trace_viz};
 pub use uop::uop_viz;
 
 #[cfg(test)]
