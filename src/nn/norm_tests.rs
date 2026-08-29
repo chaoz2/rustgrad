@@ -78,6 +78,30 @@ fn batchnorm_training_commit_and_eval_match_tinygrad_statistics() {
 }
 
 #[test]
+fn batchnorm3d_is_the_batchnorm_alias_with_rank_three_module_surface() {
+    let mut graph = Graph::new();
+    let norm: BatchNorm3d = BatchNorm3d::new(&mut graph, 2, 1e-5, true, true, 0.1).unwrap();
+    let _: &BatchNorm = &norm;
+
+    let input = graph.input("input", [1, 2, 3]);
+    let output = norm.forward(&mut graph, input, Mode::Eval).unwrap().output;
+    assert_eq!(graph.shape(output).unwrap().dims(), &[1, 2, 3]);
+
+    let state = get_state_dict(&norm, "");
+    let names: Vec<_> = state.keys().collect();
+    assert_eq!(
+        names,
+        [
+            "weight",
+            "bias",
+            "running_mean",
+            "running_var",
+            "num_batches_tracked",
+        ]
+    );
+}
+
+#[test]
 fn batchnorm_stale_statistics_preflight_leaves_other_running_buffers_unchanged() {
     let mut graph = Graph::new();
     let norm = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1).unwrap();

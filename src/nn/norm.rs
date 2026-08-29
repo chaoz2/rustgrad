@@ -165,6 +165,8 @@ pub struct BatchNorm {
     identity: Arc<()>,
 }
 pub type BatchNorm2d = BatchNorm;
+/// Tinygrad aliases `BatchNorm3d` to the rank-two-or-greater `BatchNorm` module.
+pub type BatchNorm3d = BatchNorm;
 impl BatchNorm {
     pub fn new(
         _graph: &mut Graph,

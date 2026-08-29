@@ -21,7 +21,8 @@ pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
 pub use embedding::Embedding;
 pub use linear::Linear;
 pub use norm::{
-    BatchNorm, BatchNorm2d, BatchNormOutput, GroupNorm, InstanceNorm, LayerNorm, LayerNorm2d,
+    BatchNorm, BatchNorm2d, BatchNorm3d, BatchNormOutput, GroupNorm, InstanceNorm, LayerNorm,
+    LayerNorm2d,
     PendingBatchNormStats, RMSNorm,
 };
 pub use parameter::{Parameter, ParameterId, ParameterSnapshot};
