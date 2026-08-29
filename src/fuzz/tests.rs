@@ -544,16 +544,20 @@ fn concat_many_cases_preserve_arity_order_and_raw_payloads() {
 
 #[test]
 fn generated_unary_cases_are_valid_diverse_and_deterministic() {
+    let all_dtypes = [
+        DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32,
+        DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64,
+    ];
     let mut found = false;
     let mut neg = false;
     let mut abs = false;
-    let mut f32 = false;
-    let mut i32 = false;
+    let mut dtypes = std::collections::BTreeSet::new();
+    let mut coverage = [[false; 2]; 13];
     let mut scalar = false;
     let mut empty = false;
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index in 0..256 {
+        for index in 0..2048 {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
@@ -563,17 +567,18 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
             found = true;
             neg |= op == FuzzUnaryOp::Neg;
             abs |= op == FuzzUnaryOp::Abs;
-            f32 |= input.dtype == DType::F32;
-            i32 |= input.dtype == DType::I32;
+            dtypes.insert(input.dtype);
+            let dtype_index = all_dtypes.iter().position(|dtype| *dtype == input.dtype).unwrap();
+            coverage[dtype_index][usize::from(op == FuzzUnaryOp::Abs)] = true;
             scalar |= input.shape.is_empty();
             empty |= input.shape.iter().any(|extent| *extent == 0);
-            assert!(matches!(input.dtype, DType::F32 | DType::I32));
         }
     }
 
     assert!(found);
     assert!(neg && abs);
-    assert!(f32 && i32);
+    assert_eq!(dtypes.len(), 13);
+    assert!(coverage.iter().all(|ops| ops.iter().all(|covered| *covered)));
     assert!(scalar && empty);
 }
 
@@ -2435,6 +2440,167 @@ fn unary_cases_round_trip_minimize_and_build_as_direct_graph_unaries() {
 }
 
 #[test]
+fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
+    let dtypes = [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+    for dtype in dtypes {
+        for op in [FuzzUnaryOp::Neg, FuzzUnaryOp::Abs] {
+            let source = TensorData::from_scalars([2], dtype, [Scalar::I(0), Scalar::I(1)]).unwrap();
+            let case = FuzzCase::Unary {
+                op,
+                input: FuzzTensor::from_tensor(&source),
+            };
+            let encoded = serde_json::to_value(&case).unwrap();
+            assert_eq!(serde_json::from_value::<FuzzCase>(encoded).unwrap(), case);
+            let built = case.build().unwrap();
+            assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
+            assert_eq!(built.graph.shape(built.output).unwrap().dims(), &[2]);
+            if dtype == DType::Bool && op == FuzzUnaryOp::Neg {
+                assert!(matches!(
+                    built.graph.op(built.output).unwrap(),
+                    Op::Compare { op: CompareOp::Ne, .. }
+                ));
+                assert!((0..built.graph.node_count()).any(|index| {
+                    matches!(built.graph.op(crate::NodeId(index)).unwrap(), Op::Cast { dtype: DType::Bool, .. })
+                }));
+            } else {
+                let expected = match op {
+                    FuzzUnaryOp::Neg => UnaryOp::Neg,
+                    FuzzUnaryOp::Abs => UnaryOp::Abs,
+                };
+                assert!(matches!(
+                    built.graph.op(built.output).unwrap(),
+                    Op::Unary { op, .. } if *op == expected
+                ));
+            }
+
+            let scheduled = schedule(&built.graph, built.output).unwrap();
+            assert_eq!(scheduled.items.len(), 1);
+            let kernel = &scheduled.items[0].kernel;
+            let topological = kernel.topological().unwrap();
+            if dtype == DType::Bool && op == FuzzUnaryOp::Neg {
+                assert!(topological.iter().any(|node| matches!(node.kind(), UOpKind::Cast)));
+                assert!(topological.iter().any(|node| matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne))));
+            } else {
+                let expected = match op {
+                    FuzzUnaryOp::Neg => UnaryOp::Neg,
+                    FuzzUnaryOp::Abs => UnaryOp::Abs,
+                };
+                assert!(topological.iter().any(|node| {
+                    matches!(node.kind(), UOpKind::GraphUnary(actual) if *actual == expected)
+                }));
+            }
+            assert!(CpuJit::render(kernel).is_ok(), "{op:?} {dtype:?}");
+            let vector = CpuJit::render_vectorized(kernel).unwrap();
+            if matches!(dtype, DType::F16 | DType::BF16) {
+                assert!(!vector.source.contains("B2 VectorProgram"), "{op:?} {dtype:?}");
+            } else if matches!(dtype, DType::F32 | DType::I32) {
+                assert!(vector.source.contains("B2 VectorProgram"), "{op:?} {dtype:?}");
+            }
+            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let capture_bytes = captured.to_bytes().unwrap();
+            assert_eq!(CapturedSchedule::from_bytes(&capture_bytes).unwrap().to_bytes().unwrap(), capture_bytes);
+            let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(output.dtype(), dtype);
+            assert_eq!(output.shape().dims(), &[2]);
+            if op == FuzzUnaryOp::Abs
+                && (dtype == DType::Bool
+                    || matches!(dtype.category(), crate::DTypeCategory::Unsigned))
+            {
+                assert_eq!(output, source);
+            }
+        }
+    }
+
+    // Exact storage edge cases are deliberately separate from generator
+    // values: min lanes must wrap, U64 must not take an f64 detour, and full
+    // float lanes preserve the observable IEEE behavior. Half NaN payload
+    // identity remains outside this assertion because decode/re-encode is the
+    // established storage boundary.
+    let edges = [
+        (FuzzUnaryOp::Abs, TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap()),
+        (FuzzUnaryOp::Abs, TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap()),
+        (FuzzUnaryOp::Abs, TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap()),
+        (FuzzUnaryOp::Abs, TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap()),
+        (FuzzUnaryOp::Neg, TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap()),
+        (FuzzUnaryOp::Neg, TensorData::from_storage([3], Storage::F32(vec![-0.0, f32::NAN, f32::INFINITY])).unwrap()),
+        (FuzzUnaryOp::Abs, TensorData::from_storage([3], Storage::F64(vec![-0.0, f64::NAN, f64::NEG_INFINITY])).unwrap()),
+        (FuzzUnaryOp::Abs, TensorData::from_storage([3], Storage::F16(vec![0x8000, 0x7e01, 0x7c00])).unwrap()),
+        (FuzzUnaryOp::Abs, TensorData::from_storage([3], Storage::BF16(vec![0x8000, 0x7fc1, 0x7f80])).unwrap()),
+    ];
+    for (op, input) in edges {
+        let case = FuzzCase::Unary { op, input: FuzzTensor::from_tensor(&input) };
+        let built = case.build().unwrap();
+        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(output.dtype(), input.dtype());
+        assert_eq!(output.shape(), input.shape());
+        match (op, input.dtype()) {
+            (FuzzUnaryOp::Abs, DType::I8 | DType::I16 | DType::I32 | DType::I64) => {
+                assert_eq!(output, input);
+            }
+            (FuzzUnaryOp::Neg, DType::U64) => {
+                assert_eq!(output.scalar_at(0).as_u64(), u64::MAX - (1u64 << 53));
+            }
+            (FuzzUnaryOp::Neg, DType::F32) => {
+                assert!(output.scalar_at(0).as_f64().is_sign_positive());
+                assert!(output.scalar_at(1).as_f64().is_nan());
+                assert!(output.scalar_at(2).as_f64().is_infinite());
+            }
+            (FuzzUnaryOp::Abs, DType::F64) => {
+                assert!(output.scalar_at(0).as_f64().is_sign_positive());
+                assert!(output.scalar_at(1).as_f64().is_nan());
+                assert!(output.scalar_at(2).as_f64().is_infinite());
+            }
+            (FuzzUnaryOp::Abs, DType::F16 | DType::BF16) => {
+                assert!(output.scalar_at(0).as_f64().is_sign_positive());
+                assert!(output.scalar_at(1).as_f64().is_nan());
+                assert!(output.scalar_at(2).as_f64().is_infinite());
+            }
+            _ => unreachable!("constructed exact unary edge"),
+        }
+    }
+
+    let bool_neg = FuzzCase::Unary {
+        op: FuzzUnaryOp::Neg,
+        input: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap()),
+    };
+    let built = bool_neg.build().unwrap();
+    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    assert_eq!(output, TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap());
+    let artifact = FuzzFailureArtifact::new(
+        41,
+        43,
+        bool_neg.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&output),
+        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Bool unary mismatch".into() },
+    )
+    .unwrap();
+    let artifact_bytes = artifact.to_bytes().unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap(), artifact);
+    let minimized = minimize_case(&bool_neg, |candidate| {
+        matches!(candidate, FuzzCase::Unary { op: FuzzUnaryOp::Neg, input }
+            if input.dtype == DType::Bool && input.shape == vec![2] && input.bytes == vec![0, 0])
+    });
+    assert!(matches!(minimized, FuzzCase::Unary { op: FuzzUnaryOp::Neg, ref input }
+        if input.dtype == DType::Bool && input.shape == vec![2] && input.bytes == vec![0, 0]));
+}
+
+#[test]
 fn fixed_campaigns_match_interpreter_and_strict_native() {
     let interpreter = run_campaign(FuzzConfig {
         seed: 7,
@@ -2489,7 +2655,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 33);
+    assert_eq!(cases.len(), 40);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(

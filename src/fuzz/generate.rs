@@ -205,10 +205,15 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             }
         }
         6 => {
-            // Direct GraphUnary Neg/Abs have a complete bounded CPU,
-            // captured, and strict-native path for F32 and small I32 lanes.
-            // Do not claim Bool/narrow-float coverage through this raw path.
-            let dtype = [DType::F32, DType::I32][rng.pick(2)];
+            // The public Neg route deliberately lowers Bool through
+            // logical_not; every other dtype remains a direct GraphUnary.
+            // Both it and direct GraphUnary Abs have a bounded CPU/captured/
+            // strict-native path for every concrete local storage dtype.
+            let dtype = [
+                DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
+                DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+                DType::F64,
+            ][rng.pick(13)];
             let op = [FuzzUnaryOp::Neg, FuzzUnaryOp::Abs][rng.pick(2)];
             let shape = static_shape(&mut rng);
             FuzzCase::Unary {

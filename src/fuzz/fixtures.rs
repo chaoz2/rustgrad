@@ -89,6 +89,49 @@ pub fn regression_cases() -> Vec<FuzzCase> {
                 ]),
             ),
         },
+        FuzzCase::Unary {
+            // Public Bool Neg is source logical_not, not a raw GraphUnary.
+            op: FuzzUnaryOp::Neg,
+            input: tensor(vec![2], Storage::Bool(vec![false, true])),
+        },
+        FuzzCase::Unary {
+            // Direct Bool Abs is the raw storage identity path.
+            op: FuzzUnaryOp::Abs,
+            input: tensor(vec![2], Storage::Bool(vec![false, true])),
+        },
+        FuzzCase::Unary {
+            // Signed minima use the exact wrapping_abs storage contract.
+            op: FuzzUnaryOp::Abs,
+            input: tensor(vec![2], Storage::I64(vec![i64::MIN, i64::MAX])),
+        },
+        FuzzCase::Unary {
+            // This lane must not be rounded through f64 before raw Neg.
+            op: FuzzUnaryOp::Neg,
+            input: tensor(vec![1], Storage::U64(vec![(1u64 << 53) + 1])),
+        },
+        FuzzCase::Unary {
+            // Half/BF16 retain sign and infinity semantics through the
+            // established decode/encode boundary; arbitrary NaN payload
+            // identity is intentionally not claimed by this fixture.
+            op: FuzzUnaryOp::Abs,
+            input: tensor(vec![3], Storage::F16(vec![0x8000, 0x7e01, 0x7c00])),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Abs,
+            input: tensor(vec![3], Storage::BF16(vec![0x8000, 0x7fc1, 0x7f80])),
+        },
+        FuzzCase::Unary {
+            // Full-width float storage retains observable special lanes.
+            op: FuzzUnaryOp::Abs,
+            input: tensor(
+                vec![3],
+                Storage::F64(vec![
+                    f64::from_bits(0x8000_0000_0000_0000),
+                    f64::from_bits(0x7ff8_0000_0000_0001),
+                    f64::INFINITY,
+                ]),
+            ),
+        },
         FuzzCase::Compare {
             // IEEE partial comparison makes NaN unequal to itself, while
             // signed zero remains equal to positive zero.
