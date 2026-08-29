@@ -19,6 +19,9 @@ pub fn compile_trace_viz(trace: &CompileTrace) -> Result<VizGraph, VizError> {
 }
 
 pub fn realization_trace_viz(trace: &RealizationTrace) -> Result<VizGraph, VizError> {
+    if trace.items.iter().any(|item| item.vector_main.checked_add(item.vector_tail) != Some(item.lanes)) {
+        return Err(VizError::InvalidSchedule("vector geometry does not match lanes".into()));
+    }
     let nodes = trace.items.iter().map(|item| VizNode::new(format!("r{}", item.item), "realization_trace", "item")
         .field("backend", backend_name(item.backend)).field("cache_key", item.cache_key.to_string()).field("buffer", item.materialized_buffer.to_string()).field("last_consumer", item.last_consumer.map_or_else(|| "none".into(), |x| x.to_string())).field("allocation", item.allocation_id.map_or_else(|| "none".into(), |x| x.to_string())).field("slot", item.physical_slot.map_or_else(|| "none".into(), |x| x.to_string())).field("generation", item.generation.map_or_else(|| "none".into(), |x| x.to_string())).field("reused_from", item.reused_from.map_or_else(|| "none".into(), |x| x.to_string())).field("released", u64_list(&item.released_buffers)).field("lanes", item.lanes.to_string()).field("vector_main", item.vector_main.to_string()).field("vector_tail", item.vector_tail.to_string()).field("vector_reason", item.vector_reason.clone())).collect();
     let edges = trace.items.iter().flat_map(|item| item.dependencies.iter().map(move |dependency| VizEdge::new(format!("r{dependency}"), format!("r{}", item.item), "dependency", "data"))).collect();

@@ -37,7 +37,7 @@ fn typed_trace_visualization_is_deterministic_and_fail_closed() {
     assert!(matches!(crate::compile_trace_viz(&missing), Err(VizError::InvalidGraphNode(9))));
 
     let trace = crate::RealizationTrace { items: vec![
-        crate::ItemTrace { item: 1, dependencies: vec![], backend: crate::ItemBackend::Interpreter, cache_key: 7, materialized_buffer: 9, last_consumer: Some(3), allocation_id: Some(4), physical_slot: Some(5), generation: Some(6), reused_from: None, released_buffers: vec![8], lanes: 4, vector_main: 8, vector_tail: 1, vector_reason: "tail".into() },
+        crate::ItemTrace { item: 1, dependencies: vec![], backend: crate::ItemBackend::Interpreter, cache_key: 7, materialized_buffer: 9, last_consumer: Some(3), allocation_id: Some(4), physical_slot: Some(5), generation: Some(6), reused_from: None, released_buffers: vec![8], lanes: 4, vector_main: 3, vector_tail: 1, vector_reason: "tail".into() },
         crate::ItemTrace { item: 2, dependencies: vec![1], backend: crate::ItemBackend::NativeJit, cache_key: 10, materialized_buffer: 11, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: Some(4), released_buffers: vec![], lanes: 1, vector_main: 0, vector_tail: 1, vector_reason: "scalar".into() },
         crate::ItemTrace { item: 3, dependencies: vec![1], backend: crate::ItemBackend::JitFallback, cache_key: 12, materialized_buffer: 13, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: None, released_buffers: vec![], lanes: 1, vector_main: 1, vector_tail: 0, vector_reason: "fallback".into() },
     ]};
@@ -45,6 +45,8 @@ fn typed_trace_visualization_is_deterministic_and_fail_closed() {
     for field in ["backend=interpreter", "backend=native_jit", "backend=jit_fallback", "cache_key=7", "buffer=9", "last_consumer=3", "allocation=4", "slot=5", "generation=6", "reused_from=4", "released=[8]", "vector_tail=1", "vector_reason=tail"] { assert!(dot.contains(field), "{field}"); }
     let missing_dependency = crate::RealizationTrace { items: vec![crate::ItemTrace { item: 1, dependencies: vec![99], backend: crate::ItemBackend::Interpreter, cache_key: 0, materialized_buffer: 0, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: None, released_buffers: vec![], lanes: 1, vector_main: 1, vector_tail: 0, vector_reason: String::new() }] };
     assert!(matches!(crate::realization_trace_viz(&missing_dependency), Err(VizError::MissingEndpoint { .. })));
+    assert!(matches!(crate::realization_trace_viz(&crate::RealizationTrace { items: vec![crate::ItemTrace { lanes: 2, vector_main: 2, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
+    assert!(matches!(crate::realization_trace_viz(&crate::RealizationTrace { items: vec![crate::ItemTrace { lanes: usize::MAX, vector_main: usize::MAX, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
 }
 
 #[test]
