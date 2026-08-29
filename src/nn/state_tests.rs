@@ -186,6 +186,72 @@ impl Module for Tied {
         v(join(p, "running"), &self.running, StateKind::Buffer)
     }
 }
+
+struct Stateless;
+impl Module for Stateless {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
+#[test]
+fn get_parameters_preserves_declared_order_buffers_and_tied_handles() {
+    let mut graph = Graph::new();
+    let left = Linear::new(&mut graph, 2, 2, false, 1).unwrap();
+    let running = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), false);
+    let tied = Tied {
+        right: left.weight.clone(),
+        left,
+        running: running.clone(),
+    };
+    let handles = get_parameters(&tied);
+    assert_eq!(handles.len(), 3);
+    assert_eq!(handles[0].id(), tied.left.weight.id());
+    assert_eq!(handles[1].id(), tied.right.id());
+    assert_eq!(handles[2].id(), running.id());
+    assert_eq!(handles[0].id(), handles[1].id());
+    assert!(!handles[2].is_trainable());
+
+    let first = Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true);
+    let second = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let third = Parameter::new(TensorData::new([1], vec![3.]).unwrap(), true);
+    let mut nested = Sequential::default();
+    nested.push(OneParameter(second.clone()));
+    nested.push(OneParameter(third.clone()));
+    let mut sequence = Sequential::default();
+    sequence.push(OneParameter(first.clone()));
+    sequence.push(nested);
+    assert_eq!(
+        get_parameters(&sequence)
+            .iter()
+            .map(Parameter::id)
+            .collect::<Vec<_>>(),
+        vec![first.id(), second.id(), third.id()]
+    );
+
+    assert!(get_parameters(&Stateless).is_empty());
+}
+
+#[test]
+fn get_parameters_clones_handles_without_snapshotting_locking_or_mutation() {
+    let parameter = Parameter::new(TensorData::new([1], vec![4.]).unwrap(), true);
+    let module = OneParameter(parameter.clone());
+    let version = parameter.version().unwrap();
+    let value = parameter.value().unwrap();
+    let handles = get_parameters(&module);
+    assert_eq!(handles.len(), 1);
+    assert_eq!(handles[0].id(), parameter.id());
+    assert_eq!(parameter.version().unwrap(), version);
+    assert_eq!(parameter.value().unwrap(), value);
+
+    parameter.poison_for_test();
+    let poisoned_handles = get_parameters(&module);
+    assert_eq!(poisoned_handles.len(), 1);
+    assert_eq!(poisoned_handles[0].id(), parameter.id());
+    assert!(matches!(
+        parameter.snapshot(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+}
+
 #[test]
 fn state_is_deterministic_shared_and_safetensors_portable() {
     let mut graph = Graph::new();

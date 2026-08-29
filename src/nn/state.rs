@@ -191,6 +191,17 @@ pub trait Module {
     }
 }
 
+/// Returns every host parameter handle visited by a module in declaration order.
+///
+/// This is the explicit-module analogue of tinygrad's `get_parameters`: buffers
+/// and repeated/tied handles remain present, and cloning a handle neither reads
+/// its value nor snapshots or locks it.
+pub fn get_parameters(module: &dyn Module) -> Vec<Parameter> {
+    let mut parameters = Vec::new();
+    module.visit("", &mut |_, parameter, _| parameters.push(parameter.clone()));
+    parameters
+}
+
 /// The only load-time shape adaptation accepted by tinygrad state loading.
 /// Both descriptors have exactly one element, so rebuilding the descriptor
 /// from cloned storage is a checked descriptor change rather than a broadcast
