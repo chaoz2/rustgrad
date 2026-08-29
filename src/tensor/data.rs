@@ -191,13 +191,9 @@ impl TensorData {
     /// CPU reference operation read-before-write snapshot semantics.  It owns
     /// no aliases; effectful graph/subbuffer lowering must use `EffectPlan`.
     pub fn assign_from(&mut self, source: &TensorData) -> Result<()> {
-        if self.dtype() != source.dtype() {
-            return Err(Error::InputDType {
-                name: "assignment".into(),
-                expected: self.dtype(),
-                actual: source.dtype(),
-            });
-        }
+        // tinygrad resolves `_broadcast_to` before checking storage dtype, so
+        // a source which is both wrongly shaped and wrongly typed reports the
+        // shape failure without touching either dense value.
         if source.shape.rank() > self.shape.rank()
             || !source
                 .shape
@@ -213,6 +209,13 @@ impl TensorData {
                 rhs: source.shape.clone(),
             });
         }
+        if self.dtype() != source.dtype() {
+            return Err(Error::InputDType {
+                name: "assignment".into(),
+                expected: self.dtype(),
+                actual: source.dtype(),
+            });
+        }
         let offsets = (0..self.len())
             .map(|linear| broadcast_offset(&self.shape, &source.shape, linear))
             .collect::<Result<Vec<_>>>()?;
@@ -220,6 +223,14 @@ impl TensorData {
         // storage variants preserves narrow-float payloads and signed zero.
         self.storage = assigned_storage(&self.storage, &source.storage, &offsets)?;
         Ok(())
+    }
+
+    /// Source-shaped wrapper for dense realized assignment. This preserves
+    /// `assign_from` for existing effect/runtime callers while returning the
+    /// exact mutated receiver for direct TensorData use.
+    pub fn assign(&mut self, source: &TensorData) -> Result<&mut Self> {
+        self.assign_from(source)?;
+        Ok(self)
     }
 
     /// Materializes a logical read through the canonical affine descriptor.
@@ -806,6 +817,92 @@ mod tests {
         half.assign_from(&TensorData::from_storage([1], Storage::F16(vec![0x7e01])).unwrap())
             .unwrap();
         assert_eq!(half.storage(), &Storage::F16(vec![0x7e01; 2]));
+    }
+
+    #[test]
+    fn assign_returns_self_after_right_aligned_broadcast_without_changing_source() {
+        let mut destination = TensorData::from_storage([2, 3], Storage::U64(vec![0; 6])).unwrap();
+        let source = TensorData::from_storage([1, 3], Storage::U64(vec![u64::MAX, 2, 3])).unwrap();
+        let source_before = source.clone();
+        let destination_address: *mut TensorData = &mut destination;
+
+        let returned = destination.assign(&source).unwrap();
+        assert_eq!(returned as *mut TensorData, destination_address);
+        assert_eq!(
+            returned.storage(),
+            &Storage::U64(vec![u64::MAX, 2, 3, u64::MAX, 2, 3])
+        );
+        assert_eq!(source, source_before);
+    }
+
+    #[test]
+    fn assign_validates_shape_before_dtype_and_keeps_failures_atomic() {
+        let mut destination = TensorData::from_storage([2, 3], Storage::F32(vec![1.0; 6])).unwrap();
+        let before = destination.clone();
+        let invalid_shape_and_dtype = TensorData::from_storage([4], Storage::I32(vec![1; 4])).unwrap();
+        assert_eq!(
+            destination.assign(&invalid_shape_and_dtype).unwrap_err(),
+            Error::ShapeMismatch {
+                op: "assign",
+                lhs: Shape::new([2, 3]),
+                rhs: Shape::new([4]),
+            }
+        );
+        assert_eq!(destination, before);
+
+        let valid_shape_wrong_dtype = TensorData::from_storage([1, 3], Storage::I32(vec![1; 3])).unwrap();
+        assert_eq!(
+            destination.assign(&valid_shape_wrong_dtype).unwrap_err(),
+            Error::InputDType {
+                name: "assignment".into(),
+                expected: DType::F32,
+                actual: DType::I32,
+            }
+        );
+        assert_eq!(destination, before);
+    }
+
+    #[test]
+    fn assign_preserves_raw_float_payloads_and_zero_extent_geometry() {
+        for source in [
+            TensorData::from_storage([1], Storage::F16(vec![0x8000])).unwrap(),
+            TensorData::from_storage([1], Storage::BF16(vec![0x7fc1])).unwrap(),
+            TensorData::from_storage([1], Storage::F32(vec![f32::from_bits(0x8000_0000)])).unwrap(),
+            TensorData::from_storage([1], Storage::F64(vec![f64::from_bits(0x7ff0_0000_0001)])).unwrap(),
+        ] {
+            let source_before = source.clone();
+            let mut destination = TensorData::from_storage(
+                [2],
+                match source.dtype() {
+                    DType::F16 => Storage::F16(vec![0; 2]),
+                    DType::BF16 => Storage::BF16(vec![0; 2]),
+                    DType::F32 => Storage::F32(vec![0.0; 2]),
+                    DType::F64 => Storage::F64(vec![0.0; 2]),
+                    _ => unreachable!("float fixture"),
+                },
+            )
+            .unwrap();
+            destination.assign(&source).unwrap();
+            let expected = match source.storage() {
+                Storage::F16(values) => Storage::F16(vec![values[0]; 2]),
+                Storage::BF16(values) => Storage::BF16(vec![values[0]; 2]),
+                Storage::F32(values) => Storage::F32(vec![values[0]; 2]),
+                Storage::F64(values) => Storage::F64(vec![values[0]; 2]),
+                _ => unreachable!("float fixture"),
+            };
+            assert_same_storage_bits(destination.storage(), &expected);
+            assert_same_storage_bits(source.storage(), source_before.storage());
+        }
+
+        let scalar = TensorData::scalar_with_dtype(Scalar::I(-7), DType::I32);
+        let mut scalar_destination = TensorData::scalar_with_dtype(Scalar::I(0), DType::I32);
+        scalar_destination.assign(&scalar).unwrap();
+        assert_eq!(scalar_destination.storage(), scalar.storage());
+
+        let zero_source = TensorData::from_storage([1, 0, 3], Storage::U8(vec![])).unwrap();
+        let mut zero_destination = TensorData::from_storage([2, 0, 3], Storage::U8(vec![])).unwrap();
+        zero_destination.assign(&zero_source).unwrap();
+        assert_eq!(zero_destination.storage(), &Storage::U8(vec![]));
     }
 
     #[test]
