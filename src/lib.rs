@@ -211,7 +211,7 @@ pub use uop::{
 pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
 pub use viz::{
     VizEdge, VizError, VizGraph, VizNode, captured_schedule_viz, graph_viz, linear_viz,
-    memory_space_viz, schedule_viz, uop_viz, vector_viz,
+    compile_trace_viz, memory_space_viz, realization_trace_viz, schedule_viz, uop_viz, vector_viz,
 };
 
 #[cfg(test)]

@@ -21,12 +21,14 @@ mod graph;
 mod kernel;
 mod model;
 mod schedule;
+mod trace;
 mod uop;
 
 pub use graph::graph_viz;
 pub use kernel::{linear_viz, memory_space_viz, vector_viz};
 pub use model::{VizEdge, VizError, VizGraph, VizNode};
 pub use schedule::{captured_schedule_viz, schedule_viz};
+pub use trace::{compile_trace_viz, realization_trace_viz};
 pub use uop::uop_viz;
 
 #[cfg(test)]
