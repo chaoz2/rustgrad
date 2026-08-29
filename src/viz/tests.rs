@@ -35,9 +35,7 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
     ));
     let mut graph = Graph::new();
     let input = graph.input("x", [1]);
-    let unsupported = graph
-        .scatter_positions(input, Shape::from([2]), vec![0], vec![1])
-        .unwrap();
+    let unsupported = graph.einsum("i,i->", &[input, input]).unwrap();
     assert!(matches!(
         graph_viz(&graph, &[unsupported]),
         Err(VizError::UnsupportedGraphOp(_))
@@ -46,6 +44,37 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn scatter_positions_graph_visualization_preserves_static_map_geometry() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2]);
+    // A zero step makes both input coordinates target the same destination.
+    // The graph-level map preserves that duplicate geometry verbatim.
+    let placed = graph
+        .scatter_positions(input, Shape::from([1]), vec![0], vec![0])
+        .unwrap();
+    let cotangent = graph.input("cotangent", [1]);
+    let read = graph
+        .scatter_positions_vjp(cotangent, Shape::from([2]), vec![0], vec![0])
+        .unwrap();
+    let first = graph_viz(&graph, &[placed, read]).unwrap();
+    let second = graph_viz(&graph, &[placed, read]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2]\"];\n  \"g1\" [label=\"scatter_positions\\nkind=graph_op\\ndtype=f32\\nmode=place\\nnode=1\\nshape=[1]\\nstarts=[0]\\nsteps=[0]\\ntarget_shape=[1]\"];\n  \"g2\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=cotangent\\nnode=2\\nshape=[1]\"];\n  \"g3\" [label=\"scatter_positions_vjp\\nkind=graph_op\\ndtype=f32\\ninput_shape=[2]\\nmode=read_static_map\\nnode=3\\nshape=[2]\\nstarts=[0]\\nsteps=[0]\"];\n  \"g0\" -> \"g1\" [label=\"data:0:input\"];\n  \"g2\" -> \"g3\" [label=\"data:0:cotangent\"];\n}\n"
+    );
+
+    let empty = graph.input("empty", [0, 2]);
+    let empty_map = graph
+        .scatter_positions(empty, Shape::from([0, 4]), vec![0, 3], vec![1, -1])
+        .unwrap();
+    let empty_dot = graph_viz(&graph, &[empty_map]).unwrap().to_dot();
+    assert!(empty_dot.contains("target_shape=[0,4]"));
+    assert!(empty_dot.contains("starts=[0,3]"));
+    assert!(empty_dot.contains("steps=[1,-1]"));
 }
 
 #[test]

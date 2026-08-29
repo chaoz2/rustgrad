@@ -54,6 +54,17 @@ pub(super) fn i64_list(values: &[i64]) -> String {
     )
 }
 
+fn isize_list(values: &[isize]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(isize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 fn scalar_name(value: Scalar) -> String {
     match value {
         Scalar::Bool(value) => format!("bool:{value}"),
@@ -96,6 +107,8 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
         | Op::Shrink { input, .. }
         | Op::Pad { input, .. }
         | Op::Stride { input, .. } => vec![("input", *input)],
+        Op::ScatterPositions { input, .. } => vec![("input", *input)],
+        Op::ScatterPositionsVjp { cotangent, .. } => vec![("cotangent", *cotangent)],
         Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } | Op::Matmul { lhs, rhs } => {
             vec![("lhs", *lhs), ("rhs", *rhs)]
         }
@@ -257,6 +270,26 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("fill", scalar_name(*fill)),
         Op::Stride { slices, .. } => node.field("rank", slices.len().to_string()),
         Op::Concat { axis, .. } | Op::Gather { axis, .. } => node.field("axis", axis.to_string()),
+        Op::ScatterPositions {
+            shape,
+            starts,
+            steps,
+            ..
+        } => node
+            .field("mode", "place")
+            .field("target_shape", shape_name(shape))
+            .field("starts", isize_list(starts))
+            .field("steps", isize_list(steps)),
+        Op::ScatterPositionsVjp {
+            input_shape,
+            starts,
+            steps,
+            ..
+        } => node
+            .field("mode", "read_static_map")
+            .field("input_shape", shape_name(input_shape))
+            .field("starts", isize_list(starts))
+            .field("steps", isize_list(steps)),
         Op::Scatter { axis, add, .. } => node
             .field("axis", axis.to_string())
             .field("mode", if *add { "add" } else { "replace" }),
