@@ -46,7 +46,7 @@ fn static_shape(rng: &mut SplitMix64) -> Vec<usize> {
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(10) {
+    match rng.pick(11) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = if rng.pick(2) == 0 {
@@ -209,6 +209,16 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 op,
                 lhs: tensor(&mut rng, shape, DType::Bool),
                 rhs: tensor(&mut rng, rhs_shape, DType::Bool),
+            }
+        }
+        9 => {
+            // Source `logical_not` is Cast(Bool) then Ne(true), not the raw
+            // GraphLogical Not opcode. This intersection is native-safe only
+            // after Bool-target Cast adopted `!=0` truthiness.
+            let dtype = [DType::Bool, DType::I32, DType::F32][rng.pick(3)];
+            let shape = static_shape(&mut rng);
+            FuzzCase::LogicalNot {
+                input: tensor(&mut rng, shape, dtype),
             }
         }
         _ => {

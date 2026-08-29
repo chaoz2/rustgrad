@@ -254,6 +254,175 @@ fn generated_logical_cases_are_valid_diverse_and_deterministic() {
 }
 
 #[test]
+fn generated_logical_not_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut boolean = false;
+    let mut i32 = false;
+    let mut f32 = false;
+    let mut zero = false;
+    let mut nonzero = false;
+    let mut scalar = false;
+    let mut empty = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..512 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::LogicalNot { input } = case else {
+                continue;
+            };
+            found = true;
+            scalar |= input.shape.is_empty();
+            empty |= input.shape.iter().any(|extent| *extent == 0);
+            match input.to_tensor().unwrap().storage() {
+                Storage::Bool(values) => {
+                    boolean = true;
+                    zero |= values.iter().any(|value| !*value);
+                    nonzero |= values.iter().any(|value| *value);
+                }
+                Storage::I32(values) => {
+                    i32 = true;
+                    zero |= values.contains(&0);
+                    nonzero |= values.iter().any(|value| *value != 0);
+                }
+                Storage::F32(values) => {
+                    f32 = true;
+                    zero |= values.iter().any(|value| *value == 0.0);
+                    nonzero |= values.iter().any(|value| *value != 0.0);
+                }
+                _ => unreachable!("logical-not generator selects only Bool/I32/F32"),
+            }
+        }
+    }
+
+    assert!(found);
+    assert!(boolean && i32 && f32 && zero && nonzero && scalar && empty);
+}
+
+#[test]
+fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
+    let logical_not = FuzzCase::LogicalNot {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [7],
+                Storage::F32(vec![
+                    0.0,
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    0.5,
+                    -0.5,
+                ]),
+            )
+            .unwrap(),
+        ),
+    };
+    let value = serde_json::to_value(&logical_not).unwrap();
+    assert_eq!(value["kind"], "logical_not");
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        logical_not
+    );
+    let mut unknown = value;
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    for input in [
+        logical_not_input(&logical_not),
+        FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(-1), DType::I32)),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap(),
+        ),
+    ] {
+        let case = FuzzCase::LogicalNot { input };
+        let built = case.build().unwrap();
+        let Op::Compare {
+            op: CompareOp::Ne,
+            lhs,
+            rhs,
+        } = built.graph.op(built.output).unwrap()
+        else {
+            panic!("logical_not must be a source Ne root");
+        };
+        assert!(matches!(
+            built.graph.op(*lhs).unwrap(),
+            Op::Cast { dtype: DType::Bool, .. }
+        ));
+        assert!(matches!(
+            built.graph.op(*rhs).unwrap(),
+            Op::Constant(value)
+                if value.shape().dims().is_empty()
+                    && value.dtype() == DType::Bool
+                    && value.storage() == &Storage::Bool(vec![true])
+        ));
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        let assert_kernel = |kernel: &crate::UOp| {
+            let nodes = kernel.topological().unwrap();
+            assert!(nodes.iter().any(|node| {
+                matches!(node.kind(), UOpKind::Cast)
+                    && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
+            }));
+            assert!(nodes.iter().any(|node| {
+                matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne))
+            }));
+            assert!(!nodes.iter().any(|node| {
+                matches!(node.kind(), UOpKind::GraphLogical(crate::LogicalOp::Not))
+            }));
+        };
+        for item in &scheduled.items {
+            assert_kernel(&item.kernel);
+        }
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        for item in &captured.items {
+            assert_kernel(&item.kernel);
+        }
+    }
+
+    let built = logical_not.build().unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
+    assert_eq!(
+        output.storage(),
+        &Storage::Bool(vec![true, true, false, false, false, false, false])
+    );
+    let expected = FuzzOutcome::value(&output);
+    let artifact = FuzzFailureArtifact::new(
+        10,
+        14,
+        logical_not.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        expected,
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic logical-not mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&logical_not, |candidate| {
+        matches!(candidate, FuzzCase::LogicalNot { input } if input.bytes == vec![0; 28])
+    });
+    assert!(matches!(zeroed, FuzzCase::LogicalNot { ref input } if input.bytes == vec![0; 28]));
+    let scalarized = minimize_case(&logical_not, |_| true);
+    assert!(matches!(scalarized, FuzzCase::LogicalNot { ref input } if input.shape.is_empty()));
+    scalarized.validate().unwrap();
+}
+
+fn logical_not_input(case: &FuzzCase) -> FuzzTensor {
+    match case {
+        FuzzCase::LogicalNot { input } => input.clone(),
+        _ => unreachable!("constructed as logical-not"),
+    }
+}
+
+#[test]
 fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
     let logical = FuzzCase::Logical {
         op: FuzzLogicalOp::Or,
@@ -623,7 +792,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 14);
+    assert_eq!(cases.len(), 17);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(

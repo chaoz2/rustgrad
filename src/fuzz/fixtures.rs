@@ -108,6 +108,28 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             lhs: tensor(vec![3], Storage::Bool(vec![false, true, false])),
             rhs: tensor(vec![], Storage::Bool(vec![true])),
         },
+        FuzzCase::LogicalNot {
+            // Source truthiness: +0/-0 are false; NaN, infinities, and every
+            // nonzero fractional lane are true before the final Ne(true).
+            input: tensor(
+                vec![7],
+                Storage::F32(vec![
+                    0.0,
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    0.5,
+                    -0.5,
+                ]),
+            ),
+        },
+        FuzzCase::LogicalNot {
+            input: tensor(vec![3], Storage::Bool(vec![false, true, false])),
+        },
+        FuzzCase::LogicalNot {
+            input: tensor(vec![3], Storage::I32(vec![0, -1, 2])),
+        },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),
             rhs: tensor(vec![2, 3], Storage::I32(vec![0; 6])),
