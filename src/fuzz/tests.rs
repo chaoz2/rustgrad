@@ -770,6 +770,37 @@ fn generated_select_cases_cover_homogeneous_dtypes_and_broadcasts() {
 }
 
 #[test]
+fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
+    let dtypes = [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64];
+    for dtype in dtypes {
+        let mut graph = crate::Graph::new();
+        let condition = graph.input_dtype("condition", crate::Shape::from([2]), DType::Bool);
+        let on_true = graph.input_dtype("on_true", crate::Shape::from([2]), dtype);
+        let on_false = graph.input_dtype("on_false", crate::Shape::from([]), dtype);
+        let output = graph.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        assert!(matches!(uop.kind(), UOpKind::Store));
+        assert!(CpuJit::render(&uop).is_ok());
+        let vector = CpuJit::render_vectorized(&uop).unwrap();
+        if matches!(dtype, DType::F16 | DType::BF16) { assert!(!vector.source.contains("B2 VectorProgram")); } else if matches!(dtype, DType::F32 | DType::I32) { assert!(vector.source.contains("B2 VectorProgram")); }
+    }
+    let case = FuzzCase::Select {
+        condition: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::Bool(vec![true, false, true])).unwrap()),
+        on_true: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::INFINITY, 3.0])).unwrap()),
+        on_false: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![1.0, f32::from_bits(0x7fc0_0001), 2.0])).unwrap()),
+    };
+    let encoded = serde_json::to_value(&case).unwrap();
+    assert_eq!(serde_json::from_value::<FuzzCase>(encoded).unwrap(), case);
+    let built = case.build().unwrap();
+    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), 3.0])).unwrap()));
+    let malformed = FuzzCase::Select { condition: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I32(vec![1, 0])).unwrap()), on_true: case.on_true.clone(), on_false: case.on_false.clone() };
+    assert!(malformed.validate().is_err());
+}
+
+#[test]
 fn generated_pad_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
     let mut dtypes = std::collections::BTreeSet::new();
