@@ -80,6 +80,13 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
             padding: padding.clone(),
             fill: fill.zeroed(),
         },
+        FuzzCase::Gather { input, index, axis } => FuzzCase::Gather {
+            input: input.zeroed(),
+            // Zero is in range whenever a generated index lane exists; an
+            // axis of length zero necessarily has an empty index tensor.
+            index: index.zeroed(),
+            axis: *axis,
+        },
     }
 }
 
@@ -135,6 +142,9 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
             fill: fill.scalar_prefix()?,
         }),
         FuzzCase::Pad { .. } => None,
+        // Rank and axis are part of Gather's static admission, so reducing it
+        // to scalars would turn a valid case into a different program.
+        FuzzCase::Gather { .. } => None,
         _ => None,
     }
 }

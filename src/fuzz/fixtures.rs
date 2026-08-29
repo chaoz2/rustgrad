@@ -164,6 +164,29 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             padding: vec![],
             fill: tensor(vec![], Storage::Bool(vec![false])),
         },
+        FuzzCase::Gather {
+            // Axis-one duplicate/reorder selection is intentionally obvious.
+            input: tensor(vec![2, 4], Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
+            index: tensor(vec![2, 3], Storage::I32(vec![3, 1, 1, 0, 2, 2])),
+            axis: 1,
+        },
+        FuzzCase::Gather {
+            input: tensor(vec![3], Storage::I32(vec![10, 20, 30])),
+            index: tensor(vec![3], Storage::I64(vec![2, 0, 1])),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            input: tensor(vec![2, 0], Storage::F16(vec![])),
+            index: tensor(vec![2, 0], Storage::I32(vec![])),
+            axis: 1,
+        },
+        FuzzCase::Gather {
+            // Raw storage lanes retain signed zero and the NaN payload through
+            // select_raw, with no scalar conversion on the Gather payload.
+            input: tensor(vec![3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])),
+            index: tensor(vec![3], Storage::I32(vec![1, 0, 2])),
+            axis: 0,
+        },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),
             rhs: tensor(vec![2, 3], Storage::I32(vec![0; 6])),

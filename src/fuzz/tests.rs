@@ -505,6 +505,171 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
 }
 
 #[test]
+fn generated_gather_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut f32 = false;
+    let mut i32 = false;
+    let mut f16 = false;
+    let mut boolean = false;
+    let mut index_i32 = false;
+    let mut index_i64 = false;
+    let mut axes = std::collections::BTreeSet::new();
+    let mut empty = false;
+    let mut duplicate = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index_number in 0..512 {
+            let case = generate_case(seed, index_number);
+            assert_eq!(case, generate_case(seed, index_number));
+            case.validate().unwrap();
+            let FuzzCase::Gather { input, index, axis } = case else {
+                continue;
+            };
+            found = true;
+            assert!((1..=3).contains(&input.shape.len()));
+            assert_eq!(index.shape.len(), input.shape.len());
+            assert!(axis < input.shape.len());
+            assert!(matches!(index.dtype, DType::I32 | DType::I64));
+            for (dimension, (&source, &selected)) in input.shape.iter().zip(&index.shape).enumerate() {
+                if dimension != axis {
+                    assert!(selected <= source);
+                }
+            }
+            let lanes = index.to_tensor().unwrap();
+            let mut values = std::collections::BTreeSet::new();
+            for position in 0..lanes.len() {
+                let Scalar::I(value) = lanes.scalar_at(position) else {
+                    panic!("generated gather indices are signed integer lanes")
+                };
+                assert!(value >= 0 && (value as usize) < input.shape[axis]);
+                duplicate |= !values.insert(value);
+            }
+            empty |= input.shape.iter().any(|extent| *extent == 0) || index.shape.iter().any(|extent| *extent == 0);
+            axes.insert((input.shape.len(), axis));
+            match input.dtype {
+                DType::F32 => f32 = true,
+                DType::I32 => i32 = true,
+                DType::F16 => f16 = true,
+                DType::Bool => boolean = true,
+                _ => unreachable!("Gather generator selects movement dtypes only"),
+            }
+            index_i32 |= index.dtype == DType::I32;
+            index_i64 |= index.dtype == DType::I64;
+        }
+    }
+
+    assert!(found);
+    assert!(f32 && i32 && f16 && boolean && index_i32 && index_i64);
+    assert!(empty && duplicate);
+    assert!(axes.contains(&(1, 0)) && axes.iter().any(|(rank, axis)| *rank >= 2 && *axis == 1));
+}
+
+#[test]
+fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
+    let gather = FuzzCase::Gather {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2, 4], Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])).unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2, 3], Storage::I32(vec![3, 1, 1, 0, 2, 2])).unwrap(),
+        ),
+        axis: 1,
+    };
+    let value = serde_json::to_value(&gather).unwrap();
+    assert_eq!(value["kind"], "gather");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), gather);
+    let mut unknown = value;
+    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    for case in [
+        gather.clone(),
+        FuzzCase::Gather {
+            input: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I32(vec![10, 20, 30])).unwrap()),
+            index: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I64(vec![2, 0, 1])).unwrap()),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            input: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap()),
+            index: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::I32(vec![])).unwrap()),
+            axis: 1,
+        },
+    ] {
+        let built = case.build().unwrap();
+        let Op::Gather { axis, .. } = built.graph.op(built.output).unwrap() else {
+            panic!("raw Gather case must retain its Gather root");
+        };
+        let FuzzCase::Gather { axis: expected, .. } = &case else {
+            unreachable!("constructed as Gather")
+        };
+        assert_eq!(axis, expected);
+        let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        let MovementKernelKind::Gather { axis: planned, input, index } = &plan.kind else {
+            panic!("Gather root must use a Gather movement plan");
+        };
+        assert_eq!(planned, expected);
+        assert_eq!(plan.output_shape, index.shape);
+        assert_eq!(plan.dtype, input.dtype);
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        let item = &scheduled.items[0];
+        assert!(item.boundary.is_none());
+        assert!(matches!(item.kernel.kind(), UOpKind::Movement));
+        assert!(matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Gather { .. })));
+        let scalar = CpuJit::render(&item.kernel).unwrap();
+        assert!(scalar.source.contains("rg_selected < 0") && scalar.source.contains("failure[1]=3"));
+        assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+    }
+
+    let built = gather.build().unwrap();
+    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    assert_eq!(
+        FuzzTensor::from_tensor(&output),
+        FuzzTensor::from_tensor(&TensorData::from_storage([2, 3], Storage::F32(vec![3.0, 1.0, 1.0, 4.0, 6.0, 6.0])).unwrap()),
+    );
+    let artifact = FuzzFailureArtifact::new(
+        13, 17, gather.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&output),
+        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Gather mismatch".into() },
+    ).unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&gather, |candidate| {
+        matches!(candidate, FuzzCase::Gather { input, index, axis }
+            if input.bytes == vec![0; 32] && index.bytes == vec![0; 24] && *axis == 1)
+    });
+    assert!(matches!(zeroed, FuzzCase::Gather { ref input, ref index, axis }
+        if input.bytes == vec![0; 32] && index.bytes == vec![0; 24] && axis == 1));
+
+    let ieee = FuzzCase::Gather {
+        input: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])).unwrap()),
+        index: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I32(vec![1, 0, 2])).unwrap()),
+        axis: 0,
+    };
+    let ieee_built = ieee.build().unwrap();
+    let ieee_output = CpuBackend.execute(&ieee_built.graph, ieee_built.output, &ieee_built.oracle).unwrap();
+    assert_eq!(
+        FuzzTensor::from_tensor(&ieee_output),
+        FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0, f32::INFINITY])).unwrap()),
+    );
+
+    let bad_dtype = FuzzCase::Gather {
+        input: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap()),
+        index: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I16(vec![0])).unwrap()),
+        axis: 0,
+    };
+    let bad_index = FuzzCase::Gather {
+        input: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap()),
+        index: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I32(vec![2])).unwrap()),
+        axis: 0,
+    };
+    assert!(bad_dtype.validate().is_err());
+    assert!(bad_index.validate().is_err());
+}
+
+#[test]
 fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
     let tensor_t = FuzzCase::TensorT {
         input: FuzzTensor::from_tensor(
@@ -1092,7 +1257,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 23);
+    assert_eq!(cases.len(), 27);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(

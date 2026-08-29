@@ -228,6 +228,11 @@ pub enum FuzzCase {
         padding: Vec<(usize, usize)>,
         fill: FuzzTensor,
     },
+    Gather {
+        input: FuzzTensor,
+        index: FuzzTensor,
+        axis: usize,
+    },
 }
 
 pub(super) struct BuiltCase {
@@ -248,7 +253,12 @@ impl FuzzCase {
             | Self::Concat { lhs, rhs, .. }
             | Self::Matmul { lhs, rhs }
             | Self::Compare { lhs, rhs, .. }
-            | Self::Logical { lhs, rhs, .. } => vec![lhs, rhs],
+            | Self::Logical { lhs, rhs, .. }
+            | Self::Gather {
+                input: lhs,
+                index: rhs,
+                ..
+            } => vec![lhs, rhs],
             Self::Select {
                 condition,
                 on_true,
@@ -423,6 +433,36 @@ impl FuzzCase {
                 let input = bind(&mut graph, "input", input)?;
                 graph
                     .pad(input, padding.clone(), fill)
+                    .map_err(|error| error.to_string())?
+            }
+            Self::Gather { input, index, axis } => {
+                if !matches!(index.dtype, DType::I32 | DType::I64) {
+                    return Err("raw fuzz gather index dtype must be I32 or I64".into());
+                }
+                if input.shape.is_empty()
+                    || index.shape.len() != input.shape.len()
+                    || *axis >= input.shape.len()
+                    || input
+                        .shape
+                        .iter()
+                        .zip(&index.shape)
+                        .enumerate()
+                        .any(|(dimension, (input, index))| dimension != *axis && index > input)
+                {
+                    return Err("invalid raw fuzz gather geometry".into());
+                }
+                let extent = input.shape[*axis];
+                let index_value = index.to_tensor()?;
+                if (0..index_value.len()).any(|position| match index_value.scalar_at(position) {
+                    Scalar::I(value) => usize::try_from(value).map_or(true, |value| value >= extent),
+                    _ => true,
+                }) {
+                    return Err("raw fuzz gather index is negative or out of range".into());
+                }
+                let input = bind(&mut graph, "input", input)?;
+                let index = bind(&mut graph, "index", index)?;
+                graph
+                    .gather(input, index, *axis)
                     .map_err(|error| error.to_string())?
             }
         };

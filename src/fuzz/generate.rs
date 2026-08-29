@@ -43,10 +43,30 @@ fn static_shape(rng: &mut SplitMix64) -> Vec<usize> {
     [vec![], vec![0], vec![1], vec![3], vec![17], vec![2, 3]][rng.pick(6)].clone()
 }
 
+fn gather_index(
+    rng: &mut SplitMix64,
+    shape: Vec<usize>,
+    axis_extent: usize,
+    dtype: DType,
+) -> FuzzTensor {
+    let elements = Shape::new(shape.clone())
+        .numel()
+        .expect("bounded generated gather index shape");
+    debug_assert!(elements == 0 || axis_extent != 0);
+    FuzzTensor::from_tensor(
+        &TensorData::from_scalars(
+            shape,
+            dtype,
+            (0..elements).map(|_| Scalar::I(rng.pick(axis_extent) as i64)),
+        )
+        .expect("generated gather indices are in range"),
+    )
+}
+
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(13) {
+    match rng.pick(14) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = if rng.pick(2) == 0 {
@@ -245,6 +265,37 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 input: tensor(&mut rng, shape, dtype),
                 padding,
                 fill: tensor(&mut rng, vec![], dtype),
+            }
+        }
+        12 => {
+            // Raw Gather is a homogeneous movement kernel. Keep live indices
+            // signed, nonnegative, in range, and same-rank by construction.
+            let rank = 1 + rng.pick(3);
+            let axis = rng.pick(rank);
+            let dtype = [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)];
+            let input_shape = (0..rank)
+                .map(|_| [0, 1, 2, 3][rng.pick(4)])
+                .collect::<Vec<_>>();
+            let mut index_shape = Vec::with_capacity(rank);
+            for dimension in 0..rank {
+                if dimension == axis {
+                    let source = input_shape[dimension];
+                    index_shape.push(if source == 0 { 0 } else { rng.pick(4) });
+                } else {
+                    index_shape.push(rng.pick(input_shape[dimension] + 1));
+                }
+            }
+            let index_dtype = [DType::I32, DType::I64][rng.pick(2)];
+            let index = gather_index(
+                &mut rng,
+                index_shape,
+                input_shape[axis],
+                index_dtype,
+            );
+            FuzzCase::Gather {
+                input: tensor(&mut rng, input_shape, dtype),
+                index,
+                axis,
             }
         }
         _ => {
