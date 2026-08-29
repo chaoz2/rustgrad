@@ -1,5 +1,5 @@
 use super::{VizEdge, VizError, VizGraph, VizNode};
-use crate::{CompileTrace, ItemBackend, RealizationTrace};
+use crate::{CompileTrace, CudaCollectiveTrace, ItemBackend, RealizationTrace, ShardedCudaExecutionTrace};
 
 fn dtype_name(dtype: crate::DType) -> &'static str {
     match dtype {
@@ -23,4 +23,18 @@ pub fn realization_trace_viz(trace: &RealizationTrace) -> Result<VizGraph, VizEr
         .field("backend", backend_name(item.backend)).field("cache_key", item.cache_key.to_string()).field("buffer", item.materialized_buffer.to_string()).field("last_consumer", item.last_consumer.map_or_else(|| "none".into(), |x| x.to_string())).field("allocation", item.allocation_id.map_or_else(|| "none".into(), |x| x.to_string())).field("slot", item.physical_slot.map_or_else(|| "none".into(), |x| x.to_string())).field("generation", item.generation.map_or_else(|| "none".into(), |x| x.to_string())).field("reused_from", item.reused_from.map_or_else(|| "none".into(), |x| x.to_string())).field("released", u64_list(&item.released_buffers)).field("lanes", item.lanes.to_string()).field("vector_main", item.vector_main.to_string()).field("vector_tail", item.vector_tail.to_string()).field("vector_reason", item.vector_reason.clone())).collect();
     let edges = trace.items.iter().flat_map(|item| item.dependencies.iter().map(move |dependency| VizEdge::new(format!("r{dependency}"), format!("r{}", item.item), "dependency", "data"))).collect();
     VizGraph::try_new("rustgrad_realization_trace", nodes, edges)
+}
+
+pub fn cuda_collective_trace_viz(trace: &[CudaCollectiveTrace]) -> Result<VizGraph, VizError> {
+    let nodes = trace.iter().enumerate().map(|(sequence, action)| VizNode::new(format!("cc{}", action.action_id), "cuda_collective_trace", "submission")
+        .field("sequence", sequence.to_string()).field("operation", action.operation).field("device", action.device.as_str()).field("range", format!("{}:{}", action.range.start, action.range.len)).field("cache_key", action.cache_key.clone().unwrap_or_else(|| "none".into()))).collect();
+    let edges = trace.windows(2).map(|pair| VizEdge::new(format!("cc{}", pair[0].action_id), format!("cc{}", pair[1].action_id), "order", "next")).collect();
+    VizGraph::try_new("rustgrad_cuda_collective_trace", nodes, edges)
+}
+
+pub fn sharded_cuda_execution_trace_viz(trace: &[ShardedCudaExecutionTrace]) -> Result<VizGraph, VizError> {
+    let nodes = trace.iter().enumerate().map(|(sequence, stage)| VizNode::new(format!("cs{}", stage.stage), "sharded_cuda_execution_trace", "stage")
+        .field("sequence", sequence.to_string()).field("action", stage.action).field("skipped", stage.skipped.to_string())).collect();
+    let edges = trace.windows(2).map(|pair| VizEdge::new(format!("cs{}", pair[0].stage), format!("cs{}", pair[1].stage), "order", "next")).collect();
+    VizGraph::try_new("rustgrad_sharded_cuda_execution_trace", nodes, edges)
 }
