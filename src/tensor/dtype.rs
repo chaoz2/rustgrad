@@ -60,6 +60,66 @@ impl DType {
         (self.bits() as usize).div_ceil(8)
     }
 
+    /// Returns this supported dtype's concrete tinygrad promotion priority.
+    pub const fn tinygrad_priority(self) -> u8 {
+        match self {
+            Self::Bool => 0,
+            Self::I8 => 1,
+            Self::U8 => 2,
+            Self::I16 => 3,
+            Self::U16 => 4,
+            Self::I32 => 5,
+            Self::U32 => 6,
+            Self::I64 => 7,
+            Self::U64 => 8,
+            Self::F16 => 12,
+            Self::BF16 => 13,
+            Self::F32 => 14,
+            Self::F64 => 15,
+        }
+    }
+
+    /// Returns tinygrad's concrete internal `DType.name` value.
+    ///
+    /// This intentionally differs from [`Self::canonical_tinygrad_name`],
+    /// whose spelling follows the alias-overwritten inverse dictionary.
+    pub const fn tinygrad_source_name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::I8 => "signed char",
+            Self::U8 => "unsigned char",
+            Self::I16 => "short",
+            Self::U16 => "unsigned short",
+            Self::I32 => "int",
+            Self::U32 => "unsigned int",
+            Self::I64 => "long",
+            Self::U64 => "unsigned long",
+            Self::F16 => "half",
+            Self::BF16 => "__bf16",
+            Self::F32 => "float",
+            Self::F64 => "double",
+        }
+    }
+
+    /// Returns tinygrad's concrete `DType.fmt` byte-format code.
+    pub const fn tinygrad_format(self) -> Option<char> {
+        match self {
+            Self::Bool => Some('?'),
+            Self::I8 => Some('b'),
+            Self::U8 => Some('B'),
+            Self::I16 => Some('h'),
+            Self::U16 => Some('H'),
+            Self::I32 => Some('i'),
+            Self::U32 => Some('I'),
+            Self::I64 => Some('q'),
+            Self::U64 => Some('Q'),
+            Self::F16 => Some('e'),
+            Self::BF16 => None,
+            Self::F32 => Some('f'),
+            Self::F64 => Some('d'),
+        }
+    }
+
     pub const fn is_float(self) -> bool {
         matches!(self.category(), DTypeCategory::Float)
     }
@@ -384,6 +444,42 @@ mod tests {
         assert_eq!(DType::I8.promote(DType::U8), DType::I16);
         assert_eq!(DType::I32.promote(DType::F32), DType::F32);
         assert_eq!(DType::U64.promote(DType::I64), DType::F64);
+    }
+
+    #[test]
+    fn tinygrad_concrete_metadata_matches_every_supported_dtype() {
+        let cases = [
+            (DType::Bool, 0, 1, 1, "bool", Some('?'), "bool"),
+            (DType::I8, 1, 8, 1, "signed char", Some('b'), "char"),
+            (DType::U8, 2, 8, 1, "unsigned char", Some('B'), "uchar"),
+            (DType::I16, 3, 16, 2, "short", Some('h'), "short"),
+            (DType::U16, 4, 16, 2, "unsigned short", Some('H'), "ushort"),
+            (DType::I32, 5, 32, 4, "int", Some('i'), "int"),
+            (DType::U32, 6, 32, 4, "unsigned int", Some('I'), "uint"),
+            (DType::I64, 7, 64, 8, "long", Some('q'), "long"),
+            (DType::U64, 8, 64, 8, "unsigned long", Some('Q'), "ulong"),
+            (DType::F16, 12, 16, 2, "half", Some('e'), "half"),
+            (DType::BF16, 13, 16, 2, "__bf16", None, "bfloat16"),
+            (DType::F32, 14, 32, 4, "float", Some('f'), "float"),
+            (DType::F64, 15, 64, 8, "double", Some('d'), "double"),
+        ];
+        for (dtype, priority, bits, itemsize, source_name, format, canonical_name) in cases {
+            assert_eq!(dtype.tinygrad_priority(), priority, "{dtype:?}");
+            assert_eq!(dtype.bits(), bits, "{dtype:?}");
+            assert_eq!(dtype.itemsize(), itemsize, "{dtype:?}");
+            assert_eq!(dtype.tinygrad_source_name(), source_name, "{dtype:?}");
+            assert_eq!(dtype.tinygrad_format(), format, "{dtype:?}");
+            assert_eq!(
+                dtype.canonical_tinygrad_name(),
+                canonical_name,
+                "{dtype:?}"
+            );
+        }
+        assert_ne!(DType::I8.tinygrad_source_name(), DType::I8.canonical_tinygrad_name());
+        assert_ne!(
+            DType::BF16.tinygrad_source_name(),
+            DType::BF16.canonical_tinygrad_name()
+        );
     }
 
     #[test]
