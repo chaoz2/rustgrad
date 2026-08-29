@@ -94,6 +94,9 @@ pub enum Error {
     InvalidTinygradDTypeName {
         name: String,
     },
+    InvalidTensorLen {
+        node: NodeId,
+    },
     BitcastItemsizeMismatch {
         input: DType,
         output: DType,
@@ -341,6 +344,7 @@ impl fmt::Display for Error {
             Self::InvalidTinygradDTypeName { name } => {
                 write!(f, "unsupported tinygrad dtype name {name:?}")
             }
+            Self::InvalidTensorLen { .. } => write!(f, "len() of a 0-d tensor"),
             Self::BitcastItemsizeMismatch { input, output } => write!(
                 f,
                 "cannot bitcast {input:?} ({}) to {output:?} ({})",

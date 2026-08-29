@@ -56,7 +56,9 @@ fn dtype_conveniences_alias_source_cast_and_are_atomic() {
 fn descriptor_queries_are_read_only_and_source_axis_checked() {
     let mut graph = Graph::new();
     let scalar = graph.input_dtype("scalar", [], DType::Bool);
+    let vector = graph.input_dtype("vector", [4], DType::I32);
     let zero_extent = graph.input_dtype("zero_extent", [2, 0, 3], DType::F16);
+    let leading_zero = graph.input_dtype("leading_zero", [0, 3], DType::F64);
     let before = graph.node_count();
 
     assert_eq!(graph.numel(scalar).unwrap(), 1);
@@ -64,11 +66,14 @@ fn descriptor_queries_are_read_only_and_source_axis_checked() {
     assert_eq!(graph.max_shape(scalar).unwrap(), Shape::new([]));
     assert_eq!(graph.max_numel(scalar).unwrap(), 1);
     assert_eq!(graph.size(scalar).unwrap(), Shape::new([]));
+    assert_eq!(graph.len_tinygrad(vector).unwrap(), 4);
     assert_eq!(graph.numel(zero_extent).unwrap(), 0);
     assert_eq!(graph.ndim(zero_extent).unwrap(), 3);
     assert_eq!(graph.max_shape(zero_extent).unwrap(), Shape::new([2, 0, 3]));
     assert_eq!(graph.max_numel(zero_extent).unwrap(), 0);
     assert_eq!(graph.size(zero_extent).unwrap(), Shape::new([2, 0, 3]));
+    assert_eq!(graph.len_tinygrad(zero_extent).unwrap(), 2);
+    assert_eq!(graph.len_tinygrad(leading_zero).unwrap(), 0);
     assert_eq!(graph.size_dim(zero_extent, -3).unwrap(), 2);
     assert_eq!(graph.size_dim(zero_extent, -1).unwrap(), 3);
     assert_eq!(graph.element_size(scalar).unwrap(), DType::Bool.itemsize());
@@ -95,6 +100,12 @@ fn descriptor_queries_are_read_only_and_source_axis_checked() {
     }
 
     assert!(matches!(graph.size_dim(scalar, 0), Err(Error::InvalidAxis { .. })));
+    let scalar_len_error = graph.len_tinygrad(scalar).unwrap_err();
+    assert!(matches!(
+        &scalar_len_error,
+        Error::InvalidTensorLen { node } if *node == scalar
+    ));
+    assert_eq!(scalar_len_error.to_string(), "len() of a 0-d tensor");
     assert!(matches!(graph.size_dim(zero_extent, 3), Err(Error::InvalidAxis { .. })));
     let unknown = NodeId::from_index(usize::MAX);
     assert!(matches!(graph.numel(unknown), Err(Error::UnknownNode(_))));
@@ -104,6 +115,7 @@ fn descriptor_queries_are_read_only_and_source_axis_checked() {
     assert!(matches!(graph.size(unknown), Err(Error::UnknownNode(_))));
     assert!(matches!(graph.size_dim(unknown, 0), Err(Error::UnknownNode(_))));
     assert!(matches!(graph.element_size(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.len_tinygrad(unknown), Err(Error::UnknownNode(_))));
     assert_eq!(graph.node_count(), before + 13);
 
     let overflow = graph.input_dtype("overflow", [usize::MAX, 2], DType::F64);
@@ -113,6 +125,7 @@ fn descriptor_queries_are_read_only_and_source_axis_checked() {
     assert_eq!(graph.max_shape(overflow).unwrap(), Shape::new([usize::MAX, 2]));
     assert!(matches!(graph.max_numel(overflow), Err(Error::ShapeOverflow(_))));
     assert!(matches!(graph.nbytes(overflow), Err(Error::ShapeOverflow(_))));
+    assert_eq!(graph.len_tinygrad(overflow).unwrap(), usize::MAX);
     assert_eq!(graph.node_count(), overflow_before);
 }
 

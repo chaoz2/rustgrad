@@ -4257,6 +4257,21 @@ impl Graph {
         self.node(id)?.shape.numel()
     }
 
+    /// Read-only checked-in tinygrad `Tensor.__len__`.
+    ///
+    /// Concrete non-scalar tensors return their leading extent, including
+    /// zero. Scalars reject with the same source-visible 0-d length error;
+    /// no descriptor product is needed, so overflow-shaped descriptors remain
+    /// queryable when their leading extent is concrete.
+    pub fn len_tinygrad(&self, id: NodeId) -> Result<usize> {
+        self.node(id)?
+            .shape
+            .dims()
+            .first()
+            .copied()
+            .ok_or(Error::InvalidTensorLen { node: id })
+    }
+
     /// Read-only tinygrad `Tensor.size()` without a dimension.
     ///
     /// The owned `Shape` keeps this query independent of the graph's internal
