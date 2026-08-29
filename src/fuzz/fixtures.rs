@@ -137,6 +137,33 @@ pub fn regression_cases() -> Vec<FuzzCase> {
         FuzzCase::TensorT {
             input: tensor(vec![0, 3], Storage::F16(vec![])),
         },
+        FuzzCase::Pad {
+            // [2, 2] becomes [3, 4], retaining row-major placement and the
+            // raw negative-zero fill at every padded lane.
+            input: tensor(vec![2, 2], Storage::F32(vec![1.0, 2.0, 3.0, 4.0])),
+            padding: vec![(1, 0), (0, 2)],
+            fill: tensor(vec![], Storage::F32(vec![-0.0])),
+        },
+        FuzzCase::Pad {
+            // A zero input domain can become a nonempty all-fill movement
+            // result; this remains a raw Pad contract, not pad_signed.
+            input: tensor(vec![0, 2], Storage::I32(vec![])),
+            padding: vec![(1, 1), (1, 0)],
+            fill: tensor(vec![], Storage::I32(vec![-7])),
+        },
+        FuzzCase::Pad {
+            // The scalar bridge commits this raw F32 NaN fill through the
+            // existing Graph::pad/MovementKernelPlan storage contract.
+            input: tensor(vec![1], Storage::F32(vec![1.0])),
+            padding: vec![(1, 1)],
+            fill: tensor(vec![], Storage::F32(vec![f32::from_bits(0x7fc0_0001)])),
+        },
+        FuzzCase::Pad {
+            // Rank-zero Pad has empty padding but still emits an Op::Pad.
+            input: tensor(vec![], Storage::Bool(vec![true])),
+            padding: vec![],
+            fill: tensor(vec![], Storage::Bool(vec![false])),
+        },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),
             rhs: tensor(vec![2, 3], Storage::I32(vec![0; 6])),

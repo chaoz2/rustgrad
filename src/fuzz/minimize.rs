@@ -71,6 +71,15 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
         FuzzCase::TensorT { input } => FuzzCase::TensorT {
             input: input.zeroed(),
         },
+        FuzzCase::Pad {
+            input,
+            padding,
+            fill,
+        } => FuzzCase::Pad {
+            input: input.zeroed(),
+            padding: padding.clone(),
+            fill: fill.zeroed(),
+        },
     }
 }
 
@@ -114,6 +123,18 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
         // Tensor.T admits rank two only, so scalarization would stop being a
         // valid source program and is deliberately omitted.
         FuzzCase::TensorT { .. } => None,
+        // Pad can remain scalar only when its rank-zero padding contract is
+        // already valid. Higher-rank padding cannot follow scalarization.
+        FuzzCase::Pad {
+            input,
+            padding,
+            fill,
+        } if input.shape.is_empty() && padding.is_empty() => Some(FuzzCase::Pad {
+            input: input.scalar_prefix()?,
+            padding: vec![],
+            fill: fill.scalar_prefix()?,
+        }),
+        FuzzCase::Pad { .. } => None,
         _ => None,
     }
 }

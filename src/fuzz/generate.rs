@@ -46,7 +46,7 @@ fn static_shape(rng: &mut SplitMix64) -> Vec<usize> {
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(12) {
+    match rng.pick(13) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = if rng.pick(2) == 0 {
@@ -228,6 +228,23 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             let dtype = [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)];
             FuzzCase::TensorT {
                 input: tensor(&mut rng, shape, dtype),
+            }
+        }
+        11 => {
+            // Raw Pad is a self-contained homogeneous movement plan. It is
+            // intentionally distinct from source-level signed/mode-aware pad.
+            let rank = rng.pick(4);
+            let dtype = [DType::F32, DType::I32, DType::F16, DType::Bool][rng.pick(4)];
+            let shape = (0..rank)
+                .map(|_| [0, 1, 2, 3][rng.pick(4)])
+                .collect::<Vec<_>>();
+            let padding = (0..rank)
+                .map(|_| ([0, 1, 2][rng.pick(3)], [0, 1, 2][rng.pick(3)]))
+                .collect::<Vec<_>>();
+            FuzzCase::Pad {
+                input: tensor(&mut rng, shape, dtype),
+                padding,
+                fill: tensor(&mut rng, vec![], dtype),
             }
         }
         _ => {

@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
     Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, Op, Scalar,
-    Storage, TensorData, UArg, UOpKind, UnaryOp, schedule,
+    MovementKernelKind, MovementKernelPlan, Storage, TensorData, UArg, UOpKind, UnaryOp,
+    schedule,
 };
 use std::{
     fs::{self, File},
@@ -341,6 +342,166 @@ fn generated_tensor_t_cases_are_valid_diverse_and_deterministic() {
     assert!(found);
     assert!(f32 && i32 && f16 && boolean);
     assert!(square && rectangular && zero_rows && zero_columns && all_zero);
+}
+
+#[test]
+fn generated_pad_cases_are_valid_diverse_and_deterministic() {
+    let mut found = false;
+    let mut f32 = false;
+    let mut i32 = false;
+    let mut f16 = false;
+    let mut boolean = false;
+    let mut scalar = false;
+    let mut empty = false;
+    let mut before = false;
+    let mut after = false;
+    let mut asymmetric = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..512 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Pad {
+                input,
+                padding,
+                fill,
+            } = case
+            else {
+                continue;
+            };
+            found = true;
+            assert_eq!(padding.len(), input.shape.len());
+            assert!(fill.shape.is_empty());
+            assert_eq!(fill.dtype, input.dtype);
+            scalar |= input.shape.is_empty();
+            empty |= input.shape.iter().any(|extent| *extent == 0);
+            before |= padding.iter().any(|(before, _)| *before != 0);
+            after |= padding.iter().any(|(_, after)| *after != 0);
+            asymmetric |= padding.iter().any(|(before, after)| before != after);
+            match input.dtype {
+                DType::F32 => f32 = true,
+                DType::I32 => i32 = true,
+                DType::F16 => f16 = true,
+                DType::Bool => boolean = true,
+                _ => unreachable!("Pad generator selects movement dtypes only"),
+            }
+        }
+    }
+
+    assert!(found);
+    assert!(f32 && i32 && f16 && boolean);
+    assert!(scalar && empty && before && after && asymmetric);
+}
+
+#[test]
+fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
+    let pad = FuzzCase::Pad {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2, 2], Storage::F32(vec![1.0, 2.0, 3.0, 4.0])).unwrap(),
+        ),
+        padding: vec![(1, 0), (0, 2)],
+        fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::F32(vec![-0.0])).unwrap()),
+    };
+    let value = serde_json::to_value(&pad).unwrap();
+    assert_eq!(value["kind"], "pad");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), pad);
+    let mut unknown = value;
+    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
+
+    for case in [
+        pad.clone(),
+        FuzzCase::Pad {
+            input: FuzzTensor::from_tensor(&TensorData::from_storage([0, 2], Storage::I32(vec![])).unwrap()),
+            padding: vec![(1, 1), (1, 0)],
+            fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::I32(vec![-7])).unwrap()),
+        },
+        FuzzCase::Pad {
+            input: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::Bool(vec![true])).unwrap()),
+            padding: vec![],
+            fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::Bool(vec![false])).unwrap()),
+        },
+    ] {
+        let built = case.build().unwrap();
+        assert_eq!(built.ordered.len(), 1, "Pad fill is plan metadata, not an input binding");
+        let Op::Pad { padding, .. } = built.graph.op(built.output).unwrap() else {
+            panic!("raw Pad case must retain its Pad root");
+        };
+        let FuzzCase::Pad { padding: expected, .. } = &case else {
+            unreachable!("constructed as Pad")
+        };
+        assert_eq!(padding, expected);
+        let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        let MovementKernelKind::Pad { padding: planned, fill_bits, .. } = &plan.kind else {
+            panic!("Pad root must use a Pad movement plan");
+        };
+        assert_eq!(planned, expected);
+        if matches!(&case, FuzzCase::Pad { input, .. } if input.dtype == DType::F32) {
+            assert_eq!(*fill_bits, 0x8000_0000);
+        }
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        let item = &scheduled.items[0];
+        assert!(item.boundary.is_none());
+        assert!(matches!(item.kernel.kind(), UOpKind::Movement));
+        assert!(matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Pad { .. })));
+        assert!(CpuJit::render(&item.kernel).is_ok());
+        assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
+        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+    }
+
+    let built = pad.build().unwrap();
+    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let expected = TensorData::from_storage(
+        [3, 4],
+        Storage::F32(vec![-0.0, -0.0, -0.0, -0.0, 1.0, 2.0, -0.0, -0.0, 3.0, 4.0, -0.0, -0.0]),
+    ).unwrap();
+    assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&expected));
+    let artifact = FuzzFailureArtifact::new(
+        12, 16, pad.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&output),
+        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Pad mismatch".into() },
+    ).unwrap();
+    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    let zeroed = minimize_case(&pad, |candidate| {
+        matches!(candidate, FuzzCase::Pad { input, fill, .. }
+            if input.bytes == vec![0; 16] && fill.bytes == vec![0; 4])
+    });
+    assert!(matches!(zeroed, FuzzCase::Pad { ref input, ref fill, .. }
+        if input.bytes == vec![0; 16] && fill.bytes == vec![0; 4]));
+
+    let nan_fill = FuzzCase::Pad {
+        input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),
+        padding: vec![(1, 1)],
+        fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::F32(vec![f32::from_bits(0x7fc0_0001)])).unwrap()),
+    };
+    let nan_built = nan_fill.build().unwrap();
+    let MovementKernelKind::Pad { fill_bits, .. } = MovementKernelPlan::from_graph(&nan_built.graph, nan_built.output).unwrap().kind else {
+        unreachable!("Pad plan")
+    };
+    assert!(f32::from_bits(fill_bits as u32).is_nan());
+
+    let bad_shape = FuzzCase::Pad {
+        input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),
+        padding: vec![(0, 1)],
+        fill: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![0.0])).unwrap()),
+    };
+    let bad_dtype = FuzzCase::Pad {
+        input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),
+        padding: vec![(0, 1)],
+        fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::I32(vec![0])).unwrap()),
+    };
+    let bad_padding = FuzzCase::Pad {
+        input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),
+        padding: vec![],
+        fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::F32(vec![0.0])).unwrap()),
+    };
+    assert!(bad_shape.validate().is_err());
+    assert!(bad_dtype.validate().is_err());
+    assert!(bad_padding.validate().is_err());
 }
 
 #[test]
@@ -931,7 +1092,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 19);
+    assert_eq!(cases.len(), 23);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(

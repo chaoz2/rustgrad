@@ -223,6 +223,11 @@ pub enum FuzzCase {
     TensorT {
         input: FuzzTensor,
     },
+    Pad {
+        input: FuzzTensor,
+        padding: Vec<(usize, usize)>,
+        fill: FuzzTensor,
+    },
 }
 
 pub(super) struct BuiltCase {
@@ -255,6 +260,9 @@ impl FuzzCase {
             | Self::Unary { input, .. }
             | Self::LogicalNot { input }
             | Self::TensorT { input } => vec![input],
+            // Raw Graph::pad stores its fill in the movement plan, not as a
+            // caller-owned graph buffer. `build` validates it explicitly.
+            Self::Pad { input, .. } => vec![input],
         }
     }
 
@@ -401,6 +409,21 @@ impl FuzzCase {
             Self::TensorT { input } => {
                 let input = bind(&mut graph, "input", input)?;
                 graph.t_tinygrad(input).map_err(|error| error.to_string())?
+            }
+            Self::Pad {
+                input,
+                padding,
+                fill,
+            } => {
+                fill.validate()?;
+                if !fill.shape.is_empty() || fill.dtype != input.dtype {
+                    return Err("pad fill must be a rank-zero tensor with the input dtype".into());
+                }
+                let fill = fill.to_tensor()?.scalar_at(0);
+                let input = bind(&mut graph, "input", input)?;
+                graph
+                    .pad(input, padding.clone(), fill)
+                    .map_err(|error| error.to_string())?
             }
         };
         let oracle = ordered.clone().into_iter().collect();
