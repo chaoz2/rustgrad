@@ -136,6 +136,43 @@ impl DType {
         Storage::from_scalars(self, [value]).scalar(0)
     }
 
+    /// Returns the concrete float work dtype used by tinygrad's source helpers.
+    pub const fn least_upper_float(self) -> Self {
+        if self.is_float() { self } else { Self::F32 }
+    }
+
+    /// Returns whether every value in `self` is representable by `target`.
+    pub const fn can_losslessly_cast_to(self, target: Self) -> bool {
+        use DType::*;
+        if self == target || self == Bool {
+            return true;
+        }
+        match target {
+            F64 => matches!(self, F32 | F16 | BF16 | U32 | U16 | U8 | I32 | I16 | I8),
+            F32 => matches!(self, F16 | BF16 | U16 | U8 | I16 | I8),
+            F16 => matches!(self, U8 | I8),
+            U64 => matches!(self, U32 | U16 | U8),
+            U32 => matches!(self, U16 | U8),
+            U16 => matches!(self, U8),
+            I64 => matches!(self, U32 | U16 | U8 | I32 | I16 | I8),
+            I32 => matches!(self, U16 | U8 | I16 | I8),
+            I16 => matches!(self, U8 | I8),
+            _ => false,
+        }
+    }
+
+    /// Returns tinygrad's concrete default accumulation storage for Sum.
+    pub const fn sum_accumulator_dtype(self) -> Self {
+        match self {
+            Self::Bool | Self::I8 | Self::I16 | Self::I32 => Self::I32,
+            Self::U8 | Self::U16 | Self::U32 => Self::U32,
+            Self::I64 => Self::I64,
+            Self::U64 => Self::U64,
+            Self::F16 | Self::BF16 | Self::F32 => Self::F32,
+            Self::F64 => Self::F64,
+        }
+    }
+
     /// A compact, deterministic promotion lattice for supported scalar dtypes.
     /// It follows tinygrad's widening intent; fp8/weak/pointer dtypes are not
     /// implemented yet.
@@ -195,6 +232,7 @@ const fn integer_dtype(signed: bool, bits: u8) -> DType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReductionDType;
 
     fn assert_scalar_eq(actual: Scalar, expected: Scalar) {
         match (actual, expected) {
@@ -300,6 +338,81 @@ mod tests {
             assert!(dtype.commit_scalar(Scalar::F(f64::from_bits(0x7ff8_0000_0000_1234)))
                 .as_f64()
                 .is_nan());
+        }
+    }
+
+    #[test]
+    fn concrete_float_lub_and_lossless_cast_matrix_match_tinygrad() {
+        const DTYPES: [DType; 13] = [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ];
+        const LOSSLESS: [[bool; 13]; 13] = [
+            [true, true, true, true, true, true, true, true, true, true, true, true, true],
+            [false, true, false, true, false, true, false, true, false, true, false, true, true],
+            [false, false, true, true, true, true, true, true, true, true, false, true, true],
+            [false, false, false, true, false, true, false, true, false, false, false, true, true],
+            [false, false, false, false, true, true, true, true, true, false, false, true, true],
+            [false, false, false, false, false, true, false, true, false, false, false, false, true],
+            [false, false, false, false, false, false, true, true, true, false, false, false, true],
+            [false, false, false, false, false, false, false, true, false, false, false, false, false],
+            [false, false, false, false, false, false, false, false, true, false, false, false, false],
+            [false, false, false, false, false, false, false, false, false, true, false, true, true],
+            [false, false, false, false, false, false, false, false, false, false, true, true, true],
+            [false, false, false, false, false, false, false, false, false, false, false, true, true],
+            [false, false, false, false, false, false, false, false, false, false, false, false, true],
+        ];
+        for (source_index, source) in DTYPES.into_iter().enumerate() {
+            assert_eq!(
+                source.least_upper_float(),
+                if source.is_float() { source } else { DType::F32 }
+            );
+            for (target_index, target) in DTYPES.into_iter().enumerate() {
+                assert_eq!(
+                    source.can_losslessly_cast_to(target),
+                    LOSSLESS[source_index][target_index],
+                    "{source:?} -> {target:?}"
+                );
+            }
+        }
+        assert_eq!(DType::I64.least_upper_float(), DType::F32);
+        assert_eq!(DType::U64.least_upper_float(), DType::F32);
+    }
+
+    #[test]
+    fn sum_accumulator_dtype_drives_the_ir_default_pair() {
+        let cases = [
+            (DType::Bool, DType::I32, DType::I32),
+            (DType::I8, DType::I32, DType::I32),
+            (DType::U8, DType::U32, DType::U32),
+            (DType::I16, DType::I32, DType::I32),
+            (DType::U16, DType::U32, DType::U32),
+            (DType::I32, DType::I32, DType::I32),
+            (DType::U32, DType::U32, DType::U32),
+            (DType::I64, DType::I64, DType::I64),
+            (DType::U64, DType::U64, DType::U64),
+            (DType::F16, DType::F32, DType::F16),
+            (DType::BF16, DType::F32, DType::BF16),
+            (DType::F32, DType::F32, DType::F32),
+            (DType::F64, DType::F64, DType::F64),
+        ];
+        for (input, accumulator, output) in cases {
+            assert_eq!(input.sum_accumulator_dtype(), accumulator);
+            assert_eq!(
+                ReductionDType::sum_default(input),
+                ReductionDType::new(accumulator, output)
+            );
         }
     }
 }

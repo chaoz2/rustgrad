@@ -654,16 +654,12 @@ impl ReductionDType {
     }
 
     pub const fn sum_default(input: DType) -> Self {
-        use DType::*;
-        match input {
-            Bool | I8 | I16 | I32 => Self::new(I32, I32),
-            U8 | U16 | U32 => Self::new(U32, U32),
-            I64 => Self::new(I64, I64),
-            U64 => Self::new(U64, U64),
-            F16 | BF16 => Self::new(F32, input),
-            F32 => Self::new(F32, F32),
-            F64 => Self::new(F64, F64),
-        }
+        let accumulator = input.sum_accumulator_dtype();
+        let output = match input {
+            DType::F16 | DType::BF16 => input,
+            _ => accumulator,
+        };
+        Self::new(accumulator, output)
     }
 
     pub const fn product_default(input: DType) -> Self {
