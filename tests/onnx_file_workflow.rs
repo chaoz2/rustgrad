@@ -267,7 +267,7 @@ fn local_model_named_npy_strict_native_is_atomic_and_reuses_caller_cache() {
         .windows(4)
         .position(|window| window == b"Relu")
         .unwrap();
-    unsupported[relu..relu + 4].copy_from_slice(b"Tanh");
+    unsupported[relu..relu + 4].copy_from_slice(b"Ceil");
     let unsupported_model = d.join("unsupported.onnx");
     fs::write(&unsupported_model, unsupported).unwrap();
     let rejected = run_onnx_files_native(
