@@ -5,14 +5,8 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum EffectUOpKind {
-    Store,
-    After,
-}
-
-/// Typed immutable STORE payload. `snapshot` is the target state read before
-/// writing, so overlap cannot silently become write-after-read.
+/// Typed immutable effect-assignment payload. `snapshot` is the target state
+/// read before writing, so overlap cannot silently become write-after-read.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EffectPayload {
     pub step: u64,
@@ -23,17 +17,66 @@ pub struct EffectPayload {
     pub index_plan: Option<crate::ir::indexing::StaticIndexPlan>,
 }
 
+/// One validated state transition in an effect schedule.
+///
+/// The logical assignment payload is stored once. Its compiler-visible
+/// `EffectStore` and `After` operations are derived together, so callers
+/// cannot pair the wrong payload, predecessor list, or UOp kind.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct EffectUOp {
-    pub kind: EffectUOpKind,
-    pub payload: EffectPayload,
-    pub after: Vec<u64>,
-    pub uop: crate::UOp,
+pub struct EffectScheduleNode {
+    payload: EffectPayload,
+    predecessors: Vec<u64>,
+}
+
+impl EffectScheduleNode {
+    /// Creates one descriptor-valid assignment node. Predecessor existence and
+    /// source order are schedule-level invariants checked by
+    /// [`EffectSchedule::validate`].
+    pub fn assignment(payload: EffectPayload, predecessors: Vec<u64>) -> Result<Self, EffectError> {
+        super::validate_effect_payload(&payload)?;
+        Ok(Self {
+            payload,
+            predecessors,
+        })
+    }
+
+    pub fn payload(&self) -> &EffectPayload {
+        &self.payload
+    }
+
+    pub fn predecessors(&self) -> &[u64] {
+        &self.predecessors
+    }
+
+    /// Synthesizes the immutable STORE source for this assignment.
+    pub fn store_uop(&self) -> crate::UOp {
+        crate::UOp::from_operation(
+            crate::Operation::EffectStore(Box::new(self.payload.clone())),
+            None,
+            vec![],
+        )
+    }
+
+    /// Synthesizes the ordered AFTER root and its matching STORE source.
+    pub fn after_uop(&self) -> crate::UOp {
+        crate::UOp::from_operation(
+            crate::Operation::After(Box::new(self.payload.clone())),
+            None,
+            vec![self.store_uop()],
+        )
+    }
+
+    fn validate(&self) -> Result<(), EffectError> {
+        super::validate_effect_payload(&self.payload)?;
+        self.after_uop()
+            .validate()
+            .map_err(|_| EffectError::EffectCycle)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectSchedule {
-    pub uops: Vec<EffectUOp>,
+    nodes: Vec<EffectScheduleNode>,
     pub cache_key: u64,
 }
 
@@ -41,7 +84,7 @@ impl EffectSchedule {
     pub fn lower(graph: &EffectGraph) -> Result<Self, EffectError> {
         let plan = graph.plan();
         plan.validate()?;
-        let mut uops = Vec::with_capacity(plan.steps.len() * 2);
+        let mut nodes = Vec::with_capacity(plan.steps.len());
         for step in &plan.steps {
             let snapshot = step
                 .reads
@@ -69,82 +112,37 @@ impl EffectSchedule {
                 target_view: step.target_view.clone(),
                 index_plan: step.index_plan.clone(),
             };
-            let store_uop = crate::UOp::from_operation(
-                crate::Operation::EffectStore(Box::new(payload.clone())),
-                None,
-                vec![],
-            );
-            uops.push(EffectUOp {
-                kind: EffectUOpKind::Store,
-                payload: payload.clone(),
-                after: vec![],
-                uop: store_uop.clone(),
-            });
-            uops.push(EffectUOp {
-                kind: EffectUOpKind::After,
-                payload,
-                after: step.after.clone(),
-                uop: crate::UOp::from_operation(
-                    crate::Operation::After(Box::new(step_payload(step))),
-                    None,
-                    vec![store_uop],
-                ),
-            });
+            nodes.push(EffectScheduleNode::assignment(payload, step.after.clone())?);
         }
-        let mut schedule = Self { uops, cache_key: 0 };
+        let mut schedule = Self {
+            nodes,
+            cache_key: 0,
+        };
         schedule.validate()?;
         schedule.cache_key = schedule_key(&schedule);
         Ok(schedule)
     }
+
+    pub fn nodes(&self) -> &[EffectScheduleNode] {
+        &self.nodes
+    }
+
     pub fn validate(&self) -> Result<(), EffectError> {
-        let mut stores = BTreeSet::new();
-        let mut after = BTreeSet::new();
-        for pair in self.uops.chunks_exact(2) {
-            let (store, next) = (&pair[0], &pair[1]);
-            if store.kind != EffectUOpKind::Store
-                || next.kind != EffectUOpKind::After
-                || store.payload != next.payload
-                || !store.after.is_empty()
-            {
-                return Err(EffectError::EffectCycle);
+        let mut completed = BTreeSet::new();
+        for node in &self.nodes {
+            node.validate()?;
+            let payload = node.payload();
+            if !completed.insert(payload.step) {
+                return Err(EffectError::DuplicateStep(payload.step));
             }
-            store.uop.validate().map_err(|_| EffectError::EffectCycle)?;
-            next.uop.validate().map_err(|_| EffectError::EffectCycle)?;
-            if !stores.insert(store.payload.step) || !after.insert(next.payload.step) {
-                return Err(EffectError::DuplicateStep(store.payload.step));
-            }
-            if store.payload.target.version
-                != store
-                    .payload
-                    .snapshot
-                    .version
-                    .checked_add(1)
-                    .ok_or(EffectError::Overflow)?
-                || store.payload.target.buffer != store.payload.snapshot.buffer
-            {
-                return Err(EffectError::InvalidVersion {
-                    buffer: store.payload.target.buffer,
-                    previous: store.payload.snapshot.version,
-                    next: store.payload.target.version,
-                });
-            }
-            if store.payload.target.dtype != store.payload.source.dtype {
-                return Err(EffectError::DescriptorMismatch {
-                    buffer: store.payload.target.buffer,
-                    version: store.payload.target.version,
-                });
-            }
-            for predecessor in &next.after {
-                if *predecessor >= store.payload.step || !after.contains(predecessor) {
+            for predecessor in node.predecessors() {
+                if *predecessor >= payload.step || !completed.contains(predecessor) {
                     return Err(EffectError::MissingAfter {
-                        step: store.payload.step,
+                        step: payload.step,
                         after: *predecessor,
                     });
                 }
             }
-        }
-        if self.uops.len() % 2 != 0 {
-            return Err(EffectError::EffectCycle);
         }
         Ok(())
     }
@@ -157,28 +155,15 @@ impl EffectSchedule {
     ) -> Result<EffectCommit, EffectError> {
         self.validate()?;
         if let Some(step) = fail_at
-            && self
-                .uops
-                .iter()
-                .any(|u| u.kind == EffectUOpKind::Store && u.payload.step == step)
+            && self.nodes.iter().any(|node| node.payload.step == step)
         {
             return Err(EffectError::TransactionFailed { step });
         }
         graph.execute()
     }
 }
-fn step_payload(step: &super::EffectStep) -> EffectPayload {
-    EffectPayload {
-        step: step.id,
-        target: step.write.clone(),
-        source: step.reads[1].clone(),
-        snapshot: step.reads[0].clone(),
-        target_view: step.target_view.clone(),
-        index_plan: step.index_plan.clone(),
-    }
-}
 fn schedule_key(schedule: &EffectSchedule) -> u64 {
     let mut h = DefaultHasher::new();
-    schedule.uops.hash(&mut h);
+    schedule.nodes.hash(&mut h);
     h.finish()
 }

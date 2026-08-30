@@ -99,7 +99,7 @@ pub use datasets::{
 pub use effects::{
     BufferState, EffectBatch, EffectBatchEntry, EffectBatchSource, EffectBatchStep, EffectCommit,
     EffectError, EffectGraph, EffectMutationPermit, EffectPayload, EffectPlan, EffectRuntime,
-    EffectSchedule, EffectStep, EffectUOp, EffectUOpKind, MutationSafety, PersistentRuntimeStats,
+    EffectSchedule, EffectScheduleNode, EffectStep, MutationSafety, PersistentRuntimeStats,
     PersistentSlotIdentity, PersistentSnapshot, RuntimeError, StateHandle,
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
