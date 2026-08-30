@@ -2401,6 +2401,16 @@ impl Graph {
     ) -> Result<NodeId> {
         let source = self.node(input)?;
         let axes = normalize_axes(input, source.shape.rank(), axes)?;
+        if matches!(kind, ReduceKind::Any | ReduceKind::All) && source.dtype != DType::Bool {
+            return Err(Error::InvalidElementwiseDType {
+                op: match kind {
+                    ReduceKind::Any => "any",
+                    ReduceKind::All => "all",
+                    _ => unreachable!(),
+                },
+                actual: source.dtype,
+            });
+        }
         let shape = reduction_shape(&source.shape, &axes, keepdim);
         if matches!(kind, ReduceKind::Max | ReduceKind::Min)
             && has_empty_reduction_domain(&source.shape, &shape, &axes)

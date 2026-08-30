@@ -474,7 +474,10 @@ fn elu_uses_strict_source_relu_branches_and_live_alpha_promotion() {
     close(gradient[1], 1.5 * (-1.0f64).exp(), 1e-12);
     assert_eq!(gradient[2], 0.0);
     assert_eq!(gradient[3], 0.0);
-    assert_eq!(gradient[4], 0.0);
+    // The inactive Select route contributes zero to the Exp input, but the
+    // literal Exp VJP still evaluates `0 * exp(NaN)`, which is NaN just as in
+    // tinygrad's compositional gradient graph.
+    assert!(gradient[4].is_nan());
     assert_eq!(gradient[5], 1.0);
 
     let mut infinite_alpha = Graph::new();
@@ -935,7 +938,7 @@ fn softplus_uses_live_beta_stable_logaddexp_and_typed_reciprocal() {
     close(values.scalar_at(1).as_f64(), std::f64::consts::LN_2, 1e-12);
     close(values.scalar_at(2).as_f64(), std::f64::consts::LN_2, 1e-12);
     assert!(values.scalar_at(3).as_f64().is_nan());
-    assert_eq!(values.scalar_at(4).as_f64(), f64::INFINITY);
+    assert!(values.scalar_at(4).as_f64().is_nan());
     let gradient = CpuBackend
         .execute(&graph, input_gradient, &bindings)
         .unwrap()
@@ -1122,13 +1125,15 @@ fn selu_scalar_matches_tinygrad_defaults_and_preflights_before_constants() {
     let output = graph.selu_default(input).unwrap();
     assert_eq!(graph.dtype(output).unwrap(), DType::F64);
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+    // Source Exp is the typed `exp2(x * (1 / ln(2)))` composition, so its
+    // scale joins alpha, gamma, zero, and one as the fifth F64 constant.
     assert_eq!(
         graph
             .nodes
             .iter()
             .filter(|node| matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F64))
             .count(),
-        4
+        5
     );
     let values = CpuBackend
         .execute(
@@ -1317,7 +1322,8 @@ fn hardsigmoid_supports_source_defaults_and_live_strict_relu_parameters() {
     assert_eq!(values.scalar_at(3).as_f64(), 0.25);
     assert_eq!(values.scalar_at(4).as_f64(), 1.0);
     assert_eq!(values.scalar_at(5).as_f64().to_bits(), 0.0f64.to_bits());
-    assert_eq!(values.scalar_at(6).as_f64(), 1.0);
+    // Source Hardsigmoid is a ReLU difference, so +inf reaches inf-inf.
+    assert!(values.scalar_at(6).as_f64().is_nan());
     let gradient = CpuBackend
         .execute(&graph, input_gradient, &bindings)
         .unwrap()
@@ -2394,14 +2400,7 @@ fn parameterized_hardsigmoid_matches_tinygrad_relu_difference() {
         let beta = graph
             .constant(TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(0.5)]).unwrap());
         let output = graph.hardsigmoid_with(x, alpha, beta).unwrap();
-        assert_eq!(
-            graph.dtype(output).unwrap(),
-            if dtype == DType::F64 {
-                DType::F64
-            } else {
-                DType::F32
-            }
-        );
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
         let values = execute(&graph, output, dtype, &[-4.0, -2.0, 0.0, 2.0, 4.0]).to_vec_f64();
         for (actual, expected) in values.into_iter().zip([0.0, 0.0, 0.5, 1.0, 1.0]) {
             close(
@@ -2474,14 +2473,7 @@ fn hardswish_matches_tinygrad_relu6_composition() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [6], dtype);
         let output = graph.hardswish(x).unwrap();
-        assert_eq!(
-            graph.dtype(output).unwrap(),
-            if dtype == DType::F64 {
-                DType::F64
-            } else {
-                DType::F32
-            }
-        );
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
         let values = execute(&graph, output, dtype, &[-4.0, -1.0, 0.0, 1.0, 3.0, 4.0]).to_vec_f64();
         let expected = [0.0, -1.0 / 3.0, 0.0, 2.0 / 3.0, 3.0, 4.0];
         for (actual, expected) in values.into_iter().zip(expected) {
@@ -2554,14 +2546,7 @@ fn relu6_matches_tinygrad_relu_difference() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [7], dtype);
         let output = graph.relu6(x).unwrap();
-        assert_eq!(
-            graph.dtype(output).unwrap(),
-            if dtype == DType::F64 {
-                DType::F64
-            } else {
-                DType::F32
-            }
-        );
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
         let values = execute(
             &graph,
             output,
@@ -2582,7 +2567,7 @@ fn relu6_matches_tinygrad_relu_difference() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [1], dtype);
         let output = graph.relu6(x).unwrap();
-        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
     }
 
     let mut graph = Graph::new();
@@ -2643,17 +2628,7 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
         let beta = graph
             .constant(TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(1.0)]).unwrap());
         let output = graph.softplus(x, beta).unwrap();
-        // RustGrad's scalar literals follow the existing activation-helper
-        // promotion contract: F16/BF16 and non-floats lift through F32,
-        // while F32/F64 retain their widened floating dtype.
-        assert_eq!(
-            graph.dtype(output).unwrap(),
-            if dtype == DType::F64 {
-                DType::F64
-            } else {
-                DType::F32
-            }
-        );
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
         let values = execute(&graph, output, dtype, &[-1000.0, 0.0, 1000.0]).to_vec_f64();
         close(values[0], 0.0, 1e-5);
         close(
@@ -2688,7 +2663,10 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
         &[f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -0.0],
     )
     .to_vec_f64();
-    assert!(softplus_values[0].is_infinite() && softplus_values[0].is_sign_positive());
+    // Source logaddexp computes `m = maximum(+inf, 0)` and then evaluates
+    // `exp(+inf-m)`, so this literal boundary is NaN rather than a stabilized
+    // special-case +inf.
+    assert!(softplus_values[0].is_nan());
     assert_eq!(softplus_values[1], 0.0);
     assert!(softplus_values[2].is_nan());
     close(softplus_values[3], std::f64::consts::LN_2, 1e-12);

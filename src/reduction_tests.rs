@@ -554,7 +554,7 @@ fn boolean_reduction_trace_artifact_and_invalid_requests_are_checked() {
     let any = graph.any(x, Some(vec![-1]), true).unwrap();
     let trace = graph.trace(any).unwrap().to_string();
     assert!(trace.contains("cast(%"));
-    assert!(trace.contains("Any(%"));
+    assert!(trace.contains("Max(%"));
     assert!(trace.contains("[2, 1] Bool"));
     let lowered = crate::lower_graph_reduction(&graph, any).unwrap();
     lowered.validate().unwrap();

@@ -442,9 +442,12 @@ impl Graph {
                             self.mul(upstream, sign)?
                         }
                         UnaryOp::Reciprocal => {
-                            let square = self.mul(node, node)?;
-                            let local = self.mul(upstream, square)?;
-                            self.neg(local)?
+                            // tinygrad's literal rule is `-ctx * ret * ret`.
+                            // Preserve that order as well as using the
+                            // reciprocal result rather than the source input.
+                            let local = self.neg(upstream)?;
+                            let local = self.mul(local, node)?;
+                            self.mul(local, node)?
                         }
                         UnaryOp::Square => {
                             let two = self.constant(TensorData::scalar(2.0f32));
@@ -1662,17 +1665,28 @@ mod tests {
         let loss = graph.sum_all(reciprocal).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
 
-        let Op::Unary {
-            op: UnaryOp::Neg,
-            input: local,
+        let Op::Binary {
+            op: BinaryOp::Mul,
+            lhs: local,
+            rhs: final_reciprocal,
         } = graph.op(gradient).unwrap()
         else {
-            panic!("reciprocal gradient must end in Neg");
+            panic!("reciprocal gradient must end in the second source Mul");
         };
+        assert_eq!(*final_reciprocal, reciprocal);
+        let Op::Binary {
+            op: BinaryOp::Mul,
+            lhs: negated_upstream,
+            rhs: first_reciprocal,
+        } = graph.op(*local).unwrap()
+        else {
+            panic!("reciprocal gradient must multiply by the result twice");
+        };
+        assert_eq!(*first_reciprocal, reciprocal);
         assert!(matches!(
-            graph.op(*local).unwrap(),
-            Op::Binary {
-                op: BinaryOp::Mul,
+            graph.op(*negated_upstream).unwrap(),
+            Op::Unary {
+                op: UnaryOp::Neg,
                 ..
             }
         ));
