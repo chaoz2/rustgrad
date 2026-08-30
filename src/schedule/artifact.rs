@@ -20,7 +20,7 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSA";
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 // The executable envelope supports ordered outputs; the inspection-only
 // multi-output envelope remains intentionally separate.
 /// Inspection-only scheduled-output envelope. This deliberately has a
@@ -66,7 +66,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         return Err(ArtifactError::Format("schedule magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 1 | 2 | 3 | 4 | VERSION) {
+    if !matches!(version, 1 | 2 | 3 | 4 | 5 | VERSION) {
         return Err(ArtifactError::Format("schedule version"));
     }
     let stored_identity = r.u64()?;
@@ -80,6 +80,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         2 => identity_v2(&capture)?,
         3 => identity_v3(&capture)?,
         4 => identity_v4(&capture)?,
+        5 => identity_v5(&capture)?,
         _ => identity(&capture)?,
     };
     if decoded_identity != stored_identity {
@@ -176,7 +177,25 @@ pub(crate) fn scheduled_outputs_identity(capture: &CapturedSchedule) -> Result<u
 }
 
 fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_base(w, c, true, true)?;
+    write_base(w, c, true, true, true)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    Ok(())
+}
+
+fn write_payload_v5(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_base(w, c, true, true, false)?;
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
         write_symbolic_schema(w, schema)?;
@@ -220,7 +239,7 @@ fn write_payload_v3(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
 }
 
 fn write_payload_v4(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_base(w, c, true, false)?;
+    write_base(w, c, true, false, false)?;
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
         write_symbolic_schema(w, schema)?;
@@ -238,7 +257,7 @@ fn write_payload_v4(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
 }
 
 fn write_payload_v1(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_base(w, c, false, false)
+    write_base(w, c, false, false, false)
 }
 
 fn write_base(
@@ -246,12 +265,13 @@ fn write_base(
     c: &CapturedSchedule,
     quantized_items: bool,
     output_lists: bool,
+    affine_views: bool,
 ) -> Result<(), ArtifactError> {
     write_len(w, c.items.len(), MAX_ITEMS)?;
     for item in &c.items {
         if quantized_items {
             if output_lists {
-                write_item(w, item)?;
+                write_item(w, item, affine_views)?;
             } else {
                 write_item_inner(w, item, false)?;
             }
@@ -266,7 +286,7 @@ fn write_base(
     for input in &c.inputs {
         w.string(&input.name)?;
         w.u64(input.node.index() as u64)?;
-        write_desc(w, &input.desc)?;
+        write_desc_inner(w, &input.desc, affine_views)?;
     }
     write_len(w, c.constants.len(), MAX_BINDINGS)?;
     for (id, value) in &c.constants {
@@ -288,7 +308,7 @@ fn write_scheduled_outputs_payload(
     for input in &c.inputs {
         w.string(&input.name)?;
         w.u64(input.node.index() as u64)?;
-        write_desc(w, &input.desc)?;
+        write_desc_inner(w, &input.desc, false)?;
     }
     write_len(w, c.constants.len(), MAX_BINDINGS)?;
     for (id, value) in &c.constants {
@@ -331,7 +351,7 @@ fn read_payload(
         inputs.push(ReplayInput {
             name: r.string()?,
             node: node(r.u64()?)?,
-            desc: read_desc(r)?,
+            desc: read_desc_inner(r, version >= 6)?,
         });
     }
     let n = r.count(MAX_BINDINGS)?;
@@ -396,7 +416,7 @@ fn read_scheduled_outputs_payload(
         inputs.push(ReplayInput {
             name: r.string()?,
             node: node(r.u64()?)?,
-            desc: read_desc(r)?,
+            desc: read_desc_inner(r, false)?,
         });
     }
     let n = r.count(MAX_BINDINGS)?;
@@ -508,19 +528,35 @@ fn identity_v4(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     }))
 }
 
-fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
+fn identity_v5(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
+    let mut writer = Writer::new();
+    write_payload_v5(&mut writer, capture)?;
+    if writer
+        .out
+        .len()
+        .checked_add(17)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
+    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    }))
+}
+
+fn write_item(w: &mut Writer, x: &ScheduleItem, affine_views: bool) -> Result<(), ArtifactError> {
     w.u64(x.id)?;
     w.u64(x.node.index() as u64)?;
     write_u64s(w, &x.dependencies)?;
     write_u64s(w, &x.consumers)?;
     write_len(w, x.inputs.len(), MAX_BINDINGS)?;
     for desc in &x.inputs {
-        write_desc(w, desc)?;
+        write_desc_inner(w, desc, affine_views)?;
     }
     write_len(w, x.input_bindings.len(), MAX_BINDINGS)?;
     for binding in &x.input_bindings {
         w.u64(binding.input_node.index() as u64)?;
-        write_desc(w, &binding.desc)?;
+        write_desc_inner(w, &binding.desc, affine_views)?;
         w.usize(binding.abi_index)?;
     }
     write_len(w, x.quantized_input_bindings.len(), MAX_BINDINGS)?;
@@ -535,7 +571,7 @@ fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     }
     write_len(w, x.outputs.len(), MAX_BINDINGS)?;
     for output in x.outputs.iter() {
-        write_desc(w, output)?;
+        write_desc_inner(w, output, affine_views)?;
     }
     let kernel = encode_uop(&x.kernel)?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
@@ -551,12 +587,12 @@ fn write_scheduled_outputs_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
     write_u64s(w, &x.consumers)?;
     write_len(w, x.inputs.len(), MAX_BINDINGS)?;
     for desc in &x.inputs {
-        write_desc(w, desc)?;
+        write_desc_inner(w, desc, false)?;
     }
     write_len(w, x.input_bindings.len(), MAX_BINDINGS)?;
     for binding in &x.input_bindings {
         w.u64(binding.input_node.index() as u64)?;
-        write_desc(w, &binding.desc)?;
+        write_desc_inner(w, &binding.desc, false)?;
         w.usize(binding.abi_index)?;
     }
     write_len(w, x.quantized_input_bindings.len(), MAX_BINDINGS)?;
@@ -571,10 +607,10 @@ fn write_scheduled_outputs_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
     }
     // Keep the legacy primary descriptor explicit in the new envelope so a
     // decoder can reject a list whose projection was tampered independently.
-    write_desc(w, &x.output)?;
+    write_desc_inner(w, &x.output, false)?;
     write_len(w, x.outputs.len(), MAX_BINDINGS)?;
     for output in x.outputs.iter() {
-        write_desc(w, output)?;
+        write_desc_inner(w, output, false)?;
     }
     let kernel = encode_uop(&x.kernel)?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
@@ -636,19 +672,19 @@ fn write_item_v3(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> 
     write_u64s(w, &x.consumers)?;
     write_len(w, x.inputs.len(), MAX_BINDINGS)?;
     for desc in &x.inputs {
-        write_desc(w, desc)?;
+        write_desc_inner(w, desc, false)?;
     }
     write_len(w, x.input_bindings.len(), MAX_BINDINGS)?;
     for binding in &x.input_bindings {
         w.u64(binding.input_node.index() as u64)?;
-        write_desc(w, &binding.desc)?;
+        write_desc_inner(w, &binding.desc, false)?;
         w.usize(binding.abi_index)?;
     }
     write_len(w, x.external_materializations.len(), MAX_BINDINGS)?;
     for id in &x.external_materializations {
         w.u64(id.index() as u64)?;
     }
-    write_desc(w, &x.output)?;
+    write_desc_inner(w, &x.output, false)?;
     let kernel = encode_uop(&x.kernel)?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
@@ -668,14 +704,14 @@ fn read_scheduled_outputs_item(r: &mut Reader<'_>) -> Result<ScheduleItem, Artif
     let n = r.count(MAX_BINDINGS)?;
     let mut inputs = Vec::with_capacity(n);
     for _ in 0..n {
-        inputs.push(read_desc(r)?);
+        inputs.push(read_desc_inner(r, false)?);
     }
     let n = r.count(MAX_BINDINGS)?;
     let mut input_bindings = Vec::with_capacity(n);
     for _ in 0..n {
         input_bindings.push(ScheduleInputBinding {
             input_node: node(r.u64()?)?,
-            desc: read_desc(r)?,
+            desc: read_desc_inner(r, false)?,
             abi_index: r.usize()?,
         });
     }
@@ -693,11 +729,11 @@ fn read_scheduled_outputs_item(r: &mut Reader<'_>) -> Result<ScheduleItem, Artif
     for _ in 0..n {
         external_materializations.push(node(r.u64()?)?);
     }
-    let output = read_desc(r)?;
+    let output = read_desc_inner(r, false)?;
     let n = r.count(MAX_BINDINGS)?;
     let mut output_descs = Vec::with_capacity(n);
     for _ in 0..n {
-        output_descs.push(read_desc(r)?);
+        output_descs.push(read_desc_inner(r, false)?);
     }
     let outputs = ScheduledOutputs::new(output_descs)
         .map_err(|_| ArtifactError::Format("scheduled outputs"))?;
@@ -734,6 +770,7 @@ fn read_item_inner(
     version: u8,
     effects: bool,
 ) -> Result<ScheduleItem, ArtifactError> {
+    let affine_views = effects || version >= 6;
     let id = r.u64()?;
     let item_node = node(r.u64()?)?;
     let dependencies = read_u64s(r)?;
@@ -741,14 +778,14 @@ fn read_item_inner(
     let n = r.count(MAX_BINDINGS)?;
     let mut inputs = Vec::with_capacity(n);
     for _ in 0..n {
-        inputs.push(read_desc_inner(r, effects)?);
+        inputs.push(read_desc_inner(r, affine_views)?);
     }
     let n = r.count(MAX_BINDINGS)?;
     let mut input_bindings = Vec::with_capacity(n);
     for _ in 0..n {
         input_bindings.push(ScheduleInputBinding {
             input_node: node(r.u64()?)?,
-            desc: read_desc_inner(r, effects)?,
+            desc: read_desc_inner(r, affine_views)?,
             abi_index: r.usize()?,
         });
     }
@@ -773,11 +810,11 @@ fn read_item_inner(
         let n = r.count(MAX_BINDINGS)?;
         let mut outputs = Vec::with_capacity(n);
         for _ in 0..n {
-            outputs.push(read_desc_inner(r, effects)?);
+            outputs.push(read_desc_inner(r, affine_views)?);
         }
         ScheduledOutputs::new(outputs).map_err(|_| ArtifactError::Format("scheduled outputs"))?
     } else {
-        ScheduledOutputs::single(read_desc_inner(r, effects)?)
+        ScheduledOutputs::single(read_desc_inner(r, affine_views)?)
     };
     let output = outputs.primary().clone();
     let kernel_len = r.count(MAX_ARTIFACT_BYTES)?;
@@ -801,15 +838,15 @@ fn read_item_inner(
     })
 }
 
-fn write_desc(w: &mut Writer, x: &BufferDesc) -> Result<(), ArtifactError> {
-    write_desc_inner(w, x, false)
-}
-
 pub(crate) fn write_effect_desc(w: &mut Writer, x: &BufferDesc) -> Result<(), ArtifactError> {
     write_desc_inner(w, x, true)
 }
 
-fn write_desc_inner(w: &mut Writer, x: &BufferDesc, effects: bool) -> Result<(), ArtifactError> {
+fn write_desc_inner(
+    w: &mut Writer,
+    x: &BufferDesc,
+    affine_views: bool,
+) -> Result<(), ArtifactError> {
     validate_desc(x)?;
     w.u64(x.id)?;
     write_shape(w, &x.shape)?;
@@ -819,7 +856,7 @@ fn write_desc_inner(w: &mut Writer, x: &BufferDesc, effects: bool) -> Result<(),
     w.bool(x.read_only)?;
     w.bool(x.view.is_some())?;
     if let Some(view) = &x.view {
-        if effects {
+        if affine_views {
             write_affine_view(w, view)?;
         } else {
             write_view(
@@ -830,15 +867,11 @@ fn write_desc_inner(w: &mut Writer, x: &BufferDesc, effects: bool) -> Result<(),
     }
     Ok(())
 }
-fn read_desc(r: &mut Reader<'_>) -> Result<BufferDesc, ArtifactError> {
-    read_desc_inner(r, false)
-}
-
 pub(crate) fn read_effect_desc(r: &mut Reader<'_>) -> Result<BufferDesc, ArtifactError> {
     read_desc_inner(r, true)
 }
 
-fn read_desc_inner(r: &mut Reader<'_>, effects: bool) -> Result<BufferDesc, ArtifactError> {
+fn read_desc_inner(r: &mut Reader<'_>, affine_views: bool) -> Result<BufferDesc, ArtifactError> {
     let x = BufferDesc {
         id: r.u64()?,
         shape: read_shape(r)?,
@@ -847,7 +880,7 @@ fn read_desc_inner(r: &mut Reader<'_>, effects: bool) -> Result<BufferDesc, Arti
         alignment: r.usize()?,
         read_only: r.bool()?,
         view: if r.bool()? {
-            Some(if effects {
+            Some(if affine_views {
                 read_affine_view(r)?
             } else {
                 read_view(r)?.into()
@@ -1627,7 +1660,7 @@ fn node(x: u64) -> Result<NodeId, ArtifactError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DType, Graph, Scalar, Shape, TensorData};
+    use crate::{DType, Graph, Scalar, Shape, Slice, TensorData};
 
     fn unchecked(capture: &CapturedSchedule) -> Vec<u8> {
         let mut w = Writer::new();
@@ -1668,6 +1701,17 @@ mod tests {
         writer.u8(2).unwrap();
         writer.u64(identity_v2(capture).unwrap()).unwrap();
         write_payload_v2(&mut writer, capture).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
+    fn legacy_v5(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(5).unwrap();
+        writer.u64(identity_v5(capture).unwrap()).unwrap();
+        write_payload_v5(&mut writer, capture).unwrap();
         let sum = checksum(&writer.out);
         writer.u32(sum).unwrap();
         writer.out
@@ -1750,10 +1794,50 @@ mod tests {
         assert_eq!(encode(&upgraded).unwrap()[4], VERSION);
         let upgraded_v2 = decode(&legacy_v2(&capture)).unwrap();
         assert_eq!(encode(&upgraded_v2).unwrap()[4], VERSION);
+        let upgraded_v5 = decode(&legacy_v5(&capture)).unwrap();
+        assert_eq!(encode(&upgraded_v5).unwrap()[4], VERSION);
     }
 
     #[test]
-    fn v5_round_trips_ordered_outputs_but_replay_fails_closed() {
+    fn signed_affine_views_round_trip_in_executable_artifacts() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::I64);
+        let output = graph
+            .stride(
+                input,
+                [
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 2,
+                    },
+                ],
+            )
+            .unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let capture = CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        let bytes = encode(&capture).unwrap();
+        assert_eq!(bytes[4], VERSION);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(encode(&decoded).unwrap(), bytes);
+        let view = decoded.items[0]
+            .inputs
+            .iter()
+            .find_map(|input| input.view.as_ref())
+            .expect("stride input binding retains its affine view");
+        assert_eq!(view.logical_shape.dims(), &[2, 2]);
+        assert_eq!(view.strides, vec![-3, 2]);
+        assert_eq!(view.offset, 3);
+        assert!(validate_for_replay(&decoded).is_ok());
+    }
+
+    #[test]
+    fn ordered_outputs_round_trip_but_replay_fails_closed() {
         let mut capture = fixture();
         let item = &mut capture.items[0];
         let primary = item.primary_output().clone();
@@ -1789,7 +1873,7 @@ mod tests {
         let mut descriptor = encode(&capture).unwrap();
         let body = descriptor.len() - 4;
         let mut output = Writer::new();
-        write_desc(&mut output, &capture.items[0].output).unwrap();
+        write_desc_inner(&mut output, &capture.items[0].output, true).unwrap();
         let output_start = descriptor[..body]
             .windows(output.out.len())
             .rposition(|window| window == output.out)

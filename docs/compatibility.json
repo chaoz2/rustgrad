@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:e5accf43dac19723",
+  "source_fingerprint": "fnv1a64:31ea50682f20c633",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -495,7 +495,7 @@
       "subject": "JIT capture, specialization, cache and symbolic replay",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CapturedSchedule` serializes concrete schedules or guarded static-rank symbolic families, then replays through explicit interpreter/native/fallback policy without Graph traversal. Complete named bindings specialize checked UOp/schedule descriptors; canonical values key concrete specialization and process-local native compilation caches. Eligible specialized F32 matrix schedules deterministically retile and serialize the selection for PTX consumers; CPU native replay remains serial-K. Captured generalized raw F32/F64 Matmul retains renderer-v16 source identity and the per-step F32/F64 contraction boundary. Captured static-axis raw `ReduceFinalize` initializes extrema from their first lane and preserves leading-NaN/signed-zero first-tie payload ownership with exact Bool/signed/unsigned comparisons rather than a lossy f64 projection. Symbolic batch preflight validates and compiles every invocation before execution. Elementwise broadcast, static-axis reduction, generalized F32/F64 matmul, source-backed affine movement chains, and exact-splat constant resizing are differential-tested for multiple legal bindings and zero extents. Dynamic rank/cardinality, arbitrary storage resizing, mutation aliases, serialized compiled code, live device resources, and CUDA graph integration remain absent."
+        "Acceptance requirement": "`CapturedSchedule` serializes concrete schedules or guarded static-rank symbolic families, then replays through explicit interpreter/native/fallback policy without Graph traversal. Executable RGSA v6 retains signed `AffineView` input descriptors for negative-stride replay and deterministically upgrades v1--v5 artifacts without weakening descriptor validation. Complete named bindings specialize checked UOp/schedule descriptors; canonical values key concrete specialization and process-local native compilation caches. Eligible specialized F32 matrix schedules deterministically retile and serialize the selection for PTX consumers; CPU native replay remains serial-K. Captured generalized raw F32/F64 Matmul retains renderer-v16 source identity and the per-step F32/F64 contraction boundary. Captured static-axis raw `ReduceFinalize` initializes extrema from their first lane and preserves leading-NaN/signed-zero first-tie payload ownership with exact Bool/signed/unsigned comparisons rather than a lossy f64 projection. Symbolic batch preflight validates and compiles every invocation before execution. Elementwise broadcast, static-axis reduction, generalized F32/F64 matmul, source-backed affine movement chains, and exact-splat constant resizing are differential-tested for multiple legal bindings and zero extents. Dynamic rank/cardinality, arbitrary storage resizing, mutation aliases, serialized compiled code, live device resources, and CUDA graph integration remain absent."
       }
     },
     {
