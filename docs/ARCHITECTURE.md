@@ -1105,12 +1105,12 @@ recreate an invalid combination. `LinearPayload` likewise stores one typed
 matches `Operation` directly; only the private artifact codec translates it to
 stable wire tags.
 
-The generated metadata does not replace semantic boundaries. Detailed type/control
+The direct enum does not replace semantic boundaries. Detailed type/control
 validation, portable interpretation, schedule lowering, artifact tag codecs,
 and CPU/PTX/OpenCL/Metal/WebGPU rendering remain local exhaustive matches because
 their accepted subsets and failure behavior intentionally differ. The same
-rule applies to future refactors: shared taxonomy policy moves into the typed
-enum, while evaluation, wire ABI, and backend capability decisions stay
+rule applies to future refactors: operations and their payloads stay in the one
+typed enum, while evaluation, wire ABI, and backend capability decisions stay
 visible and fail closed. Remaining high-value follow-ups are ordered as:
 
 1. reconcile repeated scalar/linear/vector presentation mapping where a
@@ -1124,11 +1124,11 @@ The current exhaustive-switch inventory is intentional and reviewable:
 | Hotspot | Responsibility | Disposition |
 | --- | --- | --- |
 | `uop::validate_one` | dtype, indexing, control pairing, and payload semantics | canonical semantic boundary; keep exhaustive |
-| `uop::artifact` structural validation | typed operation, source-shape, and wire admission | consume generated operation metadata plus explicit wire validation |
-| `uop::artifact` kind codec | stable numeric tags and version gates | canonical wire boundary; keep exhaustive |
+| `uop::artifact` structural validation | typed operation, source-shape, and wire admission | validate `Operation` payloads and sources before explicit wire encoding |
+| `uop::artifact` private opcode codec | stable numeric tags and version gates | canonical wire boundary; keep exhaustive and private |
 | `kernel` evaluators | portable operation semantics | canonical interpreter boundary; keep exhaustive |
 | `schedule` lowering | materialization, dependencies, and fusion roots | canonical planning boundary; keep exhaustive |
-| `viz` | operation-specific names and retained payload fields | consume shared family; keep presentation metadata local |
+| `viz` | operation-specific names and retained payload fields | match `Operation` directly; keep presentation metadata local |
 | CPU/PTX/device renderers | backend capability and source emission | canonical backend boundaries; keep exhaustive and fail closed |
 | linear/vector instruction mapping | scalar versus vector instruction families | highest-priority follow-up after proving a shared typed contract |
 
