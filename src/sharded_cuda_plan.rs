@@ -9,8 +9,9 @@ use crate::collective::{
 };
 use crate::sharded_cuda_execute::{BufferSubstitution, ShardedCudaPlanComposition};
 use crate::{
-    Capability, CollectiveBoundaryLifecycle, DType, Error, Graph, PrimaryContext, PtxRenderer,
-    RenderedPtx, Shape, ShardedGraphTensor, schedule, schedule_with_external_materializations,
+    Capability, CollectiveBoundaryLifecycle, DType, Error, Graph, NodeId, Op, PrimaryContext,
+    PtxRenderer, RenderedPtx, Shape, ShardedGraphTensor, UnaryOp, schedule,
+    schedule_with_external_materializations,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +22,52 @@ pub struct CudaPlanBinding {
     pub device: SemanticDeviceId,
     pub context: PrimaryContext,
     pub capability: Capability,
+}
+
+/// Closed graph operation identity retained only by the graph-aware unary
+/// downstream companion. The released v5 envelope remains unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphBackedDownstreamUnary {
+    Neg,
+    Abs,
+    NegF64,
+    AbsF64,
+}
+
+impl GraphBackedDownstreamUnary {
+    pub(crate) fn op(self) -> UnaryOp {
+        match self {
+            Self::Neg => UnaryOp::Neg,
+            Self::Abs => UnaryOp::Abs,
+            Self::NegF64 => UnaryOp::Neg,
+            Self::AbsF64 => UnaryOp::Abs,
+        }
+    }
+
+    fn dtype(self) -> DType {
+        match self {
+            Self::Neg | Self::Abs => DType::F32,
+            Self::NegF64 | Self::AbsF64 => DType::F64,
+        }
+    }
+
+    fn cache_prefix(self) -> &'static str {
+        match self {
+            Self::Neg => "graph-backed-unary-neg:",
+            Self::Abs => "graph-backed-unary-abs:",
+            Self::NegF64 => "graph-backed-unary-f64-neg:",
+            Self::AbsF64 => "graph-backed-unary-f64-abs:",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Neg => "Neg",
+            Self::Abs => "Abs",
+            Self::NegF64 => "F64 Neg",
+            Self::AbsF64 => "F64 Abs",
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CudaPlanDiagnostic {
@@ -244,6 +291,95 @@ pub struct CollectiveDownstreamOutputCommitRecord {
     pub destination_buffer: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveGraphResultBinding {
+    pub replicated_result: usize,
+    pub rank: usize,
+    pub candidate_buffer: u64,
+    pub local_input_buffer: u64,
+    pub device: SemanticDeviceId,
+    pub owner_identity: usize,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+    pub first_consumer_stage: usize,
+    pub lifetime_end_stage: usize,
+}
+
+impl CollectiveGraphResultBinding {
+    /// Pure per-rank validation used by the graph-unary envelope.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.candidate_buffer == self.local_input_buffer
+            || self.bytes
+                != self
+                    .shape
+                    .numel()?
+                    .checked_mul(self.dtype.itemsize())
+                    .ok_or_else(|| err("graph result binding byte overflow"))?
+            || self.first_consumer_stage > self.lifetime_end_stage
+        {
+            return Err(err("collective graph result binding is inconsistent"));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_key(&self) -> (usize, usize, u64, u64) {
+        (
+            self.replicated_result,
+            self.rank,
+            self.candidate_buffer,
+            self.local_input_buffer,
+        )
+    }
+}
+
+/// Graph-unary local ABI identity. This record names the distinct graph-schedule
+/// input key that the executor substitutes with the collective candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveDownstreamConsumerAbi {
+    pub replicated_result: usize,
+    pub rank: usize,
+    pub candidate_buffer: u64,
+    pub local_input_buffer: u64,
+    pub output_candidate_buffer: u64,
+    pub device: SemanticDeviceId,
+    pub owner_identity: usize,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+    pub consumer_stage: usize,
+    pub lifetime_end_stage: usize,
+}
+
+impl CollectiveDownstreamConsumerAbi {
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.candidate_buffer == self.local_input_buffer
+            || self.output_candidate_buffer == self.candidate_buffer
+            || self.output_candidate_buffer == self.local_input_buffer
+            || self.consumer_stage > self.lifetime_end_stage
+            || self.bytes
+                != self
+                    .shape
+                    .numel()?
+                    .checked_mul(self.dtype.itemsize())
+                    .ok_or_else(|| err("v5 consumer ABI byte overflow"))?
+        {
+            return Err(err("v5 downstream consumer ABI is inconsistent"));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_key(&self) -> (usize, usize, u64, u64, u64) {
+        (
+            self.replicated_result,
+            self.rank,
+            self.candidate_buffer,
+            self.local_input_buffer,
+            self.output_candidate_buffer,
+        )
+    }
+}
+
 /// Version-five envelope.  It is the first format that can describe owned
 /// downstream output candidates and their ordered final commits; older
 /// envelopes deliberately reject these keys rather than infer defaults.
@@ -266,6 +402,69 @@ type DownstreamOutputArtifactParts = (
     Vec<CollectiveDownstreamOutputDescriptor>,
     Vec<CollectiveDownstreamOutputCommitRecord>,
 );
+
+/// Version-one envelope for the closed graph-backed downstream unary route.
+/// It is deliberately distinct from the released v5 logical-output envelope:
+/// graph schedule bindings cannot be inferred by an older decoder.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveGraphUnaryOutputArtifact {
+    pub format_version: u32,
+    pub fingerprint: String,
+    pub plan: ShardedCudaPlan,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+    pub materializations: Vec<CollectiveLifecycleMaterialization>,
+    pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
+    pub consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
+    pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
+    pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
+}
+
+type GraphUnaryOutputArtifactParts = (
+    ShardedCudaPlan,
+    Vec<CollectiveCandidateDescriptor>,
+    Vec<CollectiveCommitRecord>,
+    Vec<CollectiveLifecycleMaterialization>,
+    Vec<CollectiveGraphResultBinding>,
+    Vec<CollectiveDownstreamConsumerAbi>,
+    Vec<CollectiveDownstreamOutputDescriptor>,
+    Vec<CollectiveDownstreamOutputCommitRecord>,
+);
+
+pub struct CollectiveGraphUnaryOutputComponents {
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+    pub materializations: Vec<CollectiveLifecycleMaterialization>,
+    pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
+    pub consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
+    pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
+    pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
+}
+
+#[derive(Clone, Copy)]
+struct DownstreamOutputArtifactComponentRefs<'a> {
+    candidates: &'a [CollectiveCandidateDescriptor],
+    commits: &'a [CollectiveCommitRecord],
+    materializations: &'a [CollectiveLifecycleMaterialization],
+    graph_result_bindings: &'a [CollectiveGraphResultBinding],
+    consumer_abis: &'a [CollectiveDownstreamConsumerAbi],
+    outputs: &'a [CollectiveDownstreamOutputDescriptor],
+    output_commits: &'a [CollectiveDownstreamOutputCommitRecord],
+}
+
+impl CollectiveGraphUnaryOutputComponents {
+    fn refs(&self) -> DownstreamOutputArtifactComponentRefs<'_> {
+        DownstreamOutputArtifactComponentRefs {
+            candidates: &self.candidates,
+            commits: &self.commits,
+            materializations: &self.materializations,
+            graph_result_bindings: &self.graph_result_bindings,
+            consumer_abis: &self.consumer_abis,
+            outputs: &self.outputs,
+            output_commits: &self.output_commits,
+        }
+    }
+}
 
 impl CollectiveDownstreamOutputArtifact {
     pub const FORMAT_VERSION: u32 = 5;
@@ -372,6 +571,90 @@ impl CollectiveDownstreamOutputArtifact {
             envelope.candidates,
             envelope.commits,
             envelope.materializations,
+            envelope.outputs,
+            envelope.output_commits,
+        ))
+    }
+}
+
+impl CollectiveGraphUnaryOutputArtifact {
+    pub const FORMAT_VERSION: u32 = 1;
+
+    pub fn encode(
+        plan: &ShardedCudaPlan,
+        components: CollectiveGraphUnaryOutputComponents,
+    ) -> Result<Vec<u8>, Error> {
+        let refs = components.refs();
+        validate_graph_unary_output_plan(plan, &refs)?;
+        let fingerprint = graph_unary_output_fingerprint(plan, &refs)?;
+        serde_json::to_vec(&Self {
+            format_version: Self::FORMAT_VERSION,
+            fingerprint,
+            plan: plan.clone(),
+            candidates: components.candidates,
+            commits: components.commits,
+            materializations: components.materializations,
+            graph_result_bindings: components.graph_result_bindings,
+            consumer_abis: components.consumer_abis,
+            outputs: components.outputs,
+            output_commits: components.output_commits,
+        })
+        .map_err(|error| err(format!("sharded CUDA graph unary artifact encode: {error}")))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<GraphUnaryOutputArtifactParts, Error> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| err(format!("sharded CUDA graph unary artifact JSON: {error}")))?;
+        reject_unknown_envelope_fields(
+            &value,
+            &[
+                "format_version",
+                "fingerprint",
+                "plan",
+                "candidates",
+                "commits",
+                "materializations",
+                "graph_result_bindings",
+                "consumer_abis",
+                "outputs",
+                "output_commits",
+            ],
+        )?;
+        reject_unknown_plan_fields(
+            value
+                .get("plan")
+                .ok_or_else(|| err("graph unary artifact plan is absent"))?,
+        )?;
+        let envelope: Self = serde_json::from_value(value).map_err(|error| {
+            err(format!(
+                "sharded CUDA graph unary artifact envelope: {error}"
+            ))
+        })?;
+        if envelope.format_version != Self::FORMAT_VERSION {
+            return Err(err("unsupported sharded CUDA graph unary artifact version"));
+        }
+        let refs = DownstreamOutputArtifactComponentRefs {
+            candidates: &envelope.candidates,
+            commits: &envelope.commits,
+            materializations: &envelope.materializations,
+            graph_result_bindings: &envelope.graph_result_bindings,
+            consumer_abis: &envelope.consumer_abis,
+            outputs: &envelope.outputs,
+            output_commits: &envelope.output_commits,
+        };
+        validate_graph_unary_output_plan(&envelope.plan, &refs)?;
+        if envelope.fingerprint != graph_unary_output_fingerprint(&envelope.plan, &refs)? {
+            return Err(err(
+                "sharded CUDA graph unary artifact fingerprint mismatch",
+            ));
+        }
+        Ok((
+            envelope.plan,
+            envelope.candidates,
+            envelope.commits,
+            envelope.materializations,
+            envelope.graph_result_bindings,
+            envelope.consumer_abis,
             envelope.outputs,
             envelope.output_commits,
         ))
@@ -778,7 +1061,9 @@ fn contains_materialization_metadata(value: &serde_json::Value) -> bool {
 fn contains_downstream_output_metadata(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
-            key == "outputs"
+            key == "graph_result_bindings"
+                || key == "consumer_abis"
+                || key == "outputs"
                 || key == "output_commits"
                 || contains_downstream_output_metadata(value)
         }),
@@ -847,6 +1132,7 @@ fn validate_transaction_plan(
         return Err(err("transaction artifact requires candidates and commits"));
     }
     let mut candidate_keys = BTreeSet::new();
+    let mut candidate_sources = BTreeSet::new();
     for candidate in candidates {
         let Some(CudaPlanStage::Collective { buffers, .. }) = plan.stages.get(candidate.stage)
         else {
@@ -864,6 +1150,7 @@ fn validate_transaction_plan(
                     .checked_mul(candidate.dtype.itemsize())
                     .ok_or_else(|| err("candidate byte overflow"))?
             || !candidate_keys.insert((candidate.rank, candidate.candidate_buffer))
+            || !candidate_sources.insert((candidate.stage, candidate.rank, candidate.source_buffer))
         {
             return Err(err("candidate descriptor is duplicate or inconsistent"));
         }
@@ -966,6 +1253,43 @@ fn downstream_output_fingerprint(
     Ok(format!("fnv1a64:{hash:016x}"))
 }
 
+fn graph_unary_output_fingerprint(
+    plan: &ShardedCudaPlan,
+    components: &DownstreamOutputArtifactComponentRefs<'_>,
+) -> Result<String, Error> {
+    let DownstreamOutputArtifactComponentRefs {
+        candidates,
+        commits,
+        materializations,
+        graph_result_bindings,
+        consumer_abis,
+        outputs,
+        output_commits,
+    } = *components;
+    let canonical = serde_json::to_vec(&(
+        CollectiveGraphUnaryOutputArtifact::FORMAT_VERSION,
+        plan,
+        candidates,
+        commits,
+        materializations,
+        graph_result_bindings,
+        consumer_abis,
+        outputs,
+        output_commits,
+    ))
+    .map_err(|error| {
+        err(format!(
+            "sharded CUDA graph unary output canonicalize: {error}"
+        ))
+    })?;
+    let hash = canonical
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+        });
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
 fn validate_materialization_plan(
     plan: &ShardedCudaPlan,
     candidates: &[CollectiveCandidateDescriptor],
@@ -1035,6 +1359,16 @@ fn validate_lifecycle_materialization_plan(
     commits: &[CollectiveCommitRecord],
     materializations: &[CollectiveLifecycleMaterialization],
 ) -> Result<(), Error> {
+    validate_lifecycle_materialization_components(plan, candidates, commits, materializations, true)
+}
+
+fn validate_lifecycle_materialization_components(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+    materializations: &[CollectiveLifecycleMaterialization],
+    require_shared_boundary_lifetime: bool,
+) -> Result<(), Error> {
     validate_transaction_plan(plan, candidates, commits)?;
     if !plan.materializations.is_empty() {
         return Err(err(
@@ -1102,10 +1436,12 @@ fn validate_lifecycle_materialization_plan(
                     return Err(err("downstream v4 materialization lifecycle is invalid"));
                 }
                 let consumer = &record.consumers[0];
-                if let Some((first, last)) = downstream_boundaries.insert(
-                    binding.boundary_key.as_str(),
-                    (*first_consumer_stage, *lifetime_end_stage),
-                ) && (first != *first_consumer_stage || last != *lifetime_end_stage)
+                if require_shared_boundary_lifetime
+                    && let Some((first, last)) = downstream_boundaries.insert(
+                        binding.boundary_key.as_str(),
+                        (*first_consumer_stage, *lifetime_end_stage),
+                    )
+                    && (first != *first_consumer_stage || last != *lifetime_end_stage)
                 {
                     return Err(err(
                         "downstream v4 boundary has inconsistent rank-local lifetime",
@@ -1258,6 +1594,290 @@ fn validate_downstream_output_plan(
     }
     Ok(())
 }
+
+fn validate_graph_unary_output_plan(
+    plan: &ShardedCudaPlan,
+    components: &DownstreamOutputArtifactComponentRefs<'_>,
+) -> Result<(), Error> {
+    let DownstreamOutputArtifactComponentRefs {
+        candidates,
+        commits,
+        materializations,
+        graph_result_bindings,
+        consumer_abis,
+        outputs,
+        output_commits,
+    } = *components;
+    let lifecycle_plan = downstream_output_lifecycle_projection(plan, graph_result_bindings)?;
+    validate_lifecycle_materialization_components(
+        &lifecycle_plan,
+        candidates,
+        commits,
+        materializations,
+        false,
+    )?;
+    if graph_result_bindings.len() != materializations.len() {
+        return Err(err("v5 graph result binding coverage is incomplete"));
+    }
+    let mut graph_keys = BTreeSet::new();
+    for binding in graph_result_bindings {
+        binding.validate()?;
+        let materialization = materializations
+            .iter()
+            .find(|record| {
+                record.materialization.rank == binding.rank
+                    && record.materialization.candidate_buffer == binding.candidate_buffer
+            })
+            .ok_or_else(|| err("v5 graph result binding candidate linkage is absent"))?;
+        if binding.replicated_result != materialization.materialization.replicated_result
+            || binding.device != materialization.materialization.device
+            || binding.owner_identity != materialization.materialization.owner_identity
+            || binding.dtype != materialization.materialization.dtype
+            || binding.shape != materialization.materialization.shape
+            || binding.bytes != materialization.materialization.bytes
+            || binding.first_consumer_stage != materialization.materialization.first_consumer
+            || binding.lifetime_end_stage != materialization.materialization.last_consumer
+            || !graph_keys.insert(binding.canonical_key())
+        {
+            return Err(err("v5 graph result binding is duplicate or inconsistent"));
+        }
+    }
+    let expected_graph_keys = materializations
+        .iter()
+        .map(|record| {
+            (
+                record.materialization.replicated_result,
+                record.materialization.rank,
+                record.materialization.candidate_buffer,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let actual_graph_keys = graph_result_bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.replicated_result,
+                binding.rank,
+                binding.candidate_buffer,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if actual_graph_keys != expected_graph_keys {
+        return Err(err("v5 graph result binding rank coverage is incomplete"));
+    }
+    if consumer_abis.len() != materializations.len() {
+        return Err(err("v5 downstream consumer ABI coverage is incomplete"));
+    }
+    let mut consumer_keys = BTreeSet::new();
+    let mut local_inputs = BTreeSet::new();
+    let mut output_candidates = BTreeSet::new();
+    let mut previous_consumer_key = None;
+    for abi in consumer_abis {
+        abi.validate()?;
+        let key = abi.canonical_key();
+        if let Some(previous) = previous_consumer_key
+            && previous >= key
+        {
+            return Err(err("v5 downstream consumer ABI ordering is not canonical"));
+        }
+        previous_consumer_key = Some(key);
+        let binding = graph_result_bindings
+            .iter()
+            .find(|binding| {
+                binding.rank == abi.rank && binding.candidate_buffer == abi.candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream consumer ABI graph binding is absent"))?;
+        let materialization = materializations
+            .iter()
+            .find(|record| {
+                record.materialization.rank == abi.rank
+                    && record.materialization.candidate_buffer == abi.candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream consumer ABI materialization is absent"))?;
+        let output = outputs
+            .iter()
+            .find(|output| {
+                output.rank == abi.rank && output.source_candidate_buffer == abi.candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream consumer ABI output linkage is absent"))?;
+        if abi.replicated_result != binding.replicated_result
+            || abi.local_input_buffer != binding.local_input_buffer
+            || abi.consumer_stage != binding.first_consumer_stage
+            || abi.lifetime_end_stage != binding.lifetime_end_stage
+            || abi.replicated_result != materialization.materialization.replicated_result
+            || abi.device != materialization.materialization.device
+            || abi.owner_identity != materialization.materialization.owner_identity
+            || abi.dtype != materialization.materialization.dtype
+            || abi.shape != materialization.materialization.shape
+            || abi.bytes != materialization.materialization.bytes
+            || abi.consumer_stage != materialization.materialization.first_consumer
+            || abi.lifetime_end_stage != materialization.materialization.last_consumer
+            || abi.output_candidate_buffer != output.output_candidate_buffer
+            || abi.consumer_stage != output.consumer_stage
+            || abi.lifetime_end_stage != output.last_stage
+            || abi.device != output.device
+            || abi.owner_identity != output.owner_identity
+            || abi.dtype != output.dtype
+            || abi.shape != output.shape
+            || abi.bytes != output.bytes
+            || !consumer_keys.insert((abi.replicated_result, abi.rank, abi.candidate_buffer))
+            || !local_inputs.insert((abi.rank, abi.local_input_buffer))
+            || !output_candidates.insert((abi.rank, abi.output_candidate_buffer))
+        {
+            return Err(err(
+                "v5 downstream consumer ABI is duplicate or inconsistent",
+            ));
+        }
+    }
+    let expected_consumer_keys = materializations
+        .iter()
+        .map(|record| {
+            (
+                record.materialization.replicated_result,
+                record.materialization.rank,
+                record.materialization.candidate_buffer,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if consumer_keys != expected_consumer_keys {
+        return Err(err(
+            "v5 downstream consumer ABI rank coverage is incomplete",
+        ));
+    }
+    if outputs.is_empty() || outputs.len() != output_commits.len() {
+        return Err(err("v5 downstream output coverage is invalid"));
+    }
+    let mut output_keys = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    let mut source_keys = BTreeSet::new();
+    for output in outputs {
+        let owner = plan
+            .bindings
+            .get(output.rank)
+            .ok_or_else(|| err("v5 downstream output rank is outside bindings"))?;
+        let materialization = materializations
+            .iter()
+            .find(|record| {
+                record.materialization.rank == output.rank
+                    && record.materialization.candidate_buffer == output.source_candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream output provenance is absent"))?;
+        let CollectiveMaterializationLifecycle::Downstream {
+            first_consumer_stage,
+            lifetime_end_stage,
+        } = &materialization.lifecycle
+        else {
+            return Err(err(
+                "v5 downstream output requires downstream materialization",
+            ));
+        };
+        let Some(CudaPlanStage::Local {
+            id,
+            device,
+            owner_identity,
+            output: declared_output,
+            dependencies,
+            ..
+        }) = plan.stages.get(output.consumer_stage)
+        else {
+            return Err(err("v5 downstream output consumer is not local"));
+        };
+        if output.consumer_stage != *first_consumer_stage
+            || output.first_stage != *first_consumer_stage
+            || output.last_stage != *lifetime_end_stage
+            || output.last_stage < output.first_stage
+            || *id != output.consumer_stage
+            || output.device != *device
+            || output.owner_identity != *owner_identity
+            || output.device != owner.0
+            || output.owner_identity != owner.1
+            || output.dtype != materialization.materialization.dtype
+            || output.shape != materialization.materialization.shape
+            || output.bytes != materialization.materialization.bytes
+            || output.bytes
+                != output
+                    .shape
+                    .numel()?
+                    .checked_mul(output.dtype.itemsize())
+                    .ok_or_else(|| err("v5 downstream output byte overflow"))?
+            || output.output_candidate_buffer == output.source_candidate_buffer
+            || output.output_candidate_buffer == output.destination_buffer
+            || *declared_output != output.destination_buffer
+            || !dependencies.contains(&materialization.materialization.producer_stage)
+            || !output_keys.insert((output.rank, output.output_candidate_buffer))
+            || !destinations.insert((output.rank, output.destination_buffer))
+            || !source_keys.insert((output.rank, output.source_candidate_buffer))
+        {
+            return Err(err(
+                "v5 downstream output descriptor is duplicate or inconsistent",
+            ));
+        }
+    }
+    let mut committed = BTreeSet::new();
+    for (expected, commit) in output_commits.iter().enumerate() {
+        let output = outputs
+            .iter()
+            .find(|output| {
+                output.rank == commit.rank
+                    && output.output_candidate_buffer == commit.output_candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream output commit source is absent"))?;
+        if commit.order != expected
+            || commit.destination_buffer != output.destination_buffer
+            || !committed.insert((commit.rank, commit.output_candidate_buffer))
+        {
+            return Err(err(
+                "v5 downstream output commit is duplicate or inconsistent",
+            ));
+        }
+    }
+    let expected_sources = materializations
+        .iter()
+        .map(|record| {
+            (
+                record.materialization.rank,
+                record.materialization.candidate_buffer,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if committed.len() != output_keys.len()
+        || source_keys != expected_sources
+        || output_candidates != output_keys
+    {
+        return Err(err(
+            "v5 downstream output commits or provenance are incomplete",
+        ));
+    }
+    Ok(())
+}
+
+/// The graph-unary envelope retains the rendered local-stage ABI while
+/// projecting its result binding to the candidate ABI required by the released
+/// v4 lifecycle proof.
+fn downstream_output_lifecycle_projection(
+    plan: &ShardedCudaPlan,
+    graph_result_bindings: &[CollectiveGraphResultBinding],
+) -> Result<ShardedCudaPlan, Error> {
+    let mut projection = plan.clone();
+    for binding in graph_result_bindings {
+        let Some(CudaPlanStage::Local { inputs, .. }) =
+            projection.stages.get_mut(binding.first_consumer_stage)
+        else {
+            return Err(err("v5 graph result binding consumer is not a local stage"));
+        };
+        if inputs.contains(&binding.candidate_buffer) {
+            continue;
+        }
+        let Some(input) = inputs
+            .iter_mut()
+            .find(|input| **input == binding.local_input_buffer)
+        else {
+            return Err(err("v5 graph result binding local input is absent"));
+        };
+        *input = binding.candidate_buffer;
+    }
+    Ok(projection)
+}
 /// Non-serializable execution companion retaining exact PTX ABI artifacts and primary owners.
 ///
 /// `ShardedCudaPlan` is the data-only replay record. This companion deliberately
@@ -1308,6 +1928,35 @@ pub struct ExecutableCollectiveDownstreamOutput {
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     pub buffers: Vec<ExecutableBuffer>,
+}
+
+/// Dedicated executable companion for the graph-unary envelope. The released
+/// v5 companion remains exactly source-compatible for external struct literals.
+pub struct ExecutableCollectiveGraphUnaryOutput {
+    pub downstream: ExecutableCollectiveDownstreamOutput,
+    pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
+    pub consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
+    /// Graph-backed rank-local unary nodes retained only after the strict
+    /// constructor has proven their exact correspondence to the artifact.
+    pub(crate) consumer_nodes: Vec<NodeId>,
+    /// Exact closed unary operation identity retained with the non-serializable
+    /// executable companion. The serialized artifact cache key is validated
+    /// against this identity before graph rebinding.
+    pub(crate) unary_op: Option<GraphBackedDownstreamUnary>,
+    /// Per-rank graph-schedule ABI substitutions retained for the dedicated
+    /// execution entrypoint; generic substitution execution stays closed.
+    pub(crate) substitutions: Vec<BufferSubstitution>,
+    /// Retained only by the graph-aware unary constructor; execution must still
+    /// rehydrate the exact graph schedules from these checked owner bindings.
+    pub(crate) unary_bindings: Option<Vec<CudaPlanBinding>>,
+}
+
+impl std::ops::Deref for ExecutableCollectiveGraphUnaryOutput {
+    type Target = ExecutableCollectiveDownstreamOutput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.downstream
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutableBufferRole {
@@ -2233,10 +2882,119 @@ impl ShardedCudaPlanner {
         })
     }
 
-    /// Rebinds a fingerprinted v5 transaction-output artifact before cache,
-    /// allocation, renderer, driver, or launch work. This is intentionally a
-    /// pure ownership/lifetime proof; the executor still rejects the role
-    /// until the narrowly-scoped downstream local-stage execution vertical.
+    /// Rebinds the dedicated fingerprinted graph-unary envelope before cache,
+    /// allocation, renderer, driver, or launch work.
+    fn rebind_graph_unary_output_artifact(
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveGraphUnaryOutput, Error> {
+        let (
+            logical,
+            candidates,
+            commits,
+            materializations,
+            graph_result_bindings,
+            consumer_abis,
+            outputs,
+            output_commits,
+        ) = CollectiveGraphUnaryOutputArtifact::decode(bytes)?;
+        if bindings.len() != logical.bindings.len()
+            || bindings
+                .iter()
+                .zip(&logical.bindings)
+                .any(|(binding, expected)| {
+                    binding.device != expected.0
+                        || binding.context.identity() != expected.1
+                        || binding.capability.sm() != expected.2
+                        || binding.context.device() != binding.capability.device
+                })
+        {
+            return Err(err(
+                "graph unary output owner or capability binding mismatch",
+            ));
+        }
+        if bindings
+            .iter()
+            .map(|binding| (&binding.device, binding.context.identity()))
+            .collect::<BTreeSet<_>>()
+            .len()
+            != bindings.len()
+        {
+            return Err(err("graph unary output bindings are not unique"));
+        }
+        let owners = bindings
+            .iter()
+            .map(|binding| binding.context.clone())
+            .collect();
+        let mut buffers = materializations
+            .iter()
+            .map(|record| {
+                let binding = &record.materialization;
+                ExecutableBuffer {
+                    rank: binding.rank,
+                    device: binding.device.clone(),
+                    owner_identity: binding.owner_identity,
+                    buffer: binding.candidate_buffer,
+                    dtype: binding.dtype,
+                    shape: binding.shape.clone(),
+                    bytes: binding.bytes,
+                    producer: Some(binding.producer_stage),
+                    consumers: record
+                        .consumers
+                        .iter()
+                        .map(|consumer| consumer.consumer_stage)
+                        .collect(),
+                    first_stage: binding.producer_stage,
+                    last_stage: binding.last_consumer,
+                    role: ExecutableBufferRole::CollectiveResult,
+                }
+            })
+            .collect::<Vec<_>>();
+        for output in &outputs {
+            if buffers.iter().any(|buffer| {
+                buffer.rank == output.rank
+                    && (buffer.buffer == output.output_candidate_buffer
+                        || buffer.buffer == output.destination_buffer)
+            }) {
+                return Err(err("v5 downstream output collides with collective role"));
+            }
+            buffers.push(ExecutableBuffer {
+                rank: output.rank,
+                device: output.device.clone(),
+                owner_identity: output.owner_identity,
+                buffer: output.output_candidate_buffer,
+                dtype: output.dtype,
+                shape: output.shape.clone(),
+                bytes: output.bytes,
+                producer: Some(output.consumer_stage),
+                consumers: vec![],
+                first_stage: output.first_stage,
+                last_stage: output.last_stage,
+                role: ExecutableBufferRole::TransactionOutput,
+            });
+        }
+        Ok(ExecutableCollectiveGraphUnaryOutput {
+            downstream: ExecutableCollectiveDownstreamOutput {
+                logical,
+                owners,
+                candidates,
+                commits,
+                materializations,
+                outputs,
+                output_commits,
+                buffers,
+            },
+            graph_result_bindings,
+            consumer_abis,
+            consumer_nodes: vec![],
+            substitutions: vec![],
+            unary_op: None,
+            unary_bindings: None,
+        })
+    }
+
+    /// Rebinds the released v5 logical-output artifact without authorizing its
+    /// local stage. Graph-aware execution uses the distinct unary envelope.
     pub fn rebind_downstream_output_artifact(
         bindings: &[CudaPlanBinding],
         bytes: &[u8],
@@ -2284,6 +3042,189 @@ impl ShardedCudaPlanner {
             output_commits,
             buffers,
         })
+    }
+
+    /// Graph-aware, still non-executing rebind for exactly one collective
+    /// result consumed by one rank-local closed-set F32 unary per rank. The
+    /// generic downstream executor deliberately remains fail-closed; this only retains
+    /// verified node identities for the dedicated transaction execution path.
+    pub(crate) fn rebind_downstream_output_artifact_for_unary(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+        unary_op: GraphBackedDownstreamUnary,
+    ) -> Result<ExecutableCollectiveGraphUnaryOutput, Error> {
+        let mut rebound = Self::rebind_graph_unary_output_artifact(bindings, bytes)?;
+        if rebound.logical.graph_id != graph.id()
+            || !rebound
+                .logical
+                .cache_key
+                .starts_with(unary_op.cache_prefix())
+            || rebound.materializations.len() != bindings.len()
+            || rebound.consumer_abis.len() != bindings.len()
+            || rebound.outputs.len() != bindings.len()
+            || rebound
+                .logical
+                .stages
+                .iter()
+                .filter(|stage| matches!(stage, CudaPlanStage::Collective { .. }))
+                .count()
+                != 1
+        {
+            return Err(err(
+                "v5 graph-backed unary rebind requires one collective and one local stage per rank",
+            ));
+        }
+        let boundary_keys = rebound
+            .materializations
+            .iter()
+            .map(|record| record.materialization.boundary_key.as_str())
+            .collect::<BTreeSet<_>>();
+        if boundary_keys.len() != 1 {
+            return Err(err(
+                "v5 graph-backed unary rebind requires one collective boundary",
+            ));
+        }
+        let collective_stage = rebound
+            .logical
+            .stages
+            .iter()
+            .position(|stage| matches!(stage, CudaPlanStage::Collective { .. }))
+            .ok_or_else(|| err("v5 graph-backed unary collective stage is absent"))?;
+        let consumer_stages = rebound
+            .consumer_abis
+            .iter()
+            .map(|abi| abi.consumer_stage)
+            .collect::<BTreeSet<_>>();
+        if rebound
+            .logical
+            .stages
+            .iter()
+            .enumerate()
+            .skip(collective_stage + 1)
+            .any(|(index, stage)| {
+                !consumer_stages.contains(&index) || !matches!(stage, CudaPlanStage::Local { .. })
+            })
+        {
+            return Err(err(
+                "v5 graph-backed unary has an unauthorized post-collective stage",
+            ));
+        }
+        let mut consumer_nodes = Vec::with_capacity(bindings.len());
+        let mut substitutions = Vec::with_capacity(bindings.len());
+        for rank in 0..bindings.len() {
+            let abi = rebound
+                .consumer_abis
+                .iter()
+                .find(|abi| abi.rank == rank)
+                .ok_or_else(|| err("v5 graph-backed unary rebind rank ABI is absent"))?;
+            let output = rebound
+                .outputs
+                .iter()
+                .find(|output| output.rank == rank)
+                .ok_or_else(|| err("v5 graph-backed unary rebind rank output is absent"))?;
+            let node = rebound
+                .logical
+                .stages
+                .get(abi.consumer_stage)
+                .and_then(|stage| match stage {
+                    CudaPlanStage::Local {
+                        node,
+                        inputs,
+                        external_materializations,
+                        ..
+                    } if external_materializations == &vec![abi.replicated_result as u64]
+                        && inputs.contains(&abi.local_input_buffer) =>
+                    {
+                        Some(NodeId::from_index(*node))
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    err("v5 graph-backed unary rebind local ABI does not match graph result binding")
+                })?;
+            if graph.dtype(node)? != unary_op.dtype()
+                || graph.shape(node)? != &abi.shape
+                || !matches!(graph.op(node)?, Op::Unary { op, input } if *op == unary_op.op() && input.index() == abi.replicated_result)
+                || output.consumer_stage != abi.consumer_stage
+                || output.output_candidate_buffer != abi.output_candidate_buffer
+            {
+                return Err(err(format!(
+                    "v5 {} rebind graph operation or layout is unsupported",
+                    unary_op.name()
+                )));
+            }
+            consumer_nodes.push(node);
+            substitutions.push(BufferSubstitution {
+                rank,
+                local_buffer: abi.local_input_buffer,
+                transfer_buffer: abi.candidate_buffer,
+            });
+        }
+        rebound.consumer_nodes = consumer_nodes;
+        rebound.substitutions = substitutions;
+        rebound.unary_op = Some(unary_op);
+        rebound.unary_bindings = Some(bindings.to_vec());
+        Ok(rebound)
+    }
+
+    /// Compatibility entrypoint for the released graph-backed F32 Neg route.
+    pub fn rebind_downstream_output_artifact_for_neg(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveGraphUnaryOutput, Error> {
+        Self::rebind_downstream_output_artifact_for_unary(
+            graph,
+            bindings,
+            bytes,
+            GraphBackedDownstreamUnary::Neg,
+        )
+    }
+
+    /// Dedicated graph-aware v5 F32 Abs authorization. Generic downstream
+    /// execution remains unavailable.
+    pub fn rebind_downstream_output_artifact_for_abs(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveGraphUnaryOutput, Error> {
+        Self::rebind_downstream_output_artifact_for_unary(
+            graph,
+            bindings,
+            bytes,
+            GraphBackedDownstreamUnary::Abs,
+        )
+    }
+
+    /// Authorizes the exact graph-backed F64 Neg companion after complete
+    /// artifact, graph, owner, and local-schedule validation.
+    pub fn rebind_downstream_output_artifact_for_f64_neg(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveGraphUnaryOutput, Error> {
+        Self::rebind_downstream_output_artifact_for_unary(
+            graph,
+            bindings,
+            bytes,
+            GraphBackedDownstreamUnary::NegF64,
+        )
+    }
+
+    /// Authorizes the exact graph-backed F64 Abs companion after complete
+    /// artifact, graph, owner, and local-schedule validation.
+    pub fn rebind_downstream_output_artifact_for_f64_abs(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveGraphUnaryOutput, Error> {
+        Self::rebind_downstream_output_artifact_for_unary(
+            graph,
+            bindings,
+            bytes,
+            GraphBackedDownstreamUnary::AbsF64,
+        )
     }
 }
 
@@ -2498,6 +3439,100 @@ mod artifact_tests {
     }
 
     #[test]
+    fn graph_result_binding_is_checked_and_canonically_ordered() {
+        let binding = CollectiveGraphResultBinding {
+            replicated_result: 7,
+            rank: 0,
+            candidate_buffer: 11,
+            local_input_buffer: 12,
+            device: SemanticDeviceId::new("CUDA:0").unwrap(),
+            owner_identity: 41,
+            dtype: DType::F32,
+            shape: Shape::from([2]),
+            bytes: 2 * DType::F32.itemsize(),
+            first_consumer_stage: 3,
+            lifetime_end_stage: 4,
+        };
+        assert_eq!(binding.canonical_key(), (7, 0, 11, 12));
+        binding.validate().unwrap();
+        let mut malformed = binding.clone();
+        malformed.local_input_buffer = malformed.candidate_buffer;
+        assert!(malformed.validate().is_err());
+        let mut malformed = binding;
+        malformed.lifetime_end_stage = 2;
+        assert!(malformed.validate().is_err());
+        let abi = CollectiveDownstreamConsumerAbi {
+            replicated_result: 7,
+            rank: 0,
+            candidate_buffer: 11,
+            local_input_buffer: 12,
+            output_candidate_buffer: 13,
+            device: SemanticDeviceId::new("CUDA:0").unwrap(),
+            owner_identity: 41,
+            dtype: DType::F32,
+            shape: Shape::from([2]),
+            bytes: 2 * DType::F32.itemsize(),
+            consumer_stage: 3,
+            lifetime_end_stage: 4,
+        };
+        abi.validate().unwrap();
+        assert_eq!(abi.canonical_key(), (7, 0, 11, 12, 13));
+        let mut malformed = abi;
+        malformed.local_input_buffer = malformed.candidate_buffer;
+        assert!(malformed.validate().is_err());
+    }
+
+    #[test]
+    fn graph_backed_downstream_unary_scope_is_exactly_f32_f64_neg_abs() {
+        for (unary, dtype, op, prefix) in [
+            (
+                GraphBackedDownstreamUnary::Neg,
+                DType::F32,
+                UnaryOp::Neg,
+                "graph-backed-unary-neg:",
+            ),
+            (
+                GraphBackedDownstreamUnary::Abs,
+                DType::F32,
+                UnaryOp::Abs,
+                "graph-backed-unary-abs:",
+            ),
+            (
+                GraphBackedDownstreamUnary::NegF64,
+                DType::F64,
+                UnaryOp::Neg,
+                "graph-backed-unary-f64-neg:",
+            ),
+            (
+                GraphBackedDownstreamUnary::AbsF64,
+                DType::F64,
+                UnaryOp::Abs,
+                "graph-backed-unary-f64-abs:",
+            ),
+        ] {
+            assert_eq!(unary.dtype(), dtype);
+            assert_eq!(unary.op(), op);
+            assert_eq!(unary.cache_prefix(), prefix);
+        }
+    }
+
+    #[test]
+    fn released_v5_executable_companion_keeps_its_eight_public_fields() {
+        let executable = ExecutableCollectiveDownstreamOutput {
+            logical: plan(),
+            owners: vec![],
+            candidates: vec![],
+            commits: vec![],
+            materializations: vec![],
+            outputs: vec![],
+            output_commits: vec![],
+            buffers: vec![],
+        };
+        assert!(executable.owners.is_empty());
+        assert!(executable.outputs.is_empty());
+    }
+
+    #[test]
     fn versioned_artifact_roundtrips_with_stable_identity_and_legacy_raw_is_candidate_free() {
         let plan = plan();
         let first = ShardedCudaPlanArtifact::encode(&plan).unwrap();
@@ -2527,6 +3562,9 @@ mod artifact_tests {
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
         let mut raw = serde_json::to_value(&plan).unwrap();
         raw["outputs"] = serde_json::json!([]);
+        assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
+        let mut raw = serde_json::to_value(&plan).unwrap();
+        raw["consumer_abis"] = serde_json::json!([]);
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
     }
 

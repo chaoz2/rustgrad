@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:4cb9ed4a1141c573",
+  "source_fingerprint": "fnv1a64:45631aa32d09aa0d",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -63,7 +63,7 @@
       "subject": "Executable CUDA plan companion",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Graph-derived local Add has cache/oracle evidence across 1/2/4 owners for F32/I32/U64, including canonical zero routes. Static-view cast, broadcasted boolean select, and exact I32/F32 `GraphUnary` Neg execute through the generic semantic Mock across 1/2/4 owners; Neg retains original view-source bindings, owner-scoped cache isolation, and logical zero-domain no-work behavior. Unsupported unary/dtype pairs remain typed diagnostics. Typed transfer→local composition substitutes exact descriptor-matched outputs into local inputs and preserves a validated dependency DAG; direct provenance fusion validates explicit external-materialized ABI order and has CPU-byte evidence for 1/2/4-owner axis→replicated Add, 2-owner axis0→axis1 Add, and zero-domain no-work execution. A validated terminal F32 all-reduce now constructs owner-bound streams/peer access/typed add kernels only after full descriptor and capability preflight, mutating the paired local buffers in deterministic group order through the semantic CUDA Mock. Capturing primary contexts, streams, leases, peer state, or a live multi-GPU/NCCL transport is intentionally unsupported; callers replay only the data-only logical plan after rebinding owners."
+        "Acceptance requirement": "Graph-derived local Add has cache/oracle evidence across 1/2/4 owners for F32/I32/U64, including canonical zero routes. Static-view cast, broadcasted boolean select, and exact I32/F32 `GraphUnary` Neg execute through the generic semantic Mock across 1/2/4 owners; Neg retains original view-source bindings, owner-scoped cache isolation, and logical zero-domain no-work behavior. Unsupported unary/dtype pairs remain typed diagnostics. Typed transfer→local composition substitutes exact descriptor-matched outputs into local inputs and preserves a validated dependency DAG; direct provenance fusion validates explicit external-materialized ABI order and has CPU-byte evidence for 1/2/4-owner axis→replicated Add, 2-owner axis0→axis1 Add, and zero-domain no-work execution. A validated terminal F32/F64 sum all-reduce constructs owner-bound streams/peer access/typed add kernels only after full descriptor and capability preflight. A distinct versioned graph-unary envelope can then bind that one terminal sum all-reduce to exactly one rank-local same-dtype Neg or Abs consumer per owner and execute its retained PTX against transaction-owned candidates. All fallible launch and completion work finishes before output publication; completed candidate leases are then atomically rekeyed as the caller-visible logical destinations without a fallible final copy, so injected local launch or completion-sync failures preserve the prior destinations and permit retry. Generic downstream artifacts, other operations/dtypes, multiple or nonterminal collectives, capture/replay of this execution seam, primary-context capture, and live multi-GPU/NCCL transport remain unsupported."
       }
     },
     {
