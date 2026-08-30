@@ -731,7 +731,7 @@ fn generated_concat_cases_are_valid_diverse_and_deterministic() {
     assert_eq!(arities, std::collections::BTreeSet::from([2, 3, 4]));
     assert!(zero_width && nonzero_width && zero_non_axis);
     assert!(axis_zero && axis_one);
-    assert_eq!(dtypes.len(), 13);
+    assert_eq!(dtypes.len(), 17);
 }
 
 #[test]
@@ -1238,7 +1238,7 @@ fn generated_select_cases_cover_homogeneous_dtypes_and_broadcasts() {
             ));
         }
     }
-    assert_eq!(dtypes.len(), 13);
+    assert_eq!(dtypes.len(), 17);
     assert!(scalar_condition && scalar_branch && aligned_condition);
 }
 
@@ -1254,6 +1254,10 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
         DType::U32,
         DType::I64,
         DType::U64,
+        DType::F8E4M3,
+        DType::F8E5M2,
+        DType::F8E4M3FNUZ,
+        DType::F8E5M2FNUZ,
         DType::F16,
         DType::BF16,
         DType::F32,
@@ -1271,7 +1275,7 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
         assert!(matches!(uop.kind(), UOpKind::Sink));
         assert!(CpuJit::render(&uop).is_ok());
         let vector = CpuJit::render_vectorized(&uop).unwrap();
-        if matches!(dtype, DType::F16 | DType::BF16) {
+        if matches!(dtype, DType::F16 | DType::BF16) || dtype.is_float8() {
             assert!(!vector.source.contains("B2 VectorProgram"));
         } else if matches!(dtype, DType::F32 | DType::I32) {
             assert!(vector.source.contains("B2 VectorProgram"));
@@ -4797,7 +4801,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 102);
+    assert_eq!(cases.len(), 106);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

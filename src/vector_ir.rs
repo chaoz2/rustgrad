@@ -145,8 +145,8 @@ impl VectorProgram {
             }
             // Float8 registers have the same raw-storage problem, but their
             // four format tags also change numeric decoding. Keep decoded
-            // Float8 comparisons on the legacy scalar-per-lane renderer even
-            // when Load/Store payload types are absent.
+            // comparisons and raw-byte Select on the legacy scalar-per-lane
+            // renderer even when Load/Store payload types are absent.
             if ty.is_some_and(crate::DType::is_float8)
                 || inst.dst.as_ref().is_some_and(float8_register)
                 || inst.inputs.iter().any(float8_register)

@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v24";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v25";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -722,13 +722,13 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     let extent = *extent;
     let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
     // Float8 storage is a tagged byte encoding, never an ordered integer.
-    // The native elementwise renderer currently has a complete decode-only
-    // contract for comparisons: loads/constants widen to f64 and the Bool
-    // result needs no Float8 store. Fail closed for every other Float8 ALU
-    // graph until its result-encoding boundary is implemented, rather than
-    // silently treating raw payload bytes as numeric lanes.
-    let has_float8_alu = nodes.iter().any(|node| {
-        matches!(
+    // Numeric comparisons have one complete decode-only contract. WHERE has
+    // a separate storage contract: a Bool condition chooses one homogeneous
+    // raw Float8 byte, so neither branch is decoded or re-encoded. Validate
+    // those two cases node-by-node and fail closed for every other Float8 ALU
+    // graph rather than silently treating payload bytes as numeric lanes.
+    for node in &nodes {
+        if !matches!(
             node.kind(),
             UOpKind::GraphUnary(_)
                 | UOpKind::GraphBinary(_)
@@ -736,55 +736,49 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                 | UOpKind::GraphLogical(_)
                 | UOpKind::Cast
                 | UOpKind::Ternary(_)
-        ) && (node.ty().is_some_and(|ty| ty.scalar.is_float8())
-            || node
-                .sources()
-                .iter()
-                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8())))
-    });
-    if has_float8_alu {
-        if out.dtype != DType::Bool {
-            return Err(JitError::Unsupported(
-                "native Float8 elementwise output encoding is not implemented".into(),
-            ));
+        ) {
+            continue;
         }
-        for node in &nodes {
-            if !matches!(
-                node.kind(),
-                UOpKind::GraphUnary(_)
-                    | UOpKind::GraphBinary(_)
-                    | UOpKind::GraphCompare(_)
-                    | UOpKind::GraphLogical(_)
-                    | UOpKind::Cast
-                    | UOpKind::Ternary(_)
-            ) {
-                continue;
-            }
-            let node_float8 = node.ty().is_some_and(|ty| ty.scalar.is_float8());
-            let consumes_float8 = node
-                .sources()
+        let node_dtype = node.ty().map(|ty| ty.scalar);
+        let source_types = node
+            .sources()
+            .iter()
+            .map(|source| source.ty().map(|ty| ty.scalar))
+            .collect::<Vec<_>>();
+        let touches_float8 = node_dtype.is_some_and(DType::is_float8)
+            || source_types
                 .iter()
-                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
-            let float8_alu = node_float8 || consumes_float8;
-            if float8_alu {
-                if !matches!(node.kind(), UOpKind::GraphCompare(_)) {
-                    return Err(JitError::Unsupported(
-                        "native Float8 elementwise supports comparisons only".into(),
-                    ));
-                }
-                let source_types = node
-                    .sources()
-                    .iter()
-                    .map(|source| source.ty().map(|ty| ty.scalar))
-                    .collect::<Vec<_>>();
-                if source_types.len() != 2
-                    || source_types[0] != source_types[1]
-                    || !source_types[0].is_some_and(DType::is_float8)
-                {
-                    return Err(JitError::Unsupported(
-                        "native Float8 comparison requires one homogeneous format".into(),
-                    ));
-                }
+                .copied()
+                .any(|dtype| dtype.is_some_and(DType::is_float8));
+        if !touches_float8 {
+            continue;
+        }
+        match node.kind() {
+            UOpKind::GraphCompare(_)
+                if node_dtype == Some(DType::Bool)
+                    && source_types.len() == 2
+                    && source_types[0] == source_types[1]
+                    && source_types[0].is_some_and(DType::is_float8) => {}
+            UOpKind::Ternary(crate::uop::Ternary::Where)
+                if node_dtype.is_some_and(DType::is_float8)
+                    && source_types.len() == 3
+                    && source_types[0] == Some(DType::Bool)
+                    && source_types[1] == node_dtype
+                    && source_types[2] == node_dtype => {}
+            UOpKind::GraphCompare(_) => {
+                return Err(JitError::Unsupported(
+                    "native Float8 comparison requires one homogeneous format".into(),
+                ));
+            }
+            UOpKind::Ternary(crate::uop::Ternary::Where) => {
+                return Err(JitError::Unsupported(
+                    "native Float8 selection requires homogeneous branches".into(),
+                ));
+            }
+            _ => {
+                return Err(JitError::Unsupported(
+                    "native Float8 elementwise supports comparisons and raw selection only".into(),
+                ));
             }
         }
     }
@@ -3252,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    fn float8_compare_decodes_numeric_lanes_and_other_float8_alu_fails_closed() {
+    fn float8_compare_decodes_select_preserves_raw_and_other_alu_fails_closed() {
         let operations = [
             CompareOp::Eq,
             CompareOp::Ne,
@@ -3339,6 +3333,51 @@ mod tests {
                 }
             }
 
+            let condition_values = TensorData::from_storage(
+                [6],
+                Storage::Bool(vec![true, false, true, false, true, false]),
+            )
+            .unwrap();
+            let mut graph = Graph::new();
+            let condition = graph.input_dtype("condition", [6], DType::Bool);
+            let on_true = graph.input_dtype("on_true", [6], dtype);
+            let on_false = graph.input_dtype("on_false", [], dtype);
+            let selected = graph.select(condition, on_true, on_false).unwrap();
+            let false_values = TensorData::from_storage(
+                [],
+                Storage::Float8(crate::Float8Storage::from_raw(format, vec![0xa5])),
+            )
+            .unwrap();
+            let bindings = HashMap::from([
+                ("condition".into(), condition_values.clone()),
+                ("on_true".into(), lhs_values.clone()),
+                ("on_false".into(), false_values.clone()),
+            ]);
+            let expected = CpuBackend.execute(&graph, selected, &bindings).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, selected).unwrap();
+            let scalar_rendered = CpuJit::render(&uop).unwrap();
+            let vector_rendered = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(!scalar_rendered.source.contains("rg_f8_decode"));
+            assert!(!vector_rendered.source.contains("rg_f8_decode"));
+            assert!(!vector_rendered.source.contains("B2 VectorProgram"));
+            for kernel in [
+                CpuJit::compile(&uop).unwrap(),
+                CpuJit::compile_vectorized(&uop).unwrap(),
+            ] {
+                let mut buffers = [
+                    JitBuffer::from_tensor(&condition_values, false),
+                    JitBuffer::from_tensor(&lhs_values, false),
+                    JitBuffer::from_tensor(&false_values, false),
+                    JitBuffer::zeroed(dtype, expected.len(), true),
+                ];
+                kernel.call(&mut buffers, &[]).unwrap();
+                let actual = buffers[3]
+                    .clone()
+                    .into_tensor(expected.shape().clone())
+                    .unwrap();
+                assert_eq!(actual.storage(), expected.storage(), "{dtype:?} raw Select");
+            }
+
             let mut graph = Graph::new();
             let lhs = graph.input_dtype("lhs", [1], dtype);
             let rhs = graph.input_dtype("rhs", [1], dtype);
@@ -3347,7 +3386,7 @@ mod tests {
                 .unwrap_err();
             assert!(
                 matches!(&error, JitError::Unsupported(reason)
-                    if reason == "native Float8 elementwise output encoding is not implemented"),
+                    if reason == "native Float8 elementwise supports comparisons and raw selection only"),
                 "{dtype:?}: {error:?}"
             );
 
@@ -3413,7 +3452,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v24");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v25");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),

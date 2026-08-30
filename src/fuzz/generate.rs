@@ -238,11 +238,15 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 DType::U32,
                 DType::I64,
                 DType::U64,
+                DType::F8E4M3,
+                DType::F8E5M2,
+                DType::F8E4M3FNUZ,
+                DType::F8E5M2FNUZ,
                 DType::F16,
                 DType::BF16,
                 DType::F32,
                 DType::F64,
-            ][rng.pick(13)];
+            ][rng.pick(17)];
             let false_shape = if rng.pick(2) == 0 {
                 vec![]
             } else {

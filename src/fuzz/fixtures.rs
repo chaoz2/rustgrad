@@ -824,5 +824,57 @@ pub fn regression_cases() -> Vec<FuzzCase> {
                 DType::BF16,
             )),
         },
+        FuzzCase::Select {
+            condition: tensor(vec![4], Storage::Bool(vec![true, false, false, true])),
+            on_true: FuzzTensor {
+                shape: vec![4],
+                dtype: DType::F8E4M3,
+                bytes: vec![0x80, 0x7f, 0x01, 0xff],
+            },
+            on_false: FuzzTensor {
+                shape: vec![],
+                dtype: DType::F8E4M3,
+                bytes: vec![0xa5],
+            },
+        },
+        FuzzCase::Select {
+            condition: tensor(vec![4], Storage::Bool(vec![true, false, false, true])),
+            on_true: FuzzTensor {
+                shape: vec![4],
+                dtype: DType::F8E5M2,
+                bytes: vec![0x80, 0x7f, 0x01, 0xff],
+            },
+            on_false: FuzzTensor {
+                shape: vec![],
+                dtype: DType::F8E5M2,
+                bytes: vec![0xa5],
+            },
+        },
+        FuzzCase::Select {
+            condition: tensor(vec![4], Storage::Bool(vec![true, false, false, true])),
+            on_true: FuzzTensor {
+                shape: vec![4],
+                dtype: DType::F8E4M3FNUZ,
+                bytes: vec![0x80, 0x7f, 0x01, 0xff],
+            },
+            on_false: FuzzTensor {
+                shape: vec![],
+                dtype: DType::F8E4M3FNUZ,
+                bytes: vec![0xa5],
+            },
+        },
+        FuzzCase::Select {
+            condition: tensor(vec![4], Storage::Bool(vec![true, false, false, true])),
+            on_true: FuzzTensor {
+                shape: vec![4],
+                dtype: DType::F8E5M2FNUZ,
+                bytes: vec![0x80, 0x7f, 0x01, 0xff],
+            },
+            on_false: FuzzTensor {
+                shape: vec![],
+                dtype: DType::F8E5M2FNUZ,
+                bytes: vec![0xa5],
+            },
+        },
     ]
 }
