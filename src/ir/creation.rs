@@ -2,9 +2,9 @@ use super::{
     Graph, NodeId, Op, RandomKind, RandomStream, RollDims, RollShifts, shape::normalize_axes,
 };
 use crate::random::reserve;
-use crate::{
-    DType, Error, ExpandExtent, ReshapeExtent, Result, Scalar, Shape, ShrinkRange, TensorData,
-};
+use crate::{DType, Error, Result, Scalar, Shape, TensorData};
+#[cfg(test)]
+use crate::{ExpandExtent, ReshapeExtent, ShrinkRange};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 

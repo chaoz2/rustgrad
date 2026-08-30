@@ -5123,6 +5123,8 @@ fn clip_is_a_clamp_alias_with_the_existing_vjp() {
     let min = graph.constant(TensorData::scalar(-1.0));
     let max = graph.constant(TensorData::scalar(1.0));
     let output = graph.clip(input, Some(min), Some(max)).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
     let bindings = HashMap::from([(
         "x".into(),
         TensorData::new([3], vec![-2., 0.5, 3.]).unwrap(),
@@ -6014,8 +6016,6 @@ fn reciprocal_preserves_tinygrad_alu_dtype_special_and_vjp_contract() {
         if *reciprocal == input)
     );
     assert_eq!(graph.dtype(output).unwrap(), DType::F64);
-    let loss = graph.sum_all(output).unwrap();
-    let gradient = graph.grad(loss, input).unwrap();
     let bindings = HashMap::from([(
         "input".into(),
         TensorData::from_scalars(

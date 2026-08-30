@@ -4,9 +4,7 @@ use super::{
     bad,
     wire::{Msg, one_bytes, one_varint, var},
 };
-#[cfg(test)]
-use crate::Shape;
-use crate::{DType, PoolOptions, Result, TensorData};
+use crate::{DType, PoolOptions, Result, Shape, TensorData};
 use std::collections::BTreeMap;
 
 pub(super) fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
