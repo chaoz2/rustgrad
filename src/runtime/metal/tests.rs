@@ -1,9 +1,9 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    Backend, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend, CpuSession, DType,
-    EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc, NodeId, ReduceKind,
-    Scalar, Shape, Slice, Storage, TensorData, UArg, schedule,
+    Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend,
+    CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc,
+    NodeId, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,

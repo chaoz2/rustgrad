@@ -1,10 +1,10 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    AddressSpace, Backend, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend,
-    DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc, NodeId,
-    ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, UOp, UOpKind, UType, ViewMap,
-    schedule,
+    AddressSpace, Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor,
+    CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc,
+    NodeId, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, UOp, UOpKind, UType,
+    ViewMap, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawAdapter, RawBuffer, RawCommand,
