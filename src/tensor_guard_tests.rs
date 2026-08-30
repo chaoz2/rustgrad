@@ -9,13 +9,13 @@ fn commit_pending_with_shared_stream_retry(
     session: &mut CpuSession,
     guard: &crate::Tensor,
     shape: impl Into<crate::Shape> + Clone,
-) -> crate::Tensor {
+) -> (crate::Tensor, crate::PendingRandomReservation) {
     for _ in 0..64 {
         let mut pending = session
             .pending_uniform_after_guard(guard, shape.clone(), DType::F32)
             .unwrap();
         match session.commit_pending_uniform(guard, &mut pending) {
-            Ok(random) => return random,
+            Ok(random) => return (random, pending),
             Err(Error::InvalidRandom {
                 reason: "pending random reservation is stale",
             }) => continue,
@@ -162,10 +162,7 @@ fn pending_random_reservation_is_stale_retryable_and_exactly_once() {
     );
     assert_eq!(session.graph().node_count(), before + 1);
 
-    let mut retry = session
-        .pending_uniform_after_guard(&guard, [2], DType::F32)
-        .unwrap();
-    let random = session.commit_pending_uniform(&guard, &mut retry).unwrap();
+    let (random, mut retry) = commit_pending_with_shared_stream_retry(&mut session, &guard, [2]);
     assert_eq!(random.dtype(), DType::F32);
     assert!(session.commit_pending_uniform(&guard, &mut retry).is_err());
 }
@@ -187,7 +184,7 @@ fn pending_random_guard_failure_rolls_back_and_a_new_guard_retries() {
 
     let valid = session.tensor([2], [1.0, 1.0]).unwrap();
     let valid_guard = session.tensor_guard_distribution(&valid, 0).unwrap();
-    let random = commit_pending_with_shared_stream_retry(&mut session, &valid_guard, [2]);
+    let (random, _) = commit_pending_with_shared_stream_retry(&mut session, &valid_guard, [2]);
     assert!(
         session
             .trace(&random)
@@ -242,7 +239,7 @@ fn pending_random_zero_words_preserves_the_next_implicit_stream_draw() {
         let mut guarded = CpuSession::new();
         let weights = guarded.tensor([2], [1.0, 1.0]).unwrap();
         let guard = guarded.tensor_guard_distribution(&weights, 0).unwrap();
-        let empty = commit_pending_with_shared_stream_retry(&mut guarded, &guard, [0]);
+        let (empty, _) = commit_pending_with_shared_stream_retry(&mut guarded, &guard, [0]);
         assert_eq!(guarded.realize(&empty).unwrap().shape().dims(), &[0]);
         let guarded_next = guarded.rand_implicit([2], DType::F32).unwrap();
         let empty_trace = guarded.trace(&empty).unwrap();
