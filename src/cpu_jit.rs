@@ -631,6 +631,12 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     let nodes = root
         .topological()
         .map_err(|e| JitError::Unsupported(e.to_string()))?;
+    let needs_erf = nodes.iter().any(|node| {
+        matches!(
+            node.kind(),
+            UOpKind::GraphUnary(crate::UnaryOp::Erf | crate::UnaryOp::Erfc)
+        )
+    });
     let store = root
         .sources()
         .iter()
@@ -769,7 +775,6 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
         "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
         "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
-        "static double rg_erf(double x){double t,p;if(isnan(x))return x;t=1.0/(1.0+0.3275911*fabs(x));p=((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t;return copysign(1.0,x)*(1.0-p*exp((-x)*x));}".into(),
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
         "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
@@ -781,6 +786,16 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         if plan.enabled { format!("  for (size_t rg_base = 0; rg_base + {}u <= {extent}u; rg_base += {}u) {{ for (size_t rg_lane = 0; rg_lane < {}u; ++rg_lane) {{ size_t rg_i = rg_base + rg_lane;", plan.lanes, plan.lanes, plan.lanes) } else { format!("  for (size_t rg_i = 0; rg_i < {extent}u; ++rg_i) {{") },
     ];
+    if needs_erf {
+        let kernel_index = lines
+            .iter()
+            .position(|line| line.starts_with("int rustgrad_kernel"))
+            .expect("renderer always emits the kernel declaration");
+        lines.insert(
+            kernel_index,
+            "static double rg_erf(double x){double t,p;if(isnan(x))return x;t=1.0/(1.0+0.3275911*fabs(x));p=((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t;return copysign(1.0,x)*(1.0-p*exp((-x)*x));}".into(),
+        );
+    }
     if let Some(rendered) = render_reduction(store, &abi, &ids, out, &mut lines)? {
         let source = rendered;
         let cache_key = native_cache_key("", &source);

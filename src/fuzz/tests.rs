@@ -4510,7 +4510,11 @@ fn portable_float_unaries_retain_graph_capture_and_native_contracts() {
                 .unwrap();
             let interpreted =
                 crate::execute_elementwise(&built.graph, built.output, &built.oracle).unwrap();
-            assert_eq!(interpreted, oracle, "captured {dtype:?} {fuzz_op:?}");
+            assert_eq!(
+                FuzzTensor::from_tensor(&interpreted),
+                FuzzTensor::from_tensor(&oracle),
+                "captured {dtype:?} {fuzz_op:?}"
+            );
 
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert_eq!(scheduled.items.len(), 1);

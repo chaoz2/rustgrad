@@ -1666,13 +1666,16 @@ mod tests {
     #[test]
     fn unsupported_native_policy_is_explicit() {
         let mut graph = Graph::new();
-        let x = graph.input_dtype("x", Shape::from([2]), DType::F32);
-        // Public sinh is now a source-literal Exp/Sub/Div composition that
-        // native replay supports. Keep this policy test on a genuinely raw
-        // unary operation outside the native C renderer's owned subset.
-        let output = graph.unary(crate::UnaryOp::Erf, x).unwrap();
+        let x = graph.input_dtype("x", Shape::from([2]), DType::I32);
+        // Keep this policy test on a genuinely raw unary/dtype combination
+        // outside the native C renderer's owned subset. The captured oracle
+        // still defines exact integer storage commitment for this raw form.
+        let output = graph.unary(crate::UnaryOp::Sin, x).unwrap();
         let capture = captured(&graph, &[output]);
-        let values = BTreeMap::from([("x".into(), TensorData::new([2], vec![0., 1.]).unwrap())]);
+        let values = BTreeMap::from([(
+            "x".into(),
+            TensorData::from_storage([2], Storage::I32(vec![0, 1])).unwrap(),
+        )]);
         let executor = CapturedReplayExecutor::default();
         assert!(matches!(
             executor.replay(
