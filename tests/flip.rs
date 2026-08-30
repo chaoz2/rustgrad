@@ -35,7 +35,7 @@ fn flip_matches_tinygrad_axis_set_and_signed_axis_tables() {
 fn flip_preserves_bool_payloads_zero_domains_and_empty_axis_identity() {
     let mut bool_graph = Graph::new();
     let input = bool_graph.input_dtype("input", [3], DType::Bool);
-    let output = bool_graph.flip(input, &[0]).unwrap();
+    let output = bool_graph.flip(input, [0]).unwrap();
     assert_eq!(
         execute(
             &bool_graph,
@@ -48,7 +48,7 @@ fn flip_preserves_bool_payloads_zero_domains_and_empty_axis_identity() {
 
     let mut zero_graph = Graph::new();
     let zero = zero_graph.input("input", [0, 3]);
-    let flipped = zero_graph.flip(zero, &[0]).unwrap();
+    let flipped = zero_graph.flip(zero, [0]).unwrap();
     assert_eq!(
         execute(&zero_graph, flipped, f32_data([0, 3], [])),
         f32_data([0, 3], [])
@@ -57,7 +57,7 @@ fn flip_preserves_bool_payloads_zero_domains_and_empty_axis_identity() {
     let mut scalar_graph = Graph::new();
     let scalar = scalar_graph.input("input", []);
     let before = scalar_graph.node_count();
-    assert_eq!(scalar_graph.flip(scalar, &[]).unwrap(), scalar);
+    assert_eq!(scalar_graph.flip(scalar, []).unwrap(), scalar);
     assert_eq!(scalar_graph.node_count(), before);
 }
 
@@ -67,15 +67,15 @@ fn flip_rejects_duplicate_and_invalid_axes_before_graph_mutation() {
     let input = graph.input("input", [3, 4]);
     let before = graph.node_count();
     assert!(matches!(
-        graph.flip(input, &[0, 0]),
+        graph.flip(input, [0, 0]),
         Err(Error::InvalidFlip { .. })
     ));
     assert!(matches!(
-        graph.flip(input, &[1, -1]),
+        graph.flip(input, [1, -1]),
         Err(Error::InvalidFlip { .. })
     ));
     assert!(matches!(
-        graph.flip(input, &[2]),
+        graph.flip(input, [2]),
         Err(Error::InvalidAxis { .. })
     ));
     assert_eq!(graph.node_count(), before);
