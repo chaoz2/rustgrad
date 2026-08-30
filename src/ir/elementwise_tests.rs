@@ -8952,6 +8952,180 @@ fn bitwise_binary_public_and_scalar_forms_use_tinygrad_lub_before_publication() 
 }
 
 #[test]
+fn shift_public_and_scalar_forms_use_tinygrad_lub_before_publication() {
+    // Live operands are both committed to `_broadcasted`'s source LUB before
+    // the shift. Every concrete integer family remains storage-typed.
+    for dtype in DType::INTS {
+        for op in [BinaryOp::Shl, BinaryOp::Shr] {
+            let mut graph = Graph::new();
+            let value = graph.input_dtype("value", [2, 1], dtype);
+            let count = graph.input_dtype("count", [3], dtype);
+            let output = if op == BinaryOp::Shl {
+                graph.lshift(value, count).unwrap()
+            } else {
+                graph.rshift(value, count).unwrap()
+            };
+            assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            assert!(matches!(
+                graph.op(output).unwrap(),
+                Op::Binary { op: actual, lhs, rhs }
+                    if *actual == op && *lhs == value && *rhs == count
+            ));
+        }
+    }
+
+    let mut mixed = Graph::new();
+    let value = mixed.input_dtype("value", [2, 1], DType::I8);
+    let count = mixed.input_dtype("count", [3], DType::U8);
+    let output = mixed.lshift(value, count).unwrap();
+    assert_eq!(mixed.dtype(output).unwrap(), DType::I16);
+    let Op::Binary {
+        op: BinaryOp::Shl,
+        lhs,
+        rhs,
+    } = mixed.op(output).unwrap()
+    else {
+        panic!("mixed lshift must retain its Binary root");
+    };
+    assert!(matches!(
+        mixed.op(*lhs).unwrap(),
+        Op::Cast { input, dtype: DType::I16 } if *input == value
+    ));
+    assert!(matches!(
+        mixed.op(*rhs).unwrap(),
+        Op::Cast { input, dtype: DType::I16 } if *input == count
+    ));
+
+    // A Python integer is weak: it commits at the live integer width, while
+    // Bool plus weakint lifts to the configured default I32 width. Reflected
+    // forms reverse only the final operands.
+    let u8_value = mixed.input_dtype("u8", [], DType::U8);
+    let shifted = mixed.lshift_scalar(u8_value, Scalar::I(2)).unwrap();
+    assert!(matches!(
+        mixed.op(shifted).unwrap(),
+        Op::Binary { op: BinaryOp::Shl, lhs, rhs }
+            if *lhs == u8_value
+                && matches!(mixed.op(*rhs).unwrap(), Op::Constant(data)
+                    if data.dtype() == DType::U8 && data.scalar_at(0).as_u64() == 2)
+    ));
+    let reflected = mixed.scalar_rshift(Scalar::U(128), u8_value).unwrap();
+    assert!(matches!(
+        mixed.op(reflected).unwrap(),
+        Op::Binary { op: BinaryOp::Shr, lhs, rhs }
+            if *rhs == u8_value
+                && matches!(mixed.op(*lhs).unwrap(), Op::Constant(data)
+                    if data.dtype() == DType::U8 && data.scalar_at(0).as_u64() == 128)
+    ));
+
+    let bool_count = mixed.input_dtype("bool", [2], DType::Bool);
+    let bool_lift = mixed.rshift_scalar(bool_count, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(bool_lift).unwrap(), DType::I32);
+    let Op::Binary {
+        op: BinaryOp::Shr,
+        lhs,
+        rhs,
+    } = mixed.op(bool_lift).unwrap()
+    else {
+        panic!("Bool/weakint rshift must retain its Binary root");
+    };
+    assert!(matches!(
+        mixed.op(*lhs).unwrap(),
+        Op::Cast { input, dtype: DType::I32 } if *input == bool_count
+    ));
+    assert!(matches!(
+        mixed.op(*rhs).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::I32 && data.scalar_at(0).as_i64() == 1
+    ));
+
+    let empty = mixed.input_dtype("empty", [0, 2], DType::U16);
+    let empty_output = mixed.rshift_scalar(empty, Scalar::I(3)).unwrap();
+    assert_eq!(mixed.shape(empty_output).unwrap(), &Shape::new([0, 2]));
+
+    // Bool/Bool and every floating family are rejected before casts or roots.
+    let mut invalid = Graph::new();
+    let bool_lhs = invalid.input_dtype("bool_lhs", [1], DType::Bool);
+    let bool_rhs = invalid.input_dtype("bool_rhs", [1], DType::Bool);
+    let node_count = invalid.node_count();
+    assert!(matches!(
+        invalid.lshift(bool_lhs, bool_rhs),
+        Err(Error::InvalidElementwiseDType {
+            actual: DType::Bool,
+            ..
+        })
+    ));
+    assert_eq!(invalid.node_count(), node_count);
+    assert!(matches!(
+        invalid.rshift_scalar(bool_lhs, Scalar::Bool(true)),
+        Err(Error::InvalidElementwiseDType {
+            actual: DType::Bool,
+            ..
+        })
+    ));
+    assert_eq!(invalid.node_count(), node_count);
+
+    for dtype in DType::FLOATS {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [1], dtype);
+        let rhs = graph.input_dtype("rhs", [1], DType::I32);
+        let node_count = graph.node_count();
+        assert!(matches!(
+            graph.rshift(lhs, rhs),
+            Err(Error::InvalidElementwiseDType { .. })
+        ));
+        assert_eq!(graph.node_count(), node_count);
+    }
+
+    let mut wide = Graph::new();
+    let lhs = wide.input_dtype("lhs", [1], DType::I64);
+    let rhs = wide.input_dtype("rhs", [1], DType::U64);
+    let node_count = wide.node_count();
+    assert!(matches!(
+        wide.lshift(lhs, rhs),
+        Err(Error::InvalidElementwiseDType {
+            actual: DType::F32,
+            ..
+        })
+    ));
+    assert_eq!(wide.node_count(), node_count);
+
+    // Known scalar counts are validated before their Constant is published.
+    let mut counts = Graph::new();
+    let value = counts.input_dtype("value", [1], DType::U8);
+    let node_count = counts.node_count();
+    assert!(matches!(
+        counts.lshift_scalar(value, Scalar::I(-1)),
+        Err(Error::InvalidShiftCount { bits: 8, .. })
+    ));
+    assert_eq!(counts.node_count(), node_count);
+    assert!(matches!(
+        counts.rshift_scalar(value, Scalar::I(8)),
+        Err(Error::InvalidShiftCount { count: 8, bits: 8 })
+    ));
+    assert_eq!(counts.node_count(), node_count);
+    assert!(matches!(
+        counts.lshift_scalar(value, Scalar::F(1.0)),
+        Err(Error::InvalidElementwiseDType { .. })
+    ));
+    assert_eq!(counts.node_count(), node_count);
+    assert!(matches!(
+        counts.rshift(NodeId(usize::MAX), value),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(counts.node_count(), node_count);
+
+    let mut overflow = Graph::new();
+    let lhs = overflow.input_dtype("lhs", [usize::MAX / 8 + 1], DType::I64);
+    let rhs = overflow.input_dtype("rhs", [], DType::I64);
+    let node_count = overflow.node_count();
+    assert!(matches!(
+        overflow.lshift(lhs, rhs),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn isnan_uses_tinygrad_self_inequality_and_preflight() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [4], DType::F64);

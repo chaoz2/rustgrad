@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:2d032c3be29e3596",
+  "source_fingerprint": "fnv1a64:9540215c9ee419c0",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -711,7 +711,7 @@
       "subject": "bitwise ops, shifts, comparisons, `logical_not`",
       "status": "verified",
       "fields": {
-        "RustGrad Graph method(s)": "`bitwise_not`, `bit_and/bit_or/bit_xor/shl/shr`, comparisons, logical methods"
+        "RustGrad Graph method(s)": "`bitwise_not`, `bit_and/bit_or/bit_xor`, source-LUB `lshift/rshift` plus scalar/reflected forms (`shl/shr` aliases), comparisons, logical methods"
       }
     },
     {

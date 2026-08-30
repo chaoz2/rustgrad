@@ -173,7 +173,7 @@ from both surfaces**.
 | tinygrad helper(s) | RustGrad Graph method(s) | Status |
 |---|---|---:|
 | `neg/add/sub/mul/div/pow`, `mod/fmod`, floor division | `neg/add/sub/mul/div/pow/modulo/fmod/floor_div/trunc_div` | ✅ |
-| bitwise ops, shifts, comparisons, `logical_not` | `bitwise_not`, `bit_and/bit_or/bit_xor/shl/shr`, comparisons, logical methods | ✅ |
+| bitwise ops, shifts, comparisons, `logical_not` | `bitwise_not`, `bit_and/bit_or/bit_xor`, source-LUB `lshift/rshift` plus scalar/reflected forms (`shl/shr` aliases), comparisons, logical methods | ✅ |
 | `maximum/minimum`, `where`, `masked_fill`, `clamp/clip` | `maximum/minimum`, `select` (and `select` composition), `masked_fill`, `clamp` | ✅ |
 | `reciprocal/trunc/sqrt/sin/cos/exp/log2/exp2/square` | same-named methods | ✅ |
 | `log/log10/tan/sinh/cosh`, `asin/acos/atan`, `asinh/acosh/atanh` | same-named methods | ✅ |
