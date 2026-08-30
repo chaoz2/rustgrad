@@ -129,12 +129,30 @@ impl VectorProgram {
                     }
                 )
             };
+            let float8_register = |operand: &VectorOperand| {
+                matches!(
+                    operand,
+                    VectorOperand::Register { dtype, .. } if dtype.is_float8()
+                )
+            };
             if matches!(ty, Some(crate::DType::F16 | crate::DType::BF16))
                 || inst.dst.as_ref().is_some_and(narrow_register)
                 || inst.inputs.iter().any(narrow_register)
             {
                 return Err(VectorIrError::Unsupported(
                     "portable narrow vector ABI needs tagged float lanes".into(),
+                ));
+            }
+            // Float8 registers have the same raw-storage problem, but their
+            // four format tags also change numeric decoding. Keep decoded
+            // Float8 comparisons on the legacy scalar-per-lane renderer even
+            // when Load/Store payload types are absent.
+            if ty.is_some_and(crate::DType::is_float8)
+                || inst.dst.as_ref().is_some_and(float8_register)
+                || inst.inputs.iter().any(float8_register)
+            {
+                return Err(VectorIrError::Unsupported(
+                    "portable Float8 vector ABI needs tagged decoded lanes".into(),
                 ));
             }
             if !matches!(

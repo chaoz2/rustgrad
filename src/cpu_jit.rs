@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v23";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v24";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -721,6 +721,58 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     let out_id = *out_id;
     let extent = *extent;
     let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
+    // Float8 storage is a tagged byte encoding, never an ordered integer.
+    // The native elementwise renderer currently has a complete decode-only
+    // contract for comparisons: loads/constants widen to f64 and the Bool
+    // result needs no Float8 store. Fail closed for every other Float8 ALU
+    // graph until its result-encoding boundary is implemented, rather than
+    // silently treating raw payload bytes as numeric lanes.
+    let has_float8 = nodes.iter().any(|node| {
+        node.ty().is_some_and(|ty| ty.scalar.is_float8())
+            || node
+                .sources()
+                .iter()
+                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()))
+    });
+    if has_float8 {
+        if out.dtype != DType::Bool {
+            return Err(JitError::Unsupported(
+                "native Float8 elementwise output encoding is not implemented".into(),
+            ));
+        }
+        for node in &nodes {
+            let node_float8 = node.ty().is_some_and(|ty| ty.scalar.is_float8());
+            let consumes_float8 = node
+                .sources()
+                .iter()
+                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
+            if node_float8 && !matches!(node.kind(), UOpKind::Load | UOpKind::Const) {
+                return Err(JitError::Unsupported(
+                    "native Float8 elementwise supports decoded loads/constants only".into(),
+                ));
+            }
+            if consumes_float8 {
+                if !matches!(node.kind(), UOpKind::GraphCompare(_)) {
+                    return Err(JitError::Unsupported(
+                        "native Float8 elementwise supports comparisons only".into(),
+                    ));
+                }
+                let source_types = node
+                    .sources()
+                    .iter()
+                    .map(|source| source.ty().map(|ty| ty.scalar))
+                    .collect::<Vec<_>>();
+                if source_types.len() != 2
+                    || source_types[0] != source_types[1]
+                    || !source_types[0].is_some_and(DType::is_float8)
+                {
+                    return Err(JitError::Unsupported(
+                        "native Float8 comparison requires one homogeneous format".into(),
+                    ));
+                }
+            }
+        }
+    }
     let (plan, linear_key, b1_program) = if request_vector {
         let linear = CpuJit::linearize(root)?;
         linear
@@ -774,6 +826,11 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff; r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
         "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
         "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
+        // mode: 0=E4M3, 1=E5M2, 2=FNUZ. This is the exact inverse of
+        // Float8Format::decode: FNUZ reserves 0x80 as NaN, E5M2 reserves the
+        // terminal exponent for infinity/NaN, and E4M3 reserves only its
+        // terminal mantissa. ldexp keeps subnormal and normal powers exact.
+        "static double rg_f8_decode(uint8_t x,int bias,unsigned mb,unsigned mode){unsigned em=(1u<<(7u-mb))-1u,mm=(1u<<mb)-1u,e=(x>>mb)&em,m=x&mm,s=x>>7;if(mode==2u&&x==0x80u)return NAN;if((x&0x7fu)==0u)return s?-0.0:0.0;if(mode!=2u&&e==em){if(mode==1u){double v=m?NAN:INFINITY;return s?-v:v;}if(m==mm)return NAN;}double v=e?ldexp(1.0+(double)m/(double)(mm+1u),(int)e-bias):ldexp((double)m/(double)(mm+1u),1-bias);return s?-v:v;}".into(),
         "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
@@ -2396,6 +2453,10 @@ fn emit(
     match n.kind() {
         UOpKind::Const => match n.arg() {
             UArg::Int(v) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
+            UArg::Scalar { dtype, bits } if *dtype == ty && dtype.is_float8() => Ok(
+                float8_decode_expr(*dtype, &format!("((uint8_t)0x{:02x}u)", *bits as u8))
+                    .expect("guarded Float8 dtype"),
+            ),
             UArg::Scalar { dtype, bits } if *dtype == ty => Ok(literal_expr(*dtype, *bits)),
             UArg::Scalar { .. } => {
                 Err(JitError::Unsupported("scalar literal/type mismatch".into()))
@@ -2426,22 +2487,25 @@ fn emit(
                 }
                 _ => return Err(JitError::Unsupported("load index".into())),
             };
-            let load = match ty {
-                DType::F16 => "rg_f16_to_f32",
-                DType::BF16 => "rg_bf16_to_f32",
-                _ => "",
-            };
-            if load.is_empty() {
+            let raw = format!("((uint8_t*)buffers[{}])[{}]", ids[&buffer], off);
+            if let Some(decoded) = float8_decode_expr(ty, &raw) {
+                Ok(decoded)
+            } else if matches!(ty, DType::F16 | DType::BF16) {
+                let load = if ty == DType::F16 {
+                    "rg_f16_to_f32"
+                } else {
+                    "rg_bf16_to_f32"
+                };
+                Ok(format!(
+                    "{load}(((uint16_t*)buffers[{}])[{}])",
+                    ids[&buffer], off
+                ))
+            } else {
                 Ok(format!(
                     "(({}*)buffers[{}])[{}]",
                     ctype(ty),
                     ids[&buffer],
                     off
-                ))
-            } else {
-                Ok(format!(
-                    "{load}(((uint16_t*)buffers[{}])[{}])",
-                    ids[&buffer], off
                 ))
             }
         }
@@ -2745,6 +2809,18 @@ fn literal_expr(dtype: DType, bits: u64) -> String {
         ),
         _ => format!("(({})UINT64_C(0x{:016x}))", ctype(dtype), bits),
     }
+}
+fn float8_decode_expr(dtype: DType, raw: &str) -> Option<String> {
+    let (bias, mantissa_bits, mode) = match dtype {
+        DType::F8E4M3 => (7, 3, 0),
+        DType::F8E5M2 => (15, 2, 1),
+        DType::F8E4M3FNUZ => (8, 3, 2),
+        DType::F8E5M2FNUZ => (16, 2, 2),
+        _ => return None,
+    };
+    Some(format!(
+        "rg_f8_decode(({raw}),{bias},{mantissa_bits}u,{mode}u)"
+    ))
 }
 fn broadcast_offset(input: &crate::Shape, output: &crate::Shape) -> String {
     if input == output {
@@ -3148,6 +3224,120 @@ mod tests {
     }
 
     #[test]
+    fn float8_compare_decodes_numeric_lanes_and_other_float8_alu_fails_closed() {
+        let operations = [
+            CompareOp::Eq,
+            CompareOp::Ne,
+            CompareOp::Lt,
+            CompareOp::Le,
+            CompareOp::Gt,
+            CompareOp::Ge,
+        ];
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let format = dtype.float8_format().unwrap();
+            let nan = if matches!(dtype, DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) {
+                0x80
+            } else {
+                0x7f
+            };
+            let lhs_values = TensorData::from_storage(
+                [6],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    format,
+                    vec![
+                        format.encode(-2.0),
+                        format.encode(-0.0),
+                        format.encode(0.5),
+                        format.encode(2.0),
+                        nan,
+                        format.encode(4.0),
+                    ],
+                )),
+            )
+            .unwrap();
+            let rhs_values = TensorData::from_storage(
+                [6],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    format,
+                    vec![
+                        format.encode(-1.0),
+                        format.encode(0.0),
+                        format.encode(1.0),
+                        format.encode(1.0),
+                        format.encode(0.0),
+                        format.encode(4.0),
+                    ],
+                )),
+            )
+            .unwrap();
+
+            for op in operations {
+                let mut graph = Graph::new();
+                let lhs = graph.input_dtype("lhs", [6], dtype);
+                let rhs = graph.input_dtype("rhs", [6], dtype);
+                let output = graph.compare(op, lhs, rhs).unwrap();
+                let bindings = HashMap::from([
+                    ("lhs".into(), lhs_values.clone()),
+                    ("rhs".into(), rhs_values.clone()),
+                ]);
+                let expected = CpuBackend.execute(&graph, output, &bindings).unwrap();
+                let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+                let scalar_rendered = CpuJit::render(&uop).unwrap();
+                let vector_rendered = CpuJit::render_vectorized(&uop).unwrap();
+                assert!(scalar_rendered.source.contains("rg_f8_decode"));
+                assert!(vector_rendered.source.contains("rg_f8_decode"));
+                assert!(!vector_rendered.source.contains("B2 VectorProgram"));
+
+                for kernel in [
+                    CpuJit::compile(&uop).unwrap(),
+                    CpuJit::compile_vectorized(&uop).unwrap(),
+                ] {
+                    let mut buffers = [
+                        JitBuffer::from_tensor(&lhs_values, false),
+                        JitBuffer::from_tensor(&rhs_values, false),
+                        JitBuffer::zeroed(DType::Bool, expected.len(), true),
+                    ];
+                    kernel.call(&mut buffers, &[]).unwrap();
+                    let actual = buffers[2]
+                        .clone()
+                        .into_tensor(expected.shape().clone())
+                        .unwrap();
+                    assert_eq!(actual.storage(), expected.storage(), "{dtype:?} {op:?}");
+                }
+            }
+
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [1], dtype);
+            let rhs = graph.input_dtype("rhs", [1], dtype);
+            let output = graph.binary(crate::BinaryOp::Add, lhs, rhs).unwrap();
+            let error = CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap_err();
+            assert!(
+                matches!(&error, JitError::Unsupported(reason)
+                    if reason == "native Float8 elementwise output encoding is not implemented"),
+                "{dtype:?}: {error:?}"
+            );
+
+            let mut mixed = Graph::new();
+            let lhs = mixed.input_dtype("lhs", [1], dtype);
+            let rhs = mixed.input_dtype("rhs", [1], DType::F16);
+            let output = mixed.compare(CompareOp::Eq, lhs, rhs).unwrap();
+            let error = CpuJit::render(&crate::lower_graph_elementwise(&mixed, output).unwrap())
+                .unwrap_err();
+            assert!(
+                matches!(&error, JitError::Unsupported(reason)
+                    if reason == "native Float8 comparison requires one homogeneous format"),
+                "{dtype:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn public_logical_not_keeps_cast_then_ne_and_renders_bool_truthiness() {
         for dtype in [DType::F32, DType::I32] {
             let mut graph = Graph::new();
@@ -3195,7 +3385,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v23");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v24");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),

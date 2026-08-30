@@ -361,6 +361,81 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             ),
             rhs: tensor(vec![3], Storage::F32(vec![0.0, 0.0, f32::INFINITY])),
         },
+        FuzzCase::Compare {
+            // E4M3 terminal payloads are NaN, while raw 0x80 is negative
+            // zero and must compare equal to positive zero after decoding.
+            op: FuzzCompareOp::Eq,
+            lhs: tensor(
+                vec![3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E4M3,
+                    vec![0x80, 0x7f, 0x38],
+                )),
+            ),
+            rhs: tensor(
+                vec![3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E4M3,
+                    vec![0x00, 0x7f, 0x38],
+                )),
+            ),
+        },
+        FuzzCase::Compare {
+            // E5M2 retains infinities and unordered NaNs at its terminal
+            // exponent, independent of their unsigned storage-byte order.
+            op: FuzzCompareOp::Lt,
+            lhs: tensor(
+                vec![3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E5M2,
+                    vec![0xfc, 0x7c, 0x7f],
+                )),
+            ),
+            rhs: tensor(
+                vec![3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E5M2,
+                    vec![0x00, 0x7c, 0x00],
+                )),
+            ),
+        },
+        FuzzCase::Compare {
+            // FNUZ reserves 0x80 as NaN rather than negative zero.
+            op: FuzzCompareOp::Ne,
+            lhs: tensor(
+                vec![3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E4M3FNUZ,
+                    vec![0x80, 0x00, 0x40],
+                )),
+            ),
+            rhs: tensor(
+                vec![3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E4M3FNUZ,
+                    vec![0x80, 0x00, 0x40],
+                )),
+            ),
+        },
+        FuzzCase::Compare {
+            // E5M2FNUZ uses bias 16; numeric order must be decoded rather
+            // than inferred from the sign bit and raw magnitude byte.
+            op: FuzzCompareOp::Ge,
+            lhs: tensor(
+                vec![3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E5M2FNUZ,
+                    vec![0xc0, 0x40, 0x80],
+                )),
+            ),
+            rhs: tensor(
+                vec![3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E5M2FNUZ,
+                    vec![0x40, 0xc0, 0x00],
+                )),
+            ),
+        },
         FuzzCase::Logical {
             // Full And truth table in row-major Bool storage.
             op: FuzzLogicalOp::And,

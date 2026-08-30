@@ -1000,7 +1000,7 @@ fn generated_compare_cases_are_valid_diverse_and_deterministic() {
 
     assert!(found);
     assert_eq!(ops.len(), 6);
-    assert_eq!(dtypes.len(), 13);
+    assert_eq!(dtypes.len(), 17);
     assert!(scalar && empty && scalar_rhs && matching_rhs && right_aligned_rhs);
 }
 
@@ -3975,6 +3975,10 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
         DType::U32,
         DType::I64,
         DType::U64,
+        DType::F8E4M3,
+        DType::F8E5M2,
+        DType::F8E4M3FNUZ,
+        DType::F8E5M2FNUZ,
         DType::F16,
         DType::BF16,
         DType::F32,
@@ -4038,7 +4042,14 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
                 .take(if right { 3 } else { 6 })
                 .map(Scalar::U)
                 .collect(),
-                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => (if right {
+                DType::F8E4M3
+                | DType::F8E5M2
+                | DType::F8E4M3FNUZ
+                | DType::F8E5M2FNUZ
+                | DType::F16
+                | DType::BF16
+                | DType::F32
+                | DType::F64 => (if right {
                     [f64::NAN, 0.0, f64::NEG_INFINITY]
                 } else {
                     [f64::NAN, -0.0, f64::INFINITY]
@@ -4048,7 +4059,6 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
                 .take(if right { 3 } else { 6 })
                 .map(Scalar::F)
                 .collect(),
-                _ => unreachable!("float8 comparison fuzz is not generated"),
             }
         };
         let lhs = FuzzTensor::from_tensor(
@@ -4092,7 +4102,11 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
             ));
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
-            if matches!(dtype, DType::F16 | DType::BF16) {
+            if dtype.is_float8() {
+                assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+                assert!(scalar.source.contains("rg_f8_decode"), "{dtype:?}");
+                assert!(vector.source.contains("rg_f8_decode"), "{dtype:?}");
+            } else if matches!(dtype, DType::F16 | DType::BF16) {
                 assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
                 assert!(scalar.source.contains("rg_f"), "{dtype:?}");
             } else if matches!(dtype, DType::F32 | DType::I32) {
@@ -4783,7 +4797,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 98);
+    assert_eq!(cases.len(), 102);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

@@ -28,9 +28,14 @@ fn tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> FuzzTensor {
         match dtype {
             DType::Bool => Scalar::Bool(raw & 1 != 0),
             DType::I32 => Scalar::I((raw % 17) as i64 - 8),
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
-                Scalar::F((raw % 33) as f64 / 4.0 - 4.0)
-            }
+            DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ
+            | DType::F16
+            | DType::BF16
+            | DType::F32
+            | DType::F64 => Scalar::F((raw % 33) as f64 / 4.0 - 4.0),
             _ => Scalar::I((raw % 17) as i64 - 8),
         }
     });
@@ -452,8 +457,10 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
         7 => {
             // Raw GraphCompare is homogeneous here: CPU, captured UOps, and
             // C compare each stored kind directly, including I64/U64 rather
-            // than projecting through f64. Exercise scalar, equal, and
-            // right-aligned broadcast geometry without source promotion.
+            // than projecting through f64. Float8 loads first use the exact
+            // format decoder and deliberately remain outside B2. Exercise
+            // scalar, equal, and right-aligned broadcast geometry without
+            // source promotion.
             let dtype = [
                 DType::Bool,
                 DType::I8,
@@ -464,11 +471,15 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 DType::U32,
                 DType::I64,
                 DType::U64,
+                DType::F8E4M3,
+                DType::F8E5M2,
+                DType::F8E4M3FNUZ,
+                DType::F8E5M2FNUZ,
                 DType::F16,
                 DType::BF16,
                 DType::F32,
                 DType::F64,
-            ][rng.pick(13)];
+            ][rng.pick(17)];
             let shape = [
                 vec![],
                 vec![0],
