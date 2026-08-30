@@ -2701,8 +2701,10 @@ mod tests {
         assert_eq!(graph.shape(zero).unwrap(), &Shape::from([0, 2]));
         assert_eq!(graph.shrink_to(input, [None, None]).unwrap(), input);
         let loss = graph.sum_all(output).unwrap();
-        let gradient = graph.grad(loss, input).unwrap();
-        assert_eq!(graph.shape(gradient).unwrap(), &Shape::from([2, 3]));
+        assert!(matches!(
+            graph.grad(loss, input),
+            Err(Error::NonDifferentiableTarget(node)) if node == input
+        ));
 
         let scalar = graph.input("scalar", []);
         assert_eq!(graph.shrink_to(scalar, []).unwrap(), scalar);

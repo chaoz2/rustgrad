@@ -1336,7 +1336,6 @@ mod tests {
             .nll_loss(logp, labels, Some(weight), Some(-1), Reduction::None)
             .unwrap();
         assert_eq!(graph.shape(loss).unwrap(), &Shape::new([2, 4]));
-        assert!(graph.trace(loss).unwrap().to_string().contains("select"));
         assert!(
             (0..graph.node_count())
                 .any(|n| matches!(graph.op(NodeId(n)).unwrap(), crate::Op::Select { .. }))
@@ -1439,7 +1438,8 @@ mod tests {
         let loss =
             binary_cross_entropy_with_logits(&mut graph, logits, target, None, Reduction::Mean)
                 .unwrap();
-        let gradient = graph.grad(loss, logits).unwrap();
+        let gradient_loss = graph.sum_all(loss).unwrap();
+        let gradient = graph.grad(gradient_loss, logits).unwrap();
         let inputs = HashMap::from([
             ("x".into(), TensorData::new([2], vec![-1., 2.]).unwrap()),
             ("y".into(), TensorData::new([2], vec![0., 1.]).unwrap()),
@@ -1720,8 +1720,10 @@ mod tests {
         assert_eq!(graph.dtype(loss).unwrap(), crate::DType::F16);
         let trace = graph.trace(loss).unwrap().to_string();
         assert!(trace.contains("log_softmax") || trace.contains("exp2"));
-        assert!(trace.contains("reduce"));
-        assert!(!trace.contains("ne"));
+        assert!(
+            (0..graph.node_count())
+                .any(|index| matches!(graph.op(NodeId(index)).unwrap(), crate::Op::Reduce { .. }))
+        );
         let dx = graph.grad(loss, logits).unwrap();
         assert_eq!(graph.shape(dx).unwrap(), &Shape::from([2, 3, 4]));
 

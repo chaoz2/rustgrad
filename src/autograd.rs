@@ -747,6 +747,12 @@ impl Graph {
                     }
                     let expanded = self.reshape(upstream, Shape::new(kept_dims))?;
                     let grad = self.expand(expanded, input_shape)?;
+                    let input_dtype = self.node(input)?.dtype;
+                    let grad = if self.node(grad)?.dtype == input_dtype {
+                        grad
+                    } else {
+                        self.cast(grad, input_dtype)?
+                    };
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Reduce {
@@ -774,6 +780,12 @@ impl Graph {
                         dtype,
                     ));
                     let grad = self.div(up, divisor)?;
+                    let input_dtype = self.node(input)?.dtype;
+                    let grad = if self.node(grad)?.dtype == input_dtype {
+                        grad
+                    } else {
+                        self.cast(grad, input_dtype)?
+                    };
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Reduce {
@@ -786,6 +798,12 @@ impl Graph {
                     keepdim,
                 } => {
                     let grad = self.reduce_grad(input, upstream, kind, axes, keepdim)?;
+                    let input_dtype = self.node(input)?.dtype;
+                    let grad = if self.node(grad)?.dtype == input_dtype {
+                        grad
+                    } else {
+                        self.cast(grad, input_dtype)?
+                    };
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Reduce {
@@ -804,6 +822,12 @@ impl Graph {
                     ..
                 } => {
                     let gradient = self.cumsum_vjp(upstream, axis)?;
+                    let input_dtype = self.node(input)?.dtype;
+                    let gradient = if self.node(gradient)?.dtype == input_dtype {
+                        gradient
+                    } else {
+                        self.cast(gradient, input_dtype)?
+                    };
                     self.accumulate(&mut grads, input, gradient)?;
                 }
                 Op::PrefixScan {
@@ -813,6 +837,12 @@ impl Graph {
                     ..
                 } => {
                     let gradient = self.cumprod_vjp(upstream, input, axis)?;
+                    let input_dtype = self.node(input)?.dtype;
+                    let gradient = if self.node(gradient)?.dtype == input_dtype {
+                        gradient
+                    } else {
+                        self.cast(gradient, input_dtype)?
+                    };
                     self.accumulate(&mut grads, input, gradient)?;
                 }
                 Op::PrefixScan {
@@ -1278,6 +1308,13 @@ impl Graph {
                 continue;
             }
             let current = self.node(node)?;
+            // Reverse mode never reaches exact/control-only subgraphs, and a
+            // detach node is a fresh leaf. Do not let an integer coordinate
+            // range or a detached cumulative-extrema implementation reject a
+            // derivative whose active floating path does not cross it.
+            if !current.requires_grad || matches!(&current.op, Op::Detach { .. }) {
+                continue;
+            }
             if let Op::PrefixScan { input, kind, .. } = &current.op {
                 match kind {
                     crate::PrefixScanKind::Sum if !self.node(*input)?.dtype.is_float() => {
@@ -1298,7 +1335,13 @@ impl Graph {
                     crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => {}
                 }
             }
-            pending.extend(current.op.backward_inputs());
+            pending.extend(
+                current
+                    .op
+                    .backward_inputs()
+                    .into_iter()
+                    .filter(|input| self.nodes[input.index()].requires_grad),
+            );
         }
         Ok(())
     }

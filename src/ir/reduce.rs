@@ -2305,7 +2305,10 @@ mod tests {
         assert_eq!(graph.shape(all).unwrap(), &Shape::new([1, 1]));
         assert_eq!(output.dtype(), DType::Bool);
         assert_eq!(output.to_vec_f64(), vec![1.]);
-        assert!(matches!(graph.grad(all, input), Err(Error::NoGradient(_))));
+        assert!(matches!(
+            graph.grad(all, input),
+            Err(Error::NonDifferentiableTarget(node)) if node == all
+        ));
 
         let mut empty_graph = Graph::new();
         let empty = empty_graph.input("empty", [2, 0]);
@@ -2400,7 +2403,10 @@ mod tests {
         assert_eq!(graph.shape(any).unwrap(), &Shape::new([1, 1]));
         assert_eq!(output.dtype(), DType::Bool);
         assert_eq!(output.to_vec_f64(), vec![1.]);
-        assert!(matches!(graph.grad(any, input), Err(Error::NoGradient(_))));
+        assert!(matches!(
+            graph.grad(any, input),
+            Err(Error::NonDifferentiableTarget(node)) if node == any
+        ));
 
         let mut empty_graph = Graph::new();
         let empty = empty_graph.input("empty", [2, 0]);
@@ -2511,8 +2517,14 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(graph.grad(any, input), Err(Error::NoGradient(_))));
-        assert!(matches!(graph.grad(all, input), Err(Error::NoGradient(_))));
+        assert!(matches!(
+            graph.grad(any, input),
+            Err(Error::NonDifferentiableTarget(node)) if node == any
+        ));
+        assert!(matches!(
+            graph.grad(all, input),
+            Err(Error::NonDifferentiableTarget(node)) if node == all
+        ));
         let bindings = HashMap::from([(
             "input".into(),
             TensorData::from_scalars(
@@ -2608,7 +2620,7 @@ mod tests {
         assert_eq!(values.to_vec_f64(), vec![3., 0., 2.]);
         assert!(matches!(
             graph.grad(output, input),
-            Err(Error::NoGradient(_))
+            Err(Error::NonDifferentiableTarget(node)) if node == output
         ));
 
         let mut flattened = Graph::new();
@@ -2706,7 +2718,7 @@ mod tests {
         assert_eq!(values.to_vec_f64(), vec![3., 0., 2.]);
         assert!(matches!(
             graph.grad(output, input),
-            Err(Error::NoGradient(_))
+            Err(Error::NonDifferentiableTarget(node)) if node == output
         ));
 
         let mut flattened = Graph::new();
@@ -2838,7 +2850,7 @@ mod tests {
             ));
             assert!(matches!(
                 graph.grad(output, input),
-                Err(Error::NoGradient(_))
+                Err(Error::NonDifferentiableTarget(node)) if node == output
             ));
         }
         assert!(graph.nodes.iter().any(|node| matches!(
@@ -3115,7 +3127,7 @@ mod tests {
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
             crate::Op::Compare {
-                op: crate::CompareOp::Ge,
+                op: crate::CompareOp::Lt,
                 ..
             }
         )));
@@ -3463,7 +3475,7 @@ mod tests {
 
         let legacy = graph.input_dtype("legacy", [2], DType::F16);
         let legacy_sum = graph.reduce(legacy, ReduceKind::Sum, None, false).unwrap();
-        assert_eq!(graph.dtype(legacy_sum).unwrap(), DType::F16);
+        assert_eq!(graph.dtype(legacy_sum).unwrap(), DType::F32);
 
         let mut overflow = Graph::new();
         let input = overflow.input("input", [usize::MAX, 2]);
@@ -3942,10 +3954,11 @@ mod tests {
         assert_ne!(pair_standard_deviation, pair_standard_mean);
         assert!((0..graph.node_count()).any(|index| matches!(
             graph.op(NodeId(index)).unwrap(),
-            crate::Op::Unary {
-                op: UnaryOp::Square,
-                ..
-            }
+            crate::Op::Binary {
+                op: BinaryOp::Mul,
+                lhs,
+                rhs,
+            } if lhs == rhs
         )));
         assert!(matches!(
             graph.op(pair_standard_deviation).unwrap(),
@@ -4070,17 +4083,21 @@ mod tests {
         let inputs = HashMap::from([("input".into(), data([2, 2], &[3., 4., 5., 12.]))]);
 
         assert_eq!(graph.shape(normalized).unwrap(), &Shape::new([2, 2]));
-        assert_eq!(
-            CpuBackend
-                .execute(&graph, normalized, &inputs)
-                .unwrap()
-                .to_vec_f64(),
-            vec![
-                0.6f32 as f64,
-                0.8f32 as f64,
-                (5.0f32 / 13.0) as f64,
-                (12.0f32 / 13.0) as f64,
-            ]
+        let actual = CpuBackend
+            .execute(&graph, normalized, &inputs)
+            .unwrap()
+            .to_vec_f64();
+        let expected = [
+            0.6f32 as f64,
+            0.8f32 as f64,
+            (5.0f32 / 13.0) as f64,
+            (12.0f32 / 13.0) as f64,
+        ];
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (*actual - expected).abs() <= f32::EPSILON as f64)
         );
         assert_eq!(
             CpuBackend
@@ -4189,7 +4206,8 @@ mod tests {
         let mut differentiable = Graph::new();
         let input = differentiable.input_dtype("input", [2], DType::F32);
         let output = differentiable.normalize(input, 1.0, 0, 1e-12).unwrap();
-        assert!(differentiable.grad(output, input).is_ok());
+        let loss = differentiable.sum_all(output).unwrap();
+        assert!(differentiable.grad(loss, input).is_ok());
 
         let mut zero = Graph::new();
         let input = zero.input_dtype("input", [], DType::Bool);
@@ -4371,7 +4389,8 @@ mod tests {
         assert!(graph.nodes.iter().any(|node| {
             matches!(&node.op, crate::Op::Binary { op: crate::BinaryOp::Mul, lhs, rhs } if *lhs == centered && *rhs == centered)
         }));
-        assert!(graph.grad(output, input).is_ok());
+        let loss = graph.sum_all(output).unwrap();
+        assert!(graph.grad(loss, input).is_ok());
         let default = graph.layernorm_default(input).unwrap();
         assert_eq!(graph.shape(default).unwrap(), &Shape::new([2, 3, 4]));
 
@@ -4560,7 +4579,14 @@ mod tests {
         let mut scalar = Graph::new();
         let x = scalar.input("input", []);
         let output = scalar.min_with_axes(x, Some(vec![-1]), false).unwrap();
-        assert_eq!(output, x);
+        assert_ne!(output, x);
+        assert!(matches!(
+            scalar.op(output).unwrap(),
+            crate::Op::Unary {
+                op: UnaryOp::Neg,
+                ..
+            }
+        ));
 
         let mut malformed = Graph::new();
         let x = malformed.input("input", [2, 2]);

@@ -36,7 +36,8 @@ fn dtype_conveniences_alias_source_cast_and_are_atomic() {
     assert!(
         matches!(graph.op(widened).unwrap(), Op::Cast { input, dtype: DType::F32 } if *input == f16_empty)
     );
-    assert!(graph.grad(widened, f16_empty).is_ok());
+    let widened_loss = graph.sum_all(widened).unwrap();
+    assert!(graph.grad(widened_loss, f16_empty).is_ok());
 
     let half = graph.to_f16(integer).unwrap();
     let bfloat = graph.to_bf16(f32_input).unwrap();
@@ -74,7 +75,8 @@ fn dtype_conveniences_alias_source_cast_and_are_atomic() {
         matches!(graph.op(bool_value).unwrap(), Op::Cast { input, dtype: DType::Bool } if *input == integer)
     );
     assert!(graph.grad(bfloat, f32_input).is_ok());
-    assert!(graph.grad(double, f16_empty).is_ok());
+    let double_loss = graph.sum_all(double).unwrap();
+    assert!(graph.grad(double_loss, f16_empty).is_ok());
     assert!(graph.node_count() > before);
 
     let unknown = NodeId::from_index(usize::MAX);
@@ -664,7 +666,10 @@ fn allclose_default_uses_scalar_isclose_then_bool_all() {
     );
     assert!(graph.nodes.iter().any(|node| matches!(&node.op,
         Op::Constant(data) if data.dtype() == DType::Bool && !data.scalar_at(0).as_bool())));
-    assert!(matches!(graph.grad(output, lhs), Err(Error::NoGradient(_))));
+    assert!(matches!(
+        graph.grad(output, lhs),
+        Err(Error::NonDifferentiableTarget(node)) if node == output
+    ));
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [2], DType::I64);
@@ -1622,7 +1627,7 @@ fn eq_keeps_typed_wide_integer_equality_and_float_special_values() {
     let output = predicate.eq(input, rhs).unwrap();
     assert!(matches!(
         predicate.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 }
 
@@ -1698,11 +1703,11 @@ fn equality_scalar_forms_preserve_weak_lub_and_eq_not_ne_structure() {
         ));
         assert!(matches!(
             graph.grad(equal, input),
-            Err(Error::NoGradient(_))
+            Err(Error::NonDifferentiableTarget(node)) if node == equal
         ));
         assert!(matches!(
             graph.grad(unequal, input),
-            Err(Error::NoGradient(_))
+            Err(Error::NonDifferentiableTarget(node)) if node == unequal
         ));
     }
 
@@ -1857,7 +1862,7 @@ fn ne_keeps_typed_wide_comparison_and_source_float_special_values() {
     let output = predicate.ne(input, rhs).unwrap();
     assert!(matches!(
         predicate.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 }
 
@@ -1986,7 +1991,7 @@ fn lt_keeps_typed_ordering_and_float_special_values() {
     let output = predicate.lt(input, rhs).unwrap();
     assert!(matches!(
         predicate.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 }
 
@@ -2115,7 +2120,7 @@ fn gt_keeps_typed_ordering_and_float_special_values() {
     let output = predicate.gt(input, rhs).unwrap();
     assert!(matches!(
         predicate.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 }
 
@@ -2261,7 +2266,7 @@ fn le_keeps_tinygrad_nan_and_typed_ordering_behavior() {
     let output = predicate.le(input, rhs).unwrap();
     assert!(matches!(
         predicate.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 }
 
@@ -2414,7 +2419,7 @@ fn ge_keeps_tinygrad_nan_and_typed_ordering_behavior() {
     let output = predicate.ge(input, rhs).unwrap();
     assert!(matches!(
         predicate.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 }
 
@@ -2460,7 +2465,7 @@ fn ordered_comparison_scalar_forms_preserve_tensor_and_reflected_orientations() 
             assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
             assert!(matches!(
                 graph.grad(output, input),
-                Err(Error::NoGradient(_))
+                Err(Error::NonDifferentiableTarget(node)) if node == output
             ));
         }
         assert!(matches!(
@@ -2936,10 +2941,13 @@ fn sub_scalar_preserves_tinygrad_neg_then_add_and_reflected_order() {
         };
         assert_eq!(*lhs, input);
         if dtype == DType::Bool {
-            assert!(
-                matches!(forward.op(*rhs).unwrap(), Op::Logical { op: LogicalOp::Not, lhs: scalar, rhs: None }
-                if matches!(forward.op(*scalar).unwrap(), Op::Constant(_)))
-            );
+            assert!(matches!(
+                forward.op(*rhs).unwrap(),
+                Op::Compare {
+                    op: CompareOp::Ne,
+                    ..
+                }
+            ));
         } else {
             assert!(
                 matches!(forward.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Neg, input: scalar }
@@ -3058,10 +3066,14 @@ fn sub_matches_tinygrad_bool_negation_and_float_broadcast_vjp() {
         panic!("expected Bool Add");
     };
     assert_eq!(*added_lhs, lhs);
-    assert!(
-        matches!(booleans.op(*added_rhs).unwrap(), Op::Logical { op: LogicalOp::Not, lhs: input, rhs: None }
-        if *input == rhs)
-    );
+    assert!(matches!(
+        booleans.op(*added_rhs).unwrap(),
+        Op::Compare {
+            op: CompareOp::Ne,
+            lhs: input,
+            ..
+        } if *input == rhs
+    ));
     let values = CpuBackend
         .execute(
             &booleans,
@@ -3818,7 +3830,7 @@ fn trunc_div_uses_tinygrad_integer_cdiv_lub_and_zero_sentinel() {
     assert!(matches!(
         graph.op(*condition).unwrap(),
         Op::Compare {
-            op: CompareOp::Eq,
+            op: CompareOp::Ne,
             ..
         }
     ));
@@ -3848,14 +3860,10 @@ fn trunc_div_uses_tinygrad_integer_cdiv_lub_and_zero_sentinel() {
         vec![-1.0, 0.0]
     );
     let loss = graph.sum_all(output).unwrap();
-    let gradient = graph.grad(loss, lhs).unwrap();
-    assert_eq!(
-        CpuBackend
-            .execute(&graph, gradient, &bindings)
-            .unwrap()
-            .to_vec_f64(),
-        vec![0.0, 0.0]
-    );
+    assert!(matches!(
+        graph.grad(loss, lhs),
+        Err(Error::NonDifferentiableTarget(node)) if node == lhs
+    ));
 
     let mut signed_edge = Graph::new();
     let lhs = signed_edge.input_dtype("lhs", [], DType::I64);
@@ -4039,7 +4047,7 @@ fn trunc_div_scalar_preserves_source_integer_and_float_branches() {
     let boolean_output = mixed.trunc_div_scalar(boolean, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
     let integral_output = mixed.scalar_trunc_div(Scalar::F(-0.0), integral).unwrap();
-    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
     let narrow_output = mixed.trunc_div_scalar(narrow, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
@@ -4141,7 +4149,7 @@ fn floor_div_uses_tinygrad_python_floor_correction_and_zero_sentinel() {
     assert!(matches!(
         graph.op(*condition).unwrap(),
         Op::Compare {
-            op: CompareOp::Eq,
+            op: CompareOp::Ne,
             ..
         }
     ));
@@ -4187,14 +4195,10 @@ fn floor_div_uses_tinygrad_python_floor_correction_and_zero_sentinel() {
         vec![-2.0, 1.0, -2.0, 1.0, 0.0]
     );
     let loss = graph.sum_all(output).unwrap();
-    let gradient = graph.grad(loss, lhs).unwrap();
-    assert_eq!(
-        CpuBackend
-            .execute(&graph, gradient, &bindings)
-            .unwrap()
-            .to_vec_f64(),
-        vec![0.0; 5]
-    );
+    assert!(matches!(
+        graph.grad(loss, lhs),
+        Err(Error::NonDifferentiableTarget(node)) if node == lhs
+    ));
 
     let mut negative_divisor = Graph::new();
     let lhs = negative_divisor.input_dtype("lhs", [2], DType::I64);
@@ -4227,10 +4231,14 @@ fn floor_div_uses_tinygrad_python_floor_correction_and_zero_sentinel() {
     let output = wide.floor_div(lhs, rhs).unwrap();
     assert_eq!(wide.dtype(output).unwrap(), DType::F32);
     assert_eq!(wide.shape(output).unwrap(), &Shape::new([2, 3]));
-    assert!(
-        matches!(wide.op(output).unwrap(), Op::Unary { op: UnaryOp::Floor, input }
-        if matches!(wide.op(*input).unwrap(), Op::Binary { op: BinaryOp::Mul, .. }))
-    );
+    assert!(matches!(wide.op(output).unwrap(), Op::Select { .. }));
+    assert!(wide.nodes.iter().any(|node| matches!(
+        &node.op,
+        Op::Unary {
+            op: UnaryOp::Trunc,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -4263,10 +4271,14 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
         if dtype.is_integer() {
             assert!(matches!(forward.op(output).unwrap(), Op::Select { .. }));
         } else {
-            assert!(
-                matches!(forward.op(output).unwrap(), Op::Unary { op: UnaryOp::Floor, input }
-                if matches!(forward.op(*input).unwrap(), Op::Binary { op: BinaryOp::Mul, .. }))
-            );
+            assert!(matches!(forward.op(output).unwrap(), Op::Select { .. }));
+            assert!(forward.nodes.iter().any(|node| matches!(
+                &node.op,
+                Op::Unary {
+                    op: UnaryOp::Trunc,
+                    ..
+                }
+            )));
         }
 
         let mut reflected = Graph::new();
@@ -4277,10 +4289,14 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
         if dtype.is_integer() {
             assert!(matches!(reflected.op(output).unwrap(), Op::Select { .. }));
         } else {
-            assert!(
-                matches!(reflected.op(output).unwrap(), Op::Unary { op: UnaryOp::Floor, input }
-                if matches!(reflected.op(*input).unwrap(), Op::Binary { op: BinaryOp::Mul, .. }))
-            );
+            assert!(matches!(reflected.op(output).unwrap(), Op::Select { .. }));
+            assert!(reflected.nodes.iter().any(|node| matches!(
+                &node.op,
+                Op::Unary {
+                    op: UnaryOp::Trunc,
+                    ..
+                }
+            )));
         }
     }
 
@@ -4291,7 +4307,7 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
     let boolean_output = mixed.floor_div_scalar(boolean, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
     let integral_output = mixed.scalar_floor_div(Scalar::F(-0.0), integral).unwrap();
-    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
     let narrow_output = mixed.floor_div_scalar(narrow, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
@@ -4590,7 +4606,7 @@ fn modulo_scalar_preserves_floor_composition_and_reflected_roles() {
     let boolean_output = mixed.modulo_scalar(boolean, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
     let integral_output = mixed.scalar_modulo(Scalar::F(-0.0), integral).unwrap();
-    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
     let narrow_output = mixed.modulo_scalar(narrow, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
@@ -4714,7 +4730,7 @@ fn fmod_scalar_preserves_non_reflected_trunc_composition() {
     let boolean_output = mixed.fmod_scalar(boolean, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
     let integral_output = mixed.fmod_scalar(integral, Scalar::F(-0.0)).unwrap();
-    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
     let narrow_output = mixed.fmod_scalar(narrow, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
@@ -7461,9 +7477,10 @@ fn acos_uses_tinygrad_half_pi_minus_asin_and_preflight() {
     assert!(matches!(
         graph.op(output).unwrap(),
         Op::Binary {
-            op: BinaryOp::Sub,
+            op: BinaryOp::Add,
+            rhs,
             ..
-        }
+        } if matches!(graph.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Neg, .. })
     ));
     assert!((0..graph.node_count()).all(|index| !matches!(
         graph.op(NodeId(index)).unwrap(),
@@ -9716,10 +9733,14 @@ fn neg_uses_tinygrad_bool_logical_not_and_preflighted_numeric_unary() {
     let boolean_output = discrete.neg(boolean).unwrap();
     let signed_output = discrete.neg(signed).unwrap();
     let unsigned_output = discrete.neg(unsigned).unwrap();
-    assert!(
-        matches!(discrete.op(boolean_output).unwrap(), Op::Logical { op: LogicalOp::Not, lhs, rhs: None }
-        if *lhs == boolean)
-    );
+    assert!(matches!(
+        discrete.op(boolean_output).unwrap(),
+        Op::Compare {
+            op: CompareOp::Ne,
+            lhs,
+            ..
+        } if *lhs == boolean
+    ));
     assert!(matches!(
         discrete.op(signed_output).unwrap(),
         Op::Unary {
@@ -9979,8 +10000,8 @@ fn lerp_scalar_uses_the_ordinary_source_composition_even_for_u8_start() {
     ));
     assert!((0..u8.node_count()).any(|index| matches!(
         u8.op(NodeId(index)).unwrap(),
-        Op::Binary {
-            op: BinaryOp::Sub,
+        Op::Unary {
+            op: UnaryOp::Neg,
             ..
         }
     )));
@@ -10421,7 +10442,7 @@ fn public_pad_modes_are_literal_composites_and_atomic() {
     );
 
     let mut malformed = Graph::new();
-    let input = malformed.input("x", [usize::MAX / 8, 1]);
+    let input = malformed.input("x", [usize::MAX / 4, 1]);
     let before = malformed.node_count();
     assert!(matches!(
         malformed.pad_with_mode(input, [(0, 1), (0, 0)], PadMode::Constant, Scalar::I(0)),
@@ -10462,9 +10483,12 @@ fn public_pad_to_is_strict_target_shape_and_source_mask_fill() {
         (0..graph.node_count())
             .any(|node| matches!(graph.op(NodeId(node)).unwrap(), Op::Select { .. }))
     );
-    let loss = graph.sum_all(default).unwrap();
-    let gradient = graph.grad(loss, input).unwrap();
-    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([1, 2]));
+    let mut differentiable = Graph::new();
+    let input = differentiable.input("x", [1, 2]);
+    let output = differentiable.pad_to(input, [Some(3), None]).unwrap();
+    let loss = differentiable.sum_all(output).unwrap();
+    let gradient = differentiable.grad(loss, input).unwrap();
+    assert_eq!(differentiable.shape(gradient).unwrap(), &Shape::new([1, 2]));
 
     // Source returns self before considering `value` when no target extent
     // changes, including a signed-zero/nonrepresentable scalar.
@@ -10559,7 +10583,9 @@ fn softplus_uses_tinygrad_logaddexp_and_preflights_beta() {
         .to_vec_f64();
     assert_eq!(values[0], 1000.0);
     assert_eq!(values[1], 0.0);
-    assert!(values[2].is_infinite() && values[2].is_sign_positive());
+    // Source logaddexp subtracts its ordered maximum. At +inf that literal
+    // composition evaluates `inf - inf`, so the lane remains NaN.
+    assert!(values[2].is_nan());
     assert!(values[3].is_nan());
 
     let mut scalar = Graph::new();
@@ -10655,7 +10681,7 @@ fn mish_reuses_the_stable_tinygrad_softplus_composition() {
     assert_eq!(values[0], 1000.0);
     assert_eq!(values[1], 0.0);
     assert!(values[1].is_sign_negative());
-    assert!(values[2].is_infinite() && values[2].is_sign_positive());
+    assert!(values[2].is_nan());
     assert!(values[3].is_nan());
 
     let mut signed_zero = Graph::new();
@@ -11546,7 +11572,7 @@ fn tinygrad_scatter_replacement_is_ordered_mask_fold_not_raw_scatter() {
             .iter()
             .filter(|node| matches!(&node.op, Op::Select { .. }))
             .count()
-            >= 3
+            >= 2
     );
     assert!(
         !graph

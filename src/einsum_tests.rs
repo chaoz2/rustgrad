@@ -272,19 +272,16 @@ fn einsum_dtype_override_is_traceable_and_validated_before_mutation() {
 }
 
 #[test]
-fn einsum_dtype_override_rejects_gradients_until_cast_aware_vjp_exists() {
+fn einsum_dtype_override_uses_cast_aware_vjp() {
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [2], DType::F16);
     let y = graph.input_dtype("y", [2], DType::F16);
     let loss = graph
         .einsum_with_dtype("i,i->", &[x, y], DType::F32)
         .unwrap();
-    assert_eq!(
-        graph.grad(loss, x),
-        Err(Error::NonDifferentiableIndexing(
-            "einsum dtype overrides require cast-aware gradients",
-        ))
-    );
+    let gradient = graph.grad(loss, x).unwrap();
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::F16);
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2]));
 }
 
 #[test]
@@ -529,6 +526,6 @@ fn einsum_gradients_keep_target_float_dtype_and_skip_exact_inputs() {
     let exact_loss = exact_graph.einsum("i,i->", &[exact, floating]).unwrap();
     assert_eq!(
         exact_graph.grad(exact_loss, exact),
-        Err(Error::NoGradient(exact))
+        Err(Error::NonDifferentiableTarget(exact))
     );
 }

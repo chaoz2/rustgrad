@@ -106,7 +106,10 @@ pub(crate) fn matmul_shape(lhs: &Shape, rhs: &Shape) -> Option<Shape> {
         if lhs_axis != rhs_axis && lhs_axis != 1 && rhs_axis != 1 {
             return None;
         }
-        result.push(lhs_axis.max(rhs_axis));
+        // A singleton broadcasts to the other extent, including a zero
+        // extent. `max` is wrong for the valid `0 x 1` case because it turns
+        // the empty batch axis into one.
+        result.push(if lhs_axis == 1 { rhs_axis } else { lhs_axis });
     }
     if !lhs_vector {
         result.push(lhs_dims[lhs.rank() - 2]);
@@ -433,6 +436,30 @@ mod sum_dtype_tests {
         ];
         for (input, output) in cases {
             assert_eq!(sum_dtype(input), output, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn matmul_batch_broadcast_preserves_zero_extents() {
+        let cases = [
+            (
+                Shape::new([0, 2, 3]),
+                Shape::new([1, 3, 4]),
+                Shape::new([0, 2, 4]),
+            ),
+            (
+                Shape::new([1, 2, 3]),
+                Shape::new([0, 3, 4]),
+                Shape::new([0, 2, 4]),
+            ),
+            (
+                Shape::new([2, 0, 2, 3]),
+                Shape::new([1, 3, 4]),
+                Shape::new([2, 0, 2, 4]),
+            ),
+        ];
+        for (lhs, rhs, expected) in cases {
+            assert_eq!(matmul_shape(&lhs, &rhs), Some(expected));
         }
     }
 }
