@@ -5854,7 +5854,10 @@ fn isinf_sign_selection_preserves_tinygrad_predicate_contract() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F32, []).unwrap(),
+                )]),
             )
             .unwrap()
             .storage(),
@@ -5991,7 +5994,10 @@ fn sign_uses_tinygrad_ordered_nan_and_signed_zero_contract() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F32, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -6154,7 +6160,10 @@ fn reciprocal_preserves_tinygrad_alu_dtype_special_and_vjp_contract() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -6314,7 +6323,10 @@ fn exp_uses_tinygrad_exp2_promotion_special_values_and_vjp() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -6488,7 +6500,10 @@ fn exp2_preserves_tinygrad_storage_width_special_values_and_vjp() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -6642,7 +6657,10 @@ fn sqrt_preserves_direct_storage_width_special_values_and_typed_vjp() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -6768,7 +6786,10 @@ fn rsqrt_uses_tinygrad_sqrt_then_reciprocal_structure_and_preflight() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -6928,7 +6949,10 @@ fn square_uses_tinygrad_self_multiplication_structure_and_preflight() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -7079,7 +7103,10 @@ fn sin_preserves_direct_storage_and_tinygrad_phase_shift_vjp() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -7213,7 +7240,10 @@ fn cos_uses_tinygrad_widened_phase_shift_and_preflight() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -9371,7 +9401,10 @@ fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -9612,7 +9645,10 @@ fn abs_uses_tinygrad_sign_multiply_structure_special_values_and_vjp() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
@@ -9733,7 +9769,10 @@ fn neg_uses_tinygrad_bool_logical_not_and_preflighted_numeric_unary() {
             .execute(
                 &empty,
                 output,
-                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                )]),
             )
             .unwrap()
             .to_vec_f64(),
