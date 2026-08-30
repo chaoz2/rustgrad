@@ -625,8 +625,8 @@ fn packed_generation_serving_identity_rollback_and_malformed_binding_are_explici
             if tensor == super::TOKEN_EMBEDDING
     ));
 
-    let mut unsupported_embedding = packed_state();
-    unsupported_embedding.insert(
+    let mut retained_q5_embedding = packed_state();
+    retained_q5_embedding.insert(
         super::TOKEN_EMBEDDING.to_owned(),
         FixtureTensor::Raw {
             shape: Shape::from([VOCAB, DIM]),
@@ -634,12 +634,18 @@ fn packed_generation_serving_identity_rollback_and_malformed_binding_are_explici
             bytes: vec![0; VOCAB * (DIM / 32) * 22],
         },
     );
-    let bytes = fixture(&unsupported_embedding);
+    let bytes = fixture(&retained_q5_embedding);
     let file = crate::gguf::read_gguf(&bytes).unwrap();
-    assert!(matches!(
-        LlamaModel::from_gguf(&file),
-        Err(LlamaModelError::State(_))
-    ));
+    let (retained_q5_embedding, _) = LlamaModel::from_gguf(&file).unwrap();
+    assert_eq!(
+        retained_q5_embedding.embedding_weight().quantized_type(),
+        Some(GgmlType::Q5_0)
+    );
+    assert!(
+        !retained_q5_embedding
+            .dense_state()
+            .contains_key(super::TOKEN_EMBEDDING)
+    );
 
     let mut malformed_embedding = packed_state();
     let mut malformed_bytes = vec![0; VOCAB * (DIM / 32) * 18];
@@ -671,8 +677,8 @@ fn packed_generation_serving_identity_rollback_and_malformed_binding_are_explici
         Err(LlamaModelError::ShapeMismatch { tensor, .. }) if tensor == "blk.0.attn_k.weight"
     ));
 
-    let mut unsupported = packed_state();
-    unsupported.insert(
+    let mut retained_q5_projection = packed_state();
+    retained_q5_projection.insert(
         "blk.0.attn_q.weight".to_owned(),
         FixtureTensor::Raw {
             shape: Shape::from([HEADS * HEAD_DIM, DIM]),
@@ -680,12 +686,21 @@ fn packed_generation_serving_identity_rollback_and_malformed_binding_are_explici
             bytes: vec![0; HEADS * HEAD_DIM * (DIM / 32) * 22],
         },
     );
-    let bytes = fixture(&unsupported);
+    let bytes = fixture(&retained_q5_projection);
     let file = crate::gguf::read_gguf(&bytes).unwrap();
-    assert!(matches!(
-        LlamaModel::from_gguf(&file),
-        Err(LlamaModelError::State(_))
-    ));
+    let (retained_q5_projection, _) = LlamaModel::from_gguf(&file).unwrap();
+    assert_eq!(
+        retained_q5_projection
+            .linear_weights()
+            .get("blk.0.attn_q.weight")
+            .and_then(LlamaLinearWeight::quantized_type),
+        Some(GgmlType::Q5_0)
+    );
+    assert!(
+        !retained_q5_projection
+            .dense_state()
+            .contains_key("blk.0.attn_q.weight")
+    );
 
     let mut malformed_block = packed_state();
     let mut malformed_bytes = vec![0; HEADS * HEAD_DIM * (DIM / 32) * 18];
