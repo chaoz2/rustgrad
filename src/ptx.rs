@@ -8481,15 +8481,18 @@ mod tests {
             renderer.render(&crate::lower_graph_elementwise(&raw_bool, output).unwrap()),
             Err(PtxError::Unsupported(_))
         ));
+        // Swapping the Not branch is not admitted as scoped subtraction, but
+        // it remains an exact generic Bool Ne followed by Bool OR.
         let mut swapped = Graph::new();
         let lhs = swapped.input_dtype("lhs", [1], DType::Bool);
         let rhs = swapped.input_dtype("rhs", [1], DType::Bool);
         let not_lhs = swapped.logical_not(lhs).unwrap();
         let output = swapped.binary(crate::BinaryOp::Add, not_lhs, rhs).unwrap();
-        assert!(matches!(
-            renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()),
-            Err(PtxError::Unsupported(_))
-        ));
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&swapped, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("setp.ne.u8"));
+        assert!(rendered.source.contains("or.b32"));
 
         let mut narrow = Graph::new();
         let lhs = narrow.input_dtype("lhs", [1], DType::I16);
