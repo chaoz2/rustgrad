@@ -1624,21 +1624,7 @@ fn generated_cast_cases_reach_every_concrete_dtype_on_the_safe_domain() {
 
 #[test]
 fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
-    const DTYPES: [DType; 13] = [
-        DType::Bool,
-        DType::I8,
-        DType::U8,
-        DType::I16,
-        DType::U16,
-        DType::I32,
-        DType::U32,
-        DType::I64,
-        DType::U64,
-        DType::F16,
-        DType::BF16,
-        DType::F32,
-        DType::F64,
-    ];
+    const DTYPES: [DType; 17] = DType::ALL;
     let ops = [
         (FuzzBinaryOp::Add, crate::BinaryOp::Add),
         (FuzzBinaryOp::Sub, crate::BinaryOp::Sub),
@@ -1665,6 +1651,17 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             {
                 continue;
             }
+            if dtype.is_float8()
+                && matches!(
+                    fuzz_op,
+                    FuzzBinaryOp::FloorDiv
+                        | FuzzBinaryOp::TruncDiv
+                        | FuzzBinaryOp::Mod
+                        | FuzzBinaryOp::FMod
+                )
+            {
+                continue;
+            }
             let shape = match (op_index + dtype_index) % 3 {
                 0 => vec![],
                 1 => vec![0],
@@ -1677,12 +1674,26 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             };
             let values = (0..shape.iter().product::<usize>()).map(|lane| match dtype {
                 DType::Bool => Scalar::Bool(lane != 0),
-                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(lane as f64),
+                DType::F8E4M3
+                | DType::F8E5M2
+                | DType::F8E4M3FNUZ
+                | DType::F8E5M2FNUZ
+                | DType::F16
+                | DType::BF16
+                | DType::F32
+                | DType::F64 => Scalar::F(lane as f64),
                 _ => Scalar::I(lane as i64),
             });
             let rhs_values = (0..rhs_shape.iter().product::<usize>()).map(|_| match dtype {
                 DType::Bool => Scalar::Bool(true),
-                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(1.0),
+                DType::F8E4M3
+                | DType::F8E5M2
+                | DType::F8E4M3FNUZ
+                | DType::F8E5M2FNUZ
+                | DType::F16
+                | DType::BF16
+                | DType::F32
+                | DType::F64 => Scalar::F(1.0),
                 _ => Scalar::I(1),
             });
             let case = FuzzCase::Binary {
@@ -1707,6 +1718,15 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
                 .execute(&built.graph, built.output, &built.oracle)
                 .unwrap();
             assert_eq!(output.dtype(), dtype);
+            if dtype.is_float8() {
+                assert_eq!(
+                    crate::execute_elementwise(&built.graph, built.output, &built.oracle)
+                        .unwrap()
+                        .storage(),
+                    output.storage(),
+                    "captured {fuzz_op:?} {dtype:?}",
+                );
+            }
 
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert_eq!(scheduled.items.len(), 1);
@@ -1735,6 +1755,7 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             assert!(CpuJit::render(&uop).is_ok(), "{fuzz_op:?} {dtype:?}");
             let vector = CpuJit::render_vectorized(&uop).unwrap();
             if matches!(dtype, DType::F16 | DType::BF16)
+                || dtype.is_float8()
                 || matches!(fuzz_op, FuzzBinaryOp::Maximum | FuzzBinaryOp::Minimum)
                 || (dtype.is_float()
                     && matches!(
@@ -1748,6 +1769,18 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             {
                 assert!(
                     !vector.source.contains("B2 VectorProgram"),
+                    "{fuzz_op:?} {dtype:?}"
+                );
+            }
+            if dtype.is_float8() {
+                assert!(
+                    uop.topological().unwrap().iter().any(
+                        |node| matches!(node.kind(), UOpKind::GraphBinary(op) if *op == raw_op)
+                    )
+                );
+                assert!(
+                    vector.source.matches("rg_f8_decode(").count() > 1
+                        && vector.source.matches("rg_f8_encode(").count() > 1,
                     "{fuzz_op:?} {dtype:?}"
                 );
             }
@@ -1883,6 +1916,75 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
         assert_eq!(output.dtype(), dtype);
     }
 
+    // Float8 arithmetic consumes numeric decoded lanes and commits every raw
+    // result through the source format. Captured execution and native source
+    // must therefore use the exact codec rather than treating bytes as U8.
+    for dtype in [
+        DType::F8E4M3,
+        DType::F8E5M2,
+        DType::F8E4M3FNUZ,
+        DType::F8E5M2FNUZ,
+    ] {
+        let format = dtype.float8_format().unwrap();
+        let lhs = TensorData::from_storage(
+            [4],
+            Storage::Float8(Float8Storage::from_raw(
+                format,
+                [-0.0, f64::INFINITY, f64::NAN, -2.0]
+                    .into_iter()
+                    .map(|value| format.encode(value))
+                    .collect(),
+            )),
+        )
+        .unwrap();
+        let rhs = TensorData::from_storage(
+            [4],
+            Storage::Float8(Float8Storage::from_raw(
+                format,
+                [0.0, 2.0, 1.0, -1.0]
+                    .into_iter()
+                    .map(|value| format.encode(value))
+                    .collect(),
+            )),
+        )
+        .unwrap();
+        for op in [
+            FuzzBinaryOp::Add,
+            FuzzBinaryOp::Sub,
+            FuzzBinaryOp::Mul,
+            FuzzBinaryOp::Div,
+            FuzzBinaryOp::Maximum,
+            FuzzBinaryOp::Minimum,
+        ] {
+            let case = FuzzCase::Binary {
+                op,
+                lhs: FuzzTensor::from_tensor(&lhs),
+                rhs: FuzzTensor::from_tensor(&rhs),
+            };
+            let built = case.build().unwrap();
+            let oracle = CpuBackend
+                .execute(&built.graph, built.output, &built.oracle)
+                .unwrap();
+            assert_eq!(
+                crate::execute_elementwise(&built.graph, built.output, &built.oracle)
+                    .unwrap()
+                    .storage(),
+                oracle.storage(),
+                "{dtype:?} {op:?} special lanes",
+            );
+            let rendered = CpuJit::render_vectorized(
+                &crate::lower_graph_elementwise(&built.graph, built.output).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                rendered.source.matches("rg_f8_decode(").count() > 1
+                    && rendered.source.matches("rg_f8_encode(").count() > 1
+                    && !rendered.source.contains("B2 VectorProgram"),
+                "{dtype:?} {op:?}"
+            );
+        }
+    }
+
     let bool_lhs =
         TensorData::from_storage([4], Storage::Bool(vec![true, true, false, false])).unwrap();
     let bool_rhs =
@@ -2010,7 +2112,7 @@ fn generated_binary_cases_reach_all_ops_dtypes_and_broadcast_geometries() {
                 let lanes = rhs.to_tensor().unwrap();
                 assert!((0..lanes.len()).all(|lane| lanes.scalar_at(lane).as_f64() != 0.0));
             }
-            if lhs.dtype == DType::Bool {
+            if lhs.dtype == DType::Bool || lhs.dtype.is_float8() {
                 assert!(matches!(
                     op,
                     FuzzBinaryOp::Add
@@ -2027,7 +2129,7 @@ fn generated_binary_cases_reach_all_ops_dtypes_and_broadcast_geometries() {
             empty |= lhs.shape.contains(&0);
         }
     }
-    assert_eq!(pairs.len(), 126);
+    assert_eq!(pairs.len(), 150);
     assert!(scalar_rhs && scalar && empty);
 }
 

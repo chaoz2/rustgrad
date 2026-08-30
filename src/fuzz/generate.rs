@@ -61,11 +61,17 @@ fn nonzero_tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> Fuzz
                 let magnitude = (raw % 4 + 1) as i64;
                 Scalar::I(if raw & 1 == 0 { magnitude } else { -magnitude })
             }
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+            DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ
+            | DType::F16
+            | DType::BF16
+            | DType::F32
+            | DType::F64 => {
                 let magnitude = (raw % 8 + 1) as f64 / 4.0;
                 Scalar::F(if raw & 1 == 0 { magnitude } else { -magnitude })
             }
-            _ => unreachable!("float8 binary fuzz is not generated"),
         }
     });
     FuzzTensor::from_tensor(
@@ -170,27 +176,13 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     match rng.pick(17) {
         0 => {
             let shape = static_shape(&mut rng);
-            let dtype = [
-                DType::Bool,
-                DType::I8,
-                DType::U8,
-                DType::I16,
-                DType::U16,
-                DType::I32,
-                DType::U32,
-                DType::I64,
-                DType::U64,
-                DType::F16,
-                DType::BF16,
-                DType::F32,
-                DType::F64,
-            ][rng.pick(13)];
+            let dtype = DType::ALL[rng.pick(DType::ALL.len())];
             let rhs_shape = if rng.pick(3) == 0 {
                 vec![]
             } else {
                 shape.clone()
             };
-            let ops: &[FuzzBinaryOp] = if dtype == DType::Bool {
+            let ops: &[FuzzBinaryOp] = if dtype == DType::Bool || dtype.is_float8() {
                 &[
                     FuzzBinaryOp::Add,
                     FuzzBinaryOp::Sub,
