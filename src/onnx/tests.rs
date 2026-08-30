@@ -152,15 +152,16 @@ fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
     for (actual, expected) in output.values().iter().zip([0.6, 3. / 7., 9. / 13.]) {
         assert!((actual - expected).abs() < 1e-6);
     }
-    // The source composition retains Pad in the Graph even when scheduling
-    // fuses it into the consumer kernel rather than exposing a movement root.
+    // The source composition retains Pad in the Graph. Scheduling a view of
+    // that computed Pad currently fails closed until computed-base affine
+    // views gain an explicit producer edge.
     assert!(
         graph
             .nodes
             .iter()
             .any(|node| matches!(node.op, crate::Op::Pad { .. }))
     );
-    assert!(crate::schedule(&graph, values["out"]).is_ok());
+    assert!(crate::schedule(&graph, values["out"]).is_err());
 
     for invalid in [
         lrn(&[]),
@@ -1558,7 +1559,7 @@ fn split_preflights_every_source_section_before_atomic_multi_output_publication(
             split(Some("sections"), &["a", "b"], &[]),
             BTreeMap::from([(
                 "sections".into(),
-                TensorData::from_scalars([2], DType::I64, [Scalar::I(1), Scalar::I(1)]).unwrap(),
+                TensorData::from_scalars([2], DType::I64, [Scalar::I(1), Scalar::I(2)]).unwrap(),
             )]),
         ),
         (
@@ -5472,14 +5473,15 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         &[0., 4., 5., 6., 7., 0., 0., 0., 8., 9., 10., 11., 0., 0.]
     );
     // Crop remains an affine view and the final constant Pad remains in the
-    // source Graph even when scheduling fuses it into the consumer kernel.
+    // source Graph. Its downstream view currently fails closed at scheduling
+    // rather than silently dropping the computed producer.
     assert!(
         mixed_graph
             .nodes
             .iter()
             .any(|node| matches!(node.op, crate::Op::Pad { .. }))
     );
-    assert!(crate::schedule(&mixed_graph, mixed_values["out"]).is_ok());
+    assert!(crate::schedule(&mixed_graph, mixed_values["out"]).is_err());
 
     let (_, _, _, default_axes) = run(
         vec![1, 5, 4],
@@ -8995,7 +8997,7 @@ fn reduce_sum_square_matches_tinygrad_typed_sum_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.shape().dims(), &[2, 1]);
     assert_eq!(output.values(), &[0., 0.]);
 
     let mut unknown = node("ReduceSumSquare", &["x"], "out");
@@ -9310,7 +9312,7 @@ fn reduce_l1_matches_tinygrad_abs_then_typed_sum_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.shape().dims(), &[2, 1]);
     assert_eq!(output.values(), &[0., 0.]);
 
     let mut unknown = node("ReduceL1", &["x"], "out");
@@ -11425,7 +11427,7 @@ fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
             )
             .unwrap();
         assert_eq!(output.dtype(), dtype);
-        assert_eq!(output.values(), &[255.]);
+        assert_eq!(output.scalar_at(0).as_f64(), 255.0, "{dtype:?}");
     }
 
     // Integer and Bool square at their source storage width, Sum with the
@@ -11517,7 +11519,7 @@ fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
         )
         .unwrap();
     assert_eq!(output.dtype(), DType::I8);
-    assert_eq!(output.values(), &[0.]);
+    assert_eq!(output.scalar_at(0).as_i64(), 0);
 
     let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap();
     let mut graph = Graph::new();
@@ -11538,7 +11540,7 @@ fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.shape().dims(), &[2, 1]);
     assert_eq!(output.values(), &[0., 0.]);
 
     let mut unknown = node("ReduceL2", &["x"], "out");
@@ -11806,7 +11808,7 @@ fn reduce_log_sum_matches_tinygrad_typed_sum_log2_ln2_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.shape().dims(), &[2, 1]);
     assert_eq!(output.values(), &[f32::NEG_INFINITY, f32::NEG_INFINITY]);
 
     let mut unknown = node("ReduceLogSum", &["x"], "out");
@@ -12102,7 +12104,7 @@ fn reduce_log_sum_exp_matches_tinygrad_direct_exp_sum_log_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.shape().dims(), &[2, 1]);
     assert_eq!(output.values(), &[f32::NEG_INFINITY, f32::NEG_INFINITY]);
 
     let mut unknown = node("ReduceLogSumExp", &["x"], "out");

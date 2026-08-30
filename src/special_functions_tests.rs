@@ -2687,6 +2687,24 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
             .iter()
             .any(|operation| operation.starts_with("abs("))
     );
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(
+            node.op,
+            Op::Unary {
+                op: UnaryOp::Sign,
+                ..
+            }
+        )
+    }));
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(
+            node.op,
+            Op::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]

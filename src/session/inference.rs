@@ -355,7 +355,8 @@ mod tests {
     impl ModuleForward for UnsupportedLater {
         fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
             let supported = graph.relu(input)?;
-            graph.sinh(supported)
+            let mask = graph.gt_scalar(supported, Scalar::F(0.0))?;
+            graph.masked_select(supported, mask, 2, Scalar::F(0.0))
         }
     }
 

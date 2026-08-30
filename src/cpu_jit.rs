@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v19";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v20";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -1390,6 +1390,7 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
                     "    (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[rg_offset];",
                     ids[&(input.node.index() as u64)]
                 ));
+                lines.push("  }".into());
             }
         }
         crate::MovementKernelKind::Pad {
@@ -2882,6 +2883,27 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     #[test]
+    fn computed_affine_copy_renderer_closes_loop_and_kernel() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let producer = graph.relu(input).unwrap();
+        let viewed = graph.reshape(producer, [1, 4]).unwrap();
+        let plan = crate::MovementKernelPlan::from_computed_affine_view(&graph, viewed).unwrap();
+        let rendered = render_movement(&plan).unwrap();
+
+        assert!(rendered.source.contains("for (size_t rg_i=0;"));
+        assert_eq!(
+            rendered.source.bytes().filter(|byte| *byte == b'{').count(),
+            rendered.source.bytes().filter(|byte| *byte == b'}').count()
+        );
+        assert!(
+            rendered
+                .source
+                .ends_with("  return failure[1] ? (int)failure[1] : 0;\n}\n")
+        );
+    }
+
+    #[test]
     fn extrema_render_as_ordered_selects_not_host_intrinsics() {
         let mut graph = Graph::new();
         let lhs = graph.input_dtype("lhs", Shape::from([1]), DType::F32);
@@ -2950,7 +2972,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v19");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v20");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),

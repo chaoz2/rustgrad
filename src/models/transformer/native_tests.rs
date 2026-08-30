@@ -41,7 +41,7 @@ fn strict_native_artifacts_match_graph_and_independent_dense_reference() {
         | LlamaNativeStageKind::QuantizedMatmul { .. }
         | LlamaNativeStageKind::QuantizedRowGather { .. } => true,
         LlamaNativeStageKind::Movement(kind) => {
-            matches!(kind, "reshape" | "permute" | "expand")
+            matches!(kind, "reshape" | "permute" | "expand" | "detach")
         }
     }));
     assert!(
