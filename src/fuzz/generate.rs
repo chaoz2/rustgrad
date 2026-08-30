@@ -318,13 +318,28 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             }
         }
         6 => {
-            // Neg/Abs retain their all-storage surface. The additional raw
-            // transcendental/discrete operations are the exact F32/F64
-            // CPU/captured/strict-native intersection proven by the native
-            // renderer; narrow-float admission remains deliberately absent.
+            // Storage-preserving arithmetic, rounding, sign, and predicates
+            // exercise every concrete non-Float8 dtype. Float-valued
+            // transcendental operations retain the exact F32/F64
+            // CPU/captured/strict-native intersection; narrow transcendental
+            // admission remains deliberately absent.
             let (op, dtype) = if rng.pick(2) == 0 {
                 (
-                    [FuzzUnaryOp::Neg, FuzzUnaryOp::Abs][rng.pick(2)],
+                    [
+                        FuzzUnaryOp::Neg,
+                        FuzzUnaryOp::Abs,
+                        FuzzUnaryOp::Relu,
+                        FuzzUnaryOp::Step,
+                        FuzzUnaryOp::Square,
+                        FuzzUnaryOp::Floor,
+                        FuzzUnaryOp::Ceil,
+                        FuzzUnaryOp::Trunc,
+                        FuzzUnaryOp::Round,
+                        FuzzUnaryOp::Sign,
+                        FuzzUnaryOp::IsNan,
+                        FuzzUnaryOp::IsInf,
+                        FuzzUnaryOp::IsFinite,
+                    ][rng.pick(13)],
                     [
                         DType::Bool,
                         DType::I8,
@@ -344,14 +359,17 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             } else {
                 (
                     [
+                        FuzzUnaryOp::Exp,
                         FuzzUnaryOp::Exp2,
+                        FuzzUnaryOp::Reciprocal,
+                        FuzzUnaryOp::Sqrt,
+                        FuzzUnaryOp::Rsqrt,
                         FuzzUnaryOp::Log2,
                         FuzzUnaryOp::Sin,
                         FuzzUnaryOp::Cos,
                         FuzzUnaryOp::Tan,
                         FuzzUnaryOp::Log,
-                        FuzzUnaryOp::Trunc,
-                    ][rng.pick(7)],
+                    ][rng.pick(10)],
                     [DType::F32, DType::F64][rng.pick(2)],
                 )
             };

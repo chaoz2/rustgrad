@@ -897,16 +897,13 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
         DType::F64,
     ];
     let mut found = false;
-    let mut neg = false;
-    let mut abs = false;
+    let mut ops = std::collections::BTreeSet::new();
     let mut dtypes = std::collections::BTreeSet::new();
-    let mut coverage = [[false; 2]; 13];
-    let mut portable = std::collections::BTreeSet::new();
     let mut scalar = false;
     let mut empty = false;
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index in 0..2048 {
+        for index in 0..8192 {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
@@ -914,44 +911,44 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
                 continue;
             };
             found = true;
-            neg |= op == FuzzUnaryOp::Neg;
-            abs |= op == FuzzUnaryOp::Abs;
+            ops.insert(op);
             dtypes.insert(input.dtype);
-            if matches!(op, FuzzUnaryOp::Neg | FuzzUnaryOp::Abs) {
-                let dtype_index = all_dtypes
-                    .iter()
-                    .position(|dtype| *dtype == input.dtype)
-                    .unwrap();
-                coverage[dtype_index][usize::from(op == FuzzUnaryOp::Abs)] = true;
-            } else {
-                portable.insert((op, input.dtype));
-            }
             scalar |= input.shape.is_empty();
             empty |= input.shape.contains(&0);
         }
     }
 
     assert!(found);
-    assert!(neg && abs);
+    assert_eq!(ops.len(), 23);
     assert_eq!(dtypes.len(), 13);
-    assert!(
-        coverage
-            .iter()
-            .all(|ops| ops.iter().all(|covered| *covered))
-    );
-    assert_eq!(portable.len(), 14);
     for op in [
+        FuzzUnaryOp::Neg,
+        FuzzUnaryOp::Abs,
+        FuzzUnaryOp::Exp,
         FuzzUnaryOp::Exp2,
+        FuzzUnaryOp::Relu,
+        FuzzUnaryOp::Step,
+        FuzzUnaryOp::Reciprocal,
+        FuzzUnaryOp::Square,
+        FuzzUnaryOp::Sqrt,
+        FuzzUnaryOp::Rsqrt,
         FuzzUnaryOp::Log2,
         FuzzUnaryOp::Sin,
         FuzzUnaryOp::Cos,
         FuzzUnaryOp::Tan,
         FuzzUnaryOp::Log,
+        FuzzUnaryOp::Floor,
+        FuzzUnaryOp::Ceil,
         FuzzUnaryOp::Trunc,
+        FuzzUnaryOp::Round,
+        FuzzUnaryOp::Sign,
+        FuzzUnaryOp::IsNan,
+        FuzzUnaryOp::IsInf,
+        FuzzUnaryOp::IsFinite,
     ] {
-        assert!(portable.contains(&(op, DType::F32)));
-        assert!(portable.contains(&(op, DType::F64)));
+        assert!(ops.contains(&op), "missing generated {op:?}");
     }
+    assert_eq!(all_dtypes.len(), 13);
     assert!(scalar && empty);
 }
 
@@ -4448,13 +4445,16 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
 #[test]
 fn portable_float_unaries_retain_graph_capture_and_native_contracts() {
     let operations = [
+        (FuzzUnaryOp::Exp, UnaryOp::Exp, "exp("),
         (FuzzUnaryOp::Exp2, UnaryOp::Exp2, "exp2("),
+        (FuzzUnaryOp::Reciprocal, UnaryOp::Reciprocal, "1.0/("),
+        (FuzzUnaryOp::Sqrt, UnaryOp::Sqrt, "sqrt("),
+        (FuzzUnaryOp::Rsqrt, UnaryOp::Rsqrt, "1.0/sqrt("),
         (FuzzUnaryOp::Log2, UnaryOp::Log2, "log2("),
         (FuzzUnaryOp::Sin, UnaryOp::Sin, "sin("),
         (FuzzUnaryOp::Cos, UnaryOp::Cos, "cos("),
         (FuzzUnaryOp::Tan, UnaryOp::Tan, "tan("),
         (FuzzUnaryOp::Log, UnaryOp::Log, "log("),
-        (FuzzUnaryOp::Trunc, UnaryOp::Trunc, "trunc("),
     ];
 
     for dtype in [DType::F32, DType::F64] {
@@ -4540,6 +4540,108 @@ fn portable_float_unaries_retain_graph_capture_and_native_contracts() {
 }
 
 #[test]
+fn portable_storage_unaries_cover_every_concrete_dtype_and_native_fallback() {
+    let dtypes = [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+    let operations = [
+        (FuzzUnaryOp::Relu, UnaryOp::Relu),
+        (FuzzUnaryOp::Step, UnaryOp::Step),
+        (FuzzUnaryOp::Square, UnaryOp::Square),
+        (FuzzUnaryOp::Floor, UnaryOp::Floor),
+        (FuzzUnaryOp::Ceil, UnaryOp::Ceil),
+        (FuzzUnaryOp::Trunc, UnaryOp::Trunc),
+        (FuzzUnaryOp::Round, UnaryOp::Round),
+        (FuzzUnaryOp::Sign, UnaryOp::Sign),
+        (FuzzUnaryOp::IsNan, UnaryOp::IsNan),
+        (FuzzUnaryOp::IsInf, UnaryOp::IsInf),
+        (FuzzUnaryOp::IsFinite, UnaryOp::IsFinite),
+    ];
+
+    for dtype in dtypes {
+        for (fuzz_op, graph_op) in operations {
+            let input =
+                TensorData::from_scalars([3], dtype, [Scalar::I(-2), Scalar::I(0), Scalar::I(3)])
+                    .unwrap();
+            let case = FuzzCase::Unary {
+                op: fuzz_op,
+                input: FuzzTensor::from_tensor(&input),
+            };
+            let built = case.build().unwrap();
+            let predicate = matches!(
+                fuzz_op,
+                FuzzUnaryOp::IsNan | FuzzUnaryOp::IsInf | FuzzUnaryOp::IsFinite
+            );
+            assert_eq!(
+                built.graph.dtype(built.output).unwrap(),
+                if predicate { DType::Bool } else { dtype },
+                "{dtype:?} {fuzz_op:?}"
+            );
+            assert!(matches!(
+                built.graph.op(built.output).unwrap(),
+                Op::Unary { op, .. } if *op == graph_op
+            ));
+
+            let oracle = CpuBackend
+                .execute(&built.graph, built.output, &built.oracle)
+                .unwrap();
+            let interpreted =
+                crate::execute_elementwise(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(interpreted, oracle, "captured {dtype:?} {fuzz_op:?}");
+
+            let scheduled = schedule(&built.graph, built.output).unwrap();
+            assert_eq!(scheduled.items.len(), 1);
+            assert!(scheduled.items[0].kernel.topological().unwrap().iter().any(
+                |node| matches!(node.kind(), UOpKind::GraphUnary(actual) if *actual == graph_op)
+            ));
+            let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+            let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
+            assert!(scalar.source.contains(crate::cpu_jit::RENDERER_VERSION));
+            assert!(vector.source.contains(crate::cpu_jit::RENDERER_VERSION));
+            assert!(
+                !vector.source.contains("B2 VectorProgram"),
+                "storage unary remains on the exact scalar-per-lane path: {dtype:?} {fuzz_op:?}"
+            );
+            if fuzz_op == FuzzUnaryOp::Square && dtype.is_integer() {
+                assert!(scalar.source.contains("(uint64_t)"), "{dtype:?}");
+            }
+            if fuzz_op == FuzzUnaryOp::Round && dtype.is_float() {
+                assert!(scalar.source.contains("rg_round_ties_even("), "{dtype:?}");
+            }
+            if fuzz_op == FuzzUnaryOp::IsNan && dtype.is_float() {
+                assert!(scalar.source.contains("isnan("), "{dtype:?}");
+            }
+            if fuzz_op == FuzzUnaryOp::IsInf && dtype.is_float() {
+                assert!(scalar.source.contains("isinf("), "{dtype:?}");
+            }
+
+            let captured =
+                CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let bytes = captured.to_bytes().unwrap();
+            assert_eq!(
+                CapturedSchedule::from_bytes(&bytes)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+}
+
+#[test]
 fn fixed_campaigns_match_interpreter_and_strict_native() {
     let interpreter = run_campaign(FuzzConfig {
         seed: 7,
@@ -4601,7 +4703,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 76);
+    assert_eq!(cases.len(), 84);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

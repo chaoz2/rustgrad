@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v20";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v21";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -768,6 +768,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff; r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
         "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
         "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
+        "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
         "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
@@ -2476,8 +2477,23 @@ fn emit(
                 crate::UnaryOp::Square if ty.is_float() => {
                     format!("((double)({a}))*((double)({a}))")
                 }
-                crate::UnaryOp::Square => format!("({a})*({a})"),
+                crate::UnaryOp::Square if input_ty == DType::Bool => a,
+                // Multiply exact integer lanes in defined unsigned arithmetic,
+                // then restore the original storage width. This avoids C's
+                // signed-overflow UB and the narrow unsigned integer promotions
+                // that would otherwise make U16 multiplication overflow `int`.
+                crate::UnaryOp::Square => {
+                    wrap_expr(input_ty, format!("((uint64_t)({a}))*((uint64_t)({a}))"))?
+                }
+                crate::UnaryOp::Relu
+                    if input_ty == DType::Bool
+                        || matches!(input_ty.category(), crate::DTypeCategory::Unsigned) =>
+                {
+                    a
+                }
                 crate::UnaryOp::Relu => format!("(({a})>0?({a}):0)"),
+                crate::UnaryOp::Step if input_ty == DType::Bool => a,
+                crate::UnaryOp::Step => format!("(({a})>0?1:0)"),
                 crate::UnaryOp::Sqrt => format!("sqrt({a})"),
                 crate::UnaryOp::Rsqrt => format!("(1.0/sqrt({a}))"),
                 crate::UnaryOp::Exp => format!("exp({a})"),
@@ -2511,6 +2527,18 @@ fn emit(
                 // integers, so preserve the source storage lane directly.
                 crate::UnaryOp::Trunc if ty.is_float() => format!("trunc({a})"),
                 crate::UnaryOp::Trunc => a,
+                crate::UnaryOp::Floor if input_ty.is_float() => format!("floor({a})"),
+                crate::UnaryOp::Floor => a,
+                crate::UnaryOp::Ceil if input_ty.is_float() => format!("ceil({a})"),
+                crate::UnaryOp::Ceil => a,
+                crate::UnaryOp::Round if input_ty.is_float() => {
+                    format!("rg_round_ties_even({a})")
+                }
+                crate::UnaryOp::Round => a,
+                crate::UnaryOp::IsNan if ty == DType::Bool && input_ty.is_float() => {
+                    format!("((uint8_t)isnan({a}))")
+                }
+                crate::UnaryOp::IsNan if ty == DType::Bool => "((uint8_t)0)".into(),
                 // The raw IsInf public helper has Bool output. C11's
                 // type-generic predicate precisely recognizes both floating
                 // infinities and excludes NaN/finite/signed-zero lanes. Do
@@ -2521,6 +2549,10 @@ fn emit(
                     format!("((uint8_t)isinf({a}))")
                 }
                 crate::UnaryOp::IsInf if ty == DType::Bool => "((uint8_t)0)".into(),
+                crate::UnaryOp::IsFinite if ty == DType::Bool && input_ty.is_float() => {
+                    format!("((uint8_t)isfinite({a}))")
+                }
+                crate::UnaryOp::IsFinite if ty == DType::Bool => "((uint8_t)1)".into(),
                 // tinygrad Sign is `ne(0).where(lt(0).where(-1, 1), 0)`.
                 // Keep its ordered comparisons: NaN is nonzero but unordered
                 // and therefore +1, while either signed zero takes the
@@ -3109,7 +3141,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v20");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v21");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -3366,6 +3398,65 @@ mod tests {
             assert!(absolute.scalar_at(1).as_f64().is_nan());
             assert!(negated.scalar_at(2).as_f64().is_infinite());
             assert!(absolute.scalar_at(2).as_f64().is_infinite());
+        }
+    }
+
+    #[test]
+    fn storage_unaries_use_defined_integer_and_rounding_predicate_paths() {
+        let mut exact = Graph::new();
+        let i64_input = exact.input_dtype("i64", Shape::from([2]), DType::I64);
+        let u16_input = exact.input_dtype("u16", Shape::from([2]), DType::U16);
+        for output in [
+            exact.unary(crate::UnaryOp::Square, i64_input).unwrap(),
+            exact.unary(crate::UnaryOp::Square, u16_input).unwrap(),
+        ] {
+            let rendered =
+                CpuJit::render(&crate::lower_graph_elementwise(&exact, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("((uint64_t)("));
+            assert!(rendered.source.contains("*((uint64_t)("));
+            assert!(!rendered.source.contains("fabs("));
+        }
+
+        let mut floating = Graph::new();
+        let input = floating.input_dtype("input", Shape::from([7]), DType::F64);
+        for (op, token) in [
+            (crate::UnaryOp::Floor, "floor("),
+            (crate::UnaryOp::Ceil, "ceil("),
+            (crate::UnaryOp::Round, "rg_round_ties_even("),
+            (crate::UnaryOp::IsNan, "isnan("),
+            (crate::UnaryOp::IsInf, "isinf("),
+            (crate::UnaryOp::IsFinite, "isfinite("),
+        ] {
+            let output = floating.unary(op, input).unwrap();
+            let uop = crate::lower_graph_elementwise(&floating, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains(token), "{op:?}");
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains(token), "{op:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{op:?}");
+        }
+
+        let round = floating.unary(crate::UnaryOp::Round, input).unwrap();
+        let round_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&floating, round).unwrap())
+                .unwrap()
+                .source;
+        assert!(round_source.contains("frac<0.5"));
+        assert!(round_source.contains("fmod(lo,2.0)==0.0"));
+        assert!(round_source.contains("copysign(0.0,x)"));
+
+        for (dtype, op, expected) in [
+            (DType::I64, crate::UnaryOp::IsNan, "((uint8_t)0)"),
+            (DType::U64, crate::UnaryOp::IsInf, "((uint8_t)0)"),
+            (DType::Bool, crate::UnaryOp::IsFinite, "((uint8_t)1)"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.unary(op, input).unwrap();
+            let source = CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap()
+                .source;
+            assert!(source.contains(expected), "{dtype:?} {op:?}");
         }
     }
 

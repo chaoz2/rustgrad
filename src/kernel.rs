@@ -1505,6 +1505,9 @@ fn unary(x: Scalar, dtype: DType, op: UnaryOp) -> Result<Scalar> {
             (DType::U8 | DType::U16 | DType::U32 | DType::U64, UnaryOp::Sign) => {
                 Scalar::U(u64::from(x.as_u64() != 0))
             }
+            (DType::U8 | DType::U16 | DType::U32 | DType::U64, UnaryOp::Step) => {
+                Scalar::U(u64::from(x.as_u64() > 0))
+            }
             (DType::U8 | DType::U16 | DType::U32 | DType::U64, _) => Scalar::U(x.as_u64()),
             (_, UnaryOp::Neg) => Scalar::I(x.as_i64().wrapping_neg()),
             (_, UnaryOp::Abs) => Scalar::I(x.as_i64().wrapping_abs()),

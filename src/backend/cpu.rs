@@ -1549,12 +1549,12 @@ fn unary_exact(input: &TensorData, op: UnaryOp) -> Result<TensorData> {
                 Scalar::U(match op {
                     UnaryOp::Neg => 0u64.wrapping_sub(value),
                     UnaryOp::Relu
-                    | UnaryOp::Step
                     | UnaryOp::Abs
                     | UnaryOp::Floor
                     | UnaryOp::Ceil
                     | UnaryOp::Trunc
                     | UnaryOp::Round => value,
+                    UnaryOp::Step => u64::from(value > 0),
                     UnaryOp::Square => value.wrapping_mul(value),
                     UnaryOp::Sign => u64::from(value != 0),
                     _ => value,

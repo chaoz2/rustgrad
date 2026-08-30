@@ -23,13 +23,27 @@ pub enum FuzzBinaryOp {
 pub enum FuzzUnaryOp {
     Neg,
     Abs,
+    Exp,
     Exp2,
+    Relu,
+    Step,
+    Reciprocal,
+    Square,
+    Sqrt,
+    Rsqrt,
     Log2,
     Sin,
     Cos,
     Tan,
     Log,
+    Floor,
+    Ceil,
     Trunc,
+    Round,
+    Sign,
+    IsNan,
+    IsInf,
+    IsFinite,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -499,13 +513,27 @@ impl FuzzCase {
                     // direct GraphUnary Abs path shared by captured/native
                     // replay, just as Neg does for its numeric inputs.
                     FuzzUnaryOp::Abs => graph.unary(UnaryOp::Abs, input),
+                    FuzzUnaryOp::Exp => graph.unary(UnaryOp::Exp, input),
                     FuzzUnaryOp::Exp2 => graph.unary(UnaryOp::Exp2, input),
+                    FuzzUnaryOp::Relu => graph.unary(UnaryOp::Relu, input),
+                    FuzzUnaryOp::Step => graph.unary(UnaryOp::Step, input),
+                    FuzzUnaryOp::Reciprocal => graph.unary(UnaryOp::Reciprocal, input),
+                    FuzzUnaryOp::Square => graph.unary(UnaryOp::Square, input),
+                    FuzzUnaryOp::Sqrt => graph.unary(UnaryOp::Sqrt, input),
+                    FuzzUnaryOp::Rsqrt => graph.unary(UnaryOp::Rsqrt, input),
                     FuzzUnaryOp::Log2 => graph.unary(UnaryOp::Log2, input),
                     FuzzUnaryOp::Sin => graph.unary(UnaryOp::Sin, input),
                     FuzzUnaryOp::Cos => graph.unary(UnaryOp::Cos, input),
                     FuzzUnaryOp::Tan => graph.unary(UnaryOp::Tan, input),
                     FuzzUnaryOp::Log => graph.unary(UnaryOp::Log, input),
+                    FuzzUnaryOp::Floor => graph.unary(UnaryOp::Floor, input),
+                    FuzzUnaryOp::Ceil => graph.unary(UnaryOp::Ceil, input),
                     FuzzUnaryOp::Trunc => graph.unary(UnaryOp::Trunc, input),
+                    FuzzUnaryOp::Round => graph.unary(UnaryOp::Round, input),
+                    FuzzUnaryOp::Sign => graph.unary(UnaryOp::Sign, input),
+                    FuzzUnaryOp::IsNan => graph.unary(UnaryOp::IsNan, input),
+                    FuzzUnaryOp::IsInf => graph.unary(UnaryOp::IsInf, input),
+                    FuzzUnaryOp::IsFinite => graph.unary(UnaryOp::IsFinite, input),
                 }
                 .map_err(|error| error.to_string())?
             }

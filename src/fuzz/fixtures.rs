@@ -181,6 +181,72 @@ pub fn regression_cases() -> Vec<FuzzCase> {
                 Storage::F32(vec![-0.0, -1.75, 1.75, f32::INFINITY, f32::NAN]),
             ),
         },
+        FuzzCase::Unary {
+            // Exact integer Square uses storage-width wrapping rather than
+            // signed C overflow or a lossy floating detour.
+            op: FuzzUnaryOp::Square,
+            input: tensor(vec![3], Storage::I64(vec![i64::MIN, -3, i64::MAX])),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Square,
+            input: tensor(vec![2], Storage::U64(vec![(1u64 << 63) + 1, u64::MAX])),
+        },
+        FuzzCase::Unary {
+            // Round is ties-to-even and retains the sign of a zero result.
+            op: FuzzUnaryOp::Round,
+            input: tensor(
+                vec![8],
+                Storage::F64(vec![
+                    -2.5,
+                    -1.5,
+                    -0.5,
+                    0.5,
+                    1.5,
+                    2.5,
+                    f64::INFINITY,
+                    f64::NAN,
+                ]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Step,
+            input: tensor(vec![5], Storage::I64(vec![i64::MIN, -1, 0, 1, i64::MAX])),
+        },
+        FuzzCase::Unary {
+            // Unsigned Step is a source predicate, not an identity for lanes
+            // above one; retain exact U64 values beyond f64 precision here.
+            op: FuzzUnaryOp::Step,
+            input: tensor(vec![3], Storage::U64(vec![0, 1, (1u64 << 53) + 1])),
+        },
+        FuzzCase::Unary {
+            // One raw predicate fixture carries every floating classification.
+            op: FuzzUnaryOp::IsFinite,
+            input: tensor(
+                vec![6],
+                Storage::F32(vec![
+                    -0.0,
+                    1.0,
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                    f32::NAN,
+                    f32::MIN_POSITIVE,
+                ]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Sqrt,
+            input: tensor(
+                vec![6],
+                Storage::F64(vec![-1.0, -0.0, 0.0, 4.0, f64::INFINITY, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Reciprocal,
+            input: tensor(
+                vec![6],
+                Storage::F32(vec![-0.0, 0.0, -2.0, 2.0, f32::INFINITY, f32::NAN]),
+            ),
+        },
         FuzzCase::Compare {
             // IEEE partial comparison makes NaN unequal to itself, while
             // signed zero remains equal to positive zero.
