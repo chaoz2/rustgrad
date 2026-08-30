@@ -106,7 +106,6 @@ pub enum MemoryPlanError {
     InvalidSchedule(String),
     Overflow,
     DuplicateBuffer(u64),
-    InvalidOutputProjection(u64),
     UnsupportedMultiOutput(u64),
     MissingProducer(u64),
     UseBeforeProduce {
