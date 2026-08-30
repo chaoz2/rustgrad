@@ -563,7 +563,7 @@ fn write_scheduled_outputs_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
     }
     // Keep the legacy primary descriptor explicit in the new envelope so a
     // decoder can reject a list whose projection was tampered independently.
-    write_desc_inner(w, &x.output, false)?;
+    write_desc_inner(w, x.primary_output(), false)?;
     write_len(w, x.outputs.len(), MAX_BINDINGS)?;
     for output in x.outputs.iter() {
         write_desc_inner(w, output, false)?;
@@ -609,7 +609,7 @@ fn write_item_inner(w: &mut Writer, x: &ScheduleItem, effects: bool) -> Result<(
     for id in &x.external_materializations {
         w.u64(id.index() as u64)?;
     }
-    write_desc_inner(w, &x.output, effects)?;
+    write_desc_inner(w, x.primary_output(), effects)?;
     let kernel = if effects {
         encode_effect_aware(&x.kernel)?
     } else {
@@ -640,7 +640,7 @@ fn write_item_v3(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> 
     for id in &x.external_materializations {
         w.u64(id.index() as u64)?;
     }
-    write_desc_inner(w, &x.output, false)?;
+    write_desc_inner(w, x.primary_output(), false)?;
     let kernel = encode_uop(&x.kernel)?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
@@ -685,7 +685,7 @@ fn read_scheduled_outputs_item(r: &mut Reader<'_>) -> Result<ScheduleItem, Artif
     for _ in 0..n {
         external_materializations.push(node(r.u64()?)?);
     }
-    let output = read_desc_inner(r, false)?;
+    let legacy_primary = read_desc_inner(r, false)?;
     let n = r.count(MAX_BINDINGS)?;
     let mut output_descs = Vec::with_capacity(n);
     for _ in 0..n {
@@ -693,7 +693,7 @@ fn read_scheduled_outputs_item(r: &mut Reader<'_>) -> Result<ScheduleItem, Artif
     }
     let outputs = ScheduledOutputs::new(output_descs)
         .map_err(|_| ArtifactError::Format("scheduled outputs"))?;
-    if outputs.primary() != &output {
+    if outputs.primary() != &legacy_primary {
         return Err(ArtifactError::Format("scheduled-output projection"));
     }
     let kernel_len = r.count(MAX_ARTIFACT_BYTES)?;
@@ -709,7 +709,6 @@ fn read_scheduled_outputs_item(r: &mut Reader<'_>) -> Result<ScheduleItem, Artif
         input_bindings,
         quantized_input_bindings,
         external_materializations,
-        output,
         outputs,
         kernel,
         boundary,
@@ -772,7 +771,6 @@ fn read_item_inner(
     } else {
         ScheduledOutputs::single(read_desc_inner(r, affine_views)?)
     };
-    let output = outputs.primary().clone();
     let kernel_len = r.count(MAX_ARTIFACT_BYTES)?;
     let kernel = decode_uop(r.take(kernel_len)?)?;
     let boundary = read_boundary_inner(r, effects)?;
@@ -787,7 +785,6 @@ fn read_item_inner(
         quantized_input_bindings,
         external_materializations,
         outputs,
-        output,
         kernel,
         boundary,
         cache_key,
@@ -926,10 +923,7 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
     let count = c.items.len() as u64;
     let mut output_ids = BTreeSet::new();
     for (index, item) in c.items.iter().enumerate() {
-        if item.id != index as u64
-            || item.node.index() as u64 != item.output.id
-            || item.outputs.primary() != &item.output
-        {
+        if item.id != index as u64 || item.node.index() as u64 != item.primary_output().id {
             return Err(ArtifactError::Format("item identity"));
         }
         for output in item.outputs.iter() {
@@ -979,7 +973,7 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
             }
         }
         if item.boundary.is_none()
-            && super::input_bindings(&item.kernel, &item.inputs, &item.output)
+            && super::input_bindings(&item.kernel, &item.inputs, item.primary_output())
                 .map_err(|_| ArtifactError::Format("kernel resources"))?
                 != item.input_bindings
         {
@@ -1144,9 +1138,9 @@ fn rekey_current(capture: &mut CapturedSchedule) -> Result<(), ArtifactError> {
 }
 
 /// Validates the distinct inspection envelope without weakening the released
-/// executable artifact invariant. The legacy validator below still sees a
-/// single-output projection; this routine first validates the complete output
-/// inventory and then verifies its additional producer availability rules.
+/// executable artifact invariant. This routine validates the complete output
+/// inventory and then projects each item to its canonical primary descriptor
+/// before applying the established single-output rules.
 fn validate_scheduled_outputs(
     c: &CapturedSchedule,
     validate_keys: bool,
@@ -1167,9 +1161,7 @@ fn validate_scheduled_outputs(
 
     let mut output_ids = BTreeSet::new();
     for item in &c.items {
-        if item.primary_output() != &item.output
-            || item.node.index() as u64 != item.primary_output().id
-        {
+        if item.node.index() as u64 != item.primary_output().id {
             return Err(ArtifactError::Format("item identity"));
         }
         for output in item.outputs.iter() {
@@ -1242,7 +1234,8 @@ fn validate_scheduled_outputs(
         .retain(|id| primary_ids.contains(id) || passthrough_ids.contains(id));
     let provenance = projected.specialized_from.clone();
     for item in &mut projected.items {
-        item.outputs = ScheduledOutputs::single(item.output.clone());
+        let primary = item.primary_output().clone();
+        item.outputs = ScheduledOutputs::single(primary);
         item.cache_key = if let Some(provenance) = &provenance {
             super::specialized_item_cache_key(
                 item,
@@ -1874,7 +1867,6 @@ mod tests {
         let mut secondary = primary.clone();
         secondary.id = 99;
         item.outputs = ScheduledOutputs::new(vec![primary, secondary.clone()]).unwrap();
-        item.output = item.primary_output().clone();
         item.cache_key = crate::schedule::item_cache_key(item).unwrap();
         capture.identity = identity(&capture).unwrap();
 
@@ -1903,12 +1895,12 @@ mod tests {
         let mut descriptor = encode(&capture).unwrap();
         let body = descriptor.len() - 4;
         let mut output = Writer::new();
-        write_desc_inner(&mut output, &capture.items[0].output, true).unwrap();
+        write_desc_inner(&mut output, capture.items[0].primary_output(), true).unwrap();
         let output_start = descriptor[..body]
             .windows(output.out.len())
             .rposition(|window| window == output.out)
             .unwrap();
-        let bytes = capture.items[0].output.bytes.to_le_bytes();
+        let bytes = capture.items[0].primary_output().bytes.to_le_bytes();
         let bytes_offset = output
             .out
             .windows(bytes.len())
@@ -1952,7 +1944,7 @@ mod tests {
         assert!(decode(&unchecked(&bad_template)).is_err());
 
         let mut missing_shape = capture.clone();
-        let output = missing_shape.items[0].output.id;
+        let output = missing_shape.items[0].primary_output().id;
         missing_shape
             .symbolic
             .as_mut()
@@ -2082,10 +2074,11 @@ mod tests {
         assert_ne!(upgraded.items[0].cache_key, opaque.items[0].cache_key);
 
         let mut multi = capture.clone();
-        let mut secondary = multi.items[0].output.clone();
+        let mut secondary = multi.items[0].primary_output().clone();
         secondary.id = secondary.id.checked_add(1).unwrap();
         multi.items[0].outputs =
-            ScheduledOutputs::new(vec![multi.items[0].output.clone(), secondary]).unwrap();
+            ScheduledOutputs::new(vec![multi.items[0].primary_output().clone(), secondary])
+                .unwrap();
         multi.items[0].cache_key = super::super::item_cache_key(&multi.items[0]).unwrap();
         let bytes = encode_scheduled_outputs(&multi).unwrap();
         let decoded = decode_scheduled_outputs(&bytes).unwrap();
@@ -2097,24 +2090,35 @@ mod tests {
     #[test]
     fn scheduled_output_envelope_rejects_projection_and_identity_tampering() {
         let mut capture = fixture();
-        let mut secondary = capture.items[0].output.clone();
+        let mut secondary = capture.items[0].primary_output().clone();
         secondary.id = secondary.id.checked_add(1).unwrap();
         capture.items[0].outputs =
-            ScheduledOutputs::new(vec![capture.items[0].output.clone(), secondary]).unwrap();
+            ScheduledOutputs::new(vec![capture.items[0].primary_output().clone(), secondary])
+                .unwrap();
         capture.items[0].cache_key = super::super::item_cache_key(&capture.items[0]).unwrap();
-        let mut bad_projection = capture.clone();
-        let secondary_output = bad_projection.items[0]
-            .outputs
-            .iter()
-            .nth(1)
-            .unwrap()
-            .clone();
-        bad_projection.items[0].output = secondary_output;
-        assert!(decode_scheduled_outputs(&unchecked_scheduled_outputs(&bad_projection)).is_err());
+
+        // RGSO retains the historical primary descriptor only inside its
+        // codec. Corrupt that private projection independently of the
+        // canonical output list and prove the decoder still rejects it.
+        let mut bad_projection = encode_scheduled_outputs(&capture).unwrap();
+        let body = bad_projection.len() - 4;
+        let mut marker = Writer::new();
+        write_desc_inner(&mut marker, capture.items[0].primary_output(), false).unwrap();
+        write_len(&mut marker, capture.items[0].outputs.len(), MAX_BINDINGS).unwrap();
+        write_desc_inner(&mut marker, capture.items[0].primary_output(), false).unwrap();
+        let projection_start = bad_projection[..body]
+            .windows(marker.out.len())
+            .position(|window| window == marker.out)
+            .unwrap();
+        bad_projection[projection_start] ^= 1;
+        let sum = checksum(&bad_projection[..body]);
+        bad_projection[body..].copy_from_slice(&sum.to_le_bytes());
+        assert!(decode_scheduled_outputs(&bad_projection).is_err());
+
         assert!(
             ScheduledOutputs::new(vec![
-                capture.items[0].output.clone(),
-                capture.items[0].output.clone(),
+                capture.items[0].primary_output().clone(),
+                capture.items[0].primary_output().clone(),
             ])
             .is_err()
         );

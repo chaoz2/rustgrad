@@ -615,7 +615,7 @@ impl CapturedReplayExecutor {
                 continue;
             }
             if item
-                .output
+                .primary_output()
                 .shape
                 .numel()
                 .map_err(|e| ReplayError::Descriptor(e.to_string()))?
@@ -648,7 +648,7 @@ impl CapturedReplayExecutor {
                 continue;
             }
             if item
-                .output
+                .primary_output()
                 .shape
                 .numel()
                 .map_err(|e| ReplayError::Descriptor(e.to_string()))?

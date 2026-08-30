@@ -1169,9 +1169,11 @@ temporary-plan utility only reuses caller-designated internal buffers with
 non-overlapping lifetimes and compatible size/alignment. Vectorization and
 device rendering retain their own capability boundaries. A separate
 `ScheduledOutputs` collection is the canonical nonempty ordered output ABI:
-the legacy single-output projection remains checked and preserves existing
-identities, while a coupled static `Sort` owns one value descriptor and one I32
-index descriptor. The CPU interpreter is the sole multi-output consumer; all
+`ScheduleItem` stores no second primary projection, and one-output consumers
+call `primary_output()` explicitly. Historical artifact codecs privately
+project the first descriptor to preserve and validate released RGSA/RGSM/RGSO
+bytes, while a coupled static `Sort` owns one value descriptor and one I32 index
+descriptor. The CPU interpreter is the sole multi-output consumer; all
 other executors reject the pair before cache, allocation, source generation, or
 launch. `argsort` chooses the index descriptor and `top_k` composes only checked
 slices over the same stable ordered pair. `TensorGuard` is a typed value

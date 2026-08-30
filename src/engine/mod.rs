@@ -679,7 +679,6 @@ mod tests {
         let mut secondary = primary.clone();
         secondary.id = 99;
         schedule.items[0].outputs = crate::ScheduledOutputs::new(vec![primary, secondary]).unwrap();
-        schedule.items[0].output = schedule.items[0].primary_output().clone();
         schedule.items[0].cache_key = crate::schedule::item_cache_key(&schedule.items[0]).unwrap();
         assert!(matches!(
             realize(

@@ -87,9 +87,8 @@ pub enum ScheduleBoundary {
 }
 /// Immutable, ordered outputs owned by one scheduled producer.
 ///
-/// `ScheduleItem::output` is retained temporarily as the checked legacy
-/// projection while executors migrate. New multi-output producers use this
-/// collection as their canonical descriptor inventory.
+/// This is the sole output descriptor inventory for a scheduled producer.
+/// Single-output consumers use [`ScheduleItem::primary_output`] explicitly.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ScheduledOutputs(Vec<BufferDesc>);
 
@@ -145,8 +144,6 @@ pub struct ScheduleItem {
     /// lowering in this item.
     pub external_materializations: Vec<NodeId>,
     pub outputs: ScheduledOutputs,
-    /// Checked source-compatible projection for legacy one-output consumers.
-    pub output: BufferDesc,
     pub kernel: UOp,
     pub boundary: Option<ScheduleBoundary>,
     pub cache_key: u64,
@@ -197,15 +194,9 @@ impl Schedule {
         }
         self.validate_dag_edges(&ids)?;
         for item in &self.items {
-            if item.outputs.primary() != &item.output {
-                return Err(ScheduleError::Binding(
-                    "scheduled output projection is not canonical".into(),
-                ));
-            }
             for output in item.outputs.iter() {
                 validate_buffer_desc(output)?;
             }
-            validate_buffer_desc(&item.output)?;
             for input in &item.inputs {
                 validate_buffer_desc(input)?;
             }
@@ -409,9 +400,7 @@ pub enum ScheduleError {
     Binding(String),
 }
 impl ScheduleItem {
-    /// Canonical first descriptor. Existing one-output paths must use this
-    /// explicit projection rather than directly depending on the retained
-    /// compatibility field.
+    /// Canonical first descriptor for single-output execution paths.
     pub fn primary_output(&self) -> &BufferDesc {
         self.outputs.primary()
     }
@@ -441,7 +430,8 @@ impl ScheduleItem {
         // payloads as dependency-free UOp constants. Validate every binding
         // against the inventory below without requiring equal cardinality.
         if self.boundary.is_none()
-            && input_bindings(&self.kernel, &self.inputs, &self.output)? != self.input_bindings
+            && input_bindings(&self.kernel, &self.inputs, self.primary_output())?
+                != self.input_bindings
         {
             return Err(ScheduleError::Binding(
                 "bindings do not match lowered kernel resources".into(),
@@ -572,8 +562,7 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
             }],
             quantized_input_bindings: vec![],
             external_materializations: vec![],
-            outputs: ScheduledOutputs::single(output.clone()),
-            output,
+            outputs: ScheduledOutputs::single(output),
             kernel: node.after_uop(),
             boundary: Some(ScheduleBoundary::Effect),
             cache_key: 0,
@@ -1687,7 +1676,6 @@ fn schedule_many_with_external(
             } else {
                 ScheduledOutputs::single(output.clone())
             },
-            output,
             kernel,
             boundary,
             cache_key: 0,
@@ -1831,8 +1819,7 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
         input_bindings,
         quantized_input_bindings,
         external_materializations: vec![],
-        outputs: ScheduledOutputs::single(out.clone()),
-        output: out,
+        outputs: ScheduledOutputs::single(out),
         kernel,
         boundary,
         cache_key: 0,

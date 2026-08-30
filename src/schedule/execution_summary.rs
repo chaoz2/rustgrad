@@ -1,5 +1,5 @@
 //! Immutable static schedule and logical-memory inspection.
-use super::{BufferDesc, Schedule, ScheduleError, schedule_many};
+use super::{BufferDesc, Schedule, ScheduleError, ScheduledOutputs, schedule_many};
 use crate::{Graph, MemoryPlan, MemoryPlanError, NodeId, Operation};
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
@@ -11,12 +11,17 @@ use std::{
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ExecutionPlanItemSummary {
     pub item_id: u64,
-    /// Ordered producer-owned descriptors. `output` remains the primary
-    /// compatibility projection for one-output callers.
-    pub outputs: Vec<BufferDesc>,
-    pub output: BufferDesc,
+    /// Ordered producer-owned descriptors.
+    pub outputs: ScheduledOutputs,
     pub operation: Operation,
     pub dependencies: Vec<u64>,
+}
+
+impl ExecutionPlanItemSummary {
+    /// Canonical first descriptor for one-output inspection paths.
+    pub fn primary_output(&self) -> &BufferDesc {
+        self.outputs.primary()
+    }
 }
 
 /// Deterministic logical facts derived from one validated static schedule and
@@ -94,8 +99,7 @@ impl ExecutionPlanSummary {
             .iter()
             .map(|item| ExecutionPlanItemSummary {
                 item_id: item.id,
-                outputs: item.outputs.iter().cloned().collect(),
-                output: item.primary_output().clone(),
+                outputs: item.outputs.clone(),
                 operation: item.kernel.operation().clone(),
                 dependencies: item.dependencies.clone(),
             })

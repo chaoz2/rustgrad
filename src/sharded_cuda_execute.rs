@@ -5204,7 +5204,7 @@ mod tests {
                         .iter()
                         .map(|node| node.index() as u64)
                         .collect(),
-                    output: item.output.id,
+                    output: item.primary_output().id,
                     dependencies,
                     source_key: source_key.clone(),
                     module_key: format!(
@@ -5504,7 +5504,7 @@ mod tests {
                     .iter()
                     .map(|node| node.index() as u64)
                     .collect(),
-                output: item.output.id,
+                output: item.primary_output().id,
                 dependencies,
                 source_key: source_key.clone(),
                 module_key: format!(

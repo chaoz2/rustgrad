@@ -24,8 +24,7 @@ fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
         input_bindings: vec![],
         quantized_input_bindings: vec![],
         external_materializations: vec![],
-        outputs: crate::ScheduledOutputs::single(output.clone()),
-        output,
+        outputs: crate::ScheduledOutputs::single(output),
         kernel: UOp::sink(vec![]),
         boundary: None,
         cache_key: 0,
@@ -67,7 +66,7 @@ fn requested_source_values_are_passthroughs_not_schedule_producers() {
 }
 
 #[test]
-fn scheduled_outputs_are_nonempty_ordered_and_preserve_canonical_single_identity() {
+fn scheduled_outputs_are_nonempty_ordered_and_define_cache_identity() {
     let output = buffer(7, 4, 1);
     assert!(ScheduledOutputs::new(vec![]).is_err());
     assert!(ScheduledOutputs::new(vec![output.clone(), output.clone()]).is_err());
@@ -90,14 +89,12 @@ fn scheduled_outputs_are_nonempty_ordered_and_preserve_canonical_single_identity
         canonical_identity
     );
 
-    let mut stale_projection = single;
-    stale_projection.output.id = 9;
     let schedule = crate::Schedule {
-        items: vec![stale_projection],
+        items: vec![single],
         value_bindings: vec![],
         state_bindings: vec![],
     };
-    assert!(schedule.validate().is_err());
+    schedule.validate().unwrap();
 }
 
 #[test]
@@ -323,11 +320,13 @@ fn schedule_descriptor_validation_rejects_before_memory_or_capture_work() {
         .collect::<Vec<_>>();
 
     let mut wrong_bytes = schedule.clone();
-    wrong_bytes.items[0].output.bytes += 1;
+    let mut output_desc = wrong_bytes.items[0].primary_output().clone();
+    output_desc.bytes += 1;
+    wrong_bytes.items[0].outputs = ScheduledOutputs::single(output_desc);
     assert!(matches!(
         wrong_bytes.validate(),
         Err(crate::ScheduleError::Binding(message))
-            if message == "scheduled output projection is not canonical"
+            if message == "buffer descriptor byte size mismatch"
     ));
     assert_eq!(
         wrong_bytes
