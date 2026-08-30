@@ -123,7 +123,7 @@ impl std::error::Error for LinearizeError {}
 impl LinearKernel {
     pub fn from_uop(source: &UOp) -> Result<Self, LinearizeError> {
         source
-            .topological()
+            .validate()
             .map_err(|e| LinearizeError::Invalid(e.to_string()))?;
         let mut nodes = Vec::new();
         producer_order(source, &mut BTreeSet::new(), &mut nodes);
@@ -512,7 +512,90 @@ fn validate_program(program: &LinearProgram) -> Result<(), LinearizeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Graph, Shape};
+    use crate::{AddressSpace, AddressValue, Graph, Shape, UType};
+
+    fn scalar_copy_kernel(space: AddressSpace) -> UOp {
+        let f32_type = UType::scalar(DType::F32);
+        let i64_type = UType::scalar(DType::I64);
+        let address = UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
+                space,
+                name: "b0".into(),
+                element: f32_type,
+            }),
+            Some(f32_type),
+            vec![],
+        );
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(i64_type),
+            vec![UOp::constant(1, i64_type)],
+        );
+        let index = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
+                buffer: 0,
+                elements: 1,
+                input_shape: Shape::from([1]),
+                output_shape: Shape::from([1]),
+            }),
+            Some(f32_type),
+            vec![address, range.clone()],
+        );
+        let store = UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![
+                index,
+                UOp::scalar_constant(DType::F32, 1.0_f32.to_bits() as u64, f32_type),
+            ],
+        );
+        UOp::sink(vec![
+            store,
+            UOp::from_operation(Operation::EndRange, None, vec![range]),
+        ])
+    }
+
+    #[test]
+    fn rejects_invalid_source_uop_before_linearization() {
+        let valid = scalar_copy_kernel(AddressSpace::Global);
+        valid.validate().unwrap();
+        LinearKernel::from_uop(&valid).unwrap();
+
+        let invalid = scalar_copy_kernel(AddressSpace::Local);
+        assert_eq!(invalid.topological().unwrap().last(), Some(&invalid));
+        assert_eq!(invalid.validate(), Err(crate::UOpError::InvalidArgument));
+        assert!(matches!(
+            LinearKernel::from_uop(&invalid),
+            Err(LinearizeError::Invalid(reason)) if reason.contains("InvalidArgument")
+        ));
+    }
+
+    #[test]
+    fn admits_source_lifted_transcendentals_before_linearization() {
+        for op in [
+            crate::UnaryOp::Exp2,
+            crate::UnaryOp::Log2,
+            crate::UnaryOp::Sin,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([4]), DType::I64);
+            let output = graph.unary(op, input).unwrap();
+            let source = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let unary = source
+                .topological()
+                .unwrap()
+                .into_iter()
+                .find(
+                    |node| matches!(node.operation(), Operation::GraphUnary(found) if *found == op),
+                )
+                .unwrap();
+            assert_eq!(unary.sources()[0].ty(), Some(UType::scalar(DType::I64)));
+            assert_eq!(unary.ty(), Some(UType::scalar(DType::F32)));
+            source.validate().unwrap();
+            LinearKernel::from_uop(&source).unwrap();
+        }
+    }
+
     #[test]
     fn snapshots_contiguous_and_varying_broadcast_plans() {
         let mut graph = Graph::new();

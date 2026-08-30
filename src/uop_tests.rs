@@ -88,6 +88,59 @@ fn graph_unary_predicates_have_bool_outputs_and_retain_typed_inputs() {
 }
 
 #[test]
+fn graph_unary_transcendentals_follow_source_dtype_lifting_and_lane_width() {
+    let scalar_input = UOp::scalar_constant(DType::I64, 1, i64t());
+    for op in [
+        crate::UnaryOp::Exp2,
+        crate::UnaryOp::Log2,
+        crate::UnaryOp::Sin,
+    ] {
+        UOp::from_operation(
+            Operation::GraphUnary(op),
+            Some(f32t()),
+            vec![scalar_input.clone()],
+        )
+        .validate()
+        .unwrap();
+
+        let wrong_storage = UOp::from_operation(
+            Operation::GraphUnary(op),
+            Some(i64t()),
+            vec![scalar_input.clone()],
+        );
+        assert!(matches!(
+            wrong_storage.validate(),
+            Err(crate::UOpError::InvalidDType)
+        ));
+    }
+
+    let four_i64 = UType::vector(DType::I64, 4).unwrap();
+    let four_f32 = UType::vector(DType::F32, 4).unwrap();
+    let vector_input = UOp::from_operation(
+        Operation::Special("transcendental_input".into()),
+        Some(four_i64),
+        vec![],
+    );
+    UOp::from_operation(
+        Operation::GraphUnary(crate::UnaryOp::Sin),
+        Some(four_f32),
+        vec![vector_input.clone()],
+    )
+    .validate()
+    .unwrap();
+
+    let wrong_lanes = UOp::from_operation(
+        Operation::GraphUnary(crate::UnaryOp::Sin),
+        Some(UType::vector(DType::F32, 2).unwrap()),
+        vec![vector_input],
+    );
+    assert!(matches!(
+        wrong_lanes.validate(),
+        Err(crate::UOpError::InvalidDType)
+    ));
+}
+
+#[test]
 fn upat_rewrites_are_prioritized_shared_and_pure() {
     let x = UOp::scalar_constant(DType::I32, 7, i32t());
     let zero = UOp::scalar_constant(DType::I32, 0, i32t());
@@ -367,6 +420,34 @@ fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
         UOp::from_operation(Operation::EndRange, None, vec![range]),
     ]);
     assert!(root.validate().is_err());
+}
+
+#[test]
+fn typed_address_definitions_require_their_declared_memory_space() {
+    let address = |space| AddressValue {
+        space,
+        name: "buffer".into(),
+        element: i64t(),
+    };
+    for operation in [
+        Operation::DefineGlobal(address(crate::AddressSpace::Global)),
+        Operation::DefineLocal(address(crate::AddressSpace::Local)),
+        Operation::DefineRegister(address(crate::AddressSpace::Register)),
+    ] {
+        UOp::from_operation(operation, Some(i64t()), vec![])
+            .validate()
+            .unwrap();
+    }
+    for operation in [
+        Operation::DefineGlobal(address(crate::AddressSpace::Local)),
+        Operation::DefineLocal(address(crate::AddressSpace::Register)),
+        Operation::DefineRegister(address(crate::AddressSpace::Global)),
+    ] {
+        assert_eq!(
+            UOp::from_operation(operation, Some(i64t()), vec![]).validate(),
+            Err(crate::UOpError::InvalidArgument)
+        );
+    }
 }
 
 #[test]
