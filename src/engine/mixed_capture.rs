@@ -10,7 +10,10 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSM";
-const VERSION: u8 = 2;
+/// v3 adopts canonical schedule item/state-binding keys. v1-v2 retain opaque
+/// historical keys and are upgraded only after their stored envelope passes.
+const VERSION: u8 = 3;
+const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 const MAX_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -73,7 +76,7 @@ impl<'a> BoundMixedCapture<'a> {
         starts: BTreeMap<u64, BufferState>,
         provided: &BTreeMap<String, crate::TensorData>,
     ) -> Result<Self, ReplayError> {
-        validate(capture)?;
+        validate(capture, true)?;
         let mut inputs = provided.clone();
         for binding in &capture.state_bindings {
             let input = capture
@@ -215,7 +218,7 @@ impl CapturedMixedSchedule {
     /// every persistent state referenced by the captured Store/After and
     /// state-input ABI exactly once.
     pub fn rebound(&self, rebinding: &MixedStateRebinding) -> Result<Self, ReplayError> {
-        validate(self)?;
+        validate(self, true)?;
         let referenced = referenced_buffers(self)?;
         rebinding.validate_exact(&referenced)?;
         let map_state = |state: &BufferState| -> Result<BufferState, ReplayError> {
@@ -293,7 +296,18 @@ impl CapturedMixedSchedule {
                 .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
             item.output = item.primary_output().clone();
         }
-        validate(&value)?;
+        let specialization = value
+            .schedule
+            .specialized_from
+            .as_ref()
+            .map(|source| (source.source_identity, source.bindings.as_slice()));
+        crate::schedule::rekey_schedule_items(
+            &mut value.schedule.items,
+            &value.state_bindings,
+            specialization,
+        )
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        validate(&value, true)?;
         Ok(value)
     }
 
@@ -355,7 +369,7 @@ impl CapturedMixedSchedule {
         provided: &BTreeMap<String, crate::TensorData>,
         native: Option<(&super::captured_replay::CapturedReplayExecutor, bool)>,
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
-        validate(self)?;
+        validate(self, true)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
             value_bindings: self.value_bindings.clone(),
@@ -521,18 +535,20 @@ impl CapturedMixedSchedule {
                 ));
             }
         }
-        Ok(Self {
+        let value = Self {
             schedule,
             value_bindings: mixed.value_bindings.clone(),
             state_bindings: mixed.state_bindings.clone(),
             states,
-        })
+        };
+        validate(&value, true)?;
+        Ok(value)
     }
 
     /// Bounded deterministic RGSM encoding. It intentionally excludes every
     /// runtime lease, slot, pointer, generation, and current buffer byte.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ReplayError> {
-        validate(self)?;
+        validate(self, true)?;
         let mut w = Writer::new();
         w.bytes(MAGIC).map_err(codec)?;
         w.u8(VERSION).map_err(codec)?;
@@ -613,20 +629,30 @@ impl CapturedMixedSchedule {
             state_bindings,
             states,
         };
-        validate(&decoded)?;
-        let actual = identity(&decoded)?;
-        // v1's effect-aware UOp stream predates the optional normalized index
-        // payload flag. Its bytes cannot be re-emitted byte-for-byte by v2,
-        // so retain the validated v1 envelope while assigning the upgraded
-        // canonical identity on decode. v2 remains self-authenticating.
-        if version == VERSION && actual != stored_identity {
+        let legacy = version < VERSION;
+        // Current envelopes must already carry canonical item identities.
+        // Historical versions authenticate their opaque keys first and only
+        // then derive the current representation below.
+        validate(&decoded, !legacy)?;
+        let actual = fnv1a(&bytes[HEADER_LEN..body]);
+        if actual != stored_identity {
             return Err(ReplayError::Corrupt("RGSM identity".into()));
         }
-        schedule.identity = actual;
-        Ok(Self {
+        if legacy {
+            crate::schedule::rekey_schedule_items(
+                &mut schedule.items,
+                &decoded.state_bindings,
+                None,
+            )
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        }
+        let mut upgraded = Self {
             schedule,
             ..decoded
-        })
+        };
+        upgraded.schedule.identity = identity(&upgraded)?;
+        validate(&upgraded, true)?;
+        Ok(upgraded)
     }
 
     /// Replays a decoded mixed artifact against caller-owned persistent state.
@@ -639,7 +665,7 @@ impl CapturedMixedSchedule {
         provided: &BTreeMap<String, crate::TensorData>,
         injected_failure: Option<u64>,
     ) -> Result<MixedReplayResult, ReplayError> {
-        validate(self)?;
+        validate(self, true)?;
         if self
             .schedule
             .items
@@ -764,7 +790,7 @@ impl CapturedMixedSchedule {
         vectorized: bool,
         injected_failure: Option<u64>,
     ) -> Result<MixedReplayResult, ReplayError> {
-        validate(self)?;
+        validate(self, true)?;
         let native_trace = self.native_replay_trace(vectorized)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
@@ -862,7 +888,7 @@ impl CapturedMixedSchedule {
         &self,
         vectorized: bool,
     ) -> Result<NativeMixedReplayTrace, ReplayError> {
-        validate(self)?;
+        validate(self, true)?;
         let artifact_identity = identity(self)?;
         let pure_item_cache_keys = self
             .schedule
@@ -1175,6 +1201,66 @@ mod tests {
     }
 
     #[test]
+    fn rgsm_rejects_unserialized_symbolic_and_specialization_metadata() {
+        let base = captured_effect();
+        let mixed = Schedule {
+            items: base.schedule.items.clone(),
+            value_bindings: base.value_bindings.clone(),
+            state_bindings: base.state_bindings.clone(),
+        };
+        let states = base.states.clone();
+
+        let mut symbolic = base.schedule.clone();
+        symbolic.symbolic = Some(crate::engine::symbolic::SymbolicSchema {
+            parameters: vec![],
+            template_values: vec![],
+            guards: vec![],
+            buffer_shapes: BTreeMap::new(),
+            item_domains: BTreeMap::new(),
+            views: BTreeMap::new(),
+            splat_constants: BTreeSet::new(),
+        });
+        let symbolic_value = CapturedMixedSchedule {
+            schedule: symbolic.clone(),
+            value_bindings: base.value_bindings.clone(),
+            state_bindings: base.state_bindings.clone(),
+            states: base.states.clone(),
+        };
+        assert!(matches!(
+            symbolic_value.to_bytes(),
+            Err(ReplayError::Unsupported(message))
+                if message == "RGSM does not encode symbolic schemas or specialization provenance"
+        ));
+        assert!(matches!(
+            CapturedMixedSchedule::from_parts(symbolic, &mixed, states.clone()),
+            Err(ReplayError::Unsupported(message))
+                if message == "RGSM does not encode symbolic schemas or specialization provenance"
+        ));
+
+        let mut specialized = base.schedule.clone();
+        specialized.specialized_from = Some(crate::engine::symbolic::SpecializedFrom {
+            source_identity: 17,
+            bindings: vec![(3, 5)],
+        });
+        assert!(matches!(
+            CapturedMixedSchedule::from_parts(specialized.clone(), &mixed, states),
+            Err(ReplayError::Unsupported(message))
+                if message == "RGSM does not encode symbolic schemas or specialization provenance"
+        ));
+        let invalid = CapturedMixedSchedule {
+            schedule: specialized,
+            value_bindings: base.value_bindings,
+            state_bindings: base.state_bindings,
+            states: base.states,
+        };
+        assert!(matches!(
+            invalid.to_bytes(),
+            Err(ReplayError::Unsupported(message))
+                if message == "RGSM does not encode symbolic schemas or specialization provenance"
+        ));
+    }
+
+    #[test]
     fn replay_local_rebinding_preserves_artifact_and_raw_state_contract() {
         let captured = captured_effect();
         let bytes = captured.to_bytes().unwrap();
@@ -1363,14 +1449,73 @@ mod tests {
     }
 
     #[test]
-    fn rgsm_v1_envelope_upgrades_to_the_canonical_v2_identity() {
-        let mut bytes = captured_effect().to_bytes().unwrap();
-        bytes[4] = 1;
-        let checksum_at = bytes.len() - 4;
-        let sum = checksum(&bytes[..checksum_at]).to_le_bytes();
-        bytes[checksum_at..].copy_from_slice(&sum);
-        let decoded = CapturedMixedSchedule::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.to_bytes().unwrap()[4], VERSION);
+    fn released_rgsm_v1_v2_layout_fixture_remains_decodable() {
+        // Preserve the historical fixture used before the identity migration:
+        // v1 and v2 share the released typed field layout, differing only in
+        // envelope policy. Updating only the version/checksum must therefore
+        // remain a supported decode-and-upgrade path.
+        for legacy_version in [1, 2] {
+            let mut bytes = captured_effect().to_bytes().unwrap();
+            bytes[4] = legacy_version;
+            let checksum_at = bytes.len() - 4;
+            let sum = checksum(&bytes[..checksum_at]).to_le_bytes();
+            bytes[checksum_at..].copy_from_slice(&sum);
+            let decoded = CapturedMixedSchedule::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.to_bytes().unwrap()[4], VERSION);
+        }
+    }
+
+    #[test]
+    fn legacy_rgsm_envelopes_upgrade_to_the_canonical_v3_identity() {
+        for legacy_version in [1, 2] {
+            let mut legacy = captured_effect();
+            for (index, item) in legacy.schedule.items.iter_mut().enumerate() {
+                item.cache_key = 0x8877_6655_4433_2200 + index as u64;
+            }
+            let opaque = legacy
+                .schedule
+                .items
+                .iter()
+                .map(|item| item.cache_key)
+                .collect::<Vec<_>>();
+            let payload = legacy.to_bytes_without_identity().unwrap();
+            let mut writer = Writer::new();
+            writer.bytes(MAGIC).unwrap();
+            writer.u8(legacy_version).unwrap();
+            writer.u64(fnv1a(&payload)).unwrap();
+            writer.bytes(&payload).unwrap();
+            let sum = checksum(&writer.out);
+            writer.u32(sum).unwrap();
+            let decoded = CapturedMixedSchedule::from_bytes(&writer.out).unwrap();
+            assert_eq!(decoded.to_bytes().unwrap()[4], VERSION);
+            assert_ne!(
+                decoded
+                    .schedule
+                    .items
+                    .iter()
+                    .map(|item| item.cache_key)
+                    .collect::<Vec<_>>(),
+                opaque
+            );
+        }
+    }
+
+    #[test]
+    fn current_rgsm_rejects_authenticated_noncanonical_item_keys() {
+        let mut forged = captured_effect();
+        forged.schedule.items[0].cache_key ^= 1;
+        let payload = forged.to_bytes_without_identity().unwrap();
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(VERSION).unwrap();
+        writer.u64(fnv1a(&payload)).unwrap();
+        writer.bytes(&payload).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        assert!(matches!(
+            CapturedMixedSchedule::from_bytes(&writer.out),
+            Err(ReplayError::Corrupt(message)) if message.contains("cache identity")
+        ));
     }
 
     #[test]
@@ -1628,7 +1773,12 @@ fn read_states(r: &mut Reader<'_>) -> Result<Vec<BufferState>, ReplayError> {
         .collect()
 }
 
-fn validate(value: &CapturedMixedSchedule) -> Result<(), ReplayError> {
+fn validate(value: &CapturedMixedSchedule, validate_keys: bool) -> Result<(), ReplayError> {
+    if value.schedule.symbolic.is_some() || value.schedule.specialized_from.is_some() {
+        return Err(ReplayError::Unsupported(
+            "RGSM does not encode symbolic schemas or specialization provenance".into(),
+        ));
+    }
     let schedule = Schedule {
         items: value.schedule.items.clone(),
         value_bindings: value.value_bindings.clone(),
@@ -1637,6 +1787,27 @@ fn validate(value: &CapturedMixedSchedule) -> Result<(), ReplayError> {
     schedule
         .validate()
         .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
+    if validate_keys {
+        let mut expected = schedule.items.clone();
+        let specialization = value
+            .schedule
+            .specialized_from
+            .as_ref()
+            .map(|source| (source.source_identity, source.bindings.as_slice()));
+        crate::schedule::rekey_schedule_items(
+            &mut expected,
+            &schedule.state_bindings,
+            specialization,
+        )
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        if expected
+            .iter()
+            .zip(&schedule.items)
+            .any(|(expected, actual)| expected.cache_key != actual.cache_key)
+        {
+            return Err(ReplayError::Corrupt("RGSM item cache identity".into()));
+        }
+    }
     if !schedule.items.iter().any(crate::ScheduleItem::is_effect) {
         return Err(ReplayError::Unsupported(
             "mixed capture has no effects".into(),

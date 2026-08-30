@@ -190,7 +190,7 @@ mod tests {
     fn later_unsupported_capture_prevents_earlier_submission() {
         let (first, end) = pure_assign(91);
         let (mut later, _) = pure_assign(92);
-        later.schedule.items[0].boundary = Some(crate::ScheduleBoundary::Unsupported("test"));
+        crate::engine::mixed_batch::test_support::mark_first_prefix_unsupported(&mut later, "test");
         let batch = CapturedMixedBatch::new(vec![first, later]).unwrap();
         let mock = Arc::new(crate::runtime::opencl::tests::MockDispatch::default());
         let (context, _) = crate::runtime::opencl::tests::setup(mock.clone());

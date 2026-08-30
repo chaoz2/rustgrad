@@ -16,6 +16,20 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+fn single_local_schedule_item(schedule: &crate::Schedule) -> Result<&crate::ScheduleItem, Error> {
+    if schedule.items.len() != 1 {
+        return Err(err(
+            "sharded CUDA local stages require exactly one schedule item",
+        ));
+    }
+    Ok(&schedule.items[0])
+}
+
+fn schedule_source_key(schedule: &crate::Schedule) -> Result<String, Error> {
+    let item = single_local_schedule_item(schedule)?;
+    Ok(format!("schedule:{}", item.cache_key))
+}
+
 /// Caller-supplied owner/capability binding. Context resources stay outside the serializable plan.
 #[derive(Clone)]
 pub struct CudaPlanBinding {
@@ -2204,21 +2218,16 @@ impl ShardedCudaPlanner {
             let binding = &bindings[rank];
             let owner_identity = binding.context.identity();
             let scheduled = schedule(graph, *node).map_err(|e| err(e.to_string()))?;
-            let mut diagnostic = scheduled
-                .items
-                .first()
-                .and_then(|item| item.boundary.as_ref())
+            let item = single_local_schedule_item(&scheduled)?;
+            let mut diagnostic = item
+                .boundary
+                .as_ref()
                 .map(|x| CudaPlanDiagnostic::Unsupported {
                     node: node.index(),
                     reason: format!("schedule boundary: {x:?}"),
                 });
-            let source_key = scheduled
-                .items
-                .first()
-                .map(|x| format!("schedule:{}", x.cache_key))
-                .unwrap_or_else(|| "schedule:empty".into());
+            let source_key = schedule_source_key(&scheduled)?;
             if diagnostic.is_none()
-                && let Some(item) = scheduled.items.first()
                 && let Err(error) =
                     PtxRenderer::new(binding.capability.sm()).and_then(|r| r.render(&item.kernel))
             {
@@ -2231,7 +2240,6 @@ impl ShardedCudaPlanner {
                 diagnostics.push(d);
             }
             let id = stages.len();
-            let item = scheduled.items.first();
             stages.push(CudaPlanStage::Local {
                 id,
                 device: binding.device.clone(),
@@ -2239,13 +2247,9 @@ impl ShardedCudaPlanner {
                 node: node.index(),
                 shape: graph.shape(*node)?.clone(),
                 dtype: graph.dtype(*node)?,
-                inputs: item
-                    .map(|x| x.inputs.iter().map(|b| b.id).collect())
-                    .unwrap_or_default(),
+                inputs: item.inputs.iter().map(|buffer| buffer.id).collect(),
                 external_materializations: vec![],
-                output: item
-                    .map(|x| x.primary_output().id)
-                    .unwrap_or(node.index() as u64),
+                output: item.primary_output().id,
                 dependencies: previous.clone(),
                 source_key: source_key.clone(),
                 module_key: format!(
@@ -2415,10 +2419,7 @@ impl ShardedCudaPlanner {
             }
             let scheduled = schedule_with_external_materializations(graph, &[*node], &external)
                 .map_err(|e| err(e.to_string()))?;
-            let item = scheduled
-                .items
-                .first()
-                .ok_or_else(|| err("local stage schedule missing"))?;
+            let item = single_local_schedule_item(&scheduled)?;
             item.validate_input_bindings()
                 .map_err(|e| err(e.to_string()))?;
             if item.external_materializations != external {
@@ -2470,7 +2471,7 @@ impl ShardedCudaPlanner {
             if let Some(diagnostic) = diagnostic.clone() {
                 diagnostics.push(diagnostic);
             }
-            let source_key = format!("schedule:{}", item.cache_key);
+            let source_key = schedule_source_key(&scheduled)?;
             local_stages.push(CudaPlanStage::Local {
                 id: rank,
                 device: binding.device.clone(),
@@ -2559,17 +2560,14 @@ impl ShardedCudaPlanner {
                         .iter()
                         .map(|node| crate::NodeId::from_index(*node as usize))
                         .collect::<Vec<_>>();
-                    let item = schedule_with_external_materializations(
+                    let scheduled = schedule_with_external_materializations(
                         graph,
                         &[crate::NodeId::from_index(*node)],
                         &materialized,
                     )
-                    .map_err(|e| err(e.to_string()))?
-                    .items
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| err("local stage schedule missing"))?;
-                    if source_key != &format!("schedule:{}", item.cache_key) {
+                    .map_err(|e| err(e.to_string()))?;
+                    let item = single_local_schedule_item(&scheduled)?;
+                    if source_key != &schedule_source_key(&scheduled)? {
                         return Err(err("local stage schedule identity mismatch"));
                     }
                     kernels.push(if diagnostic.is_none() {
@@ -3438,6 +3436,25 @@ mod artifact_tests {
             cache_key: "artifact-cache".into(),
             materializations: vec![],
         }
+    }
+
+    #[test]
+    fn sharded_local_source_keys_preserve_stable_schedule_identity() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2], DType::F32);
+        let output = graph.neg(input).unwrap();
+        let schedule = schedule(&graph, output).unwrap();
+        assert_eq!(
+            schedule_source_key(&schedule).unwrap(),
+            format!("schedule:{}", schedule.items[0].cache_key)
+        );
+
+        let mut empty = schedule.clone();
+        empty.items.clear();
+        assert!(schedule_source_key(&empty).is_err());
+        let mut multiple = schedule.clone();
+        multiple.items.push(schedule.items[0].clone());
+        assert!(schedule_source_key(&multiple).is_err());
     }
 
     #[test]

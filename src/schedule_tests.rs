@@ -67,22 +67,28 @@ fn requested_source_values_are_passthroughs_not_schedule_producers() {
 }
 
 #[test]
-fn scheduled_outputs_are_nonempty_ordered_and_preserve_single_cache_identity() {
+fn scheduled_outputs_are_nonempty_ordered_and_preserve_canonical_single_identity() {
     let output = buffer(7, 4, 1);
     assert!(ScheduledOutputs::new(vec![]).is_err());
     assert!(ScheduledOutputs::new(vec![output.clone(), output.clone()]).is_err());
 
     let single = item(0, vec![], output.clone());
-    let released_identity = crate::schedule::item_cache_key(&single);
+    let canonical_identity = crate::schedule::item_cache_key(&single).unwrap();
     let mut rebuilt = single.clone();
     rebuilt.outputs = ScheduledOutputs::new(vec![output.clone()]).unwrap();
-    assert_eq!(crate::schedule::item_cache_key(&rebuilt), released_identity);
+    assert_eq!(
+        crate::schedule::item_cache_key(&rebuilt).unwrap(),
+        canonical_identity
+    );
 
     let mut second = output.clone();
     second.id = 8;
     let mut paired = single.clone();
     paired.outputs = ScheduledOutputs::new(vec![output.clone(), second]).unwrap();
-    assert_ne!(crate::schedule::item_cache_key(&paired), released_identity);
+    assert_ne!(
+        crate::schedule::item_cache_key(&paired).unwrap(),
+        canonical_identity
+    );
 
     let mut stale_projection = single;
     stale_projection.output.id = 9;

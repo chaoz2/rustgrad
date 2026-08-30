@@ -226,7 +226,7 @@ fn mixed_batch_webgpu_signed_state_input_matches_interpreter_and_native() {
 fn mixed_batch_webgpu_rejects_later_unsupported_before_submission() {
     let (first, first_end) = crate::engine::mixed_batch::test_support::pure_add_capture(91);
     let (mut later, _) = crate::engine::mixed_batch::test_support::pure_add_capture(92);
-    later.schedule.items[0].boundary = Some(crate::ScheduleBoundary::Unsupported("test"));
+    crate::engine::mixed_batch::test_support::mark_first_prefix_unsupported(&mut later, "test");
     let batch = CapturedMixedBatch::new(vec![first, later]).unwrap();
     let mock = Arc::new(MockDispatch::default());
     let (device, _) = setup(mock.clone());

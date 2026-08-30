@@ -59,6 +59,19 @@ pub(crate) fn add_inputs() -> BTreeMap<String, TensorData> {
     ])
 }
 
+pub(crate) fn mark_first_prefix_unsupported(
+    capture: &mut CapturedMixedSchedule,
+    reason: &'static str,
+) {
+    capture.schedule.items[0].boundary = Some(crate::ScheduleBoundary::Unsupported(reason));
+    crate::schedule::rekey_schedule_items(
+        &mut capture.schedule.items,
+        &capture.state_bindings,
+        None,
+    )
+    .unwrap();
+}
+
 /// A capture whose pure input reads a flipped persistent state. The fixture is
 /// backend-neutral; individual runtime suites provide their own dispatch and
 /// assertion surface.

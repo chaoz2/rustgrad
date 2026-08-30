@@ -3,13 +3,13 @@
 //! roots retain stable buffer and UOp identities for realization.
 use crate::{DType, Graph, NodeId, Op, Shape, UOp, UOpError};
 use std::{
-    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet},
     fmt,
-    hash::{Hash, Hasher},
 };
 pub mod artifact;
 pub(crate) mod dynamic;
 pub mod execution_summary;
+mod identity;
 pub mod mixed;
 pub use execution_summary::{
     ExecutionPlanItemSummary, ExecutionPlanSummary, ExecutionPlanSummaryError,
@@ -579,7 +579,7 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
             boundary: Some(ScheduleBoundary::Effect),
             cache_key: 0,
         };
-        item.cache_key = item_cache_key(&item);
+        item.cache_key = item_cache_key(&item)?;
         items.push(item);
     }
     let ids = items.iter().map(|item| item.id).collect::<BTreeSet<_>>();
@@ -609,36 +609,49 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
     schedule.validate()?;
     Ok(schedule)
 }
-pub(crate) fn item_cache_key(item: &ScheduleItem) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    item.id.hash(&mut hasher);
-    item.node.hash(&mut hasher);
-    item.dependencies.hash(&mut hasher);
-    item.inputs.hash(&mut hasher);
-    // Keep the released single-output identity byte-for-byte stable.  A
-    // multi-output producer instead hashes its canonical ordered ABI.
-    if item.outputs.is_single() {
-        item.primary_output().hash(&mut hasher);
-    } else {
-        item.outputs.hash(&mut hasher);
-    }
-    item.boundary.hash(&mut hasher);
-    item.kernel.hash(&mut hasher);
-    item.external_materializations.hash(&mut hasher);
-    item.input_bindings.hash(&mut hasher);
-    item.quantized_input_bindings.hash(&mut hasher);
-    hasher.finish()
+pub(crate) fn item_cache_key(item: &ScheduleItem) -> Result<u64, ScheduleError> {
+    identity::item_key(item)
+        .map_err(|error| ScheduleError::Binding(format!("schedule identity: {error}")))
 }
 pub(crate) fn specialized_item_cache_key(
     item: &ScheduleItem,
     source_identity: u64,
     bindings: &[(u64, i64)],
-) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    item_cache_key(item).hash(&mut hasher);
-    source_identity.hash(&mut hasher);
-    bindings.hash(&mut hasher);
-    hasher.finish()
+) -> Result<u64, ScheduleError> {
+    identity::specialized_item_key(item, source_identity, bindings)
+        .map_err(|error| ScheduleError::Binding(format!("schedule identity: {error}")))
+}
+pub(crate) fn state_bound_item_cache_key(
+    source_key: u64,
+    bindings: &[&ScheduleStateBinding],
+) -> Result<u64, ScheduleError> {
+    identity::state_bound_item_key(source_key, bindings)
+        .map_err(|error| ScheduleError::Binding(format!("schedule identity: {error}")))
+}
+pub(crate) fn rekey_schedule_items(
+    items: &mut [ScheduleItem],
+    state_bindings: &[ScheduleStateBinding],
+    specialization: Option<(u64, &[(u64, i64)])>,
+) -> Result<(), ScheduleError> {
+    // Derive the base key exactly once before wrapping it with the canonical
+    // state-binding sidecar. A symbolic specialization is the base identity;
+    // state metadata then wraps that specialized key exactly once.
+    for item in items {
+        item.cache_key = match specialization {
+            Some((source_identity, bindings)) => {
+                specialized_item_cache_key(item, source_identity, bindings)?
+            }
+            None => item_cache_key(item)?,
+        };
+        let relevant = state_bindings
+            .iter()
+            .filter(|binding| binding.consumer_item == item.id)
+            .collect::<Vec<_>>();
+        if !relevant.is_empty() {
+            item.cache_key = state_bound_item_cache_key(item.cache_key, &relevant)?;
+        }
+    }
+    Ok(())
 }
 fn input_bindings(
     kernel: &UOp,
@@ -1681,7 +1694,7 @@ fn schedule_many_with_external(
             boundary,
             cache_key: 0,
         };
-        item.cache_key = item_cache_key(&item);
+        item.cache_key = item_cache_key(&item)?;
         item.validate_input_bindings()?;
         items.push(item);
     }
@@ -1808,32 +1821,26 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             desc.view = Some(view.clone());
         }
     }
-    let mut h = DefaultHasher::new();
-    inputs.hash(&mut h);
-    out.hash(&mut h);
-    boundary.hash(&mut h);
-    kernel.hash(&mut h);
     let input_bindings = input_bindings(&kernel, &inputs, &out)?;
     let quantized_input_bindings = quantized_input_bindings(&kernel)?;
-    input_bindings.hash(&mut h);
-    quantized_input_bindings.hash(&mut h);
-    let cache_key = h.finish();
+    let mut item = ScheduleItem {
+        id: 0,
+        node: output,
+        dependencies: vec![],
+        consumers: vec![],
+        inputs,
+        input_bindings,
+        quantized_input_bindings,
+        external_materializations: vec![],
+        outputs: ScheduledOutputs::single(out.clone()),
+        output: out,
+        kernel,
+        boundary,
+        cache_key: 0,
+    };
+    item.cache_key = item_cache_key(&item)?;
     Ok(Schedule {
-        items: vec![ScheduleItem {
-            id: 0,
-            node: output,
-            dependencies: vec![],
-            consumers: vec![],
-            inputs,
-            input_bindings,
-            quantized_input_bindings,
-            external_materializations: vec![],
-            outputs: ScheduledOutputs::single(out.clone()),
-            output: out,
-            kernel,
-            boundary,
-            cache_key,
-        }],
+        items: vec![item],
         value_bindings: vec![],
         state_bindings: vec![],
     })

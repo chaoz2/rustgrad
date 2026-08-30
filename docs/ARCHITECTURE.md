@@ -241,10 +241,11 @@ value before a step exists; detached, non-differentiable-only, and unrelated
 uses receive distinct safe classifications. This is not a VJP or alias
 registry: higher-order and device mutation autograd still need an owned use
 registry and tape.
-RGSM v2 serializes the normalized static-index offset map in its typed effect
+RGSM v3 serializes the normalized static-index offset map in its typed effect
 payload and replays it graph-free through the same raw-storage transaction;
-v1 envelopes remain decodable and upgrade to the canonical v2 identity. Native
-and device indexed-effect replay remain deliberately unsupported.
+v1--v2 envelopes remain decodable, authenticate their stored opaque keys, and
+upgrade to the canonical current schedule identity. Native and device
+indexed-effect replay remain deliberately unsupported.
 
 `effects::EffectSourceBridge` is an immutable host-interpreter sidecar: it
 binds exact persistent snapshots to pure Graph inputs and one pure output to an
@@ -1192,6 +1193,20 @@ or participate in CUDA graph capture. `CapturedSchedule::to_bytes` writes a
 versioned, bounded, checksummed artifact containing typed schedule descriptors,
 explicit dependencies and ordered dense/packed bindings, topological UOp node
 tables, exact raw `TensorData` storage, and exact quantized constant bytes.
+RGSA v7 derives durable item, symbolic-specialization, mixed-state-binding, and
+sharded source identities from explicit versioned canonical bytes and stable
+FNV-1a, never Rust's implementation-selected `DefaultHasher`. Legacy v1--v6
+decode first authenticates the historical envelope over its stored opaque
+keys, validates structure and bindings without comparing them to current keys,
+then rekeys in dependency order and performs the complete current validation.
+The related inspection-only RGSO v2 and mixed/effect RGSM v3 envelopes apply
+the same legacy authentication and current-key upgrade rule.
+RGSM deliberately rejects symbolic schemas and specialization provenance until
+its wire format can retain them. Sharded CUDA local stages likewise admit one
+schedule item exactly; empty or multi-item DAGs fail before a partial source
+identity or kernel can be published.
+Dynamic-control buffer identities and execution-summary hashes remain
+process-local implementation details and never enter persistent artifacts.
 `from_bytes` validates the complete artifact,
 including view bounds, scalar-tiled/tensor-core resource, barrier and fragment
 metadata, and resource identities,
