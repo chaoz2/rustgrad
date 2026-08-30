@@ -5,7 +5,7 @@ use rustgrad::onnx::{
     NamedPaths, OnnxFileError, OnnxReadLimits, OnnxWorkflowError, OnnxWorkflowLimits,
     run_onnx_files, run_onnx_files_native, run_onnx_files_native_many,
 };
-use rustgrad::{CapturedReplayExecutor, DType, TensorData};
+use rustgrad::{CapturedReplayExecutor, DType, Scalar, TensorData};
 use std::{
     fs,
     path::PathBuf,
@@ -265,7 +265,7 @@ fn local_model_named_npy_strict_native_is_atomic_and_reuses_caller_cache() {
     let rejected_input = d.join("rejected-input.npy");
     save_npy_file(
         &rejected_input,
-        &TensorData::new([1, 2], vec![1.0f64, 2.0]).unwrap(),
+        &TensorData::from_scalars([1, 2], DType::F64, [Scalar::F(1.0), Scalar::F(2.0)]).unwrap(),
     )
     .unwrap();
     let rejected = run_onnx_files_native(
