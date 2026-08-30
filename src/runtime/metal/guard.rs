@@ -4,7 +4,7 @@ use super::{
     renderer::{MetalViewAccess, broadcast_offset, metal_storage_type},
     transaction::{GuardedIntegerOp, MetalTransactionAbi},
 };
-use crate::{DType, Operation, UArgRef, UOp};
+use crate::{DType, IndexValue, LiteralValue, Operation, UOp};
 use std::collections::BTreeMap;
 
 pub(super) fn emit_transactional(
@@ -49,7 +49,7 @@ impl Emitter<'_> {
             .scalar;
         let name = self.value_name();
         match node.operation() {
-            Operation::Const => {
+            Operation::Const(_) => {
                 let value = scalar_literal(node, dtype)?;
                 self.lines.push(format!(
                     "{indent}const {} {name} = {value};",
@@ -192,20 +192,20 @@ impl Emitter<'_> {
             .sources()
             .first()
             .ok_or_else(|| MetalError::Unsupported("load has no index".into()))?;
-        let (buffer, input_shape, output_shape, view) = match index.arg() {
-            UArgRef::BufferIndex {
+        let (buffer, input_shape, output_shape, view) = match index.operation() {
+            Operation::Index(IndexValue::Buffer {
                 buffer,
                 input_shape,
                 output_shape,
                 ..
-            } => (*buffer, input_shape, output_shape, None),
-            UArgRef::ViewBufferIndex {
+            }) => (*buffer, input_shape, output_shape, None),
+            Operation::Index(IndexValue::View {
                 buffer,
                 input_shape,
                 output_shape,
                 view,
                 ..
-            } => (*buffer, input_shape, output_shape, Some(view)),
+            }) => (*buffer, input_shape, output_shape, Some(view)),
             _ => {
                 return Err(MetalError::Unsupported(
                     "load requires checked static indexing".into(),
@@ -226,23 +226,23 @@ impl Emitter<'_> {
 }
 
 fn scalar_literal(node: &UOp, dtype: DType) -> Result<String, MetalError> {
-    match node.arg() {
-        UArgRef::Scalar {
+    match node.operation() {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::Bool && dtype == DType::Bool && *bits <= 1 => {
+        }) if *actual == DType::Bool && dtype == DType::Bool && *bits <= 1 => {
             Ok(format!("(uchar){bits}u"))
         }
-        UArgRef::Scalar {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::I32 && dtype == DType::I32 => {
+        }) if *actual == DType::I32 && dtype == DType::I32 => {
             Ok(format!("as_type<int>((uint)0x{:08x}u)", *bits as u32))
         }
-        UArgRef::Scalar {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::U32 && dtype == DType::U32 => {
+        }) if *actual == DType::U32 && dtype == DType::U32 => {
             Ok(format!("(uint)0x{:08x}u", *bits as u32))
         }
         _ => Err(MetalError::Unsupported(

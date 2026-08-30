@@ -2853,7 +2853,6 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UArgRef;
 
     fn finish(mut w: Writer) -> Vec<u8> {
         let sum = checksum(&w.out);
@@ -2885,18 +2884,16 @@ mod tests {
     }
     #[test]
     fn tensor_guard_v17_round_trip_and_legacy_exclusion_are_exact() {
-        let guard = UOp::try_new(
-            WireOpcode::TensorGuard,
-            Some(UType::scalar(DType::F32)),
-            vec![],
-            WireArg::TensorGuard {
+        let guard = UOp::from_operation(
+            Operation::TensorGuard(TensorGuardValue {
                 input: crate::NodeId::from_index(3),
                 input_shape: Shape::from([2, 3]),
                 axis: 1,
                 dtype: DType::F32,
-            },
-        )
-        .unwrap();
+            }),
+            Some(UType::scalar(DType::F32)),
+            vec![],
+        );
         let bytes = encode(&guard).unwrap();
         assert_eq!(bytes, encode(&guard).unwrap());
         assert_eq!(decode(&bytes).unwrap(), guard);
@@ -2925,7 +2922,7 @@ mod tests {
             .topological()
             .unwrap()
             .into_iter()
-            .map(|node| node.kind())
+            .map(|node| operation_to_wire(node.operation()).0)
             .collect::<Vec<_>>();
         assert!(kinds.contains(&WireOpcode::Store));
         assert!(kinds.contains(&WireOpcode::Sink));
@@ -2957,18 +2954,16 @@ mod tests {
         legacy_version[body_len..].copy_from_slice(&sum.to_le_bytes());
         assert!(decode(&legacy_version).is_err());
 
-        let UArgRef::Matmul(plan) = root.arg() else {
+        let Operation::Matmul(MatmulValue::Serial(plan)) = root.operation() else {
             panic!("matmul payload missing");
         };
         let mut malformed = plan.clone();
         malformed.k += 1;
-        let malformed = UOp::try_new(
-            WireOpcode::Matmul,
+        let malformed = UOp::from_operation(
+            Operation::Matmul(MatmulValue::Serial(Box::new(malformed))),
             Some(UType::scalar(DType::F64)),
             vec![],
-            WireArg::Matmul(Box::new(malformed)),
-        )
-        .unwrap();
+        );
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
 
@@ -2980,30 +2975,26 @@ mod tests {
         let tiled_bytes = encode(&tiled).unwrap();
         assert_eq!(decode(&tiled_bytes).unwrap(), tiled);
         assert_eq!(encode(&decode(&tiled_bytes).unwrap()).unwrap(), tiled_bytes);
-        let UArgRef::TiledMatmul(payload) = tiled.arg() else {
+        let Operation::Matmul(MatmulValue::Tiled(payload)) = tiled.operation() else {
             panic!("tiled matmul payload missing");
         };
         let mut malformed = payload.clone();
         malformed.tile.barriers[0].uniform = false;
-        let malformed = UOp::try_new(
-            WireOpcode::Matmul,
+        let malformed = UOp::from_operation(
+            Operation::Matmul(MatmulValue::Tiled(Box::new(malformed))),
             Some(UType::scalar(DType::F32)),
             vec![],
-            WireArg::TiledMatmul(Box::new(malformed)),
-        )
-        .unwrap();
+        );
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
 
         let mut misaligned = payload.clone();
         misaligned.tile.lhs_shared.alignment = 3;
-        let misaligned = UOp::try_new(
-            WireOpcode::Matmul,
+        let misaligned = UOp::from_operation(
+            Operation::Matmul(MatmulValue::Tiled(Box::new(misaligned))),
             Some(UType::scalar(DType::F32)),
             vec![],
-            WireArg::TiledMatmul(Box::new(misaligned)),
-        )
-        .unwrap();
+        );
         assert!(misaligned.validate().is_err());
         assert!(encode(&misaligned).is_err());
 
@@ -3028,18 +3019,16 @@ mod tests {
         assert_eq!(bytes, encode(&decoded).unwrap());
         assert_eq!(root, decoded);
 
-        let UArgRef::Movement(plan) = root.arg() else {
+        let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
             panic!("movement payload missing");
         };
         let mut malformed = plan.clone();
         malformed.output_shape = Shape::from([3, 2]);
-        let malformed = UOp::try_new(
-            WireOpcode::Movement,
+        let malformed = UOp::from_operation(
+            Operation::Movement(MovementValue::Plan(Box::new(malformed))),
             Some(UType::scalar(DType::F32)),
             vec![],
-            WireArg::Movement(Box::new(malformed)),
-        )
-        .unwrap();
+        );
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
 
@@ -3053,7 +3042,7 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(encode(&decoded).unwrap(), bytes);
         assert_eq!(decoded, root);
-        let UArgRef::Movement(plan) = root.arg() else {
+        let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
             panic!("movement payload missing");
         };
         assert!(matches!(
@@ -3073,7 +3062,7 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(encode(&decoded).unwrap(), bytes);
         assert_eq!(decoded, root);
-        let UArgRef::Movement(plan) = root.arg() else {
+        let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
             panic!("movement payload missing");
         };
         assert!(matches!(
@@ -3094,7 +3083,7 @@ mod tests {
         let root = crate::kernel::lower_graph_computed_affine_view(&graph, output).unwrap();
         let bytes = encode(&root).unwrap();
         assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes);
-        let UArgRef::Movement(plan) = root.arg() else {
+        let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
             panic!("movement payload missing");
         };
         assert!(matches!(plan.kind, MovementKernelKind::AffineCopy { .. }));

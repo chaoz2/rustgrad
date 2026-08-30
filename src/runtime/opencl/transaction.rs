@@ -1,6 +1,8 @@
 //! Typed metadata and bounded fault reconstruction for transactional kernels.
 use super::OpenClError;
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, Operation, Scalar, Shape, UArgRef, UOp};
+use crate::{
+    BinaryOp, CompareOp, DType, IndexValue, LiteralValue, LogicalOp, Operation, Scalar, Shape, UOp,
+};
 use std::collections::BTreeMap;
 
 pub const OPENCL_TRANSACTION_ABI_VERSION: u32 = 3;
@@ -194,7 +196,7 @@ pub(super) fn first_fault_at<F>(
     mut load: F,
 ) -> Result<Option<u32>, OpenClError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, OpenClError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, OpenClError>,
 {
     match eval(
         &transaction.evaluation_root,
@@ -214,7 +216,7 @@ pub(super) fn detail_rhs_at<F>(
     mut load: F,
 ) -> Result<Scalar, OpenClError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, OpenClError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, OpenClError>,
 {
     match eval(&guard.rhs, logical, &transaction.guard_ids(), &mut load)? {
         Evaluated::Value(value) => Ok(value),
@@ -231,28 +233,24 @@ fn eval<F>(
     load: &mut F,
 ) -> Result<Evaluated, OpenClError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, OpenClError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, OpenClError>,
 {
     let dtype = node
         .ty()
         .ok_or_else(|| OpenClError::InvalidBinding("untyped detail expression".into()))?
         .scalar;
     let value = match node.operation() {
-        Operation::Const => match node.arg() {
-            UArgRef::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits),
-            UArgRef::Int(value) => Scalar::I(*value),
-            _ => {
-                return Err(OpenClError::InvalidBinding(
-                    "invalid detail constant".into(),
-                ));
-            }
-        },
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => scalar_from_bits(*dtype, *bits),
+        Operation::Const(LiteralValue::Int(value)) => Scalar::I(*value),
         Operation::Load => {
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| OpenClError::InvalidBinding("detail load lacks index".into()))?;
-            load(index.arg(), dtype, logical)?
+            let Operation::Index(value) = index.operation() else {
+                return Err(OpenClError::InvalidBinding("detail load index".into()));
+            };
+            load(value, dtype, logical)?
         }
         Operation::Cast => {
             let source = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -433,14 +431,14 @@ fn compare(lhs: Scalar, rhs: Scalar, op: CompareOp) -> bool {
     }
 }
 
-pub(super) fn logical_offset(arg: UArgRef<'_>, logical: usize) -> Result<usize, OpenClError> {
+pub(super) fn logical_offset(arg: &IndexValue, logical: usize) -> Result<usize, OpenClError> {
     let (input, output, view) = match arg {
-        UArgRef::BufferIndex {
+        IndexValue::Buffer {
             input_shape,
             output_shape,
             ..
         } => (input_shape, output_shape, None),
-        UArgRef::ViewBufferIndex {
+        IndexValue::View {
             input_shape,
             output_shape,
             view,

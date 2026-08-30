@@ -156,7 +156,7 @@ impl LinearKernel {
         if nodes.iter().any(|node| {
             matches!(
                 node.operation(),
-                Operation::ReduceInit
+                Operation::ReduceInit(_)
                     | Operation::ReduceAccumulate
                     | Operation::ReduceFinalize
                     | Operation::Barrier

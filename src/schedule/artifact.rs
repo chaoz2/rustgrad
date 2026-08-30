@@ -1285,7 +1285,7 @@ pub(crate) fn validate_for_replay(c: &CapturedSchedule) -> Result<(), ArtifactEr
     validate_capture(c)?;
     if c.items
         .iter()
-        .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard))
+        .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard(_)))
     {
         return Err(ArtifactError::Unsupported);
     }

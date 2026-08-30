@@ -35,7 +35,7 @@ fn topk_is_a_stable_sort_pair_followed_by_checked_slices() {
         schedule
             .items
             .iter()
-            .filter(|item| matches!(item.kernel.operation(), crate::Operation::Sort))
+            .filter(|item| matches!(item.kernel.operation(), crate::Operation::Sort(_)))
             .count(),
         1
     );
@@ -43,7 +43,7 @@ fn topk_is_a_stable_sort_pair_followed_by_checked_slices() {
         schedule
             .items
             .iter()
-            .find(|item| matches!(item.kernel.operation(), crate::Operation::Sort))
+            .find(|item| matches!(item.kernel.operation(), crate::Operation::Sort(_)))
             .unwrap()
             .outputs
             .len(),

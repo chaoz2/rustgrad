@@ -2,8 +2,9 @@ use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend,
-    CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc,
-    NodeId, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArgRef, schedule,
+    CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue, KernelBindings,
+    KernelBufferDesc, NodeId, Operation, ReduceKind, Scalar, Shape, Slice, Storage, TensorData,
+    schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -776,12 +777,8 @@ impl Dispatch for MockDispatch {
                 if let Some(id) =
                     transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
                         let buffer_id = match arg {
-                            crate::UArgRef::BufferIndex { buffer, .. }
-                            | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
-                            _ => {
-                                return Err(MetalError::InvalidBinding(
-                                    "mock transaction load index".into(),
-                                ));
+                            IndexValue::Buffer { buffer, .. } | IndexValue::View { buffer, .. } => {
+                                *buffer
                             }
                         };
                         let (abi, bytes) = stored
@@ -1214,7 +1211,7 @@ fn captured_random_plans_render_and_mock_execute_without_stream_state() {
     for output in [uniform, normal, randint_i32, randint_u32] {
         let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
         let rendered = renderer.render(&root).unwrap();
-        let UArgRef::Random(plan) = root.arg() else {
+        let Operation::Random(plan) = root.operation() else {
             panic!("missing random plan")
         };
         let expected = plan.execute().unwrap();

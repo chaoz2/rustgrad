@@ -9,8 +9,8 @@
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
-    AddressSpace, BufferView, CudaError, DType, Function, LaunchConfig, Operation, Shape, Stream,
-    UArg, UArgRef, UOp, UType,
+    AddressSpace, AddressValue, BufferView, CudaError, DType, Function, IndexValue, LaunchConfig,
+    LiteralValue, MatmulValue, Operation, ReductionValue, Shape, Stream, UOp, UType,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -350,52 +350,52 @@ impl PtxRenderer {
                 return false;
             };
             let (
-                UArgRef::BufferIndex {
+                Operation::Index(IndexValue::Buffer {
                     buffer: input_buffer,
                     elements: input_elements,
                     input_shape,
                     output_shape: input_output_shape,
-                },
-                UArgRef::BufferIndex {
+                }),
+                Operation::Index(IndexValue::Buffer {
                     buffer: output_buffer,
                     elements: output_elements,
                     input_shape: output_input_shape,
                     output_shape,
-                },
-            ) = (input_index.arg(), output_index.arg())
+                }),
+            ) = (input_index.operation(), output_index.operation())
             else {
                 return false;
             };
             let (
-                UArgRef::Address {
+                Operation::DefineGlobal(AddressValue {
                     space: input_space,
                     name: input_name,
                     element: input_element,
-                },
-                UArgRef::Address {
+                }),
+                Operation::DefineGlobal(AddressValue {
                     space: output_space,
                     name: output_name,
                     element: output_element,
-                },
-                UArgRef::Int(bound),
-                UArgRef::RangeAxis(axis),
+                }),
+                Operation::Const(LiteralValue::Int(bound)),
+                Operation::Range(axis),
             ) = (
-                input_address.arg(),
-                output_address.arg(),
-                range_bound.arg(),
-                input_range.arg(),
+                input_address.operation(),
+                output_address.operation(),
+                range_bound.operation(),
+                input_range.operation(),
             )
             else {
                 return false;
             };
             matches!(exp.operation(), Operation::GraphUnary(crate::UnaryOp::Exp))
                 && matches!(load.operation(), Operation::Load)
-                && matches!(input_index.operation(), Operation::Index)
-                && matches!(output_index.operation(), Operation::Index)
-                && matches!(input_address.operation(), Operation::DefineGlobal)
-                && matches!(output_address.operation(), Operation::DefineGlobal)
-                && matches!(input_range.operation(), Operation::Range)
-                && matches!(range_bound.operation(), Operation::Const)
+                && matches!(input_index.operation(), Operation::Index(_))
+                && matches!(output_index.operation(), Operation::Index(_))
+                && matches!(input_address.operation(), Operation::DefineGlobal(_))
+                && matches!(output_address.operation(), Operation::DefineGlobal(_))
+                && matches!(input_range.operation(), Operation::Range(_))
+                && matches!(range_bound.operation(), Operation::Const(_))
                 && input_range.ty() == Some(UType::scalar(DType::I64))
                 && range_bound.ty() == Some(UType::scalar(DType::I64))
                 && input_range.shares_node_with(output_range)
@@ -526,25 +526,22 @@ fn render(
     root: &UOp,
     allow_linked_f32_exp: bool,
 ) -> Result<RenderedPtx, PtxError> {
-    if matches!(root.operation(), Operation::Random) {
-        let UArgRef::Random(plan) = root.arg() else {
-            return Err(PtxError::Unsupported("random payload is absent".into()));
-        };
+    if let Operation::Random(plan) = root.operation() {
         return render_random(renderer, root, plan);
     }
     if matches!(
         root.operation(),
-        Operation::PrefixScan | Operation::Sort | Operation::TensorGuard
+        Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
     ) {
         return Err(PtxError::Unsupported(
             "prefix scans and sort pairs are outside the PTX lowering subset".into(),
         ));
     }
-    if matches!(root.operation(), Operation::Matmul) {
-        return match root.arg() {
-            UArgRef::Matmul(plan) => matmul::render_serial(renderer, plan),
-            UArgRef::TiledMatmul(payload) => matmul::render_tiled(renderer, payload),
-            UArgRef::TensorCoreMatmul(payload) => matmul::render_tensor_core(renderer, payload),
+    if let Operation::Matmul(value) = root.operation() {
+        return match value {
+            MatmulValue::Serial(plan) => matmul::render_serial(renderer, plan),
+            MatmulValue::Tiled(payload) => matmul::render_tiled(renderer, payload),
+            MatmulValue::TensorCore(payload) => matmul::render_tensor_core(renderer, payload),
             _ => Err(PtxError::Unsupported("matmul payload is absent".into())),
         };
     }
@@ -560,12 +557,12 @@ fn render(
         .sources()
         .first()
         .ok_or_else(|| PtxError::Unsupported("Store without index".into()))?;
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         buffer: out_id,
         elements: extent,
         output_shape,
         ..
-    } = out_index.arg()
+    }) = out_index.operation()
     else {
         return Err(PtxError::Unsupported("Store needs BufferIndex".into()));
     };
@@ -582,8 +579,9 @@ fn render(
     // arithmetic; fall back only when every indexed buffer is already in the
     // generic storage subset.
     let generic_storage = nodes.iter().all(|node| {
-        let storage_ok = match node.arg() {
-            UArgRef::BufferIndex { .. } | UArgRef::ViewBufferIndex { .. } => {
+        let storage_ok = match node.operation() {
+            Operation::Index(IndexValue::Buffer { .. })
+            | Operation::Index(IndexValue::View { .. }) => {
                 node.ty().is_some_and(|ty| reject_dtype(ty.scalar).is_ok())
             }
             _ => true,
@@ -616,14 +614,14 @@ fn render(
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
     for node in &nodes {
-        if let Some((buffer, elements, source_shape)) = match node.arg() {
-            UArgRef::BufferIndex {
+        if let Some((buffer, elements, source_shape)) = match node.operation() {
+            Operation::Index(IndexValue::Buffer {
                 buffer,
                 elements,
                 input_shape,
                 ..
-            } => Some((buffer, *elements, input_shape.clone())),
-            UArgRef::ViewBufferIndex { buffer, view, .. } => Some((
+            }) => Some((buffer, *elements, input_shape.clone())),
+            Operation::Index(IndexValue::View { buffer, view, .. }) => Some((
                 buffer,
                 view.source_shape.numel().map_err(|_| PtxError::Overflow)?,
                 view.source_shape.clone(),
@@ -664,10 +662,9 @@ fn render(
         let Some(index) = node.sources().first() else {
             return Err(PtxError::InvalidBinding("load without index".into()));
         };
-        let buffer = match index.arg() {
-            UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
-                *buffer
-            }
+        let buffer = match index.operation() {
+            Operation::Index(IndexValue::Buffer { buffer, .. })
+            | Operation::Index(IndexValue::View { buffer, .. }) => *buffer,
             _ => return Err(PtxError::InvalidBinding("load index lacks buffer".into())),
         };
         if seen.insert(buffer, ()).is_none() {
@@ -1407,8 +1404,8 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     let Some(input_index) = load.sources().first() else {
         return Err(PtxError::Unsupported("scoped load without index".into()));
     };
-    if !matches!(output_index.operation(), Operation::Index)
-        || !matches!(input_index.operation(), Operation::Index)
+    if !matches!(output_index.operation(), Operation::Index(_))
+        || !matches!(input_index.operation(), Operation::Index(_))
     {
         return Err(PtxError::Unsupported(
             "scoped narrow-storage ABI requires typed indices".into(),
@@ -1458,22 +1455,27 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             "scoped storage ABI has incompatible input/output dtypes".into(),
         ));
     }
-    let output_shape = match output_index.arg() {
-        UArgRef::BufferIndex { output_shape, .. } => output_shape,
+    let output_shape = match output_index.operation() {
+        Operation::Index(IndexValue::Buffer { output_shape, .. }) => output_shape,
         _ => {
             return Err(PtxError::Unsupported(
                 "scoped narrow-storage ABI requires a concrete output buffer".into(),
             ));
         }
     };
-    if (sqrt_direct || sqrt_cast) && matches!(input_index.arg(), UArgRef::ViewBufferIndex { .. }) {
+    if (sqrt_direct || sqrt_cast)
+        && matches!(
+            input_index.operation(),
+            Operation::Index(IndexValue::View { .. })
+        )
+    {
         return Err(PtxError::Unsupported(
             "scoped Sqrt does not admit affine-view inputs".into(),
         ));
     }
-    let input_shape = match input_index.arg() {
-        UArgRef::BufferIndex { output_shape, .. }
-        | UArgRef::ViewBufferIndex { output_shape, .. } => output_shape,
+    let input_shape = match input_index.operation() {
+        Operation::Index(IndexValue::Buffer { output_shape, .. })
+        | Operation::Index(IndexValue::View { output_shape, .. }) => output_shape,
         _ => {
             return Err(PtxError::Unsupported(
                 "scoped narrow-storage ABI requires a concrete input buffer".into(),
@@ -1482,8 +1484,8 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     };
     if input_shape != output_shape
         || output_shape.numel().map_err(|_| PtxError::Overflow)?
-            != match output_index.arg() {
-                UArgRef::BufferIndex { elements, .. } => *elements,
+            != match output_index.operation() {
+                Operation::Index(IndexValue::Buffer { elements, .. }) => *elements,
                 _ => unreachable!(),
             }
     {
@@ -1522,11 +1524,11 @@ fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     let [sqrt_input] = sqrt.sources() else {
         return Err(PtxError::Unsupported("Rsqrt Sqrt needs input".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "Rsqrt needs a concrete output".into(),
@@ -1566,12 +1568,12 @@ fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     let [index] = load.sources() else {
         return Err(PtxError::Unsupported("Rsqrt load needs index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: input_elements,
         input_shape,
         output_shape: input_output,
         ..
-    } = index.arg()
+    }) = index.operation()
     else {
         return Err(PtxError::Unsupported(
             "Rsqrt does not admit affine views".into(),
@@ -1630,11 +1632,11 @@ fn scoped_binary_plan(
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output_index.arg()
+    }) = output_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "scoped Mul requires a concrete output buffer".into(),
@@ -1678,7 +1680,7 @@ fn scoped_binary_plan(
         let [index] = load.sources() else {
             return Err(PtxError::Unsupported("Mul load must have one index".into()));
         };
-        if !matches!(index.operation(), Operation::Index) {
+        if !matches!(index.operation(), Operation::Index(_)) {
             return Err(PtxError::Unsupported("Mul load needs a typed index".into()));
         }
         Ok(index)
@@ -1721,20 +1723,20 @@ fn scoped_binary_plan(
             ));
         }
         let input_index = index(load)?;
-        let (elements, input_shape, operand_output) = match input_index.arg() {
-            UArgRef::BufferIndex {
+        let (elements, input_shape, operand_output) = match input_index.operation() {
+            Operation::Index(IndexValue::Buffer {
                 elements,
                 input_shape,
                 output_shape,
                 ..
-            } => (*elements, input_shape, output_shape),
-            UArgRef::ViewBufferIndex {
+            }) => (*elements, input_shape, output_shape),
+            Operation::Index(IndexValue::View {
                 elements,
                 input_shape,
                 output_shape,
                 view,
                 ..
-            } => {
+            }) => {
                 view.validate_read().map_err(|_| {
                     PtxError::Unsupported("scoped Mul affine view is invalid".into())
                 })?;
@@ -1768,16 +1770,14 @@ fn scoped_binary_plan(
             ));
         }
     }
-    let left_shape = match index(left_load)?.arg() {
-        UArgRef::BufferIndex { input_shape, .. } | UArgRef::ViewBufferIndex { input_shape, .. } => {
-            input_shape
-        }
+    let left_shape = match index(left_load)?.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. })
+        | Operation::Index(IndexValue::View { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
-    let right_shape = match index(right_load)?.arg() {
-        UArgRef::BufferIndex { input_shape, .. } | UArgRef::ViewBufferIndex { input_shape, .. } => {
-            input_shape
-        }
+    let right_shape = match index(right_load)?.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. })
+        | Operation::Index(IndexValue::View { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
     if left_shape
@@ -1825,20 +1825,12 @@ fn scoped_sub_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     if negated.ty() != value.ty() || right.ty() != value.ty() {
         return Ok(None);
     }
-    let synthetic = UOp::try_new(
+    let synthetic = UOp::from_operation(
         Operation::GraphBinary(crate::BinaryOp::Sub),
         value.ty(),
         vec![left.clone(), right.clone()],
-        UArg::None,
-    )
-    .unwrap();
-    let proof = UOp::try_new(
-        Operation::Store,
-        None,
-        vec![output.clone(), synthetic],
-        UArg::None,
-    )
-    .unwrap();
+    );
+    let proof = UOp::from_operation(Operation::Store, None, vec![output.clone(), synthetic]);
     scoped_binary_plan(&proof, sm, crate::BinaryOp::Sub, ScopedStorageMode::Sub)
 }
 
@@ -1898,12 +1890,12 @@ fn scoped_compare_value_proof(
                 "public Eq load needs one index".into(),
             ));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(
                 "public Eq does not admit affine-view inputs".into(),
@@ -1963,12 +1955,12 @@ fn scoped_compare_value_proof(
     }
     let left_index = index(left_load, domain_shape)?;
     let right_index = index(right_load, domain_shape)?;
-    let left_shape = match left_index.arg() {
-        UArgRef::BufferIndex { input_shape, .. } => input_shape,
+    let left_shape = match left_index.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
-    let right_shape = match right_index.arg() {
-        UArgRef::BufferIndex { input_shape, .. } => input_shape,
+    let right_shape = match right_index.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
     let comparison_shape = left_shape
@@ -2012,11 +2004,11 @@ fn scoped_compare_value_plan(
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output_index.arg()
+    }) = output_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "public Eq requires a concrete output buffer".into(),
@@ -2067,26 +2059,24 @@ fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Ptx
             unequal.operation(),
             Operation::GraphCompare(crate::CompareOp::Ne)
         )
-        || !matches!(truth.operation(), Operation::Const)
+        || !matches!(truth.operation(), Operation::Const(_))
         || !matches!(
-            truth.arg(),
-            UArgRef::Scalar {
+            truth.operation(),
+            Operation::Const(LiteralValue::Scalar {
                 dtype: &DType::Bool,
                 bits: &1
-            }
+            })
         )
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let proof = UOp::try_new(
+    let proof = UOp::from_operation(
         Operation::Store,
         None,
         vec![output.clone(), unequal.clone()],
-        UArg::None,
-    )
-    .unwrap();
+    );
     if scoped_compare_value_plan(&proof, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)?.is_some()
     {
         Ok(Some(ScopedStorageMode::Eq))
@@ -2125,23 +2115,23 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
         || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-        || !matches!(truth.operation(), Operation::Const)
+        || !matches!(truth.operation(), Operation::Const(_))
         || !matches!(
-            truth.arg(),
-            UArgRef::Scalar {
+            truth.operation(),
+            Operation::Const(LiteralValue::Scalar {
                 dtype: &DType::Bool,
                 bits: &1
-            }
+            })
         )
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public logical-not requires a concrete output buffer".into(),
@@ -2166,12 +2156,12 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
         .ty()
         .ok_or_else(|| PtxError::Unsupported("untyped public logical-not input".into()))?
         .scalar;
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements,
         input_shape,
         output_shape: input_output,
         ..
-    } = input.arg()
+    }) = input.operation()
     else {
         return Err(PtxError::Unsupported(
             "public logical-not does not admit affine-view inputs".into(),
@@ -2217,11 +2207,11 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     {
         return Ok(None);
     }
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public IsInf requires a concrete output buffer".into(),
@@ -2246,12 +2236,12 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         .ty()
         .ok_or_else(|| PtxError::Unsupported("untyped public IsInf input".into()))?
         .scalar;
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements,
         input_shape,
         output_shape: input_output,
         ..
-    } = input.arg()
+    }) = input.operation()
     else {
         return Err(PtxError::Unsupported(
             "public IsInf does not admit affine-view inputs".into(),
@@ -2325,23 +2315,23 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
         || nan.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || outer.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-        || !matches!(truth.operation(), Operation::Const)
+        || !matches!(truth.operation(), Operation::Const(_))
         || !matches!(
-            truth.arg(),
-            UArgRef::Scalar {
+            truth.operation(),
+            Operation::Const(LiteralValue::Scalar {
                 dtype: &DType::Bool,
                 bits: &1
-            }
+            })
         )
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public IsFinite requires a concrete output buffer".into(),
@@ -2357,23 +2347,16 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
             "public IsFinite output descriptor is invalid".into(),
         ));
     }
-    let isinf_store = UOp::try_new(
+    let isinf_store = UOp::from_operation(
         Operation::Store,
         None,
         vec![output.clone(), infinite.clone()],
-        UArg::None,
-    )
-    .unwrap();
+    );
     if scoped_isinf_plan(&isinf_store, sm)?.is_none() {
         return Ok(None);
     }
-    let isnan_store = UOp::try_new(
-        Operation::Store,
-        None,
-        vec![output.clone(), nan.clone()],
-        UArg::None,
-    )
-    .unwrap();
+    let isnan_store =
+        UOp::from_operation(Operation::Store, None, vec![output.clone(), nan.clone()]);
     if scoped_compare_value_plan(
         &isnan_store,
         sm,
@@ -2413,25 +2396,19 @@ fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorage
             inner.operation(),
             Operation::GraphCompare(crate::CompareOp::Lt)
         )
-        || !matches!(truth.operation(), Operation::Const)
+        || !matches!(truth.operation(), Operation::Const(_))
         || !matches!(
-            truth.arg(),
-            UArgRef::Scalar {
+            truth.operation(),
+            Operation::Const(LiteralValue::Scalar {
                 dtype: &DType::Bool,
                 bits: &1
-            }
+            })
         )
         || truth.ty().map(|t| t.scalar) != Some(DType::Bool)
     {
         return Ok(None);
     }
-    let proof = UOp::try_new(
-        Operation::Store,
-        None,
-        vec![output.clone(), inner.clone()],
-        UArg::None,
-    )
-    .unwrap();
+    let proof = UOp::from_operation(Operation::Store, None, vec![output.clone(), inner.clone()]);
     if scoped_compare_value_plan(
         &proof,
         sm,
@@ -2491,13 +2468,13 @@ fn scoped_select_predicate_shape(
             if value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 || inner.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-                || !matches!(truth.operation(), Operation::Const)
+                || !matches!(truth.operation(), Operation::Const(_))
                 || !matches!(
-                    truth.arg(),
-                    UArgRef::Scalar {
+                    truth.operation(),
+                    Operation::Const(LiteralValue::Scalar {
                         dtype: &DType::Bool,
                         bits: &1
-                    }
+                    })
                 )
                 || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
             {
@@ -2541,11 +2518,11 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public ReLU requires a concrete output buffer".into(),
@@ -2588,8 +2565,8 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
             "public ReLU predicate/payload dtypes are invalid".into(),
         ));
     }
-    if !matches!(zero.operation(), Operation::Const)
-        || !matches!(zero.arg(), UArgRef::Scalar { dtype, bits } if *dtype == output_dtype && *bits == 0)
+    if !matches!(zero.operation(), Operation::Const(_))
+        || !matches!(zero.operation(), Operation::Const(LiteralValue::Scalar { dtype, bits }) if *dtype == output_dtype && *bits == 0)
         || !zero.sources().is_empty()
     {
         return Ok(None);
@@ -2602,12 +2579,12 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
             "public ReLU input load needs one index".into(),
         ));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: input_elements,
         input_shape,
         output_shape: input_output_shape,
         ..
-    } = input_index.arg()
+    }) = input_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "public ReLU does not admit affine-view input".into(),
@@ -2663,11 +2640,11 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public LeakyReLU requires a concrete output buffer".into(),
@@ -2710,8 +2687,8 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
     if condition.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || scaled.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || input_value.ty().map(|ty| ty.scalar) != Some(output_dtype)
-        || !matches!(zero.operation(), Operation::Const)
-        || !matches!(zero.arg(), UArgRef::Scalar { bits, .. } if *bits == 0)
+        || !matches!(zero.operation(), Operation::Const(_))
+        || !matches!(zero.operation(), Operation::Const(LiteralValue::Scalar { bits, .. }) if *bits == 0)
         || !zero.sources().is_empty()
     {
         return Ok(None);
@@ -2751,12 +2728,12 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
                 "public LeakyReLU {role} load needs one index"
             )));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(format!(
                 "public LeakyReLU {role} does not admit affine views"
@@ -2856,11 +2833,11 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
             "Clamp Store needs index and value".into(),
         ));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported("Clamp needs concrete output".into()));
     };
@@ -2911,12 +2888,12 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         let [index] = load.sources() else {
             return Err(PtxError::Unsupported("Clamp load arity".into()));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(
                 "Clamp does not admit affine views".into(),
@@ -3100,11 +3077,11 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public Select requires a concrete output buffer".into(),
@@ -3159,12 +3136,12 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
                 "public Select {role} load needs one index"
             )));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(format!(
                 "public Select {role} does not admit affine views"
@@ -3198,8 +3175,8 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
             ));
         }
         let index = index(condition, output_shape, "condition")?;
-        let shape = match index.arg() {
-            UArgRef::BufferIndex { input_shape, .. } => input_shape.clone(),
+        let shape = match index.operation() {
+            Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape.clone(),
             _ => unreachable!(),
         };
         (shape, dtype)
@@ -3252,8 +3229,8 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
     let true_index = index(true_load, output_shape, "true payload")?;
     let false_index = index(false_load, output_shape, "false payload")?;
     fn input_shape(index: &UOp) -> &Shape {
-        match index.arg() {
-            UArgRef::BufferIndex { input_shape, .. } => input_shape,
+        match index.operation() {
+            Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
             _ => unreachable!(),
         }
     }
@@ -3309,11 +3286,11 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output_index.arg()
+    }) = output_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "public Div requires a concrete output buffer".into(),
@@ -3383,12 +3360,12 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
                 "public Div load needs one index".into(),
             ));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(
                 "public Div does not admit affine-view inputs".into(),
@@ -3470,12 +3447,12 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     let rhs_load = path(divisor, rhs_dtype, &rhs_targets)?;
     let lhs_index = index(lhs_load, output_shape)?;
     let rhs_index = index(rhs_load, output_shape)?;
-    let lhs_shape = match lhs_index.arg() {
-        UArgRef::BufferIndex { input_shape, .. } => input_shape,
+    let lhs_shape = match lhs_index.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
-    let rhs_shape = match rhs_index.arg() {
-        UArgRef::BufferIndex { input_shape, .. } => input_shape,
+    let rhs_shape = match rhs_index.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
     if lhs_shape
@@ -3549,11 +3526,11 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output_index.arg()
+    }) = output_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "Bool Sub requires a concrete output".into(),
@@ -3575,12 +3552,12 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
                 "Bool Sub load needs one index".into(),
             ));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(
                 "Bool Sub does not admit affine-view operands".into(),
@@ -4265,41 +4242,40 @@ fn emit(
         _ => format!("%r{id}"),
     };
     match n.operation() {
-        Operation::Const => match n.arg() {
-            UArgRef::Int(v) => lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty))),
-            UArgRef::Scalar { dtype, bits } if *dtype == ty => {
-                // Bool is logically one bit but PTX tensors store it in an
-                // addressable byte.  A scalar Bool literal must use that
-                // physical width as well; `mov.b1` is not a valid register
-                // operation and would lose the canonical UOp Const boundary.
-                let width = (dtype.itemsize() * 8) as u8;
-                let digits = width as usize / 4;
-                lines.push(format!("  mov.b{width} {dst}, 0x{bits:0digits$x};"));
-            }
-            UArgRef::Scalar { .. } => {
-                return Err(PtxError::Unsupported("scalar literal/type mismatch".into()));
-            }
-            _ => return Err(PtxError::Unsupported("invalid constant".into())),
-        },
+        Operation::Const(LiteralValue::Int(v)) => {
+            lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty)))
+        }
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) if *dtype == ty => {
+            // Bool is logically one bit but PTX tensors store it in an
+            // addressable byte.  A scalar Bool literal must use that
+            // physical width as well; `mov.b1` is not a valid register
+            // operation and would lose the canonical UOp Const boundary.
+            let width = (dtype.itemsize() * 8) as u8;
+            let digits = width as usize / 4;
+            lines.push(format!("  mov.b{width} {dst}, 0x{bits:0digits$x};"));
+        }
+        Operation::Const(LiteralValue::Scalar { .. }) => {
+            return Err(PtxError::Unsupported("scalar literal/type mismatch".into()));
+        }
         Operation::Load => {
             let ix = n
                 .sources()
                 .first()
                 .ok_or_else(|| PtxError::Unsupported("Load without index".into()))?;
-            let (buffer, input_shape, output_shape, view) = match ix.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, output_shape, view) = match ix.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                } => (buffer, input_shape, output_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (buffer, input_shape, output_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                } => (buffer, input_shape, output_shape, Some(view)),
+                }) => (buffer, input_shape, output_shape, Some(view)),
                 _ => return Err(PtxError::Unsupported("Load index".into())),
             };
             let b = ids[buffer] + 1;
@@ -5074,7 +5050,7 @@ fn emit(
                         "scoped IsFinite has a non-Ne comparison".into(),
                     ));
                 }
-                if matches!(n.sources()[1].operation(), Operation::Const) {
+                if matches!(n.sources()[1].operation(), Operation::Const(_)) {
                     if n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                         || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                     {
@@ -5356,14 +5332,14 @@ fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
         .sources()
         .first()
         .ok_or_else(|| PtxError::Unsupported("reduction update without init".into()))?;
-    let UArgRef::Reduction {
+    let Operation::ReduceInit(ReductionValue {
         input_shape,
         output_shape,
         axes,
         keepdim,
         kind,
         mean,
-    } = init.arg()
+    }) = init.operation()
     else {
         return Err(PtxError::Unsupported("reduction metadata".into()));
     };
@@ -6877,17 +6853,15 @@ mod tests {
 
     fn global(dtype: DType, buffer: u64) -> UOp {
         let element = UType::scalar(dtype);
-        UOp::try_new(
-            Operation::DefineGlobal,
-            Some(element),
-            vec![],
-            UArg::Address {
+        UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
                 space: AddressSpace::Global,
                 name: format!("b{buffer}"),
                 element,
-            },
+            }),
+            Some(element),
+            vec![],
         )
-        .unwrap()
     }
 
     #[test]
@@ -7354,106 +7328,90 @@ mod tests {
     fn kernel(dtype: DType) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let addr = global(dtype, 1);
-        let ix = UOp::try_new(
-            Operation::Index,
-            Some(UType::scalar(dtype)),
-            vec![addr, range],
-            UArg::BufferIndex {
+        let ix = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 1,
                 elements: 4,
                 input_shape: crate::Shape::new(vec![4]),
                 output_shape: crate::Shape::new(vec![4]),
-            },
-        )
-        .unwrap();
-        let load = UOp::try_new(
+            }),
+            Some(UType::scalar(dtype)),
+            vec![addr, range],
+        );
+        let load = UOp::from_operation(
             Operation::Load,
             Some(UType::scalar(dtype)),
             vec![ix.clone()],
-            UArg::None,
-        )
-        .unwrap();
-        let value = UOp::try_new(
+        );
+        let value = UOp::from_operation(
             Operation::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![load, UOp::constant(1, UType::scalar(dtype))],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(Operation::Store, None, vec![ix, value], UArg::None).unwrap(),
-        ])
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![ix, value],
+        )])
     }
     fn unary_kernel(dtype: DType, op: crate::UnaryOp, shape: crate::Shape) -> UOp {
         let elements = shape.numel().unwrap();
         let range = UOp::constant(elements as i64, UType::scalar(DType::I64));
-        let index = UOp::try_new(
-            Operation::Index,
-            Some(UType::scalar(dtype)),
-            vec![global(dtype, 1), range],
-            UArg::BufferIndex {
+        let index = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 1,
                 elements,
                 input_shape: shape.clone(),
                 output_shape: shape,
-            },
-        )
-        .unwrap();
-        let value = UOp::try_new(
+            }),
+            Some(UType::scalar(dtype)),
+            vec![global(dtype, 1), range],
+        );
+        let value = UOp::from_operation(
             Operation::GraphUnary(op),
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::try_new(
-                    Operation::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![index.clone()],
-                    UArg::None,
-                )
-                .unwrap(),
-            ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(Operation::Store, None, vec![index, value], UArg::None).unwrap(),
-        ])
+            vec![UOp::from_operation(
+                Operation::Load,
+                Some(UType::scalar(dtype)),
+                vec![index.clone()],
+            )],
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![index, value],
+        )])
     }
     fn broadcast_unary_kernel(dtype: DType, op: crate::UnaryOp) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer, input_shape: crate::Shape| {
-            UOp::try_new(
-                Operation::Index,
-                Some(UType::scalar(dtype)),
-                vec![global(dtype, buffer), range.clone()],
-                UArg::BufferIndex {
+            UOp::from_operation(
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements: input_shape.numel().unwrap(),
                     input_shape,
                     output_shape: crate::Shape::new(vec![2, 2]),
-                },
+                }),
+                Some(UType::scalar(dtype)),
+                vec![global(dtype, buffer), range.clone()],
             )
-            .unwrap()
         };
         let input = index(1, crate::Shape::new(vec![1, 2]));
         let output = index(2, crate::Shape::new(vec![2, 2]));
-        let value = UOp::try_new(
+        let value = UOp::from_operation(
             Operation::GraphUnary(op),
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::try_new(
-                    Operation::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![input],
-                    UArg::None,
-                )
-                .unwrap(),
-            ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(Operation::Store, None, vec![output, value], UArg::None).unwrap(),
-        ])
+            vec![UOp::from_operation(
+                Operation::Load,
+                Some(UType::scalar(dtype)),
+                vec![input],
+            )],
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![output, value],
+        )])
     }
     fn static_view_unary_kernel(dtype: DType, op: crate::UnaryOp, offset: usize) -> UOp {
         let output_shape = crate::Shape::new(vec![2, 2]);
@@ -7464,94 +7422,72 @@ mod tests {
             offset,
         };
         let range = UOp::constant(4, UType::scalar(DType::I64));
-        let input = UOp::try_new(
-            Operation::Index,
-            Some(UType::scalar(dtype)),
-            vec![global(dtype, 1), range.clone()],
-            UArg::ViewBufferIndex {
+        let input = UOp::from_operation(
+            Operation::Index(IndexValue::View {
                 buffer: 1,
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape: output_shape.clone(),
                 view: view.into(),
-            },
-        )
-        .unwrap();
-        let output = UOp::try_new(
-            Operation::Index,
+            }),
             Some(UType::scalar(dtype)),
-            vec![global(dtype, 2), range],
-            UArg::BufferIndex {
+            vec![global(dtype, 1), range.clone()],
+        );
+        let output = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 2,
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape,
-            },
-        )
-        .unwrap();
-        let value = UOp::try_new(
+            }),
+            Some(UType::scalar(dtype)),
+            vec![global(dtype, 2), range],
+        );
+        let value = UOp::from_operation(
             Operation::GraphUnary(op),
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::try_new(
-                    Operation::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![input],
-                    UArg::None,
-                )
-                .unwrap(),
-            ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(Operation::Store, None, vec![output, value], UArg::None).unwrap(),
-        ])
+            vec![UOp::from_operation(
+                Operation::Load,
+                Some(UType::scalar(dtype)),
+                vec![input],
+            )],
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![output, value],
+        )])
     }
     fn broadcast_add_kernel(dtype: DType) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer, shape: Vec<usize>| {
-            UOp::try_new(
-                Operation::Index,
-                Some(UType::scalar(dtype)),
-                vec![global(dtype, buffer), range.clone()],
-                UArg::BufferIndex {
+            UOp::from_operation(
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements: shape.iter().product(),
                     input_shape: crate::Shape::new(shape),
                     output_shape: crate::Shape::new(vec![2, 2]),
-                },
+                }),
+                Some(UType::scalar(dtype)),
+                vec![global(dtype, buffer), range.clone()],
             )
-            .unwrap()
         };
         let left = index(1, vec![2, 2]);
         let right = index(2, vec![1, 2]);
         let out = index(3, vec![2, 2]);
-        let add = UOp::try_new(
+        let add = UOp::from_operation(
             Operation::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![
-                UOp::try_new(
-                    Operation::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![left],
-                    UArg::None,
-                )
-                .unwrap(),
-                UOp::try_new(
-                    Operation::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![right],
-                    UArg::None,
-                )
-                .unwrap(),
+                UOp::from_operation(Operation::Load, Some(UType::scalar(dtype)), vec![left]),
+                UOp::from_operation(Operation::Load, Some(UType::scalar(dtype)), vec![right]),
             ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(Operation::Store, None, vec![out, add], UArg::None).unwrap(),
-        ])
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![out, add],
+        )])
     }
 
     fn static_view_add_kernel(dtype: DType, offset: usize) -> UOp {
@@ -7565,59 +7501,43 @@ mod tests {
         };
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer| {
-            UOp::try_new(
-                Operation::Index,
-                Some(UType::scalar(dtype)),
-                vec![global(dtype, buffer), range.clone()],
-                UArg::ViewBufferIndex {
+            UOp::from_operation(
+                Operation::Index(IndexValue::View {
                     buffer,
                     elements: 4,
                     input_shape: output_shape.clone(),
                     output_shape: output_shape.clone(),
                     view: view.clone().into(),
-                },
+                }),
+                Some(UType::scalar(dtype)),
+                vec![global(dtype, buffer), range.clone()],
             )
-            .unwrap()
         };
         let left = index(1);
         let right = index(2);
-        let output = UOp::try_new(
-            Operation::Index,
-            Some(UType::scalar(dtype)),
-            vec![global(dtype, 3), range],
-            UArg::BufferIndex {
+        let output = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 3,
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape,
-            },
-        )
-        .unwrap();
-        let value = UOp::try_new(
+            }),
+            Some(UType::scalar(dtype)),
+            vec![global(dtype, 3), range],
+        );
+        let value = UOp::from_operation(
             Operation::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![
-                UOp::try_new(
-                    Operation::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![left],
-                    UArg::None,
-                )
-                .unwrap(),
-                UOp::try_new(
-                    Operation::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![right],
-                    UArg::None,
-                )
-                .unwrap(),
+                UOp::from_operation(Operation::Load, Some(UType::scalar(dtype)), vec![left]),
+                UOp::from_operation(Operation::Load, Some(UType::scalar(dtype)), vec![right]),
             ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(Operation::Store, None, vec![output, value], UArg::None).unwrap(),
-        ])
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![output, value],
+        )])
     }
 
     #[test]

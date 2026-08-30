@@ -7,7 +7,9 @@ use super::{
     transaction::{GuardedIntegerOp, OpenClGuardDomain, OpenClTransactionAbi},
     view::OpenClViewAccess,
 };
-use crate::{AffineView, DType, Operation, ScheduleInputBinding, Shape, UArgRef, UOp};
+use crate::{
+    AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -113,15 +115,12 @@ impl OpenClRenderer {
     }
 
     pub fn render(&self, root: &UOp) -> Result<RenderedOpenCl, OpenClError> {
-        if matches!(root.operation(), Operation::Random) {
-            let UArgRef::Random(plan) = root.arg() else {
-                return Err(OpenClError::Unsupported("random payload is absent".into()));
-            };
+        if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
         if matches!(
             root.operation(),
-            Operation::PrefixScan | Operation::Sort | Operation::TensorGuard
+            Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
         ) {
             return Err(OpenClError::Unsupported(
                 "prefix scans and sort pairs are CPU-oracle only".into(),
@@ -155,12 +154,12 @@ impl OpenClRenderer {
             .sources()
             .first()
             .ok_or_else(|| OpenClError::Unsupported("store has no index".into()))?;
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             buffer: output_id,
             elements: extent,
             input_shape: output_shape,
             output_shape: store_shape,
-        } = output_index.arg()
+        }) = output_index.operation()
         else {
             return Err(OpenClError::Unsupported(
                 "output requires a contiguous BufferIndex".into(),
@@ -179,14 +178,14 @@ impl OpenClRenderer {
 
         let mut inventory = BTreeMap::<u64, OpenClBufferAbi>::new();
         for node in &nodes {
-            let (buffer, source_shape, elements, view) = match node.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, source_shape, elements, view) = match node.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements,
                     input_shape,
                     ..
-                } => (*buffer, input_shape.clone(), *elements, None),
-                UArgRef::ViewBufferIndex { buffer, view, .. } => {
+                }) => (*buffer, input_shape.clone(), *elements, None),
+                Operation::Index(IndexValue::View { buffer, view, .. }) => {
                     let access = OpenClViewAccess::new(
                         view,
                         node.ty()
@@ -240,10 +239,9 @@ impl OpenClRenderer {
                 .sources()
                 .first()
                 .ok_or_else(|| OpenClError::InvalidBinding("load lacks index".into()))?;
-            let buffer = match index.arg() {
-                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
-                    *buffer
-                }
+            let buffer = match index.operation() {
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                | Operation::Index(IndexValue::View { buffer, .. }) => *buffer,
                 _ => {
                     return Err(OpenClError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -560,36 +558,36 @@ fn emit_expr(
             .and_then(|source| emit_expr(source, ids, source_map, lines, linear, capabilities))
     };
     match node.operation() {
-        Operation::Const => match node.arg() {
-            UArgRef::Scalar {
+        Operation::Const(value) => match value {
+            LiteralValue::Scalar {
                 dtype: &DType::F32,
                 bits,
             } => Ok(format!("as_float((uint)0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("((uchar){bits}u)")),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::I32,
                 bits,
             } => Ok(format!("as_int((uint)0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::U32,
                 bits,
             } => Ok(format!("((uint)0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::I64,
                 bits,
             } => Ok(format!("as_long((ulong)0x{bits:016x}ul)")),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::U64,
                 bits,
             } => Ok(format!("((ulong)0x{bits:016x}ul)")),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::F64,
                 bits,
             } => Ok(format!("as_double((ulong)0x{bits:016x}ul)")),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::F16,
                 bits,
             } if dtype == DType::F16 => Ok(narrow::decode(
@@ -597,7 +595,7 @@ fn emit_expr(
                 format!("((ushort)0x{:04x}u)", *bits as u16),
             )
             .expect("F16 is a narrow float")),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::BF16,
                 bits,
             } if dtype == DType::BF16 => Ok(narrow::decode(
@@ -605,7 +603,7 @@ fn emit_expr(
                 format!("((ushort)0x{:04x}u)", *bits as u16),
             )
             .expect("BF16 is a narrow float")),
-            UArgRef::Scalar { .. } => Err(OpenClError::Unsupported(
+            LiteralValue::Scalar { .. } => Err(OpenClError::Unsupported(
                 "scalar literal/type mismatch".into(),
             )),
             _ => Err(OpenClError::Unsupported("invalid scalar literal".into())),
@@ -615,20 +613,20 @@ fn emit_expr(
                 .sources()
                 .first()
                 .ok_or_else(|| OpenClError::Unsupported("load has no index".into()))?;
-            let (buffer, input_shape, output_shape, view) = match index.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, output_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                } => (*buffer, input_shape, output_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, input_shape, output_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                } => (*buffer, input_shape, output_shape, Some(view)),
+                }) => (*buffer, input_shape, output_shape, Some(view)),
                 _ => {
                     return Err(OpenClError::Unsupported(
                         "load requires a checked static buffer index".into(),

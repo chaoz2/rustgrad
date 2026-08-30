@@ -1090,23 +1090,20 @@ storage. The CPU backend remains the differential semantic oracle.
 
 `UOpNode` stores one typed `Operation`, its result type, and its sources. Each
 `Operation` variant owns its payload, removing the former invalid cross-product
-of an independently stored kind and untyped argument. The small `define_uops!`
-registry declares every variant once and generates the enum plus its stable
-compatibility kind projection, borrowed payload view, and generic
-family/arity/effect metadata. Direct DAG validation, rewrite purity, artifacts,
-and visualization consume those generated interfaces rather than maintaining
-independent taxonomy lists. Artifact encoding and legacy backend seams request
-explicit owned `UOpKind`/`UArg` projections; they are not stored in the DAG and
-the existing numeric tags and version gates are unchanged.
+of an independently stored kind and untyped argument. The enum is declared
+directly and is the sole in-memory operation taxonomy. DAG validation, rewrite
+purity, interpretation, schedules, and renderers match it explicitly where
+their semantic policies differ. Artifact encoding alone projects operations to
+a private wire opcode and payload; the existing numeric tags and version gates
+are unchanged and cannot leak back into the DAG.
 
 This is an intentional pre-1.0 Rust source migration. `UOp::from_operation`
-is the infallible typed constructor; legacy opcode/argument callers use
-fallible `UOp::try_new`, which rejects mismatched pairs without publishing a
-node. `UOp::kind()` returns the lightweight opcode projection by value and
-`UOp::arg()` returns a borrowed `UArgRef`. `LinearPayload` likewise stores one
-typed `operation` instead of public duplicate `uop_kind` and `arg` fields.
-Downstream code should match `Operation` when it needs payload semantics and
-request compatibility projections only at wire or backend boundaries.
+is the typed constructor and `UOp::operation()` exposes the borrowed enum.
+There is no legacy opcode/argument constructor or projection that could
+recreate an invalid combination. `LinearPayload` likewise stores one typed
+`operation` instead of duplicate kind and argument fields. Downstream code
+matches `Operation` directly; only the private artifact codec translates it to
+stable wire tags.
 
 The generated metadata does not replace semantic boundaries. Detailed type/control
 validation, portable interpretation, schedule lowering, artifact tag codecs,
@@ -1116,7 +1113,7 @@ rule applies to future refactors: shared taxonomy policy moves into the typed
 enum, while evaluation, wire ABI, and backend capability decisions stay
 visible and fail closed. Remaining high-value follow-ups are ordered as:
 
-1. reconcile repeated scalar/linear/vector instruction-family mapping where a
+1. reconcile repeated scalar/linear/vector presentation mapping where a
    single typed mapping is demonstrably shared;
 2. centralize presentation names without coupling them to artifact tags;
 3. leave backend capability lists local unless two backends first share an

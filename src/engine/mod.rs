@@ -244,7 +244,7 @@ pub fn realize_with_options(
         ));
     }
     if schedule.items.iter().any(|item| {
-        !item.outputs.is_single() && !matches!(item.kernel.operation(), crate::Operation::Sort)
+        !item.outputs.is_single() && !matches!(item.kernel.operation(), crate::Operation::Sort(_))
     }) {
         return Err(RealizationError::Unsupported(
             "multi-output schedule items have no executor lowering".into(),
@@ -280,7 +280,9 @@ pub fn realize_with_options(
     let jit = matches!(policy, RealizationPolicy::CpuJit { .. })
         .then(|| CpuJitBackend::new(JitFallback::Error));
     for item in &schedule.items {
-        if !item.outputs.is_single() && !matches!(item.kernel.operation(), crate::Operation::Sort) {
+        if !item.outputs.is_single()
+            && !matches!(item.kernel.operation(), crate::Operation::Sort(_))
+        {
             return Err(RealizationError::Unsupported(format!(
                 "item {} has no multi-output executor",
                 item.id
@@ -308,7 +310,7 @@ pub fn realize_with_options(
         let mut vector_tail = 0;
         let mut vector_reason = "interpreter scalar semantics".to_string();
         let materialized = materialized_values(&leases, &values).map_err(RealizationError::Host)?;
-        let sort_pair = if matches!(item.kernel.operation(), crate::Operation::Sort) {
+        let sort_pair = if matches!(item.kernel.operation(), crate::Operation::Sort(_)) {
             if jit.is_some() {
                 return Err(RealizationError::Unsupported(
                     "static sort pairs are CPU-interpreter only".into(),

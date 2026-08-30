@@ -4,7 +4,7 @@ use super::{
     renderer::{WgslViewAccess, broadcast_offset, ordered_compare_operand},
     transaction::{GuardedIntegerOp, WebGpuTransactionAbi},
 };
-use crate::{DType, Operation, UArgRef, UOp};
+use crate::{DType, IndexValue, LiteralValue, Operation, UOp};
 use std::collections::BTreeMap;
 
 pub(super) fn emit_transactional(
@@ -50,7 +50,7 @@ impl Emitter<'_> {
         supported_transaction_dtype(dtype)?;
         let name = self.value_name();
         match node.operation() {
-            Operation::Const => {
+            Operation::Const(_) => {
                 let value = scalar_literal(node, dtype)?;
                 self.lines.push(format!(
                     "{indent}let {name}: {} = {value};",
@@ -237,20 +237,20 @@ impl Emitter<'_> {
             .sources()
             .first()
             .ok_or_else(|| WebGpuError::Unsupported("load has no index".into()))?;
-        let (buffer, input_shape, output_shape, view) = match index.arg() {
-            UArgRef::BufferIndex {
+        let (buffer, input_shape, output_shape, view) = match index.operation() {
+            Operation::Index(IndexValue::Buffer {
                 buffer,
                 input_shape,
                 output_shape,
                 ..
-            } => (*buffer, input_shape, output_shape, None),
-            UArgRef::ViewBufferIndex {
+            }) => (*buffer, input_shape, output_shape, None),
+            Operation::Index(IndexValue::View {
                 buffer,
                 input_shape,
                 output_shape,
                 view,
                 ..
-            } => (*buffer, input_shape, output_shape, Some(view)),
+            }) => (*buffer, input_shape, output_shape, Some(view)),
             _ => {
                 return Err(WebGpuError::Unsupported(
                     "load requires checked static indexing".into(),
@@ -303,25 +303,27 @@ fn zero(dtype: DType) -> &'static str {
 }
 
 fn scalar_literal(node: &UOp, dtype: DType) -> Result<String, WebGpuError> {
-    match node.arg() {
-        UArgRef::Scalar {
+    match node.operation() {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::Bool && dtype == DType::Bool && *bits <= 1 => Ok(if *bits == 0 {
+        }) if *actual == DType::Bool && dtype == DType::Bool && *bits <= 1 => Ok(if *bits == 0 {
             "false".into()
         } else {
             "true".into()
         }),
-        UArgRef::Scalar {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::I32 && dtype == DType::I32 => {
+        }) if *actual == DType::I32 && dtype == DType::I32 => {
             Ok(format!("bitcast<i32>(0x{:08x}u)", *bits as u32))
         }
-        UArgRef::Scalar {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::U32 && dtype == DType::U32 => Ok(format!("0x{:08x}u", *bits as u32)),
+        }) if *actual == DType::U32 && dtype == DType::U32 => {
+            Ok(format!("0x{:08x}u", *bits as u32))
+        }
         _ => Err(WebGpuError::Unsupported(
             "transactional scalar literal/type mismatch".into(),
         )),

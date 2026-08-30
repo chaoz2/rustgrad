@@ -1,7 +1,7 @@
 use super::graph::{dtype_name, i64_list, shape_name, usize_list};
 use super::{VizEdge, VizError, VizGraph, VizNode};
 use crate::uop::{Binary, Unary};
-use crate::{AddressSpace, Operation, UArgRef, UOp};
+use crate::{AddressSpace, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation, UOp};
 use std::collections::BTreeMap;
 
 fn unary_name(op: Unary) -> &'static str {
@@ -31,14 +31,14 @@ fn binary_name(op: Binary) -> &'static str {
 
 pub(super) fn kind_name(kind: &Operation) -> String {
     match kind {
-        Operation::Const => "const".into(),
-        Operation::VConst => "vconst".into(),
-        Operation::DefineVar => "define_var".into(),
-        Operation::DefineGlobal => "define_global".into(),
-        Operation::DefineLocal => "define_local".into(),
-        Operation::DefineRegister => "define_register".into(),
-        Operation::Special => "special".into(),
-        Operation::Range => "range".into(),
+        Operation::Const(_) => "const".into(),
+        Operation::VConst(_) => "vconst".into(),
+        Operation::DefineVar(_) => "define_var".into(),
+        Operation::DefineGlobal(_) => "define_global".into(),
+        Operation::DefineLocal(_) => "define_local".into(),
+        Operation::DefineRegister(_) => "define_register".into(),
+        Operation::Special(_) => "special".into(),
+        Operation::Range(_) => "range".into(),
         Operation::EndRange => "end_range".into(),
         Operation::If => "if".into(),
         Operation::EndIf => "end_if".into(),
@@ -48,26 +48,26 @@ pub(super) fn kind_name(kind: &Operation) -> String {
         Operation::GraphBinary(op) => format!("graph_binary.{}", op.name()),
         Operation::GraphCompare(op) => format!("graph_compare.{}", op.name()),
         Operation::GraphLogical(op) => format!("graph_logical.{}", op.name()),
-        Operation::Matmul => "matmul".into(),
-        Operation::Conv2d => "conv2d.static_1x1".into(),
-        Operation::Movement => "movement".into(),
-        Operation::Random => "random".into(),
-        Operation::PrefixScan => "prefix_scan".into(),
-        Operation::Sort => "sort.pair".into(),
-        Operation::TensorGuard => "tensor_guard".into(),
-        Operation::ReduceInit => "reduce_init".into(),
+        Operation::Matmul(_) => "matmul".into(),
+        Operation::Conv2d(_) => "conv2d.static_1x1".into(),
+        Operation::Movement(_) => "movement".into(),
+        Operation::Random(_) => "random".into(),
+        Operation::PrefixScan(_) => "prefix_scan".into(),
+        Operation::Sort(_) => "sort.pair".into(),
+        Operation::TensorGuard(_) => "tensor_guard".into(),
+        Operation::ReduceInit(_) => "reduce_init".into(),
         Operation::ReduceAccumulate => "reduce_accumulate".into(),
         Operation::ReduceFinalize => "reduce_finalize".into(),
         Operation::Ternary(_) => "ternary.where".into(),
         Operation::Cast => "cast".into(),
         Operation::Bitcast => "bitcast".into(),
         Operation::Vectorize => "vectorize".into(),
-        Operation::Gep => "gep".into(),
-        Operation::Index => "index".into(),
+        Operation::Gep(_) => "gep".into(),
+        Operation::Index(_) => "index".into(),
         Operation::Load => "load".into(),
         Operation::Store => "store".into(),
-        Operation::EffectStore => "effect_store".into(),
-        Operation::After => "after".into(),
+        Operation::EffectStore(_) => "effect_store".into(),
+        Operation::After(_) => "after".into(),
         Operation::Barrier => "barrier".into(),
         Operation::Sink => "sink".into(),
     }
@@ -81,60 +81,63 @@ fn space_name(space: AddressSpace) -> &'static str {
     }
 }
 
-fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
+fn operation_fields(operation: &Operation) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    match arg {
-        UArgRef::None => {}
-        UArgRef::Int(value) => {
+    match operation {
+        Operation::Const(LiteralValue::Int(value))
+        | Operation::VConst(LiteralValue::Int(value)) => {
             out.insert("arg".into(), value.to_string());
         }
-        UArgRef::Scalar { dtype, bits } => {
+        Operation::Const(LiteralValue::Scalar { dtype, bits })
+        | Operation::VConst(LiteralValue::Scalar { dtype, bits }) => {
             out.insert("scalar_dtype".into(), dtype_name(*dtype).into());
             out.insert("scalar_bits".into(), format!("0x{bits:016x}"));
         }
-        UArgRef::Name(name) => {
+        Operation::Special(name) => {
             out.insert("name".into(), name.to_owned());
         }
-        UArgRef::Variable { name, bounds } => {
-            out.insert("name".into(), name.to_owned());
-            out.insert("bounds".into(), bounds.to_string());
+        Operation::DefineVar(value) => {
+            out.insert("name".into(), value.name.clone());
+            out.insert("bounds".into(), value.bounds.to_string());
         }
-        UArgRef::Address {
-            space,
-            name,
-            element,
-        } => {
-            out.insert("space".into(), space_name(*space).into());
-            out.insert("name".into(), name.to_owned());
+        Operation::DefineGlobal(value)
+        | Operation::DefineLocal(value)
+        | Operation::DefineRegister(value) => {
+            out.insert("space".into(), space_name(value.space).into());
+            out.insert("name".into(), value.name.clone());
             out.insert(
                 "element".into(),
-                format!("{}x{}", dtype_name(element.scalar), element.lanes),
+                format!(
+                    "{}x{}",
+                    dtype_name(value.element.scalar),
+                    value.element.lanes
+                ),
             );
         }
-        UArgRef::RangeAxis(axis) => {
+        Operation::Range(axis) => {
             out.insert("axis".into(), axis.to_string());
         }
-        UArgRef::GepLane(lane) => {
+        Operation::Gep(lane) => {
             out.insert("lane".into(), lane.to_string());
         }
-        UArgRef::BufferIndex {
+        Operation::Index(IndexValue::Buffer {
             buffer,
             elements,
             input_shape,
             output_shape,
-        } => {
+        }) => {
             out.insert("buffer".into(), buffer.to_string());
             out.insert("elements".into(), elements.to_string());
             out.insert("input_shape".into(), shape_name(input_shape));
             out.insert("output_shape".into(), shape_name(output_shape));
         }
-        UArgRef::ViewBufferIndex {
+        Operation::Index(IndexValue::View {
             buffer,
             elements,
             input_shape,
             output_shape,
             view,
-        } => {
+        }) => {
             out.insert("buffer".into(), buffer.to_string());
             out.insert("elements".into(), elements.to_string());
             out.insert("input_shape".into(), shape_name(input_shape));
@@ -144,14 +147,14 @@ fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
             out.insert("view_strides".into(), i64_list(&view.strides));
             out.insert("view_offset".into(), view.offset.to_string());
         }
-        UArgRef::Reduction {
+        Operation::ReduceInit(crate::ReductionValue {
             input_shape,
             output_shape,
             axes,
             keepdim,
             kind,
             mean,
-        } => {
+        }) => {
             out.insert("input_shape".into(), shape_name(input_shape));
             out.insert("output_shape".into(), shape_name(output_shape));
             out.insert("axes".into(), usize_list(axes));
@@ -171,8 +174,8 @@ fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
             );
             out.insert("mean".into(), mean.to_string());
         }
-        UArgRef::Matmul(plan) => matmul_fields(&mut out, plan, "serial"),
-        UArgRef::Conv2d(plan) => {
+        Operation::Matmul(MatmulValue::Serial(plan)) => matmul_fields(&mut out, plan, "serial"),
+        Operation::Conv2d(plan) => {
             out.insert("strategy".into(), "static_f32_1x1".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());
             out.insert("input_shape".into(), shape_name(&plan.input_shape));
@@ -187,7 +190,7 @@ fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
             );
             out.insert("bias".into(), plan.bias.is_some().to_string());
         }
-        UArgRef::TiledMatmul(payload) => {
+        Operation::Matmul(MatmulValue::Tiled(payload)) => {
             matmul_fields(&mut out, &payload.matmul, "tiled");
             out.insert("plan_key".into(), payload.tile.cache_key.to_string());
             out.insert(
@@ -198,7 +201,7 @@ fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
                 ),
             );
         }
-        UArgRef::TensorCoreMatmul(payload) => {
+        Operation::Matmul(MatmulValue::TensorCore(payload)) => {
             matmul_fields(&mut out, &payload.matmul, "tensor_core");
             out.insert("plan_key".into(), payload.tensor_core.cache_key.to_string());
             out.insert(
@@ -209,7 +212,7 @@ fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
                 .into(),
             );
         }
-        UArgRef::QuantizedMatmul(plan) => {
+        Operation::Matmul(MatmulValue::Quantized(plan)) => {
             out.insert("strategy".into(), "quantized".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());
             out.insert(
@@ -219,13 +222,13 @@ fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
             out.insert("output_shape".into(), shape_name(&plan.output_shape));
             out.insert("m_n_k".into(), format!("{}x{}x{}", plan.m, plan.n, plan.k));
         }
-        UArgRef::QuantizedRowGather(plan) => {
+        Operation::Movement(MovementValue::QuantizedRowGather(plan)) => {
             out.insert("strategy".into(), "quantized_row_gather".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());
             out.insert("indices_shape".into(), shape_name(&plan.indices_shape));
             out.insert("output_shape".into(), shape_name(&plan.output_shape));
         }
-        UArgRef::Movement(plan) => {
+        Operation::Movement(MovementValue::Plan(plan)) => {
             out.insert("strategy".into(), "movement".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());
             out.insert("output_shape".into(), shape_name(&plan.output_shape));
@@ -249,69 +252,107 @@ fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
                 .into(),
             );
         }
-        UArgRef::Random(plan) => {
+        Operation::Random(plan) => {
             out.insert("strategy".into(), "threefry".into());
             out.insert("output".into(), plan.output.to_string());
             out.insert("output_shape".into(), shape_name(&plan.shape));
             out.insert("word_count".into(), plan.word_count.to_string());
             out.insert("device".into(), plan.stream.device.to_string());
         }
-        UArgRef::PrefixScan {
-            input,
-            input_shape,
-            axis,
-            kind,
-            output,
-            dtype,
-            ..
-        } => {
-            out.insert("input".into(), input.to_string());
-            out.insert("input_shape".into(), shape_name(input_shape));
-            out.insert("axis".into(), axis.to_string());
-            out.insert("operation".into(), format!("{kind:?}").to_lowercase());
-            out.insert("output".into(), format!("{output:?}").to_lowercase());
-            out.insert("dtype".into(), dtype_name(*dtype).to_string());
+        Operation::PrefixScan(value) => {
+            out.insert("input".into(), value.input.to_string());
+            out.insert("input_shape".into(), shape_name(&value.input_shape));
+            out.insert("axis".into(), value.axis.to_string());
+            out.insert(
+                "operation".into(),
+                format!("{:?}", value.kind).to_lowercase(),
+            );
+            out.insert(
+                "output".into(),
+                format!("{:?}", value.output).to_lowercase(),
+            );
+            out.insert("dtype".into(), dtype_name(value.dtype).to_string());
         }
-        UArgRef::Sort {
-            input,
-            input_shape,
-            axis,
-            descending,
-            values,
-            indices,
-            dtype,
-        } => {
-            out.insert("input".into(), input.to_string());
-            out.insert("input_shape".into(), shape_name(input_shape));
-            out.insert("axis".into(), axis.to_string());
-            out.insert("descending".into(), descending.to_string());
-            out.insert("values".into(), values.to_string());
-            out.insert("indices".into(), indices.to_string());
-            out.insert("dtype".into(), dtype_name(*dtype).to_string());
+        Operation::Sort(value) => {
+            out.insert("input".into(), value.input.to_string());
+            out.insert("input_shape".into(), shape_name(&value.input_shape));
+            out.insert("axis".into(), value.axis.to_string());
+            out.insert("descending".into(), value.descending.to_string());
+            out.insert("values".into(), value.values.to_string());
+            out.insert("indices".into(), value.indices.to_string());
+            out.insert("dtype".into(), dtype_name(value.dtype).to_string());
         }
-        UArgRef::TensorGuard {
-            input,
-            input_shape,
-            axis,
-            dtype,
-        } => {
-            out.insert("input".into(), input.to_string());
-            out.insert("input_shape".into(), shape_name(input_shape));
-            out.insert("axis".into(), axis.to_string());
+        Operation::TensorGuard(value) => {
+            out.insert("input".into(), value.input.to_string());
+            out.insert("input_shape".into(), shape_name(&value.input_shape));
+            out.insert("axis".into(), value.axis.to_string());
             out.insert(
                 "contract".into(),
                 "finite_nonnegative_positive_row_sum".into(),
             );
-            out.insert("dtype".into(), dtype_name(*dtype).to_string());
+            out.insert("dtype".into(), dtype_name(value.dtype).to_string());
         }
-        UArgRef::Effect(payload) => {
+        Operation::EffectStore(payload) | Operation::After(payload) => {
             out.insert("effect_step".into(), payload.step.to_string());
             out.insert("target_buffer".into(), payload.target.buffer.to_string());
             out.insert("target_version".into(), payload.target.version.to_string());
             out.insert("source_buffer".into(), payload.source.buffer.to_string());
         }
+        Operation::EndRange
+        | Operation::If
+        | Operation::EndIf
+        | Operation::Unary(_)
+        | Operation::Binary(_)
+        | Operation::GraphUnary(_)
+        | Operation::GraphBinary(_)
+        | Operation::GraphCompare(_)
+        | Operation::GraphLogical(_)
+        | Operation::ReduceAccumulate
+        | Operation::ReduceFinalize
+        | Operation::Ternary(_)
+        | Operation::Cast
+        | Operation::Bitcast
+        | Operation::Vectorize
+        | Operation::Load
+        | Operation::Store
+        | Operation::Barrier
+        | Operation::Sink => {}
     }
     out
+}
+
+fn family_name(operation: &Operation) -> &'static str {
+    match operation {
+        Operation::Const(_) | Operation::VConst(_) => "literal",
+        Operation::DefineVar(_)
+        | Operation::DefineGlobal(_)
+        | Operation::DefineLocal(_)
+        | Operation::DefineRegister(_)
+        | Operation::Special(_) => "definition",
+        Operation::Range(_) | Operation::EndRange | Operation::If | Operation::EndIf => "control",
+        Operation::Unary(_) | Operation::Binary(_) | Operation::Ternary(_) => "core_alu",
+        Operation::GraphUnary(_)
+        | Operation::GraphBinary(_)
+        | Operation::GraphCompare(_)
+        | Operation::GraphLogical(_) => "graph_alu",
+        Operation::Matmul(_)
+        | Operation::Conv2d(_)
+        | Operation::Movement(_)
+        | Operation::Random(_)
+        | Operation::PrefixScan(_)
+        | Operation::Sort(_)
+        | Operation::TensorGuard(_) => "materialized",
+        Operation::ReduceInit(_) | Operation::ReduceAccumulate | Operation::ReduceFinalize => {
+            "reduction"
+        }
+        Operation::Cast | Operation::Bitcast | Operation::Vectorize | Operation::Gep(_) => {
+            "conversion"
+        }
+        Operation::Index(_) | Operation::Load | Operation::Store => "memory",
+        Operation::EffectStore(_) | Operation::After(_) | Operation::Barrier | Operation::Sink => {
+            "effect"
+        }
+    }
 }
 
 fn matmul_fields(
@@ -345,12 +386,12 @@ pub fn uop_viz(root: &UOp) -> Result<VizGraph, VizError> {
     let mut viz_nodes = Vec::with_capacity(nodes.len());
     let mut edges = Vec::new();
     for (id, node) in nodes.iter().enumerate() {
-        let mut viz = VizNode::new(format!("u{id}"), "uop", kind_name(&node.operation()))
-            .field("family", node.operation().signature().family.name());
+        let mut viz = VizNode::new(format!("u{id}"), "uop", kind_name(node.operation()))
+            .field("family", family_name(node.operation()));
         if let Some(ty) = node.ty() {
             viz = viz.field("type", format!("{}x{}", dtype_name(ty.scalar), ty.lanes));
         }
-        for (key, value) in arg_fields(node.arg()) {
+        for (key, value) in operation_fields(node.operation()) {
             viz = viz.field(key, value);
         }
         for (slot, source) in node.sources().iter().enumerate() {

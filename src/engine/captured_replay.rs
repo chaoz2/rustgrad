@@ -1127,7 +1127,7 @@ fn backend_error(error: JitBackendError) -> ReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, Storage, UArg};
+    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, Storage};
     use std::collections::HashMap;
 
     fn captured(graph: &Graph, requested: &[crate::NodeId]) -> CapturedSchedule {
@@ -2457,7 +2457,7 @@ mod tests {
             );
             assert!(matches!(
                 schedule.items[0].kernel.operation(),
-                crate::Operation::Matmul
+                crate::Operation::Matmul(_)
             ));
             assert_eq!(
                 schedule.items[0]

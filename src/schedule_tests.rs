@@ -114,7 +114,7 @@ fn external_concat_materialization_makes_local_add_renderable() {
         direct
             .items
             .iter()
-            .any(|item| matches!(item.kernel.operation(), crate::Operation::Movement))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::Movement(_)))
     );
     let scheduled = schedule_with_external_materializations(&graph, &[out], &[joined]).unwrap();
     let item = scheduled
@@ -410,7 +410,7 @@ fn matmul_materializes_computed_operands_and_participates_in_lifetimes() {
         .unwrap();
     assert!(matches!(
         matmul.kernel.operation(),
-        crate::Operation::Matmul
+        crate::Operation::Matmul(_)
     ));
     assert_eq!(matmul.dependencies.len(), 1);
     assert_eq!(
@@ -516,6 +516,9 @@ fn sharded_graph_local_shrink_feeds_a_fused_binary_kernel() {
             .topological()
             .unwrap()
             .iter()
-            .any(|node| matches!(node.arg(), crate::UArgRef::ViewBufferIndex { .. }))
+            .any(|node| matches!(
+                node.operation(),
+                crate::Operation::Index(crate::IndexValue::View { .. })
+            ))
     );
 }

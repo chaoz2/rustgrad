@@ -621,7 +621,8 @@ mod tests {
         let (graph, plan, _, _) = fixture(DType::F16, false);
         let output = plan.output;
         let kernel = crate::lower_graph_matmul(&graph, output).unwrap();
-        let crate::UArgRef::TensorCoreMatmul(payload) = kernel.arg() else {
+        let crate::Operation::Matmul(crate::MatmulValue::TensorCore(payload)) = kernel.operation()
+        else {
             panic!("eligible narrow matmul was not tensor-core lowered");
         };
         let bytes = crate::uop::artifact::encode(&kernel).unwrap();
@@ -631,37 +632,31 @@ mod tests {
 
         let mut bad_fragment = payload.clone();
         bad_fragment.tensor_core.fragments.lhs_registers_per_lane = 3;
-        let bad_fragment = crate::UOp::try_new(
-            crate::Operation::Matmul,
+        let bad_fragment = crate::UOp::from_operation(
+            crate::Operation::Matmul(crate::MatmulValue::TensorCore(Box::new(bad_fragment))),
             Some(crate::UType::scalar(DType::F16)),
             vec![],
-            crate::UArg::TensorCoreMatmul(Box::new(bad_fragment)),
-        )
-        .unwrap();
+        );
         assert!(bad_fragment.validate().is_err());
         assert!(crate::uop::artifact::encode(&bad_fragment).is_err());
 
         let mut bad_barrier = payload.clone();
         bad_barrier.tensor_core.barriers[0].uniform = false;
-        let bad_barrier = crate::UOp::try_new(
-            crate::Operation::Matmul,
+        let bad_barrier = crate::UOp::from_operation(
+            crate::Operation::Matmul(crate::MatmulValue::TensorCore(Box::new(bad_barrier))),
             Some(crate::UType::scalar(DType::F16)),
             vec![],
-            crate::UArg::TensorCoreMatmul(Box::new(bad_barrier)),
-        )
-        .unwrap();
+        );
         assert!(bad_barrier.validate().is_err());
         assert!(crate::uop::artifact::encode(&bad_barrier).is_err());
 
         let mut bad_layout = payload.clone();
         bad_layout.tensor_core.lhs_shared.alignment = 2;
-        let bad_layout = crate::UOp::try_new(
-            crate::Operation::Matmul,
+        let bad_layout = crate::UOp::from_operation(
+            crate::Operation::Matmul(crate::MatmulValue::TensorCore(Box::new(bad_layout))),
             Some(crate::UType::scalar(DType::F16)),
             vec![],
-            crate::UArg::TensorCoreMatmul(Box::new(bad_layout)),
-        )
-        .unwrap();
+        );
         assert!(bad_layout.validate().is_err());
         assert!(crate::uop::artifact::encode(&bad_layout).is_err());
     }
@@ -725,8 +720,8 @@ mod tests {
         );
         for specialized in [first.capture(), larger.capture()] {
             assert!(matches!(
-                specialized.items[0].kernel.arg(),
-                crate::UArgRef::TensorCoreMatmul(_)
+                specialized.items[0].kernel.operation(),
+                crate::Operation::Matmul(crate::MatmulValue::TensorCore(_))
             ));
         }
     }
@@ -740,8 +735,8 @@ mod tests {
         let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.to_bytes().unwrap(), bytes);
         assert!(matches!(
-            decoded.items[0].kernel.arg(),
-            crate::UArgRef::TensorCoreMatmul(_)
+            decoded.items[0].kernel.operation(),
+            crate::Operation::Matmul(crate::MatmulValue::TensorCore(_))
         ));
         let replayed = crate::CapturedReplayExecutor::default()
             .replay(
@@ -775,8 +770,10 @@ mod tests {
             let output = graph.matmul(lhs, rhs).unwrap();
             let plan = MatmulKernelPlan::from_graph(&graph, output).unwrap();
             assert!(matches!(
-                crate::lower_graph_matmul(&graph, output).unwrap().arg(),
-                crate::UArgRef::Matmul(_)
+                crate::lower_graph_matmul(&graph, output)
+                    .unwrap()
+                    .operation(),
+                crate::Operation::Matmul(crate::MatmulValue::Serial(_))
             ));
             assert!(
                 TensorCoreMatmulPayload::select(

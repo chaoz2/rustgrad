@@ -5,7 +5,9 @@ use super::{
     narrow::{self, WEBGPU_NARROW_ABI_VERSION},
     transaction::WebGpuTransactionAbi,
 };
-use crate::{AffineView, DType, Operation, ScheduleInputBinding, Shape, UArgRef, UOp};
+use crate::{
+    AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -204,15 +206,12 @@ impl WgslRenderer {
 
     /// Lowers a validated scheduled UOp without executing or allocating.
     pub fn render(&self, root: &UOp) -> Result<RenderedWgsl, WebGpuError> {
-        if matches!(root.operation(), Operation::Random) {
-            let UArgRef::Random(plan) = root.arg() else {
-                return Err(WebGpuError::Unsupported("random payload is absent".into()));
-            };
+        if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
         if matches!(
             root.operation(),
-            Operation::PrefixScan | Operation::Sort | Operation::TensorGuard
+            Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
         ) {
             return Err(WebGpuError::Unsupported(
                 "prefix scans and sort pairs are CPU-oracle only".into(),
@@ -226,7 +225,7 @@ impl WgslRenderer {
         if nodes.iter().any(|node| {
             matches!(
                 node.operation(),
-                Operation::ReduceInit
+                Operation::ReduceInit(_)
                     | Operation::ReduceAccumulate
                     | Operation::ReduceFinalize
                     | Operation::Barrier
@@ -247,12 +246,12 @@ impl WgslRenderer {
             .sources()
             .first()
             .ok_or_else(|| WebGpuError::Unsupported("store has no index".into()))?;
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             buffer: output_id,
             elements: extent,
             input_shape: output_shape,
             output_shape: store_shape,
-        } = output_index.arg()
+        }) = output_index.operation()
         else {
             return Err(WebGpuError::Unsupported(
                 "output requires a contiguous BufferIndex".into(),
@@ -276,14 +275,14 @@ impl WgslRenderer {
 
         let mut inventory = BTreeMap::<u64, WgslBufferAbi>::new();
         for node in &nodes {
-            let (buffer, source_shape, elements, view) = match node.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, source_shape, elements, view) = match node.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements,
                     input_shape,
                     ..
-                } => (*buffer, input_shape.clone(), *elements, None),
-                UArgRef::ViewBufferIndex { buffer, view, .. } => {
+                }) => (*buffer, input_shape.clone(), *elements, None),
+                Operation::Index(IndexValue::View { buffer, view, .. }) => {
                     let access = WgslViewAccess::new(view)?;
                     let elements = access
                         .source_shape
@@ -326,10 +325,9 @@ impl WgslRenderer {
                 .sources()
                 .first()
                 .ok_or_else(|| WebGpuError::InvalidBinding("load lacks index".into()))?;
-            let buffer = match index.arg() {
-                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
-                    *buffer
-                }
+            let buffer = match index.operation() {
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                | Operation::Index(IndexValue::View { buffer, .. }) => *buffer,
                 _ => {
                     return Err(WebGpuError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -584,12 +582,12 @@ fn emit_expr(
                 .and_then(|source| emit_expr(source, ids, source_map, lines, linear))
         };
     match node.operation() {
-        Operation::Const => match node.arg() {
-            UArgRef::Scalar {
+        Operation::Const(value) => match value {
+            LiteralValue::Scalar {
                 dtype: &DType::F32,
                 bits,
             } => Ok(format!("bitcast<f32>(0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(if *bits == 0 {
@@ -597,15 +595,15 @@ fn emit_expr(
             } else {
                 "true".into()
             }),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::I32,
                 bits,
             } => Ok(format!("bitcast<i32>(0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
+            LiteralValue::Scalar {
                 dtype: &DType::U32,
                 bits,
             } => Ok(format!("0x{:08x}u", *bits as u32)),
-            UArgRef::Scalar { dtype, bits } if narrow::is_narrow(*dtype) => {
+            LiteralValue::Scalar { dtype, bits } if narrow::is_narrow(*dtype) => {
                 Ok(narrow::decode(*dtype, format!("0x{:04x}u", *bits as u16))
                     .expect("validated narrow scalar"))
             }
@@ -618,20 +616,20 @@ fn emit_expr(
                 .sources()
                 .first()
                 .ok_or_else(|| WebGpuError::Unsupported("load has no index".into()))?;
-            let (buffer, input_shape, output_shape, view) = match index.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, output_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                } => (*buffer, input_shape, output_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, input_shape, output_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                } => (*buffer, input_shape, output_shape, Some(view)),
+                }) => (*buffer, input_shape, output_shape, Some(view)),
                 _ => {
                     return Err(WebGpuError::Unsupported(
                         "load requires a checked static buffer index".into(),

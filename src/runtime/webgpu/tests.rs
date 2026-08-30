@@ -1,10 +1,10 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    AddressSpace, Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor,
-    CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc,
-    NodeId, Operation, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, UArgRef, UOp,
-    UType, ViewMap, schedule,
+    AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CapturedMixedBatch,
+    CapturedReplayExecutor, CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
+    KernelBindings, KernelBufferDesc, LiteralValue, NodeId, Operation, ReduceKind, Scalar, Shape,
+    Slice, Storage, TensorData, UOp, UType, ViewMap, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawAdapter, RawBuffer, RawCommand,
@@ -815,12 +815,8 @@ impl Dispatch for MockDispatch {
                 if let Some(id) =
                     transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
                         let buffer_id = match arg {
-                            crate::UArgRef::BufferIndex { buffer, .. }
-                            | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
-                            _ => {
-                                return Err(WebGpuError::InvalidBinding(
-                                    "mock transaction load index".into(),
-                                ));
+                            IndexValue::Buffer { buffer, .. } | IndexValue::View { buffer, .. } => {
+                                *buffer
                             }
                         };
                         let (abi, bytes) = stored
@@ -1099,7 +1095,7 @@ fn captured_random_plans_render_and_mock_execute_without_stream_state() {
     for output in [uniform, normal, signed, unsigned] {
         let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
         let rendered = renderer.render(&root).unwrap();
-        let UArgRef::Random(plan) = root.arg() else {
+        let Operation::Random(plan) = root.operation() else {
             panic!("missing random plan")
         };
         let expected = plan.execute().unwrap().to_le_bytes().unwrap();
@@ -1197,7 +1193,7 @@ fn execute_webgpu_semantics(program: &UOp, bindings: &KernelBindings) -> crate::
         .find(|node| matches!(node.operation(), Operation::Store))
         .ok_or(crate::Error::InvalidIndex)?;
     let index = store.sources().first().ok_or(crate::Error::InvalidIndex)?;
-    let UArgRef::BufferIndex { output_shape, .. } = index.arg() else {
+    let Operation::Index(IndexValue::Buffer { output_shape, .. }) = index.operation() else {
         return Err(crate::Error::InvalidIndex);
     };
     let dtype = index.ty().ok_or(crate::Error::InvalidIndex)?.scalar;
@@ -1236,35 +1232,32 @@ fn eval_webgpu_narrow(
         )
     };
     match node.operation() {
-        Operation::Const => match node.arg() {
-            UArgRef::Scalar { dtype, bits } => quantize_webgpu_scalar(
-                *dtype,
-                match dtype {
-                    DType::Bool => Scalar::Bool(*bits != 0),
-                    DType::I32 => Scalar::I(*bits as i32 as i64),
-                    DType::U32 => Scalar::U(*bits as u32 as u64),
-                    DType::F16 => Scalar::F(crate::tensor::f16_to_f32(*bits as u16) as f64),
-                    DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
-                    DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
-                    _ => return Err(crate::Error::InvalidIndex),
-                },
-            ),
-            _ => Err(crate::Error::InvalidIndex),
-        },
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => quantize_webgpu_scalar(
+            *dtype,
+            match dtype {
+                DType::Bool => Scalar::Bool(*bits != 0),
+                DType::I32 => Scalar::I(*bits as i32 as i64),
+                DType::U32 => Scalar::U(*bits as u32 as u64),
+                DType::F16 => Scalar::F(crate::tensor::f16_to_f32(*bits as u16) as f64),
+                DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
+                DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
+                _ => return Err(crate::Error::InvalidIndex),
+            },
+        ),
         Operation::Load => {
             let index = node.sources().first().ok_or(crate::Error::InvalidIndex)?;
-            let (buffer, input_shape, view) = match index.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     ..
-                } => (*buffer, input_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, input_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     view,
                     ..
-                } => (*buffer, input_shape, Some(view)),
+                }) => (*buffer, input_shape, Some(view)),
                 _ => return Err(crate::Error::InvalidIndex),
             };
             let logical = semantic_broadcast_offset(input_shape, output_shape, linear)?;
@@ -1976,47 +1969,39 @@ fn narrow_scalar_literals_preserve_raw_bits_at_the_storage_boundary() {
     ] {
         let ty = UType::scalar(dtype);
         let shape = Shape::new([]);
-        let range = UOp::try_new(
-            Operation::Range,
+        let range = UOp::from_operation(
+            Operation::Range(0),
             Some(UType::scalar(DType::I64)),
             vec![UOp::constant(1, UType::scalar(DType::I64))],
-            UArg::RangeAxis(0),
-        )
-        .unwrap();
-        let address = UOp::try_new(
-            Operation::DefineGlobal,
-            Some(ty),
-            vec![],
-            UArg::Address {
+        );
+        let address = UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
                 space: AddressSpace::Global,
                 name: "literal".into(),
                 element: ty,
-            },
-        )
-        .unwrap();
-        let index = UOp::try_new(
-            Operation::Index,
+            }),
             Some(ty),
-            vec![address, range.clone()],
-            UArg::BufferIndex {
+            vec![],
+        );
+        let index = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 77,
                 elements: 1,
                 input_shape: shape.clone(),
                 output_shape: shape,
-            },
-        )
-        .unwrap();
+            }),
+            Some(ty),
+            vec![address, range.clone()],
+        );
         let rendered = WgslRenderer::new(1, capabilities())
             .unwrap()
             .render(&UOp::sink(vec![
-                UOp::try_new(
+                UOp::from_operation(
                     Operation::Store,
                     None,
                     vec![index, UOp::scalar_constant(dtype, bits, ty)],
-                    UArg::None,
-                )
-                .unwrap(),
-                UOp::try_new(Operation::EndRange, None, vec![range], UArg::None).unwrap(),
+                ),
+                UOp::from_operation(Operation::EndRange, None, vec![range]),
             ]))
             .unwrap();
         assert!(rendered.source.contains(marker), "{dtype:?}");

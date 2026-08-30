@@ -5,10 +5,10 @@
 //! are checked separately from byte offsets, which keeps the ABI boundary
 //! explicit for future renderers.
 use crate::{
-    AddressValue, BinaryOp, CompareOp, DType, Error, Graph, IndexValue, LogicalOp, MatmulValue,
-    MovementValue, NodeId, Op, Operation, PrefixScanValue, ReductionValue, Result, Scalar, Shape,
-    SortValue, Storage, SymbolicShape, SymbolicVar, TensorData, TensorGuardValue, UOp, UOpError,
-    UType, UnaryOp,
+    AddressValue, BinaryOp, CompareOp, DType, Error, Graph, IndexValue, LiteralValue, LogicalOp,
+    MatmulValue, MovementValue, NodeId, Op, Operation, PrefixScanValue, ReductionValue, Result,
+    Scalar, Shape, SortValue, Storage, SymbolicShape, SymbolicVar, TensorData, TensorGuardValue,
+    UOp, UOpError, UType, UnaryOp,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -1801,18 +1801,17 @@ mod tests {
         let output = graph.ne(input, truth).unwrap();
         let uop = lower_graph_elementwise(&graph, output).unwrap();
         let nodes = uop.topological().unwrap();
-        assert!(
-            nodes
-                .iter()
-                .any(|node| matches!(node.operation(), Operation::Const)
-                    && matches!(
-                        node.arg(),
-                        UArgRef::Scalar { dtype, bits }
-                            if *dtype == DType::Bool && *bits == 1
-                    ))
-        );
-        assert!(!nodes.iter().any(|node| matches!(node.operation(), Operation::Index)
-            && matches!(node.arg(), UArgRef::BufferIndex { buffer, .. } if *buffer == truth.index() as u64)));
+        assert!(nodes.iter().any(|node| matches!(
+            node.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            })
+        )));
+        assert!(!nodes.iter().any(|node| matches!(
+            node.operation(),
+            Operation::Index(IndexValue::Buffer { buffer, .. }) if *buffer == truth.index() as u64
+        )));
 
         // Exact scalar payloads are carried through the UOp rather than host
         // floating conversion, including an F32 NaN bit pattern.
@@ -1831,9 +1830,11 @@ mod tests {
             .topological()
             .unwrap();
         assert!(nodes.iter().any(|node| matches!(
-            node.arg(),
-            UArgRef::Scalar { dtype, bits }
-                if *dtype == DType::F32 && *bits == 0x7f80_0001
+            node.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::F32,
+                bits: 0x7f80_0001
+            })
         )));
 
         // A rank-one singleton is not a scalar provenance value: it remains a
@@ -1848,8 +1849,10 @@ mod tests {
             .unwrap()
             .topological()
             .unwrap();
-        assert!(nodes.iter().any(|node| matches!(node.operation(), Operation::Index)
-            && matches!(node.arg(), UArgRef::BufferIndex { buffer, .. } if *buffer == constant.index() as u64)));
+        assert!(nodes.iter().any(|node| matches!(
+            node.operation(),
+            Operation::Index(IndexValue::Buffer { buffer, .. }) if *buffer == constant.index() as u64
+        )));
     }
 
     #[test]
@@ -2413,7 +2416,7 @@ mod tests {
                 .topological()
                 .unwrap()
                 .iter()
-                .any(|node| matches!(node.arg(), UArgRef::ViewBufferIndex { .. }))
+                .any(|node| matches!(node.operation(), Operation::Index(IndexValue::View { .. })))
         );
         let ptx = crate::PtxRenderer::new(80)
             .unwrap()

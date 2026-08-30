@@ -5,7 +5,10 @@
 //! buffer id; shapes and dtypes are validated by the caller before this unsafe
 //! boundary is crossed.  This module never allocates executable memory: the OS
 //! dynamic loader owns executable mappings and `JitKernel` owns the library.
-use crate::{DType, Operation, SymbolicShape, SymbolicVar, UArgRef, UOp};
+use crate::{
+    DType, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation, ReductionValue,
+    SymbolicShape, SymbolicVar, UOp,
+};
 use std::{
     collections::BTreeMap,
     ffi::{CString, c_char, c_int, c_void},
@@ -582,7 +585,7 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     if matches!(
         root.operation(),
-        Operation::Matmul | Operation::Conv2d | Operation::Movement | Operation::Random
+        Operation::Matmul(_) | Operation::Conv2d(_) | Operation::Movement(_) | Operation::Random(_)
     ) {
         return Ok(VectorPlan {
             lanes: 1,
@@ -602,30 +605,28 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     })
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
-    if let (Operation::Random, UArgRef::Random(plan)) = (root.operation(), root.arg()) {
+    if let Operation::Random(plan) = root.operation() {
         return random::render(plan);
     }
-    if matches!(root.operation(), Operation::Matmul)
-        && let Some(plan) = root.arg().quantized_matmul_plan()
-    {
+    if let Operation::Matmul(MatmulValue::Quantized(plan)) = root.operation() {
         return render_quantized_matmul(plan);
     }
-    if matches!(root.operation(), Operation::Matmul)
-        && let Some(plan) = root.arg().matmul_plan()
-    {
+    let matmul = match root.operation() {
+        Operation::Matmul(MatmulValue::Serial(plan)) => Some(plan.as_ref()),
+        Operation::Matmul(MatmulValue::Tiled(payload)) => Some(&payload.matmul),
+        Operation::Matmul(MatmulValue::TensorCore(payload)) => Some(&payload.matmul),
+        _ => None,
+    };
+    if let Some(plan) = matmul {
         return render_matmul(plan);
     }
-    if matches!(root.operation(), Operation::Conv2d)
-        && let Some(plan) = root.arg().static_conv2d_plan()
-    {
+    if let Operation::Conv2d(plan) = root.operation() {
         return render_static_conv2d(plan);
     }
-    if matches!(root.operation(), Operation::Movement)
-        && let Some(plan) = root.arg().quantized_row_gather_plan()
-    {
+    if let Operation::Movement(MovementValue::QuantizedRowGather(plan)) = root.operation() {
         return render_quantized_row_gather(plan);
     }
-    if let (Operation::Movement, UArgRef::Movement(plan)) = (root.operation(), root.arg()) {
+    if let Operation::Movement(MovementValue::Plan(plan)) = root.operation() {
         return render_movement(plan);
     }
     let nodes = root
@@ -652,11 +653,11 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         .sources()
         .first()
         .ok_or_else(|| JitError::Unsupported("Store without index".into()))?;
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         buffer: out_id,
         elements: extent,
         ..
-    } = out_index.arg()
+    }) = out_index.operation()
     else {
         return Err(JitError::Unsupported("Store needs BufferIndex".into()));
     };
@@ -671,11 +672,11 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         let Some(index) = n.sources().first() else {
             return Err(JitError::Unsupported("load without index".into()));
         };
-        let (buffer, elements) = match index.arg() {
-            UArgRef::BufferIndex {
+        let (buffer, elements) = match index.operation() {
+            Operation::Index(IndexValue::Buffer {
                 buffer, elements, ..
-            } => (*buffer, *elements),
-            UArgRef::ViewBufferIndex { buffer, view, .. } => (
+            }) => (*buffer, *elements),
+            Operation::Index(IndexValue::View { buffer, view, .. }) => (
                 *buffer,
                 view.source_shape
                     .numel()
@@ -2011,11 +2012,13 @@ fn emit_vector_insts(
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 splat without destination".into()))?;
-                let (ty, literal) = match inst.payload.arg() {
-                    crate::UArgRef::Scalar { dtype, bits } => {
+                let (ty, literal) = match &inst.payload.operation {
+                    Operation::Const(LiteralValue::Scalar { dtype, bits })
+                    | Operation::VConst(LiteralValue::Scalar { dtype, bits }) => {
                         (dst_ty.unwrap_or(*dtype), literal_expr(*dtype, *bits))
                     }
-                    crate::UArgRef::Int(value) => (
+                    Operation::Const(LiteralValue::Int(value))
+                    | Operation::VConst(LiteralValue::Int(value)) => (
                         dst_ty.ok_or_else(|| {
                             JitError::Unsupported("portable constant type".into())
                         })?,
@@ -2303,14 +2306,14 @@ fn render_reduction(
         .sources()
         .first()
         .ok_or_else(|| JitError::Unsupported("reduction init".into()))?;
-    let UArgRef::Reduction {
+    let Operation::ReduceInit(ReductionValue {
         input_shape,
         output_shape,
         axes,
         keepdim,
         kind,
         mean,
-    } = init.arg()
+    }) = init.operation()
     else {
         return Err(JitError::Unsupported("reduction metadata".into()));
     };
@@ -2515,36 +2518,37 @@ fn emit(
         .scalar;
     let mut s = |i: usize| emit(&n.sources()[i], ids, map, lines);
     match n.operation() {
-        Operation::Const => match n.arg() {
-            UArgRef::Int(v) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
-            UArgRef::Scalar { dtype, bits } if *dtype == ty && dtype.is_float8() => {
-                Ok(format!("((uint8_t)0x{:02x}u)", *bits as u8))
-            }
-            UArgRef::Scalar { dtype, bits } if *dtype == ty => Ok(literal_expr(*dtype, *bits)),
-            UArgRef::Scalar { .. } => {
-                Err(JitError::Unsupported("scalar literal/type mismatch".into()))
-            }
-            _ => Err(JitError::Unsupported("non-integer const".into())),
-        },
+        Operation::Const(LiteralValue::Int(v)) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
+        Operation::Const(LiteralValue::Scalar { dtype, bits })
+            if *dtype == ty && dtype.is_float8() =>
+        {
+            Ok(format!("((uint8_t)0x{:02x}u)", *bits as u8))
+        }
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) if *dtype == ty => {
+            Ok(literal_expr(*dtype, *bits))
+        }
+        Operation::Const(LiteralValue::Scalar { .. }) => {
+            Err(JitError::Unsupported("scalar literal/type mismatch".into()))
+        }
         Operation::Load => {
             let ix = n
                 .sources()
                 .first()
                 .ok_or_else(|| JitError::Unsupported("load no index".into()))?;
-            let (buffer, off) = match ix.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, off) = match ix.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                } => (*buffer, broadcast_offset(input_shape, output_shape)),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, broadcast_offset(input_shape, output_shape)),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                } => {
+                }) => {
                     let logical = broadcast_offset(input_shape, output_shape);
                     (*buffer, view_offset(view, &logical))
                 }

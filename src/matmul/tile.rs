@@ -751,16 +751,14 @@ mod tests {
             off_policy.validate(&base),
             Err(TiledMatmulError::InvalidPlan)
         ));
-        let kernel = crate::UOp::try_new(
-            crate::Operation::Matmul,
-            Some(crate::UType::scalar(DType::F32)),
-            vec![],
-            crate::UArg::TiledMatmul(Box::new(TiledMatmulPayload {
+        let kernel = crate::UOp::from_operation(
+            crate::Operation::Matmul(crate::MatmulValue::Tiled(Box::new(TiledMatmulPayload {
                 matmul: base,
                 tile: off_policy,
-            })),
-        )
-        .unwrap();
+            }))),
+            Some(crate::UType::scalar(DType::F32)),
+            vec![],
+        );
         assert!(kernel.validate().is_err());
         assert!(crate::uop::artifact::encode(&kernel).is_err());
     }

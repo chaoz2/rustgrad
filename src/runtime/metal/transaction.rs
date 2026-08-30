@@ -1,6 +1,8 @@
 //! Typed transaction metadata and bounded integer-fault reconstruction.
 use super::MetalError;
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, Operation, Scalar, Shape, UArgRef, UOp};
+use crate::{
+    BinaryOp, CompareOp, DType, IndexValue, LiteralValue, LogicalOp, Operation, Scalar, Shape, UOp,
+};
 use std::collections::BTreeMap;
 
 pub const METAL_TRANSACTION_ABI_VERSION: u32 = 1;
@@ -182,7 +184,7 @@ pub(super) fn first_fault_at<F>(
     mut load: F,
 ) -> Result<Option<u32>, MetalError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, MetalError>,
 {
     match eval(
         &transaction.evaluation_root,
@@ -202,7 +204,7 @@ pub(super) fn detail_rhs_at<F>(
     mut load: F,
 ) -> Result<Scalar, MetalError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, MetalError>,
 {
     match eval(&guard.rhs, logical, &transaction.guard_ids(), &mut load)? {
         Evaluated::Value(value) => Ok(value),
@@ -219,23 +221,26 @@ fn eval<F>(
     load: &mut F,
 ) -> Result<Evaluated, MetalError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, MetalError>,
 {
     let dtype = node
         .ty()
         .ok_or_else(|| MetalError::InvalidBinding("untyped detail expression".into()))?
         .scalar;
     let value = match node.operation() {
-        Operation::Const => match node.arg() {
-            UArgRef::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits)?,
-            _ => return Err(MetalError::InvalidBinding("invalid detail constant".into())),
-        },
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => scalar_from_bits(*dtype, *bits)?,
+        Operation::Const(_) => {
+            return Err(MetalError::InvalidBinding("invalid detail constant".into()));
+        }
         Operation::Load => {
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| MetalError::InvalidBinding("detail load lacks index".into()))?;
-            load(index.arg(), dtype, logical)?
+            let Operation::Index(value) = index.operation() else {
+                return Err(MetalError::InvalidBinding("detail load index".into()));
+            };
+            load(value, dtype, logical)?
         }
         Operation::Cast => {
             let source = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -389,14 +394,14 @@ fn compare(lhs: Scalar, rhs: Scalar, op: CompareOp) -> bool {
     }
 }
 
-pub(super) fn logical_offset(arg: UArgRef<'_>, logical: usize) -> Result<usize, MetalError> {
+pub(super) fn logical_offset(arg: &IndexValue, logical: usize) -> Result<usize, MetalError> {
     let (input, output, view) = match arg {
-        UArgRef::BufferIndex {
+        IndexValue::Buffer {
             input_shape,
             output_shape,
             ..
         } => (input_shape, output_shape, None),
-        UArgRef::ViewBufferIndex {
+        IndexValue::View {
             input_shape,
             output_shape,
             view,

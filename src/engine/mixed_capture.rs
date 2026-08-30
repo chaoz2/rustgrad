@@ -670,7 +670,7 @@ impl CapturedMixedSchedule {
             .schedule
             .items
             .iter()
-            .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard(_)))
         {
             return Err(ReplayError::Unsupported(
                 "tensor guard mixed replay is unsupported".into(),
@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(decoded.states, captured.states);
         assert!(matches!(
             decoded.schedule.items[0].kernel.sources()[0].operation(),
-            crate::Operation::EffectStore
+            crate::Operation::EffectStore(_)
         ));
         assert!(crate::uop::artifact::encode(&decoded.schedule.items[0].kernel).is_err());
         let _ = (DType::F16, Shape::from([2]));

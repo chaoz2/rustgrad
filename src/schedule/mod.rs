@@ -230,7 +230,7 @@ impl Schedule {
             if item.is_effect() {
                 if !item.outputs.is_single()
                     || item.boundary != Some(ScheduleBoundary::Effect)
-                    || !matches!(item.kernel.operation(), crate::Operation::After)
+                    || !matches!(item.kernel.operation(), crate::Operation::After(_))
                 {
                     return Err(ScheduleError::Binding(
                         "invalid effect item boundary".into(),
@@ -249,7 +249,7 @@ impl Schedule {
                         && binding.source_position == 0
                         && item.inputs.first() == Some(&binding.producer_output)
                 });
-                if !matches!(store.operation(), crate::Operation::EffectStore)
+                if !matches!(store.operation(), crate::Operation::EffectStore(_))
                     || after != store_payload
                     || item.primary_output().id != after.target.buffer
                     || (!pure_bound
@@ -419,7 +419,7 @@ impl ScheduleItem {
     pub fn is_effect(&self) -> bool {
         matches!(
             self.kernel.operation(),
-            crate::Operation::EffectStore | crate::Operation::After
+            crate::Operation::EffectStore(_) | crate::Operation::After(_)
         )
     }
     pub fn ordered_inputs(&self) -> &[ScheduleInputBinding] {
