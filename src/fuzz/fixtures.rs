@@ -2,7 +2,7 @@ use super::{
     FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzSlice,
     FuzzTensor, FuzzUnaryOp,
 };
-use crate::{DType, Scalar, Storage, TensorData};
+use crate::{DType, Float8Format, Float8Storage, Scalar, Storage, TensorData};
 
 fn tensor(shape: impl Into<Vec<usize>>, storage: Storage) -> FuzzTensor {
     FuzzTensor::from_tensor(
@@ -721,6 +721,88 @@ pub fn regression_cases() -> Vec<FuzzCase> {
                 tensor(vec![1, 2], Storage::Bool(vec![true, false])),
                 tensor(vec![1, 1], Storage::Bool(vec![true])),
                 tensor(vec![1, 1], Storage::Bool(vec![false])),
+            ],
+            axis: 1,
+        },
+        FuzzCase::ConcatMany {
+            // Raw E4M3 lanes, including negative zero and a NaN encoding, are
+            // copied without entering the numeric Float8 codec.
+            inputs: vec![
+                tensor(
+                    vec![2],
+                    Storage::Float8(Float8Storage::from_raw(
+                        Float8Format::E4M3,
+                        vec![0x80, 0x38],
+                    )),
+                ),
+                tensor(
+                    vec![0],
+                    Storage::Float8(Float8Storage::from_raw(Float8Format::E4M3, vec![])),
+                ),
+                tensor(
+                    vec![2],
+                    Storage::Float8(Float8Storage::from_raw(
+                        Float8Format::E4M3,
+                        vec![0x7f, 0x7e],
+                    )),
+                ),
+            ],
+            axis: 0,
+        },
+        FuzzCase::ConcatMany {
+            inputs: vec![
+                tensor(
+                    vec![1, 1],
+                    Storage::Float8(Float8Storage::from_raw(Float8Format::E5M2, vec![0x80])),
+                ),
+                tensor(
+                    vec![1, 0],
+                    Storage::Float8(Float8Storage::from_raw(Float8Format::E5M2, vec![])),
+                ),
+                tensor(
+                    vec![1, 2],
+                    Storage::Float8(Float8Storage::from_raw(
+                        Float8Format::E5M2,
+                        vec![0x7d, 0x7c],
+                    )),
+                ),
+            ],
+            axis: 1,
+        },
+        FuzzCase::ConcatMany {
+            inputs: vec![
+                tensor(
+                    vec![1],
+                    Storage::Float8(Float8Storage::from_raw(Float8Format::E4M3FNUZ, vec![0x00])),
+                ),
+                tensor(
+                    vec![1],
+                    Storage::Float8(Float8Storage::from_raw(Float8Format::E4M3FNUZ, vec![0x80])),
+                ),
+                tensor(
+                    vec![1],
+                    Storage::Float8(Float8Storage::from_raw(Float8Format::E4M3FNUZ, vec![0xff])),
+                ),
+            ],
+            axis: 0,
+        },
+        FuzzCase::ConcatMany {
+            inputs: vec![
+                tensor(
+                    vec![1, 1, 1],
+                    Storage::Float8(Float8Storage::from_raw(Float8Format::E5M2FNUZ, vec![0x00])),
+                ),
+                tensor(
+                    vec![1, 0, 1],
+                    Storage::Float8(Float8Storage::from_raw(Float8Format::E5M2FNUZ, vec![])),
+                ),
+                tensor(
+                    vec![1, 2, 1],
+                    Storage::Float8(Float8Storage::from_raw(
+                        Float8Format::E5M2FNUZ,
+                        vec![0x80, 0xff],
+                    )),
+                ),
             ],
             axis: 1,
         },

@@ -2,7 +2,7 @@ use super::*;
 use crate::uop::Ternary;
 use crate::{
     Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, MovementKernelKind,
-    MovementKernelPlan, Op, ReduceKind, Scalar, Storage, TensorData, UArg, UOpKind, UnaryOp,
+    MovementKernelPlan, Op, ReduceKind, Scalar, Shape, Storage, TensorData, UArg, UOpKind, UnaryOp,
     schedule,
 };
 use std::{
@@ -731,7 +731,81 @@ fn generated_concat_cases_are_valid_diverse_and_deterministic() {
     assert_eq!(arities, std::collections::BTreeSet::from([2, 3, 4]));
     assert!(zero_width && nonzero_width && zero_non_axis);
     assert!(axis_zero && axis_one);
-    assert_eq!(dtypes.len(), 13);
+    assert_eq!(dtypes, DType::ALL.into_iter().collect());
+}
+
+#[test]
+fn concat_many_all_dtypes_preserve_storage_through_plan_capture_and_native_rendering() {
+    for dtype in DType::ALL {
+        let values = match dtype {
+            DType::Bool => vec![Scalar::Bool(false), Scalar::Bool(true), Scalar::Bool(true)],
+            DType::U8 | DType::U16 | DType::U32 | DType::U64 => {
+                vec![Scalar::U(0), Scalar::U(1), Scalar::U(2)]
+            }
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => {
+                vec![Scalar::I(-1), Scalar::I(0), Scalar::I(1)]
+            }
+            _ => vec![Scalar::F(-0.0), Scalar::F(1.0), Scalar::F(f64::INFINITY)],
+        };
+        let first = FuzzTensor::from_tensor(
+            &TensorData::from_scalars([1, 2], dtype, values[..2].iter().copied()).unwrap(),
+        );
+        let empty = FuzzTensor::from_tensor(
+            &TensorData::from_scalars([1, 0], dtype, std::iter::empty::<Scalar>()).unwrap(),
+        );
+        let last = FuzzTensor::from_tensor(
+            &TensorData::from_scalars([1, 1], dtype, values[2..].iter().copied()).unwrap(),
+        );
+        let mut expected = first.bytes.clone();
+        expected.extend_from_slice(&last.bytes);
+        let case = FuzzCase::ConcatMany {
+            inputs: vec![first, empty, last],
+            axis: 1,
+        };
+        let built = case.build().unwrap();
+        assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
+        assert_eq!(
+            built.graph.shape(built.output).unwrap(),
+            &Shape::from([1, 3])
+        );
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        assert_eq!(output.to_le_bytes().unwrap(), expected, "{dtype:?}");
+
+        let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        assert_eq!(plan.dtype, dtype);
+        assert!(matches!(
+            &plan.kind,
+            MovementKernelKind::Concat { inputs, axis: 1 } if inputs.len() == 3
+        ));
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert!(matches!(
+            scheduled.items[0].kernel.arg(),
+            UArg::Movement(plan)
+                if plan.dtype == dtype
+                    && matches!(&plan.kind, MovementKernelKind::Concat { inputs, axis: 1 } if inputs.len() == 3)
+        ));
+        let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+        let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
+        if dtype.is_float8() {
+            assert!(scalar.source.contains("uint8_t"), "{dtype:?}");
+            assert!(vector.source.contains("uint8_t"), "{dtype:?}");
+            assert!(!scalar.source.contains("rg_f8_decode"), "{dtype:?}");
+            assert!(!vector.source.contains("rg_f8_decode"), "{dtype:?}");
+        }
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes,
+            "{dtype:?}",
+        );
+    }
 }
 
 #[test]
@@ -4801,7 +4875,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 106);
+    assert_eq!(cases.len(), 110);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

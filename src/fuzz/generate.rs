@@ -351,21 +351,7 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             // additive many-input surface across every local storage dtype.
             let rank = 1 + rng.pick(3);
             let axis = rng.pick(rank);
-            let dtype = [
-                DType::Bool,
-                DType::I8,
-                DType::U8,
-                DType::I16,
-                DType::U16,
-                DType::I32,
-                DType::U32,
-                DType::I64,
-                DType::U64,
-                DType::F16,
-                DType::BF16,
-                DType::F32,
-                DType::F64,
-            ][rng.pick(13)];
+            let dtype = DType::ALL[rng.pick(DType::ALL.len())];
             let arity = 2 + rng.pick(3);
             let mut base_shape = Vec::with_capacity(rank);
             for dimension in 0..rank {
