@@ -559,6 +559,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
             | Op::Expand { .. }
             | Op::Shrink { .. }
             | Op::Stride { .. }
+            | Op::Pad { .. }
             | Op::Concat { .. }
             | Op::Gather { .. }
             | Op::StaticIndex { .. }
