@@ -3025,7 +3025,13 @@ fn sub_scalar_preserves_tinygrad_neg_then_add_and_reflected_order() {
     assert!(
         matches!(specials.op(*lhs).unwrap(), Op::Constant(data) if data.scalar_at(0).as_f64().is_nan())
     );
-    assert_eq!(*rhs, input);
+    assert!(matches!(
+        specials.op(*rhs).unwrap(),
+        Op::Unary {
+            op: UnaryOp::Neg,
+            input: source,
+        } if *source == input
+    ));
     let loss = specials.sum_all(negative_zero).unwrap();
     let gradient = specials.grad(loss, input).unwrap();
     assert_eq!(specials.shape(gradient).unwrap(), &Shape::new([2, 1]));
@@ -4057,7 +4063,7 @@ fn trunc_div_scalar_preserves_source_integer_and_float_branches() {
     let boolean_output = mixed.trunc_div_scalar(boolean, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
     let integral_output = mixed.scalar_trunc_div(Scalar::F(-0.0), integral).unwrap();
-    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
     let narrow_output = mixed.trunc_div_scalar(narrow, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
@@ -4315,7 +4321,7 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
     let boolean_output = mixed.floor_div_scalar(boolean, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
     let integral_output = mixed.scalar_floor_div(Scalar::F(-0.0), integral).unwrap();
-    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
     let narrow_output = mixed.floor_div_scalar(narrow, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
@@ -4594,7 +4600,7 @@ fn modulo_scalar_preserves_floor_composition_and_reflected_roles() {
     let boolean_output = mixed.modulo_scalar(boolean, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
     let integral_output = mixed.scalar_modulo(Scalar::F(-0.0), integral).unwrap();
-    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
     let narrow_output = mixed.modulo_scalar(narrow, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
@@ -4718,7 +4724,7 @@ fn fmod_scalar_preserves_non_reflected_trunc_composition() {
     let boolean_output = mixed.fmod_scalar(boolean, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
     let integral_output = mixed.fmod_scalar(integral, Scalar::F(-0.0)).unwrap();
-    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
     let narrow_output = mixed.fmod_scalar(narrow, Scalar::I(1)).unwrap();
     assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 

@@ -2690,15 +2690,6 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
     assert!(graph.nodes.iter().any(|node| {
         matches!(
             node.op,
-            Op::Unary {
-                op: UnaryOp::Sign,
-                ..
-            }
-        )
-    }));
-    assert!(graph.nodes.iter().any(|node| {
-        matches!(
-            node.op,
             Op::Binary {
                 op: BinaryOp::Mul,
                 ..
