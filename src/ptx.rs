@@ -6534,8 +6534,9 @@ mod tests {
         assert_eq!(vjp.dtype(lhs_gradient).unwrap(), DType::F32);
         assert_eq!(vjp.dtype(rhs_gradient).unwrap(), DType::F32);
 
-        // Non-LUB casts, affine operands, unrelated compounds, and the F16
-        // architecture gate cannot inherit this strict binary-root admission.
+        // Non-LUB casts and affine operands remain valid exact extrema roots.
+        // Unrelated compounds and the F16 architecture gate cannot inherit
+        // this strict binary-root admission.
         let mut non_lub = Graph::new();
         let lhs = non_lub.input_dtype("lhs", [1], DType::I64);
         let rhs = non_lub.input_dtype("rhs", [1], DType::U64);
@@ -6553,10 +6554,12 @@ mod tests {
         let lhs = viewed.permute(raw_lhs, [1, 0]).unwrap();
         let rhs = viewed.input_dtype("rhs", [2, 1], DType::F16);
         let output = viewed.maximum(lhs, rhs).unwrap();
-        assert!(matches!(
-            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
-            Err(PtxError::Unsupported(_))
-        ));
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&viewed, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("setp.lt.f32"));
+        assert!(rendered.source.contains("selp.b32"));
+        assert!(rendered.source.contains("st.global.b16"));
 
         let mut compound = Graph::new();
         let lhs = compound.input_dtype("lhs", [1], DType::F16);
@@ -8467,7 +8470,7 @@ mod tests {
         let rendered = renderer
             .render(&crate::lower_graph_elementwise(&boolean, output).unwrap())
             .unwrap();
-        assert!(rendered.source.contains("setp.eq.u8"));
+        assert!(rendered.source.contains("setp.ne.u8"));
         assert!(rendered.source.contains("or.b32"));
 
         let mut raw_bool = Graph::new();
@@ -9097,7 +9100,8 @@ mod tests {
         let rendered = renderer
             .render(&crate::lower_graph_elementwise(&signs, output).unwrap())
             .unwrap();
-        assert!(rendered.source.contains("setp.eq.f32"));
+        assert!(rendered.source.contains("setp.ne.f32"));
+        assert!(rendered.source.contains("setp.ne.u8"));
         assert!(rendered.source.contains("and.b32"));
         let mut viewed = Graph::new();
         let input = viewed.input_dtype("input", [1, 1], DType::F32);
@@ -10669,8 +10673,9 @@ mod tests {
         assert!(bf16.contains("0x8000"));
         assert!(!bf16.contains("shl.b32"));
 
-        // The raw-bit exception is root-scoped: no other narrow unary or
-        // compound expression inherits this admission.
+        // The raw-bit exception is root-scoped: no other narrow unary
+        // inherits this admission. The exact Add(input, Neg(input)) compound
+        // is public subtraction and therefore uses its own scoped boundary.
         assert!(matches!(
             renderer.render(&unary_kernel(
                 DType::F16,
@@ -10686,8 +10691,8 @@ mod tests {
         let rendered = renderer
             .render(&crate::lower_graph_elementwise(&compound, combined).unwrap())
             .unwrap();
-        assert!(rendered.source.contains("xor.b32"));
-        assert!(rendered.source.contains("add.rn.f32"));
+        assert!(rendered.source.contains("sub.rn.f64"));
+        assert!(rendered.source.contains("cvt.rn.f16.f32"));
 
         // Numeric Neg retains its source-composed reverse rule; Bool is a
         // logical predicate and remains outside differentiable paths.

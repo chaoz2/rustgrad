@@ -591,6 +591,7 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
                 FuzzReduction::Sum => match dtype {
                     DType::Bool | DType::I8 | DType::I16 => DType::I32,
                     DType::U8 | DType::U16 => DType::U32,
+                    DType::F16 | DType::BF16 => DType::F32,
                     _ => dtype,
                 },
                 FuzzReduction::Mean if !dtype.is_float() => DType::F32,

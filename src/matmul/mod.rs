@@ -211,7 +211,12 @@ impl MatmulKernelPlan {
                     false,
                     self.rhs_vector,
                 ));
-                acc = add(acc, mul(a, b, self.dtype), self.dtype);
+                // Raw Graph::matmul commits both the product and the running
+                // accumulator at the output storage dtype. In particular,
+                // F32 must round after every multiply and add; widening the
+                // complete contraction to f64 changes cancellation results.
+                let product = self.dtype.commit_scalar(mul(a, b, self.dtype));
+                acc = self.dtype.commit_scalar(add(acc, product, self.dtype));
             }
             out.push(acc);
         }
