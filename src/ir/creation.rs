@@ -277,6 +277,27 @@ fn lower_source_randperm(graph: &mut Graph, random: NodeId, dtype: DType) -> Res
     }
 }
 
+/// Lowers tinygrad's source `((high-low) * rand).cast(dtype) + low` suffix
+/// after the default-F32 unit random tensor has been created. Keeping this
+/// pure suffix separate lets composite initializers rehearse every later
+/// scalar, cast, promotion, and byte boundary before reserving an ambient
+/// stream.
+fn lower_source_uniform(
+    graph: &mut Graph,
+    unit: NodeId,
+    low: f64,
+    high: f64,
+    dtype: DType,
+) -> Result<NodeId> {
+    let scaled = graph.scalar_mul(Scalar::F(high - low), unit)?;
+    let cast = if graph.dtype(scaled)? == dtype {
+        scaled
+    } else {
+        graph.cast(scaled, dtype)?
+    };
+    graph.add_scalar(cast, Scalar::F(low))
+}
+
 fn one_hot_source_lub(lhs: DType, rhs: DType) -> DType {
     if matches!(
         (lhs, rhs),
@@ -966,6 +987,107 @@ mod tests {
                 .uniform_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64)
                 .is_err()
         );
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
+    fn scaled_uniform_implicit_is_source_uniform_then_weak_scale() {
+        Graph::manual_seed(43);
+        let mut graph = Graph::new();
+        let output = graph.scaled_uniform_implicit([2, 3], DType::F16).unwrap();
+        let scalar = graph.scaled_uniform_default([]).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+        assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(scalar).unwrap(), DType::F32);
+        assert!(!graph.node(output).unwrap().requires_grad);
+
+        // Source applies the scale after the complete `uniform(-1, 1)`
+        // result. The scale is a right-hand weak scalar and the uniform path
+        // retains scalar-left two, requested storage cast, then weak minus-one
+        // Add; it is never folded into a ranged Random node.
+        let Op::Binary {
+            op: crate::BinaryOp::Mul,
+            lhs: uniform,
+            rhs: scale,
+        } = graph.op(output).unwrap()
+        else {
+            panic!("expected final scaled_uniform weak Mul");
+        };
+        assert!(matches!(graph.op(*scale).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == DType::F16));
+        let Op::Binary {
+            op: crate::BinaryOp::Add,
+            lhs: cast,
+            ..
+        } = graph.op(*uniform).unwrap()
+        else {
+            panic!("expected source uniform low Add");
+        };
+        let Op::Cast {
+            input: scaled_unit,
+            dtype: DType::F16,
+        } = graph.op(*cast).unwrap()
+        else {
+            panic!("expected source uniform requested cast");
+        };
+        let Op::Binary {
+            op: crate::BinaryOp::Mul,
+            lhs: two,
+            rhs: random,
+        } = graph.op(*scaled_unit).unwrap()
+        else {
+            panic!("expected source uniform scalar-left scale");
+        };
+        assert!(matches!(graph.op(*two).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == DType::F32));
+        assert!(matches!(graph.op(*random).unwrap(), Op::Random {
+            kind: RandomKind::Uniform { low, high }, ..
+        } if *low == 0.0 && *high == 1.0));
+
+        // Every concrete local storage request is admitted. As in source,
+        // the final weak float stages retain a requested float width but lift
+        // explicit Bool/integer storage back to default F32.
+        for dtype in DType::ALL {
+            let value = graph.scaled_uniform_implicit([1], dtype).unwrap();
+            assert_eq!(graph.shape(value).unwrap(), &Shape::from([1]));
+            assert_eq!(
+                graph.dtype(value).unwrap(),
+                if dtype.is_float() { dtype } else { DType::F32 }
+            );
+            assert!(matches!(
+                graph.op(value).unwrap(),
+                Op::Binary {
+                    op: crate::BinaryOp::Mul,
+                    ..
+                }
+            ));
+        }
+
+        // Python's exponent raises for a zero product after a zero-word rand
+        // request. Since that request cannot advance the counter, rejecting
+        // before graph publication preserves both graph and stream identity.
+        Graph::manual_seed(47);
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.scaled_uniform_implicit([2, 0, 3], DType::F32),
+            Err(Error::InvalidRandom {
+                reason: "scaled_uniform has a zero-sized shape"
+            })
+        ));
+        assert_eq!(malformed.node_count(), before);
+        let first = malformed.rand_implicit([1], DType::F32).unwrap();
+        assert!(
+            matches!(malformed.op(first).unwrap(), Op::Random { stream, .. }
+            if stream.counter == [0, 0])
+        );
+
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.scaled_uniform_implicit([usize::MAX, 2], DType::F64),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -4838,13 +4960,7 @@ impl Graph {
         // stream on a malformed late stage.
         let mut rehearsal = self.clone();
         let unit = rehearsal.rand(shape.clone(), DType::F32, 0)?;
-        let scaled = rehearsal.scalar_mul(Scalar::F(high - low), unit)?;
-        let cast = if rehearsal.dtype(scaled)? == dtype {
-            scaled
-        } else {
-            rehearsal.cast(scaled, dtype)?
-        };
-        let rehearsed = rehearsal.add_scalar(cast, Scalar::F(low))?;
+        let rehearsed = lower_source_uniform(&mut rehearsal, unit, low, high, dtype)?;
         let output_shape = rehearsal.shape(rehearsed)?.clone();
         let output_dtype = rehearsal.dtype(rehearsed)?;
         if output_shape != shape {
@@ -4860,13 +4976,7 @@ impl Graph {
         // All fallible descriptor work has completed, so this is the first
         // operation that advances the graph's captured default-device stream.
         let unit = self.rand_implicit(shape, DType::F32)?;
-        let scaled = self.scalar_mul(Scalar::F(high - low), unit)?;
-        let cast = if self.dtype(scaled)? == dtype {
-            scaled
-        } else {
-            self.cast(scaled, dtype)?
-        };
-        let output = self.add_scalar(cast, Scalar::F(low))?;
+        let output = lower_source_uniform(self, unit, low, high, dtype)?;
         debug_assert_eq!(
             self.shape(output).expect("uniform preflighted"),
             &output_shape
@@ -4881,6 +4991,70 @@ impl Graph {
     /// Omits tinygrad `Tensor.uniform`'s low/high/dtype defaults.
     pub fn uniform_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
         self.uniform_implicit(shape, 0.0, 1.0, DType::F32)
+    }
+
+    /// Source-literal ambient-stream `Tensor.scaled_uniform`.
+    ///
+    /// tinygrad first constructs `uniform(low=-1, high=1)` and then applies a
+    /// receiver-left weak scalar multiply by `prod(shape) ** -0.5`. For a
+    /// zero-element shape Python raises while evaluating that exponent after
+    /// the zero-word random request; a zero-word request does not advance the
+    /// stream, so RustGrad can reject atomically without changing subsequent
+    /// random identity. Positive shapes rehearse the complete uniform and
+    /// final multiply before the live stream is reserved.
+    pub fn scaled_uniform_implicit(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let shape = shape.into();
+        let elements = shape.numel()?;
+        elements
+            .checked_mul(DType::F32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        elements
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if elements == 0 {
+            return Err(Error::InvalidRandom {
+                reason: "scaled_uniform has a zero-sized shape",
+            });
+        }
+        let scale = (elements as f64).powf(-0.5);
+
+        let mut rehearsal = self.clone();
+        let unit = rehearsal.rand(shape.clone(), DType::F32, 0)?;
+        let uniform = lower_source_uniform(&mut rehearsal, unit, -1.0, 1.0, dtype)?;
+        let rehearsed = rehearsal.mul_scalar(uniform, Scalar::F(scale))?;
+        let output_shape = rehearsal.shape(rehearsed)?.clone();
+        let output_dtype = rehearsal.dtype(rehearsed)?;
+        if output_shape != shape {
+            return Err(Error::InvalidRandom {
+                reason: "scaled_uniform output shape changed during preflight",
+            });
+        }
+        output_shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+
+        let unit = self.rand_implicit(shape, DType::F32)?;
+        let uniform = lower_source_uniform(self, unit, -1.0, 1.0, dtype)?;
+        let output = self.mul_scalar(uniform, Scalar::F(scale))?;
+        debug_assert_eq!(
+            self.shape(output).expect("scaled_uniform preflighted"),
+            &output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("scaled_uniform preflighted"),
+            output_dtype
+        );
+        Ok(output)
+    }
+
+    /// Omits tinygrad `Tensor.scaled_uniform`'s default-F32 dtype.
+    pub fn scaled_uniform_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
+        self.scaled_uniform_implicit(shape, DType::F32)
     }
 
     /// Source-literal ambient-stream `Tensor.glorot_uniform`.
