@@ -808,21 +808,27 @@ mod tests {
         let mut malformed = Graph::new();
         let source = malformed.input_dtype("source", [2, 6], DType::F64);
         let before = malformed.node_count();
-        assert!(malformed
-            .rearrange(source, "b (h w) -> h b w", &BTreeMap::new())
-            .is_err());
+        assert!(
+            malformed
+                .rearrange(source, "b (h w) -> h b w", &BTreeMap::new())
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed
-            .rearrange(source, "b b -> b", &BTreeMap::new())
-            .is_err());
+        assert!(
+            malformed
+                .rearrange(source, "b b -> b", &BTreeMap::new())
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed
-            .rearrange(source, "b c -> (b c)", &{
-                let mut unused = BTreeMap::new();
-                unused.insert("unused".into(), 1);
-                unused
-            })
-            .is_err());
+        assert!(
+            malformed
+                .rearrange(source, "b c -> (b c)", &{
+                    let mut unused = BTreeMap::new();
+                    unused.insert("unused".into(), 1);
+                    unused
+                })
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
         assert!(matches!(
             malformed.rearrange(

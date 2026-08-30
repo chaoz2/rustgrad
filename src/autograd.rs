@@ -1540,11 +1540,13 @@ mod tests {
         let loss = graph.sum(product, 0).unwrap();
         let vector_grad = graph.grad(loss, vector).unwrap();
         let matrix_grad = graph.grad(loss, matrix).unwrap();
-        assert!(graph
-            .trace(vector_grad)
-            .unwrap()
-            .to_string()
-            .contains("matmul_lhs_grad"));
+        assert!(
+            graph
+                .trace(vector_grad)
+                .unwrap()
+                .to_string()
+                .contains("matmul_lhs_grad")
+        );
         let inputs = HashMap::from([
             (
                 "vector".into(),
@@ -2417,10 +2419,12 @@ mod tests {
             ("y".into(), data([1, 2], &[3., 4.])),
         ]);
         let actual = CpuBackend.execute(&graph, second, &values).unwrap();
-        assert!(actual
-            .values()
-            .iter()
-            .all(|value| value.is_finite() && *value > 0.0));
+        assert!(
+            actual
+                .values()
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        );
     }
 
     #[test]
@@ -2470,11 +2474,13 @@ mod tests {
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([2], &[4., 2.])
         );
-        assert!(graph
-            .trace(hvp)
-            .unwrap()
-            .to_string()
-            .contains("matmul_grad_vjp"));
+        assert!(
+            graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("matmul_grad_vjp")
+        );
     }
 
     #[test]
@@ -2497,11 +2503,13 @@ mod tests {
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([2, 2], &[16., 0., 0., 16.])
         );
-        assert!(graph
-            .trace(hvp)
-            .unwrap()
-            .to_string()
-            .contains("einsum_grad_vjp"));
+        assert!(
+            graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("einsum_grad_vjp")
+        );
     }
 
     #[test]
@@ -2530,11 +2538,13 @@ mod tests {
                 data([2], &expected),
                 "{name}"
             );
-            assert!(graph
-                .trace(hvp)
-                .unwrap()
-                .to_string()
-                .contains("reduce_grad_vjp_Product"));
+            assert!(
+                graph
+                    .trace(hvp)
+                    .unwrap()
+                    .to_string()
+                    .contains("reduce_grad_vjp_Product")
+            );
         }
     }
 
@@ -2558,11 +2568,13 @@ mod tests {
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([3], &[0., 0., 0.])
         );
-        assert!(graph
-            .trace(hvp)
-            .unwrap()
-            .to_string()
-            .contains("reduce_grad_vjp_Max"));
+        assert!(
+            graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("reduce_grad_vjp_Max")
+        );
     }
 
     #[test]
@@ -2609,11 +2621,13 @@ mod tests {
             CpuBackend.execute(&graph, shrink_vjp, &values).unwrap(),
             data([2], &[20., 30.])
         );
-        assert!(graph
-            .trace(shrink_vjp)
-            .unwrap()
-            .to_string()
-            .contains("scatter_positions_vjp"));
+        assert!(
+            graph
+                .trace(shrink_vjp)
+                .unwrap()
+                .to_string()
+                .contains("scatter_positions_vjp")
+        );
     }
 
     #[test]
@@ -2640,10 +2654,12 @@ mod tests {
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([1, 1, 1, 1], &[160.])
         );
-        assert!(graph
-            .trace(hvp)
-            .unwrap()
-            .to_string()
-            .contains("conv2d_grad_vjp"));
+        assert!(
+            graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("conv2d_grad_vjp")
+        );
     }
 }

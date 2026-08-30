@@ -205,21 +205,31 @@ fn copysign_is_the_source_literal_predicate_reciprocal_select_graph() {
         .into_iter()
         .map(|step| step.operation)
         .collect();
-    assert!(operations
-        .iter()
-        .any(|operation| operation.starts_with("reciprocal(")));
-    assert!(operations
-        .iter()
-        .any(|operation| operation.starts_with("logical_or(")));
-    assert!(operations
-        .iter()
-        .any(|operation| operation.starts_with("sign(")));
-    assert!(operations
-        .iter()
-        .any(|operation| operation.starts_with("neg(")));
-    assert!(!operations
-        .iter()
-        .any(|operation| operation.starts_with("copysign(")));
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation.starts_with("reciprocal("))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation.starts_with("logical_or("))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation.starts_with("sign("))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation.starts_with("neg("))
+    );
+    assert!(
+        !operations
+            .iter()
+            .any(|operation| operation.starts_with("copysign("))
+    );
 }
 
 #[test]
@@ -566,10 +576,11 @@ fn elu_scalar_matches_tinygrad_weak_default_without_changing_live_alpha_api() {
         let x = nonfloat.input_dtype("x", [], dtype);
         let output = nonfloat.elu_scalar(x, 0.125).unwrap();
         assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
-        assert!(nonfloat
-            .nodes
-            .iter()
-            .any(|node| { matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32) }));
+        assert!(
+            nonfloat.nodes.iter().any(|node| {
+                matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32)
+            })
+        );
     }
 
     let mut empty = Graph::new();
@@ -661,15 +672,19 @@ fn elu_with_scalar_preserves_tinygrad_untyped_alpha_staging() {
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(malformed
-        .elu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
-        .is_err());
+    assert!(
+        malformed
+            .elu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(malformed
-        .elu_with_scalar(overflow, Scalar::F(-0.5))
-        .is_err());
+    assert!(
+        malformed
+            .elu_with_scalar(overflow, Scalar::F(-0.5))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -1019,15 +1034,19 @@ fn softplus_scalar_and_default_preserve_tinygrad_literal_staging() {
     assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(malformed
-        .softplus_with_scalar(crate::NodeId(usize::MAX), Scalar::F(1.0))
-        .is_err());
+    assert!(
+        malformed
+            .softplus_with_scalar(crate::NodeId(usize::MAX), Scalar::F(1.0))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(malformed
-        .softplus_with_scalar(overflow, Scalar::F(1.0))
-        .is_err());
+    assert!(
+        malformed
+            .softplus_with_scalar(overflow, Scalar::F(1.0))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -1238,15 +1257,19 @@ fn selu_with_scalars_preserves_tinygrad_untyped_parameter_consumers() {
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(malformed
-        .selu_with_scalars(crate::NodeId(usize::MAX), Scalar::Bool(true), Scalar::I(1))
-        .is_err());
+    assert!(
+        malformed
+            .selu_with_scalars(crate::NodeId(usize::MAX), Scalar::Bool(true), Scalar::I(1))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(malformed
-        .selu_with_scalars(overflow, Scalar::F(-0.5), Scalar::F(1.0))
-        .is_err());
+    assert!(
+        malformed
+            .selu_with_scalars(overflow, Scalar::F(-0.5), Scalar::F(1.0))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -1697,10 +1720,11 @@ fn leaky_relu_scalar_matches_tinygrad_weak_default_without_changing_live_slope_a
         let x = nonfloat.input_dtype("x", [], dtype);
         let output = nonfloat.leaky_relu_scalar(x, 0.125).unwrap();
         assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
-        assert!(nonfloat
-            .nodes
-            .iter()
-            .any(|node| { matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32) }));
+        assert!(
+            nonfloat.nodes.iter().any(|node| {
+                matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32)
+            })
+        );
     }
 
     let mut empty = Graph::new();
@@ -1711,9 +1735,11 @@ fn leaky_relu_scalar_matches_tinygrad_weak_default_without_changing_live_slope_a
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(malformed
-        .leaky_relu_default(crate::NodeId(usize::MAX))
-        .is_err());
+    assert!(
+        malformed
+            .leaky_relu_default(crate::NodeId(usize::MAX))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX], DType::F32);
     let before = malformed.node_count();
@@ -1797,15 +1823,19 @@ fn leaky_relu_with_scalar_preserves_tinygrad_untyped_slope_surface() {
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(malformed
-        .leaky_relu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
-        .is_err());
+    assert!(
+        malformed
+            .leaky_relu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(malformed
-        .leaky_relu_with_scalar(overflow, Scalar::F(-0.5))
-        .is_err());
+    assert!(
+        malformed
+            .leaky_relu_with_scalar(overflow, Scalar::F(-0.5))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -2031,10 +2061,11 @@ fn celu_scalar_matches_tinygrad_weak_default_without_changing_live_alpha_api() {
         let x = nonfloat.input_dtype("x", [], dtype);
         let output = nonfloat.celu_scalar(x, 0.125).unwrap();
         assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
-        assert!(nonfloat
-            .nodes
-            .iter()
-            .any(|node| { matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32) }));
+        assert!(
+            nonfloat.nodes.iter().any(|node| {
+                matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32)
+            })
+        );
     }
 
     let mut empty = Graph::new();
@@ -2110,16 +2141,20 @@ fn celu_with_scalar_preserves_tinygrad_per_consumer_alpha_commitment() {
     let x = staged.input_dtype("x", [], DType::I16);
     let output = staged.celu_with_scalar(x, Scalar::I(-1)).unwrap();
     assert_eq!(staged.dtype(output).unwrap(), DType::F32);
-    assert!(staged
-        .nodes
-        .iter()
-        .any(|node| matches!(&node.op, Op::Constant(data)
-        if data.dtype() == DType::I16 && data.scalar_at(0).as_i64() == -1)));
-    assert!(staged
-        .nodes
-        .iter()
-        .any(|node| matches!(&node.op, Op::Constant(data)
-        if data.dtype() == DType::F32 && data.scalar_at(0).as_i64() == -1)));
+    assert!(
+        staged
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, Op::Constant(data)
+        if data.dtype() == DType::I16 && data.scalar_at(0).as_i64() == -1))
+    );
+    assert!(
+        staged
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, Op::Constant(data)
+        if data.dtype() == DType::F32 && data.scalar_at(0).as_i64() == -1))
+    );
 
     let mut bridge = Graph::new();
     let x = bridge.input_dtype("x", [], DType::I64);
@@ -2142,15 +2177,19 @@ fn celu_with_scalar_preserves_tinygrad_per_consumer_alpha_commitment() {
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(malformed
-        .celu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
-        .is_err());
+    assert!(
+        malformed
+            .celu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(malformed
-        .celu_with_scalar(overflow, Scalar::F(-0.5))
-        .is_err());
+    assert!(
+        malformed
+            .celu_with_scalar(overflow, Scalar::F(-0.5))
+            .is_err()
+    );
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -2672,12 +2711,16 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
         .into_iter()
         .map(|step| step.operation)
         .collect::<Vec<_>>();
-    assert!(operations
-        .iter()
-        .any(|operation| operation.starts_with("maximum(")));
-    assert!(operations
-        .iter()
-        .any(|operation| operation.starts_with("abs(")));
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation.starts_with("maximum("))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation.starts_with("abs("))
+    );
 }
 
 #[test]

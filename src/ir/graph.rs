@@ -1317,8 +1317,7 @@ fn scatter_plan(
         ScatterSource::Tensor(src) => {
             if mode != ScatterMode::Replace {
                 return Err(Error::InvalidRandom {
-                    reason:
-                        "non-scalar src is not supported with scatter reduce; use scatter_reduce",
+                    reason: "non-scalar src is not supported with scatter reduce; use scatter_reduce",
                 });
             }
             let src_node = graph.node(src)?;

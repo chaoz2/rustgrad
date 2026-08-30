@@ -9,9 +9,9 @@ use crate::engine::symbolic::{
 use crate::engine::symbolic_view::SymbolicViewMap;
 use crate::tensor::artifact as tensor_artifact;
 use crate::uop::artifact::{
-    checksum, decode as decode_uop, dtype, dtype_tag, encode as encode_uop, encode_effect_aware,
-    read_affine_view, read_shape, read_symbolic, read_view, write_affine_view, write_shape,
-    write_symbolic, write_view, ArtifactError, Reader, Writer,
+    ArtifactError, Reader, Writer, checksum, decode as decode_uop, dtype, dtype_tag,
+    encode as encode_uop, encode_effect_aware, read_affine_view, read_shape, read_symbolic,
+    read_view, write_affine_view, write_shape, write_symbolic, write_view,
 };
 use crate::{
     CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
@@ -1946,11 +1946,13 @@ mod tests {
             .clone();
         bad_projection.items[0].output = secondary_output;
         assert!(decode_scheduled_outputs(&unchecked_scheduled_outputs(&bad_projection)).is_err());
-        assert!(ScheduledOutputs::new(vec![
-            capture.items[0].output.clone(),
-            capture.items[0].output.clone(),
-        ])
-        .is_err());
+        assert!(
+            ScheduledOutputs::new(vec![
+                capture.items[0].output.clone(),
+                capture.items[0].output.clone(),
+            ])
+            .is_err()
+        );
 
         let mut bad_identity = encode_scheduled_outputs(&capture).unwrap();
         bad_identity[5..13].copy_from_slice(&0u64.to_le_bytes());

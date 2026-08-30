@@ -1,9 +1,9 @@
 use super::*;
 use crate::uop::Ternary;
 use crate::{
-    schedule, Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp,
-    MovementKernelKind, MovementKernelPlan, Op, ReduceKind, Scalar, Storage, TensorData, UArg,
-    UOpKind, UnaryOp,
+    Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, MovementKernelKind,
+    MovementKernelPlan, Op, ReduceKind, Scalar, Storage, TensorData, UArg, UOpKind, UnaryOp,
+    schedule,
 };
 use std::{
     fs::{self, File},
@@ -375,12 +375,13 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
         assert_eq!(scheduled.items.len(), 1);
         let item = &scheduled.items[0];
         assert!(item.boundary.is_none());
-        assert!(item
-            .kernel
-            .topological()
-            .unwrap()
-            .iter()
-            .any(|uop| { matches!(uop.kind(), UOpKind::ReduceFinalize) }));
+        assert!(
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|uop| { matches!(uop.kind(), UOpKind::ReduceFinalize) })
+        );
         assert!(CpuJit::render(&item.kernel).is_ok());
         assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
         let captured =
@@ -611,12 +612,14 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
                 "captured {dtype:?} {reduction:?}",
             );
             let scheduled = schedule(&built.graph, built.output).unwrap();
-            assert!(scheduled.items[0]
-                .kernel
-                .topological()
-                .unwrap()
-                .iter()
-                .any(|node| matches!(node.kind(), UOpKind::ReduceFinalize)));
+            assert!(
+                scheduled.items[0]
+                    .kernel
+                    .topological()
+                    .unwrap()
+                    .iter()
+                    .any(|node| matches!(node.kind(), UOpKind::ReduceFinalize))
+            );
             assert!(
                 CpuJit::render(&scheduled.items[0].kernel).is_ok(),
                 "{dtype:?} {reduction:?}"
@@ -917,9 +920,11 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
     assert!(found);
     assert!(neg && abs);
     assert_eq!(dtypes.len(), 13);
-    assert!(coverage
-        .iter()
-        .all(|ops| ops.iter().all(|covered| *covered)));
+    assert!(
+        coverage
+            .iter()
+            .all(|ops| ops.iter().all(|covered| *covered))
+    );
     assert!(scalar && empty);
 }
 
@@ -1353,10 +1358,12 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
     let b2_input = b2_graph.input_dtype("input", [2], DType::F32);
     let b2_output = b2_graph.cast(b2_input, DType::I32).unwrap();
     let b2_uop = crate::lower_graph_elementwise(&b2_graph, b2_output).unwrap();
-    assert!(CpuJit::render_vectorized(&b2_uop)
-        .unwrap()
-        .source
-        .contains("B2 VectorProgram"));
+    assert!(
+        CpuJit::render_vectorized(&b2_uop)
+            .unwrap()
+            .source
+            .contains("B2 VectorProgram")
+    );
 
     // Finite fractional truncation and unsigned conversion stay in the safe
     // nonnegative domain. Arbitrary half NaN payload identity is not claimed.
@@ -1715,12 +1722,14 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             crate::BinaryOp::Mul,
         ] {
             let output = b2_graph.binary(op, b2_lhs, b2_rhs).unwrap();
-            assert!(CpuJit::render_vectorized(
-                &crate::lower_graph_elementwise(&b2_graph, output).unwrap()
-            )
-            .unwrap()
-            .source
-            .contains("B2 VectorProgram"));
+            assert!(
+                CpuJit::render_vectorized(
+                    &crate::lower_graph_elementwise(&b2_graph, output).unwrap()
+                )
+                .unwrap()
+                .source
+                .contains("B2 VectorProgram")
+            );
         }
     }
 
@@ -3037,12 +3046,13 @@ fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
         let scheduled = schedule(&built.graph, built.output).unwrap();
         for item in &scheduled.items {
             assert!(item.boundary.is_none());
-            assert!(item
-                .kernel
-                .topological()
-                .unwrap()
-                .iter()
-                .any(|node| { matches!(node.arg(), UArg::ViewBufferIndex { .. }) }));
+            assert!(
+                item.kernel
+                    .topological()
+                    .unwrap()
+                    .iter()
+                    .any(|node| { matches!(node.arg(), UArg::ViewBufferIndex { .. }) })
+            );
             assert!(CpuJit::render(&item.kernel).is_ok());
             assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
         }
@@ -3171,9 +3181,11 @@ fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
                 matches!(node.kind(), UOpKind::Cast)
                     && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
             }));
-            assert!(nodes
-                .iter()
-                .any(|node| { matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)) }));
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| { matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)) })
+            );
             assert!(!nodes.iter().any(|node| {
                 matches!(node.kind(), UOpKind::GraphLogical(crate::LogicalOp::Not))
             }));
@@ -3844,12 +3856,16 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
             let kernel = &scheduled.items[0].kernel;
             let topological = kernel.topological().unwrap();
             if dtype == DType::Bool && op == FuzzUnaryOp::Neg {
-                assert!(topological
-                    .iter()
-                    .any(|node| matches!(node.kind(), UOpKind::Cast)));
-                assert!(topological
-                    .iter()
-                    .any(|node| matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne))));
+                assert!(
+                    topological
+                        .iter()
+                        .any(|node| matches!(node.kind(), UOpKind::Cast))
+                );
+                assert!(
+                    topological
+                        .iter()
+                        .any(|node| matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)))
+                );
             } else {
                 let expected = match op {
                     FuzzUnaryOp::Neg => UnaryOp::Neg,
@@ -4043,12 +4059,14 @@ fn fixed_campaigns_match_interpreter_and_strict_native() {
     assert_eq!(native.native_matches, 16);
     assert_eq!(native.native_unsupported, 0);
     assert!(native.failures.is_empty());
-    assert!(run_campaign(FuzzConfig {
-        seed: 0,
-        cases: 4097,
-        native: false
-    })
-    .is_err());
+    assert!(
+        run_campaign(FuzzConfig {
+            seed: 0,
+            cases: 4097,
+            native: false
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -4217,7 +4235,7 @@ fn nested_unknown_fields_and_equal_outcomes_are_rejected() {
 
 #[test]
 fn replay_status_distinguishes_reproduced_changed_resolved_and_unsupported() {
-    use super::execute::{replay_failure_with, PathError};
+    use super::execute::{PathError, replay_failure_with};
 
     let failure = historical_concat_failure();
     let expected = failure.expected.clone();
@@ -4264,7 +4282,7 @@ fn replay_status_distinguishes_reproduced_changed_resolved_and_unsupported() {
 
 #[test]
 fn minimization_never_blesses_unsupported_as_a_mismatch() {
-    use super::execute::{compare_path_with, PathError};
+    use super::execute::{PathError, compare_path_with};
 
     let original = regression_cases().remove(0);
     let built = original.build().unwrap();
@@ -4305,15 +4323,17 @@ fn campaign_accounting_rejects_interpreter_unsupported_only() {
         native_unsupported: 0,
         failures: vec![],
     };
-    assert!(record_comparison(
-        &mut report,
-        0,
-        FuzzComparison::Unsupported {
-            path: FuzzPath::CapturedInterpreter,
-            reason: "coverage hole".into(),
-        },
-    )
-    .is_err());
+    assert!(
+        record_comparison(
+            &mut report,
+            0,
+            FuzzComparison::Unsupported {
+                path: FuzzPath::CapturedInterpreter,
+                reason: "coverage hole".into(),
+            },
+        )
+        .is_err()
+    );
     record_comparison(
         &mut report,
         0,
@@ -4328,7 +4348,7 @@ fn campaign_accounting_rejects_interpreter_unsupported_only() {
 
 #[test]
 fn replay_output_requires_exactly_one_value() {
-    use super::execute::{exact_single_output, PathError};
+    use super::execute::{PathError, exact_single_output};
 
     assert!(matches!(
         exact_single_output(vec![]),

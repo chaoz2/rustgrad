@@ -1,6 +1,6 @@
 use super::state::join;
 use super::*;
-use crate::{save_safetensors, Backend, CpuBackend, Error, Graph, NodeId, Storage, TensorData};
+use crate::{Backend, CpuBackend, Error, Graph, NodeId, Storage, TensorData, save_safetensors};
 use std::collections::BTreeMap;
 
 fn f32s(data: &TensorData) -> Vec<f32> {
@@ -45,10 +45,12 @@ fn linear_is_a_graph_leaf_and_replacement_is_versioned() {
         )),
         vec![9., 19.]
     );
-    assert!(linear
-        .weight
-        .replace(TensorData::new([2], vec![1., 2.]).unwrap())
-        .is_err());
+    assert!(
+        linear
+            .weight
+            .replace(TensorData::new([2], vec![1., 2.]).unwrap())
+            .is_err()
+    );
     assert_eq!(linear.weight.version(), Ok(1));
     let loss = graph
         .reduce(output, crate::ReduceKind::Sum, None, false)
@@ -154,9 +156,11 @@ fn parameter_binding_is_graph_local_versioned_and_captures_values() {
         .as_f64();
     assert!((current - 1.999).abs() < 1e-6);
 
-    assert!(optimizer
-        .step(&BTreeMap::from([("value".into(), stale_gradient)]))
-        .is_err());
+    assert!(
+        optimizer
+            .step(&BTreeMap::from([("value".into(), stale_gradient)]))
+            .is_err()
+    );
 }
 
 #[test]
@@ -530,9 +534,10 @@ fn strict_state_loading_is_exact_transactional_and_rejects_tied_aliases() {
     );
     let mut conflicting = before.clone().into_tensors();
     conflicting.insert("alias".into(), TensorData::new([1], vec![3.]).unwrap());
-    assert!(tied
-        .load_state_dict_strict(&StateDict::from(conflicting))
-        .is_err());
+    assert!(
+        tied.load_state_dict_strict(&StateDict::from(conflicting))
+            .is_err()
+    );
     assert_eq!(tied.state_dict().unwrap(), before);
 }
 
@@ -572,9 +577,11 @@ fn strict_state_load_preflights_every_container_parameter_before_replacement() {
     let mut malformed = linear.state_dict().unwrap().into_tensors();
     malformed.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
     malformed.insert("weight".into(), TensorData::new([1], vec![7.]).unwrap());
-    assert!(linear
-        .load_state_dict(&StateDict::from(malformed), true, CastPolicy::Exact)
-        .is_err());
+    assert!(
+        linear
+            .load_state_dict(&StateDict::from(malformed), true, CastPolicy::Exact)
+            .is_err()
+    );
     let weight_after_failure = linear.weight.snapshot().unwrap();
     let bias_after_failure = bias.snapshot().unwrap();
     assert_eq!(weight_after_failure.data, weight_before.data);

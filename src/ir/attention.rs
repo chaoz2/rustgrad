@@ -1,7 +1,6 @@
 use super::{
-    matmul_shape,
+    AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape,
     shape::{normalize_axes, reduction_shape},
-    AttentionOptions, Graph, NodeId, ReduceKind,
 };
 use crate::{DType, Error, ReductionDType, Result, Scalar, Shape, TensorData};
 
@@ -182,11 +181,7 @@ fn softmax_plan(
                 .enumerate()
                 .map(
                     |(index, &dimension)| {
-                        if index == axis as usize {
-                            1
-                        } else {
-                            dimension
-                        }
+                        if index == axis as usize { 1 } else { dimension }
                     },
                 )
                 .collect::<Vec<_>>(),

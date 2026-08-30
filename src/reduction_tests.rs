@@ -220,10 +220,12 @@ fn extrema_retain_leading_nan_and_ignore_later_nan_in_gradients() {
                 .as_f64();
             if nan_index == 0 {
                 assert!(forward.is_nan(), "{kind:?} retains a leading NaN");
-                assert!(execute(&graph, gradient, input)
-                    .to_vec_f64()
-                    .iter()
-                    .all(|value| value.is_nan()));
+                assert!(
+                    execute(&graph, gradient, input)
+                        .to_vec_f64()
+                        .iter()
+                        .all(|value| value.is_nan())
+                );
                 continue;
             }
             let expected = match kind {
@@ -334,10 +336,12 @@ fn empty_reduction_contract_is_typed_and_explicit() {
             execute(&graph, sum, input.clone()).to_vec_f64(),
             vec![0.; 2]
         );
-        assert!(execute(&graph, mean, input.clone())
-            .to_vec_f64()
-            .iter()
-            .all(|value| value.is_nan()));
+        assert!(
+            execute(&graph, mean, input.clone())
+                .to_vec_f64()
+                .iter()
+                .all(|value| value.is_nan())
+        );
         assert_eq!(execute(&graph, product, input).to_vec_f64(), vec![1.; 2]);
 
         for (kind, op) in [(ReduceKind::Max, "max"), (ReduceKind::Min, "min")] {
@@ -412,10 +416,12 @@ fn reduce_grad_has_inspectable_label_shape_and_dtype() {
     assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 2]));
     assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
     let trace = graph.trace(gradient).unwrap();
-    assert!(trace
-        .steps
-        .iter()
-        .any(|step| step.operation.contains("reduce_grad_Product")));
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.contains("reduce_grad_Product"))
+    );
 }
 
 #[test]

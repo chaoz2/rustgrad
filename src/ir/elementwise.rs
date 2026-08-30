@@ -2302,7 +2302,7 @@ fn isclose_scalar_plan(
     extent(rhs_shape, tolerance_dtype)?; // atol + relative
     extent(&output_shape, comparison_dtype)?; // comparison's typed operands
     extent(&output_shape, DType::Bool)?; // near
-                                         // isfinite/isinf/isnan for both inputs plus their source Boolean tree.
+    // isfinite/isinf/isnan for both inputs plus their source Boolean tree.
     for _ in 0..3 {
         extent(lhs_shape, DType::Bool)?;
         extent(rhs_shape, DType::Bool)?;

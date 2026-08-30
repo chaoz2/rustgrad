@@ -8,8 +8,8 @@
 //! references fail closed.
 
 use crate::{
-    nn::{LoadReport, Module, StateDict},
     DType, Error, Result, Shape, TensorData,
+    nn::{LoadReport, Module, StateDict},
 };
 use flate2::read::DeflateDecoder;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1600,8 +1600,8 @@ fn tensor_from_raw_spec_with_limits(
 mod tests {
     use super::*;
     use crate::{
-        load_safetensors, nn::Linear, save_safetensors, CastPolicy, Graph, Metadata, Module,
-        ModuleStateDict,
+        CastPolicy, Graph, Metadata, Module, ModuleStateDict, load_safetensors, nn::Linear,
+        save_safetensors,
     };
 
     // This fixture writer is intentionally a tiny external-format encoder, not
@@ -1908,7 +1908,7 @@ mod tests {
 
     #[test]
     fn deflate_and_tar_containers_are_bounded_and_validated() {
-        use flate2::{write::DeflateEncoder, Compression};
+        use flate2::{Compression, write::DeflateEncoder};
         use std::io::Write;
         let source = b"raw deflate fixture with exact bytes";
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
@@ -2024,21 +2024,27 @@ mod tests {
         let marker_at = marker.len() - (4 + 4 + 2 * 16 + 8) + 4;
         marker[marker_at] = 1;
         assert!(legacy_tensors(&marker, &storages).is_err());
-        assert!(legacy_tensors(
-            &legacy_tensor_stream("x", "missing", "FloatTensor", &[1], &[1], 0),
-            &storages
-        )
-        .is_err());
-        assert!(legacy_tensors(
-            &legacy_tensor_stream("x", "s", "FloatTensor", &[2, 2], &[0, 1], 0),
-            &storages
-        )
-        .is_err());
-        assert!(legacy_tensors(
-            &legacy_tensor_stream("x", "s", "FloatTensor", &[3], &[1], 2),
-            &storages
-        )
-        .is_err());
+        assert!(
+            legacy_tensors(
+                &legacy_tensor_stream("x", "missing", "FloatTensor", &[1], &[1], 0),
+                &storages
+            )
+            .is_err()
+        );
+        assert!(
+            legacy_tensors(
+                &legacy_tensor_stream("x", "s", "FloatTensor", &[2, 2], &[0, 1], 0),
+                &storages
+            )
+            .is_err()
+        );
+        assert!(
+            legacy_tensors(
+                &legacy_tensor_stream("x", "s", "FloatTensor", &[3], &[1], 2),
+                &storages
+            )
+            .is_err()
+        );
     }
 
     #[test]
