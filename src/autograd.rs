@@ -358,19 +358,132 @@ impl Graph {
         let original_len = self.nodes.len();
         let previous_enabled = self.grad_enabled;
         self.grad_enabled = create_graph;
-        let result = self.grad_with_inner(loss, wrt, upstream, original_len, loss_shape);
+        let result = self
+            .reverse_with_inner(loss, upstream, original_len, loss_shape, None)
+            .and_then(|grads| grads[wrt.index()].ok_or(Error::NoGradient(wrt)));
         self.grad_enabled = previous_enabled;
         result
     }
 
-    fn grad_with_inner(
+    /// Computes tinygrad's public multi-target `Tensor.gradient` transform.
+    ///
+    /// All targets are differentiated in one reverse traversal. Repeated
+    /// targets therefore return the same graph node, while a disconnected
+    /// floating target receives an independent typed `const_like(0)` value.
+    /// Unlike [`Graph::grad_with`], this source-facing transform deliberately
+    /// does not use RustGrad's leaf `requires_grad` policy for admission:
+    /// tinygrad accepts any concrete strong floating target.
+    pub fn gradient(
         &mut self,
         loss: NodeId,
-        wrt: NodeId,
+        targets: &[NodeId],
+        gradient: Option<NodeId>,
+    ) -> Result<Vec<NodeId>> {
+        // Build the complete reverse graph, including every disconnected zero
+        // fallback, in one private candidate. Commit that candidate only after
+        // every seed, local derivative, accumulation, and fallback succeeds.
+        // Preserve the caller's graph-local no-grad mode while forcing the
+        // returned derivative itself to retain ordinary higher-order edges.
+        let mut candidate = self.clone();
+        let previous_enabled = candidate.grad_enabled;
+        candidate.grad_enabled = true;
+        let result = candidate.gradient_source_inner(loss, targets, gradient);
+        candidate.grad_enabled = previous_enabled;
+        let result = result?;
+        *self = candidate;
+        Ok(result)
+    }
+
+    /// Source-default `Tensor.gradient(*targets)` with an implicit scalar one
+    /// seed.
+    pub fn gradient_default(&mut self, loss: NodeId, targets: &[NodeId]) -> Result<Vec<NodeId>> {
+        self.gradient(loss, targets, None)
+    }
+
+    fn gradient_source_inner(
+        &mut self,
+        loss: NodeId,
+        targets: &[NodeId],
+        gradient: Option<NodeId>,
+    ) -> Result<Vec<NodeId>> {
+        let loss_node = self.node(loss)?;
+        if !loss_node.dtype.is_float() {
+            return Err(Error::NonDifferentiableTarget(loss));
+        }
+        let loss_shape = loss_node.shape.clone();
+        for &target in targets {
+            if !self.node(target)?.dtype.is_float() {
+                return Err(Error::NonDifferentiableTarget(target));
+            }
+        }
+
+        let original_len = self.nodes.len();
+        let target_path = self.source_gradient_target_path(loss, targets, original_len)?;
+        self.validate_source_gradient_path(&target_path)?;
+
+        let gradient = match gradient {
+            Some(gradient) => {
+                let shape = self.node(gradient)?.shape.clone();
+                if shape == loss_shape {
+                    gradient
+                } else if shape.numel()? == loss_shape.numel()? {
+                    self.reshape(gradient, loss_shape.clone())?
+                } else if shape.broadcast_with(&loss_shape).as_ref() == Ok(&loss_shape) {
+                    self.expand(gradient, loss_shape.clone())?
+                } else {
+                    return Err(Error::GradientShape {
+                        output: loss_shape,
+                        upstream: shape,
+                    });
+                }
+            }
+            None => {
+                // tinygrad tests the public shape tuple, not merely numel, so
+                // rank-one `[1]` outputs still require an explicit gradient.
+                if loss_shape.rank() != 0 {
+                    return Err(Error::NonScalarLoss(loss_shape));
+                }
+                self.const_like(loss, Scalar::F(1.0), None)?
+            }
+        };
+
+        let previous_enabled = self.grad_enabled;
+        self.grad_enabled = true;
+        let result = self.reverse_with_inner(
+            loss,
+            Some(gradient),
+            original_len,
+            loss_shape,
+            Some(&target_path),
+        );
+        self.grad_enabled = previous_enabled;
+        let grads = result?;
+
+        let mut zeros = std::collections::BTreeMap::new();
+        targets
+            .iter()
+            .map(|&target| {
+                if let Some(gradient) = grads[target.index()] {
+                    Ok(gradient)
+                } else if let Some(&zero) = zeros.get(&target) {
+                    Ok(zero)
+                } else {
+                    let zero = self.const_like(target, Scalar::F(0.0), None)?;
+                    zeros.insert(target, zero);
+                    Ok(zero)
+                }
+            })
+            .collect()
+    }
+
+    fn reverse_with_inner(
+        &mut self,
+        loss: NodeId,
         upstream: Option<NodeId>,
         original_len: usize,
         loss_shape: Shape,
-    ) -> Result<NodeId> {
+        target_path: Option<&[bool]>,
+    ) -> Result<Vec<Option<NodeId>>> {
         let seed = if let Some(upstream) = upstream {
             let upstream_node = self.node(upstream)?;
             if upstream_node.shape != loss_shape {
@@ -379,7 +492,7 @@ impl Graph {
                     upstream: upstream_node.shape.clone(),
                 });
             }
-            if !upstream_node.dtype.is_float() {
+            if target_path.is_none() && !upstream_node.dtype.is_float() {
                 return Err(Error::NonDifferentiableTarget(upstream));
             }
             upstream
@@ -394,6 +507,9 @@ impl Graph {
         grads[loss.index()] = Some(seed);
 
         for index in (0..original_len).rev() {
+            if target_path.is_some_and(|path| !path[index]) {
+                continue;
+            }
             let Some(upstream) = grads[index] else {
                 continue;
             };
@@ -1289,7 +1405,76 @@ impl Graph {
                 }
             }
         }
-        grads[wrt.index()].ok_or(Error::NoGradient(wrt))
+        Ok(grads)
+    }
+
+    fn source_gradient_target_path(
+        &self,
+        loss: NodeId,
+        targets: &[NodeId],
+        original_len: usize,
+    ) -> Result<Vec<bool>> {
+        let target_set = targets.iter().copied().collect::<BTreeSet<_>>();
+        let mut ancestors = vec![false; original_len];
+        let mut pending = vec![loss];
+        while let Some(node) = pending.pop() {
+            if ancestors[node.index()] {
+                continue;
+            }
+            ancestors[node.index()] = true;
+            pending.extend(self.node(node)?.op.backward_inputs());
+        }
+
+        // Graph NodeIds are topological. Track whether each ancestor contains
+        // any requested target, and separately whether its reverse rule must
+        // run to reach such a target. A target itself only needs processing
+        // when another requested target lies below it.
+        let mut contains_target = vec![false; original_len];
+        let mut target_path = vec![false; original_len];
+        for index in 0..original_len {
+            if !ancestors[index] {
+                continue;
+            }
+            let node = NodeId(index);
+            let reaches_target = self
+                .node(node)?
+                .op
+                .backward_inputs()
+                .into_iter()
+                .any(|input| contains_target[input.index()]);
+            target_path[index] = reaches_target;
+            contains_target[index] = target_set.contains(&node) || reaches_target;
+        }
+        Ok(target_path)
+    }
+
+    fn validate_source_gradient_path(&self, target_path: &[bool]) -> Result<()> {
+        for (index, &active) in target_path.iter().enumerate() {
+            if !active {
+                continue;
+            }
+            if let Op::PrefixScan { input, kind, .. } = &self.nodes[index].op {
+                match kind {
+                    crate::PrefixScanKind::Sum if !self.node(*input)?.dtype.is_float() => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumsum gradients require floating input",
+                        ));
+                    }
+                    crate::PrefixScanKind::Product if !self.node(*input)?.dtype.is_float() => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumprod gradients require floating input",
+                        ));
+                    }
+                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumulative extrema gradients are not yet represented",
+                        ));
+                    }
+                    crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     fn unbroadcast(&mut self, gradient: NodeId, shape: Shape) -> Result<NodeId> {
@@ -1738,6 +1923,123 @@ mod tests {
             let numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
             assert!((analytic.values()[index] - numerical).abs() < 2e-3);
         }
+    }
+
+    #[test]
+    fn source_gradient_batches_targets_preserves_aliases_and_zero_fallbacks() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let y = graph.input_dtype_requires_grad("y", [3], DType::F32, false);
+        let unused = graph.input_dtype_requires_grad("unused", [3], DType::F32, false);
+        let product = graph.mul(x, y).unwrap();
+        let loss = graph.sum_all(product).unwrap();
+
+        let gradients = graph.gradient_default(loss, &[x, y, x, unused]).unwrap();
+        assert_eq!(gradients[0], gradients[2], "duplicate targets must alias");
+        assert_eq!(graph.shape(gradients[0]).unwrap(), &Shape::new([3]));
+        assert_eq!(graph.shape(gradients[1]).unwrap(), &Shape::new([3]));
+        assert_eq!(graph.shape(gradients[3]).unwrap(), &Shape::new([3]));
+        assert_eq!(graph.dtype(gradients[3]).unwrap(), DType::F32);
+        assert!(matches!(graph.op(gradients[3]).unwrap(), Op::Expand { .. }));
+
+        let bindings = HashMap::from([
+            ("x".into(), data([3], &[2.0, 3.0, 5.0])),
+            ("y".into(), data([3], &[7.0, 11.0, 13.0])),
+            ("unused".into(), data([3], &[17.0, 19.0, 23.0])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradients[0], &bindings).unwrap(),
+            data([3], &[7.0, 11.0, 13.0])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradients[1], &bindings).unwrap(),
+            data([3], &[2.0, 3.0, 5.0])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradients[3], &bindings).unwrap(),
+            data([3], &[0.0, 0.0, 0.0])
+        );
+
+        // The source-style transform is independent of RustGrad's leaf
+        // tracking bit, including for higher-order composition.
+        let gx_sum = graph.sum_all(gradients[0]).unwrap();
+        let d_gx_dy = graph.gradient_default(gx_sum, &[y]).unwrap()[0];
+        assert_eq!(
+            CpuBackend.execute(&graph, d_gx_dy, &bindings).unwrap(),
+            data([3], &[1.0, 1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn source_gradient_normalizes_custom_seed_and_prunes_unrequested_paths() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let y = graph.input("y", [3]);
+        let product = graph.mul(x, y).unwrap();
+        let product_sum = graph.sum_all(product).unwrap();
+        let unrelated = graph.input("unrelated", [3]);
+        let (cumulative, _) = graph.cummax(unrelated, 0).unwrap();
+        let cumulative_sum = graph.sum_all(cumulative).unwrap();
+        let loss = graph.add(product_sum, cumulative_sum).unwrap();
+        let seed = graph.constant(data([1], &[3.0]));
+
+        // `[1]` is the concrete public representation accepted by tinygrad's
+        // scalar custom-gradient example. Normalize it to the scalar loss
+        // descriptor before the one reverse traversal.
+        let gradient = graph.gradient(loss, &[x], Some(seed)).unwrap()[0];
+        let bindings = HashMap::from([
+            ("x".into(), data([3], &[2.0, 3.0, 5.0])),
+            ("y".into(), data([3], &[7.0, 11.0, 13.0])),
+            ("unrelated".into(), data([3], &[1.0, 4.0, 2.0])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
+            data([3], &[21.0, 33.0, 39.0])
+        );
+
+        // Cumulative extrema are still unsupported in reverse mode, but an
+        // unrelated branch must not poison a target-pruned source traversal.
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient_default(loss, &[unrelated]),
+            Err(Error::NonDifferentiableIndexing(_))
+        ));
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
+    fn source_gradient_rejects_invalid_requests_before_publication() {
+        let mut graph = Graph::new();
+        let vector = graph.input("vector", [1]);
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient_default(vector, &[vector]),
+            Err(Error::NonScalarLoss(shape)) if shape == Shape::new([1])
+        ));
+        assert_eq!(graph.node_count(), before);
+
+        let integer = graph.input_dtype("integer", [1], DType::I32);
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient(vector, &[integer], Some(vector)),
+            Err(Error::NonDifferentiableTarget(node)) if node == integer
+        ));
+        assert_eq!(graph.node_count(), before);
+
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient(vector, &[NodeId(usize::MAX)], Some(vector)),
+            Err(Error::UnknownNode(NodeId(usize::MAX)))
+        ));
+        assert_eq!(graph.node_count(), before);
+
+        let bad_seed = graph.input("bad_seed", [2]);
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient(vector, &[vector], Some(bad_seed)),
+            Err(Error::GradientShape { .. })
+        ));
+        assert_eq!(graph.node_count(), before);
     }
 
     #[test]

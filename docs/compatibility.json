@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:9ec592d8961bd500",
+  "source_fingerprint": "fnv1a64:1c28fa6d901172b1",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -369,7 +369,7 @@
       "subject": "Reverse-mode graph transform",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "IR-to-IR transform covers current ALU, movement, reductions and first-order dedicated primitives. `grad_with` supplies explicit upstream validation and `create_graph` control."
+        "Acceptance requirement": "IR-to-IR transform covers current ALU, movement, reductions and first-order dedicated primitives. Source-facing `Graph::gradient` / `gradient_default` performs one target-pruned reverse traversal for an ordered target slice, preserves duplicate result aliases, admits connected concrete floating targets independently of RustGrad's leaf tracking bit, and returns one shared typed `const_like(0)` fallback per disconnected target. Custom seeds normalize equal-numel or broadcast-compatible descriptors to the loss shape; implicit seeds require a rank-zero loss. A cloned full candidate transaction validates every derivative and zero fallback before atomically replacing the live graph while preserving its no-grad mode. Existing `grad_with` retains its single-target explicit-upstream validation and `create_graph` control."
       }
     },
     {
