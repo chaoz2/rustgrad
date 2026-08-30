@@ -257,15 +257,11 @@ fn sequential_is_heterogeneous_ordered_and_preserves_prefix_failures() {
         .sequential(input, Vec::<GraphSequentialTransform>::new())
         .unwrap();
     assert_eq!(identity, input);
-    let output = graph
-        .sequential(
-            input,
-            vec![
-                Box::new(|g: &mut Graph, x: NodeId| g.mul_scalar(x, Scalar::F(2.0))),
-                Box::new(|g: &mut Graph, x: NodeId| g.add_scalar(x, Scalar::F(1.0))),
-            ],
-        )
-        .unwrap();
+    let transforms: Vec<GraphSequentialTransform> = vec![
+        Box::new(|g: &mut Graph, x: NodeId| g.mul_scalar(x, Scalar::F(2.0))),
+        Box::new(|g: &mut Graph, x: NodeId| g.add_scalar(x, Scalar::F(1.0))),
+    ];
+    let output = graph.sequential(input, transforms).unwrap();
     assert!(matches!(
         graph.op(output).unwrap(),
         Op::Binary {

@@ -795,20 +795,23 @@ impl Graph {
                     output: crate::SortOutput::Values,
                 } => {
                     let indices = self.sort_indices_sibling(node, input, axis, descending, pair)?;
-                    let source = self.node(input)?;
-                    let grad = if source.shape.rank() == 0 {
-                        if self.node(upstream)?.dtype == source.dtype {
+                    let (source_shape, source_dtype) = {
+                        let source = self.node(input)?;
+                        (source.shape.clone(), source.dtype)
+                    };
+                    let grad = if source_shape.rank() == 0 {
+                        if self.node(upstream)?.dtype == source_dtype {
                             upstream
                         } else {
-                            self.cast(upstream, source.dtype)?
+                            self.cast(upstream, source_dtype)?
                         }
                     } else {
-                        let upstream = if self.node(upstream)?.dtype == source.dtype {
+                        let upstream = if self.node(upstream)?.dtype == source_dtype {
                             upstream
                         } else {
-                            self.cast(upstream, source.dtype)?
+                            self.cast(upstream, source_dtype)?
                         };
-                        let zeros = self.constant(filled(source.shape.clone(), 0.0)?);
+                        let zeros = self.constant(filled(source_shape, 0.0)?);
                         self.scatter_add(zeros, indices, upstream, axis)?
                     };
                     self.accumulate(&mut grads, input, grad)?;

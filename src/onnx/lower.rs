@@ -17,6 +17,14 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
+fn extent(shape: &Shape, dtype: DType, what: &str) -> Result<()> {
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad(format!("{what} byte extent overflow")))?;
+    Ok(())
+}
+
 fn prelu_dtype(x: DType, slope: DType) -> DType {
     // tinygrad's weak binary lowering resolves the only supported lattice
     // disagreement, U64 mixed with I64, at its default F32 width. RustGrad's
@@ -5189,7 +5197,13 @@ fn cumsum_plan(
             .iter()
             .map(|&extent| (0, extent))
             .collect::<Vec<_>>();
-        Shape::new(shrink.iter().map(|(start, end)| end - start).collect()).numel()?;
+        Shape::new(
+            shrink
+                .iter()
+                .map(|(start, end)| end - start)
+                .collect::<Vec<usize>>(),
+        )
+        .numel()?;
         let padding = (0..rank)
             .map(|dimension| if dimension == axis { (1, 0) } else { (0, 0) })
             .collect();
