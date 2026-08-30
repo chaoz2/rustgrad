@@ -1458,22 +1458,8 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
 }
 
 #[test]
-fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts() {
-    const DTYPES: [DType; 13] = [
-        DType::Bool,
-        DType::I8,
-        DType::U8,
-        DType::I16,
-        DType::U16,
-        DType::I32,
-        DType::U32,
-        DType::I64,
-        DType::U64,
-        DType::F16,
-        DType::BF16,
-        DType::F32,
-        DType::F64,
-    ];
+fn cast_cases_cover_the_safe_full_concrete_dtype_matrix_without_undefined_c_casts() {
+    const DTYPES: [DType; 17] = DType::ALL;
 
     for from in DTYPES {
         for to in DTYPES {
@@ -1524,7 +1510,11 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
             let uop = crate::lower_graph_elementwise(&built.graph, built.output).unwrap();
             assert!(CpuJit::render(&uop).is_ok(), "{from:?} -> {to:?}");
             let vector = CpuJit::render_vectorized(&uop).unwrap();
-            if matches!(from, DType::F16 | DType::BF16) || matches!(to, DType::F16 | DType::BF16) {
+            if matches!(from, DType::F16 | DType::BF16)
+                || matches!(to, DType::F16 | DType::BF16)
+                || from.is_float8()
+                || to.is_float8()
+            {
                 assert!(
                     !vector.source.contains("B2 VectorProgram"),
                     "{from:?} -> {to:?}"
@@ -1534,9 +1524,9 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
         }
     }
 
-    // Representative non-half pairs still use B2, while every half endpoint
-    // remains on the v17 legacy scalar-per-lane path rather than claiming a
-    // tagged half-vector ABI.
+    // Representative wider pairs still use B2, while every half or Float8
+    // endpoint remains on the source-exact legacy scalar-per-lane path rather
+    // than claiming a tagged narrow-vector ABI.
     let mut b2_graph = crate::Graph::new();
     let b2_input = b2_graph.input_dtype("input", [2], DType::F32);
     let b2_output = b2_graph.cast(b2_input, DType::I32).unwrap();
@@ -1568,7 +1558,8 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
 
     let artifact_case = FuzzCase::Cast {
         input: FuzzTensor::from_tensor(
-            &TensorData::from_scalars([2], DType::BF16, [Scalar::I(0), Scalar::I(1)]).unwrap(),
+            &TensorData::from_scalars([2], DType::F8E5M2FNUZ, [Scalar::I(0), Scalar::I(1)])
+                .unwrap(),
         ),
         to: DType::U64,
     };
@@ -1600,14 +1591,14 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
     let minimized = minimize_case(&artifact_case, |candidate| {
         matches!(candidate,
             FuzzCase::Cast { input, to: DType::U64 }
-                if input.dtype == DType::BF16
+                if input.dtype == DType::F8E5M2FNUZ
                     && input.shape == vec![2]
                     && input.bytes.iter().all(|byte| *byte == 0)
         )
     });
     assert!(
         matches!(minimized, FuzzCase::Cast { ref input, to: DType::U64 }
-        if input.dtype == DType::BF16 && input.shape == vec![2])
+        if input.dtype == DType::F8E5M2FNUZ && input.shape == vec![2])
     );
 }
 
@@ -1631,8 +1622,8 @@ fn generated_cast_cases_reach_every_concrete_dtype_on_the_safe_domain() {
             targets.insert(to);
         }
     }
-    assert_eq!(sources.len(), 13);
-    assert_eq!(targets.len(), 13);
+    assert_eq!(sources.len(), 17);
+    assert_eq!(targets.len(), 17);
 }
 
 #[test]

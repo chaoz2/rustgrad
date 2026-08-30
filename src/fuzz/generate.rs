@@ -125,7 +125,7 @@ fn cast_tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> FuzzTen
         let value = (rng.next().wrapping_add(index as u64) % 3) as i64;
         match dtype {
             DType::Bool => Scalar::Bool(value != 0),
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(value as f64),
+            dtype if dtype.is_float() => Scalar::F(value as f64),
             _ => Scalar::I(value),
         }
     });
@@ -265,23 +265,8 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
         }
         2 => {
             let shape = static_shape(&mut rng);
-            let choices = [
-                DType::Bool,
-                DType::I8,
-                DType::U8,
-                DType::I16,
-                DType::U16,
-                DType::I32,
-                DType::U32,
-                DType::I64,
-                DType::U64,
-                DType::F16,
-                DType::BF16,
-                DType::F32,
-                DType::F64,
-            ];
-            let from = choices[rng.pick(choices.len())];
-            let to = choices[rng.pick(choices.len())];
+            let from = DType::ALL[rng.pick(DType::ALL.len())];
+            let to = DType::ALL[rng.pick(DType::ALL.len())];
             FuzzCase::Cast {
                 input: cast_tensor(&mut rng, shape, from),
                 to,
