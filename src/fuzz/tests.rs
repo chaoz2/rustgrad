@@ -2081,7 +2081,7 @@ fn generated_pad_cases_are_valid_diverse_and_deterministic() {
     }
 
     assert!(found);
-    assert_eq!(dtypes.len(), 13);
+    assert_eq!(dtypes, DType::ALL.into_iter().collect());
     assert!(scalar && empty && before && after && asymmetric);
 }
 
@@ -2239,10 +2239,10 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
     };
     assert!(f32::from_bits(fill_bits as u32).is_nan());
 
-    // A raw Pad copies finite input lanes at their storage width. Its scalar
+    // A raw Pad copies input lanes at their storage width. Its scalar
     // fill is deliberately a separate commitment through `scalar_at` and
-    // `MovementKernelPlan::fill_bits`, so raw half-NaN input/fill payload
-    // identity is not claimed here.
+    // `MovementKernelPlan::fill_bits`, so arbitrary raw half/Float8 fill
+    // payload identity is not claimed here.
     let dtype_cases = vec![
         (
             DType::Bool,
@@ -2380,6 +2380,69 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
             .unwrap();
         let output = FuzzTensor::from_tensor(&output);
         assert_eq!(&output.bytes[dtype.itemsize()..], input.bytes.as_slice());
+    }
+
+    for dtype in DType::FP8S {
+        let format = dtype.float8_format().expect("Float8 dtype");
+        let input = FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [2],
+                Storage::Float8(Float8Storage::from_raw(format, vec![0x80, 0xff])),
+            )
+            .unwrap(),
+        );
+        let fill = FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [],
+                Storage::Float8(Float8Storage::from_raw(format, vec![0x01])),
+            )
+            .unwrap(),
+        );
+        let committed_fill =
+            TensorData::scalar_with_dtype(fill.to_tensor().unwrap().scalar_at(0), dtype)
+                .to_le_bytes()
+                .unwrap()[0];
+        let case = FuzzCase::Pad {
+            input: input.clone(),
+            padding: vec![(1, 1)],
+            fill,
+        };
+        let built = case.build().unwrap();
+        let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        let MovementKernelKind::Pad { fill_bits, .. } = &plan.kind else {
+            panic!("Float8 Pad must retain its movement plan");
+        };
+        assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
+        assert_eq!(*fill_bits as u8, committed_fill);
+
+        let expected = vec![committed_fill, 0x80, 0xff, committed_fill];
+        let interpreted = plan.execute(&[input.to_tensor().unwrap()]).unwrap();
+        assert_eq!(interpreted.to_le_bytes().unwrap(), expected, "{dtype:?}");
+        let oracle = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        assert_eq!(oracle.to_le_bytes().unwrap(), expected, "{dtype:?}");
+
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        let scalar_source = CpuJit::render(&scheduled.items[0].kernel).unwrap().source;
+        let vector_source = CpuJit::render_vectorized(&scheduled.items[0].kernel)
+            .unwrap()
+            .source;
+        for source in [&scalar_source, &vector_source] {
+            assert!(source.contains("uint8_t"), "{dtype:?}");
+            assert!(!source.contains("rg_f8_decode"), "{dtype:?}");
+        }
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes,
+            "{dtype:?}"
+        );
     }
 
     for (dtype, fill, expect_nan) in [
@@ -5059,7 +5122,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 118);
+    assert_eq!(cases.len(), 122);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

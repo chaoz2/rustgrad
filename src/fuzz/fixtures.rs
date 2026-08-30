@@ -553,6 +553,62 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             padding: vec![(0, 1)],
             fill: tensor(vec![], Storage::U64(vec![u64::MAX])),
         },
+        FuzzCase::Pad {
+            input: tensor(
+                vec![2],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3,
+                    vec![0x80, 0x7f],
+                )),
+            ),
+            padding: vec![(1, 1)],
+            fill: tensor(
+                vec![],
+                Storage::Float8(Float8Storage::from_raw(Float8Format::E4M3, vec![0x01])),
+            ),
+        },
+        FuzzCase::Pad {
+            input: tensor(
+                vec![2],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E5M2,
+                    vec![0x80, 0x7d],
+                )),
+            ),
+            padding: vec![(0, 2)],
+            fill: tensor(
+                vec![],
+                Storage::Float8(Float8Storage::from_raw(Float8Format::E5M2, vec![0x01])),
+            ),
+        },
+        FuzzCase::Pad {
+            input: tensor(
+                vec![2],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3FNUZ,
+                    vec![0x80, 0xff],
+                )),
+            ),
+            padding: vec![(2, 0)],
+            fill: tensor(
+                vec![],
+                Storage::Float8(Float8Storage::from_raw(Float8Format::E4M3FNUZ, vec![0x01])),
+            ),
+        },
+        FuzzCase::Pad {
+            input: tensor(
+                vec![2],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E5M2FNUZ,
+                    vec![0x80, 0xff],
+                )),
+            ),
+            padding: vec![(1, 0)],
+            fill: tensor(
+                vec![],
+                Storage::Float8(Float8Storage::from_raw(Float8Format::E5M2FNUZ, vec![0x01])),
+            ),
+        },
         FuzzCase::Gather {
             // Axis-one duplicate/reorder selection is intentionally obvious.
             input: tensor(
