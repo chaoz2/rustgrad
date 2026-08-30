@@ -141,7 +141,7 @@ mod tests {
     fn accepts_source_owned_requested_values_without_producers() {
         let capture = CapturedSchedule {
             items: vec![],
-            inputs: vec![super::capture::ReplayInput {
+            inputs: vec![crate::engine::capture::ReplayInput {
                 name: "input".into(),
                 node: crate::NodeId::from_index(3),
                 desc: crate::BufferDesc {
