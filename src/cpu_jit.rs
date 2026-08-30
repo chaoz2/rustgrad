@@ -749,21 +749,24 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             ));
         }
         for node in &nodes {
+            if !matches!(
+                node.kind(),
+                UOpKind::GraphUnary(_)
+                    | UOpKind::GraphBinary(_)
+                    | UOpKind::GraphCompare(_)
+                    | UOpKind::GraphLogical(_)
+                    | UOpKind::Cast
+                    | UOpKind::Ternary(_)
+            ) {
+                continue;
+            }
             let node_float8 = node.ty().is_some_and(|ty| ty.scalar.is_float8());
             let consumes_float8 = node
                 .sources()
                 .iter()
                 .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
-            if node_float8
-                && !matches!(node.kind(), UOpKind::Index | UOpKind::Load | UOpKind::Const)
-            {
-                return Err(JitError::Unsupported(
-                    "native Float8 elementwise supports decoded loads/constants only".into(),
-                ));
-            }
-            if consumes_float8
-                && !matches!(node.kind(), UOpKind::Index | UOpKind::Load | UOpKind::Store)
-            {
+            let float8_alu = node_float8 || consumes_float8;
+            if float8_alu {
                 if !matches!(node.kind(), UOpKind::GraphCompare(_)) {
                     return Err(JitError::Unsupported(
                         "native Float8 elementwise supports comparisons only".into(),
@@ -2465,10 +2468,9 @@ fn emit(
     match n.kind() {
         UOpKind::Const => match n.arg() {
             UArg::Int(v) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
-            UArg::Scalar { dtype, bits } if *dtype == ty && dtype.is_float8() => Ok(
-                float8_decode_expr(*dtype, &format!("((uint8_t)0x{:02x}u)", *bits as u8))
-                    .expect("guarded Float8 dtype"),
-            ),
+            UArg::Scalar { dtype, bits } if *dtype == ty && dtype.is_float8() => {
+                Ok(format!("((uint8_t)0x{:02x}u)", *bits as u8))
+            }
             UArg::Scalar { dtype, bits } if *dtype == ty => Ok(literal_expr(*dtype, *bits)),
             UArg::Scalar { .. } => {
                 Err(JitError::Unsupported("scalar literal/type mismatch".into()))
@@ -2500,8 +2502,8 @@ fn emit(
                 _ => return Err(JitError::Unsupported("load index".into())),
             };
             let raw = format!("((uint8_t*)buffers[{}])[{}]", ids[&buffer], off);
-            if let Some(decoded) = float8_decode_expr(ty, &raw) {
-                Ok(decoded)
+            if ty.is_float8() {
+                Ok(raw)
             } else if matches!(ty, DType::F16 | DType::BF16) {
                 let load = if ty == DType::F16 {
                     "rg_f16_to_f32"
@@ -2769,12 +2771,12 @@ fn emit(
             }
         }
         UOpKind::GraphCompare(op) => {
-            let (a, b) = (s(0)?, s(1)?);
-            let float8 = n
-                .sources()
-                .iter()
-                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
-            if float8 {
+            let (mut a, mut b) = (s(0)?, s(1)?);
+            let source_dtype = n.sources().first().and_then(|source| source.ty());
+            if source_dtype.is_some_and(|ty| ty.scalar.is_float8()) {
+                let dtype = source_dtype.expect("guarded Float8 source").scalar;
+                a = float8_decode_expr(dtype, &a).expect("guarded Float8 dtype");
+                b = float8_decode_expr(dtype, &b).expect("guarded Float8 dtype");
                 return Ok(match op {
                     crate::CompareOp::Eq => format!("(({a}) == ({b}))"),
                     crate::CompareOp::Ne => format!("(({a}) != ({b}))"),
