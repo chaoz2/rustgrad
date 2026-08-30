@@ -940,7 +940,6 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
         if item.id != index as u64
             || item.node.index() as u64 != item.output.id
             || item.outputs.primary() != &item.output
-            || !output_ids.insert(item.primary_output().id)
         {
             return Err(ArtifactError::Format("item identity"));
         }

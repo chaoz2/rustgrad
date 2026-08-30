@@ -344,9 +344,9 @@ impl Graph {
         let ln2 = self.constant(plan.ln2);
         let logged = self.mul(log2, ln2)?;
         let maximum = if keepdim || plan.axes.is_empty() {
-            maximum
+            detached_maximum
         } else {
-            self.reshape(maximum, plan.output_shape.clone())?
+            self.reshape(detached_maximum, plan.output_shape.clone())?
         };
         let output = self.add(logged, maximum)?;
         debug_assert_eq!(
