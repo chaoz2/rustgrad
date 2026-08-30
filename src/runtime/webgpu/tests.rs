@@ -1,10 +1,10 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    AddressSpace, Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor,
-    CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc,
-    NodeId, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, UArgRef, UOp, UOpKind,
-    UType, ViewMap, schedule,
+    AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CapturedMixedBatch,
+    CapturedReplayExecutor, CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
+    KernelBindings, KernelBufferDesc, LiteralValue, NodeId, Operation, ReduceKind, Scalar, Shape,
+    Slice, Storage, TensorData, UOp, UType, ViewMap, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawAdapter, RawBuffer, RawCommand,
@@ -815,12 +815,8 @@ impl Dispatch for MockDispatch {
                 if let Some(id) =
                     transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
                         let buffer_id = match arg {
-                            crate::UArgRef::BufferIndex { buffer, .. }
-                            | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
-                            _ => {
-                                return Err(WebGpuError::InvalidBinding(
-                                    "mock transaction load index".into(),
-                                ));
+                            IndexValue::Buffer { buffer, .. } | IndexValue::View { buffer, .. } => {
+                                *buffer
                             }
                         };
                         let (abi, bytes) = stored
@@ -1099,7 +1095,7 @@ fn captured_random_plans_render_and_mock_execute_without_stream_state() {
     for output in [uniform, normal, signed, unsigned] {
         let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
         let rendered = renderer.render(&root).unwrap();
-        let UArgRef::Random(plan) = root.arg() else {
+        let Operation::Random(plan) = root.operation() else {
             panic!("missing random plan")
         };
         let expected = plan.execute().unwrap().to_le_bytes().unwrap();
@@ -1194,15 +1190,15 @@ fn execute_webgpu_semantics(program: &UOp, bindings: &KernelBindings) -> crate::
     let store = program
         .sources()
         .iter()
-        .find(|node| matches!(node.kind(), UOpKind::Store))
+        .find(|node| matches!(node.operation(), Operation::Store))
         .ok_or(crate::Error::InvalidIndex)?;
     let index = store.sources().first().ok_or(crate::Error::InvalidIndex)?;
-    let UArgRef::BufferIndex { output_shape, .. } = index.arg() else {
+    let Operation::Index(IndexValue::Buffer { output_shape, .. }) = index.operation() else {
         return Err(crate::Error::InvalidIndex);
     };
     let dtype = index.ty().ok_or(crate::Error::InvalidIndex)?.scalar;
     if dtype == DType::BF16
-        && store.sources()[1].kind() == UOpKind::Cast
+        && store.sources()[1].operation() == &Operation::Cast
         && store.sources()[1]
             .sources()
             .first()
@@ -1235,36 +1231,33 @@ fn eval_webgpu_narrow(
             output_shape,
         )
     };
-    match node.kind() {
-        UOpKind::Const => match node.arg() {
-            UArgRef::Scalar { dtype, bits } => quantize_webgpu_scalar(
-                *dtype,
-                match dtype {
-                    DType::Bool => Scalar::Bool(*bits != 0),
-                    DType::I32 => Scalar::I(*bits as i32 as i64),
-                    DType::U32 => Scalar::U(*bits as u32 as u64),
-                    DType::F16 => Scalar::F(crate::tensor::f16_to_f32(*bits as u16) as f64),
-                    DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
-                    DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
-                    _ => return Err(crate::Error::InvalidIndex),
-                },
-            ),
-            _ => Err(crate::Error::InvalidIndex),
-        },
-        UOpKind::Load => {
+    match node.operation() {
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => quantize_webgpu_scalar(
+            *dtype,
+            match dtype {
+                DType::Bool => Scalar::Bool(*bits != 0),
+                DType::I32 => Scalar::I(*bits as i32 as i64),
+                DType::U32 => Scalar::U(*bits as u32 as u64),
+                DType::F16 => Scalar::F(crate::tensor::f16_to_f32(*bits as u16) as f64),
+                DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
+                DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
+                _ => return Err(crate::Error::InvalidIndex),
+            },
+        ),
+        Operation::Load => {
             let index = node.sources().first().ok_or(crate::Error::InvalidIndex)?;
-            let (buffer, input_shape, view) = match index.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     ..
-                } => (*buffer, input_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, input_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     view,
                     ..
-                } => (*buffer, input_shape, Some(view)),
+                }) => (*buffer, input_shape, Some(view)),
                 _ => return Err(crate::Error::InvalidIndex),
             };
             let logical = semantic_broadcast_offset(input_shape, output_shape, linear)?;
@@ -1283,13 +1276,13 @@ fn eval_webgpu_narrow(
                 .storage()
                 .scalar(offset))
         }
-        UOpKind::Cast => quantize_webgpu_scalar(dtype, child(0)?),
-        UOpKind::GraphBinary(op) => {
+        Operation::Cast => quantize_webgpu_scalar(dtype, child(0)?),
+        Operation::GraphBinary(op) => {
             let lhs = child(0)?;
             let rhs = child(1)?;
-            quantize_webgpu_scalar(dtype, webgpu_binary(lhs, rhs, dtype, op)?)
+            quantize_webgpu_scalar(dtype, webgpu_binary(lhs, rhs, dtype, *op)?)
         }
-        UOpKind::Binary(op) => {
+        Operation::Binary(op) => {
             use crate::uop::Binary::{Add, Eq, Le, Lt, Mul, Sub};
             let lhs = child(0)?;
             let rhs = child(1)?;
@@ -1312,7 +1305,7 @@ fn eval_webgpu_narrow(
                 _ => Err(crate::Error::InvalidIndex),
             }
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let lhs = child(0)?.as_f64();
             let rhs = child(1)?.as_f64();
             Ok(Scalar::Bool(match op {
@@ -1324,7 +1317,7 @@ fn eval_webgpu_narrow(
                 crate::CompareOp::Ge => lhs >= rhs,
             }))
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             let lhs = child(0)?.as_bool();
             Ok(Scalar::Bool(match op {
                 crate::LogicalOp::Not => !lhs,
@@ -1332,7 +1325,7 @@ fn eval_webgpu_narrow(
                 crate::LogicalOp::Or => lhs || child(1)?.as_bool(),
             }))
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             let selected = if child(0)?.as_bool() {
                 child(1)?
             } else {
@@ -1976,47 +1969,39 @@ fn narrow_scalar_literals_preserve_raw_bits_at_the_storage_boundary() {
     ] {
         let ty = UType::scalar(dtype);
         let shape = Shape::new([]);
-        let range = UOp::try_new(
-            UOpKind::Range,
+        let range = UOp::from_operation(
+            Operation::Range(0),
             Some(UType::scalar(DType::I64)),
             vec![UOp::constant(1, UType::scalar(DType::I64))],
-            UArg::RangeAxis(0),
-        )
-        .unwrap();
-        let address = UOp::try_new(
-            UOpKind::DefineGlobal,
-            Some(ty),
-            vec![],
-            UArg::Address {
+        );
+        let address = UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
                 space: AddressSpace::Global,
                 name: "literal".into(),
                 element: ty,
-            },
-        )
-        .unwrap();
-        let index = UOp::try_new(
-            UOpKind::Index,
+            }),
             Some(ty),
-            vec![address, range.clone()],
-            UArg::BufferIndex {
+            vec![],
+        );
+        let index = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 77,
                 elements: 1,
                 input_shape: shape.clone(),
                 output_shape: shape,
-            },
-        )
-        .unwrap();
+            }),
+            Some(ty),
+            vec![address, range.clone()],
+        );
         let rendered = WgslRenderer::new(1, capabilities())
             .unwrap()
             .render(&UOp::sink(vec![
-                UOp::try_new(
-                    UOpKind::Store,
+                UOp::from_operation(
+                    Operation::Store,
                     None,
                     vec![index, UOp::scalar_constant(dtype, bits, ty)],
-                    UArg::None,
-                )
-                .unwrap(),
-                UOp::try_new(UOpKind::EndRange, None, vec![range], UArg::None).unwrap(),
+                ),
+                UOp::from_operation(Operation::EndRange, None, vec![range]),
             ]))
             .unwrap();
         assert!(rendered.source.contains(marker), "{dtype:?}");

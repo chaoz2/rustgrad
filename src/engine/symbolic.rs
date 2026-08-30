@@ -6,10 +6,19 @@
 use super::capture::{CapturedSchedule, ReplayError};
 use super::symbolic_view::SymbolicViewMap;
 use crate::{
-    BufferDesc, DType, Graph, IndexValue, MatmulValue, NodeId, Op, Operation, ReductionValue,
-    Schedule, Shape, SymbolicDim, SymbolicExpr, SymbolicShape, SymbolicVar, UArgRef, UOp, UOpKind,
+    BufferDesc, DType, Graph, IndexValue, MatmulKernelPlan, MatmulValue, NodeId, Op, Operation,
+    ReductionValue, Schedule, Shape, SymbolicDim, SymbolicExpr, SymbolicShape, SymbolicVar, UOp,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+fn operation_matmul_plan(operation: &Operation) -> Option<&MatmulKernelPlan> {
+    match operation {
+        Operation::Matmul(MatmulValue::Serial(plan)) => Some(plan),
+        Operation::Matmul(MatmulValue::Tiled(payload)) => Some(&payload.matmul),
+        Operation::Matmul(MatmulValue::TensorCore(payload)) => Some(&payload.matmul),
+        _ => None,
+    }
+}
 
 /// One portable scalar parameter. Shape parameters are signed 64-bit values;
 /// their inclusive domain is owned by the stable [`SymbolicVar`] identity.
@@ -513,7 +522,7 @@ pub(crate) fn build_schema(
             .topological()
             .map_err(|error| ReplayError::Symbolic(error.to_string()))?
         {
-            let UArgRef::ViewBufferIndex { buffer, view, .. } = node.arg() else {
+            let Operation::Index(IndexValue::View { buffer, view, .. }) = node.operation() else {
                 continue;
             };
             let mut matches = Vec::new();
@@ -731,7 +740,7 @@ impl SymbolicSchema {
                 .topological()
                 .map_err(|error| ReplayError::Symbolic(error.to_string()))?
             {
-                if let UArgRef::ViewBufferIndex { buffer, .. } = node.arg() {
+                if let Operation::Index(IndexValue::View { buffer, .. }) = node.operation() {
                     expected_views.insert((item.id, *buffer));
                 }
             }
@@ -850,11 +859,11 @@ impl SymbolicSchema {
                         .iter()
                         .any(|node| {
                             matches!(
-                                node.arg(),
-                                UArgRef::Reduction { .. }
-                                    | UArgRef::Matmul(_)
-                                    | UArgRef::TiledMatmul(_)
-                                    | UArgRef::TensorCoreMatmul(_)
+                                node.operation(),
+                                Operation::ReduceInit(_)
+                                    | Operation::Matmul(MatmulValue::Serial(_))
+                                    | Operation::Matmul(MatmulValue::Tiled(_))
+                                    | Operation::Matmul(MatmulValue::TensorCore(_))
                             )
                         })
                 {
@@ -885,8 +894,10 @@ impl SymbolicSchema {
                     .topological()
                     .map_err(|error| ReplayError::Symbolic(error.to_string()))?
                     .into_iter()
-                    .filter_map(|node| match node.arg() {
-                        UArgRef::Reduction { axes, keepdim, .. } => Some((axes.to_vec(), *keepdim)),
+                    .filter_map(|node| match node.operation() {
+                        Operation::ReduceInit(ReductionValue { axes, keepdim, .. }) => {
+                            Some((axes.clone(), *keepdim))
+                        }
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -927,7 +938,7 @@ impl SymbolicSchema {
                 n,
                 k,
             } => {
-                let Some(plan) = item.kernel.arg().matmul_plan() else {
+                let Some(plan) = operation_matmul_plan(item.kernel.operation()) else {
                     return Err(ReplayError::Symbolic(
                         "symbolic matmul payload is absent".into(),
                     ));
@@ -1450,9 +1461,10 @@ pub(crate) fn specialize_kernel(
         .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
     let mut range_extents = BTreeMap::new();
     for node in &nodes {
-        let (buffer, range) = match (node.arg(), node.sources().get(1)) {
+        let (buffer, range) = match (node.operation(), node.sources().get(1)) {
             (
-                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. },
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                | Operation::Index(IndexValue::View { buffer, .. }),
                 Some(range),
             ) => (*buffer, range),
             _ => continue,
@@ -1564,9 +1576,7 @@ pub(crate) fn specialize_kernel(
                 })?;
                 let lhs_shape = schema.bind_shape(*lhs, environment)?;
                 let rhs_shape = schema.bind_shape(*rhs, environment)?;
-                let specialized = node
-                    .arg()
-                    .matmul_plan()
+                let specialized = operation_matmul_plan(node.operation())
                     .ok_or_else(|| ReplayError::Corrupt("matmul plan is absent".into()))?
                     .specialize_shapes(lhs_shape, rhs_shape)
                     .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
@@ -1640,7 +1650,7 @@ pub(crate) fn specialize_kernel(
     root.validate()
         .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
     if let Some((_, _, _, _, _, _)) = &domain.matmul
-        && root.arg().matmul_plan().is_none()
+        && operation_matmul_plan(root.operation()).is_none()
     {
         return Err(ReplayError::Corrupt(
             "symbolic matmul item has the wrong UOp payload".into(),
@@ -1650,12 +1660,14 @@ pub(crate) fn specialize_kernel(
         .topological()
         .map_err(|error| ReplayError::Corrupt(error.to_string()))?
         .into_iter()
-        .filter_map(|node| match node.arg() {
-            UArgRef::BufferIndex { buffer, .. } if *buffer == output_buffer => Some(()),
+        .filter_map(|node| match node.operation() {
+            Operation::Index(IndexValue::Buffer { buffer, .. }) if *buffer == output_buffer => {
+                Some(())
+            }
             _ => None,
         })
         .count();
-    if !matches!(root.kind(), UOpKind::Matmul) && output != 1 {
+    if !matches!(root.operation(), Operation::Matmul(_)) && output != 1 {
         return Err(ReplayError::Corrupt(
             "symbolic kernel output ABI is ambiguous".into(),
         ));
@@ -1670,7 +1682,7 @@ pub(crate) fn specialize_capture(
     if capture
         .items
         .iter()
-        .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+        .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard(_)))
     {
         return Err(ReplayError::Unsupported(
             "tensor guard symbolic specialization is unsupported".into(),

@@ -1,6 +1,6 @@
 //! Immutable static schedule and logical-memory inspection.
 use super::{BufferDesc, Schedule, ScheduleError, schedule_many};
-use crate::{Graph, MemoryPlan, MemoryPlanError, NodeId, UOpKind};
+use crate::{Graph, MemoryPlan, MemoryPlanError, NodeId, Operation};
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
     fmt,
@@ -15,7 +15,7 @@ pub struct ExecutionPlanItemSummary {
     /// compatibility projection for one-output callers.
     pub outputs: Vec<BufferDesc>,
     pub output: BufferDesc,
-    pub operation: UOpKind,
+    pub operation: Operation,
     pub dependencies: Vec<u64>,
 }
 
@@ -96,7 +96,7 @@ impl ExecutionPlanSummary {
                 item_id: item.id,
                 outputs: item.outputs.iter().cloned().collect(),
                 output: item.primary_output().clone(),
-                operation: item.kernel.kind(),
+                operation: item.kernel.operation().clone(),
                 dependencies: item.dependencies.clone(),
             })
             .collect::<Vec<_>>();

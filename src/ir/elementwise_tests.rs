@@ -12188,7 +12188,9 @@ fn tinygrad_bitcast_preserves_raw_storage_and_rescales_only_the_final_axis() {
     );
     let scheduled = crate::schedule(&widening, words).unwrap();
     assert_eq!(scheduled.items.len(), 1);
-    let crate::UArgRef::Movement(plan) = scheduled.items[0].kernel.arg() else {
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+        scheduled.items[0].kernel.operation()
+    else {
         panic!("bitcast must schedule as a materializing movement kernel")
     };
     assert!(matches!(
@@ -12366,7 +12368,9 @@ fn tinygrad_contiguous_materializes_exact_values_and_preserves_buffer_identities
     assert_eq!(scheduled.items.len(), 2);
     assert_eq!(scheduled.items[1].dependencies, [scheduled.items[0].id]);
     assert_eq!(scheduled.items[0].consumers, [scheduled.items[1].id]);
-    let crate::UArgRef::Movement(plan) = scheduled.items.last().unwrap().kernel.arg() else {
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+        scheduled.items.last().unwrap().kernel.operation()
+    else {
         panic!("contiguous must schedule as a movement copy")
     };
     assert!(matches!(

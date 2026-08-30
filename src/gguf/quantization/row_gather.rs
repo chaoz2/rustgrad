@@ -387,7 +387,9 @@ mod tests {
             assert_eq!(decoded.to_bytes().unwrap(), bytes);
             assert!(decoded.constants.is_empty());
             assert_eq!(decoded.quantized_constants[&11], weight);
-            let crate::UArgRef::QuantizedRowGather(plan) = decoded.items[0].kernel.arg() else {
+            let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+                decoded.items[0].kernel.operation()
+            else {
                 panic!("quantized row gather payload")
             };
             assert_eq!(plan.indices_shape, Shape::from([2, 3]));

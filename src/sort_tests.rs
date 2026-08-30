@@ -117,8 +117,8 @@ fn sort_schedule_coalesces_one_typed_producer_and_cpu_materializes_both() {
         indices.index() as u64
     );
     assert!(matches!(
-        schedule.items[0].kernel.kind(),
-        crate::UOpKind::Sort
+        schedule.items[0].kernel.operation(),
+        crate::Operation::Sort(_)
     ));
 
     let realized = crate::realize_graph(
@@ -178,23 +178,19 @@ fn sort_artifact_trace_rejection_and_invalid_axis_are_explicit() {
     let bytes = crate::uop::artifact::encode(&uop).unwrap();
     assert_eq!(crate::uop::artifact::decode(&bytes).unwrap(), uop);
     assert!(
-        crate::uop::artifact::encode(
-            &crate::UOp::try_new(
-                crate::UOpKind::Sort,
-                Some(crate::UType::scalar(DType::F32)),
-                vec![],
-                crate::UArg::Sort {
-                    input: x,
-                    input_shape: Shape::new([2, 2]),
-                    axis: 2,
-                    descending: false,
-                    values,
-                    indices,
-                    dtype: DType::F32,
-                },
-            )
-            .unwrap()
-        )
+        crate::uop::artifact::encode(&crate::UOp::from_operation(
+            crate::Operation::Sort(crate::SortValue {
+                input: x,
+                input_shape: Shape::new([2, 2]),
+                axis: 2,
+                descending: false,
+                values,
+                indices,
+                dtype: DType::F32,
+            }),
+            Some(crate::UType::scalar(DType::F32)),
+            vec![],
+        ))
         .is_err()
     );
     let loss = graph.sum_all(values).unwrap();

@@ -1008,7 +1008,9 @@ fn validate_inputs(
         }
     }
     for item in &capture.items {
-        let Some(plan) = item.kernel.arg().quantized_row_gather_plan() else {
+        let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+            item.kernel.operation()
+        else {
             continue;
         };
         let input = capture
@@ -1052,7 +1054,9 @@ fn interpret_item(
     item: &ScheduleItem,
     values: &ReplayValues,
 ) -> Result<TensorData, ReplayError> {
-    if let Some(plan) = item.kernel.arg().quantized_row_gather_plan() {
+    if let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+        item.kernel.operation()
+    {
         let indices = values.tensor(plan.indices.index() as u64, "quantized gather indices")?;
         let weight = capture
             .quantized_constants
@@ -1062,7 +1066,7 @@ fn interpret_item(
             .execute(indices, weight)
             .map_err(|error| ReplayError::Execute(error.to_string()));
     }
-    if let Some(plan) = item.kernel.arg().quantized_matmul_plan() {
+    if let crate::Operation::Matmul(crate::MatmulValue::Quantized(plan)) = item.kernel.operation() {
         let activation = values.tensor(
             plan.activation.index() as u64,
             "quantized matmul activation",
@@ -1075,7 +1079,7 @@ fn interpret_item(
             .execute(activation, weight)
             .map_err(|error| ReplayError::Execute(error.to_string()));
     }
-    if let crate::UArgRef::Movement(plan) = item.kernel.arg() {
+    if let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = item.kernel.operation() {
         let operands = plan
             .input_operands()
             .into_iter()
@@ -1123,7 +1127,7 @@ fn backend_error(error: JitBackendError) -> ReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, Storage, UArg};
+    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, Storage};
     use std::collections::HashMap;
 
     fn captured(graph: &Graph, requested: &[crate::NodeId]) -> CapturedSchedule {
@@ -2452,8 +2456,8 @@ mod tests {
                 case.name
             );
             assert!(matches!(
-                schedule.items[0].kernel.kind(),
-                crate::UOpKind::Matmul
+                schedule.items[0].kernel.operation(),
+                crate::Operation::Matmul(_)
             ));
             assert_eq!(
                 schedule.items[0]
@@ -2670,18 +2674,18 @@ mod tests {
         assert_eq!(executor.compile_cache_len(false), 0);
 
         let mut malformed_plan = capture;
-        let Some(plan) = malformed_plan.items[0].kernel.arg().matmul_plan() else {
+        let crate::Operation::Matmul(crate::MatmulValue::Serial(plan)) =
+            malformed_plan.items[0].kernel.operation()
+        else {
             panic!("matmul payload missing");
         };
         let mut plan = plan.clone();
         plan.output_shape = Shape::from([4]);
-        malformed_plan.items[0].kernel = crate::UOp::try_new(
-            crate::UOpKind::Matmul,
+        malformed_plan.items[0].kernel = crate::UOp::from_operation(
+            crate::Operation::Matmul(crate::MatmulValue::Serial(plan)),
             Some(crate::UType::scalar(DType::F16)),
             vec![],
-            UArg::Matmul(Box::new(plan)),
-        )
-        .unwrap();
+        );
         assert!(matches!(
             executor.replay(
                 &malformed_plan,

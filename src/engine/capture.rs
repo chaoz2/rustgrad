@@ -66,7 +66,7 @@ impl CapturedSchedule {
         if schedule
             .items
             .iter()
-            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard(_)))
         {
             return Err(ReplayError::Unsupported(
                 "tensor guard capture is unsupported".into(),
@@ -454,7 +454,7 @@ impl CapturedSchedule {
         if self
             .items
             .iter()
-            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::Sort))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::Sort(_)))
         {
             return Err(ReplayError::Unsupported(
                 "static sort capture serialization is unsupported".into(),

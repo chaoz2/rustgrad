@@ -5,7 +5,7 @@ use super::{
     transaction::OpenClTransactionAbi,
     view::OpenClViewAccess,
 };
-use crate::{DType, UArgRef, UOp, UOpKind};
+use crate::{DType, IndexValue, LiteralValue, Operation, UOp};
 use std::collections::BTreeMap;
 
 pub(super) fn emit_transactional(
@@ -70,33 +70,33 @@ impl Emitter<'_> {
             .ok_or_else(|| OpenClError::Unsupported("untyped transactional expression".into()))?
             .scalar;
         let name = self.value_name();
-        match node.kind() {
-            UOpKind::Const => {
+        match node.operation() {
+            Operation::Const(_) => {
                 let value = scalar_literal(node, dtype)?;
                 self.lines.push(format!(
                     "{indent}const {} {name} = {value};",
                     expression_type(dtype)
                 ));
             }
-            UOpKind::Load => {
+            Operation::Load => {
                 let value = self.load(node, dtype, self.linear)?;
                 self.lines.push(format!(
                     "{indent}const {} {name} = {value};",
                     expression_type(dtype)
                 ));
             }
-            UOpKind::Cast => {
+            Operation::Cast => {
                 let source = self.node(&node.sources()[0], indent)?;
                 let source_dtype = node.sources()[0].ty().unwrap().scalar;
                 let value = cast_expression(source_dtype, dtype, &source)?;
                 self.assign_if_ok(indent, dtype, &name, &value);
             }
-            UOpKind::GraphUnary(op) => {
+            Operation::GraphUnary(op) => {
                 let source = self.node(&node.sources()[0], indent)?;
-                let value = unary_expression(op, dtype, &source)?;
+                let value = unary_expression(*op, dtype, &source)?;
                 self.assign_if_ok(indent, dtype, &name, &value);
             }
-            UOpKind::GraphBinary(op) => {
+            Operation::GraphBinary(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 let rhs = self.node(&node.sources()[1], indent)?;
                 self.lines.push(format!(
@@ -105,7 +105,7 @@ impl Emitter<'_> {
                     expression_type(dtype)
                 ));
                 if let Some(id) = self.guard_ids.get(node).copied() {
-                    let operation = super::GuardedIntegerOp::from_binary(op).ok_or_else(|| {
+                    let operation = super::GuardedIntegerOp::from_binary(*op).ok_or_else(|| {
                         OpenClError::InvalidBinding("guard opcode mismatch".into())
                     })?;
                     let invalid = invalid_expression(operation, dtype, &rhs);
@@ -123,12 +123,12 @@ impl Emitter<'_> {
                     self.lines.push(format!("{indent}  }}"));
                     self.lines.push(format!("{indent}}}"));
                 } else {
-                    let value = emit_binary(op, dtype, &lhs, &rhs)?;
+                    let value = emit_binary(*op, dtype, &lhs, &rhs)?;
                     self.lines
                         .push(format!("{indent}if (rg_ok) {name} = {value};"));
                 }
             }
-            UOpKind::GraphCompare(op) => {
+            Operation::GraphCompare(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 let rhs = self.node(&node.sources()[1], indent)?;
                 let operator = match op {
@@ -146,7 +146,7 @@ impl Emitter<'_> {
                     &format!("((uchar)(({lhs}) {operator} ({rhs})))"),
                 );
             }
-            UOpKind::GraphLogical(op) => {
+            Operation::GraphLogical(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 self.lines
                     .push(format!("{indent}uchar {name} = (uchar)0u;"));
@@ -172,7 +172,7 @@ impl Emitter<'_> {
                     }
                 }
             }
-            UOpKind::Ternary(crate::uop::Ternary::Where) => {
+            Operation::Ternary(crate::uop::Ternary::Where) => {
                 let condition = self.node(&node.sources()[0], indent)?;
                 self.lines.push(format!(
                     "{indent}{} {name} = ({})0;",
@@ -220,20 +220,20 @@ impl Emitter<'_> {
             .sources()
             .first()
             .ok_or_else(|| OpenClError::Unsupported("load has no index".into()))?;
-        let (buffer, input_shape, output_shape, view) = match index.arg() {
-            UArgRef::BufferIndex {
+        let (buffer, input_shape, output_shape, view) = match index.operation() {
+            Operation::Index(IndexValue::Buffer {
                 buffer,
                 input_shape,
                 output_shape,
                 ..
-            } => (*buffer, input_shape, output_shape, None),
-            UArgRef::ViewBufferIndex {
+            }) => (*buffer, input_shape, output_shape, None),
+            Operation::Index(IndexValue::View {
                 buffer,
                 input_shape,
                 output_shape,
                 view,
                 ..
-            } => (*buffer, input_shape, output_shape, Some(view)),
+            }) => (*buffer, input_shape, output_shape, Some(view)),
             _ => {
                 return Err(OpenClError::Unsupported(
                     "load requires checked static indexing".into(),
@@ -263,35 +263,35 @@ fn expression_type(dtype: DType) -> &'static str {
 }
 
 fn scalar_literal(node: &UOp, dtype: DType) -> Result<String, OpenClError> {
-    match node.arg() {
-        UArgRef::Scalar {
+    match node.operation() {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::Bool && dtype == DType::Bool && *bits <= 1 => {
+        }) if *actual == DType::Bool && dtype == DType::Bool && *bits <= 1 => {
             Ok(format!("((uchar){bits}u)"))
         }
-        UArgRef::Scalar {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::I32 && dtype == DType::I32 => {
+        }) if *actual == DType::I32 && dtype == DType::I32 => {
             Ok(format!("as_int((uint)0x{:08x}u)", *bits as u32))
         }
-        UArgRef::Scalar {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::U32 && dtype == DType::U32 => {
+        }) if *actual == DType::U32 && dtype == DType::U32 => {
             Ok(format!("((uint)0x{:08x}u)", *bits as u32))
         }
-        UArgRef::Scalar {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::I64 && dtype == DType::I64 => {
+        }) if *actual == DType::I64 && dtype == DType::I64 => {
             Ok(format!("as_long((ulong)0x{bits:016x}ul)"))
         }
-        UArgRef::Scalar {
+        Operation::Const(LiteralValue::Scalar {
             dtype: actual,
             bits,
-        } if *actual == DType::U64 && dtype == DType::U64 => {
+        }) if *actual == DType::U64 && dtype == DType::U64 => {
             Ok(format!("((ulong)0x{bits:016x}ul)"))
         }
         _ => Err(OpenClError::Unsupported(

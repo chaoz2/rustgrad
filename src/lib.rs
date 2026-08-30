@@ -273,7 +273,7 @@ pub use training_checkpoint::{PortableTrainingCheckpoint, TrainingCheckpoint};
 pub use uop::{
     AddressSpace, AddressValue, AffineView, Binary as UBinary, IndexValue, LiteralValue,
     MatmulValue, MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue,
-    TensorGuardValue, UArg, UArgRef, UOp, UOpError, UOpKind, UPat, UType, VariableValue, ViewMap,
+    TensorGuardValue, UOp, UOpError, UPat, UType, VariableValue, ViewMap,
 };
 pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
 pub use viz::{

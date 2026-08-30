@@ -7,7 +7,9 @@ use super::{
     transaction::{GuardedIntegerOp, OpenClGuardDomain, OpenClTransactionAbi},
     view::OpenClViewAccess,
 };
-use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArgRef, UOp, UOpKind};
+use crate::{
+    AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -113,15 +115,12 @@ impl OpenClRenderer {
     }
 
     pub fn render(&self, root: &UOp) -> Result<RenderedOpenCl, OpenClError> {
-        if matches!(root.kind(), UOpKind::Random) {
-            let UArgRef::Random(plan) = root.arg() else {
-                return Err(OpenClError::Unsupported("random payload is absent".into()));
-            };
+        if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
         if matches!(
-            root.kind(),
-            UOpKind::PrefixScan | UOpKind::Sort | UOpKind::TensorGuard
+            root.operation(),
+            Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
         ) {
             return Err(OpenClError::Unsupported(
                 "prefix scans and sort pairs are CPU-oracle only".into(),
@@ -136,10 +135,12 @@ impl OpenClRenderer {
         let uses_bf16 = nodes
             .iter()
             .any(|node| node.ty().is_some_and(|ty| ty.scalar == DType::BF16));
-        if nodes
-            .iter()
-            .any(|node| matches!(node.kind(), UOpKind::Barrier | UOpKind::If | UOpKind::EndIf))
-        {
+        if nodes.iter().any(|node| {
+            matches!(
+                node.operation(),
+                Operation::Barrier | Operation::If | Operation::EndIf
+            )
+        }) {
             return Err(OpenClError::Unsupported(
                 "effects and barriers are outside the OpenCL static subset".into(),
             ));
@@ -147,18 +148,18 @@ impl OpenClRenderer {
         let store = root
             .sources()
             .iter()
-            .find(|node| matches!(node.kind(), UOpKind::Store))
+            .find(|node| matches!(node.operation(), Operation::Store))
             .ok_or_else(|| OpenClError::Unsupported("sink has no store".into()))?;
         let output_index = store
             .sources()
             .first()
             .ok_or_else(|| OpenClError::Unsupported("store has no index".into()))?;
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             buffer: output_id,
             elements: extent,
             input_shape: output_shape,
             output_shape: store_shape,
-        } = output_index.arg()
+        }) = output_index.operation()
         else {
             return Err(OpenClError::Unsupported(
                 "output requires a contiguous BufferIndex".into(),
@@ -177,14 +178,14 @@ impl OpenClRenderer {
 
         let mut inventory = BTreeMap::<u64, OpenClBufferAbi>::new();
         for node in &nodes {
-            let (buffer, source_shape, elements, view) = match node.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, source_shape, elements, view) = match node.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements,
                     input_shape,
                     ..
-                } => (*buffer, input_shape.clone(), *elements, None),
-                UArgRef::ViewBufferIndex { buffer, view, .. } => {
+                }) => (*buffer, input_shape.clone(), *elements, None),
+                Operation::Index(IndexValue::View { buffer, view, .. }) => {
                     let access = OpenClViewAccess::new(
                         view,
                         node.ty()
@@ -225,23 +226,22 @@ impl OpenClRenderer {
             .sources()
             .get(1)
             .ok_or_else(|| OpenClError::Unsupported("store has no value".into()))?;
-        let reduction = matches!(store_value.kind(), UOpKind::ReduceFinalize)
+        let reduction = matches!(store_value.operation(), Operation::ReduceFinalize)
             .then(|| OpenClReduction::from_finalize(store_value))
             .transpose()?;
         let mut schedule_inputs = Vec::new();
         let mut seen = BTreeSet::new();
         for node in &nodes {
-            if !matches!(node.kind(), UOpKind::Load) {
+            if !matches!(node.operation(), Operation::Load) {
                 continue;
             }
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| OpenClError::InvalidBinding("load lacks index".into()))?;
-            let buffer = match index.arg() {
-                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
-                    *buffer
-                }
+            let buffer = match index.operation() {
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                | Operation::Index(IndexValue::View { buffer, .. }) => *buffer,
                 _ => {
                     return Err(OpenClError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -548,7 +548,7 @@ fn emit_expr(
     source_map.insert(map_id, lines.len() + 1);
     let dtype = node
         .ty()
-        .ok_or_else(|| OpenClError::Unsupported(format!("untyped {:?}", node.kind())))?
+        .ok_or_else(|| OpenClError::Unsupported(format!("untyped {:?}", node.operation())))?
         .scalar;
     supported_storage(dtype, capabilities)?;
     let child = |index: usize, source_map: &mut BTreeMap<usize, usize>, lines: &mut Vec<String>| {
@@ -557,76 +557,76 @@ fn emit_expr(
             .ok_or_else(|| OpenClError::Unsupported("missing expression operand".into()))
             .and_then(|source| emit_expr(source, ids, source_map, lines, linear, capabilities))
     };
-    match node.kind() {
-        UOpKind::Const => match node.arg() {
-            UArgRef::Scalar {
-                dtype: &DType::F32,
+    match node.operation() {
+        Operation::Const(value) => match value {
+            LiteralValue::Scalar {
+                dtype: DType::F32,
                 bits,
             } => Ok(format!("as_float((uint)0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
-                dtype: &DType::Bool,
+            LiteralValue::Scalar {
+                dtype: DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("((uchar){bits}u)")),
-            UArgRef::Scalar {
-                dtype: &DType::I32,
+            LiteralValue::Scalar {
+                dtype: DType::I32,
                 bits,
             } => Ok(format!("as_int((uint)0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
-                dtype: &DType::U32,
+            LiteralValue::Scalar {
+                dtype: DType::U32,
                 bits,
             } => Ok(format!("((uint)0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
-                dtype: &DType::I64,
+            LiteralValue::Scalar {
+                dtype: DType::I64,
                 bits,
             } => Ok(format!("as_long((ulong)0x{bits:016x}ul)")),
-            UArgRef::Scalar {
-                dtype: &DType::U64,
+            LiteralValue::Scalar {
+                dtype: DType::U64,
                 bits,
             } => Ok(format!("((ulong)0x{bits:016x}ul)")),
-            UArgRef::Scalar {
-                dtype: &DType::F64,
+            LiteralValue::Scalar {
+                dtype: DType::F64,
                 bits,
             } => Ok(format!("as_double((ulong)0x{bits:016x}ul)")),
-            UArgRef::Scalar {
-                dtype: &DType::F16,
+            LiteralValue::Scalar {
+                dtype: DType::F16,
                 bits,
             } if dtype == DType::F16 => Ok(narrow::decode(
                 DType::F16,
                 format!("((ushort)0x{:04x}u)", *bits as u16),
             )
             .expect("F16 is a narrow float")),
-            UArgRef::Scalar {
-                dtype: &DType::BF16,
+            LiteralValue::Scalar {
+                dtype: DType::BF16,
                 bits,
             } if dtype == DType::BF16 => Ok(narrow::decode(
                 DType::BF16,
                 format!("((ushort)0x{:04x}u)", *bits as u16),
             )
             .expect("BF16 is a narrow float")),
-            UArgRef::Scalar { .. } => Err(OpenClError::Unsupported(
+            LiteralValue::Scalar { .. } => Err(OpenClError::Unsupported(
                 "scalar literal/type mismatch".into(),
             )),
             _ => Err(OpenClError::Unsupported("invalid scalar literal".into())),
         },
-        UOpKind::Load => {
+        Operation::Load => {
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| OpenClError::Unsupported("load has no index".into()))?;
-            let (buffer, input_shape, output_shape, view) = match index.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, output_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                } => (*buffer, input_shape, output_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, input_shape, output_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                } => (*buffer, input_shape, output_shape, Some(view)),
+                }) => (*buffer, input_shape, output_shape, Some(view)),
                 _ => {
                     return Err(OpenClError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -644,7 +644,7 @@ fn emit_expr(
             let raw = format!("b{position}[{offset}]");
             Ok(narrow::decode(dtype, &raw).unwrap_or(raw))
         }
-        UOpKind::Cast => {
+        Operation::Cast => {
             let value = child(0, source_map, lines)?;
             match (node.sources()[0].ty().map(|ty| ty.scalar), dtype) {
                 (Some(source), target) if source == target => Ok(value),
@@ -678,7 +678,7 @@ fn emit_expr(
                 )),
             }
         }
-        UOpKind::GraphUnary(op) => {
+        Operation::GraphUnary(op) => {
             let value = child(0, source_map, lines)?;
             match (op, dtype) {
                 (crate::UnaryOp::Neg, DType::F16 | DType::BF16 | DType::F32 | DType::F64) => {
@@ -703,12 +703,12 @@ fn emit_expr(
                 ))),
             }
         }
-        UOpKind::GraphBinary(op) => {
+        Operation::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
-            emit_binary(op, dtype, &lhs, &rhs)
+            emit_binary(*op, dtype, &lhs, &rhs)
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
             let operator = match op {
@@ -721,7 +721,7 @@ fn emit_expr(
             };
             Ok(format!("((uchar)(({lhs}) {operator} ({rhs})))"))
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             let lhs = child(0, source_map, lines)?;
             Ok(match op {
                 crate::LogicalOp::Not => format!("((uchar)!({lhs}))"),
@@ -735,7 +735,7 @@ fn emit_expr(
                 }
             })
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             let condition = child(0, source_map, lines)?;
             let yes = child(1, source_map, lines)?;
             let no = child(2, source_map, lines)?;

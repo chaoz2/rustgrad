@@ -24,7 +24,7 @@ impl PreparedOpenClPrefix {
                 .map_err(|_| OpenClError::InvalidBinding("cyclic schedule kernel".into()))?;
             if nodes
                 .iter()
-                .any(|node| matches!(node.kind(), crate::UOpKind::TensorGuard))
+                .any(|node| matches!(node.operation(), crate::Operation::TensorGuard(_)))
             {
                 return Err(OpenClError::Unsupported(
                     "tensor guard is CPU-interpreter only".into(),

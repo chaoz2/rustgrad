@@ -3,10 +3,9 @@
 use crate::{DType, Shape, SymbolicExpr};
 pub mod artifact;
 mod operation;
-pub(crate) mod spec;
 pub use operation::{
     AddressValue, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation, PrefixScanValue,
-    ReductionValue, SortValue, TensorGuardValue, UArgRef, UOpKind, VariableValue,
+    ReductionValue, SortValue, TensorGuardValue, VariableValue,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -64,90 +63,6 @@ pub enum Binary {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Ternary {
     Where,
-}
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum UArg {
-    None,
-    Int(i64),
-    /// Exact scalar storage representation. `bits` is canonical low-endian
-    /// storage bits, never a lossy numeric conversion.
-    Scalar {
-        dtype: DType,
-        bits: u64,
-    },
-    Name(String),
-    Variable {
-        name: String,
-        bounds: SymbolicExpr,
-    },
-    Address {
-        space: AddressSpace,
-        name: String,
-        element: UType,
-    },
-    RangeAxis(u32),
-    GepLane(u16),
-    /// Typed logical addressing. `input_shape` may be lower rank than the
-    /// output shape; dimensions of one are broadcast and therefore contribute
-    /// no offset.  Addresses are elements, never bytes.
-    BufferIndex {
-        buffer: u64,
-        elements: usize,
-        input_shape: Shape,
-        output_shape: Shape,
-    },
-    /// Immutable row-major mapping from a logical view to its original storage.
-    /// `offset + dot(coordinates, strides)` is an element address, never bytes.
-    ViewBufferIndex {
-        buffer: u64,
-        elements: usize,
-        input_shape: Shape,
-        output_shape: Shape,
-        view: AffineView,
-    },
-    /// Static reduction geometry retained for native renderers.  Coordinates
-    /// are row-major and `axes` is normalized/sorted by graph construction.
-    Reduction {
-        input_shape: Shape,
-        output_shape: Shape,
-        axes: Vec<usize>,
-        keepdim: bool,
-        kind: crate::ReduceKind,
-        mean: bool,
-    },
-    Matmul(Box<crate::MatmulKernelPlan>),
-    Conv2d(Box<crate::StaticConv2dPlan>),
-    TiledMatmul(Box<crate::TiledMatmulPayload>),
-    TensorCoreMatmul(Box<crate::TensorCoreMatmulPayload>),
-    QuantizedMatmul(Box<crate::QuantizedMatmulPlan>),
-    QuantizedRowGather(Box<crate::QuantizedRowGatherPlan>),
-    Movement(Box<crate::MovementKernelPlan>),
-    Random(Box<crate::random::plan::RandomKernelPlan>),
-    PrefixScan {
-        input: crate::NodeId,
-        input_shape: Shape,
-        output_shape: Shape,
-        axis: usize,
-        kind: crate::PrefixScanKind,
-        output: crate::PrefixScanOutput,
-        dtype: DType,
-    },
-    Sort {
-        input: crate::NodeId,
-        input_shape: Shape,
-        axis: usize,
-        descending: bool,
-        values: crate::NodeId,
-        indices: crate::NodeId,
-        dtype: DType,
-    },
-    TensorGuard {
-        input: crate::NodeId,
-        input_shape: Shape,
-        axis: usize,
-        dtype: DType,
-    },
-    Effect(Box<crate::EffectPayload>),
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ViewMap {
@@ -608,22 +523,6 @@ struct UOpNode {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct UOp(Arc<UOpNode>);
 impl UOp {
-    /// Fallible compatibility constructor for legacy opcode/argument pairs.
-    /// New code should prefer [`UOp::from_operation`], which cannot express a
-    /// mismatched operation payload.
-    pub fn try_new(
-        kind: UOpKind,
-        ty: Option<UType>,
-        sources: Vec<UOp>,
-        arg: UArg,
-    ) -> Result<Self, UOpError> {
-        let operation = Operation::from_legacy(kind, arg)?;
-        Ok(Self(Arc::new(UOpNode {
-            operation,
-            ty,
-            sources,
-        })))
-    }
     pub fn from_operation(operation: Operation, ty: Option<UType>, sources: Vec<UOp>) -> Self {
         Self(Arc::new(UOpNode {
             operation,
@@ -631,31 +530,17 @@ impl UOp {
             sources,
         }))
     }
-    pub(crate) fn from_artifact(
-        kind: UOpKind,
-        ty: Option<UType>,
-        sources: Vec<UOp>,
-        arg: UArg,
-    ) -> Result<Self, UOpError> {
-        Self::try_new(kind, ty, sources, arg)
-    }
     pub(crate) fn shares_node_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
     pub fn operation(&self) -> &Operation {
         &self.0.operation
     }
-    pub fn kind(&self) -> UOpKind {
-        self.0.operation.kind()
-    }
     pub fn ty(&self) -> Option<UType> {
         self.0.ty
     }
     pub fn sources(&self) -> &[UOp] {
         &self.0.sources
-    }
-    pub fn arg(&self) -> UArgRef<'_> {
-        self.0.operation.argument()
     }
     pub fn constant(value: i64, ty: UType) -> Self {
         Self::from_operation(Operation::Const(LiteralValue::Int(value)), Some(ty), vec![])
@@ -710,7 +595,17 @@ impl UOp {
         Ok(out)
     }
     pub fn is_pure(&self) -> bool {
-        self.operation().signature().effect == spec::OpEffect::Pure
+        !matches!(
+            self.operation(),
+            Operation::EndRange
+                | Operation::If
+                | Operation::EndIf
+                | Operation::Store
+                | Operation::EffectStore(_)
+                | Operation::After(_)
+                | Operation::Barrier
+                | Operation::Sink
+        )
     }
     pub fn validate(&self) -> Result<(), UOpError> {
         let nodes = self.topological()?;
@@ -728,7 +623,8 @@ impl UOp {
 
 /// Returns whether raw scalar storage metadata can faithfully inhabit `ty`.
 ///
-/// `UArg::Scalar` is a storage literal rather than an integer expression: its
+/// `LiteralValue::Scalar` is a storage literal rather than an integer
+/// expression: its
 /// dtype is part of the immutable UOp ABI and its high bits must be absent for
 /// narrow storage.  Keep this check in the universal layer so direct UOp
 /// construction, artifact decoding, and rewrite guards share one contract.
@@ -739,12 +635,9 @@ pub(crate) fn scalar_literal_is_valid(ty: Option<UType>, dtype: DType, bits: u64
 
 impl fmt::Display for UOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.kind())?;
+        write!(f, "{:?}", self.operation())?;
         if let Some(t) = self.ty() {
             write!(f, ":{:?}x{}", t.scalar, t.lanes)?
-        }
-        if !matches!(self.arg(), UArgRef::None) {
-            write!(f, "({:?})", self.arg())?
         }
         if !self.sources().is_empty() {
             write!(f, "[")?;
@@ -762,7 +655,6 @@ impl fmt::Display for UOp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UOpError {
     InvalidArity {
-        kind: UOpKind,
         expected: &'static str,
         actual: usize,
     },
@@ -783,13 +675,53 @@ impl fmt::Display for UOpError {
 }
 impl std::error::Error for UOpError {}
 fn validate_operation_arity(n: &UOp) -> Result<(), UOpError> {
-    let signature = n.operation().signature();
-    if !signature.arity.accepts(n.sources().len()) {
-        Err(UOpError::InvalidArity {
-            kind: n.kind(),
-            expected: signature.arity.expectation(),
-            actual: n.sources().len(),
-        })
+    let actual = n.sources().len();
+    let (accepted, expected) = match n.operation() {
+        Operation::Const(_)
+        | Operation::VConst(_)
+        | Operation::DefineVar(_)
+        | Operation::DefineGlobal(_)
+        | Operation::DefineLocal(_)
+        | Operation::DefineRegister(_)
+        | Operation::Special(_)
+        | Operation::Matmul(_)
+        | Operation::Conv2d(_)
+        | Operation::Movement(_)
+        | Operation::Random(_)
+        | Operation::PrefixScan(_)
+        | Operation::Sort(_)
+        | Operation::TensorGuard(_)
+        | Operation::ReduceInit(_)
+        | Operation::EffectStore(_)
+        | Operation::Barrier => (actual == 0, "no sources"),
+        Operation::Range(_)
+        | Operation::EndRange
+        | Operation::If
+        | Operation::EndIf
+        | Operation::Unary(_)
+        | Operation::GraphUnary(_)
+        | Operation::ReduceFinalize
+        | Operation::Cast
+        | Operation::Bitcast
+        | Operation::Gep(_)
+        | Operation::Load
+        | Operation::After(_) => (actual == 1, "one source"),
+        Operation::Binary(_)
+        | Operation::GraphBinary(_)
+        | Operation::GraphCompare(_)
+        | Operation::ReduceAccumulate
+        | Operation::Index(_)
+        | Operation::Store => (actual == 2, "two sources"),
+        Operation::GraphLogical(crate::LogicalOp::Not) => (actual == 1, "one source"),
+        Operation::GraphLogical(crate::LogicalOp::And | crate::LogicalOp::Or) => {
+            (actual == 2, "two sources")
+        }
+        Operation::Ternary(_) => (actual == 3, "three sources"),
+        Operation::Vectorize => (actual != 0, "one or more sources"),
+        Operation::Sink => (true, "any source count"),
+    };
+    if !accepted {
+        Err(UOpError::InvalidArity { expected, actual })
     } else {
         Ok(())
     }
@@ -798,69 +730,56 @@ fn same(n: &UOp) -> bool {
     n.sources().iter().all(|s| s.ty() == n.ty())
 }
 fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Result<(), UOpError> {
-    use UOpKind::*;
     validate_operation_arity(n)?;
-    match n.kind() {
-        Const | VConst => {
-            match n.arg() {
-                // `Int` remains the legacy structural/index literal. Its
-                // numeric interpretation is defined by the node type.
-                UArgRef::Int(_) if n.ty().is_some() => {}
-                UArgRef::Scalar { dtype, bits }
-                    if scalar_literal_is_valid(n.ty(), *dtype, *bits) => {}
-                UArgRef::Int(_) | UArgRef::Scalar { .. } => return Err(UOpError::InvalidDType),
-                _ => return Err(UOpError::InvalidArgument),
+    match n.operation() {
+        Operation::Const(value) | Operation::VConst(value) => match value {
+            // Integer literals are structural/index values interpreted by the
+            // node type. Scalar literals retain exact storage metadata.
+            LiteralValue::Int(_) if n.ty().is_some() => {}
+            LiteralValue::Scalar { dtype, bits }
+                if scalar_literal_is_valid(n.ty(), *dtype, *bits) => {}
+            LiteralValue::Int(_) | LiteralValue::Scalar { .. } => {
+                return Err(UOpError::InvalidDType);
             }
-        }
-        DefineVar => {
-            if !matches!(n.arg(), UArgRef::Variable { .. }) {
-                return Err(UOpError::InvalidArgument);
-            }
-        }
-        DefineGlobal | DefineLocal | DefineRegister => {
-            if !matches!(n.arg(), UArgRef::Address { .. }) {
-                return Err(UOpError::InvalidArgument);
-            }
-        }
-        Special => {
-            if !matches!(n.arg(), UArgRef::Name(_)) {
-                return Err(UOpError::InvalidArgument);
-            }
-        }
-        Range => {
+        },
+        Operation::DefineVar(_)
+        | Operation::DefineGlobal(_)
+        | Operation::DefineLocal(_)
+        | Operation::DefineRegister(_)
+        | Operation::Special(_) => {}
+        Operation::Range(axis) => {
             if !n.sources()[0].ty().is_some_and(|t| t.scalar.is_integer()) {
                 return Err(UOpError::InvalidDType);
             }
-            let UArgRef::RangeAxis(axis) = n.arg() else {
-                return Err(UOpError::InvalidArgument);
-            };
             ranges.insert(*axis);
         }
-        EndRange => {
-            let UArgRef::RangeAxis(axis) = n.sources()[0].arg() else {
+        Operation::EndRange => {
+            let Operation::Range(axis) = n.sources()[0].operation() else {
                 return Err(UOpError::ControlMismatch);
             };
             if !ranges.remove(axis) {
                 return Err(UOpError::ControlMismatch);
             }
         }
-        If => {
+        Operation::If => {
             if !n.sources()[0].ty().is_some_and(UType::is_bool) {
                 return Err(UOpError::InvalidDType);
             }
             ifs.push(n.clone())
         }
-        EndIf => {
-            if !matches!(n.sources()[0].kind(), If) || ifs.pop().as_ref() != Some(&n.sources()[0]) {
+        Operation::EndIf => {
+            if !matches!(n.sources()[0].operation(), Operation::If)
+                || ifs.pop().as_ref() != Some(&n.sources()[0])
+            {
                 return Err(UOpError::ControlMismatch);
             }
         }
-        Unary(_) => {
+        Operation::Unary(_) => {
             if !same(n) {
                 return Err(UOpError::InvalidDType);
             }
         }
-        GraphUnary(op) => {
+        Operation::GraphUnary(op) => {
             let valid = if matches!(
                 op,
                 crate::UnaryOp::IsNan | crate::UnaryOp::IsInf | crate::UnaryOp::IsFinite
@@ -877,7 +796,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidDType);
             }
         }
-        Binary(op) => {
+        Operation::Binary(op) => {
             if !matches!(
                 op,
                 crate::uop::Binary::Eq | crate::uop::Binary::Lt | crate::uop::Binary::Le
@@ -886,17 +805,17 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidDType);
             }
         }
-        GraphBinary(_) => {
+        Operation::GraphBinary(_) => {
             if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
         }
-        GraphCompare(_) => {
+        Operation::GraphCompare(_) => {
             if n.ty() != Some(UType::scalar(DType::Bool)) {
                 return Err(UOpError::InvalidDType);
             }
         }
-        GraphLogical(_) => {
+        Operation::GraphLogical(_) => {
             if n.ty() != Some(UType::scalar(DType::Bool))
                 || n.sources()
                     .iter()
@@ -905,62 +824,60 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidDType);
             }
         }
-        Matmul => {
-            if let Some(plan) = n.arg().matmul_plan() {
+        Operation::Matmul(value) => match value {
+            MatmulValue::Serial(plan) => {
                 plan.validate().map_err(|_| UOpError::InvalidArgument)?;
-                if let UArgRef::TiledMatmul(payload) = n.arg() {
-                    payload.validate().map_err(|_| UOpError::InvalidArgument)?;
-                }
-                if let UArgRef::TensorCoreMatmul(payload) = n.arg() {
-                    payload.validate().map_err(|_| UOpError::InvalidArgument)?;
-                }
                 if n.ty() != Some(UType::scalar(plan.dtype)) {
                     return Err(UOpError::InvalidDType);
                 }
-            } else if let Some(plan) = n.arg().quantized_matmul_plan() {
+            }
+            MatmulValue::Tiled(payload) => {
+                payload.validate().map_err(|_| UOpError::InvalidArgument)?;
+                if n.ty() != Some(UType::scalar(payload.matmul.dtype)) {
+                    return Err(UOpError::InvalidDType);
+                }
+            }
+            MatmulValue::TensorCore(payload) => {
+                payload.validate().map_err(|_| UOpError::InvalidArgument)?;
+                if n.ty() != Some(UType::scalar(payload.matmul.dtype)) {
+                    return Err(UOpError::InvalidDType);
+                }
+            }
+            MatmulValue::Quantized(plan) => {
                 plan.validate().map_err(|_| UOpError::InvalidArgument)?;
                 if n.ty() != Some(UType::scalar(plan.output_dtype)) {
                     return Err(UOpError::InvalidDType);
                 }
-            } else {
-                return Err(UOpError::InvalidArgument);
             }
-        }
-        Conv2d => {
-            let Some(plan) = n.arg().static_conv2d_plan() else {
-                return Err(UOpError::InvalidArgument);
-            };
+        },
+        Operation::Conv2d(plan) => {
             plan.validate().map_err(|_| UOpError::InvalidArgument)?;
             if n.ty() != Some(UType::scalar(DType::F32)) {
                 return Err(UOpError::InvalidDType);
             }
         }
-        Movement => match n.arg() {
-            UArgRef::Movement(plan) => {
+        Operation::Movement(value) => match value {
+            MovementValue::Plan(plan) => {
                 plan.validate().map_err(|_| UOpError::InvalidArgument)?;
                 if n.ty() != Some(UType::scalar(plan.dtype)) {
                     return Err(UOpError::InvalidDType);
                 }
             }
-            UArgRef::QuantizedRowGather(plan) => {
+            MovementValue::QuantizedRowGather(plan) => {
                 plan.validate().map_err(|_| UOpError::InvalidArgument)?;
                 if n.ty() != Some(UType::scalar(plan.output_dtype)) {
                     return Err(UOpError::InvalidDType);
                 }
             }
-            _ => return Err(UOpError::InvalidArgument),
         },
-        Random => {
-            let UArgRef::Random(plan) = n.arg() else {
-                return Err(UOpError::InvalidArgument);
-            };
+        Operation::Random(plan) => {
             plan.validate().map_err(|_| UOpError::InvalidArgument)?;
             if n.ty() != Some(UType::scalar(plan.dtype)) {
                 return Err(UOpError::InvalidDType);
             }
         }
-        PrefixScan => {
-            let UArgRef::PrefixScan {
+        Operation::PrefixScan(value) => {
+            let PrefixScanValue {
                 input_shape,
                 output_shape,
                 axis,
@@ -968,10 +885,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 output,
                 dtype,
                 ..
-            } = n.arg()
-            else {
-                return Err(UOpError::InvalidArgument);
-            };
+            } = value;
             if input_shape != output_shape
                 || (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
@@ -992,18 +906,15 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidDType);
             }
         }
-        Sort => {
-            let UArgRef::Sort {
+        Operation::Sort(value) => {
+            let SortValue {
                 input_shape,
                 axis,
                 values,
                 indices,
                 dtype,
                 ..
-            } = n.arg()
-            else {
-                return Err(UOpError::InvalidArgument);
-            };
+            } = value;
             if (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
                 || values == indices
@@ -1014,16 +925,13 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidDType);
             }
         }
-        TensorGuard => {
-            let UArgRef::TensorGuard {
+        Operation::TensorGuard(value) => {
+            let TensorGuardValue {
                 input_shape,
                 axis,
                 dtype,
                 ..
-            } = n.arg()
-            else {
-                return Err(UOpError::InvalidArgument);
-            };
+            } = value;
             if !(1..=2).contains(&input_shape.rank())
                 || *axis >= input_shape.rank()
                 || !dtype.is_float()
@@ -1032,18 +940,18 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidArgument);
             }
         }
-        ReduceInit => {}
-        ReduceAccumulate => {
+        Operation::ReduceInit(_) => {}
+        Operation::ReduceAccumulate => {
             if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
         }
-        ReduceFinalize => {
+        Operation::ReduceFinalize => {
             if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
         }
-        Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             if !n.sources()[0].ty().is_some_and(UType::is_bool)
                 || n.sources()[1].ty() != n.sources()[2].ty()
                 || n.ty() != n.sources()[1].ty()
@@ -1051,43 +959,40 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidDType);
             }
         }
-        Cast | Bitcast => {
+        Operation::Cast | Operation::Bitcast => {
             if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
         }
-        Vectorize => {
+        Operation::Vectorize => {
             if n.sources().is_empty() || !same(n) {
                 return Err(UOpError::InvalidDType);
             }
         }
-        Gep => {
-            if !matches!(n.arg(), UArgRef::GepLane(_)) {
-                return Err(UOpError::InvalidArgument);
-            }
-        }
-        Index => {
+        Operation::Gep(_) => {}
+        Operation::Index(value) => {
             if !matches!(
-                n.sources()[0].kind(),
-                DefineGlobal | DefineLocal | DefineRegister
+                n.sources()[0].operation(),
+                Operation::DefineGlobal(_)
+                    | Operation::DefineLocal(_)
+                    | Operation::DefineRegister(_)
             ) || !n.sources()[1].ty().is_some_and(|t| t.scalar.is_integer())
             {
                 return Err(UOpError::InvalidIndex);
             }
-            let (elements, input_shape, output_shape) = match n.arg() {
-                UArgRef::BufferIndex {
+            let (elements, input_shape, output_shape) = match value {
+                IndexValue::Buffer {
                     elements,
                     input_shape,
                     output_shape,
                     ..
                 }
-                | UArgRef::ViewBufferIndex {
+                | IndexValue::View {
                     elements,
                     input_shape,
                     output_shape,
                     ..
                 } => (elements, input_shape, output_shape),
-                _ => return Err(UOpError::InvalidArgument),
             };
             if input_shape.numel().ok() != Some(*elements)
                 || input_shape.rank() > output_shape.rank()
@@ -1100,28 +1005,25 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             {
                 return Err(UOpError::InvalidIndex);
             }
-            if let UArgRef::ViewBufferIndex {
+            if let IndexValue::View {
                 view, input_shape, ..
-            } = n.arg()
+            } = value
                 && (&view.logical_shape != input_shape || view.validate_read().is_err())
             {
                 return Err(UOpError::InvalidIndex);
             }
         }
-        Load => {
-            if !matches!(n.sources()[0].kind(), Index) {
+        Operation::Load => {
+            if !matches!(n.sources()[0].operation(), Operation::Index(_)) {
                 return Err(UOpError::InvalidIndex);
             }
         }
-        Store => {
-            if !matches!(n.sources()[0].kind(), Index) {
+        Operation::Store => {
+            if !matches!(n.sources()[0].operation(), Operation::Index(_)) {
                 return Err(UOpError::InvalidIndex);
             }
         }
-        EffectStore => {
-            let UArgRef::Effect(payload) = n.arg() else {
-                return Err(UOpError::InvalidArgument);
-            };
+        Operation::EffectStore(payload) => {
             if payload.target.buffer != payload.snapshot.buffer
                 || payload.target.version
                     != payload
@@ -1136,15 +1038,13 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidArgument);
             }
         }
-        After => {
-            if !matches!(n.sources()[0].kind(), EffectStore)
-                || !matches!(n.arg(), UArgRef::Effect(_))
-            {
+        Operation::After(_) => {
+            if !matches!(n.sources()[0].operation(), Operation::EffectStore(_)) {
                 return Err(UOpError::ControlMismatch);
             }
         }
-        Barrier => {}
-        Sink => {
+        Operation::Barrier => {}
+        Operation::Sink => {
             if n.ty().is_some() {
                 return Err(UOpError::InvalidDType);
             }
@@ -1162,9 +1062,9 @@ impl Captures {
 }
 #[derive(Clone, Debug)]
 pub struct UPat {
-    kinds: Option<BTreeSet<UOpKind>>,
+    operations: Option<BTreeSet<Operation>>,
+    operation_predicate: Option<fn(&Operation) -> bool>,
     ty: Option<UType>,
-    arg: Option<UArg>,
     sources: Option<Vec<UPat>>,
     name: Option<String>,
     any: bool,
@@ -1172,32 +1072,34 @@ pub struct UPat {
 impl UPat {
     pub fn any() -> Self {
         Self {
-            kinds: None,
+            operations: None,
+            operation_predicate: None,
             ty: None,
-            arg: None,
             sources: None,
             name: None,
             any: true,
         }
     }
-    pub fn op(kind: UOpKind) -> Self {
+    pub fn op(operation: Operation) -> Self {
         let mut x = Self::any();
-        x.kinds = Some([kind].into());
+        x.operations = Some([operation].into());
         x.any = false;
         x
     }
-    pub fn ops(kinds: impl IntoIterator<Item = UOpKind>) -> Self {
+    pub fn ops(operations: impl IntoIterator<Item = Operation>) -> Self {
         let mut x = Self::any();
-        x.kinds = Some(kinds.into_iter().collect());
+        x.operations = Some(operations.into_iter().collect());
+        x.any = false;
+        x
+    }
+    pub fn operation_predicate(predicate: fn(&Operation) -> bool) -> Self {
+        let mut x = Self::any();
+        x.operation_predicate = Some(predicate);
         x.any = false;
         x
     }
     pub fn dtype(mut self, ty: UType) -> Self {
         self.ty = Some(ty);
-        self
-    }
-    pub fn arg(mut self, arg: UArg) -> Self {
-        self.arg = Some(arg);
         self
     }
     pub fn sources(mut self, s: Vec<UPat>) -> Self {
@@ -1213,15 +1115,18 @@ impl UPat {
         self.match_into(node, &mut c).then_some(c)
     }
     fn match_into(&self, n: &UOp, c: &mut Captures) -> bool {
-        if !self.any && self.kinds.as_ref().is_some_and(|x| !x.contains(&n.kind())) {
+        if !self.any
+            && (self
+                .operations
+                .as_ref()
+                .is_some_and(|operations| !operations.contains(n.operation()))
+                || self
+                    .operation_predicate
+                    .is_some_and(|predicate| !predicate(n.operation())))
+        {
             return false;
         }
-        if self.ty.is_some_and(|x| n.ty() != Some(x))
-            || self
-                .arg
-                .as_ref()
-                .is_some_and(|expected| !n.arg().equals_owned(expected))
-        {
+        if self.ty.is_some_and(|x| n.ty() != Some(x)) {
             return false;
         }
         if let Some(ps) = &self.sources {
@@ -1332,20 +1237,24 @@ fn exact_integral_literal(operation: &UOp, literal: &UOp, bits: u64) -> bool {
         return false;
     }
     matches!(
-        literal.arg(),
-        UArgRef::Scalar { dtype, bits: raw } if *dtype == ty.scalar && *raw == bits
+        literal.operation(),
+        Operation::Const(LiteralValue::Scalar { dtype, bits: raw })
+            if *dtype == ty.scalar && *raw == bits
     )
 }
 
 fn exact_bool_literal(literal: &UOp, value: bool) -> bool {
     matches!(
-        (literal.kind(), literal.ty(), literal.arg()),
+        (literal.operation(), literal.ty()),
         (
-            UOpKind::Const,
+            Operation::Const(LiteralValue::Scalar { dtype, bits }),
             Some(UType { scalar: DType::Bool, lanes: 1 }),
-            UArgRef::Scalar { dtype, bits }
         ) if *dtype == DType::Bool && *bits == u64::from(value)
     )
+}
+
+fn is_const_operation(operation: &Operation) -> bool {
+    matches!(operation, Operation::Const(_))
 }
 
 pub fn builtin_rules() -> Vec<RewriteRule> {
@@ -1353,7 +1262,7 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "add-zero",
             priority: 0,
-            pattern: UPat::op(UOpKind::Binary(Binary::Add))
+            pattern: UPat::op(Operation::Binary(Binary::Add))
                 .sources(vec![UPat::any().named("x"), UPat::any().named("zero")]),
             apply: |c, n| {
                 let x = c.get("x")?;
@@ -1368,7 +1277,7 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "add-zero-left",
             priority: 1,
-            pattern: UPat::op(UOpKind::Binary(Binary::Add))
+            pattern: UPat::op(Operation::Binary(Binary::Add))
                 .sources(vec![UPat::any().named("zero"), UPat::any().named("x")]),
             apply: |c, n| {
                 let x = c.get("x")?;
@@ -1383,9 +1292,9 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "add-zero-untyped-int",
             priority: 2,
-            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
+            pattern: UPat::op(Operation::Binary(Binary::Add)).sources(vec![
                 UPat::any().named("x"),
-                UPat::op(UOpKind::Const).arg(UArg::Int(0)),
+                UPat::op(Operation::Const(LiteralValue::Int(0))),
             ]),
             // Do not turn a floating `-0.0 + 0` into `-0.0`: only the exact
             // non-float domain has this untyped literal identity.
@@ -1398,17 +1307,17 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "cast-same",
             priority: 2,
-            pattern: UPat::op(UOpKind::Cast).sources(vec![UPat::any().named("x")]),
+            pattern: UPat::op(Operation::Cast).sources(vec![UPat::any().named("x")]),
             apply: |c, n| c.get("x").filter(|x| x.ty() == n.ty()).cloned(),
         },
         RewriteRule {
             name: "where-same",
             priority: 3,
-            pattern: UPat::op(UOpKind::Ternary(Ternary::Where)).sources(vec![
+            pattern: UPat::op(Operation::Ternary(Ternary::Where)).sources(vec![
                 // A nonconstant condition can have observable failure or
                 // binding behavior even when both arms are the same value.
                 // Keep only the dependency-free, total constant condition.
-                UPat::op(UOpKind::Const),
+                UPat::operation_predicate(is_const_operation),
                 UPat::any().named("x"),
                 UPat::any().named("x"),
             ]),
@@ -1417,9 +1326,9 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-add-zero-right",
             priority: 3,
-            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
+            pattern: UPat::op(Operation::Binary(Binary::Add)).sources(vec![
                 UPat::any().named("x"),
-                UPat::op(UOpKind::Const).named("zero"),
+                UPat::operation_predicate(is_const_operation).named("zero"),
             ]),
             apply: |c, operation| {
                 c.get("x")
@@ -1433,8 +1342,8 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-add-zero-left",
             priority: 4,
-            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
-                UPat::op(UOpKind::Const).named("zero"),
+            pattern: UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+                UPat::operation_predicate(is_const_operation).named("zero"),
                 UPat::any().named("x"),
             ]),
             apply: |c, operation| {
@@ -1449,9 +1358,9 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-mul-one",
             priority: 5,
-            pattern: UPat::op(UOpKind::Binary(Binary::Mul)).sources(vec![
+            pattern: UPat::op(Operation::Binary(Binary::Mul)).sources(vec![
                 UPat::any().named("x"),
-                UPat::op(UOpKind::Const).named("one"),
+                UPat::operation_predicate(is_const_operation).named("one"),
             ]),
             apply: |c, operation| {
                 c.get("x")
@@ -1465,8 +1374,8 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-where-const",
             priority: 6,
-            pattern: UPat::op(UOpKind::Ternary(Ternary::Where)).sources(vec![
-                UPat::op(UOpKind::Const).named("gate"),
+            pattern: UPat::op(Operation::Ternary(Ternary::Where)).sources(vec![
+                UPat::operation_predicate(is_const_operation).named("gate"),
                 UPat::any().named("on_true"),
                 UPat::any().named("on_false"),
             ]),
@@ -1488,13 +1397,10 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
 /// the operand's own dtype. In particular, this deliberately does not fold a
 /// floating `-0.0`, whose signed-zero result can be observable.
 fn typed_positive_zero(node: &UOp, ty: Option<UType>) -> bool {
-    match node.arg() {
-        UArgRef::Int(value) if *value == 0 => node.kind() == UOpKind::Const && node.ty() == ty,
-        UArgRef::Scalar { dtype, bits } => {
-            node.kind() == UOpKind::Const
-                && *bits == 0
-                && node.ty() == ty
-                && scalar_literal_is_valid(node.ty(), *dtype, *bits)
+    match node.operation() {
+        Operation::Const(LiteralValue::Int(0)) => node.ty() == ty,
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => {
+            *bits == 0 && node.ty() == ty && scalar_literal_is_valid(node.ty(), *dtype, *bits)
         }
         _ => false,
     }

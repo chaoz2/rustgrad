@@ -9,8 +9,8 @@
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
-    AddressSpace, BufferView, CudaError, DType, Function, LaunchConfig, Shape, Stream, UArg,
-    UArgRef, UOp, UOpKind, UType,
+    AddressSpace, AddressValue, BufferView, CudaError, DType, Function, IndexValue, LaunchConfig,
+    LiteralValue, MatmulValue, Operation, ReductionValue, Shape, Stream, UOp, UType,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -322,9 +322,9 @@ impl PtxRenderer {
             let [store, end_range] = kernel.sources() else {
                 return false;
             };
-            if !matches!(kernel.kind(), UOpKind::Sink)
-                || !matches!(store.kind(), UOpKind::Store)
-                || !matches!(end_range.kind(), UOpKind::EndRange)
+            if !matches!(kernel.operation(), Operation::Sink)
+                || !matches!(store.operation(), Operation::Store)
+                || !matches!(end_range.operation(), Operation::EndRange)
             {
                 return false;
             }
@@ -350,52 +350,52 @@ impl PtxRenderer {
                 return false;
             };
             let (
-                UArgRef::BufferIndex {
+                Operation::Index(IndexValue::Buffer {
                     buffer: input_buffer,
                     elements: input_elements,
                     input_shape,
                     output_shape: input_output_shape,
-                },
-                UArgRef::BufferIndex {
+                }),
+                Operation::Index(IndexValue::Buffer {
                     buffer: output_buffer,
                     elements: output_elements,
                     input_shape: output_input_shape,
                     output_shape,
-                },
-            ) = (input_index.arg(), output_index.arg())
+                }),
+            ) = (input_index.operation(), output_index.operation())
             else {
                 return false;
             };
             let (
-                UArgRef::Address {
+                Operation::DefineGlobal(AddressValue {
                     space: input_space,
                     name: input_name,
                     element: input_element,
-                },
-                UArgRef::Address {
+                }),
+                Operation::DefineGlobal(AddressValue {
                     space: output_space,
                     name: output_name,
                     element: output_element,
-                },
-                UArgRef::Int(bound),
-                UArgRef::RangeAxis(axis),
+                }),
+                Operation::Const(LiteralValue::Int(bound)),
+                Operation::Range(axis),
             ) = (
-                input_address.arg(),
-                output_address.arg(),
-                range_bound.arg(),
-                input_range.arg(),
+                input_address.operation(),
+                output_address.operation(),
+                range_bound.operation(),
+                input_range.operation(),
             )
             else {
                 return false;
             };
-            matches!(exp.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))
-                && matches!(load.kind(), UOpKind::Load)
-                && matches!(input_index.kind(), UOpKind::Index)
-                && matches!(output_index.kind(), UOpKind::Index)
-                && matches!(input_address.kind(), UOpKind::DefineGlobal)
-                && matches!(output_address.kind(), UOpKind::DefineGlobal)
-                && matches!(input_range.kind(), UOpKind::Range)
-                && matches!(range_bound.kind(), UOpKind::Const)
+            matches!(exp.operation(), Operation::GraphUnary(crate::UnaryOp::Exp))
+                && matches!(load.operation(), Operation::Load)
+                && matches!(input_index.operation(), Operation::Index(_))
+                && matches!(output_index.operation(), Operation::Index(_))
+                && matches!(input_address.operation(), Operation::DefineGlobal(_))
+                && matches!(output_address.operation(), Operation::DefineGlobal(_))
+                && matches!(input_range.operation(), Operation::Range(_))
+                && matches!(range_bound.operation(), Operation::Const(_))
                 && input_range.ty() == Some(UType::scalar(DType::I64))
                 && range_bound.ty() == Some(UType::scalar(DType::I64))
                 && input_range.shares_node_with(output_range)
@@ -405,8 +405,8 @@ impl PtxRenderer {
                 && *output_space == AddressSpace::Global
                 && input_element.scalar == DType::F32
                 && output_element.scalar == DType::F32
-                && input_name == format!("b{input_buffer}")
-                && output_name == format!("b{output_buffer}")
+                && input_name == &format!("b{input_buffer}")
+                && output_name == &format!("b{output_buffer}")
                 && input_buffer != output_buffer
                 && input_index.ty().is_some_and(|ty| ty.scalar == DType::F32)
                 && load.ty().is_some_and(|ty| ty.scalar == DType::F32)
@@ -526,25 +526,22 @@ fn render(
     root: &UOp,
     allow_linked_f32_exp: bool,
 ) -> Result<RenderedPtx, PtxError> {
-    if matches!(root.kind(), UOpKind::Random) {
-        let UArgRef::Random(plan) = root.arg() else {
-            return Err(PtxError::Unsupported("random payload is absent".into()));
-        };
+    if let Operation::Random(plan) = root.operation() {
         return render_random(renderer, root, plan);
     }
     if matches!(
-        root.kind(),
-        UOpKind::PrefixScan | UOpKind::Sort | UOpKind::TensorGuard
+        root.operation(),
+        Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
     ) {
         return Err(PtxError::Unsupported(
             "prefix scans and sort pairs are outside the PTX lowering subset".into(),
         ));
     }
-    if matches!(root.kind(), UOpKind::Matmul) {
-        return match root.arg() {
-            UArgRef::Matmul(plan) => matmul::render_serial(renderer, plan),
-            UArgRef::TiledMatmul(payload) => matmul::render_tiled(renderer, payload),
-            UArgRef::TensorCoreMatmul(payload) => matmul::render_tensor_core(renderer, payload),
+    if let Operation::Matmul(value) = root.operation() {
+        return match value {
+            MatmulValue::Serial(plan) => matmul::render_serial(renderer, plan),
+            MatmulValue::Tiled(payload) => matmul::render_tiled(renderer, payload),
+            MatmulValue::TensorCore(payload) => matmul::render_tensor_core(renderer, payload),
             _ => Err(PtxError::Unsupported("matmul payload is absent".into())),
         };
     }
@@ -554,18 +551,18 @@ fn render(
     let store = root
         .sources()
         .iter()
-        .find(|n| matches!(n.kind(), UOpKind::Store))
+        .find(|n| matches!(n.operation(), Operation::Store))
         .ok_or_else(|| PtxError::Unsupported("Sink without Store".into()))?;
     let out_index = store
         .sources()
         .first()
         .ok_or_else(|| PtxError::Unsupported("Store without index".into()))?;
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         buffer: out_id,
         elements: extent,
         output_shape,
         ..
-    } = out_index.arg()
+    }) = out_index.operation()
     else {
         return Err(PtxError::Unsupported("Store needs BufferIndex".into()));
     };
@@ -582,23 +579,24 @@ fn render(
     // arithmetic; fall back only when every indexed buffer is already in the
     // generic storage subset.
     let generic_storage = nodes.iter().all(|node| {
-        let storage_ok = match node.arg() {
-            UArgRef::BufferIndex { .. } | UArgRef::ViewBufferIndex { .. } => {
+        let storage_ok = match node.operation() {
+            Operation::Index(IndexValue::Buffer { .. })
+            | Operation::Index(IndexValue::View { .. }) => {
                 node.ty().is_some_and(|ty| reject_dtype(ty.scalar).is_ok())
             }
             _ => true,
         };
-        let typed_alu_ok = match node.kind() {
-            UOpKind::GraphBinary(_) => node
+        let typed_alu_ok = match node.operation() {
+            Operation::GraphBinary(_) => node
                 .ty()
                 .is_some_and(|ty| node.sources().iter().all(|source| source.ty() == Some(ty))),
-            UOpKind::GraphCompare(_) => {
+            Operation::GraphCompare(_) => {
                 matches!(node.sources(), [left, right] if left.ty() == right.ty())
             }
-            UOpKind::Cast => matches!(node.sources(), [source]
+            Operation::Cast => matches!(node.sources(), [source]
                 if node.ty().map(|ty| ty.scalar) != Some(DType::Bool)
                     || source.ty().map(|ty| ty.scalar) == Some(DType::Bool)),
-            UOpKind::Ternary(crate::uop::Ternary::Where) => {
+            Operation::Ternary(crate::uop::Ternary::Where) => {
                 matches!(node.sources(), [condition, on_true, on_false]
                     if condition.ty().map(|ty| ty.scalar) == Some(DType::Bool)
                         && on_true.ty() == node.ty()
@@ -616,14 +614,14 @@ fn render(
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
     for node in &nodes {
-        if let Some((buffer, elements, source_shape)) = match node.arg() {
-            UArgRef::BufferIndex {
+        if let Some((buffer, elements, source_shape)) = match node.operation() {
+            Operation::Index(IndexValue::Buffer {
                 buffer,
                 elements,
                 input_shape,
                 ..
-            } => Some((buffer, *elements, input_shape.clone())),
-            UArgRef::ViewBufferIndex { buffer, view, .. } => Some((
+            }) => Some((buffer, *elements, input_shape.clone())),
+            Operation::Index(IndexValue::View { buffer, view, .. }) => Some((
                 buffer,
                 view.source_shape.numel().map_err(|_| PtxError::Overflow)?,
                 view.source_shape.clone(),
@@ -658,16 +656,15 @@ fn render(
     let mut buffers = Vec::new();
     let mut seen = BTreeMap::new();
     for node in &nodes {
-        if !matches!(node.kind(), UOpKind::Load) {
+        if !matches!(node.operation(), Operation::Load) {
             continue;
         }
         let Some(index) = node.sources().first() else {
             return Err(PtxError::InvalidBinding("load without index".into()));
         };
-        let buffer = match index.arg() {
-            UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
-                *buffer
-            }
+        let buffer = match index.operation() {
+            Operation::Index(IndexValue::Buffer { buffer, .. })
+            | Operation::Index(IndexValue::View { buffer, .. }) => *buffer,
             _ => return Err(PtxError::InvalidBinding("load index lacks buffer".into())),
         };
         if seen.insert(buffer, ()).is_none() {
@@ -1178,19 +1175,27 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add))
-        && value.ty().map(|ty| ty.scalar) == Some(DType::Bool)
+    if matches!(
+        value.operation(),
+        Operation::GraphBinary(crate::BinaryOp::Add)
+    ) && value.ty().map(|ty| ty.scalar) == Some(DType::Bool)
         && matches!(
-            value.sources().get(1).map(|node| node.kind()),
-            Some(UOpKind::GraphLogical(crate::LogicalOp::Not))
+            value.sources().get(1).map(|node| node.operation()),
+            Some(Operation::GraphLogical(crate::LogicalOp::Not))
         )
     {
         return scoped_bool_sub_plan(store);
     }
-    if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Eq)) {
+    if matches!(
+        value.operation(),
+        Operation::GraphCompare(crate::CompareOp::Eq)
+    ) {
         return scoped_eq_plan(store, sm);
     }
-    if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Ne)) {
+    if matches!(
+        value.operation(),
+        Operation::GraphCompare(crate::CompareOp::Ne)
+    ) {
         if let Some(mode) = scoped_isfinite_plan(store, sm)? {
             return Ok(Some(mode));
         }
@@ -1205,13 +1210,22 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         }
         return scoped_ne_plan(store, sm);
     }
-    if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Lt)) {
+    if matches!(
+        value.operation(),
+        Operation::GraphCompare(crate::CompareOp::Lt)
+    ) {
         return scoped_ordered_lt_plan(store, sm);
     }
-    if matches!(value.kind(), UOpKind::GraphUnary(crate::UnaryOp::IsInf)) {
+    if matches!(
+        value.operation(),
+        Operation::GraphUnary(crate::UnaryOp::IsInf)
+    ) {
         return scoped_isinf_plan(store, sm);
     }
-    if matches!(value.kind(), UOpKind::Ternary(crate::uop::Ternary::Where)) {
+    if matches!(
+        value.operation(),
+        Operation::Ternary(crate::uop::Ternary::Where)
+    ) {
         if let Some(mode) = scoped_relu_plan(store, sm)? {
             return Ok(Some(mode));
         }
@@ -1224,8 +1238,8 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         // ordinary Select proof below.
         let clamp_candidate = if let [condition, on_true, on_false] = value.sources() {
             if matches!(
-                condition.kind(),
-                UOpKind::GraphCompare(crate::CompareOp::Lt)
+                condition.operation(),
+                Operation::GraphCompare(crate::CompareOp::Lt)
             ) {
                 if let [left, right] = condition.sources() {
                     (left == on_false && right == on_true) || (left == on_true && right == on_false)
@@ -1243,13 +1257,19 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         }
         return scoped_select_plan(store, sm);
     }
-    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add)) {
+    if matches!(
+        value.operation(),
+        Operation::GraphBinary(crate::BinaryOp::Add)
+    ) {
         if let Some(mode) = scoped_sub_plan(store, sm)? {
             return Ok(Some(mode));
         }
         return scoped_binary_plan(store, sm, crate::BinaryOp::Add, ScopedStorageMode::Add);
     }
-    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Sub)) {
+    if matches!(
+        value.operation(),
+        Operation::GraphBinary(crate::BinaryOp::Sub)
+    ) {
         if value.ty().map(|ty| ty.scalar) == Some(DType::Bool) {
             return Err(PtxError::Unsupported(
                 "raw Bool Sub is not public subtraction".into(),
@@ -1257,46 +1277,48 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         }
         return scoped_binary_plan(store, sm, crate::BinaryOp::Sub, ScopedStorageMode::Sub);
     }
-    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
-        && matches!(
-            value.sources().get(1).map(|node| node.kind()),
-            Some(UOpKind::GraphUnary(crate::UnaryOp::Reciprocal))
-        )
-    {
+    if matches!(
+        value.operation(),
+        Operation::GraphBinary(crate::BinaryOp::Mul)
+    ) && matches!(
+        value.sources().get(1).map(|node| node.operation()),
+        Some(Operation::GraphUnary(crate::UnaryOp::Reciprocal))
+    ) {
         return scoped_div_plan(store, sm);
     }
-    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
-        && !matches!(
-            value.sources().get(1).map(|node| node.kind()),
-            Some(UOpKind::GraphUnary(crate::UnaryOp::Sign))
-        )
-    {
+    if matches!(
+        value.operation(),
+        Operation::GraphBinary(crate::BinaryOp::Mul)
+    ) && !matches!(
+        value.sources().get(1).map(|node| node.operation()),
+        Some(Operation::GraphUnary(crate::UnaryOp::Sign))
+    ) {
         return scoped_binary_plan(store, sm, crate::BinaryOp::Mul, ScopedStorageMode::Mul);
     }
-    if let UOpKind::GraphBinary(op @ (crate::BinaryOp::Maximum | crate::BinaryOp::Minimum)) =
-        value.kind()
+    if let Operation::GraphBinary(op @ (crate::BinaryOp::Maximum | crate::BinaryOp::Minimum)) =
+        value.operation()
     {
-        return scoped_binary_plan(store, sm, op, ScopedStorageMode::Extrema);
+        return scoped_binary_plan(store, sm, *op, ScopedStorageMode::Extrema);
     }
     if matches!(
-        value.kind(),
-        UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)
+        value.operation(),
+        Operation::GraphUnary(crate::UnaryOp::Reciprocal)
     ) && let Some(mode) = scoped_rsqrt_plan(store, sm)?
     {
         return Ok(Some(mode));
     }
-    let (load, mode) = match value.kind() {
-        UOpKind::GraphUnary(crate::UnaryOp::Sign) => {
+    let (load, mode) = match value.operation() {
+        Operation::GraphUnary(crate::UnaryOp::Sign) => {
             let [load] = value.sources() else {
                 return Err(PtxError::Unsupported("Sign must have one input".into()));
             };
             (load, ScopedStorageMode::Sign)
         }
-        UOpKind::GraphBinary(crate::BinaryOp::Mul) => {
+        Operation::GraphBinary(crate::BinaryOp::Mul) => {
             let [input, sign] = value.sources() else {
                 return Err(PtxError::Unsupported("Abs Mul must have two inputs".into()));
             };
-            let UOpKind::GraphUnary(crate::UnaryOp::Sign) = sign.kind() else {
+            let Operation::GraphUnary(crate::UnaryOp::Sign) = sign.operation() else {
                 return Ok(None);
             };
             let [sign_input] = sign.sources() else {
@@ -1307,13 +1329,13 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             }
             (input, ScopedStorageMode::Abs)
         }
-        UOpKind::GraphUnary(crate::UnaryOp::Neg) => {
+        Operation::GraphUnary(crate::UnaryOp::Neg) => {
             let [load] = value.sources() else {
                 return Err(PtxError::Unsupported("Neg must have one input".into()));
             };
             (load, ScopedStorageMode::Neg)
         }
-        UOpKind::GraphLogical(crate::LogicalOp::Not) => {
+        Operation::GraphLogical(crate::LogicalOp::Not) => {
             let [load] = value.sources() else {
                 return Err(PtxError::Unsupported(
                     "logical Neg must have one input".into(),
@@ -1321,16 +1343,16 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             };
             (load, ScopedStorageMode::NegBool)
         }
-        UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) => {
+        Operation::GraphUnary(crate::UnaryOp::Reciprocal) => {
             let [reciprocal_input] = value.sources() else {
                 return Err(PtxError::Unsupported(
                     "Reciprocal must have one input".into(),
                 ));
             };
-            if matches!(reciprocal_input.kind(), UOpKind::Load) {
+            if matches!(reciprocal_input.operation(), Operation::Load) {
                 (reciprocal_input, ScopedStorageMode::Reciprocal)
             } else {
-                let UOpKind::Cast = reciprocal_input.kind() else {
+                let Operation::Cast = reciprocal_input.operation() else {
                     return Ok(None);
                 };
                 let [load] = reciprocal_input.sources() else {
@@ -1338,7 +1360,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
                         "Reciprocal Cast must have one input".into(),
                     ));
                 };
-                if !matches!(load.kind(), UOpKind::Load)
+                if !matches!(load.operation(), Operation::Load)
                     || reciprocal_input.ty().map(|ty| ty.scalar) != Some(DType::F32)
                 {
                     return Ok(None);
@@ -1346,14 +1368,14 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
                 (load, ScopedStorageMode::ReciprocalCast)
             }
         }
-        UOpKind::GraphUnary(crate::UnaryOp::Sqrt) => {
+        Operation::GraphUnary(crate::UnaryOp::Sqrt) => {
             let [sqrt_input] = value.sources() else {
                 return Err(PtxError::Unsupported("Sqrt must have one input".into()));
             };
-            if matches!(sqrt_input.kind(), UOpKind::Load) {
+            if matches!(sqrt_input.operation(), Operation::Load) {
                 (sqrt_input, ScopedStorageMode::Sqrt)
             } else {
-                let UOpKind::Cast = sqrt_input.kind() else {
+                let Operation::Cast = sqrt_input.operation() else {
                     return Ok(None);
                 };
                 let [load] = sqrt_input.sources() else {
@@ -1361,7 +1383,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
                         "Sqrt Cast must have one input".into(),
                     ));
                 };
-                if !matches!(load.kind(), UOpKind::Load)
+                if !matches!(load.operation(), Operation::Load)
                     || sqrt_input.ty().map(|ty| ty.scalar) != Some(DType::F32)
                 {
                     return Ok(None);
@@ -1371,7 +1393,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         }
         _ => return Ok(None),
     };
-    if !matches!(load.kind(), UOpKind::Load) || load.sources().len() != 1 {
+    if !matches!(load.operation(), Operation::Load) || load.sources().len() != 1 {
         return Err(PtxError::Unsupported(
             "scoped narrow-storage ABI requires a direct load".into(),
         ));
@@ -1382,8 +1404,8 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     let Some(input_index) = load.sources().first() else {
         return Err(PtxError::Unsupported("scoped load without index".into()));
     };
-    if !matches!(output_index.kind(), UOpKind::Index)
-        || !matches!(input_index.kind(), UOpKind::Index)
+    if !matches!(output_index.operation(), Operation::Index(_))
+        || !matches!(input_index.operation(), Operation::Index(_))
     {
         return Err(PtxError::Unsupported(
             "scoped narrow-storage ABI requires typed indices".into(),
@@ -1433,22 +1455,27 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             "scoped storage ABI has incompatible input/output dtypes".into(),
         ));
     }
-    let output_shape = match output_index.arg() {
-        UArgRef::BufferIndex { output_shape, .. } => output_shape,
+    let output_shape = match output_index.operation() {
+        Operation::Index(IndexValue::Buffer { output_shape, .. }) => output_shape,
         _ => {
             return Err(PtxError::Unsupported(
                 "scoped narrow-storage ABI requires a concrete output buffer".into(),
             ));
         }
     };
-    if (sqrt_direct || sqrt_cast) && matches!(input_index.arg(), UArgRef::ViewBufferIndex { .. }) {
+    if (sqrt_direct || sqrt_cast)
+        && matches!(
+            input_index.operation(),
+            Operation::Index(IndexValue::View { .. })
+        )
+    {
         return Err(PtxError::Unsupported(
             "scoped Sqrt does not admit affine-view inputs".into(),
         ));
     }
-    let input_shape = match input_index.arg() {
-        UArgRef::BufferIndex { output_shape, .. }
-        | UArgRef::ViewBufferIndex { output_shape, .. } => output_shape,
+    let input_shape = match input_index.operation() {
+        Operation::Index(IndexValue::Buffer { output_shape, .. })
+        | Operation::Index(IndexValue::View { output_shape, .. }) => output_shape,
         _ => {
             return Err(PtxError::Unsupported(
                 "scoped narrow-storage ABI requires a concrete input buffer".into(),
@@ -1457,8 +1484,8 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     };
     if input_shape != output_shape
         || output_shape.numel().map_err(|_| PtxError::Overflow)?
-            != match output_index.arg() {
-                UArgRef::BufferIndex { elements, .. } => *elements,
+            != match output_index.operation() {
+                Operation::Index(IndexValue::Buffer { elements, .. }) => *elements,
                 _ => unreachable!(),
             }
     {
@@ -1485,23 +1512,23 @@ fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
             "Rsqrt Store needs index and value".into(),
         ));
     };
-    let UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.kind() else {
+    let Operation::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.operation() else {
         return Ok(None);
     };
     let [sqrt] = reciprocal.sources() else {
         return Err(PtxError::Unsupported("Rsqrt Reciprocal needs Sqrt".into()));
     };
-    let UOpKind::GraphUnary(crate::UnaryOp::Sqrt) = sqrt.kind() else {
+    let Operation::GraphUnary(crate::UnaryOp::Sqrt) = sqrt.operation() else {
         return Ok(None);
     };
     let [sqrt_input] = sqrt.sources() else {
         return Err(PtxError::Unsupported("Rsqrt Sqrt needs input".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "Rsqrt needs a concrete output".into(),
@@ -1521,13 +1548,13 @@ fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
             "Rsqrt result descriptor is invalid".into(),
         ));
     }
-    let (load, cast) = match sqrt_input.kind() {
-        UOpKind::Load => (sqrt_input, None),
-        UOpKind::Cast => {
+    let (load, cast) = match sqrt_input.operation() {
+        Operation::Load => (sqrt_input, None),
+        Operation::Cast => {
             let [load] = sqrt_input.sources() else {
                 return Err(PtxError::Unsupported("Rsqrt Cast arity".into()));
             };
-            if !matches!(load.kind(), UOpKind::Load) {
+            if !matches!(load.operation(), Operation::Load) {
                 return Err(PtxError::Unsupported("Rsqrt Cast needs direct load".into()));
             }
             (load, Some(sqrt_input))
@@ -1541,12 +1568,12 @@ fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     let [index] = load.sources() else {
         return Err(PtxError::Unsupported("Rsqrt load needs index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: input_elements,
         input_shape,
         output_shape: input_output,
         ..
-    } = index.arg()
+    }) = index.operation()
     else {
         return Err(PtxError::Unsupported(
             "Rsqrt does not admit affine views".into(),
@@ -1593,10 +1620,10 @@ fn scoped_binary_plan(
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    let UOpKind::GraphBinary(actual_op) = value.kind() else {
+    let Operation::GraphBinary(actual_op) = value.operation() else {
         return Ok(None);
     };
-    if actual_op != op {
+    if *actual_op != op {
         return Ok(None);
     }
     let [left, right] = value.sources() else {
@@ -1605,11 +1632,11 @@ fn scoped_binary_plan(
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output_index.arg()
+    }) = output_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "scoped Mul requires a concrete output buffer".into(),
@@ -1631,13 +1658,13 @@ fn scoped_binary_plan(
     }
 
     fn operand(node: &UOp) -> Result<(&UOp, Option<&UOp>), PtxError> {
-        match node.kind() {
-            UOpKind::Load => Ok((node, None)),
-            UOpKind::Cast => {
+        match node.operation() {
+            Operation::Load => Ok((node, None)),
+            Operation::Cast => {
                 let [load] = node.sources() else {
                     return Err(PtxError::Unsupported("Mul Cast must have one input".into()));
                 };
-                if !matches!(load.kind(), UOpKind::Load) {
+                if !matches!(load.operation(), Operation::Load) {
                     return Err(PtxError::Unsupported(
                         "scoped Mul Cast must consume a direct load".into(),
                     ));
@@ -1653,7 +1680,7 @@ fn scoped_binary_plan(
         let [index] = load.sources() else {
             return Err(PtxError::Unsupported("Mul load must have one index".into()));
         };
-        if !matches!(index.kind(), UOpKind::Index) {
+        if !matches!(index.operation(), Operation::Index(_)) {
             return Err(PtxError::Unsupported("Mul load needs a typed index".into()));
         }
         Ok(index)
@@ -1696,20 +1723,20 @@ fn scoped_binary_plan(
             ));
         }
         let input_index = index(load)?;
-        let (elements, input_shape, operand_output) = match input_index.arg() {
-            UArgRef::BufferIndex {
+        let (elements, input_shape, operand_output) = match input_index.operation() {
+            Operation::Index(IndexValue::Buffer {
                 elements,
                 input_shape,
                 output_shape,
                 ..
-            } => (*elements, input_shape, output_shape),
-            UArgRef::ViewBufferIndex {
+            }) => (*elements, input_shape, output_shape),
+            Operation::Index(IndexValue::View {
                 elements,
                 input_shape,
                 output_shape,
                 view,
                 ..
-            } => {
+            }) => {
                 view.validate_read().map_err(|_| {
                     PtxError::Unsupported("scoped Mul affine view is invalid".into())
                 })?;
@@ -1743,16 +1770,14 @@ fn scoped_binary_plan(
             ));
         }
     }
-    let left_shape = match index(left_load)?.arg() {
-        UArgRef::BufferIndex { input_shape, .. } | UArgRef::ViewBufferIndex { input_shape, .. } => {
-            input_shape
-        }
+    let left_shape = match index(left_load)?.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. })
+        | Operation::Index(IndexValue::View { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
-    let right_shape = match index(right_load)?.arg() {
-        UArgRef::BufferIndex { input_shape, .. } | UArgRef::ViewBufferIndex { input_shape, .. } => {
-            input_shape
-        }
+    let right_shape = match index(right_load)?.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. })
+        | Operation::Index(IndexValue::View { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
     if left_shape
@@ -1785,13 +1810,13 @@ fn scoped_sub_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     let [output, value] = store.sources() else {
         return Ok(None);
     };
-    let UOpKind::GraphBinary(crate::BinaryOp::Add) = value.kind() else {
+    let Operation::GraphBinary(crate::BinaryOp::Add) = value.operation() else {
         return Ok(None);
     };
     let [left, negated] = value.sources() else {
         return Ok(None);
     };
-    let UOpKind::GraphUnary(crate::UnaryOp::Neg) = negated.kind() else {
+    let Operation::GraphUnary(crate::UnaryOp::Neg) = negated.operation() else {
         return Ok(None);
     };
     let [right] = negated.sources() else {
@@ -1800,20 +1825,12 @@ fn scoped_sub_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     if negated.ty() != value.ty() || right.ty() != value.ty() {
         return Ok(None);
     }
-    let synthetic = UOp::try_new(
-        UOpKind::GraphBinary(crate::BinaryOp::Sub),
+    let synthetic = UOp::from_operation(
+        Operation::GraphBinary(crate::BinaryOp::Sub),
         value.ty(),
         vec![left.clone(), right.clone()],
-        UArg::None,
-    )
-    .unwrap();
-    let proof = UOp::try_new(
-        UOpKind::Store,
-        None,
-        vec![output.clone(), synthetic],
-        UArg::None,
-    )
-    .unwrap();
+    );
+    let proof = UOp::from_operation(Operation::Store, None, vec![output.clone(), synthetic]);
     scoped_binary_plan(&proof, sm, crate::BinaryOp::Sub, ScopedStorageMode::Sub)
 }
 
@@ -1826,10 +1843,10 @@ fn scoped_compare_value_proof(
     sm: u32,
     expected: crate::CompareOp,
 ) -> Result<Option<Shape>, PtxError> {
-    let UOpKind::GraphCompare(actual) = value.kind() else {
+    let Operation::GraphCompare(actual) = value.operation() else {
         return Ok(None);
     };
-    if actual != expected {
+    if *actual != expected {
         return Ok(None);
     }
     let [left, right] = value.sources() else {
@@ -1847,15 +1864,15 @@ fn scoped_compare_value_proof(
         ));
     }
     fn operand(node: &UOp) -> Result<(&UOp, Option<&UOp>), PtxError> {
-        match node.kind() {
-            UOpKind::Load => Ok((node, None)),
-            UOpKind::Cast => {
+        match node.operation() {
+            Operation::Load => Ok((node, None)),
+            Operation::Cast => {
                 let [load] = node.sources() else {
                     return Err(PtxError::Unsupported(
                         "public Eq Cast needs one input".into(),
                     ));
                 };
-                if !matches!(load.kind(), UOpKind::Load) {
+                if !matches!(load.operation(), Operation::Load) {
                     return Err(PtxError::Unsupported(
                         "public Eq Cast must consume a direct load".into(),
                     ));
@@ -1873,12 +1890,12 @@ fn scoped_compare_value_proof(
                 "public Eq load needs one index".into(),
             ));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(
                 "public Eq does not admit affine-view inputs".into(),
@@ -1938,12 +1955,12 @@ fn scoped_compare_value_proof(
     }
     let left_index = index(left_load, domain_shape)?;
     let right_index = index(right_load, domain_shape)?;
-    let left_shape = match left_index.arg() {
-        UArgRef::BufferIndex { input_shape, .. } => input_shape,
+    let left_shape = match left_index.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
-    let right_shape = match right_index.arg() {
-        UArgRef::BufferIndex { input_shape, .. } => input_shape,
+    let right_shape = match right_index.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
     let comparison_shape = left_shape
@@ -1987,11 +2004,11 @@ fn scoped_compare_value_plan(
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output_index.arg()
+    }) = output_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "public Eq requires a concrete output buffer".into(),
@@ -2023,13 +2040,13 @@ fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Ptx
     let [output, value] = store.sources() else {
         return Ok(None);
     };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = value.kind() else {
+    let Operation::GraphCompare(crate::CompareOp::Ne) = value.operation() else {
         return Ok(None);
     };
     let [cast, truth] = value.sources() else {
         return Ok(None);
     };
-    let UOpKind::Cast = cast.kind() else {
+    let Operation::Cast = cast.operation() else {
         return Ok(None);
     };
     let [unequal] = cast.sources() else {
@@ -2038,27 +2055,28 @@ fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Ptx
     if value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || unequal.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-        || !matches!(unequal.kind(), UOpKind::GraphCompare(crate::CompareOp::Ne))
-        || !matches!(truth.kind(), UOpKind::Const)
         || !matches!(
-            truth.arg(),
-            UArgRef::Scalar {
-                dtype: &DType::Bool,
-                bits: &1
-            }
+            unequal.operation(),
+            Operation::GraphCompare(crate::CompareOp::Ne)
+        )
+        || !matches!(truth.operation(), Operation::Const(_))
+        || !matches!(
+            truth.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            })
         )
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let proof = UOp::try_new(
-        UOpKind::Store,
+    let proof = UOp::from_operation(
+        Operation::Store,
         None,
         vec![output.clone(), unequal.clone()],
-        UArg::None,
-    )
-    .unwrap();
+    );
     if scoped_compare_value_plan(&proof, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)?.is_some()
     {
         Ok(Some(ScopedStorageMode::Eq))
@@ -2081,39 +2099,39 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
     let Some(value) = store.sources().get(1) else {
         return Ok(None);
     };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = value.kind() else {
+    let Operation::GraphCompare(crate::CompareOp::Ne) = value.operation() else {
         return Ok(None);
     };
     let [cast, truth] = value.sources() else {
         return Ok(None);
     };
-    let UOpKind::Cast = cast.kind() else {
+    let Operation::Cast = cast.operation() else {
         return Ok(None);
     };
     let [load] = cast.sources() else {
         return Ok(None);
     };
-    if !matches!(load.kind(), UOpKind::Load)
+    if !matches!(load.operation(), Operation::Load)
         || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-        || !matches!(truth.kind(), UOpKind::Const)
+        || !matches!(truth.operation(), Operation::Const(_))
         || !matches!(
-            truth.arg(),
-            UArgRef::Scalar {
-                dtype: &DType::Bool,
-                bits: &1
-            }
+            truth.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            })
         )
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public logical-not requires a concrete output buffer".into(),
@@ -2138,12 +2156,12 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
         .ty()
         .ok_or_else(|| PtxError::Unsupported("untyped public logical-not input".into()))?
         .scalar;
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements,
         input_shape,
         output_shape: input_output,
         ..
-    } = input.arg()
+    }) = input.operation()
     else {
         return Err(PtxError::Unsupported(
             "public logical-not does not admit affine-view inputs".into(),
@@ -2178,21 +2196,22 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     let Some(value) = store.sources().get(1) else {
         return Ok(None);
     };
-    let UOpKind::GraphUnary(crate::UnaryOp::IsInf) = value.kind() else {
+    let Operation::GraphUnary(crate::UnaryOp::IsInf) = value.operation() else {
         return Ok(None);
     };
     let [load] = value.sources() else {
         return Ok(None);
     };
-    if !matches!(load.kind(), UOpKind::Load) || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+    if !matches!(load.operation(), Operation::Load)
+        || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
     {
         return Ok(None);
     }
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public IsInf requires a concrete output buffer".into(),
@@ -2217,12 +2236,12 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         .ty()
         .ok_or_else(|| PtxError::Unsupported("untyped public IsInf input".into()))?
         .scalar;
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements,
         input_shape,
         output_shape: input_output,
         ..
-    } = input.arg()
+    }) = input.operation()
     else {
         return Err(PtxError::Unsupported(
             "public IsInf does not admit affine-view inputs".into(),
@@ -2257,28 +2276,28 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
     let Some(outer) = store.sources().get(1) else {
         return Ok(None);
     };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = outer.kind() else {
+    let Operation::GraphCompare(crate::CompareOp::Ne) = outer.operation() else {
         return Ok(None);
     };
     let [cast, truth] = outer.sources() else {
         return Ok(None);
     };
-    let UOpKind::Cast = cast.kind() else {
+    let Operation::Cast = cast.operation() else {
         return Ok(None);
     };
     let [or] = cast.sources() else {
         return Ok(None);
     };
-    let UOpKind::GraphLogical(crate::LogicalOp::Or) = or.kind() else {
+    let Operation::GraphLogical(crate::LogicalOp::Or) = or.operation() else {
         return Ok(None);
     };
     let [infinite, nan] = or.sources() else {
         return Ok(None);
     };
-    let UOpKind::GraphUnary(crate::UnaryOp::IsInf) = infinite.kind() else {
+    let Operation::GraphUnary(crate::UnaryOp::IsInf) = infinite.operation() else {
         return Ok(None);
     };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = nan.kind() else {
+    let Operation::GraphCompare(crate::CompareOp::Ne) = nan.operation() else {
         return Ok(None);
     };
     let [infinite_load] = infinite.sources() else {
@@ -2287,7 +2306,7 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
     let [nan_left, nan_right] = nan.sources() else {
         return Ok(None);
     };
-    if !matches!(infinite_load.kind(), UOpKind::Load)
+    if !matches!(infinite_load.operation(), Operation::Load)
         || infinite_load != nan_left
         || nan_left != nan_right
         || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
@@ -2296,23 +2315,23 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
         || nan.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || outer.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-        || !matches!(truth.kind(), UOpKind::Const)
+        || !matches!(truth.operation(), Operation::Const(_))
         || !matches!(
-            truth.arg(),
-            UArgRef::Scalar {
-                dtype: &DType::Bool,
-                bits: &1
-            }
+            truth.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            })
         )
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public IsFinite requires a concrete output buffer".into(),
@@ -2328,23 +2347,16 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
             "public IsFinite output descriptor is invalid".into(),
         ));
     }
-    let isinf_store = UOp::try_new(
-        UOpKind::Store,
+    let isinf_store = UOp::from_operation(
+        Operation::Store,
         None,
         vec![output.clone(), infinite.clone()],
-        UArg::None,
-    )
-    .unwrap();
+    );
     if scoped_isinf_plan(&isinf_store, sm)?.is_none() {
         return Ok(None);
     }
-    let isnan_store = UOp::try_new(
-        UOpKind::Store,
-        None,
-        vec![output.clone(), nan.clone()],
-        UArg::None,
-    )
-    .unwrap();
+    let isnan_store =
+        UOp::from_operation(Operation::Store, None, vec![output.clone(), nan.clone()]);
     if scoped_compare_value_plan(
         &isnan_store,
         sm,
@@ -2365,13 +2377,13 @@ fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorage
     let Some(outer) = store.sources().get(1) else {
         return Ok(None);
     };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = outer.kind() else {
+    let Operation::GraphCompare(crate::CompareOp::Ne) = outer.operation() else {
         return Ok(None);
     };
     let [cast, truth] = outer.sources() else {
         return Ok(None);
     };
-    let UOpKind::Cast = cast.kind() else {
+    let Operation::Cast = cast.operation() else {
         return Ok(None);
     };
     let [inner] = cast.sources() else {
@@ -2380,26 +2392,23 @@ fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorage
     if outer.ty().map(|t| t.scalar) != Some(DType::Bool)
         || cast.ty().map(|t| t.scalar) != Some(DType::Bool)
         || inner.ty().map(|t| t.scalar) != Some(DType::Bool)
-        || !matches!(inner.kind(), UOpKind::GraphCompare(crate::CompareOp::Lt))
-        || !matches!(truth.kind(), UOpKind::Const)
         || !matches!(
-            truth.arg(),
-            UArgRef::Scalar {
-                dtype: &DType::Bool,
-                bits: &1
-            }
+            inner.operation(),
+            Operation::GraphCompare(crate::CompareOp::Lt)
+        )
+        || !matches!(truth.operation(), Operation::Const(_))
+        || !matches!(
+            truth.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            })
         )
         || truth.ty().map(|t| t.scalar) != Some(DType::Bool)
     {
         return Ok(None);
     }
-    let proof = UOp::try_new(
-        UOpKind::Store,
-        None,
-        vec![output.clone(), inner.clone()],
-        UArg::None,
-    )
-    .unwrap();
+    let proof = UOp::from_operation(Operation::Store, None, vec![output.clone(), inner.clone()]);
     if scoped_compare_value_plan(
         &proof,
         sm,
@@ -2433,15 +2442,15 @@ fn scoped_select_predicate_shape(
     domain_shape: &Shape,
     sm: u32,
 ) -> Result<Option<Shape>, PtxError> {
-    match value.kind() {
-        UOpKind::GraphCompare(crate::CompareOp::Eq) => {
+    match value.operation() {
+        Operation::GraphCompare(crate::CompareOp::Eq) => {
             scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Eq)
         }
-        UOpKind::GraphCompare(crate::CompareOp::Lt) => {
+        Operation::GraphCompare(crate::CompareOp::Lt) => {
             scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Lt)
         }
-        UOpKind::GraphCompare(crate::CompareOp::Ne) => {
-            if matches!(value.sources(), [left, right] if matches!(left.kind(), UOpKind::Load | UOpKind::Cast) && matches!(right.kind(), UOpKind::Load | UOpKind::Cast))
+        Operation::GraphCompare(crate::CompareOp::Ne) => {
+            if matches!(value.sources(), [left, right] if matches!(left.operation(), Operation::Load | Operation::Cast) && matches!(right.operation(), Operation::Load | Operation::Cast))
                 && let Some(shape) =
                     scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Ne)?
             {
@@ -2450,7 +2459,7 @@ fn scoped_select_predicate_shape(
             let [cast, truth] = value.sources() else {
                 return Ok(None);
             };
-            let UOpKind::Cast = cast.kind() else {
+            let Operation::Cast = cast.operation() else {
                 return Ok(None);
             };
             let [inner] = cast.sources() else {
@@ -2459,23 +2468,23 @@ fn scoped_select_predicate_shape(
             if value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 || inner.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-                || !matches!(truth.kind(), UOpKind::Const)
+                || !matches!(truth.operation(), Operation::Const(_))
                 || !matches!(
-                    truth.arg(),
-                    UArgRef::Scalar {
-                        dtype: &DType::Bool,
-                        bits: &1
-                    }
+                    truth.operation(),
+                    Operation::Const(LiteralValue::Scalar {
+                        dtype: DType::Bool,
+                        bits: 1
+                    })
                 )
                 || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
             {
                 return Ok(None);
             }
-            match inner.kind() {
-                UOpKind::GraphCompare(crate::CompareOp::Lt) => {
+            match inner.operation() {
+                Operation::GraphCompare(crate::CompareOp::Lt) => {
                     scoped_compare_value_proof(inner, domain_shape, sm, crate::CompareOp::Lt)
                 }
-                UOpKind::GraphCompare(crate::CompareOp::Ne) => {
+                Operation::GraphCompare(crate::CompareOp::Ne) => {
                     scoped_compare_value_proof(inner, domain_shape, sm, crate::CompareOp::Ne)
                 }
                 _ => Ok(None),
@@ -2498,7 +2507,7 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    let UOpKind::Ternary(crate::uop::Ternary::Where) = value.kind() else {
+    let Operation::Ternary(crate::uop::Ternary::Where) = value.operation() else {
         return Ok(None);
     };
     let [condition, on_true, on_false] = value.sources() else {
@@ -2509,11 +2518,11 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public ReLU requires a concrete output buffer".into(),
@@ -2535,7 +2544,7 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
         ));
     }
 
-    let UOpKind::GraphCompare(crate::CompareOp::Lt) = condition.kind() else {
+    let Operation::GraphCompare(crate::CompareOp::Lt) = condition.operation() else {
         return Ok(None);
     };
     let [zero, input] = condition.sources() else {
@@ -2556,13 +2565,13 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
             "public ReLU predicate/payload dtypes are invalid".into(),
         ));
     }
-    if !matches!(zero.kind(), UOpKind::Const)
-        || !matches!(zero.arg(), UArgRef::Scalar { dtype, bits } if *dtype == output_dtype && *bits == 0)
+    if !matches!(zero.operation(), Operation::Const(_))
+        || !matches!(zero.operation(), Operation::Const(LiteralValue::Scalar { dtype, bits }) if *dtype == output_dtype && *bits == 0)
         || !zero.sources().is_empty()
     {
         return Ok(None);
     }
-    let UOpKind::Load = input.kind() else {
+    let Operation::Load = input.operation() else {
         return Ok(None);
     };
     let [input_index] = input.sources() else {
@@ -2570,12 +2579,12 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
             "public ReLU input load needs one index".into(),
         ));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: input_elements,
         input_shape,
         output_shape: input_output_shape,
         ..
-    } = input_index.arg()
+    }) = input_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "public ReLU does not admit affine-view input".into(),
@@ -2620,7 +2629,7 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    let UOpKind::Ternary(crate::uop::Ternary::Where) = value.kind() else {
+    let Operation::Ternary(crate::uop::Ternary::Where) = value.operation() else {
         return Ok(None);
     };
     let [condition, scaled, input_value] = value.sources() else {
@@ -2631,11 +2640,11 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public LeakyReLU requires a concrete output buffer".into(),
@@ -2656,7 +2665,7 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
         ));
     }
 
-    let UOpKind::GraphCompare(crate::CompareOp::Lt) = condition.kind() else {
+    let Operation::GraphCompare(crate::CompareOp::Lt) = condition.operation() else {
         return Ok(None);
     };
     let [predicate_input, zero] = condition.sources() else {
@@ -2664,7 +2673,7 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
             "public LeakyReLU ordered predicate needs two inputs".into(),
         ));
     };
-    let UOpKind::GraphBinary(crate::BinaryOp::Mul) = scaled.kind() else {
+    let Operation::GraphBinary(crate::BinaryOp::Mul) = scaled.operation() else {
         return Ok(None);
     };
     let [slope_value, scaled_input] = scaled.sources() else {
@@ -2678,15 +2687,15 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
     if condition.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || scaled.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || input_value.ty().map(|ty| ty.scalar) != Some(output_dtype)
-        || !matches!(zero.kind(), UOpKind::Const)
-        || !matches!(zero.arg(), UArgRef::Scalar { bits, .. } if *bits == 0)
+        || !matches!(zero.operation(), Operation::Const(_))
+        || !matches!(zero.operation(), Operation::Const(LiteralValue::Scalar { bits, .. }) if *bits == 0)
         || !zero.sources().is_empty()
     {
         return Ok(None);
     }
 
     fn direct_load<'a>(node: &'a UOp, role: &str) -> Result<&'a UOp, PtxError> {
-        if !matches!(node.kind(), UOpKind::Load) {
+        if !matches!(node.operation(), Operation::Load) {
             return Err(PtxError::Unsupported(format!(
                 "public LeakyReLU {role} must be a direct load"
             )));
@@ -2694,9 +2703,9 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
         Ok(node)
     }
     fn source_value<'a>(node: &'a UOp, role: &str) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
-        match node.kind() {
-            UOpKind::Load => Ok((node, None)),
-            UOpKind::Cast => {
+        match node.operation() {
+            Operation::Load => Ok((node, None)),
+            Operation::Cast => {
                 let [load] = node.sources() else {
                     return Err(PtxError::Unsupported(format!(
                         "public LeakyReLU {role} Cast needs one input"
@@ -2719,12 +2728,12 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
                 "public LeakyReLU {role} load needs one index"
             )));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(format!(
                 "public LeakyReLU {role} does not admit affine views"
@@ -2824,11 +2833,11 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
             "Clamp Store needs index and value".into(),
         ));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported("Clamp needs concrete output".into()));
     };
@@ -2859,13 +2868,13 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         target: DType,
         domain: &Shape,
     ) -> Result<(DType, &'a Shape), PtxError> {
-        let (load, cast) = match node.kind() {
-            UOpKind::Load => (node, None),
-            UOpKind::Cast => {
+        let (load, cast) = match node.operation() {
+            Operation::Load => (node, None),
+            Operation::Cast => {
                 let [load] = node.sources() else {
                     return Err(PtxError::Unsupported("Clamp Cast arity".into()));
                 };
-                if !matches!(load.kind(), UOpKind::Load) {
+                if !matches!(load.operation(), Operation::Load) {
                     return Err(PtxError::Unsupported("Clamp Cast needs direct load".into()));
                 }
                 (load, Some(node))
@@ -2879,12 +2888,12 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         let [index] = load.sources() else {
             return Err(PtxError::Unsupported("Clamp load arity".into()));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(
                 "Clamp does not admit affine views".into(),
@@ -2907,13 +2916,13 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         Ok((source, input_shape))
     }
     fn parts(node: &UOp) -> Result<(&UOp, &UOp, &UOp, &UOp, &UOp, DType), PtxError> {
-        let UOpKind::Ternary(crate::uop::Ternary::Where) = node.kind() else {
+        let Operation::Ternary(crate::uop::Ternary::Where) = node.operation() else {
             return Err(PtxError::Unsupported("Clamp stage needs Select".into()));
         };
         let [condition, bound, value] = node.sources() else {
             return Err(PtxError::Unsupported("Clamp Select arity".into()));
         };
-        let UOpKind::GraphCompare(crate::CompareOp::Lt) = condition.kind() else {
+        let Operation::GraphCompare(crate::CompareOp::Lt) = condition.operation() else {
             return Err(PtxError::Unsupported("Clamp needs ordered Lt".into()));
         };
         let [left, right] = condition.sources() else {
@@ -2970,16 +2979,19 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         // The upper-only root has a leaf value. The two-bound root is the
         // only permitted nested form: its value is the exact lower Select,
         // optionally followed by the required next-stage source-LUB cast.
-        let lower = match value.kind() {
-            UOpKind::Ternary(crate::uop::Ternary::Where) => Some((value, false)),
-            UOpKind::Cast => {
+        let lower = match value.operation() {
+            Operation::Ternary(crate::uop::Ternary::Where) => Some((value, false)),
+            Operation::Cast => {
                 let [inner] = value.sources() else {
                     return Err(PtxError::Unsupported(
                         "Clamp intermediate Cast arity".into(),
                     ));
                 };
-                matches!(inner.kind(), UOpKind::Ternary(crate::uop::Ternary::Where))
-                    .then_some((inner, true))
+                matches!(
+                    inner.operation(),
+                    Operation::Ternary(crate::uop::Ternary::Where)
+                )
+                .then_some((inner, true))
             }
             _ => None,
         };
@@ -3054,7 +3066,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    let UOpKind::Ternary(crate::uop::Ternary::Where) = value.kind() else {
+    let Operation::Ternary(crate::uop::Ternary::Where) = value.operation() else {
         return Ok(None);
     };
     let [condition, on_true, on_false] = value.sources() else {
@@ -3065,11 +3077,11 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output.arg()
+    }) = output.operation()
     else {
         return Err(PtxError::Unsupported(
             "public Select requires a concrete output buffer".into(),
@@ -3090,7 +3102,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         ));
     }
     fn direct_load<'a>(node: &'a UOp, role: &str) -> Result<&'a UOp, PtxError> {
-        if !matches!(node.kind(), UOpKind::Load) {
+        if !matches!(node.operation(), Operation::Load) {
             return Err(PtxError::Unsupported(format!(
                 "public Select {role} must be a direct load"
             )));
@@ -3098,15 +3110,15 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         Ok(node)
     }
     fn payload(node: &UOp) -> Result<(&UOp, Option<&UOp>), PtxError> {
-        match node.kind() {
-            UOpKind::Load => Ok((node, None)),
-            UOpKind::Cast => {
+        match node.operation() {
+            Operation::Load => Ok((node, None)),
+            Operation::Cast => {
                 let [load] = node.sources() else {
                     return Err(PtxError::Unsupported(
                         "public Select Cast needs one input".into(),
                     ));
                 };
-                if !matches!(load.kind(), UOpKind::Load) {
+                if !matches!(load.operation(), Operation::Load) {
                     return Err(PtxError::Unsupported(
                         "public Select Cast must consume a direct load".into(),
                     ));
@@ -3124,12 +3136,12 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
                 "public Select {role} load needs one index"
             )));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(format!(
                 "public Select {role} does not admit affine views"
@@ -3151,7 +3163,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         Ok(index)
     }
 
-    let (condition_shape, condition_dtype) = if matches!(condition.kind(), UOpKind::Load) {
+    let (condition_shape, condition_dtype) = if matches!(condition.operation(), Operation::Load) {
         let condition = direct_load(condition, "condition")?;
         let dtype = condition
             .ty()
@@ -3163,8 +3175,8 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
             ));
         }
         let index = index(condition, output_shape, "condition")?;
-        let shape = match index.arg() {
-            UArgRef::BufferIndex { input_shape, .. } => input_shape.clone(),
+        let shape = match index.operation() {
+            Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape.clone(),
             _ => unreachable!(),
         };
         (shape, dtype)
@@ -3217,8 +3229,8 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
     let true_index = index(true_load, output_shape, "true payload")?;
     let false_index = index(false_load, output_shape, "false payload")?;
     fn input_shape(index: &UOp) -> &Shape {
-        match index.arg() {
-            UArgRef::BufferIndex { input_shape, .. } => input_shape,
+        match index.operation() {
+            Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
             _ => unreachable!(),
         }
     }
@@ -3255,7 +3267,7 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    let UOpKind::GraphBinary(crate::BinaryOp::Mul) = value.kind() else {
+    let Operation::GraphBinary(crate::BinaryOp::Mul) = value.operation() else {
         return Ok(None);
     };
     let [dividend, reciprocal] = value.sources() else {
@@ -3263,7 +3275,7 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
             "public Div Mul needs two inputs".into(),
         ));
     };
-    let UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.kind() else {
+    let Operation::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.operation() else {
         return Ok(None);
     };
     let [divisor] = reciprocal.sources() else {
@@ -3274,11 +3286,11 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output_index.arg()
+    }) = output_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "public Div requires a concrete output buffer".into(),
@@ -3316,7 +3328,7 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
         targets: &[DType],
     ) -> Result<&'a UOp, PtxError> {
         for target in targets.iter().rev() {
-            let UOpKind::Cast = node.kind() else {
+            let Operation::Cast = node.operation() else {
                 return Err(PtxError::Unsupported(
                     "public Div is missing a required source cast".into(),
                 ));
@@ -3333,7 +3345,8 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
             };
             node = input;
         }
-        if !matches!(node.kind(), UOpKind::Load) || node.ty().map(|ty| ty.scalar) != Some(original)
+        if !matches!(node.operation(), Operation::Load)
+            || node.ty().map(|ty| ty.scalar) != Some(original)
         {
             return Err(PtxError::Unsupported(
                 "public Div needs direct typed input loads".into(),
@@ -3347,12 +3360,12 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
                 "public Div load needs one index".into(),
             ));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(
                 "public Div does not admit affine-view inputs".into(),
@@ -3376,7 +3389,7 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     // `dividend` can itself be a Cast chain, so recover its original dtype by
     // walking to the direct load before calculating the public LUB.
     fn load_dtype(mut node: &UOp) -> Result<DType, PtxError> {
-        while matches!(node.kind(), UOpKind::Cast) {
+        while matches!(node.operation(), Operation::Cast) {
             let [input] = node.sources() else {
                 return Err(PtxError::Unsupported(
                     "public Div Cast needs one input".into(),
@@ -3384,7 +3397,7 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
             };
             node = input;
         }
-        if !matches!(node.kind(), UOpKind::Load) {
+        if !matches!(node.operation(), Operation::Load) {
             return Err(PtxError::Unsupported(
                 "public Div needs direct input loads".into(),
             ));
@@ -3434,12 +3447,12 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     let rhs_load = path(divisor, rhs_dtype, &rhs_targets)?;
     let lhs_index = index(lhs_load, output_shape)?;
     let rhs_index = index(rhs_load, output_shape)?;
-    let lhs_shape = match lhs_index.arg() {
-        UArgRef::BufferIndex { input_shape, .. } => input_shape,
+    let lhs_shape = match lhs_index.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
-    let rhs_shape = match rhs_index.arg() {
-        UArgRef::BufferIndex { input_shape, .. } => input_shape,
+    let rhs_shape = match rhs_index.operation() {
+        Operation::Index(IndexValue::Buffer { input_shape, .. }) => input_shape,
         _ => unreachable!(),
     };
     if lhs_shape
@@ -3479,18 +3492,18 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    let UOpKind::GraphBinary(crate::BinaryOp::Add) = value.kind() else {
+    let Operation::GraphBinary(crate::BinaryOp::Add) = value.operation() else {
         return Ok(None);
     };
     let [lhs, not_rhs] = value.sources() else {
         return Err(PtxError::Unsupported("Bool Sub needs two inputs".into()));
     };
-    let UOpKind::Load = lhs.kind() else {
+    let Operation::Load = lhs.operation() else {
         return Err(PtxError::Unsupported(
             "Bool Sub lhs must be a direct load".into(),
         ));
     };
-    let UOpKind::GraphLogical(crate::LogicalOp::Not) = not_rhs.kind() else {
+    let Operation::GraphLogical(crate::LogicalOp::Not) = not_rhs.operation() else {
         return Err(PtxError::Unsupported(
             "Bool Sub rhs must be LogicalNot".into(),
         ));
@@ -3500,7 +3513,7 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
             "Bool Sub Not must have one input".into(),
         ));
     };
-    if !matches!(rhs.kind(), UOpKind::Load)
+    if !matches!(rhs.operation(), Operation::Load)
         || lhs.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || rhs.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || not_rhs.ty().map(|ty| ty.scalar) != Some(DType::Bool)
@@ -3513,11 +3526,11 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         elements: output_elements,
         output_shape,
         ..
-    } = output_index.arg()
+    }) = output_index.operation()
     else {
         return Err(PtxError::Unsupported(
             "Bool Sub requires a concrete output".into(),
@@ -3539,12 +3552,12 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
                 "Bool Sub load needs one index".into(),
             ));
         };
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             elements,
             input_shape,
             output_shape,
             ..
-        } = index.arg()
+        }) = index.operation()
         else {
             return Err(PtxError::Unsupported(
                 "Bool Sub does not admit affine-view operands".into(),
@@ -4131,7 +4144,7 @@ fn emit(
     map.insert(id, lines.len() + 1);
     let ty = n
         .ty()
-        .ok_or_else(|| PtxError::Unsupported(format!("untyped {:?}", n.kind())))?
+        .ok_or_else(|| PtxError::Unsupported(format!("untyped {:?}", n.operation())))?
         .scalar;
     if allow_reduction_narrow {
         reject_reduction_storage_dtype(ty)?;
@@ -4143,7 +4156,10 @@ fn emit(
     let mut child = |i| emit(&n.sources()[i], ids, lines, map, linear, options);
     let dst = match ty {
         _ if storage_mode == Some(ScopedStorageMode::Rsqrt)
-            && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)) =>
+            && matches!(
+                n.operation(),
+                Operation::GraphUnary(crate::UnaryOp::Reciprocal)
+            ) =>
         {
             format!("%fd{id}")
         }
@@ -4156,8 +4172,8 @@ fn emit(
                     | ScopedStorageMode::SqrtCast
             )
         ) && matches!(
-            n.kind(),
-            UOpKind::GraphUnary(crate::UnaryOp::Reciprocal | crate::UnaryOp::Sqrt)
+            n.operation(),
+            Operation::GraphUnary(crate::UnaryOp::Reciprocal | crate::UnaryOp::Sqrt)
         ) =>
         {
             format!("%fd{id}")
@@ -4174,8 +4190,8 @@ fn emit(
                     | ScopedStorageMode::OrderedLt
             )
         ) && matches!(
-            n.kind(),
-            UOpKind::GraphBinary(
+            n.operation(),
+            Operation::GraphBinary(
                 crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub
             )
         ) && ty.is_float() =>
@@ -4185,15 +4201,15 @@ fn emit(
         DType::F16 | DType::BF16
             if storage_mode == Some(ScopedStorageMode::Neg)
                 && matches!(
-                    n.kind(),
-                    UOpKind::Load | UOpKind::GraphUnary(crate::UnaryOp::Neg)
+                    n.operation(),
+                    Operation::Load | Operation::GraphUnary(crate::UnaryOp::Neg)
                 ) =>
         {
             format!("%r{id}")
         }
         DType::F16 | DType::BF16
             if storage_mode == Some(ScopedStorageMode::Sign)
-                && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Sign)) =>
+                && matches!(n.operation(), Operation::GraphUnary(crate::UnaryOp::Sign)) =>
         {
             format!("%r{id}")
         }
@@ -4201,7 +4217,7 @@ fn emit(
             if matches!(
                 storage_mode,
                 Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite)
-            ) && matches!(n.kind(), UOpKind::Load) =>
+            ) && matches!(n.operation(), Operation::Load) =>
         {
             format!("%r{id}")
         }
@@ -4225,42 +4241,41 @@ fn emit(
         DType::Bool => format!("%r{id}"),
         _ => format!("%r{id}"),
     };
-    match n.kind() {
-        UOpKind::Const => match n.arg() {
-            UArgRef::Int(v) => lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty))),
-            UArgRef::Scalar { dtype, bits } if *dtype == ty => {
-                // Bool is logically one bit but PTX tensors store it in an
-                // addressable byte.  A scalar Bool literal must use that
-                // physical width as well; `mov.b1` is not a valid register
-                // operation and would lose the canonical UOp Const boundary.
-                let width = (dtype.itemsize() * 8) as u8;
-                let digits = width as usize / 4;
-                lines.push(format!("  mov.b{width} {dst}, 0x{bits:0digits$x};"));
-            }
-            UArgRef::Scalar { .. } => {
-                return Err(PtxError::Unsupported("scalar literal/type mismatch".into()));
-            }
-            _ => return Err(PtxError::Unsupported("invalid constant".into())),
-        },
-        UOpKind::Load => {
+    match n.operation() {
+        Operation::Const(LiteralValue::Int(v)) => {
+            lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty)))
+        }
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) if *dtype == ty => {
+            // Bool is logically one bit but PTX tensors store it in an
+            // addressable byte.  A scalar Bool literal must use that
+            // physical width as well; `mov.b1` is not a valid register
+            // operation and would lose the canonical UOp Const boundary.
+            let width = (dtype.itemsize() * 8) as u8;
+            let digits = width as usize / 4;
+            lines.push(format!("  mov.b{width} {dst}, 0x{bits:0digits$x};"));
+        }
+        Operation::Const(LiteralValue::Scalar { .. }) => {
+            return Err(PtxError::Unsupported("scalar literal/type mismatch".into()));
+        }
+        Operation::Load => {
             let ix = n
                 .sources()
                 .first()
                 .ok_or_else(|| PtxError::Unsupported("Load without index".into()))?;
-            let (buffer, input_shape, output_shape, view) = match ix.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, output_shape, view) = match ix.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                } => (buffer, input_shape, output_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (buffer, input_shape, output_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                } => (buffer, input_shape, output_shape, Some(view)),
+                }) => (buffer, input_shape, output_shape, Some(view)),
                 _ => return Err(PtxError::Unsupported("Load index".into())),
             };
             let b = ids[buffer] + 1;
@@ -4320,7 +4335,7 @@ fn emit(
                 _ => lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty))),
             }
         }
-        UOpKind::Cast
+        Operation::Cast
             if matches!(
                 storage_mode,
                 Some(
@@ -4385,7 +4400,7 @@ fn emit(
                 emit_typed_binary_cast(lines, &dst, a, source, ty)?;
             }
         }
-        UOpKind::Cast => {
+        Operation::Cast => {
             let a = child(0)?;
             lines.push(format!(
                 "  cvt.{}.{} {dst}, {a};",
@@ -4393,19 +4408,19 @@ fn emit(
                 ptx_type(n.sources()[0].ty().unwrap().scalar)
             ));
         }
-        UOpKind::GraphUnary(op) => {
+        Operation::GraphUnary(op) => {
             // Keep this deliberately narrower than the CPU interpreter.  PTX
             // has exact scalar `neg` and `abs` instructions, including the
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
-            if op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Sub) {
+            if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Sub) {
                 // The whole-root proof owns this exact `Add(lhs, Neg(rhs))`
                 // composition. The enclosing Add emits one typed Sub, so the
                 // structural Neg contributes its source value unchanged.
                 return Ok(a);
             }
-            if op == crate::UnaryOp::IsInf
+            if *op == crate::UnaryOp::IsInf
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite)
@@ -4423,7 +4438,7 @@ fn emit(
                 emit_isinf_predicate(lines, &dst, a, source_dtype);
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Reciprocal
+            if *op == crate::UnaryOp::Reciprocal
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
@@ -4445,7 +4460,7 @@ fn emit(
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Sqrt
+            if *op == crate::UnaryOp::Sqrt
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast)
@@ -4468,7 +4483,7 @@ fn emit(
                 lines.push(format!("  sqrt.rn.f64 {dst}, {wide};"));
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Sqrt && storage_mode == Some(ScopedStorageMode::Rsqrt) {
+            if *op == crate::UnaryOp::Sqrt && storage_mode == Some(ScopedStorageMode::Rsqrt) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Sqrt input".into()))?
@@ -4476,7 +4491,7 @@ fn emit(
                 emit_rsqrt_sqrt_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Rsqrt) {
+            if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Rsqrt) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Reciprocal input".into()))?
@@ -4490,7 +4505,7 @@ fn emit(
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Div) {
+            if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Div) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| {
@@ -4500,7 +4515,7 @@ fn emit(
                 emit_div_reciprocal_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
+            if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
                 match ty {
                     DType::I8 | DType::I16 | DType::I32 => {
                         lines.push(format!("  neg.s32 {dst}, {a};"));
@@ -4528,7 +4543,7 @@ fn emit(
                 }
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Sign {
+            if *op == crate::UnaryOp::Sign {
                 // Sign is source-equivalent to ordered comparisons and
                 // selects, rather than PTX's host-dependent `sign` intrinsic.
                 // In particular, both zero signs produce +0 and unordered
@@ -4619,10 +4634,10 @@ fn emit(
             };
             lines.push(format!("  {mnemonic}.{} {dst}, {a};", ptx_type(ty)));
         }
-        UOpKind::GraphBinary(op) => {
+        Operation::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
             if storage_mode == Some(ScopedStorageMode::LeakyRelu) {
-                if op != crate::BinaryOp::Mul {
+                if *op != crate::BinaryOp::Mul {
                     return Err(PtxError::Unsupported(
                         "public LeakyReLU requires only its slope * input branch".into(),
                     ));
@@ -4707,9 +4722,10 @@ fn emit(
                 op,
                 crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub
             ) {
-                let is_sub = op == crate::BinaryOp::Sub
-                    || (storage_mode == Some(ScopedStorageMode::Sub) && op == crate::BinaryOp::Add);
-                let is_add = op == crate::BinaryOp::Add && !is_sub;
+                let is_sub = *op == crate::BinaryOp::Sub
+                    || (storage_mode == Some(ScopedStorageMode::Sub)
+                        && *op == crate::BinaryOp::Add);
+                let is_add = *op == crate::BinaryOp::Add && !is_sub;
                 match ty {
                     DType::Bool if is_add => lines.push(format!("  or.b32 {dst}, {a}, {b};")),
                     DType::Bool if !is_sub => lines.push(format!("  and.b32 {dst}, {a}, {b};")),
@@ -4790,7 +4806,7 @@ fn emit(
                 }
                 return Ok(dst);
             }
-            if storage_mode == Some(ScopedStorageMode::Abs) && op == crate::BinaryOp::Mul {
+            if storage_mode == Some(ScopedStorageMode::Abs) && *op == crate::BinaryOp::Mul {
                 let mnemonic = match ty {
                     DType::Bool => {
                         lines.push(format!("  and.b32 {dst}, {a}, {b};"));
@@ -4836,7 +4852,7 @@ fn emit(
                 // Ordered predicates select rhs only when it strictly wins.
                 // Equality, signed-zero ties, and every unordered NaN case
                 // retain lhs and its exact stored payload.
-                let predicate = if op == crate::BinaryOp::Maximum {
+                let predicate = if *op == crate::BinaryOp::Maximum {
                     "lt"
                 } else {
                     "gt"
@@ -4874,7 +4890,7 @@ fn emit(
                         "ordered maximum/minimum for narrow float lacks an exact PTX path".into(),
                     ));
                 }
-                let predicate = if op == crate::BinaryOp::Maximum {
+                let predicate = if *op == crate::BinaryOp::Maximum {
                     "lt"
                 } else {
                     "gt"
@@ -4915,7 +4931,7 @@ fn emit(
             };
             lines.push(format!("  {mnemonic}.{} {dst}, {a}, {b};", ptx_type(ty)));
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let (a, b) = (child(0)?, child(1)?);
             if matches!(
                 storage_mode,
@@ -4926,12 +4942,12 @@ fn emit(
                         | ScopedStorageMode::Clamp
                 )
             ) {
-                if storage_mode == Some(ScopedStorageMode::Relu) && op != crate::CompareOp::Lt {
+                if storage_mode == Some(ScopedStorageMode::Relu) && *op != crate::CompareOp::Lt {
                     return Err(PtxError::Unsupported(
                         "public ReLU requires ordered zero < input".into(),
                     ));
                 }
-                if storage_mode == Some(ScopedStorageMode::LeakyRelu) && op != crate::CompareOp::Lt
+                if storage_mode == Some(ScopedStorageMode::LeakyRelu) && *op != crate::CompareOp::Lt
                 {
                     return Err(PtxError::Unsupported(
                         "public LeakyReLU requires ordered input < zero".into(),
@@ -5013,7 +5029,7 @@ fn emit(
                 return Ok(dst);
             }
             if storage_mode == Some(ScopedStorageMode::LogicalNot) {
-                if op != crate::CompareOp::Ne
+                if *op != crate::CompareOp::Ne
                     || n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                     || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 {
@@ -5030,12 +5046,12 @@ fn emit(
                 return Ok(dst);
             }
             if storage_mode == Some(ScopedStorageMode::IsFinite) {
-                if op != crate::CompareOp::Ne {
+                if *op != crate::CompareOp::Ne {
                     return Err(PtxError::Unsupported(
                         "scoped IsFinite has a non-Ne comparison".into(),
                     ));
                 }
-                if matches!(n.sources()[1].kind(), UOpKind::Const) {
+                if matches!(n.sources()[1].operation(), Operation::Const(_)) {
                     if n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                         || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                     {
@@ -5083,8 +5099,8 @@ fn emit(
                     crate::CompareOp::Lt
                 };
                 let public_eq_stage =
-                    storage_mode == Some(ScopedStorageMode::Eq) && op == crate::CompareOp::Ne;
-                if op != expected && !public_eq_stage {
+                    storage_mode == Some(ScopedStorageMode::Eq) && *op == crate::CompareOp::Ne;
+                if *op != expected && !public_eq_stage {
                     return Err(PtxError::Unsupported(
                         "scoped predicate does not match its root plan".into(),
                     ));
@@ -5140,14 +5156,14 @@ fn emit(
             ));
             lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
         }
-        UOpKind::GraphLogical(crate::LogicalOp::Not)
+        Operation::GraphLogical(crate::LogicalOp::Not)
             if storage_mode == Some(ScopedStorageMode::NegBool) =>
         {
             let a = child(0)?;
             lines.push(format!("  setp.eq.u8 %p1, {a}, 0;"));
             lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
         }
-        UOpKind::GraphLogical(crate::LogicalOp::Or)
+        Operation::GraphLogical(crate::LogicalOp::Or)
             if storage_mode == Some(ScopedStorageMode::IsFinite) =>
         {
             let (a, b) = (child(0)?, child(1)?);
@@ -5161,14 +5177,14 @@ fn emit(
             }
             lines.push(format!("  or.b32 {dst}, {a}, {b};"));
         }
-        UOpKind::GraphLogical(crate::LogicalOp::Not)
+        Operation::GraphLogical(crate::LogicalOp::Not)
             if storage_mode == Some(ScopedStorageMode::SubBool) =>
         {
             let a = child(0)?;
             lines.push(format!("  setp.eq.u8 %p1, {a}, 0;"));
             lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             let (p, a, b) = (child(0)?, child(1)?, child(2)?);
             lines.push(format!("  setp.ne.u32 %p2, {p}, 0;"));
             if matches!(
@@ -5204,7 +5220,7 @@ fn emit(
                 lines.push(format!("  selp.{} {dst}, {a}, {b}, %p2;", ptx_type(ty)));
             }
         }
-        _ => return Err(PtxError::Unsupported(format!("{:?}", n.kind()))),
+        _ => return Err(PtxError::Unsupported(format!("{:?}", n.operation()))),
     };
     Ok(dst)
 }
@@ -5305,7 +5321,7 @@ fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
     let Some(finalize) = store
         .sources()
         .get(1)
-        .filter(|node| matches!(node.kind(), UOpKind::ReduceFinalize))
+        .filter(|node| matches!(node.operation(), Operation::ReduceFinalize))
     else {
         return Ok(None);
     };
@@ -5317,14 +5333,14 @@ fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
         .sources()
         .first()
         .ok_or_else(|| PtxError::Unsupported("reduction update without init".into()))?;
-    let UArgRef::Reduction {
+    let Operation::ReduceInit(ReductionValue {
         input_shape,
         output_shape,
         axes,
         keepdim,
         kind,
         mean,
-    } = init.arg()
+    }) = init.operation()
     else {
         return Err(PtxError::Unsupported("reduction metadata".into()));
     };
@@ -6838,17 +6854,15 @@ mod tests {
 
     fn global(dtype: DType, buffer: u64) -> UOp {
         let element = UType::scalar(dtype);
-        UOp::try_new(
-            UOpKind::DefineGlobal,
-            Some(element),
-            vec![],
-            UArg::Address {
+        UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
                 space: AddressSpace::Global,
                 name: format!("b{buffer}"),
                 element,
-            },
+            }),
+            Some(element),
+            vec![],
         )
-        .unwrap()
     }
 
     #[test]
@@ -7315,106 +7329,90 @@ mod tests {
     fn kernel(dtype: DType) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let addr = global(dtype, 1);
-        let ix = UOp::try_new(
-            UOpKind::Index,
-            Some(UType::scalar(dtype)),
-            vec![addr, range],
-            UArg::BufferIndex {
+        let ix = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 1,
                 elements: 4,
                 input_shape: crate::Shape::new(vec![4]),
                 output_shape: crate::Shape::new(vec![4]),
-            },
-        )
-        .unwrap();
-        let load = UOp::try_new(
-            UOpKind::Load,
+            }),
+            Some(UType::scalar(dtype)),
+            vec![addr, range],
+        );
+        let load = UOp::from_operation(
+            Operation::Load,
             Some(UType::scalar(dtype)),
             vec![ix.clone()],
-            UArg::None,
-        )
-        .unwrap();
-        let value = UOp::try_new(
-            UOpKind::GraphBinary(crate::BinaryOp::Add),
+        );
+        let value = UOp::from_operation(
+            Operation::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![load, UOp::constant(1, UType::scalar(dtype))],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(UOpKind::Store, None, vec![ix, value], UArg::None).unwrap(),
-        ])
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![ix, value],
+        )])
     }
     fn unary_kernel(dtype: DType, op: crate::UnaryOp, shape: crate::Shape) -> UOp {
         let elements = shape.numel().unwrap();
         let range = UOp::constant(elements as i64, UType::scalar(DType::I64));
-        let index = UOp::try_new(
-            UOpKind::Index,
-            Some(UType::scalar(dtype)),
-            vec![global(dtype, 1), range],
-            UArg::BufferIndex {
+        let index = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 1,
                 elements,
                 input_shape: shape.clone(),
                 output_shape: shape,
-            },
-        )
-        .unwrap();
-        let value = UOp::try_new(
-            UOpKind::GraphUnary(op),
+            }),
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::try_new(
-                    UOpKind::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![index.clone()],
-                    UArg::None,
-                )
-                .unwrap(),
-            ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(UOpKind::Store, None, vec![index, value], UArg::None).unwrap(),
-        ])
+            vec![global(dtype, 1), range],
+        );
+        let value = UOp::from_operation(
+            Operation::GraphUnary(op),
+            Some(UType::scalar(dtype)),
+            vec![UOp::from_operation(
+                Operation::Load,
+                Some(UType::scalar(dtype)),
+                vec![index.clone()],
+            )],
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![index, value],
+        )])
     }
     fn broadcast_unary_kernel(dtype: DType, op: crate::UnaryOp) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer, input_shape: crate::Shape| {
-            UOp::try_new(
-                UOpKind::Index,
-                Some(UType::scalar(dtype)),
-                vec![global(dtype, buffer), range.clone()],
-                UArg::BufferIndex {
+            UOp::from_operation(
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements: input_shape.numel().unwrap(),
                     input_shape,
                     output_shape: crate::Shape::new(vec![2, 2]),
-                },
+                }),
+                Some(UType::scalar(dtype)),
+                vec![global(dtype, buffer), range.clone()],
             )
-            .unwrap()
         };
         let input = index(1, crate::Shape::new(vec![1, 2]));
         let output = index(2, crate::Shape::new(vec![2, 2]));
-        let value = UOp::try_new(
-            UOpKind::GraphUnary(op),
+        let value = UOp::from_operation(
+            Operation::GraphUnary(op),
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::try_new(
-                    UOpKind::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![input],
-                    UArg::None,
-                )
-                .unwrap(),
-            ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(UOpKind::Store, None, vec![output, value], UArg::None).unwrap(),
-        ])
+            vec![UOp::from_operation(
+                Operation::Load,
+                Some(UType::scalar(dtype)),
+                vec![input],
+            )],
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![output, value],
+        )])
     }
     fn static_view_unary_kernel(dtype: DType, op: crate::UnaryOp, offset: usize) -> UOp {
         let output_shape = crate::Shape::new(vec![2, 2]);
@@ -7425,94 +7423,72 @@ mod tests {
             offset,
         };
         let range = UOp::constant(4, UType::scalar(DType::I64));
-        let input = UOp::try_new(
-            UOpKind::Index,
-            Some(UType::scalar(dtype)),
-            vec![global(dtype, 1), range.clone()],
-            UArg::ViewBufferIndex {
+        let input = UOp::from_operation(
+            Operation::Index(IndexValue::View {
                 buffer: 1,
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape: output_shape.clone(),
                 view: view.into(),
-            },
-        )
-        .unwrap();
-        let output = UOp::try_new(
-            UOpKind::Index,
+            }),
             Some(UType::scalar(dtype)),
-            vec![global(dtype, 2), range],
-            UArg::BufferIndex {
+            vec![global(dtype, 1), range.clone()],
+        );
+        let output = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 2,
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape,
-            },
-        )
-        .unwrap();
-        let value = UOp::try_new(
-            UOpKind::GraphUnary(op),
+            }),
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::try_new(
-                    UOpKind::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![input],
-                    UArg::None,
-                )
-                .unwrap(),
-            ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(UOpKind::Store, None, vec![output, value], UArg::None).unwrap(),
-        ])
+            vec![global(dtype, 2), range],
+        );
+        let value = UOp::from_operation(
+            Operation::GraphUnary(op),
+            Some(UType::scalar(dtype)),
+            vec![UOp::from_operation(
+                Operation::Load,
+                Some(UType::scalar(dtype)),
+                vec![input],
+            )],
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![output, value],
+        )])
     }
     fn broadcast_add_kernel(dtype: DType) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer, shape: Vec<usize>| {
-            UOp::try_new(
-                UOpKind::Index,
-                Some(UType::scalar(dtype)),
-                vec![global(dtype, buffer), range.clone()],
-                UArg::BufferIndex {
+            UOp::from_operation(
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements: shape.iter().product(),
                     input_shape: crate::Shape::new(shape),
                     output_shape: crate::Shape::new(vec![2, 2]),
-                },
+                }),
+                Some(UType::scalar(dtype)),
+                vec![global(dtype, buffer), range.clone()],
             )
-            .unwrap()
         };
         let left = index(1, vec![2, 2]);
         let right = index(2, vec![1, 2]);
         let out = index(3, vec![2, 2]);
-        let add = UOp::try_new(
-            UOpKind::GraphBinary(crate::BinaryOp::Add),
+        let add = UOp::from_operation(
+            Operation::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![
-                UOp::try_new(
-                    UOpKind::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![left],
-                    UArg::None,
-                )
-                .unwrap(),
-                UOp::try_new(
-                    UOpKind::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![right],
-                    UArg::None,
-                )
-                .unwrap(),
+                UOp::from_operation(Operation::Load, Some(UType::scalar(dtype)), vec![left]),
+                UOp::from_operation(Operation::Load, Some(UType::scalar(dtype)), vec![right]),
             ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(UOpKind::Store, None, vec![out, add], UArg::None).unwrap(),
-        ])
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![out, add],
+        )])
     }
 
     fn static_view_add_kernel(dtype: DType, offset: usize) -> UOp {
@@ -7526,59 +7502,43 @@ mod tests {
         };
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer| {
-            UOp::try_new(
-                UOpKind::Index,
-                Some(UType::scalar(dtype)),
-                vec![global(dtype, buffer), range.clone()],
-                UArg::ViewBufferIndex {
+            UOp::from_operation(
+                Operation::Index(IndexValue::View {
                     buffer,
                     elements: 4,
                     input_shape: output_shape.clone(),
                     output_shape: output_shape.clone(),
                     view: view.clone().into(),
-                },
+                }),
+                Some(UType::scalar(dtype)),
+                vec![global(dtype, buffer), range.clone()],
             )
-            .unwrap()
         };
         let left = index(1);
         let right = index(2);
-        let output = UOp::try_new(
-            UOpKind::Index,
-            Some(UType::scalar(dtype)),
-            vec![global(dtype, 3), range],
-            UArg::BufferIndex {
+        let output = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 3,
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape,
-            },
-        )
-        .unwrap();
-        let value = UOp::try_new(
-            UOpKind::GraphBinary(crate::BinaryOp::Add),
+            }),
+            Some(UType::scalar(dtype)),
+            vec![global(dtype, 3), range],
+        );
+        let value = UOp::from_operation(
+            Operation::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![
-                UOp::try_new(
-                    UOpKind::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![left],
-                    UArg::None,
-                )
-                .unwrap(),
-                UOp::try_new(
-                    UOpKind::Load,
-                    Some(UType::scalar(dtype)),
-                    vec![right],
-                    UArg::None,
-                )
-                .unwrap(),
+                UOp::from_operation(Operation::Load, Some(UType::scalar(dtype)), vec![left]),
+                UOp::from_operation(Operation::Load, Some(UType::scalar(dtype)), vec![right]),
             ],
-            UArg::None,
-        )
-        .unwrap();
-        UOp::sink(vec![
-            UOp::try_new(UOpKind::Store, None, vec![output, value], UArg::None).unwrap(),
-        ])
+        );
+        UOp::sink(vec![UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![output, value],
+        )])
     }
 
     #[test]

@@ -5,10 +5,10 @@
 //! are checked separately from byte offsets, which keeps the ABI boundary
 //! explicit for future renderers.
 use crate::{
-    AddressValue, BinaryOp, CompareOp, DType, Error, Graph, IndexValue, LogicalOp, MatmulValue,
-    MovementValue, NodeId, Op, Operation, PrefixScanValue, ReductionValue, Result, Scalar, Shape,
-    SortValue, Storage, SymbolicShape, SymbolicVar, TensorData, TensorGuardValue, UArgRef, UOp,
-    UOpError, UOpKind, UType, UnaryOp,
+    AddressValue, BinaryOp, CompareOp, DType, Error, Graph, IndexValue, LiteralValue, LogicalOp,
+    MatmulValue, MovementValue, NodeId, Op, Operation, PrefixScanValue, ReductionValue, Result,
+    Scalar, Shape, SortValue, Storage, SymbolicShape, SymbolicVar, TensorData, TensorGuardValue,
+    UOp, UOpError, UType, UnaryOp,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -878,14 +878,16 @@ pub(crate) fn execute_lowered_elementwise(
     kernel: &UOp,
     bindings: &KernelBindings,
 ) -> Result<TensorData> {
-    if matches!(kernel.kind(), UOpKind::Random)
-        && let UArgRef::Random(plan) = kernel.arg()
-    {
+    if let Operation::Random(plan) = kernel.operation() {
         return plan.execute();
     }
-    if matches!(kernel.kind(), UOpKind::Matmul)
-        && let Some(plan) = kernel.arg().matmul_plan()
-    {
+    let matmul = match kernel.operation() {
+        Operation::Matmul(MatmulValue::Serial(plan)) => Some(plan.as_ref()),
+        Operation::Matmul(MatmulValue::Tiled(payload)) => Some(&payload.matmul),
+        Operation::Matmul(MatmulValue::TensorCore(payload)) => Some(&payload.matmul),
+        _ => None,
+    };
+    if let Some(plan) = matmul {
         let lhs = bindings
             .get(plan.lhs.index() as u64)
             .ok_or(Error::InvalidIndex)?;
@@ -901,10 +903,10 @@ pub(crate) fn execute_lowered_elementwise(
     let store = kernel
         .sources()
         .iter()
-        .find(|node| matches!(node.kind(), UOpKind::Store))
+        .find(|node| matches!(node.operation(), Operation::Store))
         .ok_or(Error::InvalidIndex)?;
     let index = store.sources().first().ok_or(Error::InvalidIndex)?;
-    let UArgRef::BufferIndex { output_shape, .. } = index.arg() else {
+    let Operation::Index(IndexValue::Buffer { output_shape, .. }) = index.operation() else {
         return Err(Error::InvalidIndex);
     };
     let output_dtype = index.ty().ok_or(Error::InvalidIndex)?.scalar;
@@ -990,28 +992,30 @@ fn direct_f32_to_bf16(
     len: usize,
 ) -> Result<Option<Vec<u16>>> {
     let value = store.sources().get(1).ok_or(Error::InvalidIndex)?;
-    if !matches!(value.kind(), UOpKind::Cast)
+    if !matches!(value.operation(), Operation::Cast)
         || value.ty().is_none_or(|ty| ty.scalar != DType::BF16)
     {
         return Ok(None);
     }
     let load = value.sources().first().ok_or(Error::InvalidIndex)?;
-    if !matches!(load.kind(), UOpKind::Load) || load.ty().is_none_or(|ty| ty.scalar != DType::F32) {
+    if !matches!(load.operation(), Operation::Load)
+        || load.ty().is_none_or(|ty| ty.scalar != DType::F32)
+    {
         return Ok(None);
     }
     let index = load.sources().first().ok_or(Error::InvalidIndex)?;
-    let (buffer, input_shape, view) = match index.arg() {
-        UArgRef::BufferIndex {
+    let (buffer, input_shape, view) = match index.operation() {
+        Operation::Index(IndexValue::Buffer {
             buffer,
             input_shape,
             ..
-        } => (*buffer, input_shape, None),
-        UArgRef::ViewBufferIndex {
+        }) => (*buffer, input_shape, None),
+        Operation::Index(IndexValue::View {
             buffer,
             input_shape,
             view,
             ..
-        } => (*buffer, input_shape, Some(view)),
+        }) => (*buffer, input_shape, Some(view)),
         _ => return Ok(None),
     };
     let data = bindings.get(buffer).ok_or(Error::InvalidIndex)?;
@@ -1099,7 +1103,7 @@ fn eval_store_value(
     linear: usize,
     plan: &IterationPlan,
 ) -> Result<FusedValue> {
-    if !matches!(store.kind(), UOpKind::Store) || store.sources().len() != 2 {
+    if !matches!(store.operation(), Operation::Store) || store.sources().len() != 2 {
         return Err(Error::InvalidIndex);
     }
     eval(&store.sources()[1], bindings, linear, plan)
@@ -1234,26 +1238,25 @@ fn eval(
     linear: usize,
     plan: &IterationPlan,
 ) -> Result<FusedValue> {
-    match n.kind() {
-        UOpKind::Const => match n.arg() {
-            UArgRef::Int(v) => Ok(FusedValue::Scalar(Scalar::I(*v))),
-            UArgRef::Scalar { dtype, bits } => Ok(FusedValue::from_constant(*dtype, *bits)),
-            _ => Err(Error::InvalidIndex),
-        },
-        UOpKind::Load => {
+    match n.operation() {
+        Operation::Const(LiteralValue::Int(v)) => Ok(FusedValue::Scalar(Scalar::I(*v))),
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => {
+            Ok(FusedValue::from_constant(*dtype, *bits))
+        }
+        Operation::Load => {
             let index = n.sources().first().ok_or(Error::InvalidIndex)?;
-            let (buffer, input_shape, view) = match index.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     ..
-                } => (*buffer, input_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, input_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     view,
                     ..
-                } => (*buffer, input_shape, Some(view)),
+                }) => (*buffer, input_shape, Some(view)),
                 _ => return Err(Error::InvalidIndex),
             };
             let logical = plan.broadcast_offset(input_shape, linear)?;
@@ -1268,26 +1271,26 @@ fn eval(
                 usize::try_from(offset).map_err(|_| Error::InvalidIndex)?,
             ))
         }
-        UOpKind::Cast => Ok(eval(&n.sources()[0], bindings, linear, plan)?
+        Operation::Cast => Ok(eval(&n.sources()[0], bindings, linear, plan)?
             .cast(n.ty().ok_or(Error::InvalidIndex)?.scalar)),
-        UOpKind::GraphUnary(op) => {
+        Operation::GraphUnary(op) => {
             let input = eval(&n.sources()[0], bindings, linear, plan)?;
             let input_dtype = n.sources()[0].ty().ok_or(Error::InvalidIndex)?.scalar;
             Ok(FusedValue::typed(
-                unary(input.scalar(), input_dtype, op)?,
+                unary(input.scalar(), input_dtype, *op)?,
                 n.ty().ok_or(Error::InvalidIndex)?.scalar,
             ))
         }
-        UOpKind::GraphBinary(op) => Ok(FusedValue::typed(
+        Operation::GraphBinary(op) => Ok(FusedValue::typed(
             binary(
                 eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
                 eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
                 n.ty().ok_or(Error::InvalidIndex)?.scalar,
-                op,
+                *op,
             )?,
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
         )),
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let lhs = eval(&n.sources()[0], bindings, linear, plan)?.scalar();
             let rhs = eval(&n.sources()[1], bindings, linear, plan)?.scalar();
             let float8 = n
@@ -1295,12 +1298,12 @@ fn eval(
                 .iter()
                 .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
             Ok(FusedValue::Scalar(Scalar::Bool(if float8 {
-                compare_float8(lhs.as_f64(), rhs.as_f64(), op)
+                compare_float8(lhs.as_f64(), rhs.as_f64(), *op)
             } else {
-                compare(lhs, rhs, op)
+                compare(lhs, rhs, *op)
             })))
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             let a = eval(&n.sources()[0], bindings, linear, plan)?
                 .scalar()
                 .as_bool();
@@ -1318,7 +1321,7 @@ fn eval(
                 }
             })))
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             if eval(&n.sources()[0], bindings, linear, plan)?
                 .scalar()
                 .as_bool()
@@ -1328,17 +1331,17 @@ fn eval(
                 eval(&n.sources()[2], bindings, linear, plan)
             }
         }
-        UOpKind::ReduceFinalize => {
+        Operation::ReduceFinalize => {
             let update = n.sources().first().ok_or(Error::InvalidIndex)?;
             let init = update.sources().first().ok_or(Error::InvalidIndex)?;
-            let UArgRef::Reduction {
+            let Operation::ReduceInit(ReductionValue {
                 input_shape,
                 output_shape,
                 axes,
                 keepdim,
                 kind,
                 mean,
-            } = init.arg()
+            }) = init.operation()
             else {
                 return Err(Error::InvalidIndex);
             };
@@ -1798,18 +1801,17 @@ mod tests {
         let output = graph.ne(input, truth).unwrap();
         let uop = lower_graph_elementwise(&graph, output).unwrap();
         let nodes = uop.topological().unwrap();
-        assert!(
-            nodes
-                .iter()
-                .any(|node| matches!(node.kind(), UOpKind::Const)
-                    && matches!(
-                        node.arg(),
-                        UArgRef::Scalar { dtype, bits }
-                            if *dtype == DType::Bool && *bits == 1
-                    ))
-        );
-        assert!(!nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
-            && matches!(node.arg(), UArgRef::BufferIndex { buffer, .. } if *buffer == truth.index() as u64)));
+        assert!(nodes.iter().any(|node| matches!(
+            node.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            })
+        )));
+        assert!(!nodes.iter().any(|node| matches!(
+            node.operation(),
+            Operation::Index(IndexValue::Buffer { buffer, .. }) if *buffer == truth.index() as u64
+        )));
 
         // Exact scalar payloads are carried through the UOp rather than host
         // floating conversion, including an F32 NaN bit pattern.
@@ -1828,9 +1830,11 @@ mod tests {
             .topological()
             .unwrap();
         assert!(nodes.iter().any(|node| matches!(
-            node.arg(),
-            UArgRef::Scalar { dtype, bits }
-                if *dtype == DType::F32 && *bits == 0x7f80_0001
+            node.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::F32,
+                bits: 0x7f80_0001
+            })
         )));
 
         // A rank-one singleton is not a scalar provenance value: it remains a
@@ -1845,8 +1849,10 @@ mod tests {
             .unwrap()
             .topological()
             .unwrap();
-        assert!(nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
-            && matches!(node.arg(), UArgRef::BufferIndex { buffer, .. } if *buffer == constant.index() as u64)));
+        assert!(nodes.iter().any(|node| matches!(
+            node.operation(),
+            Operation::Index(IndexValue::Buffer { buffer, .. }) if *buffer == constant.index() as u64
+        )));
     }
 
     #[test]
@@ -2410,7 +2416,7 @@ mod tests {
                 .topological()
                 .unwrap()
                 .iter()
-                .any(|node| matches!(node.arg(), UArgRef::ViewBufferIndex { .. }))
+                .any(|node| matches!(node.operation(), Operation::Index(IndexValue::View { .. })))
         );
         let ptx = crate::PtxRenderer::new(80)
             .unwrap()

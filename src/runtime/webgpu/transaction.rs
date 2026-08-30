@@ -1,6 +1,8 @@
 //! Typed WebGPU transaction metadata and bounded fault reconstruction.
 use super::WebGpuError;
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArgRef, UOp, UOpKind};
+use crate::{
+    BinaryOp, CompareOp, DType, IndexValue, LiteralValue, LogicalOp, Operation, Scalar, Shape, UOp,
+};
 use std::collections::BTreeMap;
 
 /// Schema version for guarded WebGPU candidate/status execution.
@@ -86,10 +88,10 @@ impl WebGpuTransactionAbi {
             .topological()
             .map_err(|error| WebGpuError::Unsupported(error.to_string()))?
         {
-            let UOpKind::GraphBinary(op) = node.kind() else {
+            let Operation::GraphBinary(op) = node.operation() else {
                 continue;
             };
-            let Some(operation) = GuardedIntegerOp::from_binary(op) else {
+            let Some(operation) = GuardedIntegerOp::from_binary(*op) else {
                 continue;
             };
             let dtype = node
@@ -162,13 +164,13 @@ impl WebGpuTransactionAbi {
         let count = u32::try_from(self.guards.len()).map_err(|_| WebGpuError::Overflow)?;
         for (position, guard) in self.guards.iter().enumerate() {
             let expected_id = u32::try_from(position).map_err(|_| WebGpuError::Overflow)?;
-            let UOpKind::GraphBinary(op) = guard.expression.kind() else {
+            let Operation::GraphBinary(op) = guard.expression.operation() else {
                 return Err(WebGpuError::InvalidBinding(
                     "transaction guard expression mismatch".into(),
                 ));
             };
             if guard.id != expected_id
-                || GuardedIntegerOp::from_binary(op) != Some(guard.operation)
+                || GuardedIntegerOp::from_binary(*op) != Some(guard.operation)
                 || !matches!(guard.dtype, DType::I32 | DType::U32)
                 || guard.expression.ty().map(|ty| ty.scalar) != Some(guard.dtype)
                 || guard.expression.sources().get(1) != Some(&guard.rhs)
@@ -242,7 +244,7 @@ pub(super) fn first_fault_at<F>(
     mut load: F,
 ) -> Result<Option<u32>, WebGpuError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, WebGpuError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, WebGpuError>,
 {
     match eval(
         &transaction.evaluation_root,
@@ -262,7 +264,7 @@ pub(super) fn detail_rhs_at<F>(
     mut load: F,
 ) -> Result<Scalar, WebGpuError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, WebGpuError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, WebGpuError>,
 {
     match eval(&guard.rhs, logical, &transaction.guard_ids(), &mut load)? {
         Evaluated::Value(value) => Ok(value),
@@ -279,36 +281,37 @@ fn eval<F>(
     load: &mut F,
 ) -> Result<Evaluated, WebGpuError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, WebGpuError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, WebGpuError>,
 {
     let dtype = node
         .ty()
         .ok_or_else(|| WebGpuError::InvalidBinding("untyped detail expression".into()))?
         .scalar;
-    let value = match node.kind() {
-        UOpKind::Const => match node.arg() {
-            UArgRef::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits)?,
-            _ => {
-                return Err(WebGpuError::InvalidBinding(
-                    "invalid detail constant".into(),
-                ));
-            }
-        },
-        UOpKind::Load => {
+    let value = match node.operation() {
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => scalar_from_bits(*dtype, *bits)?,
+        Operation::Const(_) => {
+            return Err(WebGpuError::InvalidBinding(
+                "invalid detail constant".into(),
+            ));
+        }
+        Operation::Load => {
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| WebGpuError::InvalidBinding("detail load lacks index".into()))?;
-            load(index.arg(), dtype, logical)?
+            let Operation::Index(value) = index.operation() else {
+                return Err(WebGpuError::InvalidBinding("detail load index".into()));
+            };
+            load(value, dtype, logical)?
         }
-        UOpKind::Cast => {
+        Operation::Cast => {
             let source = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             cast(source, dtype)?
         }
-        UOpKind::GraphBinary(op) => {
+        Operation::GraphBinary(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -318,13 +321,13 @@ where
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             if let Some(id) = guard_ids.get(node).copied()
-                && invalid_guard(op, dtype, rhs)
+                && invalid_guard(*op, dtype, rhs)
             {
                 return Ok(Evaluated::Fault(id));
             }
-            integer_binary(op, dtype, lhs, rhs)?
+            integer_binary(*op, dtype, lhs, rhs)?
         }
-        UOpKind::Binary(op) => {
+        Operation::Binary(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -348,7 +351,7 @@ where
                 }
             }
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -357,9 +360,9 @@ where
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
-            Scalar::Bool(compare(lhs, rhs, op))
+            Scalar::Bool(compare(lhs, rhs, *op))
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value.as_bool(),
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -376,7 +379,7 @@ where
                 }
             }
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             let condition = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value.as_bool(),
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -506,24 +509,19 @@ fn compare(lhs: Scalar, rhs: Scalar, op: CompareOp) -> bool {
     }
 }
 
-pub(super) fn logical_offset(arg: UArgRef<'_>, logical: usize) -> Result<usize, WebGpuError> {
+pub(super) fn logical_offset(arg: &IndexValue, logical: usize) -> Result<usize, WebGpuError> {
     let (input, output, view) = match arg {
-        UArgRef::BufferIndex {
+        IndexValue::Buffer {
             input_shape,
             output_shape,
             ..
         } => (input_shape, output_shape, None),
-        UArgRef::ViewBufferIndex {
+        IndexValue::View {
             input_shape,
             output_shape,
             view,
             ..
         } => (input_shape, output_shape, Some(view)),
-        _ => {
-            return Err(WebGpuError::InvalidBinding(
-                "transaction detail index mismatch".into(),
-            ));
-        }
     };
     let output_strides = output.contiguous_strides();
     let input_strides = input.contiguous_strides();

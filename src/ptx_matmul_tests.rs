@@ -3,7 +3,7 @@
 use super::{ConcurrentPtxCache, PtxBinding, PtxError, PtxRenderer};
 use crate::{
     Backend, CapturedSchedule, CpuBackend, CudaError, DType, Driver, Graph, MatmulKernelPlan,
-    Scalar, TensorData, UOpKind,
+    Operation, Scalar, TensorData,
 };
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
@@ -106,13 +106,18 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
         let captured = CapturedSchedule::capture(&graph, &schedule, &[output_node]).unwrap();
         let artifact = CapturedSchedule::from_bytes(&captured.to_bytes().unwrap()).unwrap();
         let kernel = &artifact.items[0].kernel;
-        let UOpKind::Matmul = kernel.kind() else {
+        let Operation::Matmul(matmul) = kernel.operation() else {
             panic!("{} did not retain a matmul payload", case.name);
         };
-        let shared_plan = kernel.arg().matmul_plan().unwrap();
+        let shared_plan = match matmul {
+            crate::MatmulValue::Serial(plan) => plan.as_ref(),
+            crate::MatmulValue::Tiled(payload) => &payload.matmul,
+            crate::MatmulValue::TensorCore(payload) => &payload.matmul,
+            crate::MatmulValue::Quantized(_) => panic!("unexpected quantized matmul"),
+        };
         assert_eq!(shared_plan, &plan, "{} shared plan", case.name);
         if case.name == "f32 tiled broadcast tails" {
-            let crate::UArgRef::TiledMatmul(payload) = kernel.arg() else {
+            let Operation::Matmul(crate::MatmulValue::Tiled(payload)) = kernel.operation() else {
                 panic!("eligible matrix case did not retain tiled payload");
             };
             assert!(payload.tile.tails.m && payload.tile.tails.n && payload.tile.tails.k);
@@ -311,7 +316,8 @@ fn tensor_core_primary_cache_uses_fragment_simulator_and_exact_launch() {
         let captured = CapturedSchedule::capture(&graph, &schedule, &[output_node]).unwrap();
         let artifact = CapturedSchedule::from_bytes(&captured.to_bytes().unwrap()).unwrap();
         let kernel_uop = &artifact.items[0].kernel;
-        let crate::UArgRef::TensorCoreMatmul(payload) = kernel_uop.arg() else {
+        let Operation::Matmul(crate::MatmulValue::TensorCore(payload)) = kernel_uop.operation()
+        else {
             panic!("eligible narrow artifact did not retain tensor-core payload");
         };
         let lhs = tensor(

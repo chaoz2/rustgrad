@@ -5,7 +5,10 @@
 //! buffer id; shapes and dtypes are validated by the caller before this unsafe
 //! boundary is crossed.  This module never allocates executable memory: the OS
 //! dynamic loader owns executable mappings and `JitKernel` owns the library.
-use crate::{DType, SymbolicShape, SymbolicVar, UArgRef, UOp, UOpKind};
+use crate::{
+    DType, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation, ReductionValue,
+    SymbolicShape, SymbolicVar, UOp,
+};
 use std::{
     collections::BTreeMap,
     ffi::{CString, c_char, c_int, c_void},
@@ -581,8 +584,8 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
 }
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     if matches!(
-        root.kind(),
-        UOpKind::Matmul | UOpKind::Conv2d | UOpKind::Movement | UOpKind::Random
+        root.operation(),
+        Operation::Matmul(_) | Operation::Conv2d(_) | Operation::Movement(_) | Operation::Random(_)
     ) {
         return Ok(VectorPlan {
             lanes: 1,
@@ -602,30 +605,28 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     })
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
-    if let (UOpKind::Random, UArgRef::Random(plan)) = (root.kind(), root.arg()) {
+    if let Operation::Random(plan) = root.operation() {
         return random::render(plan);
     }
-    if matches!(root.kind(), UOpKind::Matmul)
-        && let Some(plan) = root.arg().quantized_matmul_plan()
-    {
+    if let Operation::Matmul(MatmulValue::Quantized(plan)) = root.operation() {
         return render_quantized_matmul(plan);
     }
-    if matches!(root.kind(), UOpKind::Matmul)
-        && let Some(plan) = root.arg().matmul_plan()
-    {
+    let matmul = match root.operation() {
+        Operation::Matmul(MatmulValue::Serial(plan)) => Some(plan.as_ref()),
+        Operation::Matmul(MatmulValue::Tiled(payload)) => Some(&payload.matmul),
+        Operation::Matmul(MatmulValue::TensorCore(payload)) => Some(&payload.matmul),
+        _ => None,
+    };
+    if let Some(plan) = matmul {
         return render_matmul(plan);
     }
-    if matches!(root.kind(), UOpKind::Conv2d)
-        && let Some(plan) = root.arg().static_conv2d_plan()
-    {
+    if let Operation::Conv2d(plan) = root.operation() {
         return render_static_conv2d(plan);
     }
-    if matches!(root.kind(), UOpKind::Movement)
-        && let Some(plan) = root.arg().quantized_row_gather_plan()
-    {
+    if let Operation::Movement(MovementValue::QuantizedRowGather(plan)) = root.operation() {
         return render_quantized_row_gather(plan);
     }
-    if let (UOpKind::Movement, UArgRef::Movement(plan)) = (root.kind(), root.arg()) {
+    if let Operation::Movement(MovementValue::Plan(plan)) = root.operation() {
         return render_movement(plan);
     }
     let nodes = root
@@ -633,30 +634,30 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         .map_err(|e| JitError::Unsupported(e.to_string()))?;
     let needs_erf = nodes.iter().any(|node| {
         matches!(
-            node.kind(),
-            UOpKind::GraphUnary(crate::UnaryOp::Erf | crate::UnaryOp::Erfc)
+            node.operation(),
+            Operation::GraphUnary(crate::UnaryOp::Erf | crate::UnaryOp::Erfc)
         )
     });
     let needs_f8_encode = nodes.iter().any(|node| {
         matches!(
-            node.kind(),
-            UOpKind::GraphBinary(_) | UOpKind::Cast | UOpKind::ReduceFinalize
+            node.operation(),
+            Operation::GraphBinary(_) | Operation::Cast | Operation::ReduceFinalize
         ) && node.ty().is_some_and(|ty| ty.scalar.is_float8())
     });
     let store = root
         .sources()
         .iter()
-        .find(|x| matches!(x.kind(), UOpKind::Store))
+        .find(|x| matches!(x.operation(), Operation::Store))
         .ok_or_else(|| JitError::Unsupported("Sink without Store".into()))?;
     let out_index = store
         .sources()
         .first()
         .ok_or_else(|| JitError::Unsupported("Store without index".into()))?;
-    let UArgRef::BufferIndex {
+    let Operation::Index(IndexValue::Buffer {
         buffer: out_id,
         elements: extent,
         ..
-    } = out_index.arg()
+    }) = out_index.operation()
     else {
         return Err(JitError::Unsupported("Store needs BufferIndex".into()));
     };
@@ -665,17 +666,17 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     let mut buffers = Vec::<BufferAbi>::new();
     let mut seen = BTreeMap::<u64, usize>::new();
     for n in &nodes {
-        if !matches!(n.kind(), UOpKind::Load) {
+        if !matches!(n.operation(), Operation::Load) {
             continue;
         }
         let Some(index) = n.sources().first() else {
             return Err(JitError::Unsupported("load without index".into()));
         };
-        let (buffer, elements) = match index.arg() {
-            UArgRef::BufferIndex {
+        let (buffer, elements) = match index.operation() {
+            Operation::Index(IndexValue::Buffer {
                 buffer, elements, ..
-            } => (*buffer, *elements),
-            UArgRef::ViewBufferIndex { buffer, view, .. } => (
+            }) => (*buffer, *elements),
+            Operation::Index(IndexValue::View { buffer, view, .. }) => (
                 *buffer,
                 view.source_shape
                     .numel()
@@ -738,13 +739,13 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     // payload bytes as numeric lanes.
     for node in &nodes {
         if !matches!(
-            node.kind(),
-            UOpKind::GraphUnary(_)
-                | UOpKind::GraphBinary(_)
-                | UOpKind::GraphCompare(_)
-                | UOpKind::GraphLogical(_)
-                | UOpKind::Cast
-                | UOpKind::Ternary(_)
+            node.operation(),
+            Operation::GraphUnary(_)
+                | Operation::GraphBinary(_)
+                | Operation::GraphCompare(_)
+                | Operation::GraphLogical(_)
+                | Operation::Cast
+                | Operation::Ternary(_)
         ) {
             continue;
         }
@@ -762,8 +763,8 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         if !touches_float8 {
             continue;
         }
-        match node.kind() {
-            UOpKind::GraphBinary(
+        match node.operation() {
+            Operation::GraphBinary(
                 crate::BinaryOp::Add
                 | crate::BinaryOp::Sub
                 | crate::BinaryOp::Mul
@@ -774,30 +775,30 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                 && source_types.len() == 2
                 && source_types[0] == node_dtype
                 && source_types[1] == node_dtype => {}
-            UOpKind::GraphCompare(_)
+            Operation::GraphCompare(_)
                 if node_dtype == Some(DType::Bool)
                     && source_types.len() == 2
                     && source_types[0] == source_types[1]
                     && source_types[0].is_some_and(DType::is_float8) => {}
-            UOpKind::Ternary(crate::uop::Ternary::Where)
+            Operation::Ternary(crate::uop::Ternary::Where)
                 if node_dtype.is_some_and(DType::is_float8)
                     && source_types.len() == 3
                     && source_types[0] == Some(DType::Bool)
                     && source_types[1] == node_dtype
                     && source_types[2] == node_dtype => {}
-            UOpKind::Cast if source_types.len() == 1 && source_types[0].is_some() => {}
-            UOpKind::GraphCompare(_) => {
+            Operation::Cast if source_types.len() == 1 && source_types[0].is_some() => {}
+            Operation::GraphCompare(_) => {
                 return Err(JitError::Unsupported(
                     "native Float8 comparison requires one homogeneous format".into(),
                 ));
             }
-            UOpKind::GraphBinary(_) => {
+            Operation::GraphBinary(_) => {
                 return Err(JitError::Unsupported(
                     "native Float8 binary requires one homogeneous format and Add/Sub/Mul/Div/Maximum/Minimum"
                         .into(),
                 ));
             }
-            UOpKind::Ternary(crate::uop::Ternary::Where) => {
+            Operation::Ternary(crate::uop::Ternary::Where) => {
                 return Err(JitError::Unsupported(
                     "native Float8 selection requires homogeneous branches".into(),
                 ));
@@ -2011,11 +2012,13 @@ fn emit_vector_insts(
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 splat without destination".into()))?;
-                let (ty, literal) = match inst.payload.arg() {
-                    crate::UArgRef::Scalar { dtype, bits } => {
+                let (ty, literal) = match &inst.payload.operation {
+                    Operation::Const(LiteralValue::Scalar { dtype, bits })
+                    | Operation::VConst(LiteralValue::Scalar { dtype, bits }) => {
                         (dst_ty.unwrap_or(*dtype), literal_expr(*dtype, *bits))
                     }
-                    crate::UArgRef::Int(value) => (
+                    Operation::Const(LiteralValue::Int(value))
+                    | Operation::VConst(LiteralValue::Int(value)) => (
                         dst_ty.ok_or_else(|| {
                             JitError::Unsupported("portable constant type".into())
                         })?,
@@ -2097,29 +2100,29 @@ fn emit_vector_insts(
                 let a = input(0)?;
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable unary type".into()))?;
-                let expr = match inst.payload.kind() {
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
+                let expr = match &inst.payload.operation {
+                    crate::Operation::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
                         format!("!{}[l]", a)
                     }
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty.is_float() => {
+                    crate::Operation::GraphUnary(crate::UnaryOp::Neg) if ty.is_float() => {
                         format!("-{}[l]", a)
                     }
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
+                    crate::Operation::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
                         format!("!{}[l]", a)
                     }
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs) if ty.is_float() => {
+                    crate::Operation::GraphUnary(crate::UnaryOp::Abs) if ty.is_float() => {
                         format!("fabs({}[l])", a)
                     }
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs)
+                    crate::Operation::GraphUnary(crate::UnaryOp::Abs)
                         if ty == DType::Bool
                             || matches!(ty.category(), crate::DTypeCategory::Unsigned) =>
                     {
                         format!("{}[l]", a)
                     }
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) => {
+                    crate::Operation::GraphUnary(crate::UnaryOp::Neg) => {
                         wrap_expr(ty, format!("0-({}){}[l]", unsigned_ctype(ty)?, a))?
                     }
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs)
+                    crate::Operation::GraphUnary(crate::UnaryOp::Abs)
                         if matches!(ty.category(), crate::DTypeCategory::Signed) =>
                     {
                         wrap_expr(
@@ -2153,10 +2156,10 @@ fn emit_vector_insts(
                 let (a, b) = (input(0)?, input(1)?);
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable binary type".into()))?;
-                let crate::UOpKind::GraphBinary(op) = inst.payload.kind() else {
+                let crate::Operation::GraphBinary(op) = &inst.payload.operation else {
                     return Err(JitError::Unsupported("portable binary opcode".into()));
                 };
-                let expr = vector_binary_expr(ty, op, &a, &b, &format!("{base}+l"))?;
+                let expr = vector_binary_expr(ty, *op, &a, &b, &format!("{base}+l"))?;
                 lines.push(format!(
                     "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
                     ctype(ty),
@@ -2172,13 +2175,13 @@ fn emit_vector_insts(
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 compare destination".into()))?;
                 let (a, b) = (input(0)?, input(1)?);
-                let op = match inst.payload.kind() {
-                    crate::UOpKind::GraphCompare(crate::CompareOp::Eq) => "==",
-                    crate::UOpKind::GraphCompare(crate::CompareOp::Ne) => "!=",
-                    crate::UOpKind::GraphCompare(crate::CompareOp::Lt) => "<",
-                    crate::UOpKind::GraphCompare(crate::CompareOp::Le) => "<=",
-                    crate::UOpKind::GraphCompare(crate::CompareOp::Gt) => ">",
-                    crate::UOpKind::GraphCompare(crate::CompareOp::Ge) => ">=",
+                let op = match &inst.payload.operation {
+                    crate::Operation::GraphCompare(crate::CompareOp::Eq) => "==",
+                    crate::Operation::GraphCompare(crate::CompareOp::Ne) => "!=",
+                    crate::Operation::GraphCompare(crate::CompareOp::Lt) => "<",
+                    crate::Operation::GraphCompare(crate::CompareOp::Le) => "<=",
+                    crate::Operation::GraphCompare(crate::CompareOp::Gt) => ">",
+                    crate::Operation::GraphCompare(crate::CompareOp::Ge) => ">=",
                     _ => return Err(JitError::Unsupported("portable compare opcode".into())),
                 };
                 lines.push(format!(
@@ -2291,7 +2294,7 @@ fn render_reduction(
     let Some(finalize) = store
         .sources()
         .get(1)
-        .filter(|n| matches!(n.kind(), UOpKind::ReduceFinalize))
+        .filter(|n| matches!(n.operation(), Operation::ReduceFinalize))
     else {
         return Ok(None);
     };
@@ -2303,14 +2306,14 @@ fn render_reduction(
         .sources()
         .first()
         .ok_or_else(|| JitError::Unsupported("reduction init".into()))?;
-    let UArgRef::Reduction {
+    let Operation::ReduceInit(ReductionValue {
         input_shape,
         output_shape,
         axes,
         keepdim,
         kind,
         mean,
-    } = init.arg()
+    }) = init.operation()
     else {
         return Err(JitError::Unsupported("reduction metadata".into()));
     };
@@ -2511,40 +2514,41 @@ fn emit(
     map.insert(id, lines.len() + 1);
     let ty = n
         .ty()
-        .ok_or_else(|| JitError::Unsupported(format!("untyped {:?}", n.kind())))?
+        .ok_or_else(|| JitError::Unsupported(format!("untyped {:?}", n.operation())))?
         .scalar;
     let mut s = |i: usize| emit(&n.sources()[i], ids, map, lines);
-    match n.kind() {
-        UOpKind::Const => match n.arg() {
-            UArgRef::Int(v) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
-            UArgRef::Scalar { dtype, bits } if *dtype == ty && dtype.is_float8() => {
-                Ok(format!("((uint8_t)0x{:02x}u)", *bits as u8))
-            }
-            UArgRef::Scalar { dtype, bits } if *dtype == ty => Ok(literal_expr(*dtype, *bits)),
-            UArgRef::Scalar { .. } => {
-                Err(JitError::Unsupported("scalar literal/type mismatch".into()))
-            }
-            _ => Err(JitError::Unsupported("non-integer const".into())),
-        },
-        UOpKind::Load => {
+    match n.operation() {
+        Operation::Const(LiteralValue::Int(v)) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
+        Operation::Const(LiteralValue::Scalar { dtype, bits })
+            if *dtype == ty && dtype.is_float8() =>
+        {
+            Ok(format!("((uint8_t)0x{:02x}u)", *bits as u8))
+        }
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) if *dtype == ty => {
+            Ok(literal_expr(*dtype, *bits))
+        }
+        Operation::Const(LiteralValue::Scalar { .. }) => {
+            Err(JitError::Unsupported("scalar literal/type mismatch".into()))
+        }
+        Operation::Load => {
             let ix = n
                 .sources()
                 .first()
                 .ok_or_else(|| JitError::Unsupported("load no index".into()))?;
-            let (buffer, off) = match ix.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, off) = match ix.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                } => (*buffer, broadcast_offset(input_shape, output_shape)),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, broadcast_offset(input_shape, output_shape)),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                } => {
+                }) => {
                     let logical = broadcast_offset(input_shape, output_shape);
                     (*buffer, view_offset(view, &logical))
                 }
@@ -2572,7 +2576,7 @@ fn emit(
                 ))
             }
         }
-        UOpKind::Cast => {
+        Operation::Cast => {
             let source_dtype = n
                 .sources()
                 .first()
@@ -2581,7 +2585,7 @@ fn emit(
                 .scalar;
             Ok(cast_expression(source_dtype, ty, s(0)?))
         }
-        UOpKind::GraphUnary(op) => {
+        Operation::GraphUnary(op) => {
             let input_ty = n
                 .sources()
                 .first()
@@ -2743,7 +2747,7 @@ fn emit(
             };
             Ok(x)
         }
-        UOpKind::GraphBinary(op) => {
+        Operation::GraphBinary(op) => {
             let (mut a, mut b) = (s(0)?, s(1)?);
             if ty.is_float8() {
                 a = float8_decode_expr(ty, &a).expect("guarded Float8 binary dtype");
@@ -2772,7 +2776,7 @@ fn emit(
                 | crate::BinaryOp::FMod
                     if !ty.is_float() =>
                 {
-                    return Ok(int_call(op, ty, &a, &b));
+                    return Ok(int_call(*op, ty, &a, &b));
                 }
                 crate::BinaryOp::Shl if !ty.is_float() => {
                     return Ok(format!(
@@ -2826,7 +2830,7 @@ fn emit(
                 Ok(format!("(({a}) {x} ({b}))"))
             }
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             if ty != DType::Bool {
                 return Err(JitError::Unsupported("logical output is not Bool".into()));
             }
@@ -2843,7 +2847,7 @@ fn emit(
                 }
             }
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let (mut a, mut b) = (s(0)?, s(1)?);
             let source_dtype = n.sources().first().and_then(|source| source.ty());
             if source_dtype.is_some_and(|ty| ty.scalar.is_float8()) {
@@ -2869,10 +2873,10 @@ fn emit(
             };
             Ok(format!("(({a}) {x} ({b}))"))
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             Ok(format!("(({})?({}):({}))", s(0)?, s(1)?, s(2)?))
         }
-        _ => Err(JitError::Unsupported(format!("{:?}", n.kind()))),
+        _ => Err(JitError::Unsupported(format!("{:?}", n.operation()))),
     }
 }
 fn int_call(op: crate::BinaryOp, ty: DType, a: &str, b: &str) -> String {
@@ -3765,14 +3769,12 @@ mod tests {
             let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
             let topological = uop.topological().unwrap();
             assert!(topological.iter().any(|node| {
-                matches!(node.kind(), UOpKind::Cast)
+                matches!(node.operation(), Operation::Cast)
                     && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
             }));
-            assert!(
-                topological
-                    .iter()
-                    .any(|node| { matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)) })
-            );
+            assert!(topological.iter().any(|node| {
+                matches!(node.operation(), Operation::GraphCompare(CompareOp::Ne))
+            }));
 
             // `!=0` is the source truthiness predicate: it keeps fractional
             // nonzero F32 values, NaNs, and infinities true while both zeros

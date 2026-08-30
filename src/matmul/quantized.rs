@@ -444,7 +444,9 @@ mod tests {
                 .internal_temporaries(&[NodeId::from_index(22)])
                 .is_empty()
             );
-            let crate::UArgRef::QuantizedMatmul(plan) = decoded.items[0].kernel.arg() else {
+            let crate::Operation::Matmul(crate::MatmulValue::Quantized(plan)) =
+                decoded.items[0].kernel.operation()
+            else {
                 panic!("quantized matmul payload")
             };
             let rendered = CpuJit::render(&decoded.items[0].kernel).unwrap();

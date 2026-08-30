@@ -163,8 +163,8 @@ fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
     );
     let scheduled = crate::schedule(&graph, values["out"]).unwrap();
     assert!(scheduled.items.iter().any(|item| matches!(
-        item.kernel.arg(),
-        crate::UArgRef::Movement(plan)
+        item.kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
             if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
     )));
     assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
@@ -5502,8 +5502,8 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         .iter()
         .find(|item| {
             matches!(
-                item.kernel.arg(),
-                crate::UArgRef::Movement(plan)
+                item.kernel.operation(),
+                crate::Operation::Movement(crate::MovementValue::Plan(plan))
                     if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
             )
         })
@@ -5515,8 +5515,8 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         .expect("requested CenterCropPad output must be scheduled");
     assert_eq!(output_item.id, pad_item.id);
     assert!(matches!(
-        output_item.kernel.arg(),
-        crate::UArgRef::Movement(plan)
+        output_item.kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
             if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
     ));
     assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));

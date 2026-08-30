@@ -195,17 +195,20 @@ impl VectorProgram {
                 | VectorInstKind::Control => {}
             }
             if matches!(
-                inst.payload.kind(),
-                crate::UOpKind::ReduceInit
-                    | crate::UOpKind::ReduceAccumulate
-                    | crate::UOpKind::ReduceFinalize
-                    | crate::UOpKind::Barrier
+                &inst.payload.operation,
+                crate::Operation::ReduceInit(_)
+                    | crate::Operation::ReduceAccumulate
+                    | crate::Operation::ReduceFinalize
+                    | crate::Operation::Barrier
             ) {
                 return Err(VectorIrError::Unsupported(
                     "portable effects/reductions".into(),
                 ));
             }
-            if matches!(inst.payload.arg(), crate::UArgRef::ViewBufferIndex { .. }) {
+            if matches!(
+                &inst.payload.operation,
+                crate::Operation::Index(crate::IndexValue::View { .. })
+            ) {
                 return Err(VectorIrError::Unsupported(
                     "portable vector instruction ABI does not encode affine view offsets".into(),
                 ));
@@ -216,16 +219,16 @@ impl VectorProgram {
             // instead of letting it fail after vector planning.
             if matches!(inst.kind, VectorInstKind::Unary)
                 && !matches!(
-                    inst.payload.kind(),
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg | crate::UnaryOp::Abs)
+                    &inst.payload.operation,
+                    crate::Operation::GraphUnary(crate::UnaryOp::Neg | crate::UnaryOp::Abs)
                 )
             {
                 return Err(VectorIrError::Unsupported("portable unary opcode".into()));
             }
             if matches!(inst.kind, VectorInstKind::Binary)
                 && !matches!(
-                    inst.payload.kind(),
-                    crate::UOpKind::GraphBinary(
+                    &inst.payload.operation,
+                    crate::Operation::GraphBinary(
                         crate::BinaryOp::Add
                             | crate::BinaryOp::Sub
                             | crate::BinaryOp::Mul
@@ -241,7 +244,7 @@ impl VectorProgram {
             {
                 return Err(VectorIrError::Unsupported("portable binary opcode".into()));
             }
-            if let crate::UOpKind::GraphBinary(op) = inst.payload.kind() {
+            if let crate::Operation::GraphBinary(op) = &inst.payload.operation {
                 if ty.is_some_and(crate::DType::is_float)
                     && !matches!(
                         op,
@@ -348,7 +351,7 @@ impl VectorProgram {
             })
             .collect::<Vec<_>>();
         for inst in &self.instructions {
-            if !payload_matches(&inst.kind, inst.payload.kind()) {
+            if !payload_matches(&inst.kind, &inst.payload.operation) {
                 return Err(VectorIrError::Unsupported(
                     "instruction/payload kind mismatch".into(),
                 ));
@@ -388,36 +391,36 @@ impl VectorProgram {
         self.cache_key = h.finish();
     }
 }
-fn payload_matches(kind: &VectorInstKind, payload: crate::UOpKind) -> bool {
+fn payload_matches(kind: &VectorInstKind, payload: &crate::Operation) -> bool {
     matches!(
         (kind, payload),
         (
             VectorInstKind::Splat,
-            crate::UOpKind::Const | crate::UOpKind::VConst
+            crate::Operation::Const(_) | crate::Operation::VConst(_)
         ) | (
             VectorInstKind::Address,
-            crate::UOpKind::DefineGlobal
-                | crate::UOpKind::DefineLocal
-                | crate::UOpKind::DefineRegister
-        ) | (VectorInstKind::Index, crate::UOpKind::Index)
-            | (VectorInstKind::Load { .. }, crate::UOpKind::Load)
+            crate::Operation::DefineGlobal(_)
+                | crate::Operation::DefineLocal(_)
+                | crate::Operation::DefineRegister(_)
+        ) | (VectorInstKind::Index, crate::Operation::Index(_))
+            | (VectorInstKind::Load { .. }, crate::Operation::Load)
             | (
                 VectorInstKind::Cast,
-                crate::UOpKind::Cast | crate::UOpKind::Bitcast
+                crate::Operation::Cast | crate::Operation::Bitcast
             )
             | (
                 VectorInstKind::Unary,
-                crate::UOpKind::Unary(_) | crate::UOpKind::GraphUnary(_)
+                crate::Operation::Unary(_) | crate::Operation::GraphUnary(_)
             )
             | (
                 VectorInstKind::Binary,
-                crate::UOpKind::Binary(_)
-                    | crate::UOpKind::GraphBinary(_)
-                    | crate::UOpKind::GraphLogical(_)
+                crate::Operation::Binary(_)
+                    | crate::Operation::GraphBinary(_)
+                    | crate::Operation::GraphLogical(_)
             )
-            | (VectorInstKind::Compare, crate::UOpKind::GraphCompare(_))
-            | (VectorInstKind::Select, crate::UOpKind::Ternary(_))
-            | (VectorInstKind::Store { .. }, crate::UOpKind::Store)
+            | (VectorInstKind::Compare, crate::Operation::GraphCompare(_))
+            | (VectorInstKind::Select, crate::Operation::Ternary(_))
+            | (VectorInstKind::Store { .. }, crate::Operation::Store)
             | (VectorInstKind::Control, _)
     )
 }

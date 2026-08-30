@@ -230,7 +230,7 @@ impl Schedule {
             if item.is_effect() {
                 if !item.outputs.is_single()
                     || item.boundary != Some(ScheduleBoundary::Effect)
-                    || !matches!(item.kernel.kind(), crate::UOpKind::After)
+                    || !matches!(item.kernel.operation(), crate::Operation::After(_))
                 {
                     return Err(ScheduleError::Binding(
                         "invalid effect item boundary".into(),
@@ -239,8 +239,8 @@ impl Schedule {
                 let store = item.kernel.sources().first().ok_or_else(|| {
                     ScheduleError::Binding("effect AFTER has no STORE source".into())
                 })?;
-                let (crate::UArgRef::Effect(after), crate::UArgRef::Effect(store_payload)) =
-                    (item.kernel.arg(), store.arg())
+                let (crate::Operation::After(after), crate::Operation::EffectStore(store_payload)) =
+                    (item.kernel.operation(), store.operation())
                 else {
                     return Err(ScheduleError::Binding("effect payload is absent".into()));
                 };
@@ -249,7 +249,7 @@ impl Schedule {
                         && binding.source_position == 0
                         && item.inputs.first() == Some(&binding.producer_output)
                 });
-                if !matches!(store.kind(), crate::UOpKind::EffectStore)
+                if !matches!(store.operation(), crate::Operation::EffectStore(_))
                     || after != store_payload
                     || item.primary_output().id != after.target.buffer
                     || (!pure_bound
@@ -418,8 +418,8 @@ impl ScheduleItem {
 
     pub fn is_effect(&self) -> bool {
         matches!(
-            self.kernel.kind(),
-            crate::UOpKind::EffectStore | crate::UOpKind::After
+            self.kernel.operation(),
+            crate::Operation::EffectStore(_) | crate::Operation::After(_)
         )
     }
     pub fn ordered_inputs(&self) -> &[ScheduleInputBinding] {
@@ -658,13 +658,12 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
-    if matches!(kernel.kind(), crate::UOpKind::TensorGuard)
-        && let crate::UArgRef::TensorGuard {
-            input,
-            input_shape,
-            dtype,
-            ..
-        } = kernel.arg()
+    if let crate::Operation::TensorGuard(crate::TensorGuardValue {
+        input,
+        input_shape,
+        dtype,
+        ..
+    }) = kernel.operation()
     {
         let desc = inputs
             .iter()
@@ -691,14 +690,13 @@ fn input_bindings(
             abi_index: 0,
         }]);
     }
-    if matches!(kernel.kind(), crate::UOpKind::Sort)
-        && let crate::UArgRef::Sort {
-            input,
-            input_shape,
-            values,
-            dtype,
-            ..
-        } = kernel.arg()
+    if let crate::Operation::Sort(crate::SortValue {
+        input,
+        input_shape,
+        values,
+        dtype,
+        ..
+    }) = kernel.operation()
     {
         let desc = inputs
             .iter()
@@ -721,8 +719,8 @@ fn input_bindings(
             abi_index: 0,
         }]);
     }
-    if matches!(kernel.kind(), crate::UOpKind::Movement)
-        && let Some(plan) = kernel.arg().quantized_row_gather_plan()
+    if let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+        kernel.operation()
     {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
@@ -756,9 +754,7 @@ fn input_bindings(
             abi_index: 0,
         }]);
     }
-    if matches!(kernel.kind(), crate::UOpKind::Matmul)
-        && let Some(plan) = kernel.arg().quantized_matmul_plan()
-    {
+    if let crate::Operation::Matmul(crate::MatmulValue::Quantized(plan)) = kernel.operation() {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
         let desc = inputs
@@ -791,9 +787,7 @@ fn input_bindings(
             abi_index: 0,
         }]);
     }
-    if let (crate::UOpKind::Movement, crate::UArgRef::Movement(plan)) =
-        (kernel.kind(), kernel.arg())
-    {
+    if let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = kernel.operation() {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
         let mut out = Vec::new();
@@ -837,9 +831,13 @@ fn input_bindings(
         }
         return Ok(out);
     }
-    if matches!(kernel.kind(), crate::UOpKind::Matmul)
-        && let Some(plan) = kernel.arg().matmul_plan()
-    {
+    let matmul = match kernel.operation() {
+        crate::Operation::Matmul(crate::MatmulValue::Serial(plan)) => Some(plan.as_ref()),
+        crate::Operation::Matmul(crate::MatmulValue::Tiled(payload)) => Some(&payload.matmul),
+        crate::Operation::Matmul(crate::MatmulValue::TensorCore(payload)) => Some(&payload.matmul),
+        _ => None,
+    };
+    if let Some(plan) = matmul {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
         let mut out = Vec::new();
@@ -887,9 +885,7 @@ fn input_bindings(
         }
         return Ok(out);
     }
-    if matches!(kernel.kind(), crate::UOpKind::Conv2d)
-        && let Some(plan) = kernel.arg().static_conv2d_plan()
-    {
+    if let crate::Operation::Conv2d(plan) = kernel.operation() {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
         let mut out = Vec::new();
@@ -942,15 +938,15 @@ fn input_bindings(
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for node in kernel.topological().map_err(ScheduleError::UOp)? {
-        if !matches!(node.kind(), crate::UOpKind::Load) {
+        if !matches!(node.operation(), crate::Operation::Load) {
             continue;
         }
         let Some(index) = node.sources().first() else {
             return Err(ScheduleError::Binding("load lacks index".into()));
         };
-        let buffer = match index.arg() {
-            crate::UArgRef::BufferIndex { buffer, .. }
-            | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
+        let buffer = match index.operation() {
+            crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })
+            | crate::Operation::Index(crate::IndexValue::View { buffer, .. }) => *buffer,
             _ => return Err(ScheduleError::Binding("load index lacks buffer".into())),
         };
         if buffer == output.id {
@@ -977,7 +973,7 @@ fn input_bindings(
 pub(crate) fn quantized_input_bindings(
     kernel: &UOp,
 ) -> Result<Vec<QuantizedScheduleInputBinding>, ScheduleError> {
-    if let Some(plan) = kernel.arg().quantized_matmul_plan() {
+    if let crate::Operation::Matmul(crate::MatmulValue::Quantized(plan)) = kernel.operation() {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
         return Ok(vec![QuantizedScheduleInputBinding {
@@ -986,7 +982,9 @@ pub(crate) fn quantized_input_bindings(
             abi_index: 1,
         }]);
     }
-    if let Some(plan) = kernel.arg().quantized_row_gather_plan() {
+    if let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+        kernel.operation()
+    {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
         return Ok(vec![QuantizedScheduleInputBinding {
@@ -1643,7 +1641,8 @@ fn schedule_many_with_external(
                 UOp::sink(vec![])
             };
         for value in kernel.topological().map_err(ScheduleError::UOp)? {
-            if let crate::UArgRef::ViewBufferIndex { buffer, view, .. } = value.arg()
+            if let crate::Operation::Index(crate::IndexValue::View { buffer, view, .. }) =
+                value.operation()
                 && let Some(desc) = inputs.iter_mut().find(|desc| desc.id == *buffer)
             {
                 desc.view = Some(view.clone());
@@ -1815,7 +1814,8 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             UOp::sink(vec![])
         };
     for node in kernel.topological().map_err(ScheduleError::UOp)? {
-        if let crate::UArgRef::ViewBufferIndex { buffer, view, .. } = node.arg()
+        if let crate::Operation::Index(crate::IndexValue::View { buffer, view, .. }) =
+            node.operation()
             && let Some(desc) = inputs.iter_mut().find(|desc| desc.id == *buffer)
         {
             desc.view = Some(view.clone());

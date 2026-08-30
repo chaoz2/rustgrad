@@ -2,7 +2,9 @@
 use super::{
     MetalCapabilities, MetalError, guard::emit_transactional, transaction::MetalTransactionAbi,
 };
-use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArgRef, UOp, UOpKind};
+use crate::{
+    AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -109,15 +111,12 @@ impl MetalRenderer {
 
     /// Lowers a validated scheduled UOp into the exact static subset.
     pub fn render(&self, root: &UOp) -> Result<RenderedMetal, MetalError> {
-        if matches!(root.kind(), UOpKind::Random) {
-            let UArgRef::Random(plan) = root.arg() else {
-                return Err(MetalError::Unsupported("random payload is absent".into()));
-            };
+        if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
         if matches!(
-            root.kind(),
-            UOpKind::PrefixScan | UOpKind::Sort | UOpKind::TensorGuard
+            root.operation(),
+            Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
         ) {
             return Err(MetalError::Unsupported(
                 "prefix scans and sort pairs are CPU-oracle only".into(),
@@ -130,13 +129,13 @@ impl MetalRenderer {
             .map_err(|error| MetalError::Unsupported(error.to_string()))?;
         if nodes.iter().any(|node| {
             matches!(
-                node.kind(),
-                UOpKind::ReduceInit
-                    | UOpKind::ReduceAccumulate
-                    | UOpKind::ReduceFinalize
-                    | UOpKind::Barrier
-                    | UOpKind::If
-                    | UOpKind::EndIf
+                node.operation(),
+                Operation::ReduceInit(_)
+                    | Operation::ReduceAccumulate
+                    | Operation::ReduceFinalize
+                    | Operation::Barrier
+                    | Operation::If
+                    | Operation::EndIf
             )
         }) {
             return Err(MetalError::Unsupported(
@@ -146,18 +145,18 @@ impl MetalRenderer {
         let store = root
             .sources()
             .iter()
-            .find(|node| matches!(node.kind(), UOpKind::Store))
+            .find(|node| matches!(node.operation(), Operation::Store))
             .ok_or_else(|| MetalError::Unsupported("sink has no store".into()))?;
         let output_index = store
             .sources()
             .first()
             .ok_or_else(|| MetalError::Unsupported("store has no index".into()))?;
-        let UArgRef::BufferIndex {
+        let Operation::Index(IndexValue::Buffer {
             buffer: output_id,
             elements: extent,
             input_shape: output_shape,
             output_shape: store_shape,
-        } = output_index.arg()
+        }) = output_index.operation()
         else {
             return Err(MetalError::Unsupported(
                 "output requires a contiguous BufferIndex".into(),
@@ -176,14 +175,14 @@ impl MetalRenderer {
 
         let mut inventory = BTreeMap::<u64, MetalBufferAbi>::new();
         for node in &nodes {
-            let (buffer, source_shape, elements, view) = match node.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, source_shape, elements, view) = match node.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements,
                     input_shape,
                     ..
-                } => (*buffer, input_shape.clone(), *elements, None),
-                UArgRef::ViewBufferIndex { buffer, view, .. } => {
+                }) => (*buffer, input_shape.clone(), *elements, None),
+                Operation::Index(IndexValue::View { buffer, view, .. }) => {
                     let access = MetalViewAccess::new(view)?;
                     let elements = access
                         .source_shape
@@ -218,17 +217,16 @@ impl MetalRenderer {
         let mut seen = BTreeSet::new();
         let mut schedule_inputs = Vec::new();
         for node in &nodes {
-            if !matches!(node.kind(), UOpKind::Load) {
+            if !matches!(node.operation(), Operation::Load) {
                 continue;
             }
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| MetalError::InvalidBinding("load lacks index".into()))?;
-            let buffer = match index.arg() {
-                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
-                    *buffer
-                }
+            let buffer = match index.operation() {
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                | Operation::Index(IndexValue::View { buffer, .. }) => *buffer,
                 _ => {
                     return Err(MetalError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -374,7 +372,7 @@ fn emit_expr(
     source_map.insert(map_id, lines.len() + 1);
     let dtype = node
         .ty()
-        .ok_or_else(|| MetalError::Unsupported(format!("untyped {:?}", node.kind())))?
+        .ok_or_else(|| MetalError::Unsupported(format!("untyped {:?}", node.operation())))?
         .scalar;
     supported_storage(dtype)?;
     let child =
@@ -384,47 +382,47 @@ fn emit_expr(
                 .ok_or_else(|| MetalError::Unsupported("missing expression operand".into()))
                 .and_then(|source| emit_expr(source, ids, source_map, lines, linear))
         };
-    match node.kind() {
-        UOpKind::Const => match node.arg() {
-            UArgRef::Scalar {
-                dtype: &DType::F32,
+    match node.operation() {
+        Operation::Const(value) => match value {
+            LiteralValue::Scalar {
+                dtype: DType::F32,
                 bits,
             } => Ok(format!("as_type<float>((uint)0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
-                dtype: &DType::Bool,
+            LiteralValue::Scalar {
+                dtype: DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("(uchar){bits}u")),
-            UArgRef::Scalar {
-                dtype: &DType::I32,
+            LiteralValue::Scalar {
+                dtype: DType::I32,
                 bits,
             } => Ok(format!("as_type<int>((uint)0x{:08x}u)", *bits as u32)),
-            UArgRef::Scalar {
-                dtype: &DType::U32,
+            LiteralValue::Scalar {
+                dtype: DType::U32,
                 bits,
             } => Ok(format!("(uint)0x{:08x}u", *bits as u32)),
             _ => Err(MetalError::Unsupported(
                 "invalid Metal scalar literal".into(),
             )),
         },
-        UOpKind::Load => {
+        Operation::Load => {
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| MetalError::Unsupported("load has no index".into()))?;
-            let (buffer, input_shape, output_shape, view) = match index.arg() {
-                UArgRef::BufferIndex {
+            let (buffer, input_shape, output_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                } => (*buffer, input_shape, output_shape, None),
-                UArgRef::ViewBufferIndex {
+                }) => (*buffer, input_shape, output_shape, None),
+                Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                } => (*buffer, input_shape, output_shape, Some(view)),
+                }) => (*buffer, input_shape, output_shape, Some(view)),
                 _ => {
                     return Err(MetalError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -441,7 +439,7 @@ fn emit_expr(
             };
             Ok(format!("b{position}[{offset}]"))
         }
-        UOpKind::Cast => {
+        Operation::Cast => {
             let value = child(0, source_map, lines)?;
             let source = node.sources()[0]
                 .ty()
@@ -462,7 +460,7 @@ fn emit_expr(
                 )),
             }
         }
-        UOpKind::GraphUnary(op) => {
+        Operation::GraphUnary(op) => {
             let value = child(0, source_map, lines)?;
             match (op, dtype) {
                 (crate::UnaryOp::Neg, DType::F32) => Ok(format!("(-({value}))")),
@@ -482,12 +480,12 @@ fn emit_expr(
                 ))),
             }
         }
-        UOpKind::GraphBinary(op) => {
+        Operation::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
-            emit_binary(op, dtype, &lhs, &rhs)
+            emit_binary(*op, dtype, &lhs, &rhs)
         }
-        UOpKind::Binary(op) => {
+        Operation::Binary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
             use crate::uop::Binary::{Add, Eq, Le, Lt, Mul, Sub};
@@ -503,7 +501,7 @@ fn emit_expr(
                 ))),
             }
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
             let operator = match op {
@@ -516,7 +514,7 @@ fn emit_expr(
             };
             Ok(format!("(uchar)(({lhs}) {operator} ({rhs}))"))
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             let lhs = child(0, source_map, lines)?;
             Ok(match op {
                 crate::LogicalOp::Not => format!("(uchar)!({lhs})"),
@@ -530,7 +528,7 @@ fn emit_expr(
                 }
             })
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             let condition = child(0, source_map, lines)?;
             let yes = child(1, source_map, lines)?;
             let no = child(2, source_map, lines)?;

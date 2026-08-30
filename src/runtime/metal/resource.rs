@@ -698,9 +698,8 @@ impl MetalTransaction<'_> {
     ) -> Result<i64, MetalError> {
         let value = detail_rhs_at(transaction, guard, logical, |arg, dtype, logical| {
             let buffer_id = match arg {
-                crate::UArgRef::BufferIndex { buffer, .. }
-                | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
-                _ => return Err(MetalError::InvalidBinding("detail load index".into())),
+                crate::IndexValue::Buffer { buffer, .. }
+                | crate::IndexValue::View { buffer, .. } => *buffer,
             };
             let position = self
                 .pipeline

@@ -1,6 +1,8 @@
 //! Typed transaction metadata and bounded integer-fault reconstruction.
 use super::MetalError;
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArgRef, UOp, UOpKind};
+use crate::{
+    BinaryOp, CompareOp, DType, IndexValue, LiteralValue, LogicalOp, Operation, Scalar, Shape, UOp,
+};
 use std::collections::BTreeMap;
 
 pub const METAL_TRANSACTION_ABI_VERSION: u32 = 1;
@@ -78,10 +80,10 @@ impl MetalTransactionAbi {
             .topological()
             .map_err(|error| MetalError::Unsupported(error.to_string()))?
         {
-            let UOpKind::GraphBinary(op) = node.kind() else {
+            let Operation::GraphBinary(op) = node.operation() else {
                 continue;
             };
-            let Some(operation) = GuardedIntegerOp::from_binary(op) else {
+            let Some(operation) = GuardedIntegerOp::from_binary(*op) else {
                 continue;
             };
             let dtype = node
@@ -182,7 +184,7 @@ pub(super) fn first_fault_at<F>(
     mut load: F,
 ) -> Result<Option<u32>, MetalError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, MetalError>,
 {
     match eval(
         &transaction.evaluation_root,
@@ -202,7 +204,7 @@ pub(super) fn detail_rhs_at<F>(
     mut load: F,
 ) -> Result<Scalar, MetalError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, MetalError>,
 {
     match eval(&guard.rhs, logical, &transaction.guard_ids(), &mut load)? {
         Evaluated::Value(value) => Ok(value),
@@ -219,32 +221,35 @@ fn eval<F>(
     load: &mut F,
 ) -> Result<Evaluated, MetalError>
 where
-    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(&IndexValue, DType, usize) -> Result<Scalar, MetalError>,
 {
     let dtype = node
         .ty()
         .ok_or_else(|| MetalError::InvalidBinding("untyped detail expression".into()))?
         .scalar;
-    let value = match node.kind() {
-        UOpKind::Const => match node.arg() {
-            UArgRef::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits)?,
-            _ => return Err(MetalError::InvalidBinding("invalid detail constant".into())),
-        },
-        UOpKind::Load => {
+    let value = match node.operation() {
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => scalar_from_bits(*dtype, *bits)?,
+        Operation::Const(_) => {
+            return Err(MetalError::InvalidBinding("invalid detail constant".into()));
+        }
+        Operation::Load => {
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| MetalError::InvalidBinding("detail load lacks index".into()))?;
-            load(index.arg(), dtype, logical)?
+            let Operation::Index(value) = index.operation() else {
+                return Err(MetalError::InvalidBinding("detail load index".into()));
+            };
+            load(value, dtype, logical)?
         }
-        UOpKind::Cast => {
+        Operation::Cast => {
             let source = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             cast(source, dtype)?
         }
-        UOpKind::GraphBinary(op) => {
+        Operation::GraphBinary(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -254,13 +259,13 @@ where
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             if let Some(id) = guard_ids.get(node).copied()
-                && invalid_guard(op, dtype, rhs)
+                && invalid_guard(*op, dtype, rhs)
             {
                 return Ok(Evaluated::Fault(id));
             }
-            integer_binary(op, dtype, lhs, rhs)?
+            integer_binary(*op, dtype, lhs, rhs)?
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -269,9 +274,9 @@ where
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
-            Scalar::Bool(compare(lhs, rhs, op))
+            Scalar::Bool(compare(lhs, rhs, *op))
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value.as_bool(),
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -288,7 +293,7 @@ where
                 }
             }
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             let condition = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value.as_bool(),
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -389,20 +394,19 @@ fn compare(lhs: Scalar, rhs: Scalar, op: CompareOp) -> bool {
     }
 }
 
-pub(super) fn logical_offset(arg: UArgRef<'_>, logical: usize) -> Result<usize, MetalError> {
+pub(super) fn logical_offset(arg: &IndexValue, logical: usize) -> Result<usize, MetalError> {
     let (input, output, view) = match arg {
-        UArgRef::BufferIndex {
+        IndexValue::Buffer {
             input_shape,
             output_shape,
             ..
         } => (input_shape, output_shape, None),
-        UArgRef::ViewBufferIndex {
+        IndexValue::View {
             input_shape,
             output_shape,
             view,
             ..
         } => (input_shape, output_shape, Some(view)),
-        _ => return Err(MetalError::InvalidBinding("detail index mismatch".into())),
     };
     let output_strides = output.contiguous_strides();
     let input_strides = input.contiguous_strides();

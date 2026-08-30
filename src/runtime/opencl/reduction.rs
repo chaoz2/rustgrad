@@ -1,6 +1,6 @@
 //! Correctness-first serial reduction geometry for OpenCL C.
 use super::{OpenClCapabilities, OpenClError};
-use crate::{DType, ReduceKind, Shape, UArgRef, UOp, UOpKind};
+use crate::{DType, Operation, ReduceKind, ReductionValue, Shape, UOp};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct OpenClReduction {
@@ -22,7 +22,7 @@ impl OpenClReduction {
     }
 
     pub fn from_finalize(finalize: &UOp) -> Result<Self, OpenClError> {
-        if !matches!(finalize.kind(), UOpKind::ReduceFinalize) {
+        if !matches!(finalize.operation(), Operation::ReduceFinalize) {
             return Err(OpenClError::Unsupported(
                 "reduction value lacks ReduceFinalize".into(),
             ));
@@ -32,14 +32,14 @@ impl OpenClReduction {
             .first()
             .and_then(|update| update.sources().first())
             .ok_or_else(|| OpenClError::Unsupported("malformed reduction chain".into()))?;
-        let UArgRef::Reduction {
+        let Operation::ReduceInit(ReductionValue {
             input_shape,
             output_shape,
             axes,
             keepdim,
             kind,
             mean,
-        } = init.arg()
+        }) = init.operation()
         else {
             return Err(OpenClError::Unsupported(
                 "reduction lacks typed geometry".into(),

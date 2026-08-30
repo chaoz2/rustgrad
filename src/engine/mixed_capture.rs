@@ -246,7 +246,7 @@ impl CapturedMixedSchedule {
             if !item.is_effect() {
                 continue;
             }
-            let crate::UArgRef::Effect(after) = item.kernel.arg() else {
+            let crate::Operation::After(after) = item.kernel.operation() else {
                 return Err(ReplayError::Corrupt("effect item missing payload".into()));
             };
             let payload = rebind_payload(after, &map_state)?;
@@ -670,7 +670,7 @@ impl CapturedMixedSchedule {
             .schedule
             .items
             .iter()
-            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard(_)))
         {
             return Err(ReplayError::Unsupported(
                 "tensor guard mixed replay is unsupported".into(),
@@ -1050,8 +1050,8 @@ fn rebind_payload(
 }
 
 fn effect_payload(item: &crate::ScheduleItem) -> Result<&crate::EffectPayload, ReplayError> {
-    match item.kernel.arg() {
-        crate::UArgRef::Effect(payload) => Ok(payload),
+    match item.kernel.operation() {
+        crate::Operation::EffectStore(payload) | crate::Operation::After(payload) => Ok(payload),
         _ => Err(ReplayError::Corrupt("effect payload is absent".into())),
     }
 }
@@ -1065,12 +1065,12 @@ fn effect_plan(schedule: &Schedule) -> Result<crate::EffectPlan, ReplayError> {
             .sources()
             .first()
             .ok_or_else(|| ReplayError::Corrupt("effect AFTER lacks STORE".into()))?;
-        let crate::UArgRef::Effect(store_payload) = store.arg() else {
+        let crate::Operation::EffectStore(store_payload) = store.operation() else {
             return Err(ReplayError::Corrupt(
                 "effect STORE payload is absent".into(),
             ));
         };
-        if store_payload != after {
+        if store_payload.as_ref() != after {
             return Err(ReplayError::Corrupt(
                 "effect STORE/AFTER payload mismatch".into(),
             ));
@@ -1193,8 +1193,8 @@ mod tests {
         assert!(decoded.schedule.items[0].is_effect());
         assert_eq!(decoded.states, captured.states);
         assert!(matches!(
-            decoded.schedule.items[0].kernel.sources()[0].kind(),
-            crate::UOpKind::EffectStore
+            decoded.schedule.items[0].kernel.sources()[0].operation(),
+            crate::Operation::EffectStore(_)
         ));
         assert!(crate::uop::artifact::encode(&decoded.schedule.items[0].kernel).is_err());
         let _ = (DType::F16, Shape::from([2]));

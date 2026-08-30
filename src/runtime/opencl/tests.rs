@@ -1,8 +1,9 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    AddressSpace, Backend, BinaryOp, BufferRole, CpuBackend, DType, Graph, KernelBindings,
-    KernelBufferDesc, Scalar, Shape, TensorData, UArg, UArgRef, UOp, UOpKind, UType, schedule,
+    AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CpuBackend, DType, Graph,
+    IndexValue, KernelBindings, KernelBufferDesc, Operation, Scalar, Shape, TensorData, UOp, UType,
+    schedule,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -533,12 +534,8 @@ impl Dispatch for MockDispatch {
                 let fault =
                     transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
                         let buffer = match arg {
-                            UArgRef::BufferIndex { buffer, .. }
-                            | UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
-                            _ => {
-                                return Err(OpenClError::InvalidBinding(
-                                    "semantic load index".into(),
-                                ));
+                            IndexValue::Buffer { buffer, .. } | IndexValue::View { buffer, .. } => {
+                                *buffer
                             }
                         };
                         let data = bindings.get(buffer).ok_or_else(|| {
@@ -752,7 +749,7 @@ fn captured_random_plans_render_and_mock_execute_without_stream_state() {
     for output in [uniform, normal, randint] {
         let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
         let rendered = renderer.render(&root).unwrap();
-        let UArgRef::Random(plan) = root.arg() else {
+        let Operation::Random(plan) = root.operation() else {
             panic!("missing random plan")
         };
         let expected = plan.execute().unwrap().to_le_bytes().unwrap();
@@ -1153,46 +1150,38 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
     let literal_source = |dtype, bits| {
         let ty = UType::scalar(dtype);
         let shape = Shape::new([]);
-        let range = UOp::try_new(
-            UOpKind::Range,
+        let range = UOp::from_operation(
+            Operation::Range(0),
             Some(UType::scalar(DType::I64)),
             vec![UOp::constant(1, UType::scalar(DType::I64))],
-            UArg::RangeAxis(0),
-        )
-        .unwrap();
-        let address = UOp::try_new(
-            UOpKind::DefineGlobal,
-            Some(ty),
-            vec![],
-            UArg::Address {
+        );
+        let address = UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
                 space: AddressSpace::Global,
                 name: "literal".into(),
                 element: ty,
-            },
-        )
-        .unwrap();
-        let index = UOp::try_new(
-            UOpKind::Index,
+            }),
             Some(ty),
-            vec![address, range.clone()],
-            UArg::BufferIndex {
+            vec![],
+        );
+        let index = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
                 buffer: 77,
                 elements: 1,
                 input_shape: shape.clone(),
                 output_shape: shape,
-            },
-        )
-        .unwrap();
+            }),
+            Some(ty),
+            vec![address, range.clone()],
+        );
         renderer
             .render(&UOp::sink(vec![
-                UOp::try_new(
-                    UOpKind::Store,
+                UOp::from_operation(
+                    Operation::Store,
                     None,
                     vec![index, UOp::scalar_constant(dtype, bits, ty)],
-                    UArg::None,
-                )
-                .unwrap(),
-                UOp::try_new(UOpKind::EndRange, None, vec![range], UArg::None).unwrap(),
+                ),
+                UOp::from_operation(Operation::EndRange, None, vec![range]),
             ]))
             .unwrap()
             .source
@@ -2701,8 +2690,8 @@ fn guarded_shift_reconstructs_count_through_static_view() {
         rendered.transaction.as_ref().unwrap().guards[0]
             .rhs
             .sources()[0]
-            .arg(),
-        UArgRef::ViewBufferIndex { .. }
+            .operation(),
+        Operation::Index(IndexValue::View { .. })
     ));
     let mock = Arc::new(MockDispatch::default());
     let (context, queue) = setup(mock);
