@@ -109,18 +109,6 @@ fn fixture() -> Vec<u8> {
     field(&mut m, 8, &op);
     m
 }
-fn native_passthrough_fixture() -> Vec<u8> {
-    let mut g = vec![];
-    field(&mut g, 11, &value("x", &[1, 2]));
-    field(&mut g, 12, &value("y", &[1, 2]));
-    field(&mut g, 1, &node("Identity", &["x"], "y"));
-    let mut op = vec![];
-    var(&mut op, 2, 13);
-    let mut m = vec![];
-    field(&mut m, 7, &g);
-    field(&mut m, 8, &op);
-    m
-}
 fn multi_fixture() -> Vec<u8> {
     let mut g = vec![];
     field(&mut g, 11, &value("x", &[1, 2]));
@@ -274,11 +262,15 @@ fn local_model_named_npy_strict_native_is_atomic_and_reuses_caller_cache() {
 
     let rejected_output = d.join("rejected.npy");
     fs::write(&rejected_output, b"preserve-me").unwrap();
-    let unsupported_model = d.join("unsupported.onnx");
-    fs::write(&unsupported_model, native_passthrough_fixture()).unwrap();
+    let rejected_input = d.join("rejected-input.npy");
+    save_npy_file(
+        &rejected_input,
+        &TensorData::new([1, 2], vec![1.0f64, 2.0]).unwrap(),
+    )
+    .unwrap();
     let rejected = run_onnx_files_native(
-        &unsupported_model,
-        &inputs,
+        &model,
+        &paths(&[("x", rejected_input)]),
         &paths(&[("y", rejected_output.clone())]),
         OnnxWorkflowLimits::default(),
         &CapturedReplayExecutor::default(),
