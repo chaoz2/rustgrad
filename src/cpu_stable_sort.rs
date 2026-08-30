@@ -305,6 +305,10 @@ const fn dtype_tag(dtype: DType) -> u8 {
         DType::BF16 => 10,
         DType::F32 => 11,
         DType::F64 => 12,
+        DType::F8E4M3 => 13,
+        DType::F8E5M2 => 14,
+        DType::F8E4M3FNUZ => 15,
+        DType::F8E5M2FNUZ => 16,
     }
 }
 

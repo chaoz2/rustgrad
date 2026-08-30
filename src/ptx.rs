@@ -886,6 +886,9 @@ fn reject_sign_storage_dtype(dtype: DType) -> Result<(), PtxError> {
         | DType::BF16
         | DType::F32
         | DType::F64 => Ok(()),
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => Err(
+            PtxError::Unsupported(format!("float8 dtype {dtype:?} is transport-only")),
+        ),
     }
 }
 
@@ -1582,7 +1585,7 @@ fn scoped_compare_value_proof(
             "public Eq operands do not use source promotion".into(),
         ));
     }
-    for (load, cast, source_dtype) in [
+    for (_load, cast, source_dtype) in [
         (left_load, left_cast, left_dtype),
         (right_load, right_cast, right_dtype),
     ] {
@@ -2802,7 +2805,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
             "public Select payloads do not use source promotion".into(),
         ));
     }
-    for (load, cast, source_dtype) in [
+    for (_load, cast, source_dtype) in [
         (true_load, true_cast, true_dtype),
         (false_load, false_cast, false_dtype),
     ] {
@@ -3350,6 +3353,11 @@ fn emit_typed_binary_cast(
                 ));
                 Ok("%f31".into())
             }
+            DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                Err(PtxError::Unsupported(format!(
+                    "float8 source dtype {source_dtype:?} is transport-only"
+                )))
+            }
         }
     }
     match target {
@@ -3469,6 +3477,9 @@ fn emit_isinf_predicate(lines: &mut Vec<String>, dst: &str, source: String, dtyp
             lines.push(format!("  mov.b64 %rd60, {source};"));
             lines.push("  and.b64 %rd60, %rd60, 0x7fffffffffffffff;".into());
             lines.push("  setp.eq.u64 %p1, %rd60, 0x7ff0000000000000;".into());
+        }
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+            unreachable!("float8 is rejected before PTX predicate emission")
         }
     }
     lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
@@ -4105,6 +4116,11 @@ fn emit(
                         lines.push(format!("  xor.b64 {dst}, {a}, 0x8000000000000000;"));
                     }
                     DType::Bool => unreachable!(),
+                    DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                        return Err(PtxError::Unsupported(
+                            "float8 negation is outside the PTX subset".into(),
+                        ));
+                    }
                 }
                 return Ok(dst);
             }
@@ -4167,6 +4183,11 @@ fn emit(
                         lines.push(format!("  selp.f64 {dst}, 0.0, 1.0, %p1;"));
                         lines.push(format!("  setp.lt.f64 %p2, {a}, 0.0;"));
                         lines.push(format!("  selp.f64 {dst}, -1.0, {dst}, %p2;"));
+                    }
+                    DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                        return Err(PtxError::Unsupported(
+                            "float8 sign is outside the PTX subset".into(),
+                        ));
                     }
                 }
                 return Ok(dst);
@@ -4248,6 +4269,11 @@ fn emit(
                             DType::F64 => lines.push(format!("  mov.f64 {dst}, %fd28;")),
                             _ => unreachable!(),
                         }
+                    }
+                    DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                        return Err(PtxError::Unsupported(
+                            "float8 LeakyReLU is outside the PTX subset".into(),
+                        ));
                     }
                 }
                 return Ok(dst);
@@ -4338,6 +4364,11 @@ fn emit(
                             }
                         ));
                     }
+                    DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                        return Err(PtxError::Unsupported(
+                            "float8 arithmetic is outside the PTX subset".into(),
+                        ));
+                    }
                 }
                 return Ok(dst);
             }
@@ -4355,6 +4386,11 @@ fn emit(
                     // F32 registers; the sole narrowing occurs at Store.
                     DType::F16 | DType::BF16 | DType::F32 => "mul.rn.f32",
                     DType::F64 => "mul.rn.f64",
+                    DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                        return Err(PtxError::Unsupported(
+                            "float8 Abs is outside the PTX subset".into(),
+                        ));
+                    }
                 };
                 lines.push(format!("  {mnemonic} {dst}, {a}, {b};"));
                 return Ok(dst);
@@ -4372,6 +4408,11 @@ fn emit(
                 let predicate_dtype = match ty {
                     DType::F16 | DType::BF16 | DType::F32 => "f32",
                     DType::F64 => "f64",
+                    DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                        return Err(PtxError::Unsupported(
+                            "float8 extrema is outside the PTX subset".into(),
+                        ));
+                    }
                     dtype => ptx_type(dtype),
                 };
                 // Ordered predicates select rhs only when it strictly wins.
@@ -4398,6 +4439,11 @@ fn emit(
                     DType::I64 | DType::U64 => "b64",
                     DType::F32 => "f32",
                     DType::F64 => "f64",
+                    DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                        return Err(PtxError::Unsupported(
+                            "float8 extrema is outside the PTX subset".into(),
+                        ));
+                    }
                 };
                 lines.push(format!(
                     "  selp.{select_type} {dst}, {raw_b}, {raw_a}, %p1;"
@@ -4710,6 +4756,11 @@ fn emit(
                     DType::I64 | DType::U64 => "b64",
                     DType::F32 => "f32",
                     DType::F64 => "f64",
+                    DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                        return Err(PtxError::Unsupported(
+                            "float8 Select is outside the PTX subset".into(),
+                        ));
+                    }
                 };
                 lines.push(format!("  selp.{select_type} {dst}, {a}, {b}, %p2;"));
             } else {
@@ -7688,7 +7739,8 @@ mod tests {
         let mut vjp = Graph::new();
         let input = vjp.input_dtype("x", [], DType::F32);
         let output = vjp.reciprocal(input).unwrap();
-        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
+        let loss = vjp.sum_all(output).unwrap();
+        let gradient = vjp.grad(loss, input).unwrap();
         assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
     }
 
@@ -7811,7 +7863,8 @@ mod tests {
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("x", [], DType::F32, true);
         let output = vjp.sqrt(input).unwrap();
-        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
+        let loss = vjp.sum_all(output).unwrap();
+        let gradient = vjp.grad(loss, input).unwrap();
         assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
 
         let mut compound = Graph::new();
@@ -7941,7 +7994,8 @@ mod tests {
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("x", [], DType::F32, true);
         let output = vjp.rsqrt(input).unwrap();
-        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
+        let loss = vjp.sum_all(output).unwrap();
+        let gradient = vjp.grad(loss, input).unwrap();
         assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
     }
 
@@ -8309,7 +8363,8 @@ mod tests {
         let lhs = vjp.input_dtype("lhs", [], DType::F32);
         let rhs = vjp.input_dtype("rhs", [], DType::F32);
         let output = vjp.div(lhs, rhs).unwrap();
-        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), lhs).unwrap();
+        let loss = vjp.sum_all(output).unwrap();
+        let gradient = vjp.grad(loss, lhs).unwrap();
         assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
 
         // The exception is the ordered source graph only: raw DIV, swapped
@@ -8656,7 +8711,10 @@ mod tests {
         ));
         let mut raw = Graph::new();
         let input = raw.input_dtype("input", [1], DType::Bool);
-        let truth = raw.constant(crate::Scalar::Bool(true));
+        let truth = raw.constant(TensorData::scalar_with_dtype(
+            crate::Scalar::Bool(true),
+            DType::Bool,
+        ));
         let output = raw.compare(crate::CompareOp::Ne, input, truth).unwrap();
         assert!(matches!(
             renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()),
@@ -9795,7 +9853,8 @@ mod tests {
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
         let output = vjp.relu(input).unwrap();
-        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
+        let loss = vjp.sum_all(output).unwrap();
+        let gradient = vjp.grad(loss, input).unwrap();
         assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
 
         // Strict rejection: reversed predicate/payloads, noncanonical or

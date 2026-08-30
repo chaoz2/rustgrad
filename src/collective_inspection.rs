@@ -119,10 +119,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collective::DeviceId;
-    use crate::{
-        CollectiveKind, CollectivePlanner, CollectiveRequest, DType, DeviceGroup, Reduction,
-    };
+    use crate::collective::{DeviceId, Reduction};
+    use crate::{CollectiveKind, CollectivePlanner, CollectiveRequest, DType, DeviceGroup};
     fn plan() -> CollectivePlan {
         CollectivePlanner::plan(CollectiveRequest {
             group: DeviceGroup::new([

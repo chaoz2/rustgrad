@@ -20,6 +20,10 @@ fn dtype_name(dtype: crate::DType) -> &'static str {
         crate::DType::BF16 => "bf16",
         crate::DType::F32 => "f32",
         crate::DType::F64 => "f64",
+        crate::DType::F8E4M3 => "f8e4m3",
+        crate::DType::F8E5M2 => "f8e5m2",
+        crate::DType::F8E4M3FNUZ => "f8e4m3fnuz",
+        crate::DType::F8E5M2FNUZ => "f8e5m2fnuz",
     }
 }
 fn shape_name(shape: &crate::Shape) -> String {
@@ -317,6 +321,10 @@ pub fn native_mixed_batch_trace_viz(trace: &NativeMixedBatchTrace) -> Result<Viz
         .field("vectorized", trace.vectorized.to_string())
         .field("binding_count", trace.binding_count.to_string())
         .field("binding_schema_keys", u64_list(&trace.binding_schema_keys))
+        .field(
+            "rebinding_schema_keys",
+            u64_list(&trace.rebinding_schema_keys),
+        )
         .field(
             "pure_item_cache_keys",
             u64_list(&trace.pure_item_cache_keys),

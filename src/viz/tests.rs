@@ -189,7 +189,7 @@ fn typed_trace_visualization_is_deterministic_and_fail_closed() {
 
 #[test]
 fn cuda_trace_visualization_preserves_typed_submission_order() {
-    let device = crate::DeviceId::new("cuda:0").unwrap();
+    let device = crate::collective::DeviceId::new("cuda:0").unwrap();
     let collective = vec![
         crate::CudaCollectiveTrace {
             action_id: 1,
@@ -376,6 +376,7 @@ fn replay_trace_visualization_preserves_typed_fields_and_duplicates() {
         binding_count: 2,
         binding_schema_keys: vec![5, 6],
         pure_item_cache_keys: vec![7],
+        rebinding_schema_keys: vec![],
     };
     assert!(
         crate::native_mixed_batch_trace_viz(&batch)

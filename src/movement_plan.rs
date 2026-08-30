@@ -602,6 +602,7 @@ fn scalar_bits(dtype: DType, value: Scalar) -> u64 {
         Storage::U32(v) => v[0] as u64,
         Storage::I64(v) => v[0] as u64,
         Storage::U64(v) => v[0],
+        Storage::Float8(v) => v.as_raw()[0] as u64,
         Storage::F32(v) => v[0].to_bits() as u64,
         Storage::F64(v) => v[0].to_bits(),
     }
@@ -620,6 +621,14 @@ fn scalar_from_bits(dtype: DType, bits: u64) -> Scalar {
         DType::U32 => Scalar::U(bits as u32 as u64),
         DType::I64 => Scalar::I(bits as i64),
         DType::U64 => Scalar::U(bits),
+        dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
+            Scalar::F(
+                dtype
+                    .float8_format()
+                    .expect("matched float8 dtype")
+                    .decode(bits as u8),
+            )
+        }
         DType::F16 => Scalar::F(crate::f16_to_f32(bits as u16) as f64),
         DType::BF16 => Scalar::F(crate::bf16_to_f32(bits as u16) as f64),
         DType::F32 => Scalar::F(f32::from_bits(bits as u32) as f64),
@@ -1201,7 +1210,7 @@ mod tests {
         else {
             panic!("pad plan")
         };
-        assert_eq!(padding, vec![(1, 0), (0, 2)]);
+        assert_eq!(padding.as_slice(), [(1, 0), (0, 2)]);
         assert_eq!(*fill_bits, 0x8000);
         assert!(plan.validate().is_ok());
     }

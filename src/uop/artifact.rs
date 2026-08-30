@@ -1649,6 +1649,23 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
             write_operand(w, input)?;
             write_affine_view(w, view)?;
         }
+        MovementKernelKind::Pad {
+            input,
+            padding,
+            fill_bits,
+        } => {
+            w.u8(4)?;
+            write_operand(w, input)?;
+            w.u32(
+                u32::try_from(padding.len())
+                    .map_err(|_| ArtifactError::Format("movement padding"))?,
+            )?;
+            for (before, after) in padding {
+                w.usize(*before)?;
+                w.usize(*after)?;
+            }
+            w.u64(*fill_bits)?;
+        }
         MovementKernelKind::Concat { inputs, axis } => {
             w.u8(0)?;
             w.u32(
@@ -1693,6 +1710,19 @@ fn read_movement(r: &mut Reader<'_>) -> Result<MovementKernelPlan, ArtifactError
             input: read_operand(r)?,
             view: read_affine_view(r)?,
         },
+        4 => {
+            let input = read_operand(r)?;
+            let count = r.count(MAX_COLLECTION)?;
+            let mut padding = Vec::with_capacity(count);
+            for _ in 0..count {
+                padding.push((r.usize()?, r.usize()?));
+            }
+            MovementKernelKind::Pad {
+                input,
+                padding,
+                fill_bits: r.u64()?,
+            }
+        }
         0 => {
             let count = r.count(MAX_COLLECTION)?;
             let mut inputs = Vec::with_capacity(count);
@@ -2524,6 +2554,28 @@ mod tests {
         );
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
+
+        let mut pad_graph = crate::Graph::new();
+        let input = pad_graph.input_dtype("input", [1, 2], DType::F16);
+        let output = pad_graph
+            .pad(input, [(1, 0), (0, 2)], crate::Scalar::F(-0.0))
+            .unwrap();
+        let root = crate::lower_graph_movement(&pad_graph, output).unwrap();
+        let bytes = encode(&root).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(encode(&decoded).unwrap(), bytes);
+        assert_eq!(decoded, root);
+        let UArg::Movement(plan) = root.arg() else {
+            panic!("movement payload missing");
+        };
+        assert!(matches!(
+            &plan.kind,
+            MovementKernelKind::Pad {
+                padding,
+                fill_bits: 0x8000,
+                ..
+            } if padding.as_slice() == [(1, 0), (0, 2)]
+        ));
     }
 
     #[test]

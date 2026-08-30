@@ -2023,11 +2023,25 @@ mod tests {
             let inputs = HashMap::from([
                 (
                     "lhs".into(),
-                    TensorData::new([3], vec![f64::NAN, -0.0, f64::INFINITY]).unwrap(),
+                    TensorData::from_scalars(
+                        [3],
+                        DType::F64,
+                        [
+                            Scalar::F(f64::NAN),
+                            Scalar::F(-0.0),
+                            Scalar::F(f64::INFINITY),
+                        ],
+                    )
+                    .unwrap(),
                 ),
                 (
                     "rhs".into(),
-                    TensorData::new([3], vec![1.0, 0.0, f64::INFINITY]).unwrap(),
+                    TensorData::from_scalars(
+                        [3],
+                        DType::F64,
+                        [Scalar::F(1.0), Scalar::F(0.0), Scalar::F(f64::INFINITY)],
+                    )
+                    .unwrap(),
                 ),
             ]);
             assert_eq!(

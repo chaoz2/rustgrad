@@ -4043,10 +4043,18 @@ pub(crate) mod tests {
         dtod_fail_after: AtomicUsize,
         dtod_fail_result: AtomicI32,
         peer_enable_result: AtomicI32,
+        peer_enable_fail_after: AtomicUsize,
+        peer_enable_fail_result: AtomicI32,
         peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
         stream_wait_result: AtomicI32,
         stream_sync_result: AtomicI32,
+        stream_sync_fail_after: AtomicUsize,
+        stream_sync_fail_result: AtomicI32,
+        stream_create_fail_after: AtomicUsize,
+        stream_create_fail_result: AtomicI32,
+        stream_destroy_fail_after: AtomicUsize,
+        stream_destroy_fail_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -4088,15 +4096,33 @@ pub(crate) mod tests {
                 dtod_fail_after: AtomicUsize::new(usize::MAX),
                 dtod_fail_result: AtomicI32::new(0),
                 peer_enable_result: AtomicI32::new(0),
+                peer_enable_fail_after: AtomicUsize::new(usize::MAX),
+                peer_enable_fail_result: AtomicI32::new(0),
                 peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
                 stream_wait_result: AtomicI32::new(0),
                 stream_sync_result: AtomicI32::new(0),
+                stream_sync_fail_after: AtomicUsize::new(usize::MAX),
+                stream_sync_fail_result: AtomicI32::new(0),
+                stream_create_fail_after: AtomicUsize::new(usize::MAX),
+                stream_create_fail_result: AtomicI32::new(0),
+                stream_destroy_fail_after: AtomicUsize::new(usize::MAX),
+                stream_destroy_fail_result: AtomicI32::new(0),
             }
         }
     }
     impl Mock {
         const INVALID_MEMORY: CuResult = 1;
+
+        fn one_shot_failure(after: &AtomicUsize, result: &AtomicI32) -> Option<CuResult> {
+            (after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0))
+            .then(|| result.load(Ordering::Acquire))
+        }
         #[allow(dead_code)]
         pub(crate) fn generic_kernel_count(&self) -> usize {
             self.generic_kernels.lock().unwrap().len()
@@ -4651,6 +4677,12 @@ pub(crate) mod tests {
         pub(crate) fn set_peer_enable_result(&self, result: CuResult) {
             self.peer_enable_result.store(result, Ordering::Release);
         }
+        pub(crate) fn fail_peer_enable_after(&self, successful_calls: usize, result: CuResult) {
+            self.peer_enable_fail_result
+                .store(result, Ordering::Release);
+            self.peer_enable_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
         pub(crate) fn set_peer_disable_result(&self, result: CuResult) {
             self.peer_disable_result.store(result, Ordering::Release);
         }
@@ -4665,6 +4697,24 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_stream_sync_result(&self, result: CuResult) {
             self.stream_sync_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn fail_stream_sync_after(&self, successful_calls: usize, result: CuResult) {
+            self.stream_sync_fail_result
+                .store(result, Ordering::Release);
+            self.stream_sync_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
+        pub(crate) fn fail_stream_create_after(&self, successful_calls: usize, result: CuResult) {
+            self.stream_create_fail_result
+                .store(result, Ordering::Release);
+            self.stream_create_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
+        pub(crate) fn fail_stream_destroy_after(&self, successful_calls: usize, result: CuResult) {
+            self.stream_destroy_fail_result
+                .store(result, Ordering::Release);
+            self.stream_destroy_fail_after
+                .store(successful_calls, Ordering::Release);
         }
     }
     impl Dispatch for Mock {
@@ -4927,6 +4977,11 @@ pub(crate) mod tests {
         }
         fn ctx_enable_peer_access(&self, _: CuContext, _: c_uint) -> CuResult {
             self.call("peer_enable");
+            if let Some(result) =
+                Self::one_shot_failure(&self.peer_enable_fail_after, &self.peer_enable_fail_result)
+            {
+                return result;
+            }
             self.peer_enable_result.load(Ordering::Acquire)
         }
         fn ctx_disable_peer_access(&self, _: CuContext) -> CuResult {
@@ -5098,15 +5153,32 @@ pub(crate) mod tests {
         }
         fn stream_create(&self, out: &mut CuStream, _: c_uint) -> CuResult {
             self.call("stream_create");
+            if let Some(result) = Self::one_shot_failure(
+                &self.stream_create_fail_after,
+                &self.stream_create_fail_result,
+            ) {
+                return result;
+            }
             *out = 0x22usize as CuStream;
             0
         }
         fn stream_destroy(&self, _: CuStream) -> CuResult {
             self.call("stream_destroy");
+            if let Some(result) = Self::one_shot_failure(
+                &self.stream_destroy_fail_after,
+                &self.stream_destroy_fail_result,
+            ) {
+                return result;
+            }
             0
         }
         fn stream_sync(&self, _: CuStream) -> CuResult {
             self.call("stream_sync");
+            if let Some(result) =
+                Self::one_shot_failure(&self.stream_sync_fail_after, &self.stream_sync_fail_result)
+            {
+                return result;
+            }
             self.stream_sync_result.load(Ordering::Acquire)
         }
         fn event_create(&self, out: &mut CuEvent, _: c_uint) -> CuResult {

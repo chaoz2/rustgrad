@@ -145,7 +145,9 @@ impl<'a> LlamaNativeGenerator<'a> {
             }
             .into());
         }
-        self.model.validate_token_ids(prompt_ids)?;
+        self.model
+            .validate_token_ids(prompt_ids)
+            .map_err(LlamaGenerationError::from)?;
         let vocab = self.model.config().schema().vocab_size();
         validate_sampling(sampling, max_new_tokens, vocab)?;
         if max_new_tokens == 0 {
@@ -330,7 +332,9 @@ impl<'a> LlamaBatchNativeGenerator<'a> {
                 .into());
             }
         }
-        self.model.validate_batch_token_ids(prompts)?;
+        self.model
+            .validate_batch_token_ids(prompts)
+            .map_err(LlamaBatchGenerationError::from)?;
         let batch = prompts.len();
         let vocab = self.model.config().schema().vocab_size();
         validate_batch_sampling(sampling, max_new_tokens, batch, vocab)?;

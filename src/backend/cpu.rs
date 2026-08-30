@@ -236,13 +236,17 @@ impl Backend for CpuBackend {
                     pair,
                     output,
                 } => {
-                    let pair = sort_pairs.entry(*pair).or_insert_with(|| {
-                        stable_sort_pair(&values[input.index()], *axis, *descending)
-                    });
+                    if !sort_pairs.contains_key(pair) {
+                        let sorted = stable_sort_pair(&values[input.index()], *axis, *descending)?;
+                        sort_pairs.insert(*pair, sorted);
+                    }
+                    let pair = sort_pairs
+                        .get(pair)
+                        .expect("sort pair is inserted before lookup");
                     match output {
-                        SortOutput::Values => pair.as_ref().map(|pair| pair.0.clone()),
-                        SortOutput::Indices => pair.as_ref().map(|pair| pair.1.clone()),
-                    }?
+                        SortOutput::Values => pair.0.clone(),
+                        SortOutput::Indices => pair.1.clone(),
+                    }
                 }
                 Op::ReduceGrad {
                     input,
@@ -2097,28 +2101,7 @@ fn tinygrad_sort_padding(dtype: DType, descending: bool) -> Scalar {
     // `Tensor.sort` pads its bitonic network with dtype.min for descending
     // and dtype.max for ascending.  These are source values, rather than a
     // host ordering convention: floating extrema are infinities.
-    match (dtype, descending) {
-        (DType::Bool, false) => Scalar::Bool(true),
-        (DType::Bool, true) => Scalar::Bool(false),
-        (DType::I8, false) => Scalar::I(i8::MAX.into()),
-        (DType::I8, true) => Scalar::I(i8::MIN.into()),
-        (DType::U8, false) => Scalar::U(u8::MAX.into()),
-        (DType::U8, true) => Scalar::U(0),
-        (DType::I16, false) => Scalar::I(i16::MAX.into()),
-        (DType::I16, true) => Scalar::I(i16::MIN.into()),
-        (DType::U16, false) => Scalar::U(u16::MAX.into()),
-        (DType::U16, true) => Scalar::U(0),
-        (DType::I32, false) => Scalar::I(i32::MAX.into()),
-        (DType::I32, true) => Scalar::I(i32::MIN.into()),
-        (DType::U32, false) => Scalar::U(u32::MAX.into()),
-        (DType::U32, true) => Scalar::U(0),
-        (DType::I64, false) => Scalar::I(i64::MAX),
-        (DType::I64, true) => Scalar::I(i64::MIN),
-        (DType::U64, false) => Scalar::U(u64::MAX),
-        (DType::U64, true) => Scalar::U(0),
-        (DType::F16 | DType::BF16 | DType::F32 | DType::F64, false) => Scalar::F(f64::INFINITY),
-        (DType::F16 | DType::BF16 | DType::F32 | DType::F64, true) => Scalar::F(f64::NEG_INFINITY),
-    }
+    if descending { dtype.min() } else { dtype.max() }
 }
 
 /// Flips the green half of one source `split(1, crossover_dim)` exactly as
