@@ -1198,7 +1198,7 @@ fn execute_webgpu_semantics(program: &UOp, bindings: &KernelBindings) -> crate::
     };
     let dtype = index.ty().ok_or(crate::Error::InvalidIndex)?.scalar;
     if dtype == DType::BF16
-        && store.sources()[1].operation() == Operation::Cast
+        && store.sources()[1].operation() == &Operation::Cast
         && store.sources()[1]
             .sources()
             .first()
@@ -1280,7 +1280,7 @@ fn eval_webgpu_narrow(
         Operation::GraphBinary(op) => {
             let lhs = child(0)?;
             let rhs = child(1)?;
-            quantize_webgpu_scalar(dtype, webgpu_binary(lhs, rhs, dtype, op)?)
+            quantize_webgpu_scalar(dtype, webgpu_binary(lhs, rhs, dtype, *op)?)
         }
         Operation::Binary(op) => {
             use crate::uop::Binary::{Add, Eq, Le, Lt, Mul, Sub};

@@ -83,7 +83,7 @@ impl MetalTransactionAbi {
             let Operation::GraphBinary(op) = node.operation() else {
                 continue;
             };
-            let Some(operation) = GuardedIntegerOp::from_binary(op) else {
+            let Some(operation) = GuardedIntegerOp::from_binary(*op) else {
                 continue;
             };
             let dtype = node
@@ -259,11 +259,11 @@ where
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             if let Some(id) = guard_ids.get(node).copied()
-                && invalid_guard(op, dtype, rhs)
+                && invalid_guard(*op, dtype, rhs)
             {
                 return Ok(Evaluated::Fault(id));
             }
-            integer_binary(op, dtype, lhs, rhs)?
+            integer_binary(*op, dtype, lhs, rhs)?
         }
         Operation::GraphCompare(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -274,7 +274,7 @@ where
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
-            Scalar::Bool(compare(lhs, rhs, op))
+            Scalar::Bool(compare(lhs, rhs, *op))
         }
         Operation::GraphLogical(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -407,7 +407,6 @@ pub(super) fn logical_offset(arg: &IndexValue, logical: usize) -> Result<usize, 
             view,
             ..
         } => (input_shape, output_shape, Some(view)),
-        _ => return Err(MetalError::InvalidBinding("detail index mismatch".into())),
     };
     let output_strides = output.contiguous_strides();
     let input_strides = input.contiguous_strides();

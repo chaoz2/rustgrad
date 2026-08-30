@@ -405,8 +405,8 @@ impl PtxRenderer {
                 && *output_space == AddressSpace::Global
                 && input_element.scalar == DType::F32
                 && output_element.scalar == DType::F32
-                && input_name == format!("b{input_buffer}")
-                && output_name == format!("b{output_buffer}")
+                && input_name == &format!("b{input_buffer}")
+                && output_name == &format!("b{output_buffer}")
                 && input_buffer != output_buffer
                 && input_index.ty().is_some_and(|ty| ty.scalar == DType::F32)
                 && load.ty().is_some_and(|ty| ty.scalar == DType::F32)
@@ -1298,7 +1298,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     if let Operation::GraphBinary(op @ (crate::BinaryOp::Maximum | crate::BinaryOp::Minimum)) =
         value.operation()
     {
-        return scoped_binary_plan(store, sm, op, ScopedStorageMode::Extrema);
+        return scoped_binary_plan(store, sm, *op, ScopedStorageMode::Extrema);
     }
     if matches!(
         value.operation(),
@@ -1623,7 +1623,7 @@ fn scoped_binary_plan(
     let Operation::GraphBinary(actual_op) = value.operation() else {
         return Ok(None);
     };
-    if actual_op != op {
+    if *actual_op != op {
         return Ok(None);
     }
     let [left, right] = value.sources() else {
@@ -1846,7 +1846,7 @@ fn scoped_compare_value_proof(
     let Operation::GraphCompare(actual) = value.operation() else {
         return Ok(None);
     };
-    if actual != expected {
+    if *actual != expected {
         return Ok(None);
     }
     let [left, right] = value.sources() else {
@@ -2063,8 +2063,8 @@ fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Ptx
         || !matches!(
             truth.operation(),
             Operation::Const(LiteralValue::Scalar {
-                dtype: &DType::Bool,
-                bits: &1
+                dtype: DType::Bool,
+                bits: 1
             })
         )
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
@@ -2119,8 +2119,8 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
         || !matches!(
             truth.operation(),
             Operation::Const(LiteralValue::Scalar {
-                dtype: &DType::Bool,
-                bits: &1
+                dtype: DType::Bool,
+                bits: 1
             })
         )
         || !truth.sources().is_empty()
@@ -2319,8 +2319,8 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
         || !matches!(
             truth.operation(),
             Operation::Const(LiteralValue::Scalar {
-                dtype: &DType::Bool,
-                bits: &1
+                dtype: DType::Bool,
+                bits: 1
             })
         )
         || !truth.sources().is_empty()
@@ -2400,8 +2400,8 @@ fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorage
         || !matches!(
             truth.operation(),
             Operation::Const(LiteralValue::Scalar {
-                dtype: &DType::Bool,
-                bits: &1
+                dtype: DType::Bool,
+                bits: 1
             })
         )
         || truth.ty().map(|t| t.scalar) != Some(DType::Bool)
@@ -2472,8 +2472,8 @@ fn scoped_select_predicate_shape(
                 || !matches!(
                     truth.operation(),
                     Operation::Const(LiteralValue::Scalar {
-                        dtype: &DType::Bool,
-                        bits: &1
+                        dtype: DType::Bool,
+                        bits: 1
                     })
                 )
                 || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
@@ -4414,13 +4414,13 @@ fn emit(
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
-            if op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Sub) {
+            if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Sub) {
                 // The whole-root proof owns this exact `Add(lhs, Neg(rhs))`
                 // composition. The enclosing Add emits one typed Sub, so the
                 // structural Neg contributes its source value unchanged.
                 return Ok(a);
             }
-            if op == crate::UnaryOp::IsInf
+            if *op == crate::UnaryOp::IsInf
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite)
@@ -4438,7 +4438,7 @@ fn emit(
                 emit_isinf_predicate(lines, &dst, a, source_dtype);
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Reciprocal
+            if *op == crate::UnaryOp::Reciprocal
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
@@ -4460,7 +4460,7 @@ fn emit(
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Sqrt
+            if *op == crate::UnaryOp::Sqrt
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast)
@@ -4483,7 +4483,7 @@ fn emit(
                 lines.push(format!("  sqrt.rn.f64 {dst}, {wide};"));
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Sqrt && storage_mode == Some(ScopedStorageMode::Rsqrt) {
+            if *op == crate::UnaryOp::Sqrt && storage_mode == Some(ScopedStorageMode::Rsqrt) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Sqrt input".into()))?
@@ -4491,7 +4491,7 @@ fn emit(
                 emit_rsqrt_sqrt_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Rsqrt) {
+            if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Rsqrt) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Reciprocal input".into()))?
@@ -4505,7 +4505,7 @@ fn emit(
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Div) {
+            if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Div) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| {
@@ -4515,7 +4515,7 @@ fn emit(
                 emit_div_reciprocal_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
+            if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
                 match ty {
                     DType::I8 | DType::I16 | DType::I32 => {
                         lines.push(format!("  neg.s32 {dst}, {a};"));
@@ -4543,7 +4543,7 @@ fn emit(
                 }
                 return Ok(dst);
             }
-            if op == crate::UnaryOp::Sign {
+            if *op == crate::UnaryOp::Sign {
                 // Sign is source-equivalent to ordered comparisons and
                 // selects, rather than PTX's host-dependent `sign` intrinsic.
                 // In particular, both zero signs produce +0 and unordered
@@ -4637,7 +4637,7 @@ fn emit(
         Operation::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
             if storage_mode == Some(ScopedStorageMode::LeakyRelu) {
-                if op != crate::BinaryOp::Mul {
+                if *op != crate::BinaryOp::Mul {
                     return Err(PtxError::Unsupported(
                         "public LeakyReLU requires only its slope * input branch".into(),
                     ));
@@ -4722,9 +4722,10 @@ fn emit(
                 op,
                 crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub
             ) {
-                let is_sub = op == crate::BinaryOp::Sub
-                    || (storage_mode == Some(ScopedStorageMode::Sub) && op == crate::BinaryOp::Add);
-                let is_add = op == crate::BinaryOp::Add && !is_sub;
+                let is_sub = *op == crate::BinaryOp::Sub
+                    || (storage_mode == Some(ScopedStorageMode::Sub)
+                        && *op == crate::BinaryOp::Add);
+                let is_add = *op == crate::BinaryOp::Add && !is_sub;
                 match ty {
                     DType::Bool if is_add => lines.push(format!("  or.b32 {dst}, {a}, {b};")),
                     DType::Bool if !is_sub => lines.push(format!("  and.b32 {dst}, {a}, {b};")),
@@ -4805,7 +4806,7 @@ fn emit(
                 }
                 return Ok(dst);
             }
-            if storage_mode == Some(ScopedStorageMode::Abs) && op == crate::BinaryOp::Mul {
+            if storage_mode == Some(ScopedStorageMode::Abs) && *op == crate::BinaryOp::Mul {
                 let mnemonic = match ty {
                     DType::Bool => {
                         lines.push(format!("  and.b32 {dst}, {a}, {b};"));
@@ -4851,7 +4852,7 @@ fn emit(
                 // Ordered predicates select rhs only when it strictly wins.
                 // Equality, signed-zero ties, and every unordered NaN case
                 // retain lhs and its exact stored payload.
-                let predicate = if op == crate::BinaryOp::Maximum {
+                let predicate = if *op == crate::BinaryOp::Maximum {
                     "lt"
                 } else {
                     "gt"
@@ -4889,7 +4890,7 @@ fn emit(
                         "ordered maximum/minimum for narrow float lacks an exact PTX path".into(),
                     ));
                 }
-                let predicate = if op == crate::BinaryOp::Maximum {
+                let predicate = if *op == crate::BinaryOp::Maximum {
                     "lt"
                 } else {
                     "gt"
@@ -4941,12 +4942,12 @@ fn emit(
                         | ScopedStorageMode::Clamp
                 )
             ) {
-                if storage_mode == Some(ScopedStorageMode::Relu) && op != crate::CompareOp::Lt {
+                if storage_mode == Some(ScopedStorageMode::Relu) && *op != crate::CompareOp::Lt {
                     return Err(PtxError::Unsupported(
                         "public ReLU requires ordered zero < input".into(),
                     ));
                 }
-                if storage_mode == Some(ScopedStorageMode::LeakyRelu) && op != crate::CompareOp::Lt
+                if storage_mode == Some(ScopedStorageMode::LeakyRelu) && *op != crate::CompareOp::Lt
                 {
                     return Err(PtxError::Unsupported(
                         "public LeakyReLU requires ordered input < zero".into(),
@@ -5028,7 +5029,7 @@ fn emit(
                 return Ok(dst);
             }
             if storage_mode == Some(ScopedStorageMode::LogicalNot) {
-                if op != crate::CompareOp::Ne
+                if *op != crate::CompareOp::Ne
                     || n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                     || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 {
@@ -5045,7 +5046,7 @@ fn emit(
                 return Ok(dst);
             }
             if storage_mode == Some(ScopedStorageMode::IsFinite) {
-                if op != crate::CompareOp::Ne {
+                if *op != crate::CompareOp::Ne {
                     return Err(PtxError::Unsupported(
                         "scoped IsFinite has a non-Ne comparison".into(),
                     ));
@@ -5098,8 +5099,8 @@ fn emit(
                     crate::CompareOp::Lt
                 };
                 let public_eq_stage =
-                    storage_mode == Some(ScopedStorageMode::Eq) && op == crate::CompareOp::Ne;
-                if op != expected && !public_eq_stage {
+                    storage_mode == Some(ScopedStorageMode::Eq) && *op == crate::CompareOp::Ne;
+                if *op != expected && !public_eq_stage {
                     return Err(PtxError::Unsupported(
                         "scoped predicate does not match its root plan".into(),
                     ));

@@ -1070,7 +1070,7 @@ fn effect_plan(schedule: &Schedule) -> Result<crate::EffectPlan, ReplayError> {
                 "effect STORE payload is absent".into(),
             ));
         };
-        if store_payload != after {
+        if store_payload.as_ref() != after {
             return Err(ReplayError::Corrupt(
                 "effect STORE/AFTER payload mismatch".into(),
             ));

@@ -2776,7 +2776,7 @@ fn emit(
                 | crate::BinaryOp::FMod
                     if !ty.is_float() =>
                 {
-                    return Ok(int_call(op, ty, &a, &b));
+                    return Ok(int_call(*op, ty, &a, &b));
                 }
                 crate::BinaryOp::Shl if !ty.is_float() => {
                     return Ok(format!(
@@ -3121,7 +3121,7 @@ fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
                 lib.display()
             )));
         }
-        Err(error) if error.operation() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(JitError::Io(error.to_string())),
     }
     let sequence = COMPILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);

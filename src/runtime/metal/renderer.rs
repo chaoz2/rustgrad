@@ -385,19 +385,19 @@ fn emit_expr(
     match node.operation() {
         Operation::Const(value) => match value {
             LiteralValue::Scalar {
-                dtype: &DType::F32,
+                dtype: DType::F32,
                 bits,
             } => Ok(format!("as_type<float>((uint)0x{:08x}u)", *bits as u32)),
             LiteralValue::Scalar {
-                dtype: &DType::Bool,
+                dtype: DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("(uchar){bits}u")),
             LiteralValue::Scalar {
-                dtype: &DType::I32,
+                dtype: DType::I32,
                 bits,
             } => Ok(format!("as_type<int>((uint)0x{:08x}u)", *bits as u32)),
             LiteralValue::Scalar {
-                dtype: &DType::U32,
+                dtype: DType::U32,
                 bits,
             } => Ok(format!("(uint)0x{:08x}u", *bits as u32)),
             _ => Err(MetalError::Unsupported(
@@ -483,7 +483,7 @@ fn emit_expr(
         Operation::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
-            emit_binary(op, dtype, &lhs, &rhs)
+            emit_binary(*op, dtype, &lhs, &rhs)
         }
         Operation::Binary(op) => {
             let lhs = child(0, source_map, lines)?;

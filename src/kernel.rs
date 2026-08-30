@@ -1277,7 +1277,7 @@ fn eval(
             let input = eval(&n.sources()[0], bindings, linear, plan)?;
             let input_dtype = n.sources()[0].ty().ok_or(Error::InvalidIndex)?.scalar;
             Ok(FusedValue::typed(
-                unary(input.scalar(), input_dtype, op)?,
+                unary(input.scalar(), input_dtype, *op)?,
                 n.ty().ok_or(Error::InvalidIndex)?.scalar,
             ))
         }
@@ -1286,7 +1286,7 @@ fn eval(
                 eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
                 eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
                 n.ty().ok_or(Error::InvalidIndex)?.scalar,
-                op,
+                *op,
             )?,
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
         )),
@@ -1298,9 +1298,9 @@ fn eval(
                 .iter()
                 .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
             Ok(FusedValue::Scalar(Scalar::Bool(if float8 {
-                compare_float8(lhs.as_f64(), rhs.as_f64(), op)
+                compare_float8(lhs.as_f64(), rhs.as_f64(), *op)
             } else {
-                compare(lhs, rhs, op)
+                compare(lhs, rhs, *op)
             })))
         }
         Operation::GraphLogical(op) => {

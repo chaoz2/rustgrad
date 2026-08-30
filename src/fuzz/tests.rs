@@ -1739,7 +1739,7 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
                     .topological()
                     .unwrap()
                     .iter()
-                    .filter(|node| matches!(node.operation(), Operation::GraphBinary(op) if op == raw_op))
+                    .filter(|node| matches!(node.operation(), Operation::GraphBinary(op) if *op == raw_op))
                     .count(),
                 1,
             );
@@ -1777,7 +1777,7 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             }
             if dtype.is_float8() {
                 assert!(uop.topological().unwrap().iter().any(
-                    |node| matches!(node.operation(), Operation::GraphBinary(op) if op == raw_op)
+                    |node| matches!(node.operation(), Operation::GraphBinary(op) if *op == raw_op)
                 ));
                 assert!(
                     vector.source.matches("rg_f8_decode(").count() > 1
@@ -4188,14 +4188,14 @@ fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
         let scheduled = schedule(&built.graph, built.output).unwrap();
         assert!(scheduled.items.iter().any(|item| {
             item.kernel.topological().unwrap().iter().any(
-                |uop| matches!(uop.operation(), Operation::GraphLogical(actual) if actual == graph_op),
+                |uop| matches!(uop.operation(), Operation::GraphLogical(actual) if *actual == graph_op),
             )
         }));
         let captured =
             CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         assert!(captured.items.iter().any(|item| {
             item.kernel.topological().unwrap().iter().any(
-                |uop| matches!(uop.operation(), Operation::GraphLogical(actual) if actual == graph_op),
+                |uop| matches!(uop.operation(), Operation::GraphLogical(actual) if *actual == graph_op),
             )
         }));
     }
@@ -4323,7 +4323,7 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
         let scheduled = schedule(&built.graph, built.output).unwrap();
         assert!(scheduled.items.iter().any(|item| {
             item.kernel.topological().unwrap().iter().any(
-                |uop| matches!(uop.operation(), Operation::GraphCompare(actual) if actual == graph_op),
+                |uop| matches!(uop.operation(), Operation::GraphCompare(actual) if *actual == graph_op),
             )
         }));
         let captured =
@@ -4331,7 +4331,7 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
         assert_eq!(captured.items.len(), scheduled.items.len());
         assert!(captured.items.iter().any(|item| {
             item.kernel.topological().unwrap().iter().any(
-                |uop| matches!(uop.operation(), Operation::GraphCompare(actual) if actual == graph_op),
+                |uop| matches!(uop.operation(), Operation::GraphCompare(actual) if *actual == graph_op),
             )
         }));
     }
@@ -4515,7 +4515,7 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
             );
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert!(scheduled.items[0].kernel.topological().unwrap().iter().any(
-                |node| matches!(node.operation(), Operation::GraphCompare(actual) if actual == graph_op)
+                |node| matches!(node.operation(), Operation::GraphCompare(actual) if *actual == graph_op)
             ));
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
@@ -4773,7 +4773,7 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
                     _ => unreachable!("loop contains only Neg and Abs"),
                 };
                 assert!(topological.iter().any(|node| {
-                    matches!(node.operation(), Operation::GraphUnary(actual) if actual == expected)
+                    matches!(node.operation(), Operation::GraphUnary(actual) if *actual == expected)
                 }));
             }
             assert!(CpuJit::render(kernel).is_ok(), "{op:?} {dtype:?}");
@@ -5000,7 +5000,7 @@ fn portable_float_unaries_retain_graph_capture_and_native_contracts() {
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert_eq!(scheduled.items.len(), 1);
             assert!(scheduled.items[0].kernel.topological().unwrap().iter().any(
-                |node| matches!(node.operation(), Operation::GraphUnary(actual) if actual == graph_op)
+                |node| matches!(node.operation(), Operation::GraphUnary(actual) if *actual == graph_op)
             ));
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             assert!(
@@ -5114,7 +5114,7 @@ fn portable_storage_unaries_cover_every_concrete_dtype_and_native_fallback() {
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert_eq!(scheduled.items.len(), 1);
             assert!(scheduled.items[0].kernel.topological().unwrap().iter().any(
-                |node| matches!(node.operation(), Operation::GraphUnary(actual) if actual == graph_op)
+                |node| matches!(node.operation(), Operation::GraphUnary(actual) if *actual == graph_op)
             ));
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();

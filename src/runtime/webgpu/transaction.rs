@@ -91,7 +91,7 @@ impl WebGpuTransactionAbi {
             let Operation::GraphBinary(op) = node.operation() else {
                 continue;
             };
-            let Some(operation) = GuardedIntegerOp::from_binary(op) else {
+            let Some(operation) = GuardedIntegerOp::from_binary(*op) else {
                 continue;
             };
             let dtype = node
@@ -170,7 +170,7 @@ impl WebGpuTransactionAbi {
                 ));
             };
             if guard.id != expected_id
-                || GuardedIntegerOp::from_binary(op) != Some(guard.operation)
+                || GuardedIntegerOp::from_binary(*op) != Some(guard.operation)
                 || !matches!(guard.dtype, DType::I32 | DType::U32)
                 || guard.expression.ty().map(|ty| ty.scalar) != Some(guard.dtype)
                 || guard.expression.sources().get(1) != Some(&guard.rhs)
@@ -321,11 +321,11 @@ where
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             if let Some(id) = guard_ids.get(node).copied()
-                && invalid_guard(op, dtype, rhs)
+                && invalid_guard(*op, dtype, rhs)
             {
                 return Ok(Evaluated::Fault(id));
             }
-            integer_binary(op, dtype, lhs, rhs)?
+            integer_binary(*op, dtype, lhs, rhs)?
         }
         Operation::Binary(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -360,7 +360,7 @@ where
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
-            Scalar::Bool(compare(lhs, rhs, op))
+            Scalar::Bool(compare(lhs, rhs, *op))
         }
         Operation::GraphLogical(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -522,11 +522,6 @@ pub(super) fn logical_offset(arg: &IndexValue, logical: usize) -> Result<usize, 
             view,
             ..
         } => (input_shape, output_shape, Some(view)),
-        _ => {
-            return Err(WebGpuError::InvalidBinding(
-                "transaction detail index mismatch".into(),
-            ));
-        }
     };
     let output_strides = output.contiguous_strides();
     let input_strides = input.contiguous_strides();

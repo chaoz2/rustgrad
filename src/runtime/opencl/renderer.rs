@@ -560,35 +560,35 @@ fn emit_expr(
     match node.operation() {
         Operation::Const(value) => match value {
             LiteralValue::Scalar {
-                dtype: &DType::F32,
+                dtype: DType::F32,
                 bits,
             } => Ok(format!("as_float((uint)0x{:08x}u)", *bits as u32)),
             LiteralValue::Scalar {
-                dtype: &DType::Bool,
+                dtype: DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("((uchar){bits}u)")),
             LiteralValue::Scalar {
-                dtype: &DType::I32,
+                dtype: DType::I32,
                 bits,
             } => Ok(format!("as_int((uint)0x{:08x}u)", *bits as u32)),
             LiteralValue::Scalar {
-                dtype: &DType::U32,
+                dtype: DType::U32,
                 bits,
             } => Ok(format!("((uint)0x{:08x}u)", *bits as u32)),
             LiteralValue::Scalar {
-                dtype: &DType::I64,
+                dtype: DType::I64,
                 bits,
             } => Ok(format!("as_long((ulong)0x{bits:016x}ul)")),
             LiteralValue::Scalar {
-                dtype: &DType::U64,
+                dtype: DType::U64,
                 bits,
             } => Ok(format!("((ulong)0x{bits:016x}ul)")),
             LiteralValue::Scalar {
-                dtype: &DType::F64,
+                dtype: DType::F64,
                 bits,
             } => Ok(format!("as_double((ulong)0x{bits:016x}ul)")),
             LiteralValue::Scalar {
-                dtype: &DType::F16,
+                dtype: DType::F16,
                 bits,
             } if dtype == DType::F16 => Ok(narrow::decode(
                 DType::F16,
@@ -596,7 +596,7 @@ fn emit_expr(
             )
             .expect("F16 is a narrow float")),
             LiteralValue::Scalar {
-                dtype: &DType::BF16,
+                dtype: DType::BF16,
                 bits,
             } if dtype == DType::BF16 => Ok(narrow::decode(
                 DType::BF16,
@@ -706,7 +706,7 @@ fn emit_expr(
         Operation::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
-            emit_binary(op, dtype, &lhs, &rhs)
+            emit_binary(*op, dtype, &lhs, &rhs)
         }
         Operation::GraphCompare(op) => {
             let lhs = child(0, source_map, lines)?;

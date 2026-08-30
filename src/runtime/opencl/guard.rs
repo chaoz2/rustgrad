@@ -93,7 +93,7 @@ impl Emitter<'_> {
             }
             Operation::GraphUnary(op) => {
                 let source = self.node(&node.sources()[0], indent)?;
-                let value = unary_expression(op, dtype, &source)?;
+                let value = unary_expression(*op, dtype, &source)?;
                 self.assign_if_ok(indent, dtype, &name, &value);
             }
             Operation::GraphBinary(op) => {
@@ -105,7 +105,7 @@ impl Emitter<'_> {
                     expression_type(dtype)
                 ));
                 if let Some(id) = self.guard_ids.get(node).copied() {
-                    let operation = super::GuardedIntegerOp::from_binary(op).ok_or_else(|| {
+                    let operation = super::GuardedIntegerOp::from_binary(*op).ok_or_else(|| {
                         OpenClError::InvalidBinding("guard opcode mismatch".into())
                     })?;
                     let invalid = invalid_expression(operation, dtype, &rhs);
@@ -123,7 +123,7 @@ impl Emitter<'_> {
                     self.lines.push(format!("{indent}  }}"));
                     self.lines.push(format!("{indent}}}"));
                 } else {
-                    let value = emit_binary(op, dtype, &lhs, &rhs)?;
+                    let value = emit_binary(*op, dtype, &lhs, &rhs)?;
                     self.lines
                         .push(format!("{indent}if (rg_ok) {name} = {value};"));
                 }

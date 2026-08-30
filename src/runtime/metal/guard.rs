@@ -78,7 +78,7 @@ impl Emitter<'_> {
                     metal_storage_type(dtype)
                 ));
                 if let Some(id) = self.guard_ids.get(node).copied() {
-                    let operation = GuardedIntegerOp::from_binary(op).ok_or_else(|| {
+                    let operation = GuardedIntegerOp::from_binary(*op).ok_or_else(|| {
                         MetalError::InvalidBinding("guard opcode mismatch".into())
                     })?;
                     let invalid = invalid_expression(operation, dtype, &rhs);
@@ -95,7 +95,7 @@ impl Emitter<'_> {
                     self.lines.push(format!("{indent}  }}"));
                     self.lines.push(format!("{indent}}}"));
                 } else {
-                    let value = plain_binary(op, dtype, &lhs, &rhs)?;
+                    let value = plain_binary(*op, dtype, &lhs, &rhs)?;
                     self.lines
                         .push(format!("{indent}if (rg_ok) {name} = {value};"));
                 }

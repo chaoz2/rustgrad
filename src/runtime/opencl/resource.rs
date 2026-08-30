@@ -635,7 +635,6 @@ impl OpenClTransaction<'_> {
             let buffer_id = match arg {
                 crate::IndexValue::Buffer { buffer, .. }
                 | crate::IndexValue::View { buffer, .. } => *buffer,
-                _ => return Err(OpenClError::InvalidBinding("detail load index".into())),
             };
             let position = self
                 .kernel

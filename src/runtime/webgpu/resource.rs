@@ -816,11 +816,6 @@ impl WebGpuTransaction<'_> {
             let buffer_id = match arg {
                 crate::IndexValue::Buffer { buffer, .. }
                 | crate::IndexValue::View { buffer, .. } => *buffer,
-                _ => {
-                    return Err(WebGpuError::InvalidBinding(
-                        "detail load index mismatch".into(),
-                    ));
-                }
             };
             let position = self
                 .pipeline

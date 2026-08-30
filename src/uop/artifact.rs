@@ -2960,7 +2960,7 @@ mod tests {
         let mut malformed = plan.clone();
         malformed.k += 1;
         let malformed = UOp::from_operation(
-            Operation::Matmul(MatmulValue::Serial(Box::new(malformed))),
+            Operation::Matmul(MatmulValue::Serial(malformed)),
             Some(UType::scalar(DType::F64)),
             vec![],
         );
@@ -2981,7 +2981,7 @@ mod tests {
         let mut malformed = payload.clone();
         malformed.tile.barriers[0].uniform = false;
         let malformed = UOp::from_operation(
-            Operation::Matmul(MatmulValue::Tiled(Box::new(malformed))),
+            Operation::Matmul(MatmulValue::Tiled(malformed)),
             Some(UType::scalar(DType::F32)),
             vec![],
         );
@@ -2991,7 +2991,7 @@ mod tests {
         let mut misaligned = payload.clone();
         misaligned.tile.lhs_shared.alignment = 3;
         let misaligned = UOp::from_operation(
-            Operation::Matmul(MatmulValue::Tiled(Box::new(misaligned))),
+            Operation::Matmul(MatmulValue::Tiled(misaligned)),
             Some(UType::scalar(DType::F32)),
             vec![],
         );
@@ -3025,7 +3025,7 @@ mod tests {
         let mut malformed = plan.clone();
         malformed.output_shape = Shape::from([3, 2]);
         let malformed = UOp::from_operation(
-            Operation::Movement(MovementValue::Plan(Box::new(malformed))),
+            Operation::Movement(MovementValue::Plan(malformed)),
             Some(UType::scalar(DType::F32)),
             vec![],
         );
