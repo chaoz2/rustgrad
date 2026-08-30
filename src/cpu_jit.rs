@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v22";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v23";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -778,7 +778,9 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
         "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
-        "static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}".into(),
+        "static int64_t rg_sfdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b||(a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;}".into(),
+        "static int64_t rg_srem(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}".into(),
+        "static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}".into(),
         "static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a%b;}".into(),
         "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a<<b;}".into(),
         "static uint64_t rg_shr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a>>b;}".into(),
@@ -2612,11 +2614,14 @@ fn emit(
                 crate::BinaryOp::Add => "+",
                 crate::BinaryOp::Sub => "-",
                 crate::BinaryOp::Mul => "*",
-                crate::BinaryOp::Div | crate::BinaryOp::TruncDiv if !ty.is_float() => {
-                    return Ok(int_call("div", ty, &a, &b));
-                }
-                crate::BinaryOp::Mod | crate::BinaryOp::FMod if !ty.is_float() => {
-                    return Ok(int_call("mod", ty, &a, &b));
+                crate::BinaryOp::Div
+                | crate::BinaryOp::FloorDiv
+                | crate::BinaryOp::TruncDiv
+                | crate::BinaryOp::Mod
+                | crate::BinaryOp::FMod
+                    if !ty.is_float() =>
+                {
+                    return Ok(int_call(*op, ty, &a, &b));
                 }
                 crate::BinaryOp::Shl if !ty.is_float() => {
                     return Ok(format!(
@@ -2640,6 +2645,20 @@ fn emit(
                     ));
                 }
                 crate::BinaryOp::Div => "/",
+                crate::BinaryOp::FloorDiv if ty.is_float() => {
+                    return Ok(format!("floor(((double)({a}))/((double)({b})))"));
+                }
+                crate::BinaryOp::TruncDiv if ty.is_float() => {
+                    return Ok(format!("trunc(((double)({a}))/((double)({b})))"));
+                }
+                crate::BinaryOp::Mod if ty.is_float() => {
+                    return Ok(format!(
+                        "(((double)({a}))-floor(((double)({a}))/((double)({b})))*((double)({b})))"
+                    ));
+                }
+                crate::BinaryOp::FMod if ty.is_float() => {
+                    return Ok(format!("fmod((double)({a}),(double)({b}))"));
+                }
                 crate::BinaryOp::BitAnd => "&",
                 crate::BinaryOp::BitOr => "|",
                 crate::BinaryOp::BitXor => "^",
@@ -2691,13 +2710,17 @@ fn emit(
         _ => Err(JitError::Unsupported(format!("{:?}", n.kind()))),
     }
 }
-fn int_call(op: &str, ty: DType, a: &str, b: &str) -> String {
+fn int_call(op: crate::BinaryOp, ty: DType, a: &str, b: &str) -> String {
     let signed = matches!(ty.category(), crate::DTypeCategory::Signed);
     let helper = match (op, signed) {
-        ("div", true) => "rg_sdiv",
-        ("div", false) => "rg_udiv",
-        ("mod", true) => "rg_smod",
-        ("mod", false) => "rg_umod",
+        (crate::BinaryOp::Div | crate::BinaryOp::TruncDiv, true) => "rg_sdiv",
+        (crate::BinaryOp::Div | crate::BinaryOp::FloorDiv | crate::BinaryOp::TruncDiv, false) => {
+            "rg_udiv"
+        }
+        (crate::BinaryOp::FloorDiv, true) => "rg_sfdiv",
+        (crate::BinaryOp::Mod, true) => "rg_smod",
+        (crate::BinaryOp::FMod, true) => "rg_srem",
+        (crate::BinaryOp::Mod | crate::BinaryOp::FMod, false) => "rg_umod",
         _ => unreachable!(),
     };
     format!(
@@ -3172,7 +3195,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v22");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v23");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -4538,6 +4561,155 @@ mod tests {
             div.call(&mut [numerator, denominator, output], &[]),
             Err(JitError::DivisionByZero { index: 0 })
         );
+    }
+
+    #[test]
+    fn raw_division_family_matches_oracle_and_keeps_distinct_signed_semantics() {
+        let operations = [
+            crate::BinaryOp::Div,
+            crate::BinaryOp::FloorDiv,
+            crate::BinaryOp::TruncDiv,
+            crate::BinaryOp::Mod,
+            crate::BinaryOp::FMod,
+        ];
+        for (dtype, lhs, rhs) in [
+            (
+                DType::I64,
+                TensorData::from_scalars(
+                    [5],
+                    DType::I64,
+                    [
+                        Scalar::I(i64::MIN),
+                        Scalar::I(-7),
+                        Scalar::I(-7),
+                        Scalar::I(7),
+                        Scalar::I(7),
+                    ],
+                )
+                .unwrap(),
+                TensorData::from_scalars(
+                    [5],
+                    DType::I64,
+                    [
+                        Scalar::I(-1),
+                        Scalar::I(3),
+                        Scalar::I(-3),
+                        Scalar::I(3),
+                        Scalar::I(-3),
+                    ],
+                )
+                .unwrap(),
+            ),
+            (
+                DType::F64,
+                TensorData::from_scalars(
+                    [4],
+                    DType::F64,
+                    [
+                        Scalar::F(-7.5),
+                        Scalar::F(-7.5),
+                        Scalar::F(7.5),
+                        Scalar::F(7.5),
+                    ],
+                )
+                .unwrap(),
+                TensorData::from_scalars(
+                    [4],
+                    DType::F64,
+                    [
+                        Scalar::F(3.0),
+                        Scalar::F(-3.0),
+                        Scalar::F(3.0),
+                        Scalar::F(-3.0),
+                    ],
+                )
+                .unwrap(),
+            ),
+        ] {
+            for op in operations {
+                let mut graph = Graph::new();
+                let lhs_id = graph.input_dtype("lhs", lhs.shape().clone(), dtype);
+                let rhs_id = graph.input_dtype("rhs", rhs.shape().clone(), dtype);
+                let output = graph.binary(op, lhs_id, rhs_id).unwrap();
+                let bindings = HashMap::from([
+                    ("lhs".to_string(), lhs.clone()),
+                    ("rhs".to_string(), rhs.clone()),
+                ]);
+                let expected = CpuBackend.execute(&graph, output, &bindings).unwrap();
+                let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+                let rendered = CpuJit::render(&uop).unwrap();
+                match (dtype, op) {
+                    (DType::I64, crate::BinaryOp::FloorDiv) => {
+                        assert!(rendered.source.matches("rg_sfdiv(").count() >= 2)
+                    }
+                    (DType::I64, crate::BinaryOp::Mod) => {
+                        assert!(rendered.source.matches("rg_smod(").count() >= 2)
+                    }
+                    (DType::I64, crate::BinaryOp::FMod) => {
+                        assert!(rendered.source.matches("rg_srem(").count() >= 2)
+                    }
+                    (DType::F64, crate::BinaryOp::FloorDiv) => {
+                        assert!(rendered.source.contains("floor(((double)"))
+                    }
+                    (DType::F64, crate::BinaryOp::TruncDiv) => {
+                        assert!(rendered.source.contains("trunc(((double)"))
+                    }
+                    (DType::F64, crate::BinaryOp::Mod) => {
+                        assert!(rendered.source.contains("-floor(((double)"))
+                    }
+                    (DType::F64, crate::BinaryOp::FMod) => {
+                        assert!(rendered.source.contains("fmod((double)"))
+                    }
+                    _ => {}
+                }
+
+                for kernel in [
+                    CpuJit::compile(&uop).unwrap(),
+                    CpuJit::compile_vectorized(&uop).unwrap(),
+                ] {
+                    let mut buffers = [
+                        JitBuffer::from_tensor(&lhs, false),
+                        JitBuffer::from_tensor(&rhs, false),
+                        JitBuffer::zeroed(dtype, expected.len(), true),
+                    ];
+                    kernel.call(&mut buffers, &[]).unwrap();
+                    let actual = buffers[2]
+                        .clone()
+                        .into_tensor(expected.shape().clone())
+                        .unwrap();
+                    assert_eq!(actual.storage(), expected.storage(), "{dtype:?} {op:?}");
+                }
+            }
+        }
+
+        // Every exact integer quotient/remainder form reports the same first
+        // zero divisor without evaluating undefined C integer arithmetic.
+        for op in operations {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", Shape::from([1]), DType::I64);
+            let rhs = graph.input_dtype("rhs", Shape::from([1]), DType::I64);
+            let output = graph.binary(op, lhs, rhs).unwrap();
+            let kernel =
+                CpuJit::compile(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert_eq!(
+                kernel.call(
+                    &mut [
+                        JitBuffer::from_tensor(
+                            &TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+                            false,
+                        ),
+                        JitBuffer::from_tensor(
+                            &TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+                            false,
+                        ),
+                        JitBuffer::zeroed(DType::I64, 1, true),
+                    ],
+                    &[],
+                ),
+                Err(JitError::DivisionByZero { index: 0 }),
+                "{op:?}"
+            );
+        }
     }
 
     #[test]

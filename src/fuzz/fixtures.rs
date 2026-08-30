@@ -31,6 +31,21 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             lhs: tensor(vec![3], Storage::F32(vec![-0.0, f32::MIN_POSITIVE, -2.0])),
             rhs: tensor(vec![3], Storage::F32(vec![1.0, 0.5, -0.0])),
         },
+        FuzzCase::Binary {
+            op: FuzzBinaryOp::FloorDiv,
+            lhs: tensor(vec![4], Storage::I64(vec![-7, -7, 7, 7])),
+            rhs: tensor(vec![4], Storage::I64(vec![3, -3, 3, -3])),
+        },
+        FuzzCase::Binary {
+            op: FuzzBinaryOp::FMod,
+            lhs: tensor(vec![4], Storage::I64(vec![-7, -7, 7, 7])),
+            rhs: tensor(vec![4], Storage::I64(vec![3, -3, 3, -3])),
+        },
+        FuzzCase::Binary {
+            op: FuzzBinaryOp::Mod,
+            lhs: tensor(vec![4], Storage::F64(vec![-7.5, -7.5, 7.5, 7.5])),
+            rhs: tensor(vec![4], Storage::F64(vec![3.0, -3.0, 3.0, -3.0])),
+        },
         FuzzCase::Cast {
             input: tensor(
                 vec![5],

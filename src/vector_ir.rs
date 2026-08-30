@@ -223,6 +223,31 @@ impl VectorProgram {
             {
                 return Err(VectorIrError::Unsupported("portable binary opcode".into()));
             }
+            if let crate::UOpKind::GraphBinary(op) = inst.payload.uop_kind {
+                if ty.is_some_and(crate::DType::is_float)
+                    && !matches!(
+                        op,
+                        crate::BinaryOp::Add | crate::BinaryOp::Sub | crate::BinaryOp::Mul
+                    )
+                {
+                    return Err(VectorIrError::Unsupported(
+                        "portable floating binary opcode".into(),
+                    ));
+                }
+                if ty == Some(crate::DType::Bool)
+                    && !matches!(
+                        op,
+                        crate::BinaryOp::Add
+                            | crate::BinaryOp::Sub
+                            | crate::BinaryOp::Mul
+                            | crate::BinaryOp::Div
+                    )
+                {
+                    return Err(VectorIrError::Unsupported(
+                        "portable boolean binary opcode".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }

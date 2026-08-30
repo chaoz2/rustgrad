@@ -1578,11 +1578,28 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
         (FuzzBinaryOp::Add, crate::BinaryOp::Add),
         (FuzzBinaryOp::Sub, crate::BinaryOp::Sub),
         (FuzzBinaryOp::Mul, crate::BinaryOp::Mul),
+        (FuzzBinaryOp::Div, crate::BinaryOp::Div),
         (FuzzBinaryOp::Maximum, crate::BinaryOp::Maximum),
+        (FuzzBinaryOp::Minimum, crate::BinaryOp::Minimum),
+        (FuzzBinaryOp::FloorDiv, crate::BinaryOp::FloorDiv),
+        (FuzzBinaryOp::TruncDiv, crate::BinaryOp::TruncDiv),
+        (FuzzBinaryOp::Mod, crate::BinaryOp::Mod),
+        (FuzzBinaryOp::FMod, crate::BinaryOp::FMod),
     ];
 
     for (op_index, (fuzz_op, raw_op)) in ops.into_iter().enumerate() {
         for (dtype_index, dtype) in DTYPES.into_iter().enumerate() {
+            if dtype == DType::Bool
+                && matches!(
+                    fuzz_op,
+                    FuzzBinaryOp::FloorDiv
+                        | FuzzBinaryOp::TruncDiv
+                        | FuzzBinaryOp::Mod
+                        | FuzzBinaryOp::FMod
+                )
+            {
+                continue;
+            }
             let shape = match (op_index + dtype_index) % 3 {
                 0 => vec![],
                 1 => vec![0],
@@ -1652,7 +1669,18 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             let uop = crate::lower_graph_elementwise(&built.graph, built.output).unwrap();
             assert!(CpuJit::render(&uop).is_ok(), "{fuzz_op:?} {dtype:?}");
             let vector = CpuJit::render_vectorized(&uop).unwrap();
-            if matches!(dtype, DType::F16 | DType::BF16) || fuzz_op == FuzzBinaryOp::Maximum {
+            if matches!(dtype, DType::F16 | DType::BF16)
+                || matches!(fuzz_op, FuzzBinaryOp::Maximum | FuzzBinaryOp::Minimum)
+                || (dtype.is_float()
+                    && matches!(
+                        fuzz_op,
+                        FuzzBinaryOp::Div
+                            | FuzzBinaryOp::FloorDiv
+                            | FuzzBinaryOp::TruncDiv
+                            | FuzzBinaryOp::Mod
+                            | FuzzBinaryOp::FMod
+                    ))
+            {
                 assert!(
                     !vector.source.contains("B2 VectorProgram"),
                     "{fuzz_op:?} {dtype:?}"
@@ -1799,6 +1827,7 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
         (FuzzBinaryOp::Sub, vec![false, true, true, false]),
         (FuzzBinaryOp::Mul, vec![true, false, false, false]),
         (FuzzBinaryOp::Maximum, vec![true, true, true, false]),
+        (FuzzBinaryOp::Minimum, vec![true, false, false, false]),
     ] {
         let case = FuzzCase::Binary {
             op,
@@ -1905,13 +1934,35 @@ fn generated_binary_cases_reach_all_ops_dtypes_and_broadcast_geometries() {
             let FuzzCase::Binary { op, lhs, rhs } = case else {
                 continue;
             };
+            if matches!(
+                op,
+                FuzzBinaryOp::Div
+                    | FuzzBinaryOp::FloorDiv
+                    | FuzzBinaryOp::TruncDiv
+                    | FuzzBinaryOp::Mod
+                    | FuzzBinaryOp::FMod
+            ) {
+                let lanes = rhs.to_tensor().unwrap();
+                assert!((0..lanes.len()).all(|lane| lanes.scalar_at(lane).as_f64() != 0.0));
+            }
+            if lhs.dtype == DType::Bool {
+                assert!(matches!(
+                    op,
+                    FuzzBinaryOp::Add
+                        | FuzzBinaryOp::Sub
+                        | FuzzBinaryOp::Mul
+                        | FuzzBinaryOp::Div
+                        | FuzzBinaryOp::Maximum
+                        | FuzzBinaryOp::Minimum
+                ));
+            }
             pairs.insert((op, lhs.dtype));
             scalar_rhs |= rhs.shape.is_empty();
             scalar |= lhs.shape.is_empty();
             empty |= lhs.shape.contains(&0);
         }
     }
-    assert_eq!(pairs.len(), 52);
+    assert_eq!(pairs.len(), 126);
     assert!(scalar_rhs && scalar && empty);
 }
 
@@ -4732,7 +4783,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 95);
+    assert_eq!(cases.len(), 98);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

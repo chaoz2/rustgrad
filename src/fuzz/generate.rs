@@ -39,6 +39,36 @@ fn tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> FuzzTensor {
     )
 }
 
+// Division and remainder generation deliberately uses nonzero right-hand
+// lanes. This keeps every generated case inside the shared CPU/captured/native
+// value domain while focused tests separately exercise fail-closed zero-divisor
+// diagnostics and the signed MIN/-1 wrapping boundary.
+fn nonzero_tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> FuzzTensor {
+    let elements = Shape::new(shape.clone())
+        .numel()
+        .expect("bounded generated binary shape");
+    let values = (0..elements).map(|index| {
+        let raw = rng.next().wrapping_add(index as u64);
+        match dtype {
+            DType::Bool => Scalar::Bool(true),
+            DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(raw % 4 + 1),
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => {
+                let magnitude = (raw % 4 + 1) as i64;
+                Scalar::I(if raw & 1 == 0 { magnitude } else { -magnitude })
+            }
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+                let magnitude = (raw % 8 + 1) as f64 / 4.0;
+                Scalar::F(if raw & 1 == 0 { magnitude } else { -magnitude })
+            }
+            _ => unreachable!("float8 binary fuzz is not generated"),
+        }
+    });
+    FuzzTensor::from_tensor(
+        &TensorData::from_scalars(shape, dtype, values)
+            .expect("generated nonzero binary tensor geometry"),
+    )
+}
+
 // Raw integer reduction in native C is exact for this bounded domain: it
 // avoids signed overflow while still exercising each storage family and the
 // graph's output/accumulator dtype policy. Product uses only -1/0/1 (or 0/1
@@ -149,16 +179,46 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             } else {
                 shape.clone()
             };
-            let op = [
-                FuzzBinaryOp::Add,
-                FuzzBinaryOp::Sub,
-                FuzzBinaryOp::Mul,
-                FuzzBinaryOp::Maximum,
-            ][rng.pick(4)];
+            let ops: &[FuzzBinaryOp] = if dtype == DType::Bool {
+                &[
+                    FuzzBinaryOp::Add,
+                    FuzzBinaryOp::Sub,
+                    FuzzBinaryOp::Mul,
+                    FuzzBinaryOp::Div,
+                    FuzzBinaryOp::Maximum,
+                    FuzzBinaryOp::Minimum,
+                ]
+            } else {
+                &[
+                    FuzzBinaryOp::Add,
+                    FuzzBinaryOp::Sub,
+                    FuzzBinaryOp::Mul,
+                    FuzzBinaryOp::Div,
+                    FuzzBinaryOp::Maximum,
+                    FuzzBinaryOp::Minimum,
+                    FuzzBinaryOp::FloorDiv,
+                    FuzzBinaryOp::TruncDiv,
+                    FuzzBinaryOp::Mod,
+                    FuzzBinaryOp::FMod,
+                ]
+            };
+            let op = ops[rng.pick(ops.len())];
+            let rhs = if matches!(
+                op,
+                FuzzBinaryOp::Div
+                    | FuzzBinaryOp::FloorDiv
+                    | FuzzBinaryOp::TruncDiv
+                    | FuzzBinaryOp::Mod
+                    | FuzzBinaryOp::FMod
+            ) {
+                nonzero_tensor(&mut rng, rhs_shape, dtype)
+            } else {
+                tensor(&mut rng, rhs_shape, dtype)
+            };
             FuzzCase::Binary {
                 op,
                 lhs: tensor(&mut rng, shape, dtype),
-                rhs: tensor(&mut rng, rhs_shape, dtype),
+                rhs,
             }
         }
         1 => {

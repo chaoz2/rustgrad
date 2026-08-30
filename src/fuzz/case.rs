@@ -15,7 +15,13 @@ pub enum FuzzBinaryOp {
     Add,
     Sub,
     Mul,
+    Div,
     Maximum,
+    Minimum,
+    FloorDiv,
+    TruncDiv,
+    Mod,
+    FMod,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -412,7 +418,13 @@ impl FuzzCase {
                             FuzzBinaryOp::Add => BinaryOp::Add,
                             FuzzBinaryOp::Sub => BinaryOp::Sub,
                             FuzzBinaryOp::Mul => BinaryOp::Mul,
+                            FuzzBinaryOp::Div => BinaryOp::Div,
                             FuzzBinaryOp::Maximum => BinaryOp::Maximum,
+                            FuzzBinaryOp::Minimum => BinaryOp::Minimum,
+                            FuzzBinaryOp::FloorDiv => BinaryOp::FloorDiv,
+                            FuzzBinaryOp::TruncDiv => BinaryOp::TruncDiv,
+                            FuzzBinaryOp::Mod => BinaryOp::Mod,
+                            FuzzBinaryOp::FMod => BinaryOp::FMod,
                         },
                         lhs_id,
                         rhs_id,
