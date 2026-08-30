@@ -9111,8 +9111,10 @@ mod tests {
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
         let output = vjp.isinf(input).unwrap();
-        let gradient = vjp.grad(output, input).unwrap();
-        assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+        assert!(matches!(
+            vjp.grad(output, input),
+            Err(crate::Error::NonDifferentiableTarget(node)) if node == output
+        ));
     }
 
     #[test]
@@ -9284,8 +9286,10 @@ mod tests {
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
         let output = vjp.isfinite(input).unwrap();
-        let gradient = vjp.grad(output, input).unwrap();
-        assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+        assert!(matches!(
+            vjp.grad(output, input),
+            Err(crate::Error::NonDifferentiableTarget(node)) if node == output
+        ));
     }
 
     #[test]
