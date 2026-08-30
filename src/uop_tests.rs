@@ -33,6 +33,40 @@ fn uop_spec_and_dag_order_are_deterministic() {
 }
 
 #[test]
+fn graph_unary_predicates_have_bool_outputs_and_retain_typed_inputs() {
+    let input = UOp::scalar_constant(DType::F32, 1.0_f32.to_bits() as u64, f32t());
+    for op in [
+        crate::UnaryOp::IsNan,
+        crate::UnaryOp::IsInf,
+        crate::UnaryOp::IsFinite,
+    ] {
+        UOp::new(
+            UOpKind::GraphUnary(op),
+            Some(UType::scalar(DType::Bool)),
+            vec![input.clone()],
+            UArg::None,
+        )
+        .validate()
+        .unwrap();
+    }
+
+    let wrong_predicate_output = UOp::new(
+        UOpKind::GraphUnary(crate::UnaryOp::IsNan),
+        Some(f32t()),
+        vec![input.clone()],
+        UArg::None,
+    );
+    assert!(wrong_predicate_output.validate().is_err());
+    let wrong_value_output = UOp::new(
+        UOpKind::GraphUnary(crate::UnaryOp::Relu),
+        Some(UType::scalar(DType::Bool)),
+        vec![input],
+        UArg::None,
+    );
+    assert!(wrong_value_output.validate().is_err());
+}
+
+#[test]
 fn upat_rewrites_are_prioritized_shared_and_pure() {
     let x = UOp::scalar_constant(DType::I32, 7, i32t());
     let zero = UOp::scalar_constant(DType::I32, 0, i32t());

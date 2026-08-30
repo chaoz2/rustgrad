@@ -945,9 +945,27 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::ControlMismatch);
             }
         }
-        Unary(_) | GraphUnary(_) => {
+        Unary(_) => {
             exact(n, 1)?;
             if !same(n) {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        GraphUnary(op) => {
+            exact(n, 1)?;
+            let valid = if matches!(
+                op,
+                crate::UnaryOp::IsNan | crate::UnaryOp::IsInf | crate::UnaryOp::IsFinite
+            ) {
+                matches!(
+                    (n.ty(), n.sources()[0].ty()),
+                    (Some(output), Some(input))
+                        if output.scalar == DType::Bool && output.lanes == input.lanes
+                )
+            } else {
+                same(n)
+            };
+            if !valid {
                 return Err(UOpError::InvalidDType);
             }
         }

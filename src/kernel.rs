@@ -1293,14 +1293,14 @@ fn eval(
         }
         UOpKind::Cast => Ok(eval(&n.sources()[0], bindings, linear, plan)?
             .cast(n.ty().ok_or(Error::InvalidIndex)?.scalar)),
-        UOpKind::GraphUnary(op) => Ok(FusedValue::typed(
-            unary(
-                eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
+        UOpKind::GraphUnary(op) => {
+            let input = eval(&n.sources()[0], bindings, linear, plan)?;
+            let input_dtype = n.sources()[0].ty().ok_or(Error::InvalidIndex)?.scalar;
+            Ok(FusedValue::typed(
+                unary(input.scalar(), input_dtype, *op)?,
                 n.ty().ok_or(Error::InvalidIndex)?.scalar,
-                *op,
-            )?,
-            n.ty().ok_or(Error::InvalidIndex)?.scalar,
-        )),
+            ))
+        }
         UOpKind::GraphBinary(op) => Ok(FusedValue::typed(
             binary(
                 eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
