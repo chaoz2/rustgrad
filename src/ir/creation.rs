@@ -514,7 +514,7 @@ fn lazy_arange_plan(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, SplitSections};
+    use crate::{Backend, CpuBackend, Slice, SplitSections};
     use std::collections::HashMap;
 
     fn execute(graph: &Graph, output: NodeId, input: TensorData) -> TensorData {
