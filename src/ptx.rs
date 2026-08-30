@@ -377,7 +377,24 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     // Reciprocal, Mul, Add, Sub, Div, Eq, Ne, ordered-Lt, direct-mask Select,
     // the strict public ReLU, LeakyReLU, Maximum, and Minimum roots; each has
     // a source-proven typed storage boundary.
-    let storage_mode = scoped_storage_plan(store, renderer.sm)?;
+    // Operation-scoped plans extend PTX to storage widths that the generic
+    // elementwise ABI cannot carry.  A valid generic program must not become
+    // an error merely because its root resembles, but is not exactly, one of
+    // those public source compositions (for example a nested F32 Mul).  Try
+    // the stronger proof first so exact public roots retain their specialized
+    // arithmetic; fall back only when every indexed buffer is already in the
+    // generic storage subset.
+    let generic_storage = nodes.iter().all(|node| match node.arg() {
+        UArg::BufferIndex { .. } | UArg::ViewBufferIndex { .. } => {
+            node.ty().is_some_and(|ty| reject_dtype(ty.scalar).is_ok())
+        }
+        _ => true,
+    });
+    let storage_mode = match scoped_storage_plan(store, renderer.sm) {
+        Ok(mode) => mode,
+        Err(_) if generic_storage => None,
+        Err(error) => return Err(error),
+    };
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
     for node in &nodes {
@@ -970,7 +987,27 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         if let Some(mode) = scoped_leaky_relu_plan(store, sm)? {
             return Ok(Some(mode));
         }
-        if let Some(mode) = scoped_clamp_plan(store, sm)? {
+        // Clamp is an ordered-Lt Select whose payloads are exactly the two
+        // predicate operands.  Do not feed an arbitrary public Select into
+        // the strict Clamp validator: its diagnostic must not preempt the
+        // ordinary Select proof below.
+        let clamp_candidate = if let [condition, on_true, on_false] = value.sources() {
+            if matches!(
+                condition.kind(),
+                UOpKind::GraphCompare(crate::CompareOp::Lt)
+            ) {
+                if let [left, right] = condition.sources() {
+                    (left == on_false && right == on_true) || (left == on_true && right == on_false)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if clamp_candidate && let Some(mode) = scoped_clamp_plan(store, sm)? {
             return Ok(Some(mode));
         }
         return scoped_select_plan(store, sm);
@@ -4321,6 +4358,7 @@ fn emit(
                 let is_sub = *op == crate::BinaryOp::Sub;
                 match ty {
                     DType::Bool if is_add => lines.push(format!("  or.b32 {dst}, {a}, {b};")),
+                    DType::Bool if !is_sub => lines.push(format!("  and.b32 {dst}, {a}, {b};")),
                     DType::Bool => {
                         return Err(PtxError::Unsupported(
                             "raw Bool binary is not scoped Sub".into(),
