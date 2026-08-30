@@ -8297,9 +8297,9 @@ impl Graph {
         let zero = self.constant(zero);
         let positive = self.gt(input, zero)?;
         let two = self.constant(two);
-        let half_truncated = self.div(truncated, two)?;
-        let half_truncated = self.trunc(half_truncated)?;
-        let even = self.eq(half_truncated, truncated)?;
+        let divided = self.div(truncated, two)?;
+        let half_truncated = self.trunc(divided)?;
+        let even = self.eq(half_truncated, divided)?;
         let condition = self.eq(positive, even)?;
         let lower_half = self.constant(half.clone());
         let lower = self.sub(input, lower_half)?;
@@ -8391,13 +8391,22 @@ impl Graph {
         detect_positive: bool,
         detect_negative: bool,
     ) -> Result<NodeId> {
-        let dtype = self.node(input)?.dtype;
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
         if detect_positive && detect_negative {
             return self.isinf(input);
         }
         if !detect_positive && !detect_negative {
-            let none = self.isinf(input)?;
-            return self.logical_and(none, none);
+            let _source_bytes = shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            let _output_bytes = shape
+                .numel()?
+                .checked_mul(DType::Bool.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            return self.lazy_full_with_dtype(shape, Scalar::Bool(false), DType::Bool);
         }
         if !dtype.is_float() {
             return self.isinf(input);

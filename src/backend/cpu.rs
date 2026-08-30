@@ -5864,7 +5864,7 @@ mod tests {
         assert!(matches!(graph.op(top_indices).unwrap(), Op::Shrink { .. }));
         assert!(matches!(
             graph.grad(indices, input),
-            Err(Error::NonDifferentiableIndexing(_))
+            Err(Error::NonDifferentiableTarget(node)) if node == indices
         ));
 
         let empty = graph.input_dtype("empty", [0, 3], DType::I32);

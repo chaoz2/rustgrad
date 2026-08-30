@@ -345,18 +345,17 @@ impl Graph {
         upstream: Option<NodeId>,
         create_graph: bool,
     ) -> Result<NodeId> {
+        let loss_node = self.node(loss)?;
+        if !loss_node.dtype.is_float() {
+            return Err(Error::NonDifferentiableTarget(loss));
+        }
+        let loss_shape = loss_node.shape.clone();
+        let target = self.node(wrt)?;
+        if !target.dtype.is_float() || !target.requires_grad {
+            return Err(Error::NonDifferentiableTarget(wrt));
+        }
         self.validate_prefix_scan_reverse(loss)?;
         let original_len = self.nodes.len();
-        let loss_shape = self.node(loss)?.shape.clone();
-        let target = self.node(wrt)?;
-        if !target.requires_grad {
-            // Preserve operator-specific non-float diagnostics (for example
-            // Conv2d's float-only contract) while frozen float leaves fail
-            // immediately and clearly.
-            if target.dtype.is_float() {
-                return Err(Error::NonDifferentiableTarget(wrt));
-            }
-        }
         let previous_enabled = self.grad_enabled;
         self.grad_enabled = create_graph;
         let result = self.grad_with_inner(loss, wrt, upstream, original_len, loss_shape);
@@ -1437,7 +1436,7 @@ mod tests {
         assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
         assert!(matches!(
             graph.grad(indices, input),
-            Err(Error::NonDifferentiableIndexing(_))
+            Err(Error::NonDifferentiableTarget(node)) if node == indices
         ));
         let inputs = HashMap::from([(
             "input".into(),
@@ -1467,7 +1466,7 @@ mod tests {
                     &HashMap::from([("input".into(), data([3], &[2., 1., 1.]))])
                 )
                 .unwrap(),
-            data([3], &[7., 3., 2.])
+            data([3], &[5., 2., 3.])
         );
 
         let mut scalar = Graph::new();
@@ -1497,7 +1496,7 @@ mod tests {
         assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
         assert!(matches!(
             graph.grad(indices, input),
-            Err(Error::NonDifferentiableIndexing(_))
+            Err(Error::NonDifferentiableTarget(node)) if node == indices
         ));
         assert_eq!(
             CpuBackend
@@ -2029,7 +2028,7 @@ mod tests {
         ));
         assert!(matches!(
             graph.grad(gather_loss, index),
-            Err(Error::NoGradient(_))
+            Err(Error::NonDifferentiableTarget(node)) if node == index
         ));
         let inputs = HashMap::from([
             ("x".into(), data([3], &[1., 2., 3.])),
@@ -2092,7 +2091,10 @@ mod tests {
             CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
             data([2, 3], &[1., 0., 1., 0., 2., 0.])
         );
-        assert!(matches!(graph.grad(loss, index), Err(Error::NoGradient(_))));
+        assert!(matches!(
+            graph.grad(loss, index),
+            Err(Error::NonDifferentiableTarget(node)) if node == index
+        ));
 
         let mut malformed = Graph::new();
         let input = malformed.input("input", [2, 3]);
@@ -2181,7 +2183,10 @@ mod tests {
             .unwrap()
         );
         let loss = graph.sum_all(indices).unwrap();
-        assert!(matches!(graph.grad(loss, input), Err(Error::NoGradient(_))));
+        assert!(matches!(
+            graph.grad(loss, input),
+            Err(Error::NonDifferentiableTarget(node)) if node == loss
+        ));
 
         let mut scalar = Graph::new();
         let input = scalar.input("input", []);
