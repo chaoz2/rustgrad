@@ -3539,7 +3539,17 @@ impl Graph {
                 normalized_slice(*dim, *slice, axis).map(|(_, _, _, length)| length)
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(self.push(Op::Stride { input, slices }, Shape::new(dims), source.dtype))
+        let output_shape = Shape::new(dims);
+        source
+            .shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        output_shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        Ok(self.push(Op::Stride { input, slices }, output_shape, source.dtype))
     }
 
     /// Alias for [`Graph::stride`], emphasizing ordinary slicing semantics.

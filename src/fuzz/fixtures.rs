@@ -1,6 +1,6 @@
 use super::{
-    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzTensor,
-    FuzzUnaryOp,
+    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzSlice,
+    FuzzTensor, FuzzUnaryOp,
 };
 use crate::{DType, Scalar, Storage, TensorData};
 
@@ -476,6 +476,69 @@ pub fn regression_cases() -> Vec<FuzzCase> {
         FuzzCase::Matmul {
             lhs: tensor(vec![3, 0], Storage::F32(vec![])),
             rhs: tensor(vec![0, 5], Storage::F32(vec![])),
+        },
+        FuzzCase::Stride {
+            // Rank-zero slicing remains an explicit affine identity view.
+            input: tensor(vec![], Storage::Bool(vec![true])),
+            slices: vec![],
+        },
+        FuzzCase::Stride {
+            // A full slice preserves wide integer lanes without conversion.
+            input: tensor(
+                vec![3],
+                Storage::I64(vec![i64::MIN, -(1_i64 << 53) - 1, i64::MAX]),
+            ),
+            slices: vec![FuzzSlice {
+                start: None,
+                stop: None,
+                step: 1,
+            }],
+        },
+        FuzzCase::Stride {
+            // Reverse stepping retains exact raw IEEE lane ordering.
+            input: tensor(
+                vec![4],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                ]),
+            ),
+            slices: vec![FuzzSlice {
+                start: None,
+                stop: None,
+                step: -1,
+            }],
+        },
+        FuzzCase::Stride {
+            // Empty geometry and negative strides remain well-defined.
+            input: tensor(vec![0, 3], Storage::BF16(vec![])),
+            slices: vec![
+                FuzzSlice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+                FuzzSlice {
+                    start: None,
+                    stop: None,
+                    step: -2,
+                },
+            ],
+        },
+        FuzzCase::Stride {
+            // Storage-only views preserve Float8 payload bytes exactly.
+            input: FuzzTensor {
+                shape: vec![4],
+                dtype: DType::F8E4M3,
+                bytes: vec![0x80, 0x7f, 0x01, 0xff],
+            },
+            slices: vec![FuzzSlice {
+                start: None,
+                stop: None,
+                step: -1,
+            }],
         },
         FuzzCase::Select {
             condition: tensor(vec![3], Storage::Bool(vec![true, false, true])),

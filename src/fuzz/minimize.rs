@@ -79,6 +79,10 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
             input: input.zeroed(),
             axes: axes.clone(),
         },
+        FuzzCase::Stride { input, slices } => FuzzCase::Stride {
+            input: input.zeroed(),
+            slices: slices.clone(),
+        },
         FuzzCase::Pad {
             input,
             padding,
@@ -156,6 +160,9 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
         // Rank and axis order define the Permute program. Scalarization would
         // invalidate every non-scalar permutation and is therefore omitted.
         FuzzCase::Permute { .. } => None,
+        // Signed slices are rank-indexed controls. Preserve their exact axis
+        // contract rather than changing the program during minimization.
+        FuzzCase::Stride { .. } => None,
         // Raw Concat owns a rank/axis contract, including its input arity.
         FuzzCase::Concat { .. } | FuzzCase::ConcatMany { .. } => None,
         // Pad can remain scalar only when its rank-zero padding contract is

@@ -1139,6 +1139,39 @@ fn generated_permute_cases_cover_passthrough_and_affine_geometry() {
 }
 
 #[test]
+fn generated_stride_cases_cover_all_dtypes_and_signed_geometry() {
+    let mut dtypes = std::collections::BTreeSet::new();
+    let mut scalar = false;
+    let mut zero = false;
+    let mut positive_step = false;
+    let mut negative_step = false;
+    let mut bounded = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..2048 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Stride { input, slices } = case else {
+                continue;
+            };
+            assert_eq!(slices.len(), input.shape.len());
+            dtypes.insert(input.dtype);
+            scalar |= input.shape.is_empty();
+            zero |= input.shape.contains(&0);
+            positive_step |= slices.iter().any(|slice| slice.step > 1);
+            negative_step |= slices.iter().any(|slice| slice.step < 0);
+            bounded |= slices
+                .iter()
+                .any(|slice| slice.start.is_some() || slice.stop.is_some());
+        }
+    }
+
+    assert_eq!(dtypes.len(), 17);
+    assert!(scalar && zero && positive_step && negative_step && bounded);
+}
+
+#[test]
 fn generated_select_cases_cover_homogeneous_dtypes_and_broadcasts() {
     let mut dtypes = std::collections::BTreeSet::new();
     let mut scalar_condition = false;
@@ -3297,6 +3330,169 @@ fn general_permute_captures_identity_and_affine_views_for_all_dtypes() {
     assert!(malformed.validate().is_err());
 }
 
+#[test]
+fn signed_stride_captures_affine_views_for_all_dtypes_and_preserves_raw_order() {
+    let dtypes = [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F8E4M3,
+        DType::F8E5M2,
+        DType::F8E4M3FNUZ,
+        DType::F8E5M2FNUZ,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+    let slices = vec![
+        FuzzSlice {
+            start: None,
+            stop: None,
+            step: -1,
+        },
+        FuzzSlice {
+            start: None,
+            stop: None,
+            step: 2,
+        },
+    ];
+    for dtype in dtypes {
+        let case = FuzzCase::Stride {
+            input: FuzzTensor::from_tensor(&TensorData::zeros_with_dtype([2, 3], dtype).unwrap()),
+            slices: slices.clone(),
+        };
+        let built = case.build().unwrap();
+        assert_eq!(built.graph.shape(built.output).unwrap().dims(), &[2, 2]);
+        assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
+        assert!(matches!(
+            built.graph.op(built.output).unwrap(),
+            Op::Stride { slices: actual, .. }
+                if actual.iter().map(|slice| slice.step).eq([-1, 2])
+        ));
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        let nodes = scheduled.items[0].kernel.topological().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|node| matches!(node.arg(), UArg::ViewBufferIndex { .. }))
+        );
+        assert!(CpuJit::render(&scheduled.items[0].kernel).is_ok());
+        assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+        let oracle = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        let replay = crate::CapturedReplayExecutor::default()
+            .replay(
+                &decoded,
+                &built.ordered,
+                crate::CapturedReplayOptions {
+                    backend: crate::CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.outputs[0].storage(), oracle.storage());
+    }
+
+    let special = FuzzCase::Stride {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [2, 4],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::INFINITY,
+                    1.0,
+                    f32::NEG_INFINITY,
+                    2.0,
+                    3.0,
+                    4.0,
+                ]),
+            )
+            .unwrap(),
+        ),
+        slices,
+    };
+    let value = serde_json::to_value(&special).unwrap();
+    assert_eq!(value["kind"], "stride");
+    assert_eq!(serde_json::from_value::<FuzzCase>(value).unwrap(), special);
+    let built = special.build().unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
+    let Storage::F32(values) = output.storage() else {
+        panic!("stride fixture must remain F32");
+    };
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        vec![
+            f32::NEG_INFINITY.to_bits(),
+            3.0f32.to_bits(),
+            0x8000_0000,
+            f32::INFINITY.to_bits(),
+        ]
+    );
+    let artifact = FuzzFailureArtifact::new(
+        23,
+        37,
+        special.clone(),
+        FuzzPath::NativeVector,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&output),
+        FuzzOutcome::Error {
+            class: "actual".into(),
+            detail: "synthetic stride mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
+    let zeroed = minimize_case(&special, |candidate| {
+        matches!(candidate, FuzzCase::Stride { input, slices }
+            if input.shape == vec![2, 4]
+                && input.bytes == vec![0; 32]
+                && slices.len() == 2)
+    });
+    assert!(matches!(zeroed, FuzzCase::Stride { ref input, ref slices }
+        if input.bytes == vec![0; 32] && slices.len() == 2));
+
+    let malformed_rank = FuzzCase::Stride {
+        input: FuzzTensor::from_tensor(&TensorData::zeros_with_dtype([2, 3], DType::F32).unwrap()),
+        slices: vec![FuzzSlice {
+            start: None,
+            stop: None,
+            step: 1,
+        }],
+    };
+    assert!(malformed_rank.validate().is_err());
+    let malformed_step = FuzzCase::Stride {
+        input: FuzzTensor::from_tensor(&TensorData::zeros_with_dtype([2], DType::F32).unwrap()),
+        slices: vec![FuzzSlice {
+            start: None,
+            stop: None,
+            step: 0,
+        }],
+    };
+    assert!(malformed_step.validate().is_err());
+}
+
 fn tensor_t_input(case: &FuzzCase) -> FuzzTensor {
     match case {
         FuzzCase::TensorT { input } => input.clone(),
@@ -4291,7 +4487,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 64);
+    assert_eq!(cases.len(), 69);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

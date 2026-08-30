@@ -119,7 +119,7 @@ pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompo
 pub use fuzz::{
     FuzzArtifactError, FuzzBinaryOp, FuzzCampaign, FuzzCase, FuzzCompareOp, FuzzComparison,
     FuzzComparisonPolicy, FuzzConfig, FuzzFailureArtifact, FuzzLogicalOp, FuzzOutcome, FuzzPath,
-    FuzzReduction, FuzzScatterOp, FuzzTensor, FuzzUnaryOp, generate_case, minimize_case,
+    FuzzReduction, FuzzScatterOp, FuzzSlice, FuzzTensor, FuzzUnaryOp, generate_case, minimize_case,
     regression_cases, replay_failure, run_campaign, run_case,
 };
 pub use gguf::{

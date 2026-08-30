@@ -1,6 +1,6 @@
 use crate::{
     Backend, BinaryOp, CompareOp, CpuBackend, DType, Graph, NodeId, ReduceKind, Scalar, Shape,
-    Storage, TensorData, UnaryOp,
+    Slice, Storage, TensorData, UnaryOp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -59,6 +59,39 @@ pub enum FuzzReduction {
     Product,
     Max,
     Min,
+}
+
+/// Portable serialized form of one Python-style signed slice.
+///
+/// This is deliberately separate from the graph IR type so persisted fuzz
+/// artifacts remain an explicit, bounded public schema.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FuzzSlice {
+    /// Inclusive Python-style start bound; `None` selects the directional default.
+    pub start: Option<i64>,
+    /// Exclusive Python-style stop bound; `None` selects the directional default.
+    pub stop: Option<i64>,
+    /// Nonzero signed step.
+    pub step: i64,
+}
+
+impl TryFrom<FuzzSlice> for Slice {
+    type Error = &'static str;
+
+    fn try_from(value: FuzzSlice) -> Result<Self, Self::Error> {
+        Ok(Self {
+            start: value
+                .start
+                .map(|bound| isize::try_from(bound).map_err(|_| "slice start exceeds isize"))
+                .transpose()?,
+            stop: value
+                .stop
+                .map(|bound| isize::try_from(bound).map_err(|_| "slice stop exceeds isize"))
+                .transpose()?,
+            step: isize::try_from(value.step).map_err(|_| "slice step exceeds isize")?,
+        })
+    }
 }
 
 /// Portable little-endian tensor bytes used by generated cases and failures.
@@ -251,6 +284,11 @@ pub enum FuzzCase {
         input: FuzzTensor,
         axes: Vec<usize>,
     },
+    /// Raw `Graph::stride` with one signed Python-style slice per input axis.
+    Stride {
+        input: FuzzTensor,
+        slices: Vec<FuzzSlice>,
+    },
     Pad {
         input: FuzzTensor,
         padding: Vec<(usize, usize)>,
@@ -311,7 +349,8 @@ impl FuzzCase {
             | Self::Unary { input, .. }
             | Self::LogicalNot { input }
             | Self::TensorT { input }
-            | Self::Permute { input, .. } => vec![input],
+            | Self::Permute { input, .. }
+            | Self::Stride { input, .. } => vec![input],
             // Raw Graph::pad stores its fill in the movement plan, not as a
             // caller-owned graph buffer. `build` validates it explicitly.
             Self::Pad { input, .. } => vec![input],
@@ -497,6 +536,20 @@ impl FuzzCase {
                 let input = bind(&mut graph, "input", input)?;
                 graph
                     .permute(input, axes.clone())
+                    .map_err(|error| error.to_string())?
+            }
+            Self::Stride { input, slices } => {
+                let input = bind(&mut graph, "input", input)?;
+                graph
+                    .stride(
+                        input,
+                        slices
+                            .iter()
+                            .copied()
+                            .map(Slice::try_from)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(str::to_string)?,
+                    )
                     .map_err(|error| error.to_string())?
             }
             Self::Pad {

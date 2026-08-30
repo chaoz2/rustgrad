@@ -3038,6 +3038,67 @@ mod tests {
     }
 
     #[test]
+    fn stride_preflights_source_output_bytes_and_controls_before_publication() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 4], DType::F64);
+        let before = graph.node_count();
+        assert!(
+            graph
+                .stride(
+                    input,
+                    [
+                        Slice {
+                            start: None,
+                            stop: None,
+                            step: 1,
+                        },
+                        Slice {
+                            start: None,
+                            stop: None,
+                            step: 0,
+                        },
+                    ],
+                )
+                .is_err()
+        );
+        assert_eq!(graph.node_count(), before);
+        assert!(
+            graph
+                .stride(
+                    input,
+                    [Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    }],
+                )
+                .is_err()
+        );
+        assert_eq!(graph.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype(
+            "overflow",
+            [usize::MAX / DType::F64.itemsize() + 1],
+            DType::F64,
+        );
+        let before = overflow.node_count();
+        assert!(
+            overflow
+                .stride(
+                    input,
+                    [Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    }],
+                )
+                .is_err()
+        );
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
     fn flip_empty_axes_is_a_scalar_noop_and_bad_axes_do_not_grow_the_graph() {
         let mut graph = Graph::new();
         let scalar = graph.input("scalar", []);

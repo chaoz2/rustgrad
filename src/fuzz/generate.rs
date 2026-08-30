@@ -1,6 +1,6 @@
 use super::{
-    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzTensor,
-    FuzzUnaryOp,
+    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzSlice,
+    FuzzTensor, FuzzUnaryOp,
 };
 use crate::{DType, Scalar, Shape, TensorData};
 
@@ -126,7 +126,7 @@ fn gather_index(
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(16) {
+    match rng.pick(17) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = [
@@ -581,6 +581,73 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             FuzzCase::Permute {
                 input: tensor(&mut rng, shape, dtype),
                 axes,
+            }
+        }
+        15 => {
+            // Raw Stride retains Python-style signed slicing as a source-backed
+            // affine view. Exercise full/reverse/stepped/bounded slices across
+            // scalar, empty, and ordinary ranks without malformed step zero.
+            let rank = rng.pick(4);
+            let shape = (0..rank)
+                .map(|_| [0, 1, 2, 3, 5][rng.pick(5)])
+                .collect::<Vec<_>>();
+            let dtype = [
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F8E4M3,
+                DType::F8E5M2,
+                DType::F8E4M3FNUZ,
+                DType::F8E5M2FNUZ,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ][rng.pick(17)];
+            let slices = shape
+                .iter()
+                .map(|extent| match rng.pick(6) {
+                    0 => FuzzSlice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    1 => FuzzSlice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                    2 => FuzzSlice {
+                        start: None,
+                        stop: None,
+                        step: 2,
+                    },
+                    3 => FuzzSlice {
+                        start: None,
+                        stop: None,
+                        step: -2,
+                    },
+                    4 => FuzzSlice {
+                        start: Some(0),
+                        stop: Some(i64::try_from(*extent).expect("bounded stride extent")),
+                        step: 1,
+                    },
+                    _ => FuzzSlice {
+                        start: Some(-1),
+                        stop: None,
+                        step: -1,
+                    },
+                })
+                .collect();
+            FuzzCase::Stride {
+                input: tensor(&mut rng, shape, dtype),
+                slices,
             }
         }
         _ => {

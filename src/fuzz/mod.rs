@@ -30,8 +30,8 @@ pub use artifact::{
     MAX_FUZZ_ARTIFACT_FILE_BYTES,
 };
 pub use case::{
-    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzTensor,
-    FuzzUnaryOp,
+    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzSlice,
+    FuzzTensor, FuzzUnaryOp,
 };
 pub use corpus::{
     FuzzCorpusMode, FuzzCorpusRecord, FuzzCorpusReport, FuzzCorpusState, read_failure_artifact,
