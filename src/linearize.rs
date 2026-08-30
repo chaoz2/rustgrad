@@ -1,5 +1,5 @@
 //! Typed late linearization of ranged UOps for portable lane renderers.
-use crate::{DType, Shape, UArg, UOp, UOpKind};
+use crate::{DType, Operation, Shape, UArgRef, UOp, UOpKind};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     fmt,
@@ -66,9 +66,18 @@ pub enum LinearInstKind {
 /// literal, cast type, or checked index/view descriptor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LinearPayload {
-    pub uop_kind: UOpKind,
-    pub arg: UArg,
+    pub operation: Operation,
     pub ty: Option<crate::UType>,
+}
+
+impl LinearPayload {
+    pub fn kind(&self) -> UOpKind {
+        self.operation.kind()
+    }
+
+    pub fn arg(&self) -> UArgRef<'_> {
+        self.operation.argument()
+    }
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LinearInst {
@@ -137,7 +146,7 @@ impl LinearKernel {
             .first()
             .ok_or(LinearizeError::MissingStore)?;
         let (output_buffer, elements, output_shape) = match output.arg() {
-            UArg::BufferIndex {
+            UArgRef::BufferIndex {
                 buffer,
                 elements,
                 output_shape,
@@ -177,7 +186,7 @@ impl LinearKernel {
                 offset,
                 contiguous,
             ) = match node.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     elements,
                     input_shape,
@@ -191,7 +200,7 @@ impl LinearKernel {
                     0usize,
                     true,
                 ),
-                UArg::ViewBufferIndex {
+                UArgRef::ViewBufferIndex {
                     buffer,
                     elements,
                     input_shape,
@@ -356,9 +365,8 @@ fn linear_program(
                 .sources()
                 .first()
                 .and_then(|source| match source.arg() {
-                    UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => {
-                        Some(*buffer)
-                    }
+                    UArgRef::BufferIndex { buffer, .. }
+                    | UArgRef::ViewBufferIndex { buffer, .. } => Some(*buffer),
                     _ => None,
                 }) {
                 Some(buffer) => LinearInstKind::Load { buffer },
@@ -387,8 +395,7 @@ fn linear_program(
             lanes: if typed.lanes == 1 { lanes } else { typed.lanes },
             tail_mask: tail_mask.to_vec(),
             payload: LinearPayload {
-                uop_kind: node.kind().clone(),
-                arg: node.arg().clone(),
+                operation: node.operation().clone(),
                 ty: node.ty(),
             },
         });
@@ -417,7 +424,7 @@ fn linear_program(
 }
 fn source_output_buffer(source: &UOp) -> Option<u64> {
     source.sources().first().and_then(|node| match node.arg() {
-        UArg::BufferIndex { buffer, .. } => Some(*buffer),
+        UArgRef::BufferIndex { buffer, .. } => Some(*buffer),
         _ => None,
     })
 }

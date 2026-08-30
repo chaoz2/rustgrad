@@ -3,7 +3,7 @@ use crate::kernel::execute_lowered_elementwise;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend,
     CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc,
-    NodeId, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, schedule,
+    NodeId, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArgRef, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -776,8 +776,8 @@ impl Dispatch for MockDispatch {
                 if let Some(id) =
                     transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
                         let buffer_id = match arg {
-                            crate::UArg::BufferIndex { buffer, .. }
-                            | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                            crate::UArgRef::BufferIndex { buffer, .. }
+                            | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
                             _ => {
                                 return Err(MetalError::InvalidBinding(
                                     "mock transaction load index".into(),
@@ -1214,7 +1214,7 @@ fn captured_random_plans_render_and_mock_execute_without_stream_state() {
     for output in [uniform, normal, randint_i32, randint_u32] {
         let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
         let rendered = renderer.render(&root).unwrap();
-        let UArg::Random(plan) = root.arg() else {
+        let UArgRef::Random(plan) = root.arg() else {
             panic!("missing random plan")
         };
         let expected = plan.execute().unwrap();

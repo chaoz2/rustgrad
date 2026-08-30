@@ -5,7 +5,7 @@ use super::{
     transaction::OpenClTransactionAbi,
     view::OpenClViewAccess,
 };
-use crate::{DType, UArg, UOp, UOpKind};
+use crate::{DType, UArgRef, UOp, UOpKind};
 use std::collections::BTreeMap;
 
 pub(super) fn emit_transactional(
@@ -93,7 +93,7 @@ impl Emitter<'_> {
             }
             UOpKind::GraphUnary(op) => {
                 let source = self.node(&node.sources()[0], indent)?;
-                let value = unary_expression(*op, dtype, &source)?;
+                let value = unary_expression(op, dtype, &source)?;
                 self.assign_if_ok(indent, dtype, &name, &value);
             }
             UOpKind::GraphBinary(op) => {
@@ -105,7 +105,7 @@ impl Emitter<'_> {
                     expression_type(dtype)
                 ));
                 if let Some(id) = self.guard_ids.get(node).copied() {
-                    let operation = super::GuardedIntegerOp::from_binary(*op).ok_or_else(|| {
+                    let operation = super::GuardedIntegerOp::from_binary(op).ok_or_else(|| {
                         OpenClError::InvalidBinding("guard opcode mismatch".into())
                     })?;
                     let invalid = invalid_expression(operation, dtype, &rhs);
@@ -123,7 +123,7 @@ impl Emitter<'_> {
                     self.lines.push(format!("{indent}  }}"));
                     self.lines.push(format!("{indent}}}"));
                 } else {
-                    let value = emit_binary(*op, dtype, &lhs, &rhs)?;
+                    let value = emit_binary(op, dtype, &lhs, &rhs)?;
                     self.lines
                         .push(format!("{indent}if (rg_ok) {name} = {value};"));
                 }
@@ -221,13 +221,13 @@ impl Emitter<'_> {
             .first()
             .ok_or_else(|| OpenClError::Unsupported("load has no index".into()))?;
         let (buffer, input_shape, output_shape, view) = match index.arg() {
-            UArg::BufferIndex {
+            UArgRef::BufferIndex {
                 buffer,
                 input_shape,
                 output_shape,
                 ..
             } => (*buffer, input_shape, output_shape, None),
-            UArg::ViewBufferIndex {
+            UArgRef::ViewBufferIndex {
                 buffer,
                 input_shape,
                 output_shape,
@@ -264,26 +264,36 @@ fn expression_type(dtype: DType) -> &'static str {
 
 fn scalar_literal(node: &UOp, dtype: DType) -> Result<String, OpenClError> {
     match node.arg() {
-        UArg::Scalar {
-            dtype: DType::Bool,
+        UArgRef::Scalar {
+            dtype: actual,
             bits,
-        } if dtype == DType::Bool && *bits <= 1 => Ok(format!("((uchar){bits}u)")),
-        UArg::Scalar {
-            dtype: DType::I32,
+        } if *actual == DType::Bool && dtype == DType::Bool && *bits <= 1 => {
+            Ok(format!("((uchar){bits}u)"))
+        }
+        UArgRef::Scalar {
+            dtype: actual,
             bits,
-        } if dtype == DType::I32 => Ok(format!("as_int((uint)0x{:08x}u)", *bits as u32)),
-        UArg::Scalar {
-            dtype: DType::U32,
+        } if *actual == DType::I32 && dtype == DType::I32 => {
+            Ok(format!("as_int((uint)0x{:08x}u)", *bits as u32))
+        }
+        UArgRef::Scalar {
+            dtype: actual,
             bits,
-        } if dtype == DType::U32 => Ok(format!("((uint)0x{:08x}u)", *bits as u32)),
-        UArg::Scalar {
-            dtype: DType::I64,
+        } if *actual == DType::U32 && dtype == DType::U32 => {
+            Ok(format!("((uint)0x{:08x}u)", *bits as u32))
+        }
+        UArgRef::Scalar {
+            dtype: actual,
             bits,
-        } if dtype == DType::I64 => Ok(format!("as_long((ulong)0x{bits:016x}ul)")),
-        UArg::Scalar {
-            dtype: DType::U64,
+        } if *actual == DType::I64 && dtype == DType::I64 => {
+            Ok(format!("as_long((ulong)0x{bits:016x}ul)"))
+        }
+        UArgRef::Scalar {
+            dtype: actual,
             bits,
-        } if dtype == DType::U64 => Ok(format!("((ulong)0x{bits:016x}ul)")),
+        } if *actual == DType::U64 && dtype == DType::U64 => {
+            Ok(format!("((ulong)0x{bits:016x}ul)"))
+        }
         _ => Err(OpenClError::Unsupported(
             "transactional scalar literal/type mismatch".into(),
         )),

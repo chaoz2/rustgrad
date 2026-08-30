@@ -7,7 +7,7 @@ use super::{
     transaction::{GuardedIntegerOp, OpenClGuardDomain, OpenClTransactionAbi},
     view::OpenClViewAccess,
 };
-use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind};
+use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArgRef, UOp, UOpKind};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -114,7 +114,7 @@ impl OpenClRenderer {
 
     pub fn render(&self, root: &UOp) -> Result<RenderedOpenCl, OpenClError> {
         if matches!(root.kind(), UOpKind::Random) {
-            let UArg::Random(plan) = root.arg() else {
+            let UArgRef::Random(plan) = root.arg() else {
                 return Err(OpenClError::Unsupported("random payload is absent".into()));
             };
             return super::random::render(self, plan);
@@ -153,7 +153,7 @@ impl OpenClRenderer {
             .sources()
             .first()
             .ok_or_else(|| OpenClError::Unsupported("store has no index".into()))?;
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             buffer: output_id,
             elements: extent,
             input_shape: output_shape,
@@ -178,13 +178,13 @@ impl OpenClRenderer {
         let mut inventory = BTreeMap::<u64, OpenClBufferAbi>::new();
         for node in &nodes {
             let (buffer, source_shape, elements, view) = match node.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     elements,
                     input_shape,
                     ..
                 } => (*buffer, input_shape.clone(), *elements, None),
-                UArg::ViewBufferIndex { buffer, view, .. } => {
+                UArgRef::ViewBufferIndex { buffer, view, .. } => {
                     let access = OpenClViewAccess::new(
                         view,
                         node.ty()
@@ -239,7 +239,9 @@ impl OpenClRenderer {
                 .first()
                 .ok_or_else(|| OpenClError::InvalidBinding("load lacks index".into()))?;
             let buffer = match index.arg() {
-                UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
+                    *buffer
+                }
                 _ => {
                     return Err(OpenClError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -557,51 +559,51 @@ fn emit_expr(
     };
     match node.kind() {
         UOpKind::Const => match node.arg() {
-            UArg::Scalar {
-                dtype: DType::F32,
+            UArgRef::Scalar {
+                dtype: &DType::F32,
                 bits,
             } => Ok(format!("as_float((uint)0x{:08x}u)", *bits as u32)),
-            UArg::Scalar {
-                dtype: DType::Bool,
+            UArgRef::Scalar {
+                dtype: &DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("((uchar){bits}u)")),
-            UArg::Scalar {
-                dtype: DType::I32,
+            UArgRef::Scalar {
+                dtype: &DType::I32,
                 bits,
             } => Ok(format!("as_int((uint)0x{:08x}u)", *bits as u32)),
-            UArg::Scalar {
-                dtype: DType::U32,
+            UArgRef::Scalar {
+                dtype: &DType::U32,
                 bits,
             } => Ok(format!("((uint)0x{:08x}u)", *bits as u32)),
-            UArg::Scalar {
-                dtype: DType::I64,
+            UArgRef::Scalar {
+                dtype: &DType::I64,
                 bits,
             } => Ok(format!("as_long((ulong)0x{bits:016x}ul)")),
-            UArg::Scalar {
-                dtype: DType::U64,
+            UArgRef::Scalar {
+                dtype: &DType::U64,
                 bits,
             } => Ok(format!("((ulong)0x{bits:016x}ul)")),
-            UArg::Scalar {
-                dtype: DType::F64,
+            UArgRef::Scalar {
+                dtype: &DType::F64,
                 bits,
             } => Ok(format!("as_double((ulong)0x{bits:016x}ul)")),
-            UArg::Scalar {
-                dtype: DType::F16,
+            UArgRef::Scalar {
+                dtype: &DType::F16,
                 bits,
             } if dtype == DType::F16 => Ok(narrow::decode(
                 DType::F16,
                 format!("((ushort)0x{:04x}u)", *bits as u16),
             )
             .expect("F16 is a narrow float")),
-            UArg::Scalar {
-                dtype: DType::BF16,
+            UArgRef::Scalar {
+                dtype: &DType::BF16,
                 bits,
             } if dtype == DType::BF16 => Ok(narrow::decode(
                 DType::BF16,
                 format!("((ushort)0x{:04x}u)", *bits as u16),
             )
             .expect("BF16 is a narrow float")),
-            UArg::Scalar { .. } => Err(OpenClError::Unsupported(
+            UArgRef::Scalar { .. } => Err(OpenClError::Unsupported(
                 "scalar literal/type mismatch".into(),
             )),
             _ => Err(OpenClError::Unsupported("invalid scalar literal".into())),
@@ -612,13 +614,13 @@ fn emit_expr(
                 .first()
                 .ok_or_else(|| OpenClError::Unsupported("load has no index".into()))?;
             let (buffer, input_shape, output_shape, view) = match index.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
                 } => (*buffer, input_shape, output_shape, None),
-                UArg::ViewBufferIndex {
+                UArgRef::ViewBufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
@@ -704,7 +706,7 @@ fn emit_expr(
         UOpKind::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
-            emit_binary(*op, dtype, &lhs, &rhs)
+            emit_binary(op, dtype, &lhs, &rhs)
         }
         UOpKind::GraphCompare(op) => {
             let lhs = child(0, source_map, lines)?;

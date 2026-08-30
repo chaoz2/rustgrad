@@ -2,6 +2,12 @@
 //! and above future scheduling/rendering; it deliberately does not execute.
 use crate::{DType, Shape, SymbolicExpr};
 pub mod artifact;
+mod operation;
+pub(crate) mod spec;
+pub use operation::{
+    AddressValue, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation, PrefixScanValue,
+    ReductionValue, SortValue, TensorGuardValue, UArgRef, UOpKind, VariableValue,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
@@ -58,66 +64,6 @@ pub enum Binary {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Ternary {
     Where,
-}
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum UOpKind {
-    Const,
-    VConst,
-    DefineVar,
-    DefineGlobal,
-    DefineLocal,
-    DefineRegister,
-    Special,
-    Range,
-    EndRange,
-    If,
-    EndIf,
-    Unary(Unary),
-    Binary(Binary),
-    /// High-level ALU tags retained by the portable interpreter.  Renderers may
-    /// lower these to the smaller core ALU vocabulary later.
-    GraphUnary(crate::UnaryOp),
-    GraphBinary(crate::BinaryOp),
-    GraphCompare(crate::CompareOp),
-    GraphLogical(crate::LogicalOp),
-    /// Complete static generalized-matmul semantic. Its typed payload owns the
-    /// lhs/rhs/output ABI and normalized contraction geometry.
-    Matmul,
-    /// Narrow static F32 NCHW 1x1 convolution semantic. The payload owns the
-    /// exact ordered input/weight/bias/output ABI and rejects all other Conv2d
-    /// geometries before a renderer sees them.
-    Conv2d,
-    /// Complete materializing concat/gather/scatter semantic and ordered ABI.
-    Movement,
-    /// Captured Threefry source semantic.  The payload owns its stream
-    /// reservation, so execution is independent of mutable graph RNG state.
-    Random,
-    /// Static inclusive prefix scan. The payload owns normalized axis and the
-    /// exact input/output ABI; optimized renderers reject it until lowered.
-    PrefixScan,
-    /// Stable CPU-static ordering with one values and one I32-index output.
-    /// The paired buffer IDs live in the typed payload; renderers reject it
-    /// until they implement the coupled output ABI.
-    Sort,
-    /// Value-preserving CPU-static distribution validation boundary.
-    TensorGuard,
-    ReduceInit,
-    ReduceAccumulate,
-    ReduceFinalize,
-    Ternary(Ternary),
-    Cast,
-    Bitcast,
-    Vectorize,
-    Gep,
-    Index,
-    Load,
-    Store,
-    /// Immutable graph-adjacent assignment commit; never a pure kernel store.
-    EffectStore,
-    /// Orders an effect store after explicitly named predecessor effect IDs.
-    After,
-    Barrier,
-    Sink,
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UArg {
@@ -202,37 +148,6 @@ pub enum UArg {
         dtype: DType,
     },
     Effect(Box<crate::EffectPayload>),
-}
-impl UArg {
-    pub(crate) fn matmul_plan(&self) -> Option<&crate::MatmulKernelPlan> {
-        match self {
-            Self::Matmul(plan) => Some(plan),
-            Self::TiledMatmul(payload) => Some(&payload.matmul),
-            Self::TensorCoreMatmul(payload) => Some(&payload.matmul),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn quantized_matmul_plan(&self) -> Option<&crate::QuantizedMatmulPlan> {
-        match self {
-            Self::QuantizedMatmul(plan) => Some(plan),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn static_conv2d_plan(&self) -> Option<&crate::StaticConv2dPlan> {
-        match self {
-            Self::Conv2d(plan) => Some(plan),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn quantized_row_gather_plan(&self) -> Option<&crate::QuantizedRowGatherPlan> {
-        match self {
-            Self::QuantizedRowGather(plan) => Some(plan),
-            _ => None,
-        }
-    }
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ViewMap {
@@ -685,21 +600,35 @@ impl ViewMap {
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct UOpNode {
-    kind: UOpKind,
+    operation: Operation,
     ty: Option<UType>,
     sources: Vec<UOp>,
-    arg: UArg,
 }
 /// Immutable and structurally hashable. Cloning preserves DAG sharing.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct UOp(Arc<UOpNode>);
 impl UOp {
-    pub fn new(kind: UOpKind, ty: Option<UType>, sources: Vec<UOp>, arg: UArg) -> Self {
-        Self(Arc::new(UOpNode {
-            kind,
+    /// Fallible compatibility constructor for legacy opcode/argument pairs.
+    /// New code should prefer [`UOp::from_operation`], which cannot express a
+    /// mismatched operation payload.
+    pub fn try_new(
+        kind: UOpKind,
+        ty: Option<UType>,
+        sources: Vec<UOp>,
+        arg: UArg,
+    ) -> Result<Self, UOpError> {
+        let operation = Operation::from_legacy(kind, arg)?;
+        Ok(Self(Arc::new(UOpNode {
+            operation,
             ty,
             sources,
-            arg,
+        })))
+    }
+    pub fn from_operation(operation: Operation, ty: Option<UType>, sources: Vec<UOp>) -> Self {
+        Self(Arc::new(UOpNode {
+            operation,
+            ty,
+            sources,
         }))
     }
     pub(crate) fn from_artifact(
@@ -707,19 +636,17 @@ impl UOp {
         ty: Option<UType>,
         sources: Vec<UOp>,
         arg: UArg,
-    ) -> Self {
-        Self(Arc::new(UOpNode {
-            kind,
-            ty,
-            sources,
-            arg,
-        }))
+    ) -> Result<Self, UOpError> {
+        Self::try_new(kind, ty, sources, arg)
     }
     pub(crate) fn shares_node_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
-    pub fn kind(&self) -> &UOpKind {
-        &self.0.kind
+    pub fn operation(&self) -> &Operation {
+        &self.0.operation
+    }
+    pub fn kind(&self) -> UOpKind {
+        self.0.operation.kind()
     }
     pub fn ty(&self) -> Option<UType> {
         self.0.ty
@@ -727,22 +654,21 @@ impl UOp {
     pub fn sources(&self) -> &[UOp] {
         &self.0.sources
     }
-    pub fn arg(&self) -> &UArg {
-        &self.0.arg
+    pub fn arg(&self) -> UArgRef<'_> {
+        self.0.operation.argument()
     }
     pub fn constant(value: i64, ty: UType) -> Self {
-        Self::new(UOpKind::Const, Some(ty), vec![], UArg::Int(value))
+        Self::from_operation(Operation::Const(LiteralValue::Int(value)), Some(ty), vec![])
     }
     pub fn scalar_constant(dtype: DType, bits: u64, ty: UType) -> Self {
-        Self::new(
-            UOpKind::Const,
+        Self::from_operation(
+            Operation::Const(LiteralValue::Scalar { dtype, bits }),
             Some(ty),
             vec![],
-            UArg::Scalar { dtype, bits },
         )
     }
     pub fn unary(op: Unary, x: UOp) -> Self {
-        Self::new(UOpKind::Unary(op), x.ty(), vec![x], UArg::None)
+        Self::from_operation(Operation::Unary(op), x.ty(), vec![x])
     }
     pub fn binary(op: Binary, a: UOp, b: UOp) -> Self {
         let ty = if matches!(op, Binary::Eq | Binary::Lt | Binary::Le) {
@@ -750,13 +676,13 @@ impl UOp {
         } else {
             a.ty()
         };
-        Self::new(UOpKind::Binary(op), ty, vec![a, b], UArg::None)
+        Self::from_operation(Operation::Binary(op), ty, vec![a, b])
     }
     pub fn cast(x: UOp, to: UType) -> Self {
-        Self::new(UOpKind::Cast, Some(to), vec![x], UArg::None)
+        Self::from_operation(Operation::Cast, Some(to), vec![x])
     }
     pub fn sink(sources: Vec<UOp>) -> Self {
-        Self::new(UOpKind::Sink, None, sources, UArg::None)
+        Self::from_operation(Operation::Sink, None, sources)
     }
     pub fn topological(&self) -> Result<Vec<UOp>, UOpError> {
         fn visit(
@@ -784,17 +710,7 @@ impl UOp {
         Ok(out)
     }
     pub fn is_pure(&self) -> bool {
-        !matches!(
-            self.kind(),
-            UOpKind::Store
-                | UOpKind::EffectStore
-                | UOpKind::After
-                | UOpKind::Barrier
-                | UOpKind::Sink
-                | UOpKind::EndRange
-                | UOpKind::If
-                | UOpKind::EndIf
-        )
+        self.operation().signature().effect == spec::OpEffect::Pure
     }
     pub fn validate(&self) -> Result<(), UOpError> {
         let nodes = self.topological()?;
@@ -827,7 +743,7 @@ impl fmt::Display for UOp {
         if let Some(t) = self.ty() {
             write!(f, ":{:?}x{}", t.scalar, t.lanes)?
         }
-        if !matches!(self.arg(), UArg::None) {
+        if !matches!(self.arg(), UArgRef::None) {
             write!(f, "({:?})", self.arg())?
         }
         if !self.sources().is_empty() {
@@ -866,15 +782,16 @@ impl fmt::Display for UOpError {
     }
 }
 impl std::error::Error for UOpError {}
-fn exact(n: &UOp, count: usize) -> Result<(), UOpError> {
-    if n.sources().len() == count {
-        Ok(())
-    } else {
+fn validate_operation_arity(n: &UOp) -> Result<(), UOpError> {
+    let signature = n.operation().signature();
+    if !signature.arity.accepts(n.sources().len()) {
         Err(UOpError::InvalidArity {
-            kind: n.kind().clone(),
-            expected: "exact source count",
+            kind: n.kind(),
+            expected: signature.arity.expectation(),
             actual: n.sources().len(),
         })
+    } else {
+        Ok(())
     }
 }
 fn same(n: &UOp) -> bool {
@@ -882,49 +799,45 @@ fn same(n: &UOp) -> bool {
 }
 fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Result<(), UOpError> {
     use UOpKind::*;
+    validate_operation_arity(n)?;
     match n.kind() {
         Const | VConst => {
-            exact(n, 0)?;
             match n.arg() {
                 // `Int` remains the legacy structural/index literal. Its
                 // numeric interpretation is defined by the node type.
-                UArg::Int(_) if n.ty().is_some() => {}
-                UArg::Scalar { dtype, bits } if scalar_literal_is_valid(n.ty(), *dtype, *bits) => {}
-                UArg::Int(_) | UArg::Scalar { .. } => return Err(UOpError::InvalidDType),
+                UArgRef::Int(_) if n.ty().is_some() => {}
+                UArgRef::Scalar { dtype, bits }
+                    if scalar_literal_is_valid(n.ty(), *dtype, *bits) => {}
+                UArgRef::Int(_) | UArgRef::Scalar { .. } => return Err(UOpError::InvalidDType),
                 _ => return Err(UOpError::InvalidArgument),
             }
         }
         DefineVar => {
-            exact(n, 0)?;
-            if !matches!(n.arg(), UArg::Variable { .. }) {
+            if !matches!(n.arg(), UArgRef::Variable { .. }) {
                 return Err(UOpError::InvalidArgument);
             }
         }
         DefineGlobal | DefineLocal | DefineRegister => {
-            exact(n, 0)?;
-            if !matches!(n.arg(), UArg::Address { .. }) {
+            if !matches!(n.arg(), UArgRef::Address { .. }) {
                 return Err(UOpError::InvalidArgument);
             }
         }
         Special => {
-            exact(n, 0)?;
-            if !matches!(n.arg(), UArg::Name(_)) {
+            if !matches!(n.arg(), UArgRef::Name(_)) {
                 return Err(UOpError::InvalidArgument);
             }
         }
         Range => {
-            exact(n, 1)?;
             if !n.sources()[0].ty().is_some_and(|t| t.scalar.is_integer()) {
                 return Err(UOpError::InvalidDType);
             }
-            let UArg::RangeAxis(axis) = n.arg() else {
+            let UArgRef::RangeAxis(axis) = n.arg() else {
                 return Err(UOpError::InvalidArgument);
             };
             ranges.insert(*axis);
         }
         EndRange => {
-            exact(n, 1)?;
-            let UArg::RangeAxis(axis) = n.sources()[0].arg() else {
+            let UArgRef::RangeAxis(axis) = n.sources()[0].arg() else {
                 return Err(UOpError::ControlMismatch);
             };
             if !ranges.remove(axis) {
@@ -932,26 +845,22 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         If => {
-            exact(n, 1)?;
             if !n.sources()[0].ty().is_some_and(UType::is_bool) {
                 return Err(UOpError::InvalidDType);
             }
             ifs.push(n.clone())
         }
         EndIf => {
-            exact(n, 1)?;
             if !matches!(n.sources()[0].kind(), If) || ifs.pop().as_ref() != Some(&n.sources()[0]) {
                 return Err(UOpError::ControlMismatch);
             }
         }
         Unary(_) => {
-            exact(n, 1)?;
             if !same(n) {
                 return Err(UOpError::InvalidDType);
             }
         }
         GraphUnary(op) => {
-            exact(n, 1)?;
             let valid = if matches!(
                 op,
                 crate::UnaryOp::IsNan | crate::UnaryOp::IsInf | crate::UnaryOp::IsFinite
@@ -969,7 +878,6 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         Binary(op) => {
-            exact(n, 2)?;
             if !matches!(
                 op,
                 crate::uop::Binary::Eq | crate::uop::Binary::Lt | crate::uop::Binary::Le
@@ -979,24 +887,16 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         GraphBinary(_) => {
-            exact(n, 2)?;
             if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
         }
         GraphCompare(_) => {
-            exact(n, 2)?;
             if n.ty() != Some(UType::scalar(DType::Bool)) {
                 return Err(UOpError::InvalidDType);
             }
         }
-        GraphLogical(op) => {
-            let expected = if matches!(op, crate::LogicalOp::Not) {
-                1
-            } else {
-                2
-            };
-            exact(n, expected)?;
+        GraphLogical(_) => {
             if n.ty() != Some(UType::scalar(DType::Bool))
                 || n.sources()
                     .iter()
@@ -1006,13 +906,12 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         Matmul => {
-            exact(n, 0)?;
             if let Some(plan) = n.arg().matmul_plan() {
                 plan.validate().map_err(|_| UOpError::InvalidArgument)?;
-                if let UArg::TiledMatmul(payload) = n.arg() {
+                if let UArgRef::TiledMatmul(payload) = n.arg() {
                     payload.validate().map_err(|_| UOpError::InvalidArgument)?;
                 }
-                if let UArg::TensorCoreMatmul(payload) = n.arg() {
+                if let UArgRef::TensorCoreMatmul(payload) = n.arg() {
                     payload.validate().map_err(|_| UOpError::InvalidArgument)?;
                 }
                 if n.ty() != Some(UType::scalar(plan.dtype)) {
@@ -1028,7 +927,6 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         Conv2d => {
-            exact(n, 0)?;
             let Some(plan) = n.arg().static_conv2d_plan() else {
                 return Err(UOpError::InvalidArgument);
             };
@@ -1037,27 +935,23 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidDType);
             }
         }
-        Movement => {
-            exact(n, 0)?;
-            match n.arg() {
-                UArg::Movement(plan) => {
-                    plan.validate().map_err(|_| UOpError::InvalidArgument)?;
-                    if n.ty() != Some(UType::scalar(plan.dtype)) {
-                        return Err(UOpError::InvalidDType);
-                    }
+        Movement => match n.arg() {
+            UArgRef::Movement(plan) => {
+                plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+                if n.ty() != Some(UType::scalar(plan.dtype)) {
+                    return Err(UOpError::InvalidDType);
                 }
-                UArg::QuantizedRowGather(plan) => {
-                    plan.validate().map_err(|_| UOpError::InvalidArgument)?;
-                    if n.ty() != Some(UType::scalar(plan.output_dtype)) {
-                        return Err(UOpError::InvalidDType);
-                    }
-                }
-                _ => return Err(UOpError::InvalidArgument),
             }
-        }
+            UArgRef::QuantizedRowGather(plan) => {
+                plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+                if n.ty() != Some(UType::scalar(plan.output_dtype)) {
+                    return Err(UOpError::InvalidDType);
+                }
+            }
+            _ => return Err(UOpError::InvalidArgument),
+        },
         Random => {
-            exact(n, 0)?;
-            let UArg::Random(plan) = n.arg() else {
+            let UArgRef::Random(plan) = n.arg() else {
                 return Err(UOpError::InvalidArgument);
             };
             plan.validate().map_err(|_| UOpError::InvalidArgument)?;
@@ -1066,8 +960,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         PrefixScan => {
-            exact(n, 0)?;
-            let UArg::PrefixScan {
+            let UArgRef::PrefixScan {
                 input_shape,
                 output_shape,
                 axis,
@@ -1100,8 +993,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         Sort => {
-            exact(n, 0)?;
-            let UArg::Sort {
+            let UArgRef::Sort {
                 input_shape,
                 axis,
                 values,
@@ -1123,8 +1015,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         TensorGuard => {
-            exact(n, 0)?;
-            let UArg::TensorGuard {
+            let UArgRef::TensorGuard {
                 input_shape,
                 axis,
                 dtype,
@@ -1141,21 +1032,18 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidArgument);
             }
         }
-        ReduceInit => exact(n, 0)?,
+        ReduceInit => {}
         ReduceAccumulate => {
-            exact(n, 2)?;
             if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
         }
         ReduceFinalize => {
-            exact(n, 1)?;
             if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
         }
         Ternary(crate::uop::Ternary::Where) => {
-            exact(n, 3)?;
             if !n.sources()[0].ty().is_some_and(UType::is_bool)
                 || n.sources()[1].ty() != n.sources()[2].ty()
                 || n.ty() != n.sources()[1].ty()
@@ -1164,7 +1052,6 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         Cast | Bitcast => {
-            exact(n, 1)?;
             if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
@@ -1175,13 +1062,11 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         Gep => {
-            exact(n, 1)?;
-            if !matches!(n.arg(), UArg::GepLane(_)) {
+            if !matches!(n.arg(), UArgRef::GepLane(_)) {
                 return Err(UOpError::InvalidArgument);
             }
         }
         Index => {
-            exact(n, 2)?;
             if !matches!(
                 n.sources()[0].kind(),
                 DefineGlobal | DefineLocal | DefineRegister
@@ -1190,13 +1075,13 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidIndex);
             }
             let (elements, input_shape, output_shape) = match n.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     elements,
                     input_shape,
                     output_shape,
                     ..
                 }
-                | UArg::ViewBufferIndex {
+                | UArgRef::ViewBufferIndex {
                     elements,
                     input_shape,
                     output_shape,
@@ -1215,7 +1100,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             {
                 return Err(UOpError::InvalidIndex);
             }
-            if let UArg::ViewBufferIndex {
+            if let UArgRef::ViewBufferIndex {
                 view, input_shape, ..
             } = n.arg()
                 && (&view.logical_shape != input_shape || view.validate_read().is_err())
@@ -1224,20 +1109,17 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         Load => {
-            exact(n, 1)?;
             if !matches!(n.sources()[0].kind(), Index) {
                 return Err(UOpError::InvalidIndex);
             }
         }
         Store => {
-            exact(n, 2)?;
             if !matches!(n.sources()[0].kind(), Index) {
                 return Err(UOpError::InvalidIndex);
             }
         }
         EffectStore => {
-            exact(n, 0)?;
-            let UArg::Effect(payload) = n.arg() else {
+            let UArgRef::Effect(payload) = n.arg() else {
                 return Err(UOpError::InvalidArgument);
             };
             if payload.target.buffer != payload.snapshot.buffer
@@ -1255,13 +1137,13 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         After => {
-            exact(n, 1)?;
-            if !matches!(n.sources()[0].kind(), EffectStore) || !matches!(n.arg(), UArg::Effect(_))
+            if !matches!(n.sources()[0].kind(), EffectStore)
+                || !matches!(n.arg(), UArgRef::Effect(_))
             {
                 return Err(UOpError::ControlMismatch);
             }
         }
-        Barrier => exact(n, 0)?,
+        Barrier => {}
         Sink => {
             if n.ty().is_some() {
                 return Err(UOpError::InvalidDType);
@@ -1331,11 +1213,14 @@ impl UPat {
         self.match_into(node, &mut c).then_some(c)
     }
     fn match_into(&self, n: &UOp, c: &mut Captures) -> bool {
-        if !self.any && self.kinds.as_ref().is_some_and(|x| !x.contains(n.kind())) {
+        if !self.any && self.kinds.as_ref().is_some_and(|x| !x.contains(&n.kind())) {
             return false;
         }
         if self.ty.is_some_and(|x| n.ty() != Some(x))
-            || self.arg.as_ref().is_some_and(|x| x != n.arg())
+            || self
+                .arg
+                .as_ref()
+                .is_some_and(|expected| !n.arg().equals_owned(expected))
         {
             return false;
         }
@@ -1398,14 +1283,13 @@ pub fn rewrite(
         }
         let mut x = n.clone();
         if w == Walk::BottomUp {
-            x = UOp::new(
-                x.kind().clone(),
+            x = UOp::from_operation(
+                x.operation().clone(),
                 x.ty(),
                 x.sources()
                     .iter()
                     .map(|s| go(s, r, w, m, t))
                     .collect::<Result<_, _>>()?,
-                x.arg().clone(),
             )
         }
         for rule in r {
@@ -1421,14 +1305,13 @@ pub fn rewrite(
             }
         }
         if w == Walk::TopDown {
-            x = UOp::new(
-                x.kind().clone(),
+            x = UOp::from_operation(
+                x.operation().clone(),
                 x.ty(),
                 x.sources()
                     .iter()
                     .map(|s| go(s, r, w, m, t))
                     .collect::<Result<_, _>>()?,
-                x.arg().clone(),
             )
         }
         m.insert(n.clone(), x.clone());
@@ -1450,7 +1333,7 @@ fn exact_integral_literal(operation: &UOp, literal: &UOp, bits: u64) -> bool {
     }
     matches!(
         literal.arg(),
-        UArg::Scalar { dtype, bits: raw } if *dtype == ty.scalar && *raw == bits
+        UArgRef::Scalar { dtype, bits: raw } if *dtype == ty.scalar && *raw == bits
     )
 }
 
@@ -1460,8 +1343,8 @@ fn exact_bool_literal(literal: &UOp, value: bool) -> bool {
         (
             UOpKind::Const,
             Some(UType { scalar: DType::Bool, lanes: 1 }),
-            UArg::Scalar { dtype: DType::Bool, bits }
-        ) if *bits == u64::from(value)
+            UArgRef::Scalar { dtype, bits }
+        ) if *dtype == DType::Bool && *bits == u64::from(value)
     )
 }
 
@@ -1606,9 +1489,9 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
 /// floating `-0.0`, whose signed-zero result can be observable.
 fn typed_positive_zero(node: &UOp, ty: Option<UType>) -> bool {
     match node.arg() {
-        UArg::Int(0) => node.kind() == &UOpKind::Const && node.ty() == ty,
-        UArg::Scalar { dtype, bits } => {
-            node.kind() == &UOpKind::Const
+        UArgRef::Int(value) if *value == 0 => node.kind() == UOpKind::Const && node.ty() == ty,
+        UArgRef::Scalar { dtype, bits } => {
+            node.kind() == UOpKind::Const
                 && *bits == 0
                 && node.ty() == ty
                 && scalar_literal_is_valid(node.ty(), *dtype, *bits)
@@ -1662,14 +1545,13 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
         }
         let ty = UType::scalar(graph.dtype(id).map_err(|_| UOpError::UseBeforeDefinition)?);
         let x = match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-            crate::Op::Input { name } => UOp::new(
-                UOpKind::DefineVar,
-                Some(ty),
-                vec![],
-                UArg::Variable {
+            crate::Op::Input { name } => UOp::from_operation(
+                Operation::DefineVar(VariableValue {
                     name: name.clone(),
                     bounds: SymbolicExpr::constant(0),
-                },
+                }),
+                Some(ty),
+                vec![],
             ),
             crate::Op::Constant(data) => {
                 UOp::scalar_constant(data.dtype(), raw_literal_bits(data)?, ty)
@@ -1682,7 +1564,7 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                 {
                     return Err(UOpError::InvalidArgument);
                 }
-                UOp::new(UOpKind::Bitcast, Some(ty), vec![source], UArg::None)
+                UOp::from_operation(Operation::Bitcast, Some(ty), vec![source])
             }
             crate::Op::Contiguous { .. } => return Err(UOpError::InvalidArgument),
             crate::Op::ContiguousBackward { input } => lower(graph, *input, memo)?,
@@ -1704,21 +1586,19 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                 // behavior for NaNs or signed-zero ties.
                 let lhs = lower(graph, *lhs, memo)?;
                 let rhs = lower(graph, *rhs, memo)?;
-                let condition = UOp::new(
-                    UOpKind::GraphCompare(crate::CompareOp::Lt),
+                let condition = UOp::from_operation(
+                    Operation::GraphCompare(crate::CompareOp::Lt),
                     Some(UType::scalar(DType::Bool)),
                     if *op == crate::BinaryOp::Maximum {
                         vec![lhs.clone(), rhs.clone()]
                     } else {
                         vec![rhs.clone(), lhs.clone()]
                     },
-                    UArg::None,
                 );
-                UOp::new(
-                    UOpKind::Ternary(Ternary::Where),
+                UOp::from_operation(
+                    Operation::Ternary(Ternary::Where),
                     Some(ty),
                     vec![condition, rhs, lhs],
-                    UArg::None,
                 )
             }
             crate::Op::Binary { op, lhs, rhs } => {
@@ -1745,15 +1625,14 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                 condition,
                 on_true,
                 on_false,
-            } => UOp::new(
-                UOpKind::Ternary(Ternary::Where),
+            } => UOp::from_operation(
+                Operation::Ternary(Ternary::Where),
                 Some(ty),
                 vec![
                     lower(graph, *condition, memo)?,
                     lower(graph, *on_true, memo)?,
                     lower(graph, *on_false, memo)?,
                 ],
-                UArg::None,
             ),
             _ => return Err(UOpError::InvalidArgument),
         };

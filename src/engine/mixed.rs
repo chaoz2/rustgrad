@@ -112,7 +112,7 @@ pub fn realize_mixed_effects(
     for binding in &schedule.value_bindings {
         let item = &schedule.items[binding.effect_item as usize];
         let step = match item.kernel.arg() {
-            crate::UArg::Effect(payload) => payload.step,
+            crate::UArgRef::Effect(payload) => payload.step,
             _ => {
                 return Err(super::RealizationError::Schedule(
                     "effect binding lacks typed payload".into(),

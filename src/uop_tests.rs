@@ -1,5 +1,8 @@
-use crate::uop::{self, Binary, Ternary, UArg, UOpKind, UType, Walk};
-use crate::{DType, Graph, Shape, TensorData, UOp, UPat};
+use crate::uop::{
+    self, Binary, Ternary, UArg, UOpKind, UType, Walk,
+    spec::{OpArity, OpEffect, OpFamily},
+};
+use crate::{DType, Graph, Shape, TensorData, UArgRef, UOp, UPat};
 
 fn i64t() -> UType {
     UType::scalar(DType::I64)
@@ -23,13 +26,91 @@ fn uop_spec_and_dag_order_are_deterministic() {
     let order = root.topological().unwrap();
     assert_eq!(order.len(), 4);
     assert_eq!(order.last(), Some(&root));
-    let bad = UOp::new(
+    let bad = UOp::try_new(
         UOpKind::Binary(Binary::Add),
         Some(i64t()),
         vec![x],
         UArg::None,
-    );
+    )
+    .unwrap();
     assert!(bad.validate().is_err());
+}
+
+#[test]
+fn typed_operation_registry_owns_family_arity_and_effect_policy() {
+    let literal_node = UOp::constant(1, i64t());
+    let literal = literal_node.operation().signature();
+    assert_eq!(literal.family, OpFamily::Literal);
+    assert_eq!(literal.arity, OpArity::Exact(0));
+    assert_eq!(literal.effect, OpEffect::Pure);
+
+    let source = UOp::constant(1, i64t());
+    assert_eq!(
+        UOp::try_new(
+            UOpKind::GraphLogical(crate::LogicalOp::Not),
+            Some(UType::scalar(DType::Bool)),
+            vec![source.clone()],
+            UArg::None,
+        )
+        .unwrap()
+        .operation()
+        .signature()
+        .arity,
+        OpArity::Exact(1)
+    );
+    assert_eq!(
+        UOp::try_new(
+            UOpKind::GraphLogical(crate::LogicalOp::And),
+            Some(UType::scalar(DType::Bool)),
+            vec![source.clone(), source.clone()],
+            UArg::None,
+        )
+        .unwrap()
+        .operation()
+        .signature()
+        .arity,
+        OpArity::Exact(2)
+    );
+    assert_eq!(
+        UOp::try_new(
+            UOpKind::Vectorize,
+            Some(i64t()),
+            vec![source.clone()],
+            UArg::None,
+        )
+        .unwrap()
+        .operation()
+        .signature()
+        .arity,
+        OpArity::AtLeastOne
+    );
+    assert_eq!(
+        UOp::sink(vec![]).operation().signature().arity,
+        OpArity::Any
+    );
+    assert_eq!(
+        UOp::sink(vec![]).operation().signature().effect,
+        OpEffect::Effectful
+    );
+
+    let wrong_argument = UOp::try_new(
+        UOpKind::Unary(crate::uop::Unary::Neg),
+        Some(i64t()),
+        vec![source.clone()],
+        UArg::Int(0),
+    );
+    assert_eq!(wrong_argument, Err(crate::UOpError::InvalidArgument));
+    let wrong_arity = UOp::try_new(
+        UOpKind::Binary(Binary::Add),
+        Some(i64t()),
+        vec![source],
+        UArg::None,
+    )
+    .unwrap();
+    assert!(matches!(
+        wrong_arity.validate(),
+        Err(crate::UOpError::InvalidArity { actual: 1, .. })
+    ));
 }
 
 #[test]
@@ -40,29 +121,32 @@ fn graph_unary_predicates_have_bool_outputs_and_retain_typed_inputs() {
         crate::UnaryOp::IsInf,
         crate::UnaryOp::IsFinite,
     ] {
-        UOp::new(
+        UOp::try_new(
             UOpKind::GraphUnary(op),
             Some(UType::scalar(DType::Bool)),
             vec![input.clone()],
             UArg::None,
         )
+        .unwrap()
         .validate()
         .unwrap();
     }
 
-    let wrong_predicate_output = UOp::new(
+    let wrong_predicate_output = UOp::try_new(
         UOpKind::GraphUnary(crate::UnaryOp::IsNan),
         Some(f32t()),
         vec![input.clone()],
         UArg::None,
-    );
+    )
+    .unwrap();
     assert!(wrong_predicate_output.validate().is_err());
-    let wrong_value_output = UOp::new(
+    let wrong_value_output = UOp::try_new(
         UOpKind::GraphUnary(crate::UnaryOp::Relu),
         Some(UType::scalar(DType::Bool)),
         vec![input],
         UArg::None,
-    );
+    )
+    .unwrap();
     assert!(wrong_value_output.validate().is_err());
 }
 
@@ -111,7 +195,7 @@ fn raw_scalar_identity_rewrite_is_type_checked_and_preserves_signed_zero() {
 #[test]
 fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
     let malformed = [
-        UOp::new(
+        UOp::try_new(
             UOpKind::Const,
             Some(f32t()),
             vec![],
@@ -119,8 +203,9 @@ fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
                 dtype: DType::F64,
                 bits: 0,
             },
-        ),
-        UOp::new(
+        )
+        .unwrap(),
+        UOp::try_new(
             UOpKind::Const,
             Some(UType::scalar(DType::U8)),
             vec![],
@@ -128,8 +213,9 @@ fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
                 dtype: DType::U8,
                 bits: 0x100,
             },
-        ),
-        UOp::new(
+        )
+        .unwrap(),
+        UOp::try_new(
             UOpKind::VConst,
             Some(UType::scalar(DType::Bool)),
             vec![],
@@ -137,8 +223,9 @@ fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
                 dtype: DType::Bool,
                 bits: 2,
             },
-        ),
-        UOp::new(UOpKind::Const, None, vec![], UArg::Int(0)),
+        )
+        .unwrap(),
+        UOp::try_new(UOpKind::Const, None, vec![], UArg::Int(0)).unwrap(),
     ];
     for literal in malformed {
         assert!(literal.validate().is_err());
@@ -208,24 +295,27 @@ fn where_same_keeps_fallible_condition_but_folds_constant_condition() {
     let boolt = UType::scalar(DType::Bool);
     let one = UOp::constant(1, i32t);
     let zero = UOp::constant(0, i32t);
-    let div = UOp::new(
+    let div = UOp::try_new(
         UOpKind::GraphBinary(crate::BinaryOp::Div),
         Some(i32t),
         vec![one.clone(), zero],
         UArg::None,
-    );
-    let condition = UOp::new(
+    )
+    .unwrap();
+    let condition = UOp::try_new(
         UOpKind::GraphCompare(crate::CompareOp::Eq),
         Some(boolt),
         vec![div.clone(), one],
         UArg::None,
-    );
-    let guarded = UOp::new(
+    )
+    .unwrap();
+    let guarded = UOp::try_new(
         UOpKind::Ternary(Ternary::Where),
         Some(i32t),
         vec![condition.clone(), div.clone(), div.clone()],
         UArg::None,
-    );
+    )
+    .unwrap();
     guarded.validate().unwrap();
     let (rewritten, trace) =
         uop::rewrite(&guarded, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
@@ -237,12 +327,13 @@ fn where_same_keeps_fallible_condition_but_folds_constant_condition() {
 
     let nan = UOp::scalar_constant(DType::F32, 0x7fc0_1234, UType::scalar(DType::F32));
     let constant_condition = UOp::constant(0, boolt);
-    let safe = UOp::new(
+    let safe = UOp::try_new(
         UOpKind::Ternary(Ternary::Where),
         Some(UType::scalar(DType::F32)),
         vec![constant_condition, nan.clone(), nan.clone()],
         UArg::None,
-    );
+    )
+    .unwrap();
     safe.validate().unwrap();
     let (rewritten, trace) =
         uop::rewrite(&safe, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
@@ -261,12 +352,13 @@ fn uop_graph_scalar_pilot_is_inspectable() {
     uop.validate().unwrap();
     assert!(matches!(uop.kind(), UOpKind::Binary(Binary::Add)));
     let condition = UOp::constant(1, UType::scalar(DType::Bool));
-    let where_ = UOp::new(
+    let where_ = UOp::try_new(
         UOpKind::Ternary(Ternary::Where),
         uop.ty(),
         vec![condition, uop.clone(), uop],
         UArg::None,
-    );
+    )
+    .unwrap();
     where_.validate().unwrap();
 }
 
@@ -298,7 +390,7 @@ fn scalar_literals_retain_raw_storage_bits() {
         let uop = uop::lower_graph_scalar(&graph, node).unwrap();
         assert_eq!(uop.ty(), Some(UType::scalar(dtype)));
         assert!(
-            matches!(uop.arg(), UArg::Scalar { dtype: got, bits: raw } if *got == dtype && *raw == bits)
+            matches!(uop.arg(), UArgRef::Scalar { dtype: got, bits: raw } if *got == dtype && *raw == bits)
         );
     }
 }
@@ -325,7 +417,7 @@ fn typed_scalar_rewrite_leaves_fixed_schedule_cache_identity_stable() {
 
 #[test]
 fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
-    let base = UOp::new(
+    let base = UOp::try_new(
         UOpKind::DefineGlobal,
         Some(i64t()),
         vec![],
@@ -334,14 +426,16 @@ fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
             name: "b0".into(),
             element: i64t(),
         },
-    );
-    let range = UOp::new(
+    )
+    .unwrap();
+    let range = UOp::try_new(
         UOpKind::Range,
         Some(i64t()),
         vec![UOp::constant(6, i64t())],
         UArg::RangeAxis(0),
-    );
-    let invalid = UOp::new(
+    )
+    .unwrap();
+    let invalid = UOp::try_new(
         UOpKind::Index,
         Some(i64t()),
         vec![base, range.clone()],
@@ -351,10 +445,11 @@ fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
             input_shape: Shape::from([2, 3]),
             output_shape: Shape::from([3]),
         },
-    );
+    )
+    .unwrap();
     let root = UOp::sink(vec![
         invalid,
-        UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+        UOp::try_new(UOpKind::EndRange, None, vec![range], UArg::None).unwrap(),
     ]);
     assert!(root.validate().is_err());
 }

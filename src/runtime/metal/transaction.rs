@@ -1,6 +1,6 @@
 //! Typed transaction metadata and bounded integer-fault reconstruction.
 use super::MetalError;
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArg, UOp, UOpKind};
+use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArgRef, UOp, UOpKind};
 use std::collections::BTreeMap;
 
 pub const METAL_TRANSACTION_ABI_VERSION: u32 = 1;
@@ -81,7 +81,7 @@ impl MetalTransactionAbi {
             let UOpKind::GraphBinary(op) = node.kind() else {
                 continue;
             };
-            let Some(operation) = GuardedIntegerOp::from_binary(*op) else {
+            let Some(operation) = GuardedIntegerOp::from_binary(op) else {
                 continue;
             };
             let dtype = node
@@ -182,7 +182,7 @@ pub(super) fn first_fault_at<F>(
     mut load: F,
 ) -> Result<Option<u32>, MetalError>
 where
-    F: FnMut(&UArg, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
 {
     match eval(
         &transaction.evaluation_root,
@@ -202,7 +202,7 @@ pub(super) fn detail_rhs_at<F>(
     mut load: F,
 ) -> Result<Scalar, MetalError>
 where
-    F: FnMut(&UArg, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
 {
     match eval(&guard.rhs, logical, &transaction.guard_ids(), &mut load)? {
         Evaluated::Value(value) => Ok(value),
@@ -219,7 +219,7 @@ fn eval<F>(
     load: &mut F,
 ) -> Result<Evaluated, MetalError>
 where
-    F: FnMut(&UArg, DType, usize) -> Result<Scalar, MetalError>,
+    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, MetalError>,
 {
     let dtype = node
         .ty()
@@ -227,7 +227,7 @@ where
         .scalar;
     let value = match node.kind() {
         UOpKind::Const => match node.arg() {
-            UArg::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits)?,
+            UArgRef::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits)?,
             _ => return Err(MetalError::InvalidBinding("invalid detail constant".into())),
         },
         UOpKind::Load => {
@@ -254,11 +254,11 @@ where
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             if let Some(id) = guard_ids.get(node).copied()
-                && invalid_guard(*op, dtype, rhs)
+                && invalid_guard(op, dtype, rhs)
             {
                 return Ok(Evaluated::Fault(id));
             }
-            integer_binary(*op, dtype, lhs, rhs)?
+            integer_binary(op, dtype, lhs, rhs)?
         }
         UOpKind::GraphCompare(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -269,7 +269,7 @@ where
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
-            Scalar::Bool(compare(lhs, rhs, *op))
+            Scalar::Bool(compare(lhs, rhs, op))
         }
         UOpKind::GraphLogical(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -389,14 +389,14 @@ fn compare(lhs: Scalar, rhs: Scalar, op: CompareOp) -> bool {
     }
 }
 
-pub(super) fn logical_offset(arg: &UArg, logical: usize) -> Result<usize, MetalError> {
+pub(super) fn logical_offset(arg: UArgRef<'_>, logical: usize) -> Result<usize, MetalError> {
     let (input, output, view) = match arg {
-        UArg::BufferIndex {
+        UArgRef::BufferIndex {
             input_shape,
             output_shape,
             ..
         } => (input_shape, output_shape, None),
-        UArg::ViewBufferIndex {
+        UArgRef::ViewBufferIndex {
             input_shape,
             output_shape,
             view,

@@ -5,8 +5,7 @@
 use crate::uop::artifact::{ArtifactError, Reader, Writer, checksum};
 use crate::{
     BufferDesc, BufferState, CapturedSchedule, EffectPayload, MixedStateRebinding, NodeId,
-    ReplayError, ReplayInput, Schedule, ScheduleStateBinding, ScheduleValueBinding, UArg, UOp,
-    UOpKind,
+    Operation, ReplayError, ReplayInput, Schedule, ScheduleStateBinding, ScheduleValueBinding, UOp,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -244,7 +243,7 @@ impl CapturedMixedSchedule {
             if !item.is_effect() {
                 continue;
             }
-            let UArg::Effect(after) = item.kernel.arg() else {
+            let crate::UArgRef::Effect(after) = item.kernel.arg() else {
                 return Err(ReplayError::Corrupt("effect item missing payload".into()));
             };
             let payload = rebind_payload(after, &map_state)?;
@@ -253,17 +252,15 @@ impl CapturedMixedSchedule {
                 .sources()
                 .first()
                 .ok_or_else(|| ReplayError::Corrupt("effect item missing store".into()))?;
-            let store_uop = UOp::new(
-                UOpKind::EffectStore,
+            let store_uop = UOp::from_operation(
+                Operation::EffectStore(Box::new(payload.clone())),
                 store.ty(),
                 vec![],
-                UArg::Effect(Box::new(payload.clone())),
             );
-            item.kernel = UOp::new(
-                UOpKind::After,
+            item.kernel = UOp::from_operation(
+                Operation::After(Box::new(payload)),
                 item.kernel.ty(),
                 vec![store_uop],
-                UArg::Effect(Box::new(payload)),
             );
             let pure_source = self
                 .value_bindings
@@ -1028,7 +1025,7 @@ fn rebind_payload(
 
 fn effect_payload(item: &crate::ScheduleItem) -> Result<&crate::EffectPayload, ReplayError> {
     match item.kernel.arg() {
-        crate::UArg::Effect(payload) => Ok(payload),
+        crate::UArgRef::Effect(payload) => Ok(payload),
         _ => Err(ReplayError::Corrupt("effect payload is absent".into())),
     }
 }
@@ -1042,12 +1039,12 @@ fn effect_plan(schedule: &Schedule) -> Result<crate::EffectPlan, ReplayError> {
             .sources()
             .first()
             .ok_or_else(|| ReplayError::Corrupt("effect AFTER lacks STORE".into()))?;
-        let crate::UArg::Effect(store_payload) = store.arg() else {
+        let crate::UArgRef::Effect(store_payload) = store.arg() else {
             return Err(ReplayError::Corrupt(
                 "effect STORE payload is absent".into(),
             ));
         };
-        if store_payload.as_ref() != after {
+        if store_payload != after {
             return Err(ReplayError::Corrupt(
                 "effect STORE/AFTER payload mismatch".into(),
             ));

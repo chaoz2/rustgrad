@@ -96,7 +96,7 @@ impl ExecutionPlanSummary {
                 item_id: item.id,
                 outputs: item.outputs.iter().cloned().collect(),
                 output: item.primary_output().clone(),
-                operation: item.kernel.kind().clone(),
+                operation: item.kernel.kind(),
                 dependencies: item.dependencies.clone(),
             })
             .collect::<Vec<_>>();

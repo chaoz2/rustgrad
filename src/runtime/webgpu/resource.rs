@@ -814,8 +814,8 @@ impl WebGpuTransaction<'_> {
     ) -> Result<i64, WebGpuError> {
         let value = detail_rhs_at(transaction, guard, logical, |arg, dtype, logical| {
             let buffer_id = match arg {
-                crate::UArg::BufferIndex { buffer, .. }
-                | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                crate::UArgRef::BufferIndex { buffer, .. }
+                | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
                 _ => {
                     return Err(WebGpuError::InvalidBinding(
                         "detail load index mismatch".into(),

@@ -6,8 +6,8 @@
 use super::capture::{CapturedSchedule, ReplayError};
 use super::symbolic_view::SymbolicViewMap;
 use crate::{
-    BufferDesc, DType, Graph, NodeId, Op, Schedule, Shape, SymbolicDim, SymbolicExpr,
-    SymbolicShape, SymbolicVar, UArg, UOp, UOpKind,
+    BufferDesc, DType, Graph, IndexValue, MatmulValue, NodeId, Op, Operation, ReductionValue,
+    Schedule, Shape, SymbolicDim, SymbolicExpr, SymbolicShape, SymbolicVar, UArgRef, UOp, UOpKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -513,7 +513,7 @@ pub(crate) fn build_schema(
             .topological()
             .map_err(|error| ReplayError::Symbolic(error.to_string()))?
         {
-            let UArg::ViewBufferIndex { buffer, view, .. } = node.arg() else {
+            let UArgRef::ViewBufferIndex { buffer, view, .. } = node.arg() else {
                 continue;
             };
             let mut matches = Vec::new();
@@ -731,7 +731,7 @@ impl SymbolicSchema {
                 .topological()
                 .map_err(|error| ReplayError::Symbolic(error.to_string()))?
             {
-                if let UArg::ViewBufferIndex { buffer, .. } = node.arg() {
+                if let UArgRef::ViewBufferIndex { buffer, .. } = node.arg() {
                     expected_views.insert((item.id, *buffer));
                 }
             }
@@ -851,10 +851,10 @@ impl SymbolicSchema {
                         .any(|node| {
                             matches!(
                                 node.arg(),
-                                UArg::Reduction { .. }
-                                    | UArg::Matmul(_)
-                                    | UArg::TiledMatmul(_)
-                                    | UArg::TensorCoreMatmul(_)
+                                UArgRef::Reduction { .. }
+                                    | UArgRef::Matmul(_)
+                                    | UArgRef::TiledMatmul(_)
+                                    | UArgRef::TensorCoreMatmul(_)
                             )
                         })
                 {
@@ -886,7 +886,7 @@ impl SymbolicSchema {
                     .map_err(|error| ReplayError::Symbolic(error.to_string()))?
                     .into_iter()
                     .filter_map(|node| match node.arg() {
-                        UArg::Reduction { axes, keepdim, .. } => Some((axes.clone(), *keepdim)),
+                        UArgRef::Reduction { axes, keepdim, .. } => Some((axes.to_vec(), *keepdim)),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -1452,7 +1452,7 @@ pub(crate) fn specialize_kernel(
     for node in &nodes {
         let (buffer, range) = match (node.arg(), node.sources().get(1)) {
             (
-                UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. },
+                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. },
                 Some(range),
             ) => (*buffer, range),
             _ => continue,
@@ -1490,8 +1490,8 @@ pub(crate) fn specialize_kernel(
                     .ok_or_else(|| ReplayError::Corrupt("symbolic UOp source order".into()))
             })
             .collect::<Result<Vec<UOp>, _>>()?;
-        let arg = match node.arg() {
-            UArg::BufferIndex { buffer, .. } => {
+        let operation = match node.operation() {
+            Operation::Index(IndexValue::Buffer { buffer, .. }) => {
                 let input_shape = schema.bind_shape(*buffer, environment)?;
                 let output_shape = if let Some((reduction_input, _, _)) = &domain.reduction {
                     if *buffer == output_buffer {
@@ -1502,16 +1502,16 @@ pub(crate) fn specialize_kernel(
                 } else {
                     domain.output.clone()
                 };
-                UArg::BufferIndex {
+                Operation::Index(IndexValue::Buffer {
                     buffer: *buffer,
                     elements: input_shape
                         .numel()
                         .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
                     input_shape,
                     output_shape,
-                }
+                })
             }
-            UArg::ViewBufferIndex { buffer, .. } => {
+            Operation::Index(IndexValue::View { buffer, .. }) => {
                 let source_shape = schema.bind_shape(*buffer, environment)?;
                 let view = schema
                     .views
@@ -1528,7 +1528,7 @@ pub(crate) fn specialize_kernel(
                 } else {
                     domain.output.clone()
                 };
-                UArg::ViewBufferIndex {
+                Operation::Index(IndexValue::View {
                     buffer: *buffer,
                     elements: view
                         .logical_shape
@@ -1537,28 +1537,28 @@ pub(crate) fn specialize_kernel(
                     input_shape: view.logical_shape.clone(),
                     output_shape,
                     view: view.into(),
-                }
+                })
             }
-            UArg::Reduction {
+            Operation::ReduceInit(ReductionValue {
                 axes,
                 keepdim,
                 kind,
                 mean,
                 ..
-            } => {
+            }) => {
                 let (input_shape, _, _) = domain.reduction.as_ref().ok_or_else(|| {
                     ReplayError::Corrupt("reduction payload lacks symbolic domain".into())
                 })?;
-                UArg::Reduction {
+                Operation::ReduceInit(ReductionValue {
                     input_shape: input_shape.clone(),
                     output_shape: domain.output.clone(),
-                    axes: axes.clone(),
+                    axes: axes.to_vec(),
                     keepdim: *keepdim,
                     kind: *kind,
                     mean: *mean,
-                }
+                })
             }
-            UArg::Matmul(_) | UArg::TiledMatmul(_) | UArg::TensorCoreMatmul(_) => {
+            Operation::Matmul(value) => {
                 let (batch, m, n, k, lhs, rhs) = domain.matmul.as_ref().ok_or_else(|| {
                     ReplayError::Corrupt("matmul payload lacks symbolic domain".into())
                 })?;
@@ -1579,38 +1579,42 @@ pub(crate) fn specialize_kernel(
                         "symbolic matmul domain disagrees with its payload".into(),
                     ));
                 }
-                if let UArg::TensorCoreMatmul(payload) = node.arg() {
-                    match crate::TensorCoreMatmulPayload::select(
-                        specialized.clone(),
-                        payload.tensor_core.target.clone(),
-                    )
-                    .map_err(|error| ReplayError::Symbolic(error.to_string()))?
-                    {
-                        Some(payload) => UArg::TensorCoreMatmul(Box::new(payload)),
-                        None => UArg::Matmul(Box::new(specialized)),
+                match value {
+                    MatmulValue::TensorCore(payload) => {
+                        match crate::TensorCoreMatmulPayload::select(
+                            specialized.clone(),
+                            payload.tensor_core.target.clone(),
+                        )
+                        .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+                        {
+                            Some(payload) => {
+                                Operation::Matmul(MatmulValue::TensorCore(Box::new(payload)))
+                            }
+                            None => Operation::Matmul(MatmulValue::Serial(Box::new(specialized))),
+                        }
                     }
-                } else if let UArg::TiledMatmul(payload) = node.arg() {
-                    match crate::TiledMatmulPayload::select(
+                    MatmulValue::Tiled(payload) => match crate::TiledMatmulPayload::select(
                         specialized.clone(),
                         payload.tile.target.clone(),
                     )
                     .map_err(|error| ReplayError::Symbolic(error.to_string()))?
                     {
-                        Some(payload) => UArg::TiledMatmul(Box::new(payload)),
-                        None => UArg::Matmul(Box::new(specialized)),
+                        Some(payload) => Operation::Matmul(MatmulValue::Tiled(Box::new(payload))),
+                        None => Operation::Matmul(MatmulValue::Serial(Box::new(specialized))),
+                    },
+                    MatmulValue::Serial(_) => {
+                        Operation::Matmul(MatmulValue::Serial(Box::new(specialized)))
                     }
-                } else {
-                    UArg::Matmul(Box::new(specialized))
+                    MatmulValue::Quantized(_) => {
+                        return Err(ReplayError::Unsupported(
+                            "symbolic quantized matmul specialization".into(),
+                        ));
+                    }
                 }
             }
             other => other.clone(),
         };
-        if matches!(node.kind(), UOpKind::Range) {
-            let UArg::RangeAxis(axis) = node.arg() else {
-                return Err(ReplayError::Corrupt(
-                    "range is missing its symbolic axis".into(),
-                ));
-            };
+        if let Operation::Range(axis) = node.operation() {
             if *axis > 1 {
                 return Err(ReplayError::Unsupported(
                     "symbolic range axis is outside captured specialization".into(),
@@ -1626,7 +1630,7 @@ pub(crate) fn specialize_kernel(
                 .ok_or_else(|| ReplayError::Corrupt("range extent type is absent".into()))?;
             sources = vec![UOp::constant(extent, ty)];
         }
-        let replacement = UOp::from_artifact(node.kind().clone(), node.ty(), sources, arg);
+        let replacement = UOp::from_operation(operation, node.ty(), sources);
         rebuilt.insert(node, replacement);
     }
     let root = rebuilt
@@ -1647,7 +1651,7 @@ pub(crate) fn specialize_kernel(
         .map_err(|error| ReplayError::Corrupt(error.to_string()))?
         .into_iter()
         .filter_map(|node| match node.arg() {
-            UArg::BufferIndex { buffer, .. } if *buffer == output_buffer => Some(()),
+            UArgRef::BufferIndex { buffer, .. } if *buffer == output_buffer => Some(()),
             _ => None,
         })
         .count();

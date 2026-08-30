@@ -1075,7 +1075,7 @@ fn interpret_item(
             .execute(activation, weight)
             .map_err(|error| ReplayError::Execute(error.to_string()));
     }
-    if let crate::UArg::Movement(plan) = item.kernel.arg() {
+    if let crate::UArgRef::Movement(plan) = item.kernel.arg() {
         let operands = plan
             .input_operands()
             .into_iter()
@@ -2675,12 +2675,13 @@ mod tests {
         };
         let mut plan = plan.clone();
         plan.output_shape = Shape::from([4]);
-        malformed_plan.items[0].kernel = crate::UOp::new(
+        malformed_plan.items[0].kernel = crate::UOp::try_new(
             crate::UOpKind::Matmul,
             Some(crate::UType::scalar(DType::F16)),
             vec![],
             UArg::Matmul(Box::new(plan)),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             executor.replay(
                 &malformed_plan,

@@ -1,7 +1,7 @@
 use super::graph::{dtype_name, i64_list, shape_name, usize_list};
 use super::{VizEdge, VizError, VizGraph, VizNode};
 use crate::uop::{Binary, Unary};
-use crate::{AddressSpace, UArg, UOp, UOpKind};
+use crate::{AddressSpace, UArgRef, UOp, UOpKind};
 use std::collections::BTreeMap;
 
 fn unary_name(op: Unary) -> &'static str {
@@ -81,43 +81,43 @@ fn space_name(space: AddressSpace) -> &'static str {
     }
 }
 
-fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
+fn arg_fields(arg: UArgRef<'_>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     match arg {
-        UArg::None => {}
-        UArg::Int(value) => {
+        UArgRef::None => {}
+        UArgRef::Int(value) => {
             out.insert("arg".into(), value.to_string());
         }
-        UArg::Scalar { dtype, bits } => {
+        UArgRef::Scalar { dtype, bits } => {
             out.insert("scalar_dtype".into(), dtype_name(*dtype).into());
             out.insert("scalar_bits".into(), format!("0x{bits:016x}"));
         }
-        UArg::Name(name) => {
-            out.insert("name".into(), name.clone());
+        UArgRef::Name(name) => {
+            out.insert("name".into(), name.to_owned());
         }
-        UArg::Variable { name, bounds } => {
-            out.insert("name".into(), name.clone());
+        UArgRef::Variable { name, bounds } => {
+            out.insert("name".into(), name.to_owned());
             out.insert("bounds".into(), bounds.to_string());
         }
-        UArg::Address {
+        UArgRef::Address {
             space,
             name,
             element,
         } => {
             out.insert("space".into(), space_name(*space).into());
-            out.insert("name".into(), name.clone());
+            out.insert("name".into(), name.to_owned());
             out.insert(
                 "element".into(),
                 format!("{}x{}", dtype_name(element.scalar), element.lanes),
             );
         }
-        UArg::RangeAxis(axis) => {
+        UArgRef::RangeAxis(axis) => {
             out.insert("axis".into(), axis.to_string());
         }
-        UArg::GepLane(lane) => {
+        UArgRef::GepLane(lane) => {
             out.insert("lane".into(), lane.to_string());
         }
-        UArg::BufferIndex {
+        UArgRef::BufferIndex {
             buffer,
             elements,
             input_shape,
@@ -128,7 +128,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("input_shape".into(), shape_name(input_shape));
             out.insert("output_shape".into(), shape_name(output_shape));
         }
-        UArg::ViewBufferIndex {
+        UArgRef::ViewBufferIndex {
             buffer,
             elements,
             input_shape,
@@ -144,7 +144,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("view_strides".into(), i64_list(&view.strides));
             out.insert("view_offset".into(), view.offset.to_string());
         }
-        UArg::Reduction {
+        UArgRef::Reduction {
             input_shape,
             output_shape,
             axes,
@@ -171,8 +171,8 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             );
             out.insert("mean".into(), mean.to_string());
         }
-        UArg::Matmul(plan) => matmul_fields(&mut out, plan, "serial"),
-        UArg::Conv2d(plan) => {
+        UArgRef::Matmul(plan) => matmul_fields(&mut out, plan, "serial"),
+        UArgRef::Conv2d(plan) => {
             out.insert("strategy".into(), "static_f32_1x1".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());
             out.insert("input_shape".into(), shape_name(&plan.input_shape));
@@ -187,7 +187,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             );
             out.insert("bias".into(), plan.bias.is_some().to_string());
         }
-        UArg::TiledMatmul(payload) => {
+        UArgRef::TiledMatmul(payload) => {
             matmul_fields(&mut out, &payload.matmul, "tiled");
             out.insert("plan_key".into(), payload.tile.cache_key.to_string());
             out.insert(
@@ -198,7 +198,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
                 ),
             );
         }
-        UArg::TensorCoreMatmul(payload) => {
+        UArgRef::TensorCoreMatmul(payload) => {
             matmul_fields(&mut out, &payload.matmul, "tensor_core");
             out.insert("plan_key".into(), payload.tensor_core.cache_key.to_string());
             out.insert(
@@ -209,7 +209,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
                 .into(),
             );
         }
-        UArg::QuantizedMatmul(plan) => {
+        UArgRef::QuantizedMatmul(plan) => {
             out.insert("strategy".into(), "quantized".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());
             out.insert(
@@ -219,13 +219,13 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("output_shape".into(), shape_name(&plan.output_shape));
             out.insert("m_n_k".into(), format!("{}x{}x{}", plan.m, plan.n, plan.k));
         }
-        UArg::QuantizedRowGather(plan) => {
+        UArgRef::QuantizedRowGather(plan) => {
             out.insert("strategy".into(), "quantized_row_gather".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());
             out.insert("indices_shape".into(), shape_name(&plan.indices_shape));
             out.insert("output_shape".into(), shape_name(&plan.output_shape));
         }
-        UArg::Movement(plan) => {
+        UArgRef::Movement(plan) => {
             out.insert("strategy".into(), "movement".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());
             out.insert("output_shape".into(), shape_name(&plan.output_shape));
@@ -249,14 +249,14 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
                 .into(),
             );
         }
-        UArg::Random(plan) => {
+        UArgRef::Random(plan) => {
             out.insert("strategy".into(), "threefry".into());
             out.insert("output".into(), plan.output.to_string());
             out.insert("output_shape".into(), shape_name(&plan.shape));
             out.insert("word_count".into(), plan.word_count.to_string());
             out.insert("device".into(), plan.stream.device.to_string());
         }
-        UArg::PrefixScan {
+        UArgRef::PrefixScan {
             input,
             input_shape,
             axis,
@@ -272,7 +272,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("output".into(), format!("{output:?}").to_lowercase());
             out.insert("dtype".into(), dtype_name(*dtype).to_string());
         }
-        UArg::Sort {
+        UArgRef::Sort {
             input,
             input_shape,
             axis,
@@ -289,7 +289,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("indices".into(), indices.to_string());
             out.insert("dtype".into(), dtype_name(*dtype).to_string());
         }
-        UArg::TensorGuard {
+        UArgRef::TensorGuard {
             input,
             input_shape,
             axis,
@@ -304,7 +304,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             );
             out.insert("dtype".into(), dtype_name(*dtype).to_string());
         }
-        UArg::Effect(payload) => {
+        UArgRef::Effect(payload) => {
             out.insert("effect_step".into(), payload.step.to_string());
             out.insert("target_buffer".into(), payload.target.buffer.to_string());
             out.insert("target_version".into(), payload.target.version.to_string());
@@ -345,7 +345,8 @@ pub fn uop_viz(root: &UOp) -> Result<VizGraph, VizError> {
     let mut viz_nodes = Vec::with_capacity(nodes.len());
     let mut edges = Vec::new();
     for (id, node) in nodes.iter().enumerate() {
-        let mut viz = VizNode::new(format!("u{id}"), "uop", kind_name(node.kind()));
+        let mut viz = VizNode::new(format!("u{id}"), "uop", kind_name(&node.kind()))
+            .field("family", node.operation().signature().family.name());
         if let Some(ty) = node.ty() {
             viz = viz.field("type", format!("{}x{}", dtype_name(ty.scalar), ty.lanes));
         }

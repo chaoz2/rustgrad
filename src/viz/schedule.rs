@@ -1,7 +1,7 @@
 use super::graph::{dtype_name, i64_list, shape_name};
 use super::uop::kind_name;
 use super::{VizEdge, VizError, VizGraph, VizNode};
-use crate::{BufferDesc, CapturedSchedule, Schedule, ScheduleBoundary, ScheduleItem, UArg};
+use crate::{BufferDesc, CapturedSchedule, Schedule, ScheduleBoundary, ScheduleItem, UArgRef};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn buffer_node(desc: &BufferDesc) -> VizNode {
@@ -33,12 +33,12 @@ fn boundary_name(boundary: &Option<ScheduleBoundary>) -> &'static str {
 
 fn kernel_strategy(item: &ScheduleItem) -> &'static str {
     let root = match item.kernel.arg() {
-        UArg::Matmul(_) => "serial_matmul",
-        UArg::TiledMatmul(_) => "tiled_matmul",
-        UArg::TensorCoreMatmul(_) => "tensor_core_matmul",
-        UArg::QuantizedMatmul(_) => "quantized_matmul",
-        UArg::Movement(_) => "movement",
-        UArg::Reduction { .. } => "reduction",
+        UArgRef::Matmul(_) => "serial_matmul",
+        UArgRef::TiledMatmul(_) => "tiled_matmul",
+        UArgRef::TensorCoreMatmul(_) => "tensor_core_matmul",
+        UArgRef::QuantizedMatmul(_) => "quantized_matmul",
+        UArgRef::Movement(_) => "movement",
+        UArgRef::Reduction { .. } => "reduction",
         _ => "uop",
     };
     if root != "uop" {
@@ -48,14 +48,14 @@ fn kernel_strategy(item: &ScheduleItem) -> &'static str {
         Ok(nodes)
             if nodes
                 .iter()
-                .any(|node| matches!(node.arg(), UArg::Reduction { .. })) =>
+                .any(|node| matches!(node.arg(), UArgRef::Reduction { .. })) =>
         {
             "reduction"
         }
         Ok(nodes)
             if nodes
                 .iter()
-                .any(|node| matches!(node.arg(), UArg::Movement(_))) =>
+                .any(|node| matches!(node.arg(), UArgRef::Movement(_))) =>
         {
             "movement"
         }
@@ -116,7 +116,7 @@ fn base_model(items: &[ScheduleItem]) -> Result<(Vec<VizNode>, Vec<VizEdge>), Vi
             .field("item", item.id.to_string())
             .field("graph_node", item.node.index().to_string())
             .field("cache_key", item.cache_key.to_string())
-            .field("kernel", kind_name(item.kernel.kind()))
+            .field("kernel", kind_name(&item.kernel.kind()))
             .field("strategy", kernel_strategy(item))
             .field("uops", kernel_nodes.to_string())
             .field("boundary", boundary_name(&item.boundary))

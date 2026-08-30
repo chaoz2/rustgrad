@@ -3,7 +3,7 @@
 use super::{ConcurrentPtxCache, PtxBinding, PtxError, PtxRenderer};
 use crate::{
     Backend, CapturedSchedule, CpuBackend, CudaError, DType, Driver, Graph, MatmulKernelPlan,
-    Scalar, TensorData, UArg, UOpKind,
+    Scalar, TensorData, UOpKind,
 };
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
@@ -112,7 +112,7 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
         let shared_plan = kernel.arg().matmul_plan().unwrap();
         assert_eq!(shared_plan, &plan, "{} shared plan", case.name);
         if case.name == "f32 tiled broadcast tails" {
-            let UArg::TiledMatmul(payload) = kernel.arg() else {
+            let crate::UArgRef::TiledMatmul(payload) = kernel.arg() else {
                 panic!("eligible matrix case did not retain tiled payload");
             };
             assert!(payload.tile.tails.m && payload.tile.tails.n && payload.tile.tails.k);
@@ -311,7 +311,7 @@ fn tensor_core_primary_cache_uses_fragment_simulator_and_exact_launch() {
         let captured = CapturedSchedule::capture(&graph, &schedule, &[output_node]).unwrap();
         let artifact = CapturedSchedule::from_bytes(&captured.to_bytes().unwrap()).unwrap();
         let kernel_uop = &artifact.items[0].kernel;
-        let UArg::TensorCoreMatmul(payload) = kernel_uop.arg() else {
+        let crate::UArgRef::TensorCoreMatmul(payload) = kernel_uop.arg() else {
             panic!("eligible narrow artifact did not retain tensor-core payload");
         };
         let lhs = tensor(

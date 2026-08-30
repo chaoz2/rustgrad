@@ -5,7 +5,7 @@ use super::{
     narrow::{self, WEBGPU_NARROW_ABI_VERSION},
     transaction::WebGpuTransactionAbi,
 };
-use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind};
+use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArgRef, UOp, UOpKind};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -205,7 +205,7 @@ impl WgslRenderer {
     /// Lowers a validated scheduled UOp without executing or allocating.
     pub fn render(&self, root: &UOp) -> Result<RenderedWgsl, WebGpuError> {
         if matches!(root.kind(), UOpKind::Random) {
-            let UArg::Random(plan) = root.arg() else {
+            let UArgRef::Random(plan) = root.arg() else {
                 return Err(WebGpuError::Unsupported("random payload is absent".into()));
             };
             return super::random::render(self, plan);
@@ -247,7 +247,7 @@ impl WgslRenderer {
             .sources()
             .first()
             .ok_or_else(|| WebGpuError::Unsupported("store has no index".into()))?;
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             buffer: output_id,
             elements: extent,
             input_shape: output_shape,
@@ -277,13 +277,13 @@ impl WgslRenderer {
         let mut inventory = BTreeMap::<u64, WgslBufferAbi>::new();
         for node in &nodes {
             let (buffer, source_shape, elements, view) = match node.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     elements,
                     input_shape,
                     ..
                 } => (*buffer, input_shape.clone(), *elements, None),
-                UArg::ViewBufferIndex { buffer, view, .. } => {
+                UArgRef::ViewBufferIndex { buffer, view, .. } => {
                     let access = WgslViewAccess::new(view)?;
                     let elements = access
                         .source_shape
@@ -327,7 +327,9 @@ impl WgslRenderer {
                 .first()
                 .ok_or_else(|| WebGpuError::InvalidBinding("load lacks index".into()))?;
             let buffer = match index.arg() {
-                UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
+                    *buffer
+                }
                 _ => {
                     return Err(WebGpuError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -583,27 +585,27 @@ fn emit_expr(
         };
     match node.kind() {
         UOpKind::Const => match node.arg() {
-            UArg::Scalar {
-                dtype: DType::F32,
+            UArgRef::Scalar {
+                dtype: &DType::F32,
                 bits,
             } => Ok(format!("bitcast<f32>(0x{:08x}u)", *bits as u32)),
-            UArg::Scalar {
-                dtype: DType::Bool,
+            UArgRef::Scalar {
+                dtype: &DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(if *bits == 0 {
                 "false".into()
             } else {
                 "true".into()
             }),
-            UArg::Scalar {
-                dtype: DType::I32,
+            UArgRef::Scalar {
+                dtype: &DType::I32,
                 bits,
             } => Ok(format!("bitcast<i32>(0x{:08x}u)", *bits as u32)),
-            UArg::Scalar {
-                dtype: DType::U32,
+            UArgRef::Scalar {
+                dtype: &DType::U32,
                 bits,
             } => Ok(format!("0x{:08x}u", *bits as u32)),
-            UArg::Scalar { dtype, bits } if narrow::is_narrow(*dtype) => {
+            UArgRef::Scalar { dtype, bits } if narrow::is_narrow(*dtype) => {
                 Ok(narrow::decode(*dtype, format!("0x{:04x}u", *bits as u16))
                     .expect("validated narrow scalar"))
             }
@@ -617,13 +619,13 @@ fn emit_expr(
                 .first()
                 .ok_or_else(|| WebGpuError::Unsupported("load has no index".into()))?;
             let (buffer, input_shape, output_shape, view) = match index.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
                 } => (*buffer, input_shape, output_shape, None),
-                UArg::ViewBufferIndex {
+                UArgRef::ViewBufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
@@ -697,7 +699,7 @@ fn emit_expr(
         UOpKind::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
-            emit_binary(*op, dtype, &lhs, &rhs)
+            emit_binary(op, dtype, &lhs, &rhs)
         }
         UOpKind::Binary(op) => {
             let lhs = child(0, source_map, lines)?;

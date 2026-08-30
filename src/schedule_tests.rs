@@ -507,6 +507,6 @@ fn sharded_graph_local_shrink_feeds_a_fused_binary_kernel() {
             .topological()
             .unwrap()
             .iter()
-            .any(|node| matches!(node.arg(), crate::UArg::ViewBufferIndex { .. }))
+            .any(|node| matches!(node.arg(), crate::UArgRef::ViewBufferIndex { .. }))
     );
 }

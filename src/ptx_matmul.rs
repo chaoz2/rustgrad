@@ -581,7 +581,7 @@ mod tests {
             .unwrap();
         let kernel = crate::lower_graph_matmul(&graph, out).unwrap();
         let tiled = PtxRenderer::new(80).unwrap().render(&kernel).unwrap();
-        let crate::UArg::TiledMatmul(payload) = kernel.arg() else {
+        let crate::UArgRef::TiledMatmul(payload) = kernel.arg() else {
             panic!("eligible F32 matrix matmul was not tiled");
         };
         let direct_tiled = PtxRenderer::new(80)
@@ -642,7 +642,7 @@ mod tests {
             let rhs = graph.input_dtype("rhs", [1, 32, 16], dtype);
             let output = graph.matmul(lhs, rhs).unwrap();
             let kernel = crate::lower_graph_matmul(&graph, output).unwrap();
-            let crate::UArg::TensorCoreMatmul(payload) = kernel.arg() else {
+            let crate::UArgRef::TensorCoreMatmul(payload) = kernel.arg() else {
                 panic!("eligible narrow matrix was not tensor-core lowered");
             };
             let first = PtxRenderer::new(80).unwrap().render(&kernel).unwrap();

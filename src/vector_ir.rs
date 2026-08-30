@@ -195,7 +195,7 @@ impl VectorProgram {
                 | VectorInstKind::Control => {}
             }
             if matches!(
-                inst.payload.uop_kind,
+                inst.payload.kind(),
                 crate::UOpKind::ReduceInit
                     | crate::UOpKind::ReduceAccumulate
                     | crate::UOpKind::ReduceFinalize
@@ -205,7 +205,7 @@ impl VectorProgram {
                     "portable effects/reductions".into(),
                 ));
             }
-            if matches!(inst.payload.arg, crate::UArg::ViewBufferIndex { .. }) {
+            if matches!(inst.payload.arg(), crate::UArgRef::ViewBufferIndex { .. }) {
                 return Err(VectorIrError::Unsupported(
                     "portable vector instruction ABI does not encode affine view offsets".into(),
                 ));
@@ -216,7 +216,7 @@ impl VectorProgram {
             // instead of letting it fail after vector planning.
             if matches!(inst.kind, VectorInstKind::Unary)
                 && !matches!(
-                    inst.payload.uop_kind,
+                    inst.payload.kind(),
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Neg | crate::UnaryOp::Abs)
                 )
             {
@@ -224,7 +224,7 @@ impl VectorProgram {
             }
             if matches!(inst.kind, VectorInstKind::Binary)
                 && !matches!(
-                    inst.payload.uop_kind,
+                    inst.payload.kind(),
                     crate::UOpKind::GraphBinary(
                         crate::BinaryOp::Add
                             | crate::BinaryOp::Sub
@@ -241,7 +241,7 @@ impl VectorProgram {
             {
                 return Err(VectorIrError::Unsupported("portable binary opcode".into()));
             }
-            if let crate::UOpKind::GraphBinary(op) = inst.payload.uop_kind {
+            if let crate::UOpKind::GraphBinary(op) = inst.payload.kind() {
                 if ty.is_some_and(crate::DType::is_float)
                     && !matches!(
                         op,
@@ -348,7 +348,7 @@ impl VectorProgram {
             })
             .collect::<Vec<_>>();
         for inst in &self.instructions {
-            if !payload_matches(&inst.kind, &inst.payload.uop_kind) {
+            if !payload_matches(&inst.kind, inst.payload.kind()) {
                 return Err(VectorIrError::Unsupported(
                     "instruction/payload kind mismatch".into(),
                 ));
@@ -388,7 +388,7 @@ impl VectorProgram {
         self.cache_key = h.finish();
     }
 }
-fn payload_matches(kind: &VectorInstKind, payload: &crate::UOpKind) -> bool {
+fn payload_matches(kind: &VectorInstKind, payload: crate::UOpKind) -> bool {
     matches!(
         (kind, payload),
         (

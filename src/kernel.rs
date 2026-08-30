@@ -5,8 +5,10 @@
 //! are checked separately from byte offsets, which keeps the ABI boundary
 //! explicit for future renderers.
 use crate::{
-    BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
-    Storage, SymbolicShape, SymbolicVar, TensorData, UArg, UOp, UOpError, UOpKind, UType, UnaryOp,
+    AddressValue, BinaryOp, CompareOp, DType, Error, Graph, IndexValue, LogicalOp, MatmulValue,
+    MovementValue, NodeId, Op, Operation, PrefixScanValue, ReductionValue, Result, Scalar, Shape,
+    SortValue, Storage, SymbolicShape, SymbolicVar, TensorData, TensorGuardValue, UArgRef, UOp,
+    UOpError, UOpKind, UType, UnaryOp,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -267,11 +269,11 @@ pub fn lower_graph_random(graph: &Graph, output: NodeId) -> std::result::Result<
         *stream,
     )
     .map_err(|_| UOpError::InvalidArgument)?;
-    let kernel = UOp::new(
-        UOpKind::Random,
-        Some(UType::scalar(plan.dtype)),
+    let dtype = plan.dtype;
+    let kernel = UOp::from_operation(
+        Operation::Random(Box::new(plan)),
+        Some(UType::scalar(dtype)),
         vec![],
-        UArg::Random(Box::new(plan)),
     );
     kernel.validate()?;
     Ok(kernel)
@@ -285,13 +287,13 @@ pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<
     let dtype = plan.dtype;
     let target =
         crate::MatmulTargetCaps::conservative_ptx(80).map_err(|_| UOpError::InvalidArgument)?;
-    let arg = match crate::TensorCoreMatmulPayload::select(plan.clone(), target.clone())
+    let operation = match crate::TensorCoreMatmulPayload::select(plan.clone(), target.clone())
         .map_err(|_| UOpError::InvalidArgument)?
     {
         Some(payload) => {
             crate::plan_tensor_core_matmul_promotion(&payload)
                 .map_err(|_| UOpError::InvalidArgument)?;
-            UArg::TensorCoreMatmul(Box::new(payload))
+            Operation::Matmul(MatmulValue::TensorCore(Box::new(payload)))
         }
         None => match crate::TiledMatmulPayload::select(plan.clone(), target)
             .map_err(|_| UOpError::InvalidArgument)?
@@ -299,12 +301,12 @@ pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<
             Some(payload) => {
                 crate::plan_tiled_matmul_promotion(&payload)
                     .map_err(|_| UOpError::InvalidArgument)?;
-                UArg::TiledMatmul(Box::new(payload))
+                Operation::Matmul(MatmulValue::Tiled(Box::new(payload)))
             }
-            None => UArg::Matmul(Box::new(plan)),
+            None => Operation::Matmul(MatmulValue::Serial(Box::new(plan))),
         },
     };
-    let kernel = UOp::new(UOpKind::Matmul, Some(UType::scalar(dtype)), vec![], arg);
+    let kernel = UOp::from_operation(operation, Some(UType::scalar(dtype)), vec![]);
     kernel.validate()?;
     Ok(kernel)
 }
@@ -318,11 +320,10 @@ pub fn lower_graph_static_conv2d(
 ) -> std::result::Result<UOp, UOpError> {
     let plan = crate::StaticConv2dPlan::from_graph(graph, output)
         .map_err(|_| UOpError::InvalidArgument)?;
-    let kernel = UOp::new(
-        UOpKind::Conv2d,
+    let kernel = UOp::from_operation(
+        Operation::Conv2d(Box::new(plan)),
         Some(UType::scalar(DType::F32)),
         vec![],
-        UArg::Conv2d(Box::new(plan)),
     );
     kernel.validate()?;
     Ok(kernel)
@@ -333,11 +334,11 @@ pub fn lower_graph_static_conv2d(
 pub fn lower_graph_movement(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
     let plan = crate::MovementKernelPlan::from_graph(graph, output)
         .map_err(|_| UOpError::InvalidArgument)?;
-    let kernel = UOp::new(
-        UOpKind::Movement,
-        Some(UType::scalar(plan.dtype)),
+    let dtype = plan.dtype;
+    let kernel = UOp::from_operation(
+        Operation::Movement(MovementValue::Plan(Box::new(plan))),
+        Some(UType::scalar(dtype)),
         vec![],
-        UArg::Movement(Box::new(plan)),
     );
     kernel.validate()?;
     Ok(kernel)
@@ -352,11 +353,11 @@ pub(crate) fn lower_graph_computed_affine_view(
 ) -> std::result::Result<UOp, UOpError> {
     let plan = crate::MovementKernelPlan::from_computed_affine_view(graph, output)
         .map_err(|_| UOpError::InvalidArgument)?;
-    let kernel = UOp::new(
-        UOpKind::Movement,
-        Some(UType::scalar(plan.dtype)),
+    let dtype = plan.dtype;
+    let kernel = UOp::from_operation(
+        Operation::Movement(MovementValue::Plan(Box::new(plan))),
+        Some(UType::scalar(dtype)),
         vec![],
-        UArg::Movement(Box::new(plan)),
     );
     kernel.validate()?;
     Ok(kernel)
@@ -383,11 +384,10 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
         .numel()
         .map_err(|_| UOpError::InvalidArgument)?;
     let extent_i64 = i64::try_from(extent).map_err(|_| UOpError::InvalidArgument)?;
-    let range = UOp::new(
-        UOpKind::Range,
+    let range = UOp::from_operation(
+        Operation::Range(0),
         Some(UType::scalar(DType::I64)),
         vec![UOp::constant(extent_i64, UType::scalar(DType::I64))],
-        UArg::RangeAxis(0),
     );
     fn load(
         graph: &Graph,
@@ -402,40 +402,35 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
             .clone();
         let ty = UType::scalar(graph.dtype(id).map_err(|_| UOpError::UseBeforeDefinition)?);
         let elements = shape.numel().map_err(|_| UOpError::InvalidArgument)?;
-        let address = UOp::new(
-            UOpKind::DefineGlobal,
-            Some(ty),
-            vec![],
-            UArg::Address {
+        let address = UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
                 space: crate::AddressSpace::Global,
                 name: format!("b{}", id.index()),
                 element: ty,
-            },
-        );
-        let index = UOp::new(
-            UOpKind::Index,
+            }),
             Some(ty),
-            vec![address, range.clone()],
-            match view {
-                Some(view) => UArg::ViewBufferIndex {
-                    buffer: id.index() as u64,
-                    elements: view
-                        .logical_shape
-                        .numel()
-                        .map_err(|_| UOpError::InvalidArgument)?,
-                    input_shape: view.logical_shape.clone(),
-                    output_shape: out.clone(),
-                    view,
-                },
-                None => UArg::BufferIndex {
-                    buffer: id.index() as u64,
-                    elements,
-                    input_shape: shape,
-                    output_shape: out.clone(),
-                },
-            },
+            vec![],
         );
-        Ok(UOp::new(UOpKind::Load, Some(ty), vec![index], UArg::None))
+        let operation = match view {
+            Some(view) => Operation::Index(IndexValue::View {
+                buffer: id.index() as u64,
+                elements: view
+                    .logical_shape
+                    .numel()
+                    .map_err(|_| UOpError::InvalidArgument)?,
+                input_shape: view.logical_shape.clone(),
+                output_shape: out.clone(),
+                view,
+            }),
+            None => Operation::Index(IndexValue::Buffer {
+                buffer: id.index() as u64,
+                elements,
+                input_shape: shape,
+                output_shape: out.clone(),
+            }),
+        };
+        let index = UOp::from_operation(operation, Some(ty), vec![address, range.clone()]);
+        Ok(UOp::from_operation(Operation::Load, Some(ty), vec![index]))
     }
     fn lower(
         graph: &Graph,
@@ -492,50 +487,46 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 // transformation. Native lowering keeps the same typed value
                 // while Graph reverse-mode traversal owns the gradient stop.
                 Op::Detach { input } => lower(graph, *input, out, range, memo, materialized)?,
-                Op::Unary { op, input } => UOp::new(
-                    UOpKind::GraphUnary(*op),
+                Op::Unary { op, input } => UOp::from_operation(
+                    Operation::GraphUnary(*op),
                     Some(ty),
                     vec![lower(graph, *input, out, range, memo, materialized)?],
-                    UArg::None,
                 ),
-                Op::Binary { op, lhs, rhs } => UOp::new(
-                    UOpKind::GraphBinary(*op),
+                Op::Binary { op, lhs, rhs } => UOp::from_operation(
+                    Operation::GraphBinary(*op),
                     Some(ty),
                     vec![
                         lower(graph, *lhs, out, range, memo, materialized)?,
                         lower(graph, *rhs, out, range, memo, materialized)?,
                     ],
-                    UArg::None,
                 ),
-                Op::Compare { op, lhs, rhs } => UOp::new(
-                    UOpKind::GraphCompare(*op),
+                Op::Compare { op, lhs, rhs } => UOp::from_operation(
+                    Operation::GraphCompare(*op),
                     Some(ty),
                     vec![
                         lower(graph, *lhs, out, range, memo, materialized)?,
                         lower(graph, *rhs, out, range, memo, materialized)?,
                     ],
-                    UArg::None,
                 ),
                 Op::Logical { op, lhs, rhs } => {
                     let mut s = vec![lower(graph, *lhs, out, range, memo, materialized)?];
                     if let Some(rhs) = rhs {
                         s.push(lower(graph, *rhs, out, range, memo, materialized)?);
                     }
-                    UOp::new(UOpKind::GraphLogical(*op), Some(ty), s, UArg::None)
+                    UOp::from_operation(Operation::GraphLogical(*op), Some(ty), s)
                 }
                 Op::Select {
                     condition,
                     on_true,
                     on_false,
-                } => UOp::new(
-                    UOpKind::Ternary(crate::uop::Ternary::Where),
+                } => UOp::from_operation(
+                    Operation::Ternary(crate::uop::Ternary::Where),
                     Some(ty),
                     vec![
                         lower(graph, *condition, out, range, memo, materialized)?,
                         lower(graph, *on_true, out, range, memo, materialized)?,
                         lower(graph, *on_false, out, range, memo, materialized)?,
                     ],
-                    UArg::None,
                 ),
                 _ => return Err(UOpError::InvalidArgument),
             }
@@ -551,31 +542,29 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
         &mut HashMap::new(),
         materialized,
     )?;
-    let address = UOp::new(
-        UOpKind::DefineGlobal,
-        Some(output_ty),
-        vec![],
-        UArg::Address {
+    let address = UOp::from_operation(
+        Operation::DefineGlobal(AddressValue {
             space: crate::AddressSpace::Global,
             name: format!("b{}", output.index()),
             element: output_ty,
-        },
-    );
-    let index = UOp::new(
-        UOpKind::Index,
+        }),
         Some(output_ty),
-        vec![address, range.clone()],
-        UArg::BufferIndex {
+        vec![],
+    );
+    let index = UOp::from_operation(
+        Operation::Index(IndexValue::Buffer {
             buffer: output.index() as u64,
             elements: extent,
             input_shape: output_shape.clone(),
             output_shape,
-        },
+        }),
+        Some(output_ty),
+        vec![address, range.clone()],
     );
-    let store = UOp::new(UOpKind::Store, None, vec![index, value], UArg::None);
+    let store = UOp::from_operation(Operation::Store, None, vec![index, value]);
     Ok(UOp::sink(vec![
         store,
-        UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+        UOp::from_operation(Operation::EndRange, None, vec![range]),
     ]))
 }
 
@@ -605,15 +594,8 @@ pub fn lower_graph_prefix_scan(
     else {
         return Err(UOpError::InvalidArgument);
     };
-    Ok(UOp::new(
-        UOpKind::PrefixScan,
-        Some(UType::scalar(
-            graph
-                .dtype(output)
-                .map_err(|_| UOpError::UseBeforeDefinition)?,
-        )),
-        vec![],
-        UArg::PrefixScan {
+    Ok(UOp::from_operation(
+        Operation::PrefixScan(PrefixScanValue {
             input: *input,
             input_shape: graph
                 .shape(*input)
@@ -629,7 +611,13 @@ pub fn lower_graph_prefix_scan(
             dtype: graph
                 .dtype(output)
                 .map_err(|_| UOpError::UseBeforeDefinition)?,
-        },
+        }),
+        Some(UType::scalar(
+            graph
+                .dtype(output)
+                .map_err(|_| UOpError::UseBeforeDefinition)?,
+        )),
+        vec![],
     ))
 }
 
@@ -700,11 +688,8 @@ pub fn lower_graph_sort_pair(
     let dtype = graph
         .dtype(values)
         .map_err(|_| UOpError::UseBeforeDefinition)?;
-    Ok(UOp::new(
-        UOpKind::Sort,
-        Some(UType::scalar(dtype)),
-        vec![],
-        UArg::Sort {
+    Ok(UOp::from_operation(
+        Operation::Sort(SortValue {
             input: *input,
             input_shape,
             axis: *axis,
@@ -712,7 +697,9 @@ pub fn lower_graph_sort_pair(
             values,
             indices,
             dtype,
-        },
+        }),
+        Some(UType::scalar(dtype)),
+        vec![],
     ))
 }
 
@@ -733,16 +720,15 @@ pub fn lower_graph_tensor_guard(
     let dtype = graph
         .dtype(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?;
-    Ok(UOp::new(
-        UOpKind::TensorGuard,
-        Some(UType::scalar(dtype)),
-        vec![],
-        UArg::TensorGuard {
+    Ok(UOp::from_operation(
+        Operation::TensorGuard(TensorGuardValue {
             input: *input,
             input_shape,
             axis: *axis,
             dtype,
-        },
+        }),
+        Some(UType::scalar(dtype)),
+        vec![],
     ))
 }
 
@@ -781,41 +767,35 @@ pub(crate) fn lower_graph_reduction_with_materialized(
     let extent = output_shape
         .numel()
         .map_err(|_| UOpError::InvalidArgument)?;
-    let range = UOp::new(
-        UOpKind::Range,
+    let range = UOp::from_operation(
+        Operation::Range(0),
         Some(UType::scalar(DType::I64)),
         vec![UOp::constant(
             i64::try_from(extent).map_err(|_| UOpError::InvalidArgument)?,
             UType::scalar(DType::I64),
         )],
-        UArg::RangeAxis(0),
     );
-    let address = UOp::new(
-        UOpKind::DefineGlobal,
-        Some(ty),
-        vec![],
-        UArg::Address {
+    let address = UOp::from_operation(
+        Operation::DefineGlobal(AddressValue {
             space: crate::AddressSpace::Global,
             name: format!("b{}", output.index()),
             element: ty,
-        },
-    );
-    let index = UOp::new(
-        UOpKind::Index,
+        }),
         Some(ty),
-        vec![address, range.clone()],
-        UArg::BufferIndex {
+        vec![],
+    );
+    let index = UOp::from_operation(
+        Operation::Index(IndexValue::Buffer {
             buffer: output.index() as u64,
             elements: extent,
             input_shape: output_shape.clone(),
             output_shape,
-        },
-    );
-    let init = UOp::new(
-        UOpKind::ReduceInit,
+        }),
         Some(ty),
-        vec![],
-        UArg::Reduction {
+        vec![address, range.clone()],
+    );
+    let init = UOp::from_operation(
+        Operation::ReduceInit(ReductionValue {
             input_shape: graph
                 .shape(*input)
                 .map_err(|_| UOpError::UseBeforeDefinition)?
@@ -828,18 +808,15 @@ pub(crate) fn lower_graph_reduction_with_materialized(
             keepdim: *keepdim,
             kind: *kind,
             mean: matches!(kind, crate::ReduceKind::Mean),
-        },
-    );
-    let update = UOp::new(
-        UOpKind::ReduceAccumulate,
+        }),
         Some(ty),
-        vec![init, value],
-        UArg::None,
+        vec![],
     );
-    let finalize = UOp::new(UOpKind::ReduceFinalize, Some(ty), vec![update], UArg::None);
+    let update = UOp::from_operation(Operation::ReduceAccumulate, Some(ty), vec![init, value]);
+    let finalize = UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![update]);
     Ok(UOp::sink(vec![
-        UOp::new(UOpKind::Store, None, vec![index, finalize], UArg::None),
-        UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+        UOp::from_operation(Operation::Store, None, vec![index, finalize]),
+        UOp::from_operation(Operation::EndRange, None, vec![range]),
     ]))
 }
 
@@ -902,7 +879,7 @@ pub(crate) fn execute_lowered_elementwise(
     bindings: &KernelBindings,
 ) -> Result<TensorData> {
     if matches!(kernel.kind(), UOpKind::Random)
-        && let UArg::Random(plan) = kernel.arg()
+        && let UArgRef::Random(plan) = kernel.arg()
     {
         return plan.execute();
     }
@@ -927,7 +904,7 @@ pub(crate) fn execute_lowered_elementwise(
         .find(|node| matches!(node.kind(), UOpKind::Store))
         .ok_or(Error::InvalidIndex)?;
     let index = store.sources().first().ok_or(Error::InvalidIndex)?;
-    let UArg::BufferIndex { output_shape, .. } = index.arg() else {
+    let UArgRef::BufferIndex { output_shape, .. } = index.arg() else {
         return Err(Error::InvalidIndex);
     };
     let output_dtype = index.ty().ok_or(Error::InvalidIndex)?.scalar;
@@ -1024,12 +1001,12 @@ fn direct_f32_to_bf16(
     }
     let index = load.sources().first().ok_or(Error::InvalidIndex)?;
     let (buffer, input_shape, view) = match index.arg() {
-        UArg::BufferIndex {
+        UArgRef::BufferIndex {
             buffer,
             input_shape,
             ..
         } => (*buffer, input_shape, None),
-        UArg::ViewBufferIndex {
+        UArgRef::ViewBufferIndex {
             buffer,
             input_shape,
             view,
@@ -1259,19 +1236,19 @@ fn eval(
 ) -> Result<FusedValue> {
     match n.kind() {
         UOpKind::Const => match n.arg() {
-            UArg::Int(v) => Ok(FusedValue::Scalar(Scalar::I(*v))),
-            UArg::Scalar { dtype, bits } => Ok(FusedValue::from_constant(*dtype, *bits)),
+            UArgRef::Int(v) => Ok(FusedValue::Scalar(Scalar::I(*v))),
+            UArgRef::Scalar { dtype, bits } => Ok(FusedValue::from_constant(*dtype, *bits)),
             _ => Err(Error::InvalidIndex),
         },
         UOpKind::Load => {
             let index = n.sources().first().ok_or(Error::InvalidIndex)?;
             let (buffer, input_shape, view) = match index.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     input_shape,
                     ..
                 } => (*buffer, input_shape, None),
-                UArg::ViewBufferIndex {
+                UArgRef::ViewBufferIndex {
                     buffer,
                     input_shape,
                     view,
@@ -1297,7 +1274,7 @@ fn eval(
             let input = eval(&n.sources()[0], bindings, linear, plan)?;
             let input_dtype = n.sources()[0].ty().ok_or(Error::InvalidIndex)?.scalar;
             Ok(FusedValue::typed(
-                unary(input.scalar(), input_dtype, *op)?,
+                unary(input.scalar(), input_dtype, op)?,
                 n.ty().ok_or(Error::InvalidIndex)?.scalar,
             ))
         }
@@ -1306,7 +1283,7 @@ fn eval(
                 eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
                 eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
                 n.ty().ok_or(Error::InvalidIndex)?.scalar,
-                *op,
+                op,
             )?,
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
         )),
@@ -1318,9 +1295,9 @@ fn eval(
                 .iter()
                 .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
             Ok(FusedValue::Scalar(Scalar::Bool(if float8 {
-                compare_float8(lhs.as_f64(), rhs.as_f64(), *op)
+                compare_float8(lhs.as_f64(), rhs.as_f64(), op)
             } else {
-                compare(lhs, rhs, *op)
+                compare(lhs, rhs, op)
             })))
         }
         UOpKind::GraphLogical(op) => {
@@ -1354,7 +1331,7 @@ fn eval(
         UOpKind::ReduceFinalize => {
             let update = n.sources().first().ok_or(Error::InvalidIndex)?;
             let init = update.sources().first().ok_or(Error::InvalidIndex)?;
-            let UArg::Reduction {
+            let UArgRef::Reduction {
                 input_shape,
                 output_shape,
                 axes,
@@ -1371,7 +1348,7 @@ fn eval(
             let reduction = ReductionPlan::new(
                 input_shape.clone(),
                 output_shape.clone(),
-                axes.clone(),
+                axes.to_vec(),
                 *keepdim,
             )?;
             let source_plan = IterationPlan::new(input_shape.clone());
@@ -1827,14 +1804,12 @@ mod tests {
                 .any(|node| matches!(node.kind(), UOpKind::Const)
                     && matches!(
                         node.arg(),
-                        UArg::Scalar {
-                            dtype: DType::Bool,
-                            bits: 1
-                        }
+                        UArgRef::Scalar { dtype, bits }
+                            if *dtype == DType::Bool && *bits == 1
                     ))
         );
         assert!(!nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
-            && matches!(node.arg(), UArg::BufferIndex { buffer, .. } if *buffer == truth.index() as u64)));
+            && matches!(node.arg(), UArgRef::BufferIndex { buffer, .. } if *buffer == truth.index() as u64)));
 
         // Exact scalar payloads are carried through the UOp rather than host
         // floating conversion, including an F32 NaN bit pattern.
@@ -1854,10 +1829,8 @@ mod tests {
             .unwrap();
         assert!(nodes.iter().any(|node| matches!(
             node.arg(),
-            UArg::Scalar {
-                dtype: DType::F32,
-                bits: 0x7f80_0001
-            }
+            UArgRef::Scalar { dtype, bits }
+                if *dtype == DType::F32 && *bits == 0x7f80_0001
         )));
 
         // A rank-one singleton is not a scalar provenance value: it remains a
@@ -1873,7 +1846,7 @@ mod tests {
             .topological()
             .unwrap();
         assert!(nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
-            && matches!(node.arg(), UArg::BufferIndex { buffer, .. } if *buffer == constant.index() as u64)));
+            && matches!(node.arg(), UArgRef::BufferIndex { buffer, .. } if *buffer == constant.index() as u64)));
     }
 
     #[test]
@@ -2437,7 +2410,7 @@ mod tests {
                 .topological()
                 .unwrap()
                 .iter()
-                .any(|node| matches!(node.arg(), UArg::ViewBufferIndex { .. }))
+                .any(|node| matches!(node.arg(), UArgRef::ViewBufferIndex { .. }))
         );
         let ptx = crate::PtxRenderer::new(80)
             .unwrap()

@@ -1,6 +1,6 @@
 //! Typed WebGPU transaction metadata and bounded fault reconstruction.
 use super::WebGpuError;
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArg, UOp, UOpKind};
+use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArgRef, UOp, UOpKind};
 use std::collections::BTreeMap;
 
 /// Schema version for guarded WebGPU candidate/status execution.
@@ -89,7 +89,7 @@ impl WebGpuTransactionAbi {
             let UOpKind::GraphBinary(op) = node.kind() else {
                 continue;
             };
-            let Some(operation) = GuardedIntegerOp::from_binary(*op) else {
+            let Some(operation) = GuardedIntegerOp::from_binary(op) else {
                 continue;
             };
             let dtype = node
@@ -168,7 +168,7 @@ impl WebGpuTransactionAbi {
                 ));
             };
             if guard.id != expected_id
-                || GuardedIntegerOp::from_binary(*op) != Some(guard.operation)
+                || GuardedIntegerOp::from_binary(op) != Some(guard.operation)
                 || !matches!(guard.dtype, DType::I32 | DType::U32)
                 || guard.expression.ty().map(|ty| ty.scalar) != Some(guard.dtype)
                 || guard.expression.sources().get(1) != Some(&guard.rhs)
@@ -242,7 +242,7 @@ pub(super) fn first_fault_at<F>(
     mut load: F,
 ) -> Result<Option<u32>, WebGpuError>
 where
-    F: FnMut(&UArg, DType, usize) -> Result<Scalar, WebGpuError>,
+    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, WebGpuError>,
 {
     match eval(
         &transaction.evaluation_root,
@@ -262,7 +262,7 @@ pub(super) fn detail_rhs_at<F>(
     mut load: F,
 ) -> Result<Scalar, WebGpuError>
 where
-    F: FnMut(&UArg, DType, usize) -> Result<Scalar, WebGpuError>,
+    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, WebGpuError>,
 {
     match eval(&guard.rhs, logical, &transaction.guard_ids(), &mut load)? {
         Evaluated::Value(value) => Ok(value),
@@ -279,7 +279,7 @@ fn eval<F>(
     load: &mut F,
 ) -> Result<Evaluated, WebGpuError>
 where
-    F: FnMut(&UArg, DType, usize) -> Result<Scalar, WebGpuError>,
+    F: FnMut(UArgRef<'_>, DType, usize) -> Result<Scalar, WebGpuError>,
 {
     let dtype = node
         .ty()
@@ -287,7 +287,7 @@ where
         .scalar;
     let value = match node.kind() {
         UOpKind::Const => match node.arg() {
-            UArg::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits)?,
+            UArgRef::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits)?,
             _ => {
                 return Err(WebGpuError::InvalidBinding(
                     "invalid detail constant".into(),
@@ -318,11 +318,11 @@ where
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             if let Some(id) = guard_ids.get(node).copied()
-                && invalid_guard(*op, dtype, rhs)
+                && invalid_guard(op, dtype, rhs)
             {
                 return Ok(Evaluated::Fault(id));
             }
-            integer_binary(*op, dtype, lhs, rhs)?
+            integer_binary(op, dtype, lhs, rhs)?
         }
         UOpKind::Binary(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -357,7 +357,7 @@ where
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
-            Scalar::Bool(compare(lhs, rhs, *op))
+            Scalar::Bool(compare(lhs, rhs, op))
         }
         UOpKind::GraphLogical(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
@@ -506,14 +506,14 @@ fn compare(lhs: Scalar, rhs: Scalar, op: CompareOp) -> bool {
     }
 }
 
-pub(super) fn logical_offset(arg: &UArg, logical: usize) -> Result<usize, WebGpuError> {
+pub(super) fn logical_offset(arg: UArgRef<'_>, logical: usize) -> Result<usize, WebGpuError> {
     let (input, output, view) = match arg {
-        UArg::BufferIndex {
+        UArgRef::BufferIndex {
             input_shape,
             output_shape,
             ..
         } => (input_shape, output_shape, None),
-        UArg::ViewBufferIndex {
+        UArgRef::ViewBufferIndex {
             input_shape,
             output_shape,
             view,

@@ -69,11 +69,10 @@ impl EffectSchedule {
                 target_view: step.target_view.clone(),
                 index_plan: step.index_plan.clone(),
             };
-            let store_uop = crate::UOp::new(
-                crate::UOpKind::EffectStore,
+            let store_uop = crate::UOp::from_operation(
+                crate::Operation::EffectStore(Box::new(payload.clone())),
                 None,
                 vec![],
-                crate::UArg::Effect(Box::new(payload.clone())),
             );
             uops.push(EffectUOp {
                 kind: EffectUOpKind::Store,
@@ -85,11 +84,10 @@ impl EffectSchedule {
                 kind: EffectUOpKind::After,
                 payload,
                 after: step.after.clone(),
-                uop: crate::UOp::new(
-                    crate::UOpKind::After,
+                uop: crate::UOp::from_operation(
+                    crate::Operation::After(Box::new(step_payload(step))),
                     None,
                     vec![store_uop],
-                    crate::UArg::Effect(Box::new(step_payload(step))),
                 ),
             });
         }
