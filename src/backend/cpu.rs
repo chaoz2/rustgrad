@@ -5735,7 +5735,7 @@ mod tests {
                         .execute(&graph, cast, &HashMap::from([("x".into(), data)]))
                         .unwrap();
                     assert_eq!(output.dtype(), target, "{source:?} -> {target:?}");
-                    assert_eq!(output.scalar_at(0).unwrap().as_f64(), 1.0);
+                    assert_eq!(output.scalar_at(0).as_f64(), 1.0);
                 }
             }
         }
