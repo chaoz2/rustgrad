@@ -123,6 +123,9 @@ fn ordered_input_bindings_follow_lowered_operand_not_node_id() {
         vec![0, 1]
     );
     item.validate_input_bindings().unwrap();
+    let mut missing = item.clone();
+    missing.input_bindings.pop();
+    assert!(missing.validate_input_bindings().is_err());
     let mut malformed = item.clone();
     malformed.input_bindings[1].abi_index = 0;
     assert!(malformed.validate_input_bindings().is_err());
@@ -139,6 +142,15 @@ fn scalar_elementwise_schedule_is_deterministic_and_lowered() {
     assert_eq!(first.items.len(), 1);
     assert_eq!(first.items[0].cache_key, second.items[0].cache_key);
     assert!(first.items[0].boundary.is_none());
+    assert_eq!(first.items[0].inputs.len(), 2);
+    assert_eq!(first.items[0].ordered_inputs().len(), 1);
+    assert_eq!(first.items[0].ordered_inputs()[0].input_node, x);
+    assert!(
+        first.items[0]
+            .inputs
+            .iter()
+            .any(|input| input.id == one.index() as u64)
+    );
     first.items[0].kernel.validate().unwrap();
 }
 

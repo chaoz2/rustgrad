@@ -408,9 +408,17 @@ impl ScheduleItem {
         if self.boundary.is_some() && self.input_bindings.is_empty() {
             return Ok(());
         }
-        if self.input_bindings.len() != self.inputs.len() {
+        // `inputs` is the complete leaf inventory used for dependency and
+        // provenance planning, while `input_bindings` contains only buffers
+        // present in the lowered callable ABI. In particular, rank-zero graph
+        // constants remain in the inventory after lowering embeds their typed
+        // payloads as dependency-free UOp constants. Validate every binding
+        // against the inventory below without requiring equal cardinality.
+        if self.boundary.is_none()
+            && input_bindings(&self.kernel, &self.inputs, &self.output)? != self.input_bindings
+        {
             return Err(ScheduleError::Binding(
-                "binding/inventory count mismatch".into(),
+                "bindings do not match lowered kernel resources".into(),
             ));
         }
         let mut nodes = BTreeSet::new();
