@@ -231,15 +231,18 @@ pub use sharded_cuda_execute::{
 };
 pub use sharded_cuda_plan::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveConsumerDescriptor,
-    CollectiveDownstreamOutputArtifact, CollectiveDownstreamOutputCommitRecord,
-    CollectiveDownstreamOutputDescriptor, CollectiveLifecycleMaterialization,
+    CollectiveDownstreamConsumerAbi, CollectiveDownstreamOutputArtifact,
+    CollectiveDownstreamOutputCommitRecord, CollectiveDownstreamOutputDescriptor,
+    CollectiveGraphResultBinding, CollectiveGraphUnaryOutputArtifact,
+    CollectiveGraphUnaryOutputComponents, CollectiveLifecycleMaterialization,
     CollectiveLifecycleMaterializationArtifact, CollectiveMaterializationArtifact,
     CollectiveMaterializationLifecycle, CollectiveResultMaterialization,
     CollectiveTransactionArtifact, CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage,
     CudaTransferRoute, ExecutableBuffer, ExecutableBufferRole,
-    ExecutableCollectiveDownstreamOutput, ExecutableCollectiveLifecycleMaterialization,
-    ExecutableCollectiveMaterialization, ExecutableCollectiveTransaction,
-    ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
+    ExecutableCollectiveDownstreamOutput, ExecutableCollectiveGraphUnaryOutput,
+    ExecutableCollectiveLifecycleMaterialization, ExecutableCollectiveMaterialization,
+    ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, ShardedCudaPlan,
+    ShardedCudaPlanArtifact, ShardedCudaPlanner,
 };
 pub use sharded_graph::{
     CollectiveBoundaryLifecycle, CollectiveBoundaryProvenance, LocalInputProvenance,

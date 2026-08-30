@@ -1,10 +1,11 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
+use crate::sharded_cuda_plan::GraphBackedDownstreamUnary;
 use crate::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache, CudaCollectiveGroup,
-    CudaPlanStage, DType, Error, ExecutableBufferRole, ExecutableCollectiveTransaction,
-    ExecutableShardedCudaPlan, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
-    ShardedCudaCompositionErrorKind as CompositionError,
-    ShardedCudaCompositionField as CompositionField,
+    CudaPlanStage, DType, Error, ExecutableBufferRole, ExecutableCollectiveGraphUnaryOutput,
+    ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, Graph, PrimaryBufferLease,
+    PrimaryCudaAllocator, PtxBinding, Shape, ShardedCudaCompositionErrorKind as CompositionError,
+    ShardedCudaCompositionField as CompositionField, ShardedCudaPlanner,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -484,6 +485,12 @@ pub struct ShardedCudaExecutionEnvironment {
     collective: Option<CudaCollectiveGroup>,
     collective_key: Option<String>,
 }
+
+struct DownstreamOutputExecution<'a> {
+    commits: &'a [crate::CollectiveDownstreamOutputCommitRecord],
+    inputs: &'a BTreeMap<(usize, usize, u64), u64>,
+    outputs: &'a BTreeMap<(usize, usize, u64), u64>,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardedCudaExecutionTrace {
     pub stage: usize,
@@ -512,6 +519,7 @@ impl CollectiveTransaction {
             ));
         }
         let mut keys = BTreeSet::new();
+        let mut sources = BTreeSet::new();
         for candidate in &candidates {
             let owner = plan
                 .owners
@@ -542,6 +550,7 @@ impl CollectiveTransaction {
                     buffer.rank == candidate.rank && buffer.buffer == candidate.candidate_buffer
                 })
                 || !keys.insert((candidate.rank, candidate.candidate_buffer))
+                || !sources.insert((candidate.stage, candidate.rank, candidate.source_buffer))
             {
                 return Err(err(
                     "collective transaction candidate provenance is invalid",
@@ -592,6 +601,37 @@ impl CollectiveTransaction {
 }
 
 impl ShardedCudaExecutionEnvironment {
+    fn initialize_collective_candidates(
+        leases: &BTreeMap<(usize, u64), PrimaryBufferLease>,
+        plan: &ExecutableShardedCudaPlan,
+        transaction: &CollectiveTransaction,
+        stage: usize,
+    ) -> Result<(), Error> {
+        for candidate in transaction
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.stage == stage)
+        {
+            let source = leases
+                .get(&(candidate.rank, candidate.source_buffer))
+                .ok_or_else(|| err("missing collective transaction source lease"))?;
+            let destination = leases
+                .get(&(candidate.rank, candidate.candidate_buffer))
+                .ok_or_else(|| err("missing collective transaction candidate lease"))?;
+            let source_view = source.view().map_err(|e| err(e.to_string()))?;
+            let destination_view = destination.view().map_err(|e| err(e.to_string()))?;
+            let stream = plan.owners[candidate.rank]
+                .stream()
+                .map_err(|e| err(e.to_string()))?;
+            let mut copy = destination_view
+                .copy_from_view_async(0, &source_view, 0, candidate.bytes, &stream)
+                .map_err(|e| err(format!("candidate initialize: {e}")))?;
+            copy.wait()
+                .map_err(|e| err(format!("candidate initialize: {e}")))?;
+        }
+        Ok(())
+    }
+
     pub fn new(external: BTreeMap<(usize, u64), PrimaryBufferLease>, owners: usize) -> Self {
         Self {
             external,
@@ -636,14 +676,14 @@ impl ShardedCudaExecutionEnvironment {
         &mut self,
         plan: &ExecutableShardedCudaPlan,
     ) -> Result<ShardedCudaExecutionResult, Error> {
-        self.execute_with_substitutions(plan, &BTreeMap::new(), None)
+        self.execute_with_substitutions(plan, &BTreeMap::new(), None, None)
     }
     pub fn execute_composed(
         &mut self,
         composition: &ShardedCudaPlanComposition,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         let substitutions = composition.checked_substitutions()?;
-        self.execute_with_substitutions(&composition.plan, &substitutions, None)
+        self.execute_with_substitutions(&composition.plan, &substitutions, None, None)
     }
     pub fn execute_transaction(
         &mut self,
@@ -652,7 +692,7 @@ impl ShardedCudaExecutionEnvironment {
         commits: Vec<CollectiveCommitRecord>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         let transaction = CollectiveTransaction::preflight(plan, candidates, commits)?;
-        self.execute_with_substitutions(plan, &BTreeMap::new(), Some(&transaction))
+        self.execute_with_substitutions(plan, &BTreeMap::new(), Some(&transaction), None)
     }
     pub fn execute_artifact_transaction(
         &mut self,
@@ -664,20 +704,224 @@ impl ShardedCudaExecutionEnvironment {
             transaction.commits.clone(),
         )
     }
+    /// Executes only a graph-unary artifact previously rebound through the
+    /// closed unary proof. Generic downstream execution remains unavailable.
+    pub(crate) fn execute_graph_backed_unary_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveGraphUnaryOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        let _unary_op = downstream
+            .unary_op
+            .ok_or_else(|| err("graph-backed unary executable has no typed operation"))?;
+        if downstream.consumer_nodes.len() != downstream.owners.len()
+            || downstream.substitutions.len() != downstream.owners.len()
+            || downstream.unary_bindings.is_none()
+            || downstream.logical.graph_id != graph.id()
+        {
+            return Err(err("graph-backed unary executable was not graph-validated"));
+        }
+        let mut plan = ShardedCudaPlanner::executable(
+            graph,
+            downstream.logical.clone(),
+            downstream.unary_bindings.as_ref().unwrap(),
+        )?;
+        plan.logical.materializations.clear();
+        plan.buffers.retain(|buffer| {
+            downstream.candidates.iter().any(|candidate| {
+                candidate.rank == buffer.rank && candidate.source_buffer == buffer.buffer
+            }) || !downstream
+                .consumer_abis
+                .iter()
+                .any(|abi| buffer.rank == abi.rank && buffer.buffer == abi.local_input_buffer)
+        });
+        let mut targets = BTreeSet::new();
+        for output in &downstream.outputs {
+            let target = plan
+                .buffers
+                .iter_mut()
+                .find(|buffer| {
+                    buffer.rank == output.rank && buffer.buffer == output.destination_buffer
+                })
+                .ok_or_else(|| {
+                    err("graph-backed unary destination is absent from executable map")
+                })?;
+            if !targets.insert((output.rank, output.destination_buffer))
+                || !matches!(target.role, ExecutableBufferRole::Output)
+                || target.device != output.device
+                || target.owner_identity != output.owner_identity
+                || target.dtype != output.dtype
+                || target.shape != output.shape
+                || target.bytes != output.bytes
+                || target.producer != Some(output.consumer_stage)
+                || target.first_stage != output.first_stage
+                || target.last_stage != output.last_stage
+            {
+                return Err(err(
+                    "graph-backed unary destination descriptor is inconsistent",
+                ));
+            }
+            // The PTX mutable ABI is redirected below to the transaction-owned
+            // candidate, leaving this exact validated destination caller-owned.
+            target.role = ExecutableBufferRole::External;
+        }
+        if targets.len() != downstream.output_commits.len()
+            || downstream
+                .output_commits
+                .iter()
+                .any(|commit| !targets.contains(&(commit.rank, commit.destination_buffer)))
+        {
+            return Err(err(
+                "graph-backed unary destination commit coverage is inconsistent",
+            ));
+        }
+        for output in &downstream.outputs {
+            plan.buffers.push(crate::ExecutableBuffer {
+                rank: output.rank,
+                device: output.device.clone(),
+                owner_identity: output.owner_identity,
+                buffer: output.output_candidate_buffer,
+                dtype: output.dtype,
+                shape: output.shape.clone(),
+                bytes: output.bytes,
+                producer: Some(output.consumer_stage),
+                consumers: vec![],
+                first_stage: output.first_stage,
+                last_stage: output.last_stage,
+                role: ExecutableBufferRole::TransactionOutput,
+            });
+        }
+        let transaction = CollectiveTransaction::preflight(
+            &plan,
+            downstream.candidates.clone(),
+            downstream.commits.clone(),
+        )?;
+        if transaction.candidates.iter().any(|candidate| {
+            !plan.buffers.iter().any(|buffer| {
+                buffer.rank == candidate.rank
+                    && buffer.buffer == candidate.source_buffer
+                    && matches!(buffer.role, ExecutableBufferRole::Output)
+                    && buffer
+                        .producer
+                        .is_some_and(|producer| producer < candidate.stage)
+            })
+        }) {
+            return Err(err(
+                "graph-backed unary collective source is not an internal producer output",
+            ));
+        }
+        let consumer_inputs: BTreeMap<(usize, usize, u64), u64> = downstream
+            .consumer_abis
+            .iter()
+            .map(|abi| {
+                (
+                    (abi.consumer_stage, abi.rank, abi.local_input_buffer),
+                    abi.candidate_buffer,
+                )
+            })
+            .collect();
+        let outputs: BTreeMap<(usize, usize, u64), u64> = downstream
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    (
+                        output.consumer_stage,
+                        output.rank,
+                        output.destination_buffer,
+                    ),
+                    output.output_candidate_buffer,
+                )
+            })
+            .collect();
+        if consumer_inputs.len() != downstream.consumer_abis.len()
+            || outputs.len() != downstream.outputs.len()
+        {
+            return Err(err("graph-backed unary stage ABI is not unique"));
+        }
+        self.execute_with_substitutions(
+            &plan,
+            &BTreeMap::new(),
+            Some(&transaction),
+            Some(DownstreamOutputExecution {
+                commits: &downstream.output_commits,
+                inputs: &consumer_inputs,
+                outputs: &outputs,
+            }),
+        )
+    }
+
+    /// Compatibility entrypoint for the original F32 Neg-only vertical.
+    pub fn execute_graph_backed_neg_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveGraphUnaryOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.unary_op != Some(GraphBackedDownstreamUnary::Neg) {
+            return Err(err(
+                "v5 graph-backed Neg executable has the wrong typed operation",
+            ));
+        }
+        self.execute_graph_backed_unary_downstream_output(graph, downstream)
+    }
+
+    /// Executes only the separately authorized F32 Abs companion route.
+    pub fn execute_graph_backed_abs_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveGraphUnaryOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.unary_op != Some(GraphBackedDownstreamUnary::Abs) {
+            return Err(err(
+                "v5 graph-backed Abs executable has the wrong typed operation",
+            ));
+        }
+        self.execute_graph_backed_unary_downstream_output(graph, downstream)
+    }
+
+    /// Executes an artifact authorized specifically for F64 Neg.
+    pub fn execute_graph_backed_f64_neg_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveGraphUnaryOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.unary_op != Some(GraphBackedDownstreamUnary::NegF64) {
+            return Err(err(
+                "v5 graph-backed F64 Neg executable has the wrong typed operation",
+            ));
+        }
+        self.execute_graph_backed_unary_downstream_output(graph, downstream)
+    }
+
+    /// Executes an artifact authorized specifically for F64 Abs.
+    pub fn execute_graph_backed_f64_abs_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveGraphUnaryOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.unary_op != Some(GraphBackedDownstreamUnary::AbsF64) {
+            return Err(err(
+                "v5 graph-backed F64 Abs executable has the wrong typed operation",
+            ));
+        }
+        self.execute_graph_backed_unary_downstream_output(graph, downstream)
+    }
     fn execute_with_substitutions(
         &mut self,
         plan: &ExecutableShardedCudaPlan,
         substitutions: &BTreeMap<(usize, u64), u64>,
         transaction: Option<&CollectiveTransaction>,
+        downstream: Option<DownstreamOutputExecution<'_>>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
-        if !plan.logical.materializations.is_empty()
-            || plan.buffers.iter().any(|buffer| {
-                matches!(
-                    buffer.role,
-                    ExecutableBufferRole::CollectiveResult
-                        | ExecutableBufferRole::TransactionOutput
-                )
-            })
+        if downstream.is_none()
+            && (!plan.logical.materializations.is_empty()
+                || plan.buffers.iter().any(|buffer| {
+                    matches!(
+                        buffer.role,
+                        ExecutableBufferRole::CollectiveResult
+                            | ExecutableBufferRole::TransactionOutput
+                    )
+                }))
         {
             return Err(err(
                 "collective result or transaction-owned downstream outputs are logical-only; downstream execution is unsupported",
@@ -753,6 +997,8 @@ impl ShardedCudaExecutionEnvironment {
         }
         let mut leases = std::mem::take(&mut self.external);
         let mut zeros = std::mem::take(&mut self.zero_external);
+        let initial_lease_keys = leases.keys().copied().collect::<BTreeSet<_>>();
+        let initial_zero_keys = zeros.keys().copied().collect::<BTreeSet<_>>();
         let result = (|| -> Result<ShardedCudaExecutionResult, Error> {
             let mut trace = Vec::new();
             for buffer in &plan.buffers {
@@ -815,22 +1061,6 @@ impl ShardedCudaExecutionEnvironment {
                     let destination = allocator
                         .allocate(NonZeroUsize::new(candidate.bytes).unwrap())
                         .map_err(|e| err(e.to_string()))?;
-                    {
-                        let source = leases
-                            .get(&(candidate.rank, candidate.source_buffer))
-                            .ok_or_else(|| err("missing collective transaction source lease"))?;
-                        let destination_view =
-                            destination.view().map_err(|e| err(e.to_string()))?;
-                        let source_view = source.view().map_err(|e| err(e.to_string()))?;
-                        let stream = plan.owners[candidate.rank]
-                            .stream()
-                            .map_err(|e| err(e.to_string()))?;
-                        let mut copy = destination_view
-                            .copy_from_view_async(0, &source_view, 0, candidate.bytes, &stream)
-                            .map_err(|e| err(format!("candidate initialize: {e}")))?;
-                        copy.wait()
-                            .map_err(|e| err(format!("candidate initialize: {e}")))?;
-                    }
                     leases.insert((candidate.rank, candidate.candidate_buffer), destination);
                 }
             }
@@ -842,11 +1072,24 @@ impl ShardedCudaExecutionEnvironment {
                     ..
                 } = stage
                 {
+                    // Generic transactions preserve their potentially
+                    // caller-owned collective inputs by reducing private
+                    // candidates. Graph-backed unary plans prove above that
+                    // these sources are internal producer outputs instead: the
+                    // collective mutates those ephemeral buffers, then the
+                    // completed result is snapshotted into the candidate read
+                    // by the downstream unary stage.
+                    if downstream.is_none()
+                        && let Some(transaction) = transaction
+                    {
+                        Self::initialize_collective_candidates(&leases, plan, transaction, index)?;
+                    }
                     let inputs = buffers
                         .iter()
                         .enumerate()
                         .map(|(rank, buffer)| {
                             let buffer = transaction
+                                .filter(|_| downstream.is_none())
                                 .and_then(|transaction| {
                                     transaction.candidates.iter().find(|candidate| {
                                         candidate.stage == index
@@ -866,6 +1109,11 @@ impl ShardedCudaExecutionEnvironment {
                         .as_ref()
                         .ok_or_else(|| err("collective runtime was not preflighted"))?;
                     collective.all_reduce_sum(collective_plan, &inputs)?;
+                    if downstream.is_some()
+                        && let Some(transaction) = transaction
+                    {
+                        Self::initialize_collective_candidates(&leases, plan, transaction, index)?;
+                    }
                     trace.push(ShardedCudaExecutionTrace {
                         stage: *id,
                         action: "collective",
@@ -985,9 +1233,17 @@ impl ShardedCudaExecutionEnvironment {
                         let lease = leases
                             .get(&(
                                 rank,
-                                substitutions
-                                    .get(&(rank, abi.id))
+                                downstream
+                                    .as_ref()
+                                    .and_then(|downstream| {
+                                        if abi.mutable {
+                                            downstream.outputs.get(&(index, rank, abi.id))
+                                        } else {
+                                            downstream.inputs.get(&(index, rank, abi.id))
+                                        }
+                                    })
                                     .copied()
+                                    .or_else(|| substitutions.get(&(rank, abi.id)).copied())
                                     .unwrap_or(abi.id),
                             ))
                             .ok_or_else(|| err("missing ABI lease"))?;
@@ -1007,7 +1263,9 @@ impl ShardedCudaExecutionEnvironment {
                     skipped: false,
                 });
             }
-            if let Some(transaction) = transaction {
+            if let Some(transaction) = transaction
+                && downstream.is_none()
+            {
                 for commit in &transaction.commits {
                     let candidate = leases
                         .get(&(commit.rank, commit.candidate_buffer))
@@ -1031,6 +1289,21 @@ impl ShardedCudaExecutionEnvironment {
                     leases.remove(&(candidate.rank, candidate.candidate_buffer));
                 }
             }
+            if let Some(downstream) = downstream {
+                Self::publish_graph_backed_unary_outputs(&mut leases, downstream.commits)?;
+                if let Some(transaction) = transaction {
+                    for candidate in &transaction.candidates {
+                        leases.remove(&(candidate.rank, candidate.candidate_buffer));
+                    }
+                }
+                for output in plan
+                    .buffers
+                    .iter()
+                    .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::TransactionOutput))
+                {
+                    leases.remove(&(output.rank, output.buffer));
+                }
+            }
             let mut outputs = BTreeMap::new();
             let mut zero_outputs = BTreeMap::new();
             for buffer in &plan.buffers {
@@ -1052,21 +1325,62 @@ impl ShardedCudaExecutionEnvironment {
             })
         })();
         if result.is_err() {
-            for buffer in &plan.buffers {
-                if matches!(buffer.role, ExecutableBufferRole::Output) {
-                    leases.remove(&(buffer.rank, buffer.buffer));
-                    zeros.remove(&(buffer.rank, buffer.buffer));
-                }
-            }
-            if let Some(transaction) = transaction {
-                for candidate in &transaction.candidates {
-                    leases.remove(&(candidate.rank, candidate.candidate_buffer));
-                }
-            }
+            leases.retain(|key, _| initial_lease_keys.contains(key));
+            zeros.retain(|key, _| initial_zero_keys.contains(key));
         }
         self.external = leases;
         self.zero_external = zeros;
         result
+    }
+    /// Publishes all completed output candidates by infallibly rekeying their
+    /// owned leases after complete validation. No caller destination storage is
+    /// modified while a fallible launch, synchronization, or copy remains.
+    fn publish_graph_backed_unary_outputs(
+        leases: &mut BTreeMap<(usize, u64), PrimaryBufferLease>,
+        commits: &[crate::CollectiveDownstreamOutputCommitRecord],
+    ) -> Result<(), Error> {
+        let mut candidate_keys = BTreeSet::new();
+        let mut destination_keys = BTreeSet::new();
+        for commit in commits {
+            let candidate_key = (commit.rank, commit.output_candidate_buffer);
+            let destination_key = (commit.rank, commit.destination_buffer);
+            if candidate_key == destination_key
+                || !candidate_keys.insert(candidate_key)
+                || !destination_keys.insert(destination_key)
+            {
+                return Err(err("graph-unary output publication keys are inconsistent"));
+            }
+            let candidate = leases
+                .get(&candidate_key)
+                .ok_or_else(|| err("missing graph-unary output candidate lease"))?;
+            let target = leases
+                .get(&destination_key)
+                .ok_or_else(|| err("missing graph-unary output destination lease"))?;
+            if candidate.view().map_err(|e| err(e.to_string()))?.len()
+                != target.view().map_err(|e| err(e.to_string()))?.len()
+            {
+                return Err(err("graph-unary output lease sizes do not match"));
+            }
+        }
+        if !candidate_keys.is_disjoint(&destination_keys) {
+            return Err(err(
+                "graph-unary output candidates overlap destination keys",
+            ));
+        }
+        let mut replaced_destinations = Vec::with_capacity(commits.len());
+        for commit in commits {
+            let candidate_key = (commit.rank, commit.output_candidate_buffer);
+            let destination_key = (commit.rank, commit.destination_buffer);
+            let candidate = leases
+                .remove(&candidate_key)
+                .expect("graph-unary candidate was preflighted");
+            let replaced = leases
+                .insert(destination_key, candidate)
+                .expect("graph-unary destination was preflighted");
+            replaced_destinations.push(replaced);
+        }
+        drop(replaced_destinations);
+        Ok(())
     }
 }
 fn err(reason: impl Into<String>) -> Error {
@@ -1086,12 +1400,114 @@ mod tests {
     use crate::{
         Backend, CpuBackend, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, DType, DeviceId,
         Driver, ExecutableBuffer, Graph, PtxRenderer, Shape, ShardedCudaPlan, Storage, TensorData,
-        lower_graph_elementwise,
+        lower_graph_elementwise, schedule, schedule_with_external_materializations,
     };
     use crate::{BinaryOp, CudaPlanBinding, ShardedCudaPlanner};
     use std::collections::HashMap;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+
+    #[test]
+    fn graph_unary_publication_atomically_rekeys_completed_leases_without_driver_work() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let devices = [
+            driver.device(DeviceId(0)).unwrap(),
+            driver.device(DeviceId(1)).unwrap(),
+        ];
+        let owners = devices
+            .iter()
+            .map(|device| device.retain_primary_context().unwrap())
+            .collect::<Vec<_>>();
+        let mut leases = BTreeMap::new();
+        let mut target_descriptors = Vec::new();
+        let mut candidate_descriptors = Vec::new();
+        for (rank, owner) in owners.iter().enumerate() {
+            let target = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(4).unwrap())
+                .unwrap();
+            let candidate = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(4).unwrap())
+                .unwrap();
+            target
+                .view()
+                .unwrap()
+                .copy_from(0, &(10.0_f32 + rank as f32).to_le_bytes())
+                .unwrap();
+            candidate
+                .view()
+                .unwrap()
+                .copy_from(0, &(-20.0_f32 - rank as f32).to_le_bytes())
+                .unwrap();
+            target_descriptors.push(
+                mock.allocation_descriptor(
+                    owner.owner(),
+                    target.view().unwrap().device_ptr().unwrap(),
+                )
+                .unwrap(),
+            );
+            candidate_descriptors.push(
+                mock.allocation_descriptor(
+                    owner.owner(),
+                    candidate.view().unwrap().device_ptr().unwrap(),
+                )
+                .unwrap(),
+            );
+            leases.insert((rank, 100 + rank as u64), target);
+            leases.insert((rank, 200 + rank as u64), candidate);
+        }
+        let commits = (0..2)
+            .map(|rank| crate::CollectiveDownstreamOutputCommitRecord {
+                order: rank,
+                rank,
+                output_candidate_buffer: 200 + rank as u64,
+                destination_buffer: 100 + rank as u64,
+            })
+            .collect::<Vec<_>>();
+        let calls_before = mock.calls().len();
+        ShardedCudaExecutionEnvironment::publish_graph_backed_unary_outputs(&mut leases, &commits)
+            .unwrap();
+        let publication_calls = &mock.calls()[calls_before..];
+        assert!(
+            publication_calls.iter().all(|call| !matches!(
+                *call,
+                "launch"
+                    | "graph_launch"
+                    | "dtod"
+                    | "dtod_async"
+                    | "dtoh"
+                    | "dtoh_async"
+                    | "htod"
+                    | "htod_async"
+                    | "peer_copy"
+                    | "stream_sync"
+                    | "generic_kernel_sync"
+            )),
+            "publication may validate and release leases but never launches or copies"
+        );
+        for rank in 0..2 {
+            assert!(!leases.contains_key(&(rank, 200 + rank as u64)));
+            let published = leases.get(&(rank, 100 + rank as u64)).unwrap();
+            assert_eq!(
+                mock.allocation_descriptor(
+                    owners[rank].owner(),
+                    published.view().unwrap().device_ptr().unwrap()
+                )
+                .unwrap(),
+                candidate_descriptors[rank]
+            );
+            let mut bytes = [0; 4];
+            published.view().unwrap().copy_to(0, &mut bytes).unwrap();
+            assert_eq!(f32::from_le_bytes(bytes), -20.0 - rank as f32);
+            assert!(
+                mock.allocation_snapshot(owners[rank].owner(), target_descriptors[rank])
+                    .is_none(),
+                "the replaced destination lease is released without a partial copy"
+            );
+        }
+    }
 
     #[test]
     fn executor_runs_retained_generic_ptx_against_owner_scoped_mock_bytes() {
@@ -1460,6 +1876,47 @@ mod tests {
         tampered["fingerprint"] = serde_json::Value::String("fnv1a64:0000000000000000".into());
         assert!(
             CollectiveTransactionArtifact::decode(&serde_json::to_vec(&tampered).unwrap()).is_err()
+        );
+        let mut duplicate_candidates = candidates.clone();
+        let mut duplicate_candidate = candidates[0].clone();
+        duplicate_candidate.candidate_buffer = 10;
+        duplicate_candidates.push(duplicate_candidate);
+        let mut duplicate_commits = commits.clone();
+        duplicate_commits.push(CollectiveCommitRecord {
+            order: 2,
+            rank: 0,
+            candidate_buffer: 10,
+            target_buffer: 9,
+        });
+        assert!(
+            CollectiveTransactionArtifact::encode(
+                &plan.logical,
+                duplicate_candidates.clone(),
+                duplicate_commits.clone(),
+            )
+            .is_err(),
+            "serialized transaction rejects duplicate stage/rank/source provenance"
+        );
+        let mut duplicate_plan = ExecutableShardedCudaPlan {
+            logical: plan.logical.clone(),
+            owners: owners.clone(),
+            kernels: vec![None],
+            buffers: plan.buffers.clone(),
+        };
+        let mut extra_target = duplicate_plan.buffers[0].clone();
+        extra_target.buffer = 9;
+        duplicate_plan.buffers.push(extra_target);
+        let calls_before_duplicate = mock.calls().len();
+        assert!(
+            environment
+                .execute_transaction(&duplicate_plan, duplicate_candidates, duplicate_commits,)
+                .is_err(),
+            "runtime transaction rejects duplicate stage/rank/source provenance"
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_duplicate,
+            "duplicate candidate provenance is rejected before Driver work"
         );
         for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
             environment
@@ -4393,5 +4850,1117 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn graph_backed_v5_neg_fixture_has_real_downstream_provenance() {
+        let mut graph = Graph::new();
+        let group = DeviceGroup::new([
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ])
+        .unwrap();
+        let input = graph.input("input", [4]);
+        let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let reduced = graph
+            .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
+            .unwrap();
+        let negated = graph.sharded_unary(&reduced, crate::UnaryOp::Neg).unwrap();
+        let boundary = negated
+            .trace()
+            .steps
+            .iter()
+            .find_map(|step| step.collective.as_ref())
+            .unwrap();
+        assert_eq!(boundary.replicated_result, reduced.nodes()[0]);
+        assert!(matches!(
+            boundary.lifecycle,
+            crate::CollectiveBoundaryLifecycle::Downstream { .. }
+        ));
+        for node in negated.nodes() {
+            assert!(
+                matches!(graph.op(*node).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, input } if *input == reduced.nodes()[0])
+            );
+        }
+    }
+
+    #[test]
+    fn graph_backed_unary_routes_encode_rebind_execute_and_publish_all_four_variants() {
+        type Rebind = fn(
+            &Graph,
+            &[CudaPlanBinding],
+            &[u8],
+        ) -> Result<crate::ExecutableCollectiveGraphUnaryOutput, Error>;
+        type Execute = fn(
+            &mut ShardedCudaExecutionEnvironment,
+            &Graph,
+            &crate::ExecutableCollectiveGraphUnaryOutput,
+        ) -> Result<ShardedCudaExecutionResult, Error>;
+        let cases: [(DType, crate::UnaryOp, &str, Rebind, Execute, f64); 4] = [
+            (
+                DType::F32,
+                crate::UnaryOp::Neg,
+                "graph-backed-unary-neg:",
+                ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg,
+                ShardedCudaExecutionEnvironment::execute_graph_backed_neg_downstream_output,
+                -4.0,
+            ),
+            (
+                DType::F32,
+                crate::UnaryOp::Abs,
+                "graph-backed-unary-abs:",
+                ShardedCudaPlanner::rebind_downstream_output_artifact_for_abs,
+                ShardedCudaExecutionEnvironment::execute_graph_backed_abs_downstream_output,
+                4.0,
+            ),
+            (
+                DType::F64,
+                crate::UnaryOp::Neg,
+                "graph-backed-unary-f64-neg:",
+                ShardedCudaPlanner::rebind_downstream_output_artifact_for_f64_neg,
+                ShardedCudaExecutionEnvironment::execute_graph_backed_f64_neg_downstream_output,
+                -4.0,
+            ),
+            (
+                DType::F64,
+                crate::UnaryOp::Abs,
+                "graph-backed-unary-f64-abs:",
+                ShardedCudaPlanner::rebind_downstream_output_artifact_for_f64_abs,
+                ShardedCudaExecutionEnvironment::execute_graph_backed_f64_abs_downstream_output,
+                4.0,
+            ),
+        ];
+        for (dtype, unary, cache_prefix, rebind, execute, expected) in cases {
+            let mock = Arc::new(crate::cuda::tests::Mock::default());
+            let driver = Driver::from_dispatch(mock.clone()).unwrap();
+            let device = driver.device(DeviceId(0)).unwrap();
+            let owner = device.retain_primary_context().unwrap();
+            let group =
+                DeviceGroup::new([crate::collective::DeviceId::new("CUDA:0").unwrap()]).unwrap();
+            let binding = CudaPlanBinding {
+                device: group.devices()[0].clone(),
+                capability: device.capability().unwrap(),
+                context: owner.clone(),
+            };
+            let bindings = vec![binding.clone()];
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+            let reduced = graph
+                .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
+                .unwrap();
+            let downstream = graph.sharded_unary(&reduced, unary).unwrap();
+            let trace = downstream
+                .trace()
+                .steps
+                .iter()
+                .find(|step| step.collective.is_some())
+                .unwrap();
+            let boundary = trace.collective.as_ref().unwrap();
+            let replicated_result = boundary.replicated_result.index();
+            let local_stage = |id: usize,
+                               node: crate::NodeId,
+                               external: Vec<crate::NodeId>,
+                               dependencies: Vec<usize>| {
+                let scheduled = if external.is_empty() {
+                    schedule(&graph, node).unwrap()
+                } else {
+                    schedule_with_external_materializations(&graph, &[node], &external).unwrap()
+                };
+                let item = scheduled.items.first().unwrap();
+                let source_key = format!("schedule:{}", item.cache_key);
+                CudaPlanStage::Local {
+                    id,
+                    device: group.devices()[0].clone(),
+                    owner_identity: owner.identity(),
+                    node: node.index(),
+                    shape: graph.shape(node).unwrap().clone(),
+                    dtype: graph.dtype(node).unwrap(),
+                    inputs: item.inputs.iter().map(|input| input.id).collect(),
+                    external_materializations: external
+                        .iter()
+                        .map(|node| node.index() as u64)
+                        .collect(),
+                    output: item.output.id,
+                    dependencies,
+                    source_key: source_key.clone(),
+                    module_key: format!(
+                        "owner:{}:sm{}:{source_key}",
+                        owner.identity(),
+                        binding.capability.sm()
+                    ),
+                    diagnostic: None,
+                }
+            };
+            let partial = boundary.ordered_inputs[0];
+            let partial_stage = local_stage(0, partial, vec![], vec![]);
+            let partial_buffer = match &partial_stage {
+                CudaPlanStage::Local { output, .. } => *output,
+                _ => unreachable!(),
+            };
+            let collective_stage = 1;
+            let collective_shape = graph.shape(partial).unwrap();
+            let result_shape = graph.shape(boundary.replicated_result).unwrap().clone();
+            let bytes = result_shape.numel().unwrap() * dtype.itemsize();
+            let collective = CudaPlanStage::Collective {
+                id: collective_stage,
+                action: trace.action.to_string(),
+                plan: CollectivePlanner::plan(CollectiveRequest {
+                    group: group.clone(),
+                    kind: CollectiveKind::AllReduce {
+                        reduction: Reduction::Sum,
+                    },
+                    dtype,
+                    input_lengths: vec![collective_shape.numel().unwrap()],
+                })
+                .unwrap(),
+                buffers: vec![partial_buffer],
+                dependencies: vec![0],
+            };
+            let consumer_stage = 2;
+            let consumer = downstream.nodes()[0];
+            let consumer_stage_record = local_stage(
+                consumer_stage,
+                consumer,
+                vec![boundary.replicated_result],
+                vec![collective_stage],
+            );
+            let (local_input, destination) = match &consumer_stage_record {
+                CudaPlanStage::Local { inputs, output, .. } => (inputs[0], *output),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                local_input, partial_buffer,
+                "one-rank collective result intentionally aliases its partial node id"
+            );
+            let logical = ShardedCudaPlan {
+                graph_id: graph.id(),
+                layout_key: downstream.layout().cache_key().into(),
+                bindings: vec![(
+                    binding.device.clone(),
+                    owner.identity(),
+                    binding.capability.sm(),
+                )],
+                stages: vec![partial_stage, collective, consumer_stage_record],
+                diagnostics: vec![],
+                cache_key: format!("{cache_prefix}{}", downstream.layout().cache_key()),
+                materializations: vec![],
+            };
+            let candidate = crate::CollectiveCandidateDescriptor {
+                stage: collective_stage,
+                rank: 0,
+                candidate_buffer: 10_000,
+                source_buffer: partial_buffer,
+                dtype,
+                shape: result_shape.clone(),
+                bytes,
+            };
+            let commit = crate::CollectiveCommitRecord {
+                order: 0,
+                rank: 0,
+                candidate_buffer: 10_000,
+                target_buffer: partial_buffer,
+            };
+            let materialization = crate::CollectiveLifecycleMaterialization {
+                materialization: crate::CollectiveResultMaterialization {
+                    boundary_key: format!("route-{dtype:?}-{unary:?}"),
+                    replicated_result,
+                    rank: 0,
+                    device: binding.device.clone(),
+                    owner_identity: owner.identity(),
+                    candidate_buffer: 10_000,
+                    dtype,
+                    shape: result_shape.clone(),
+                    bytes,
+                    producer_stage: collective_stage,
+                    first_consumer: consumer_stage,
+                    last_consumer: consumer_stage,
+                },
+                lifecycle: crate::CollectiveMaterializationLifecycle::Downstream {
+                    first_consumer_stage: consumer_stage,
+                    lifetime_end_stage: consumer_stage,
+                },
+                consumers: vec![crate::CollectiveConsumerDescriptor {
+                    rank: 0,
+                    consumer_stage,
+                    consumer_buffer: 10_000,
+                    device: binding.device.clone(),
+                    owner_identity: owner.identity(),
+                    dtype,
+                    shape: result_shape.clone(),
+                    bytes,
+                }],
+            };
+            let graph_binding = crate::CollectiveGraphResultBinding {
+                replicated_result,
+                rank: 0,
+                candidate_buffer: 10_000,
+                local_input_buffer: local_input,
+                device: binding.device.clone(),
+                owner_identity: owner.identity(),
+                dtype,
+                shape: result_shape.clone(),
+                bytes,
+                first_consumer_stage: consumer_stage,
+                lifetime_end_stage: consumer_stage,
+            };
+            let consumer_abi = crate::CollectiveDownstreamConsumerAbi {
+                replicated_result,
+                rank: 0,
+                candidate_buffer: 10_000,
+                local_input_buffer: local_input,
+                output_candidate_buffer: 30_000,
+                device: binding.device.clone(),
+                owner_identity: owner.identity(),
+                dtype,
+                shape: result_shape.clone(),
+                bytes,
+                consumer_stage,
+                lifetime_end_stage: consumer_stage,
+            };
+            let output = crate::CollectiveDownstreamOutputDescriptor {
+                rank: 0,
+                consumer_stage,
+                output_candidate_buffer: 30_000,
+                source_candidate_buffer: 10_000,
+                destination_buffer: destination,
+                device: binding.device.clone(),
+                owner_identity: owner.identity(),
+                dtype,
+                shape: result_shape,
+                bytes,
+                first_stage: consumer_stage,
+                last_stage: consumer_stage,
+            };
+            let output_commit = crate::CollectiveDownstreamOutputCommitRecord {
+                order: 0,
+                rank: 0,
+                output_candidate_buffer: 30_000,
+                destination_buffer: destination,
+            };
+            let artifact = crate::CollectiveGraphUnaryOutputArtifact::encode(
+                &logical,
+                crate::CollectiveGraphUnaryOutputComponents {
+                    candidates: vec![candidate],
+                    commits: vec![commit],
+                    materializations: vec![materialization],
+                    graph_result_bindings: vec![graph_binding],
+                    consumer_abis: vec![consumer_abi],
+                    outputs: vec![output.clone()],
+                    output_commits: vec![output_commit],
+                },
+            )
+            .unwrap();
+            let rebound = rebind(&graph, &bindings, &artifact).unwrap();
+            let executable = ShardedCudaPlanner::executable(
+                &graph,
+                rebound.logical.clone(),
+                rebound.unary_bindings.as_ref().unwrap(),
+            )
+            .unwrap();
+            let mut external = BTreeMap::new();
+            for buffer in executable.buffers.iter().filter(|buffer| {
+                matches!(buffer.role, ExecutableBufferRole::External)
+                    && buffer.buffer != local_input
+                    && buffer.buffer != destination
+            }) {
+                let lease = owner
+                    .allocator()
+                    .allocate(NonZeroUsize::new(buffer.bytes).unwrap())
+                    .unwrap();
+                let raw = if dtype == DType::F32 {
+                    [3.0_f32, 1.0]
+                        .into_iter()
+                        .flat_map(f32::to_le_bytes)
+                        .collect::<Vec<_>>()
+                } else {
+                    [3.0_f64, 1.0]
+                        .into_iter()
+                        .flat_map(f64::to_le_bytes)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(raw.len(), buffer.bytes);
+                lease.view().unwrap().copy_from(0, &raw).unwrap();
+                external.insert((0, buffer.buffer), lease);
+            }
+            let target = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(bytes).unwrap())
+                .unwrap();
+            external.insert((0, destination), target);
+            let mut environment = ShardedCudaExecutionEnvironment::new(external, 1);
+            execute(&mut environment, &graph, &rebound).unwrap();
+            let mut actual = vec![0; bytes];
+            environment
+                .external
+                .get(&(0, destination))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut actual)
+                .unwrap();
+            if dtype == DType::F32 {
+                assert_eq!(
+                    f32::from_le_bytes(actual.try_into().unwrap()),
+                    expected as f32
+                );
+            } else {
+                assert_eq!(f64::from_le_bytes(actual.try_into().unwrap()), expected);
+            }
+            assert!(mock.calls().contains(&"launch"), "retained PTX executes");
+        }
+    }
+
+    #[test]
+    fn graph_backed_v5_f64_abs_artifact_rebinds_real_two_rank_trace_deterministically() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let devices = [
+            driver.device(DeviceId(0)).unwrap(),
+            driver.device(DeviceId(1)).unwrap(),
+        ];
+        let owners = devices
+            .iter()
+            .map(|device| device.retain_primary_context().unwrap())
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new([
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ])
+        .unwrap();
+        let bindings = devices
+            .iter()
+            .zip(&owners)
+            .enumerate()
+            .map(|(rank, (device, owner))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: device.capability().unwrap(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F64);
+        let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let reduced = graph
+            .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
+            .unwrap();
+        let abs = graph.sharded_unary(&reduced, crate::UnaryOp::Abs).unwrap();
+        let collective_trace = abs
+            .trace()
+            .steps
+            .iter()
+            .find(|step| step.collective.is_some())
+            .unwrap();
+        let boundary = collective_trace.collective.as_ref().unwrap();
+        let replicated_result = boundary.replicated_result.index();
+        assert_eq!(boundary.ordered_inputs.len(), owners.len());
+        assert_eq!(abs.nodes().len(), owners.len());
+        let local_stage = |id: usize,
+                           rank: usize,
+                           node: crate::NodeId,
+                           external_materializations: Vec<crate::NodeId>,
+                           dependencies: Vec<usize>| {
+            let scheduled = if external_materializations.is_empty() {
+                schedule(&graph, node).unwrap()
+            } else {
+                schedule_with_external_materializations(&graph, &[node], &external_materializations)
+                    .unwrap()
+            };
+            let item = scheduled.items.first().unwrap();
+            assert_eq!(item.external_materializations, external_materializations);
+            let source_key = format!("schedule:{}", item.cache_key);
+            CudaPlanStage::Local {
+                id,
+                device: group.devices()[rank].clone(),
+                owner_identity: owners[rank].identity(),
+                node: node.index(),
+                shape: graph.shape(node).unwrap().clone(),
+                dtype: graph.dtype(node).unwrap(),
+                inputs: item.inputs.iter().map(|descriptor| descriptor.id).collect(),
+                external_materializations: external_materializations
+                    .iter()
+                    .map(|node| node.index() as u64)
+                    .collect(),
+                output: item.output.id,
+                dependencies,
+                source_key: source_key.clone(),
+                module_key: format!(
+                    "owner:{}:sm{}:{source_key}",
+                    owners[rank].identity(),
+                    bindings[rank].capability.sm()
+                ),
+                diagnostic: None,
+            }
+        };
+        let mut stages = boundary
+            .ordered_inputs
+            .iter()
+            .enumerate()
+            .map(|(rank, &node)| {
+                local_stage(
+                    rank,
+                    rank,
+                    node,
+                    vec![],
+                    rank.checked_sub(1).into_iter().collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let collective_stage = stages.len();
+        let collective_buffers = stages
+            .iter()
+            .map(|stage| match stage {
+                CudaPlanStage::Local { output, .. } => *output,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        let collective_shape = graph.shape(boundary.ordered_inputs[0]).unwrap();
+        let result_shape = graph.shape(boundary.replicated_result).unwrap().clone();
+        let result_bytes = DType::F64.itemsize() * result_shape.numel().unwrap();
+        let collective_plan = CollectivePlanner::plan(CollectiveRequest {
+            group: group.clone(),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype: DType::F64,
+            input_lengths: vec![collective_shape.numel().unwrap(); owners.len()],
+        })
+        .unwrap();
+        stages.push(CudaPlanStage::Collective {
+            id: collective_stage,
+            action: collective_trace.action.to_string(),
+            plan: collective_plan,
+            buffers: collective_buffers.clone(),
+            dependencies: (0..collective_stage).collect(),
+        });
+        let abs_stages = abs
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(rank, &node)| {
+                let stage = stages.len();
+                stages.push(local_stage(
+                    stage,
+                    rank,
+                    node,
+                    vec![boundary.replicated_result],
+                    vec![collective_stage],
+                ));
+                (stage, rank)
+            })
+            .collect::<Vec<_>>();
+        let local_inputs = abs_stages
+            .iter()
+            .map(|&(stage, _)| match &stages[stage] {
+                CudaPlanStage::Local {
+                    inputs,
+                    external_materializations,
+                    ..
+                } => {
+                    assert_eq!(external_materializations, &vec![replicated_result as u64]);
+                    assert_eq!(inputs.len(), 1);
+                    inputs[0]
+                }
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            local_inputs
+                .iter()
+                .all(|&input| input == replicated_result as u64),
+            "both ranks consume the one explicit replicated-result ABI"
+        );
+        assert!(
+            local_inputs
+                .iter()
+                .zip(&collective_buffers)
+                .all(|(input, partial)| input != partial),
+            "the two-rank route keeps replicated-result inputs distinct from local partials"
+        );
+        let logical = ShardedCudaPlan {
+            graph_id: graph.id(),
+            layout_key: abs.layout().cache_key().into(),
+            bindings: bindings
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.device.clone(),
+                        binding.context.identity(),
+                        binding.capability.sm(),
+                    )
+                })
+                .collect(),
+            stages,
+            diagnostics: vec![],
+            cache_key: format!(
+                "graph-backed-unary-f64-abs:{}:{}",
+                abs.layout().cache_key(),
+                boundary.replicated_result.index()
+            ),
+            materializations: vec![],
+        };
+        let candidates = collective_buffers
+            .iter()
+            .enumerate()
+            .map(
+                |(rank, &source_buffer)| crate::CollectiveCandidateDescriptor {
+                    stage: collective_stage,
+                    rank,
+                    candidate_buffer: 10_000 + rank as u64,
+                    source_buffer,
+                    dtype: DType::F64,
+                    shape: result_shape.clone(),
+                    bytes: result_bytes,
+                },
+            )
+            .collect::<Vec<_>>();
+        let commits = collective_buffers
+            .iter()
+            .enumerate()
+            .map(|(rank, &target_buffer)| crate::CollectiveCommitRecord {
+                order: rank,
+                rank,
+                candidate_buffer: 10_000 + rank as u64,
+                target_buffer,
+            })
+            .collect::<Vec<_>>();
+        let materializations = abs_stages
+            .iter()
+            .map(|&(stage, rank)| crate::CollectiveLifecycleMaterialization {
+                materialization: crate::CollectiveResultMaterialization {
+                    boundary_key: "real-sharded-reduce-abs".into(),
+                    replicated_result,
+                    rank,
+                    device: group.devices()[rank].clone(),
+                    owner_identity: owners[rank].identity(),
+                    candidate_buffer: 10_000 + rank as u64,
+                    dtype: DType::F64,
+                    shape: result_shape.clone(),
+                    bytes: result_bytes,
+                    producer_stage: collective_stage,
+                    first_consumer: stage,
+                    last_consumer: stage,
+                },
+                lifecycle: crate::CollectiveMaterializationLifecycle::Downstream {
+                    first_consumer_stage: stage,
+                    lifetime_end_stage: stage,
+                },
+                consumers: vec![crate::CollectiveConsumerDescriptor {
+                    rank,
+                    consumer_stage: stage,
+                    consumer_buffer: 10_000 + rank as u64,
+                    device: group.devices()[rank].clone(),
+                    owner_identity: owners[rank].identity(),
+                    dtype: DType::F64,
+                    shape: result_shape.clone(),
+                    bytes: result_bytes,
+                }],
+            })
+            .collect::<Vec<_>>();
+        let graph_bindings = abs_stages
+            .iter()
+            .map(|&(stage, rank)| crate::CollectiveGraphResultBinding {
+                replicated_result,
+                rank,
+                candidate_buffer: 10_000 + rank as u64,
+                local_input_buffer: local_inputs[rank],
+                device: group.devices()[rank].clone(),
+                owner_identity: owners[rank].identity(),
+                dtype: DType::F64,
+                shape: result_shape.clone(),
+                bytes: result_bytes,
+                first_consumer_stage: stage,
+                lifetime_end_stage: stage,
+            })
+            .collect::<Vec<_>>();
+        let consumer_abis = abs_stages
+            .iter()
+            .map(|&(stage, rank)| crate::CollectiveDownstreamConsumerAbi {
+                replicated_result,
+                rank,
+                candidate_buffer: 10_000 + rank as u64,
+                local_input_buffer: local_inputs[rank],
+                output_candidate_buffer: 30_000 + rank as u64,
+                device: group.devices()[rank].clone(),
+                owner_identity: owners[rank].identity(),
+                dtype: DType::F64,
+                shape: result_shape.clone(),
+                bytes: result_bytes,
+                consumer_stage: stage,
+                lifetime_end_stage: stage,
+            })
+            .collect::<Vec<_>>();
+        let outputs = abs_stages
+            .iter()
+            .map(|&(stage, rank)| {
+                let CudaPlanStage::Local { output, .. } = &logical.stages[stage] else {
+                    unreachable!()
+                };
+                crate::CollectiveDownstreamOutputDescriptor {
+                    rank,
+                    consumer_stage: stage,
+                    output_candidate_buffer: 30_000 + rank as u64,
+                    source_candidate_buffer: 10_000 + rank as u64,
+                    destination_buffer: *output,
+                    device: group.devices()[rank].clone(),
+                    owner_identity: owners[rank].identity(),
+                    dtype: DType::F64,
+                    shape: result_shape.clone(),
+                    bytes: result_bytes,
+                    first_stage: stage,
+                    last_stage: stage,
+                }
+            })
+            .collect::<Vec<_>>();
+        let output_commits = outputs
+            .iter()
+            .enumerate()
+            .map(
+                |(order, output)| crate::CollectiveDownstreamOutputCommitRecord {
+                    order,
+                    rank: output.rank,
+                    output_candidate_buffer: output.output_candidate_buffer,
+                    destination_buffer: output.destination_buffer,
+                },
+            )
+            .collect::<Vec<_>>();
+        let artifact = crate::CollectiveGraphUnaryOutputArtifact::encode(
+            &logical,
+            crate::CollectiveGraphUnaryOutputComponents {
+                candidates: candidates.clone(),
+                commits: commits.clone(),
+                materializations: materializations.clone(),
+                graph_result_bindings: graph_bindings,
+                consumer_abis: consumer_abis.clone(),
+                outputs: outputs.clone(),
+                output_commits: output_commits.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            artifact,
+            crate::CollectiveGraphUnaryOutputArtifact::encode(
+                &logical,
+                crate::CollectiveGraphUnaryOutputComponents {
+                    candidates,
+                    commits,
+                    materializations,
+                    graph_result_bindings: crate::CollectiveGraphUnaryOutputArtifact::decode(
+                        &artifact
+                    )
+                    .unwrap()
+                    .4,
+                    consumer_abis: consumer_abis.clone(),
+                    outputs: outputs.clone(),
+                    output_commits: output_commits.clone()
+                }
+            )
+            .unwrap()
+        );
+        let mut missing_abi: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+        missing_abi.as_object_mut().unwrap().remove("consumer_abis");
+        assert!(
+            crate::CollectiveGraphUnaryOutputArtifact::decode(
+                &serde_json::to_vec(&missing_abi).unwrap()
+            )
+            .is_err()
+        );
+        let mut duplicate_abi: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+        let duplicate = duplicate_abi["consumer_abis"][0].clone();
+        duplicate_abi["consumer_abis"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(
+            crate::CollectiveGraphUnaryOutputArtifact::decode(
+                &serde_json::to_vec(&duplicate_abi).unwrap()
+            )
+            .is_err()
+        );
+        let calls_before_wrong_op = mock.calls().len();
+        assert!(
+            ShardedCudaPlanner::rebind_downstream_output_artifact_for_f64_neg(
+                &graph, &bindings, &artifact,
+            )
+            .is_err(),
+            "the closed unary route rejects an artifact with a different typed operation"
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_wrong_op,
+            "wrong unary operation is pre-driver"
+        );
+        let calls_before_rebind = mock.calls().len();
+        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_f64_abs(
+            &graph, &bindings, &artifact,
+        )
+        .unwrap();
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_rebind,
+            "rebind remains metadata-only"
+        );
+        let executable = ShardedCudaPlanner::executable(
+            &graph,
+            rebound.logical.clone(),
+            rebound.unary_bindings.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rebound.consumer_nodes, abs.nodes());
+        assert!(rebound.candidates.iter().all(|candidate| {
+            executable.buffers.iter().any(|buffer| {
+                buffer.rank == candidate.rank
+                    && buffer.buffer == candidate.source_buffer
+                    && matches!(buffer.role, ExecutableBufferRole::Output)
+                    && buffer
+                        .producer
+                        .is_some_and(|producer| producer < candidate.stage)
+            })
+        }));
+        assert_eq!(
+            rebound
+                .substitutions
+                .iter()
+                .map(|entry| (entry.rank, entry.local_buffer, entry.transfer_buffer))
+                .collect::<Vec<_>>(),
+            vec![(0, local_inputs[0], 10_000), (1, local_inputs[1], 10_001)]
+        );
+        assert_eq!(rebound.outputs, outputs);
+        assert_eq!(rebound.output_commits, output_commits);
+        let mut external = BTreeMap::new();
+        for buffer in executable.buffers.iter().filter(|buffer| {
+            matches!(buffer.role, ExecutableBufferRole::External)
+                && !outputs.iter().any(|output| {
+                    output.rank == buffer.rank && output.destination_buffer == buffer.buffer
+                })
+                && !consumer_abis
+                    .iter()
+                    .any(|abi| abi.rank == buffer.rank && abi.local_input_buffer == buffer.buffer)
+        }) {
+            let lease = owners[buffer.rank]
+                .allocator()
+                .allocate(NonZeroUsize::new(buffer.bytes).unwrap())
+                .unwrap();
+            // Local shard nodes are static views of the original graph input,
+            // so each rank binds the complete global input ABI. Rank 0 reads
+            // its leading half and rank 1 reads its trailing half.
+            let values = [1_f64, 2_f64, 3_f64, 4_f64];
+            assert_eq!(buffer.bytes, values.len() * DType::F64.itemsize());
+            lease
+                .view()
+                .unwrap()
+                .copy_from(
+                    0,
+                    &values
+                        .into_iter()
+                        .flat_map(f64::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            external.insert((buffer.rank, buffer.buffer), lease);
+        }
+        for output in &outputs {
+            let target = owners[output.rank]
+                .allocator()
+                .allocate(NonZeroUsize::new(output.bytes).unwrap())
+                .unwrap();
+            target
+                .view()
+                .unwrap()
+                .copy_from(0, &99_f64.to_le_bytes())
+                .unwrap();
+            external.insert((output.rank, output.destination_buffer), target);
+        }
+        let baseline = owners
+            .iter()
+            .map(|owner| mock.live_allocation_count(owner.owner()))
+            .collect::<Vec<_>>();
+        let source_before = executable
+            .buffers
+            .iter()
+            .filter(|buffer| {
+                matches!(buffer.role, ExecutableBufferRole::External)
+                    && !outputs.iter().any(|output| {
+                        output.rank == buffer.rank && output.destination_buffer == buffer.buffer
+                    })
+                    && !consumer_abis.iter().any(|abi| {
+                        abi.rank == buffer.rank && abi.local_input_buffer == buffer.buffer
+                    })
+            })
+            .map(|buffer| {
+                let mut bytes = vec![0; buffer.bytes];
+                external
+                    .get(&(buffer.rank, buffer.buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
+        let calls_before = mock.calls().len();
+        let mut environment = ShardedCudaExecutionEnvironment::new(external, owners.len());
+        assert!(
+            environment
+                .execute_graph_backed_f64_neg_downstream_output(&graph, &rebound)
+                .is_err(),
+            "the F64 Neg entrypoint rejects an F64 Abs executable before driver work"
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before,
+            "wrong F64 operation is pre-driver"
+        );
+        let targets_before = outputs
+            .iter()
+            .map(|output| {
+                let mut bytes = vec![0; output.bytes];
+                environment
+                    .external
+                    .get(&(output.rank, output.destination_buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
+        mock.fail_generic_kernel_launch_after(2, 2);
+        let launch_error = environment
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
+            .err()
+            .expect("injected Abs launch fails");
+        assert!(launch_error.to_string().contains("stage"));
+        for (index, output) in outputs.iter().enumerate() {
+            let mut bytes = vec![0; output.bytes];
+            environment
+                .external
+                .get(&(output.rank, output.destination_buffer))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(
+                bytes, targets_before[index],
+                "failed Abs leaves final target unchanged"
+            );
+        }
+        // The first nontrivial all-reduce permanently warms each rank's
+        // collective allocator with one scratch and one original-contribution
+        // block. Transaction and graph-output candidates are separate
+        // allocations and must be released back to the pre-execution count
+        // plus only those two intentional cache blocks.
+        let warmed_collective_baseline = baseline.iter().map(|count| count + 2).collect::<Vec<_>>();
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            warmed_collective_baseline,
+            "failed Abs releases every transaction and graph-output candidate"
+        );
+        assert!(
+            mock.calls()[calls_before..]
+                .iter()
+                .filter(|&&call| call == "launch")
+                .count()
+                >= 3,
+            "two partial local launches and collective precede Abs failure"
+        );
+        environment
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
+            .unwrap();
+        for output in &outputs {
+            let mut bytes = [0; 8];
+            environment
+                .external
+                .get(&(output.rank, output.destination_buffer))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(
+                f64::from_le_bytes(bytes),
+                10.0,
+                "rank {} all-reduce then Abs",
+                output.rank
+            );
+        }
+        let rank_one_targets = outputs
+            .iter()
+            .map(|output| {
+                let mut bytes = vec![0; output.bytes];
+                environment
+                    .external
+                    .get(&(output.rank, output.destination_buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
+        mock.set_launch_result(2);
+        for _ in 0..2 {
+            assert!(
+                environment
+                    .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
+                    .is_err(),
+                "persistent launch failure remains fail-closed"
+            );
+            for (index, output) in outputs.iter().enumerate() {
+                let mut bytes = vec![0; output.bytes];
+                environment
+                    .external
+                    .get(&(output.rank, output.destination_buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                assert_eq!(
+                    bytes, rank_one_targets[index],
+                    "persistent launch failure cannot publish any rank"
+                );
+            }
+        }
+        mock.set_launch_result(0);
+        environment
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
+            .unwrap();
+        let rank_one_calls = mock.calls().len();
+        mock.fail_generic_kernel_launch_after(3, 2);
+        assert!(
+            environment
+                .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
+                .is_err()
+        );
+        for (index, output) in outputs.iter().enumerate() {
+            let mut bytes = vec![0; output.bytes];
+            environment
+                .external
+                .get(&(output.rank, output.destination_buffer))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(
+                bytes, rank_one_targets[index],
+                "second Abs failure preserves final target"
+            );
+        }
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            warmed_collective_baseline
+        );
+        assert!(
+            mock.calls()[rank_one_calls..]
+                .iter()
+                .filter(|&&call| call == "launch")
+                .count()
+                >= 4,
+            "rank-one Abs follows both partials, collective, and first Abs"
+        );
+        environment
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
+            .unwrap();
+        let sync_targets = outputs
+            .iter()
+            .map(|output| {
+                let mut bytes = vec![0; output.bytes];
+                environment
+                    .external
+                    .get(&(output.rank, output.destination_buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
+        mock.fail_generic_kernel_sync_after(2, 2);
+        assert!(
+            environment
+                .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
+                .is_err()
+        );
+        for (index, output) in outputs.iter().enumerate() {
+            let mut bytes = vec![0; output.bytes];
+            environment
+                .external
+                .get(&(output.rank, output.destination_buffer))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(
+                bytes, sync_targets[index],
+                "Abs completion failure preserves final target"
+            );
+        }
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            warmed_collective_baseline
+        );
+        environment
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
+            .unwrap();
+        let source_after = executable
+            .buffers
+            .iter()
+            .filter(|buffer| {
+                matches!(buffer.role, ExecutableBufferRole::External)
+                    && !outputs.iter().any(|output| {
+                        output.rank == buffer.rank && output.destination_buffer == buffer.buffer
+                    })
+                    && !consumer_abis.iter().any(|abi| {
+                        abi.rank == buffer.rank && abi.local_input_buffer == buffer.buffer
+                    })
+            })
+            .map(|buffer| {
+                let mut bytes = vec![0; buffer.bytes];
+                environment
+                    .external
+                    .get(&(buffer.rank, buffer.buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_after, source_before,
+            "collective candidates leave caller sources unchanged"
+        );
+        let calls = &mock.calls()[calls_before..];
+        assert!(calls.contains(&"launch"));
+        assert!(
+            calls.iter().filter(|&&call| call == "dtod_async").count() >= 2,
+            "collective candidates are initialized before execution"
+        );
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            warmed_collective_baseline,
+            "superseded candidates and destinations are released"
+        );
     }
 }

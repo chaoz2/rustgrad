@@ -5981,7 +5981,7 @@ impl PtxKernel {
         // wait before releasing its borrow so a physical block cannot reenter
         // the cache while this launch is still in flight.
         if synchronize || bindings.iter().any(|binding| binding.buffer.is_pooled()) {
-            stream.synchronize()?
+            stream.synchronize_generic_kernel_completion()?
         };
         Ok(())
     }
@@ -6353,7 +6353,7 @@ impl PrimaryPtxKernel {
         )?;
         self.attach_primary_completion(stream, bindings)?;
         if synchronize {
-            stream.synchronize()?;
+            stream.synchronize_generic_kernel_completion()?;
         }
         Ok(())
     }

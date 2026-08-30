@@ -499,6 +499,14 @@ impl CudaCollectiveGroup {
             return Ok(Vec::new());
         }
         self.ensure_peers(plan)?;
+        // Every peer transfer below is waited before this synchronous call
+        // returns, but its source and destination leases retain completion
+        // fences when they enter the allocator's deferred queue. Promote the
+        // prior call's proven-complete workspace before allocating the next
+        // scratch/original pair so repeated collectives reuse bounded storage.
+        for allocator in &self.allocators {
+            allocator.wait_deferred().map_err(cuda_err)?;
+        }
         let scratch = self
             .allocators
             .iter()
@@ -1364,10 +1372,22 @@ mod tests {
                 );
                 assert!(action.depends_on.iter().all(|id| *id < action.id));
             }
+            let allocations_after_first = primaries
+                .iter()
+                .map(|primary| mock.live_allocation_count(primary.owner()))
+                .collect::<Vec<_>>();
             let trace_again = executor
                 .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
                 .unwrap();
             assert_eq!(trace_again.len(), trace.len());
+            let allocations_after_second = primaries
+                .iter()
+                .map(|primary| mock.live_allocation_count(primary.owner()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                allocations_after_second, allocations_after_first,
+                "{dtype:?}"
+            );
             let calls = mock.calls();
             assert_eq!(
                 calls.iter().filter(|x| **x == "module_load").count(),
