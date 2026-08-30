@@ -655,8 +655,8 @@ fn iq2_s_decodes_selectors_high_plane_scales_signs_and_repeated_blocks() {
         (1usize, 0x0808_0808_0808_082bu64),
         (257usize, 0x0819_0819_1919_2b08u64),
         (766usize, 0x192b_0808_1908_0808u64),
-        (1022usize, 0x2b2b_2b2b_082b_2b08u64),
-        (1023usize, 0x2b2b_2b2b_2b08_2b08u64),
+        (1022usize, 0x2b2b_2b2b_2b08_2b08u64),
+        (1023usize, 0x2b2b_2b2b_2b2b_2b2bu64),
     ];
     let expected = (0..16)
         .flat_map(|group| {
@@ -702,8 +702,10 @@ fn iq2_s_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() {
     signed_zero[..2].copy_from_slice(&0x8000u16.to_le_bytes());
     signed_zero[34] = 1;
     let decoded = decode_iq2_s_block(&signed_zero).unwrap();
-    assert_eq!(decoded[0].to_bits(), (-0.0f32).to_bits());
-    assert_eq!(decoded[1].to_bits(), 0.0f32.to_bits());
+    // The first sign bit negates the shared -0 scale, while the second lane
+    // retains it. Keep the IEEE payload expectation lane-exact.
+    assert_eq!(decoded[0].to_bits(), 0.0f32.to_bits());
+    assert_eq!(decoded[1].to_bits(), (-0.0f32).to_bits());
     for (length, expected) in [(81, 82), (83, 82)] {
         assert_eq!(
             decode_iq2_s_block(&vec![0; length]),

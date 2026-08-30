@@ -498,17 +498,18 @@ fn whole_file_f32_state_is_complete_deterministic_and_atomic() {
     assert_eq!(&state["a_q4k"].values()[288..320], &[4.; 32]);
     assert_eq!(state["m_q6k"].values(), &[-16.; 256]);
 
-    let unsupported = [0u8; 176];
-    let unsupported_bytes = fixture(
+    let mut invalid = [0u8; 176];
+    invalid[..2].copy_from_slice(&0x7c00u16.to_le_bytes());
+    let invalid_bytes = fixture(
         3,
         &[],
         &[
             TensorFixture {
-                name: "unsupported-first",
+                name: "invalid-first",
                 dimensions: &[256],
                 kind: 13,
                 offset: 0,
-                data: &unsupported,
+                data: &invalid,
             },
             TensorFixture {
                 name: "would-succeed",
@@ -520,14 +521,14 @@ fn whole_file_f32_state_is_complete_deterministic_and_atomic() {
         ],
         32,
     );
-    let error = read_gguf(&unsupported_bytes)
+    let error = read_gguf(&invalid_bytes)
         .unwrap()
         .materialize_state_f32()
         .unwrap_err();
     assert_eq!(
         error.kind(),
         &GgufErrorKind::QuantizedMaterialization {
-            tensor: "unsupported-first".into(),
+            tensor: "invalid-first".into(),
             kind: GgmlType::Q5K,
         }
     );
