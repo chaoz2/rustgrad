@@ -272,7 +272,7 @@ fn newton_schulz_plan(
         transposed
             .numel()?
             .checked_mul(dtype.itemsize())
-            .ok_or_else(|| Error::ShapeOverflow(transposed))?;
+            .ok_or(Error::ShapeOverflow(transposed))?;
     }
     Ok(NewtonSchulzPlan {
         input_shape,

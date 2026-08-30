@@ -1108,19 +1108,6 @@ impl Op {
                     (PrefixScanKind::Min, PrefixScanOutput::Indices) => "cummin_indices",
                 }
             ),
-            Self::Sort {
-                input,
-                axis,
-                descending,
-                output,
-                ..
-            } => format!(
-                "{}(%{input}, axis={axis}, descending={descending})",
-                match output {
-                    SortOutput::Values => "sort",
-                    SortOutput::Indices => "argsort",
-                }
-            ),
             Self::ArgReduce {
                 input,
                 max,

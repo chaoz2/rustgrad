@@ -266,7 +266,7 @@ impl Graph {
     ) -> Result<NodeId> {
         let shapes = inputs
             .iter()
-            .map(|id| self.shape(*id).map(Clone::clone))
+            .map(|id| self.shape(*id).cloned())
             .collect::<Result<Vec<_>>>()?;
         let plan = SourceEinsumPlan::parse(equation, &shapes)?;
         // The cloned graph is the whole-operation descriptor pass. It covers

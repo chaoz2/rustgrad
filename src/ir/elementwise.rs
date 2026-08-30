@@ -1438,7 +1438,6 @@ pub(crate) struct LogsigmoidPlan {
 /// Complete descriptor for tinygrad's literal
 /// `(1 / beta) * (x * beta).logaddexp(0)` Softplus graph.
 struct SoftplusPlan {
-    scaled_shape: Shape,
     scaled_dtype: DType,
     log_dtype: DType,
     inverse_dtype: DType,
@@ -3133,7 +3132,6 @@ fn softplus_plan(
         });
     }
     Ok(SoftplusPlan {
-        scaled_shape,
         scaled_dtype,
         log_dtype,
         inverse_dtype,
@@ -7359,10 +7357,8 @@ impl Graph {
         self.lower_celu(
             input,
             input_dtype,
-            alpha,
-            alpha_dtype,
-            alpha,
-            alpha_dtype,
+            (alpha, alpha_dtype),
+            (alpha, alpha_dtype),
             plan,
         )
     }
@@ -7388,10 +7384,8 @@ impl Graph {
         self.lower_celu(
             input,
             input_dtype,
-            division_alpha,
-            division_alpha_dtype,
-            multiply_alpha,
-            multiply_alpha_dtype,
+            (division_alpha, division_alpha_dtype),
+            (multiply_alpha, multiply_alpha_dtype),
             plan.core,
         )
     }
@@ -7405,12 +7399,12 @@ impl Graph {
         &mut self,
         input: NodeId,
         input_dtype: DType,
-        division_alpha: NodeId,
-        division_alpha_dtype: DType,
-        multiply_alpha: NodeId,
-        multiply_alpha_dtype: DType,
+        division_alpha: (NodeId, DType),
+        multiply_alpha: (NodeId, DType),
         plan: CeluPlan,
     ) -> Result<NodeId> {
+        let (division_alpha, division_alpha_dtype) = division_alpha;
+        let (multiply_alpha, multiply_alpha_dtype) = multiply_alpha;
         // tinygrad literally evaluates
         // `x.maximum(0) + (alpha * ((x / alpha).exp() - 1)).minimum(0)`.
         // Its division is reciprocal then multiply, and the shared extrema
@@ -7588,10 +7582,8 @@ impl Graph {
         self.lower_softplus(
             input,
             input_node.dtype,
-            beta,
-            beta_node.dtype,
-            beta,
-            beta_node.dtype,
+            (beta, beta_node.dtype),
+            (beta, beta_node.dtype),
             plan,
         )
     }
@@ -7613,10 +7605,8 @@ impl Graph {
         self.lower_softplus(
             input,
             input_dtype,
-            scale_beta,
-            scale_dtype,
-            inverse_beta,
-            inverse_dtype,
+            (scale_beta, scale_dtype),
+            (inverse_beta, inverse_dtype),
             plan.core,
         )
     }
@@ -7624,12 +7614,12 @@ impl Graph {
         &mut self,
         input: NodeId,
         input_dtype: DType,
-        scale_beta: NodeId,
-        scale_beta_dtype: DType,
-        inverse_beta: NodeId,
-        inverse_beta_dtype: DType,
+        scale_beta: (NodeId, DType),
+        inverse_beta: (NodeId, DType),
         plan: SoftplusPlan,
     ) -> Result<NodeId> {
+        let (scale_beta, scale_beta_dtype) = scale_beta;
+        let (inverse_beta, inverse_beta_dtype) = inverse_beta;
         let scaled_input = if input_dtype == plan.scaled_dtype {
             input
         } else {

@@ -675,10 +675,10 @@ fn nll_inputs(
     }
     let axis = axis(graph, log_probabilities, class_axis)?;
     target_shape(graph, log_probabilities, target, axis)?;
-    if let Some(weight) = weight {
-        if graph.shape(weight)?.dims() != [graph.shape(log_probabilities)?.dims()[axis]] {
-            return Err(invalid("NLL weight must have class shape"));
-        }
+    if let Some(weight) = weight
+        && graph.shape(weight)?.dims() != [graph.shape(log_probabilities)?.dims()[axis]]
+    {
+        return Err(invalid("NLL weight must have class shape"));
     }
     Ok(axis)
 }
@@ -1136,7 +1136,6 @@ pub fn cross_entropy(
     reduce(graph, loss, options.reduction)
 }
 /// NLL for log probabilities and sparse integer targets; optional class weights are rank-one.
-
 struct NllLossPlan {
     main: SourceGatherPlan,
     weight: Option<SourceGatherPlan>,
@@ -1360,9 +1359,9 @@ mod tests {
                 .all(|len| len == 1)
         );
         let reduced_loss = graph.sum_default(loss).unwrap();
-        assert!(matches!(graph.grad(reduced_loss, logp), Ok(_)));
+        assert!(graph.grad(reduced_loss, logp).is_ok());
         let reduced_loss = graph.sum_default(loss).unwrap();
-        assert!(matches!(graph.grad(reduced_loss, labels), Err(_)));
+        assert!(graph.grad(reduced_loss, labels).is_err());
 
         for reduction in [Reduction::Sum, Reduction::Mean] {
             let mut reduced = Graph::new();
@@ -1832,7 +1831,7 @@ mod tests {
         // Hard labels are internal one-hot Bool, then the source's Python float
         // smoothing affine lifts them before LogSoftmax multiplication.
         assert_eq!(hard.dtype(loss).unwrap(), crate::DType::F32);
-        assert!(matches!(hard.grad(loss, logits), Ok(_)));
+        assert!(hard.grad(loss, logits).is_ok());
 
         let mut probabilities = Graph::new();
         let logits = probabilities.input_dtype("x", [2, 3], crate::DType::I16);

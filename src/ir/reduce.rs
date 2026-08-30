@@ -281,13 +281,6 @@ struct MaxPlan {
     lowering: MaxLowering,
 }
 
-struct MinPlan {
-    axes: Vec<isize>,
-    output_shape: Shape,
-    dtype: DType,
-    lowering: MaxLowering,
-}
-
 struct VariancePlan {
     axes: Vec<isize>,
     mean_shape: Shape,
@@ -682,28 +675,6 @@ fn max_reduction_identity(dtype: DType) -> Scalar {
     }
 }
 
-fn min_reduction_identity(dtype: DType) -> Scalar {
-    match dtype {
-        DType::Bool => Scalar::Bool(true),
-        DType::I8 => Scalar::I(i8::MAX.into()),
-        DType::U8 => Scalar::U(u8::MAX.into()),
-        DType::I16 => Scalar::I(i16::MAX.into()),
-        DType::U16 => Scalar::U(u16::MAX.into()),
-        DType::I32 => Scalar::I(i32::MAX.into()),
-        DType::U32 => Scalar::U(u32::MAX.into()),
-        DType::I64 => Scalar::I(i64::MAX),
-        DType::U64 => Scalar::U(u64::MAX),
-        DType::F8E4M3
-        | DType::F8E5M2
-        | DType::F8E4M3FNUZ
-        | DType::F8E5M2FNUZ
-        | DType::F16
-        | DType::BF16
-        | DType::F32
-        | DType::F64 => Scalar::F(f64::INFINITY),
-    }
-}
-
 fn max_plan(
     input: NodeId,
     shape: &Shape,
@@ -743,52 +714,6 @@ fn max_plan(
         MaxLowering::Reduce
     };
     Ok(MaxPlan {
-        axes: axes.into_iter().map(|axis| axis as isize).collect(),
-        output_shape,
-        dtype,
-        lowering,
-    })
-}
-
-fn min_plan(
-    input: NodeId,
-    shape: &Shape,
-    dtype: DType,
-    axes: Option<Vec<isize>>,
-    keepdim: bool,
-) -> Result<MinPlan> {
-    let extent = |shape: &Shape| {
-        shape
-            .numel()?
-            .checked_mul(dtype.itemsize())
-            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
-    };
-    let axes = if shape.rank() == 0 {
-        if axes
-            .as_ref()
-            .is_some_and(|axes| axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0)))
-        {
-            return Err(Error::InvalidReductionAxes {
-                node: input,
-                axes: vec![usize::MAX],
-                rank: 0,
-            });
-        }
-        Vec::new()
-    } else {
-        normalize_axes(input, shape.rank(), axes)?
-    };
-    let output_shape = reduction_shape(shape, &axes, keepdim);
-    extent(shape)?;
-    extent(&output_shape)?;
-    let lowering = if axes.is_empty() {
-        MaxLowering::Identity
-    } else if output_shape.numel()? > 0 && axes.iter().any(|axis| shape.dims()[*axis] == 0) {
-        MaxLowering::IdentityValue(min_reduction_identity(dtype))
-    } else {
-        MaxLowering::Reduce
-    };
-    Ok(MinPlan {
         axes: axes.into_iter().map(|axis| axis as isize).collect(),
         output_shape,
         dtype,
@@ -1263,24 +1188,6 @@ impl Graph {
         } else {
             self.cast(reduced, dtypes.output)
         }
-    }
-
-    fn boolean_reduction_input(
-        &mut self,
-        input: NodeId,
-        axes: Option<Vec<isize>>,
-    ) -> Result<(NodeId, Vec<usize>)> {
-        let (rank, dtype) = {
-            let source = self.node(input)?;
-            (source.shape.rank(), source.dtype)
-        };
-        let axes = normalize_axes(input, rank, axes)?;
-        let boolean = if dtype == DType::Bool {
-            input
-        } else {
-            self.cast(input, DType::Bool)?
-        };
-        Ok((boolean, axes))
     }
 
     /// Product reduction over optional signed axes.
@@ -2064,13 +1971,10 @@ impl Graph {
             let input_node = self.node(input)?;
             (input_node.shape.clone(), input_node.dtype)
         };
-        let plan = min_plan(input, &input_shape, input_dtype, axes.clone(), keepdim)?;
         // Preflight the exact source middle stage before either inverse can
-        // publish. Both inverses preserve the concrete descriptor, so this
-        // validates all source/intermediate/output extents atomically.
-        let max_plan = max_plan(input, &input_shape, input_dtype, axes.clone(), keepdim)?;
-        debug_assert_eq!(plan.output_shape, max_plan.output_shape);
-        debug_assert_eq!(plan.dtype, max_plan.dtype);
+        // publish. Both inverses preserve the concrete descriptor, so the Max
+        // plan validates all source/intermediate/output extents atomically.
+        let plan = max_plan(input, &input_shape, input_dtype, axes.clone(), keepdim)?;
         let inverse = if input_dtype.is_float() {
             self.neg(input)?
         } else {

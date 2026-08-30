@@ -219,7 +219,7 @@ fn source_roll_plan(
                             rank,
                         })
                     } else {
-                        Ok(axis as isize)
+                        Ok(axis)
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -488,6 +488,9 @@ fn lazy_arange_plan(
 }
 
 #[cfg(test)]
+// This file keeps the large creation acceptance suite beside the descriptor
+// planners it exercises; the public Graph implementation follows below.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, SplitSections};
@@ -641,7 +644,7 @@ mod tests {
                 .full_tinygrad([0, 3], Scalar::I(-1), Some(dtype), true)
                 .unwrap();
             assert_eq!(graph.dtype(output).unwrap(), dtype);
-            assert!(matches!(graph.op(output).unwrap(), Op::Constant(data) if data.len() == 0));
+            assert!(matches!(graph.op(output).unwrap(), Op::Constant(data) if data.is_empty()));
         }
 
         let dense = graph
@@ -720,7 +723,7 @@ mod tests {
         assert_eq!(graph.dtype(override_dtype).unwrap(), DType::U32);
         assert_eq!(graph.dtype(inherited_one).unwrap(), DType::BF16);
         assert!(!graph.node(inherited).unwrap().requires_grad);
-        assert!(matches!(graph.op(override_dtype).unwrap(), Op::Constant(data) if data.len() == 0));
+        assert!(matches!(graph.op(override_dtype).unwrap(), Op::Constant(data) if data.is_empty()));
         let Op::Expand {
             input: inherited_scalar,
             ..
@@ -866,7 +869,7 @@ mod tests {
         assert_eq!(graph.shape(inherited).unwrap(), &Shape::from([2, 0, 3]));
         assert_eq!(graph.dtype(inherited).unwrap(), DType::BF16);
         assert_eq!(graph.dtype(override_dtype).unwrap(), DType::U32);
-        assert!(matches!(graph.op(inherited).unwrap(), Op::Constant(data) if data.len() == 0));
+        assert!(matches!(graph.op(inherited).unwrap(), Op::Constant(data) if data.is_empty()));
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
@@ -3842,7 +3845,7 @@ impl Graph {
                     .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
                 let mut shape = Vec::with_capacity(trailing + 1);
                 shape.push(length);
-                shape.extend(std::iter::repeat(1).take(trailing));
+                shape.extend(std::iter::repeat_n(1, trailing));
                 let shape = Shape::new(shape);
                 if shape.numel()? != length {
                     return Err(Error::InvalidReshape {

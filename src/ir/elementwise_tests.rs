@@ -4562,23 +4562,13 @@ fn modulo_scalar_preserves_floor_composition_and_reflected_roles() {
         let output = forward.modulo_scalar(input, value).unwrap();
         assert_eq!(forward.shape(output).unwrap(), &Shape::new([2]));
         assert_eq!(forward.dtype(output).unwrap(), expected);
-        if dtype.is_integer() {
-            assert!(matches!(
-                forward.op(output).unwrap(),
-                Op::Binary {
-                    op: BinaryOp::Add,
-                    ..
-                }
-            ));
-        } else {
-            assert!(matches!(
-                forward.op(output).unwrap(),
-                Op::Binary {
-                    op: BinaryOp::Add,
-                    ..
-                }
-            ));
-        }
+        assert!(matches!(
+            forward.op(output).unwrap(),
+            Op::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
         let mut reflected = Graph::new();
         let input = reflected.input_dtype("input", [2], dtype);
         let output = reflected.scalar_modulo(value, input).unwrap();
@@ -5133,8 +5123,6 @@ fn clip_is_a_clamp_alias_with_the_existing_vjp() {
     let min = graph.constant(TensorData::scalar(-1.0));
     let max = graph.constant(TensorData::scalar(1.0));
     let output = graph.clip(input, Some(min), Some(max)).unwrap();
-    let loss = graph.sum_all(output).unwrap();
-    let gradient = graph.grad(loss, input).unwrap();
     let bindings = HashMap::from([(
         "x".into(),
         TensorData::new([3], vec![-2., 0.5, 3.]).unwrap(),
@@ -8638,10 +8626,10 @@ fn logical_not_uses_tinygrad_bool_cast_ne_true_and_preflight() {
             )]),
         )
         .unwrap();
-    assert_eq!(values.scalar_at(0).as_bool(), true);
-    assert_eq!(values.scalar_at(1).as_bool(), false);
-    assert_eq!(values.scalar_at(2).as_bool(), false);
-    assert_eq!(values.scalar_at(3).as_bool(), false);
+    assert!(values.scalar_at(0).as_bool());
+    assert!(!values.scalar_at(1).as_bool());
+    assert!(!values.scalar_at(2).as_bool());
+    assert!(!values.scalar_at(3).as_bool());
     let mut dtypes = Graph::new();
     for (name, dtype) in [
         ("bool", DType::Bool),
@@ -10727,7 +10715,7 @@ fn hardsigmoid_scalar_preserves_source_left_alpha_and_staged_relu_difference() {
         assert!((0..graph.node_count()).any(|index| matches!(graph.op(NodeId(index)).unwrap(),
             Op::Binary { op: BinaryOp::Mul, lhs, rhs } if matches!(graph.op(*lhs).unwrap(), Op::Constant(_)) && *rhs == input)));
         let loss = graph.sum_all(output).unwrap();
-        assert!(matches!(graph.grad(loss, input), Ok(_)));
+        assert!(graph.grad(loss, input).is_ok());
     }
 
     let mut default = Graph::new();
@@ -10829,7 +10817,7 @@ fn gelu_default_delegates_to_tinygrad_tanh_without_affecting_onnx_mode() {
         }
     )));
     let loss = graph.sum_all(output).unwrap();
-    assert!(matches!(graph.grad(loss, input), Ok(_)));
+    assert!(graph.grad(loss, input).is_ok());
 
     for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
         let mut narrow = Graph::new();
@@ -10900,7 +10888,7 @@ fn batchnorm_is_source_literal_affine_with_raw_axis_membership() {
         }
     ));
     let loss = graph.sum_all(output).unwrap();
-    assert!(matches!(graph.grad(loss, input), Ok(_)));
+    assert!(graph.grad(loss, input).is_ok());
 
     let mut default_axis = Graph::new();
     let input = default_axis.input("x", [2, 3]);
