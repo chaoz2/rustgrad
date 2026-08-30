@@ -1426,20 +1426,46 @@ fn scoped_binary_plan(
             ));
         }
         let input_index = index(load)?;
-        let UArg::BufferIndex {
-            elements,
-            input_shape,
-            output_shape: operand_output,
-            ..
-        } = input_index.arg()
-        else {
-            return Err(PtxError::Unsupported(
-                "scoped Mul does not admit affine-view operands".into(),
-            ));
+        let (elements, input_shape, operand_output) = match input_index.arg() {
+            UArg::BufferIndex {
+                elements,
+                input_shape,
+                output_shape,
+                ..
+            } => (*elements, input_shape, output_shape),
+            UArg::ViewBufferIndex {
+                elements,
+                input_shape,
+                output_shape,
+                view,
+                ..
+            } => {
+                view.validate_read().map_err(|_| {
+                    PtxError::Unsupported("scoped Mul affine view is invalid".into())
+                })?;
+                if &view.logical_shape != input_shape
+                    || view
+                        .source_shape
+                        .numel()
+                        .map_err(|_| PtxError::Overflow)?
+                        .checked_mul(source_dtype.itemsize())
+                        .is_none()
+                {
+                    return Err(PtxError::Unsupported(
+                        "scoped Mul affine view descriptor is invalid".into(),
+                    ));
+                }
+                (*elements, input_shape, output_shape)
+            }
+            _ => {
+                return Err(PtxError::Unsupported(
+                    "scoped Mul requires a typed buffer index".into(),
+                ));
+            }
         };
         if input_index.ty().map(|ty| ty.scalar) != Some(source_dtype)
             || operand_output != output_shape
-            || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+            || input_shape.numel().map_err(|_| PtxError::Overflow)? != elements
             || elements.checked_mul(source_dtype.itemsize()).is_none()
         {
             return Err(PtxError::Unsupported(
@@ -1448,11 +1474,15 @@ fn scoped_binary_plan(
         }
     }
     let left_shape = match index(left_load)?.arg() {
-        UArg::BufferIndex { input_shape, .. } => input_shape,
+        UArg::BufferIndex { input_shape, .. } | UArg::ViewBufferIndex { input_shape, .. } => {
+            input_shape
+        }
         _ => unreachable!(),
     };
     let right_shape = match index(right_load)?.arg() {
-        UArg::BufferIndex { input_shape, .. } => input_shape,
+        UArg::BufferIndex { input_shape, .. } | UArg::ViewBufferIndex { input_shape, .. } => {
+            input_shape
+        }
         _ => unreachable!(),
     };
     if left_shape

@@ -757,7 +757,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "#include <math.h>".into(),
         "#include <string.h>".into(),
         "#include <limits.h>".into(),
-        format!("/* rustgrad C11 ABI v2; vector lanes={} ({}) linear={linear_key:?} */", plan.lanes, plan.reason),
+        format!("/* {RENDERER_VERSION} C11 ABI v2; vector lanes={} ({}) linear={linear_key:?} */", plan.lanes, plan.reason),
         "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
         "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff; r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
         "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
@@ -1635,7 +1635,7 @@ fn render_vector_program(
     }
     let mut lines = vec![
         "#include <stdint.h>".into(), "#include <stddef.h>".into(), "#include <math.h>".into(), "#include <string.h>".into(), "#include <limits.h>".into(),
-        format!("/* rustgrad B2 VectorProgram key={} lanes={} */", program.cache_key, lanes),
+        format!("/* {RENDERER_VERSION} B2 VectorProgram key={} lanes={} */", program.cache_key, lanes),
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static void rg_fail(uint64_t*f,uint64_t i,uint64_t c){if(!f[1]||i<f[0]){f[0]=i;f[1]=c;}}".into(),
         "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a/b;} static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a%b;}".into(),
@@ -3211,18 +3211,6 @@ mod tests {
     }
 
     #[test]
-    fn public_abs_sign_composition_is_fail_closed_without_a_jit_sign_contract() {
-        let mut graph = Graph::new();
-        let input = graph.input_dtype("input", Shape::from([1]), DType::F32);
-        let output = graph.abs(input).unwrap();
-        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
-        assert!(matches!(
-            CpuJit::render(&uop),
-            Err(JitError::Unsupported(_))
-        ));
-    }
-
-    #[test]
     fn exp2_emits_the_cpu_oracle_double_path_and_preserves_vector_fallback() {
         // Public Exp2 lifts exact storage to F32 and preserves each float
         // storage dtype. The scalar renderer evaluates the same f64 Exp2 as
@@ -3781,7 +3769,7 @@ mod tests {
     }
 
     #[test]
-    fn native_log2_matches_cpu_oracle_and_rejects_narrow_storage() {
+    fn native_log2_matches_cpu_oracle_and_renders_narrow_storage() {
         for dtype in [DType::F32, DType::F64] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([3]), dtype);
@@ -3817,19 +3805,23 @@ mod tests {
             assert_eq!(native.storage(), expected.storage(), "{dtype:?}");
         }
 
-        for dtype in [DType::F16, DType::BF16] {
-            let mut unsupported = Graph::new();
-            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
-            let output = unsupported.log2(input).unwrap();
-            assert!(matches!(
-                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
-                Err(JitError::Unsupported(reason)) if reason.contains("unary Log2")
-            ));
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.log2(input).unwrap();
+            let rendered =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("log2("), "{dtype:?}");
+            assert!(rendered.source.contains(decode), "{dtype:?}");
+            assert!(rendered.source.contains(encode), "{dtype:?}");
         }
     }
 
     #[test]
-    fn native_exp2_matches_cpu_oracle_and_rejects_narrow_storage() {
+    fn native_exp2_matches_cpu_oracle_and_renders_narrow_storage() {
         for dtype in [DType::F32, DType::F64] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([3]), dtype);
@@ -3865,19 +3857,23 @@ mod tests {
             assert_eq!(native.storage(), expected.storage(), "{dtype:?}");
         }
 
-        for dtype in [DType::F16, DType::BF16] {
-            let mut unsupported = Graph::new();
-            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
-            let output = unsupported.exp2(input).unwrap();
-            assert!(matches!(
-                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
-                Err(JitError::Unsupported(reason)) if reason.contains("unary Exp2")
-            ));
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.exp2(input).unwrap();
+            let rendered =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("exp2("), "{dtype:?}");
+            assert!(rendered.source.contains(decode), "{dtype:?}");
+            assert!(rendered.source.contains(encode), "{dtype:?}");
         }
     }
 
     #[test]
-    fn native_sin_matches_cpu_oracle_and_rejects_narrow_storage() {
+    fn native_sin_matches_cpu_oracle_and_renders_narrow_storage() {
         for dtype in [DType::F32, DType::F64] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([3]), dtype);
@@ -3920,19 +3916,23 @@ mod tests {
             }
         }
 
-        for dtype in [DType::F16, DType::BF16] {
-            let mut unsupported = Graph::new();
-            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
-            let output = unsupported.sin(input).unwrap();
-            assert!(matches!(
-                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
-                Err(JitError::Unsupported(reason)) if reason.contains("unary Sin")
-            ));
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.sin(input).unwrap();
+            let rendered =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("sin("), "{dtype:?}");
+            assert!(rendered.source.contains(decode), "{dtype:?}");
+            assert!(rendered.source.contains(encode), "{dtype:?}");
         }
     }
 
     #[test]
-    fn native_tan_matches_cpu_oracle_and_rejects_narrow_storage() {
+    fn native_tan_matches_cpu_oracle_and_renders_narrow_storage() {
         for dtype in [DType::F32, DType::F64] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([3]), dtype);
@@ -3975,19 +3975,23 @@ mod tests {
             }
         }
 
-        for dtype in [DType::F16, DType::BF16] {
-            let mut unsupported = Graph::new();
-            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
-            let output = unsupported.tan(input).unwrap();
-            assert!(matches!(
-                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
-                Err(JitError::Unsupported(reason)) if reason.contains("unary Tan")
-            ));
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.tan(input).unwrap();
+            let rendered =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("tan("), "{dtype:?}");
+            assert!(rendered.source.contains(decode), "{dtype:?}");
+            assert!(rendered.source.contains(encode), "{dtype:?}");
         }
     }
 
     #[test]
-    fn native_cos_matches_cpu_oracle_and_rejects_narrow_storage() {
+    fn native_cos_matches_cpu_oracle_and_renders_narrow_storage() {
         for dtype in [DType::F32, DType::F64] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([3]), dtype);
@@ -4030,19 +4034,23 @@ mod tests {
             }
         }
 
-        for dtype in [DType::F16, DType::BF16] {
-            let mut unsupported = Graph::new();
-            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
-            let output = unsupported.cos(input).unwrap();
-            assert!(matches!(
-                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
-                Err(JitError::Unsupported(reason)) if reason.contains("unary Cos")
-            ));
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.cos(input).unwrap();
+            let rendered =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("cos("), "{dtype:?}");
+            assert!(rendered.source.contains(decode), "{dtype:?}");
+            assert!(rendered.source.contains(encode), "{dtype:?}");
         }
     }
 
     #[test]
-    fn native_log_matches_cpu_oracle_and_rejects_narrow_storage() {
+    fn native_log_matches_cpu_oracle_and_renders_narrow_storage() {
         for dtype in [DType::F32, DType::F64] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([3]), dtype);
@@ -4085,19 +4093,23 @@ mod tests {
             }
         }
 
-        for dtype in [DType::F16, DType::BF16] {
-            let mut unsupported = Graph::new();
-            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
-            let output = unsupported.log(input).unwrap();
-            assert!(matches!(
-                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
-                Err(JitError::Unsupported(reason)) if reason.contains("unary Log")
-            ));
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.log(input).unwrap();
+            let rendered =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("log("), "{dtype:?}");
+            assert!(rendered.source.contains(decode), "{dtype:?}");
+            assert!(rendered.source.contains(encode), "{dtype:?}");
         }
     }
 
     #[test]
-    fn native_trunc_matches_cpu_oracle_and_rejects_narrow_storage() {
+    fn native_trunc_matches_cpu_oracle_and_renders_narrow_storage() {
         for dtype in [DType::F32, DType::F64] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([3]), dtype);
@@ -4133,14 +4145,18 @@ mod tests {
             assert_eq!(native.storage(), expected.storage(), "{dtype:?}");
         }
 
-        for dtype in [DType::F16, DType::BF16] {
-            let mut unsupported = Graph::new();
-            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
-            let output = unsupported.trunc(input).unwrap();
-            assert!(matches!(
-                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
-                Err(JitError::Unsupported(reason)) if reason.contains("unary Trunc")
-            ));
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.trunc(input).unwrap();
+            let rendered =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("trunc("), "{dtype:?}");
+            assert!(rendered.source.contains(decode), "{dtype:?}");
+            assert!(rendered.source.contains(encode), "{dtype:?}");
         }
     }
 

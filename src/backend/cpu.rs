@@ -138,7 +138,15 @@ impl Backend for CpuBackend {
         // Pair results are materialized together before either selector is
         // exposed to the node evaluator.
         let mut sort_pairs = HashMap::new();
+        let mut float8_taint = Vec::with_capacity(output.index() + 1);
         for (index, node) in graph.nodes[..=output.index()].iter().enumerate() {
+            let reaches_float8 = node.dtype.is_float8()
+                || node
+                    .op
+                    .value_inputs()
+                    .iter()
+                    .any(|input| float8_taint[input.index()]);
+            float8_taint.push(reaches_float8);
             if !needed[index] {
                 values.push(TensorData::zeros_with_dtype(
                     node.shape.clone(),
@@ -152,7 +160,7 @@ impl Backend for CpuBackend {
             {
                 return Err(Error::UnsupportedDType { dtype: node.dtype });
             }
-            if float8_reaches_node(graph, node) && !float8_cpu_capability(&node.op) {
+            if reaches_float8 && !float8_cpu_capability(&node.op) {
                 return Err(Error::UnsupportedDType { dtype: node.dtype });
             }
             let value = match &node.op {
@@ -519,6 +527,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
             | Op::Unary {
                 op: UnaryOp::Neg
                     | UnaryOp::Abs
+                    | UnaryOp::Sign
                     | UnaryOp::IsNan
                     | UnaryOp::IsInf
                     | UnaryOp::IsFinite,
@@ -534,6 +543,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
                 ..
             }
             | Op::Compare { .. }
+            | Op::Logical { .. }
             | Op::Reduce { .. }
             | Op::Reshape { .. }
             | Op::Permute { .. }
@@ -551,15 +561,6 @@ fn float8_cpu_capability(op: &Op) -> bool {
             | Op::Einsum { .. }
             | Op::Conv2d { .. }
     )
-}
-
-fn float8_reaches_node(graph: &Graph, node: &crate::ir::Node) -> bool {
-    node.dtype.is_float8()
-        || node
-            .op
-            .value_inputs()
-            .iter()
-            .any(|input| graph.nodes[input.index()].dtype.is_float8())
 }
 
 impl CpuBackend {
@@ -1499,6 +1500,13 @@ fn float8_unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorD
         match op {
             UnaryOp::Neg => Scalar::F(-value),
             UnaryOp::Abs => Scalar::F(value.abs()),
+            UnaryOp::Sign => Scalar::F(if value == 0.0 {
+                0.0
+            } else if value < 0.0 {
+                -1.0
+            } else {
+                1.0
+            }),
             UnaryOp::IsNan => Scalar::Bool(value.is_nan()),
             UnaryOp::IsInf => Scalar::Bool(value.is_infinite()),
             UnaryOp::IsFinite => Scalar::Bool(value.is_finite()),
@@ -4933,14 +4941,12 @@ mod tests {
         );
         let narrow = graph.add(x, integer).unwrap();
         assert_eq!(graph.dtype(narrow).unwrap(), DType::F8E4M3);
-        assert_eq!(
-            CpuBackend
-                .execute(&graph, narrow, &HashMap::from([("x".into(), lhs)]))
-                .unwrap()
-                .to_le_bytes()
-                .unwrap(),
-            vec![0x40, 0x48]
-        );
+        assert!(matches!(
+            CpuBackend.execute(&graph, narrow, &HashMap::from([("x".into(), lhs)])),
+            Err(Error::UnsupportedDType {
+                dtype: DType::F8E4M3
+            })
+        ));
     }
 
     #[test]
@@ -6587,7 +6593,7 @@ mod tests {
         assert_eq!(graph.dtype(condition).unwrap(), DType::Bool);
         let selected = graph.select(condition, lhs, rhs).unwrap();
         assert_eq!(graph.shape(selected).unwrap(), &Shape::from([2, 2]));
-        assert_eq!(graph.dtype(selected).unwrap(), DType::F64);
+        assert_eq!(graph.dtype(selected).unwrap(), DType::F32);
         let inputs = HashMap::from([
             (
                 "lhs".into(),
@@ -6604,7 +6610,7 @@ mod tests {
                 .execute(&graph, selected, &inputs)
                 .unwrap()
                 .storage(),
-            &crate::Storage::F64(vec![-1.0, -1.0, 0.0, 4.0])
+            &crate::Storage::F32(vec![-1.0, -1.0, 0.0, 4.0])
         );
 
         let mut logical_graph = Graph::new();
@@ -7542,7 +7548,9 @@ mod tests {
             assert_eq!(result.scalar_at(1).as_f64(), 2.0, "{dtype:?}");
             assert!(result.scalar_at(2).as_f64().is_infinite(), "{dtype:?}");
             assert!(result.scalar_at(3).as_f64().is_nan(), "{dtype:?}");
-            assert!(graph.trace(output).unwrap().to_string().contains("abs"));
+            let trace = graph.trace(output).unwrap().to_string();
+            assert!(trace.contains("sign"), "{dtype:?}");
+            assert!(trace.contains("mul"), "{dtype:?}");
         }
     }
 

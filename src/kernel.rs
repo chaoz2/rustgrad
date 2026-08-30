@@ -2102,11 +2102,13 @@ mod tests {
             assert_eq!(
                 execute_elementwise(&graph, output, &inputs)
                     .unwrap()
-                    .storage(),
+                    .to_le_bytes()
+                    .unwrap(),
                 CpuBackend
                     .execute(&graph, output, &inputs)
                     .unwrap()
-                    .storage(),
+                    .to_le_bytes()
+                    .unwrap(),
                 "{label} ordered float selection",
             );
         }
@@ -2172,11 +2174,13 @@ mod tests {
             assert_eq!(
                 execute_elementwise(&graph, output, &inputs)
                     .unwrap()
-                    .storage(),
+                    .to_le_bytes()
+                    .unwrap(),
                 CpuBackend
                     .execute(&graph, output, &inputs)
                     .unwrap()
-                    .storage(),
+                    .to_le_bytes()
+                    .unwrap(),
                 "{dtype:?} {kind:?}",
             );
         }
@@ -2276,11 +2280,13 @@ mod tests {
         assert_eq!(
             execute_elementwise(&graph, output, &inputs)
                 .unwrap()
-                .storage(),
+                .to_le_bytes()
+                .unwrap(),
             CpuBackend
                 .execute(&graph, output, &inputs)
                 .unwrap()
-                .storage(),
+                .to_le_bytes()
+                .unwrap(),
             "F32->BF16 signaling-NaN payload through Select"
         );
 
