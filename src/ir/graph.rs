@@ -3578,7 +3578,7 @@ impl Graph {
                 if axis < 0 || axis >= rank {
                     return Err(Error::InvalidAxis {
                         node: input,
-                        axis: usize::MAX,
+                        axis: usize::try_from(axis).unwrap_or(usize::MAX),
                         rank: rank as usize,
                     });
                 }
@@ -3587,7 +3587,7 @@ impl Graph {
             .collect::<Result<Vec<_>>>()?;
         normalized.sort_unstable();
         if normalized.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(Error::InvalidRandom {
+            return Err(Error::InvalidFlip {
                 reason: "flip axes must be unique",
             });
         }
