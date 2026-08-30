@@ -1013,7 +1013,7 @@ impl Graph {
                     self.accumulate(&mut grads, lhs, lhs_grad)?;
                     self.accumulate(&mut grads, rhs, rhs_grad)?;
                 }
-                Op::Einsum { inputs, plan } => {
+                Op::Einsum { inputs, plan, .. } => {
                     for (target, input) in inputs.iter().enumerate() {
                         if self.node(*input)?.dtype.is_float() {
                             let gradient =
@@ -1259,10 +1259,9 @@ impl Graph {
     }
 
     fn cumsum_vjp(&mut self, upstream: NodeId, axis: usize) -> Result<NodeId> {
-        self.reverse_axis(
-            self.cumsum(self.reverse_axis(upstream, axis)?, axis as isize)?,
-            axis,
-        )
+        let reversed = self.reverse_axis(upstream, axis)?;
+        let summed = self.cumsum(reversed, axis as isize)?;
+        self.reverse_axis(summed, axis)
     }
 
     fn cumprod_vjp(&mut self, upstream: NodeId, input: NodeId, axis: usize) -> Result<NodeId> {
@@ -1271,20 +1270,26 @@ impl Graph {
         let one_value = self.constant(TensorData::scalar_with_dtype(Scalar::F(1.0), dtype));
         let zero_mask = self.eq(input, zero_value)?;
         let safe_input = self.select(zero_mask, one_value, input)?;
-        let zero_count = self.cumsum(self.cast(zero_mask, DType::I32)?, axis as isize)?;
-        let weighted = self.mul(upstream, self.cumprod(safe_input, axis as isize)?)?;
+        let zero_mask_i32 = self.cast(zero_mask, DType::I32)?;
+        let zero_count = self.cumsum(zero_mask_i32, axis as isize)?;
+        let safe_product = self.cumprod(safe_input, axis as isize)?;
+        let weighted = self.mul(upstream, safe_product)?;
         let count_zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32));
         let count_one = self.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
         let zero = self.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), dtype));
-        let ordinary = self.select(self.eq(zero_count, count_zero)?, weighted, zero)?;
-        let zero_lane = self.select(self.eq(zero_count, count_one)?, weighted, zero)?;
-        let ordinary = self.div(self.cumsum_vjp(ordinary, axis)?, safe_input)?;
-        self.select(zero_mask, self.cumsum_vjp(zero_lane, axis)?, ordinary)
+        let no_zero = self.eq(zero_count, count_zero)?;
+        let one_zero = self.eq(zero_count, count_one)?;
+        let ordinary = self.select(no_zero, weighted, zero)?;
+        let zero_lane = self.select(one_zero, weighted, zero)?;
+        let ordinary_sum = self.cumsum_vjp(ordinary, axis)?;
+        let ordinary = self.div(ordinary_sum, safe_input)?;
+        let zero_lane = self.cumsum_vjp(zero_lane, axis)?;
+        self.select(zero_mask, zero_lane, ordinary)
     }
 
     fn reverse_axis(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
         let shape = self.node(input)?.shape.clone();
-        let slices = shape
+        let slices: Vec<crate::Slice> = shape
             .dims()
             .iter()
             .enumerate()
@@ -1375,7 +1380,8 @@ mod tests {
         let input = graph.input("input", [2, 3]);
         let (values, indices) = graph.sort(input, -1, true).unwrap();
         let weights = graph.constant(data([2, 3], &[1., 2., 4., 8., 16., 32.]));
-        let loss = graph.sum_all(graph.mul(values, weights).unwrap()).unwrap();
+        let weighted = graph.mul(values, weights).unwrap();
+        let loss = graph.sum_all(weighted).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
         assert!(matches!(
@@ -1397,10 +1403,10 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("input", [3]);
         let (values, _) = graph.sort(input, 0, false).unwrap();
-        let weighted = graph
-            .mul(values, graph.constant(data([3], &[1., 2., 4.])))
-            .unwrap();
-        let loss = graph.sum_all(graph.add(weighted, values).unwrap()).unwrap();
+        let weights = graph.constant(data([3], &[1., 2., 4.]));
+        let weighted = graph.mul(values, weights).unwrap();
+        let total = graph.add(weighted, values).unwrap();
+        let loss = graph.sum_all(total).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         assert_eq!(
             CpuBackend
@@ -1434,7 +1440,8 @@ mod tests {
         let input = graph.input("input", [2, 3]);
         let (values, indices) = graph.topk(input, 2, -1, true, true).unwrap();
         let weights = graph.constant(data([2, 2], &[1., 2., 4., 8.]));
-        let loss = graph.sum_all(graph.mul(values, weights).unwrap()).unwrap();
+        let weighted = graph.mul(values, weights).unwrap();
+        let loss = graph.sum_all(weighted).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
         assert!(matches!(
@@ -1529,13 +1536,11 @@ mod tests {
         let loss = graph.sum(product, 0).unwrap();
         let vector_grad = graph.grad(loss, vector).unwrap();
         let matrix_grad = graph.grad(loss, matrix).unwrap();
-        assert!(
-            graph
-                .trace(vector_grad)
-                .unwrap()
-                .to_string()
-                .contains("matmul_lhs_grad")
-        );
+        assert!(graph
+            .trace(vector_grad)
+            .unwrap()
+            .to_string()
+            .contains("matmul_lhs_grad"));
         let inputs = HashMap::from([
             (
                 "vector".into(),
@@ -2408,12 +2413,10 @@ mod tests {
             ("y".into(), data([1, 2], &[3., 4.])),
         ]);
         let actual = CpuBackend.execute(&graph, second, &values).unwrap();
-        assert!(
-            actual
-                .values()
-                .iter()
-                .all(|value| value.is_finite() && *value > 0.0)
-        );
+        assert!(actual
+            .values()
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0));
     }
 
     #[test]
@@ -2463,13 +2466,11 @@ mod tests {
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([2], &[4., 2.])
         );
-        assert!(
-            graph
-                .trace(hvp)
-                .unwrap()
-                .to_string()
-                .contains("matmul_grad_vjp")
-        );
+        assert!(graph
+            .trace(hvp)
+            .unwrap()
+            .to_string()
+            .contains("matmul_grad_vjp"));
     }
 
     #[test]
@@ -2492,13 +2493,11 @@ mod tests {
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([2, 2], &[16., 0., 0., 16.])
         );
-        assert!(
-            graph
-                .trace(hvp)
-                .unwrap()
-                .to_string()
-                .contains("einsum_grad_vjp")
-        );
+        assert!(graph
+            .trace(hvp)
+            .unwrap()
+            .to_string()
+            .contains("einsum_grad_vjp"));
     }
 
     #[test]
@@ -2527,13 +2526,11 @@ mod tests {
                 data([2], &expected),
                 "{name}"
             );
-            assert!(
-                graph
-                    .trace(hvp)
-                    .unwrap()
-                    .to_string()
-                    .contains("reduce_grad_vjp_Product")
-            );
+            assert!(graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("reduce_grad_vjp_Product"));
         }
     }
 
@@ -2557,13 +2554,11 @@ mod tests {
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([3], &[0., 0., 0.])
         );
-        assert!(
-            graph
-                .trace(hvp)
-                .unwrap()
-                .to_string()
-                .contains("reduce_grad_vjp_Max")
-        );
+        assert!(graph
+            .trace(hvp)
+            .unwrap()
+            .to_string()
+            .contains("reduce_grad_vjp_Max"));
     }
 
     #[test]
@@ -2610,13 +2605,11 @@ mod tests {
             CpuBackend.execute(&graph, shrink_vjp, &values).unwrap(),
             data([2], &[20., 30.])
         );
-        assert!(
-            graph
-                .trace(shrink_vjp)
-                .unwrap()
-                .to_string()
-                .contains("scatter_positions_vjp")
-        );
+        assert!(graph
+            .trace(shrink_vjp)
+            .unwrap()
+            .to_string()
+            .contains("scatter_positions_vjp"));
     }
 
     #[test]
@@ -2643,12 +2636,10 @@ mod tests {
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([1, 1, 1, 1], &[160.])
         );
-        assert!(
-            graph
-                .trace(hvp)
-                .unwrap()
-                .to_string()
-                .contains("conv2d_grad_vjp")
-        );
+        assert!(graph
+            .trace(hvp)
+            .unwrap()
+            .to_string()
+            .contains("conv2d_grad_vjp"));
     }
 }

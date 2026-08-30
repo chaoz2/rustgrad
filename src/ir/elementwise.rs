@@ -2302,7 +2302,7 @@ fn isclose_scalar_plan(
     extent(rhs_shape, tolerance_dtype)?; // atol + relative
     extent(&output_shape, comparison_dtype)?; // comparison's typed operands
     extent(&output_shape, DType::Bool)?; // near
-    // isfinite/isinf/isnan for both inputs plus their source Boolean tree.
+                                         // isfinite/isinf/isnan for both inputs plus their source Boolean tree.
     for _ in 0..3 {
         extent(lhs_shape, DType::Bool)?;
         extent(rhs_shape, DType::Bool)?;
@@ -4853,7 +4853,8 @@ impl Graph {
         let output = if plan.dtype == DType::Bool {
             self.logical_not(input)?
         } else {
-            self.bit_xor(input, self.constant(plan.mask))?
+            let mask = self.constant(plan.mask);
+            self.bit_xor(input, mask)?
         };
         debug_assert_eq!(
             self.shape(output).expect("bitwise_not shape preflighted"),
@@ -5306,7 +5307,8 @@ impl Graph {
             });
         }
         let boolean = self.cast(input, DType::Bool)?;
-        self.ne(boolean, self.constant(truth))
+        let truth = self.constant(truth);
+        self.ne(boolean, truth)
     }
 
     pub fn logical_and(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
@@ -5941,7 +5943,8 @@ impl Graph {
         } else {
             self.cast(lifted, work_dtype)?
         };
-        let phase = self.sub(self.constant(half_pi), widened)?;
+        let half_pi = self.constant(half_pi);
+        let phase = self.sub(half_pi, widened)?;
         let sine = self.sin(phase)?;
         if work_dtype == output_dtype {
             Ok(sine)
@@ -6026,8 +6029,11 @@ impl Graph {
             });
         }
         let positive = self.exp(input)?;
-        let negative = self.exp(self.neg(input)?)?;
-        self.div(self.sub(positive, negative)?, self.constant(two))
+        let negative = self.neg(input)?;
+        let negative = self.exp(negative)?;
+        let difference = self.sub(positive, negative)?;
+        let two = self.constant(two);
+        self.div(difference, two)
     }
     pub fn cosh(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.cosh is `(exp(x) + exp(-x)) / 2`, not raw COSH. As with
@@ -6069,8 +6075,11 @@ impl Graph {
             });
         }
         let positive = self.exp(input)?;
-        let negative = self.exp(self.neg(input)?)?;
-        self.div(self.add(positive, negative)?, self.constant(two))
+        let negative = self.neg(input)?;
+        let negative = self.exp(negative)?;
+        let sum = self.add(positive, negative)?;
+        let two = self.constant(two);
+        self.div(sum, two)
     }
     pub fn tanh(&mut self, input: NodeId) -> Result<NodeId> {
         // tinygrad spells tanh as `2 * sigmoid(2 * x) - 1`, with sigmoid
@@ -6136,8 +6145,11 @@ impl Graph {
         let neg_inv_ln2 = self.constant(neg_inv_ln2);
         let doubled = self.mul(two, work)?;
         let exponent = self.mul(doubled, neg_inv_ln2)?;
-        let sigmoid = self.reciprocal(self.add(one, self.exp2(exponent)?)?)?;
-        self.sub(self.mul(two, sigmoid)?, one)
+        let exponential = self.exp2(exponent)?;
+        let denominator = self.add(one, exponential)?;
+        let sigmoid = self.reciprocal(denominator)?;
+        let doubled_sigmoid = self.mul(two, sigmoid)?;
+        self.sub(doubled_sigmoid, one)
     }
     /// Applies the Gauss error function elementwise.
     pub fn erf(&mut self, input: NodeId) -> Result<NodeId> {
@@ -6216,19 +6228,27 @@ impl Graph {
             });
         }
         let absolute = self.abs(input)?;
-        let denominator = self.add(
-            self.constant(input_one.clone()),
-            self.mul(self.constant(coefficient), absolute)?,
-        )?;
-        let t = self.div(self.constant(input_one), denominator)?;
+        let input_one_node = self.constant(input_one.clone());
+        let coefficient = self.constant(coefficient);
+        let scaled_absolute = self.mul(coefficient, absolute)?;
+        let denominator = self.add(input_one_node, scaled_absolute)?;
+        let input_one = self.constant(input_one);
+        let t = self.div(input_one, denominator)?;
         let mut poly = self.constant(zero);
         for coefficient in polynomial {
-            poly = self.add(self.mul(poly, t)?, self.constant(coefficient))?;
+            let product = self.mul(poly, t)?;
+            let coefficient = self.constant(coefficient);
+            poly = self.add(product, coefficient)?;
         }
-        let exponent = self.exp(self.neg(self.square(input)?)?)?;
-        let tail = self.mul(self.mul(t, poly)?, exponent)?;
-        let body = self.sub(self.constant(output_one), tail)?;
-        self.mul(self.sign(input)?, body)
+        let squared = self.square(input)?;
+        let negative_squared = self.neg(squared)?;
+        let exponent = self.exp(negative_squared)?;
+        let polynomial_tail = self.mul(t, poly)?;
+        let tail = self.mul(polynomial_tail, exponent)?;
+        let output_one = self.constant(output_one);
+        let body = self.sub(output_one, tail)?;
+        let sign = self.sign(input)?;
+        self.mul(sign, body)
     }
     /// Applies the complementary Gauss error function elementwise.
     pub fn erfc(&mut self, input: NodeId) -> Result<NodeId> {
@@ -6297,16 +6317,19 @@ impl Graph {
             self.cast(absolute, output_dtype)?
         };
         let one = self.constant(one);
-        let radius = self.sqrt(self.sub(one, absolute_work)?)?;
+        let radicand = self.sub(one, absolute_work)?;
+        let radius = self.sqrt(radicand)?;
         let mut polynomial = self.constant(zero);
         for coefficient in scalars {
-            polynomial = self.add(
-                self.mul(polynomial, absolute_work)?,
-                self.constant(coefficient),
-            )?;
+            let product = self.mul(polynomial, absolute_work)?;
+            let coefficient = self.constant(coefficient);
+            polynomial = self.add(product, coefficient)?;
         }
-        let magnitude = self.sub(self.constant(half_pi), self.mul(radius, polynomial)?)?;
-        self.mul(self.sign(input)?, magnitude)
+        let half_pi = self.constant(half_pi);
+        let product = self.mul(radius, polynomial)?;
+        let magnitude = self.sub(half_pi, product)?;
+        let sign = self.sign(input)?;
+        self.mul(sign, magnitude)
     }
     pub fn acos(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.acos is `pi/2 - self.asin()`. Retain the public Asin
@@ -6343,7 +6366,8 @@ impl Graph {
             });
         }
         let asin = self.asin(input)?;
-        self.sub(self.constant(half_pi), asin)
+        let half_pi = self.constant(half_pi);
+        self.sub(half_pi, asin)
     }
     pub fn atan(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.atan is `(x / sqrt(1 + x*x)).asin()`, preserving the
@@ -6380,8 +6404,11 @@ impl Graph {
             });
         }
         let square = self.mul(input, input)?;
-        let denominator = self.sqrt(self.add(self.constant(one), square)?)?;
-        self.asin(self.div(input, denominator)?)
+        let one = self.constant(one);
+        let radicand = self.add(one, square)?;
+        let denominator = self.sqrt(radicand)?;
+        let ratio = self.div(input, denominator)?;
+        self.asin(ratio)
     }
     pub fn asinh(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.asinh is literally `log(x + sqrt(square(x) + 1))`. Keep
@@ -6431,9 +6458,11 @@ impl Graph {
             });
         }
         let square = self.square(input)?;
-        let radicand = self.add(square, self.constant(one))?;
+        let one = self.constant(one);
+        let radicand = self.add(square, one)?;
         let root = self.sqrt(radicand)?;
-        self.log(self.add(input, root)?)
+        let sum = self.add(input, root)?;
+        self.log(sum)
     }
     pub fn acosh(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.acosh is literally `log(x + sqrt(square(x) - 1))`. Keep
@@ -6483,9 +6512,11 @@ impl Graph {
             });
         }
         let square = self.square(input)?;
-        let radicand = self.sub(square, self.constant(one))?;
+        let one = self.constant(one);
+        let radicand = self.sub(square, one)?;
         let root = self.sqrt(radicand)?;
-        self.log(self.add(input, root)?)
+        let sum = self.add(input, root)?;
+        self.log(sum)
     }
     pub fn atanh(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.atanh is `log((1 + x) / (1 - x)) / 2`. The numerator and
@@ -6540,11 +6571,14 @@ impl Graph {
                 actual: log_dtype,
             });
         }
-        let numerator = self.add(self.constant(one.clone()), input)?;
-        let denominator = self.sub(self.constant(one), input)?;
+        let numerator_one = self.constant(one.clone());
+        let numerator = self.add(numerator_one, input)?;
+        let denominator_one = self.constant(one);
+        let denominator = self.sub(denominator_one, input)?;
         let ratio = self.div(numerator, denominator)?;
         let logarithm = self.log(ratio)?;
-        self.div(logarithm, self.constant(two))
+        let two = self.constant(two);
+        self.div(logarithm, two)
     }
     /// Returns the quadrant-aware angle of `(y, x)` elementwise.
     pub fn atan2(&mut self, y: NodeId, x: NodeId) -> Result<NodeId> {
@@ -6582,7 +6616,8 @@ impl Graph {
         let reciprocal_negative = self.lt(reciprocal, reciprocal_zero)?;
         let negative = self.logical_or(negative, reciprocal_negative)?;
         let magnitude = self.abs(magnitude)?;
-        let output = self.select(negative, self.neg(magnitude)?, magnitude)?;
+        let negative_magnitude = self.neg(magnitude)?;
+        let output = self.select(negative, negative_magnitude, magnitude)?;
         debug_assert_eq!(
             self.shape(output).expect("copysign preflighted"),
             &plan.output_shape
@@ -6682,7 +6717,8 @@ impl Graph {
         let neg_inv_ln2 = self.constant(neg_inv_ln2);
         let one = self.constant(one);
         let exponent = self.mul(work, neg_inv_ln2)?;
-        let denominator = self.add(one, self.exp2(exponent)?)?;
+        let exponential = self.exp2(exponent)?;
+        let denominator = self.add(one, exponential)?;
         self.reciprocal(denominator)
     }
     pub fn clamp(
@@ -6820,10 +6856,12 @@ impl Graph {
         let zero = self.constant(plan.zero);
         // Both source ReLUs are strict: equality and unordered NaNs select
         // typed zero, unlike a clamp/maximum shortcut.
-        let positive = self.select(self.gt(input, zero)?, input, zero)?;
+        let is_positive = self.gt(input, zero)?;
+        let positive = self.select(is_positive, input, zero)?;
         let six = self.constant(plan.six);
         let shifted = self.sub(input, six)?;
-        let upper = self.select(self.gt(shifted, zero)?, shifted, zero)?;
+        let above_six = self.gt(shifted, zero)?;
+        let upper = self.select(above_six, shifted, zero)?;
         let output = self.sub(positive, upper)?;
         debug_assert_eq!(self.shape(output).expect("Relu6 preflighted"), &plan.shape);
         debug_assert_eq!(self.dtype(output).expect("Relu6 preflighted"), plan.dtype);
@@ -6990,9 +7028,11 @@ impl Graph {
         let zero = self.constant(plan.zero);
         let one = self.constant(plan.one);
         // ReLU is source-strict: equality and NaN take the typed-zero branch.
-        let positive = self.select(self.gt(scaled, zero)?, scaled, zero)?;
+        let is_positive = self.gt(scaled, zero)?;
+        let positive = self.select(is_positive, scaled, zero)?;
         let shifted = self.sub(scaled, one)?;
-        let negative = self.select(self.gt(shifted, zero)?, shifted, zero)?;
+        let above_one = self.gt(shifted, zero)?;
+        let negative = self.select(above_one, shifted, zero)?;
         let output = self.sub(positive, negative)?;
         debug_assert_eq!(
             self.shape(output).expect("Hardsigmoid preflighted"),
@@ -7052,10 +7092,12 @@ impl Graph {
         let zero = self.constant(plan.zero);
         // `relu6` is source arithmetic, not a clamp: strict comparisons send
         // equality and NaN to typed zero before the subtraction.
-        let positive = self.select(self.gt(shifted, zero)?, shifted, zero)?;
+        let is_positive = self.gt(shifted, zero)?;
+        let positive = self.select(is_positive, shifted, zero)?;
         let six = self.constant(plan.six);
         let shifted_minus_six = self.sub(shifted, six)?;
-        let upper = self.select(self.gt(shifted_minus_six, zero)?, shifted_minus_six, zero)?;
+        let above_six = self.gt(shifted_minus_six, zero)?;
+        let upper = self.select(above_six, shifted_minus_six, zero)?;
         let relu6 = self.sub(positive, upper)?;
         let scaled = self.mul(work, relu6)?;
         let sixth = self.constant(plan.sixth);
@@ -7085,7 +7127,9 @@ impl Graph {
         let neg_inv_ln2 = self.constant(plan.neg_inv_ln2);
         let exponent = self.mul(scaled, neg_inv_ln2)?;
         let one = self.constant(plan.one);
-        let sigmoid = self.reciprocal(self.add(one, self.exp2(exponent)?)?)?;
+        let exponential = self.exp2(exponent)?;
+        let denominator = self.add(one, exponential)?;
+        let sigmoid = self.reciprocal(denominator)?;
         let output = self.mul(work, sigmoid)?;
         debug_assert_eq!(
             self.shape(output).expect("QuickGELU preflighted"),
@@ -7197,7 +7241,8 @@ impl Graph {
                 let scaled = self.div(work, root_two)?;
                 let erf = self.erf(scaled)?;
                 let left = self.mul(work, half)?;
-                self.mul(left, self.add(one, erf)?)
+                let factor = self.add(one, erf)?;
+                self.mul(left, factor)
             }
             "tanh" => {
                 let half = self.constant(half);
@@ -7208,13 +7253,19 @@ impl Graph {
                 let three = self.constant(three);
                 let neg_inv_ln2 = self.constant(neg_inv_ln2);
                 let cube = self.pow(work, three)?;
-                let inner = self.add(work, self.mul(coefficient, cube)?)?;
+                let cubic = self.mul(coefficient, cube)?;
+                let inner = self.add(work, cubic)?;
                 let z = self.mul(root_two_over_pi, inner)?;
                 let doubled = self.mul(two, z)?;
                 let exponent = self.mul(doubled, neg_inv_ln2)?;
-                let sigmoid = self.reciprocal(self.add(one, self.exp2(exponent)?)?)?;
-                let tanh = self.sub(self.mul(two, sigmoid)?, one)?;
-                self.mul(self.mul(half, work)?, self.add(one, tanh)?)
+                let exponential = self.exp2(exponent)?;
+                let denominator = self.add(one, exponential)?;
+                let sigmoid = self.reciprocal(denominator)?;
+                let doubled_sigmoid = self.mul(two, sigmoid)?;
+                let tanh = self.sub(doubled_sigmoid, one)?;
+                let left = self.mul(half, work)?;
+                let right = self.add(one, tanh)?;
+                self.mul(left, right)
             }
             _ => unreachable!("GELU mode validated"),
         }
@@ -7554,13 +7605,14 @@ impl Graph {
     pub fn softplus_with_scalar(&mut self, input: NodeId, beta: Scalar) -> Result<NodeId> {
         let node = self.node(input)?;
         let plan = softplus_scalar_plan(&node.shape, node.dtype, beta)?;
+        let input_dtype = node.dtype;
         let scale_dtype = plan.scale_beta.dtype();
         let inverse_dtype = plan.inverse_beta.dtype();
         let scale_beta = self.constant(plan.scale_beta);
         let inverse_beta = self.constant(plan.inverse_beta);
         self.lower_softplus(
             input,
-            node.dtype,
+            input_dtype,
             scale_beta,
             scale_dtype,
             inverse_beta,
@@ -7602,7 +7654,8 @@ impl Graph {
             self.cast(inverse_beta, plan.inverse_dtype)?
         };
         let one = self.constant(plan.one);
-        let inverse = self.mul(one, self.reciprocal(inverse_beta)?)?;
+        let reciprocal = self.reciprocal(inverse_beta)?;
+        let inverse = self.mul(one, reciprocal)?;
         let logged = if plan.log_dtype == plan.output_dtype {
             logged
         } else {
@@ -7715,9 +7768,11 @@ impl Graph {
         }
 
         let one = self.constant(one);
-        let absolute = self.mul(input, self.sign(input)?)?;
+        let sign = self.sign(input)?;
+        let absolute = self.mul(input, sign)?;
         let denominator = self.add(one, absolute)?;
-        self.mul(input, self.reciprocal(denominator)?)
+        let reciprocal = self.reciprocal(denominator)?;
+        self.mul(input, reciprocal)
     }
     pub fn log10(&mut self, input: NodeId) -> Result<NodeId> {
         let (shape, dtype) = {
@@ -7869,38 +7924,31 @@ impl Graph {
         // expression. Keep every visible cast boundary: in particular, the
         // width-local `weight * 128` happens before integer weights widen for
         // the weak `.5` addition.
-        let difference = self.cast(self.sub(end, start)?, DType::I8)?;
+        let difference = self.sub(end, start)?;
+        let difference = self.cast(difference, DType::I8)?;
         let weight = if weight_dtype == plan.weight_scale_dtype {
             weight
         } else {
             self.cast(weight, plan.weight_scale_dtype)?
         };
-        let scaled = self.mul(
-            weight,
-            self.constant(plan.scale.clone().expect("lerp U8 plan")),
-        )?;
+        let scale = self.constant(plan.scale.clone().expect("lerp U8 plan"));
+        let scaled = self.mul(weight, scale)?;
         let scaled = if plan.weight_scale_dtype == plan.weight_fraction_dtype {
             scaled
         } else {
             self.cast(scaled, plan.weight_fraction_dtype)?
         };
-        let weight = self.cast(
-            self.add(
-                scaled,
-                self.constant(plan.half.clone().expect("lerp U8 plan")),
-            )?,
-            DType::I16,
-        )?;
+        let half = self.constant(plan.half.clone().expect("lerp U8 plan"));
+        let weight = self.add(scaled, half)?;
+        let weight = self.cast(weight, DType::I16)?;
         let product = self.mul(difference, weight)?;
-        let rounded = self.add(
-            product,
-            self.constant(plan.rounding.clone().expect("lerp U8 plan")),
-        )?;
-        let shifted = self.shr(
-            self.cast(rounded, DType::U16)?,
-            self.constant(plan.shift.clone().expect("lerp U8 plan")),
-        )?;
-        let output = self.cast(self.add(start, shifted)?, DType::U8)?;
+        let rounding = self.constant(plan.rounding.clone().expect("lerp U8 plan"));
+        let rounded = self.add(product, rounding)?;
+        let rounded = self.cast(rounded, DType::U16)?;
+        let shift = self.constant(plan.shift.clone().expect("lerp U8 plan"));
+        let shifted = self.shr(rounded, shift)?;
+        let output = self.add(start, shifted)?;
+        let output = self.cast(output, DType::U8)?;
         debug_assert_eq!(
             self.shape(output).expect("lerp preflighted"),
             &plan.output_shape
@@ -8029,7 +8077,8 @@ impl Graph {
         let lhs_nan = self.isnan(lhs)?;
         let rhs_nan = self.isnan(rhs)?;
         let both_nan = self.logical_and(lhs_nan, rhs_nan)?;
-        let nan_close = self.logical_and(both_nan, self.constant(plan.equal_nan.clone()))?;
+        let equal_nan = self.constant(plan.equal_nan.clone());
+        let nan_close = self.logical_and(both_nan, equal_nan)?;
         let output = self.logical_or(result, nan_close)?;
         debug_assert_eq!(
             self.shape(output).expect("isclose scalar preflighted"),
@@ -8145,7 +8194,8 @@ impl Graph {
         }
         let truncated = self.trunc(input)?;
         let condition = self.lt(input, truncated)?;
-        let decremented = self.sub(truncated, self.constant(one))?;
+        let one = self.constant(one);
+        let decremented = self.sub(truncated, one)?;
         self.select(condition, decremented, truncated)
     }
     pub fn ceil(&mut self, input: NodeId) -> Result<NodeId> {
@@ -8178,7 +8228,8 @@ impl Graph {
         }
         let truncated = self.trunc(input)?;
         let condition = self.gt(input, truncated)?;
-        let incremented = self.add(truncated, self.constant(one))?;
+        let one = self.constant(one);
+        let incremented = self.add(truncated, one)?;
         self.select(condition, incremented, truncated)
     }
     pub fn trunc(&mut self, input: NodeId) -> Result<NodeId> {
@@ -8253,12 +8304,19 @@ impl Graph {
             });
         }
         let truncated = self.trunc(input)?;
-        let positive = self.gt(input, self.constant(zero))?;
-        let half_truncated = self.trunc(self.div(truncated, self.constant(two))?)?;
+        let zero = self.constant(zero);
+        let positive = self.gt(input, zero)?;
+        let two = self.constant(two);
+        let half_truncated = self.div(truncated, two)?;
+        let half_truncated = self.trunc(half_truncated)?;
         let even = self.eq(half_truncated, truncated)?;
         let condition = self.eq(positive, even)?;
-        let lower = self.ceil(self.sub(input, self.constant(half.clone()))?)?;
-        let upper = self.floor(self.add(input, self.constant(half))?)?;
+        let lower_half = self.constant(half.clone());
+        let lower = self.sub(input, lower_half)?;
+        let lower = self.ceil(lower)?;
+        let upper_half = self.constant(half);
+        let upper = self.add(input, upper_half)?;
+        let upper = self.floor(upper)?;
         self.select(condition, lower, upper)
     }
     pub fn sign(&mut self, input: NodeId) -> Result<NodeId> {
@@ -8390,7 +8448,8 @@ impl Graph {
         }
         let infinite = self.isinf(input)?;
         let nan = self.isnan(input)?;
-        self.logical_not(self.logical_or(infinite, nan)?)
+        let non_finite = self.logical_or(infinite, nan)?;
+        self.logical_not(non_finite)
     }
     pub fn relu(&mut self, input: NodeId) -> Result<NodeId> {
         let input_node = self.node(input)?;

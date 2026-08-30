@@ -943,7 +943,7 @@ fn shrink_to_plan(
             Ok((0, end))
         })
         .collect::<Result<Vec<_>>>()?;
-    let output_shape = Shape::new(bounds.iter().map(|&(_, end)| end));
+    let output_shape = Shape::new(bounds.iter().map(|&(_, end)| end).collect::<Vec<_>>());
     output_shape
         .numel()?
         .checked_mul(source.dtype.itemsize())
@@ -970,7 +970,14 @@ fn cat_zero(dtype: DType) -> Scalar {
         DType::Bool => Scalar::Bool(false),
         DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(0),
         DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(0),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(0.0),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(0.0),
     }
 }
 
@@ -979,7 +986,14 @@ fn scatter_one(dtype: DType) -> Scalar {
         DType::Bool => Scalar::Bool(true),
         DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(1),
         DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(1),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(1.0),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(1.0),
     }
 }
 
@@ -994,7 +1008,14 @@ fn scatter_max_identity(dtype: DType) -> Scalar {
         DType::U32 => Scalar::U(0),
         DType::I64 => Scalar::I(i64::MIN),
         DType::U64 => Scalar::U(0),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(f64::NEG_INFINITY),
     }
 }
 
@@ -1009,7 +1030,14 @@ fn scatter_min_identity(dtype: DType) -> Scalar {
         DType::U32 => Scalar::U(u32::MAX.into()),
         DType::I64 => Scalar::I(i64::MAX),
         DType::U64 => Scalar::U(u64::MAX),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::INFINITY),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(f64::INFINITY),
     }
 }
 
@@ -1183,7 +1211,8 @@ fn lower_scatter_reduce(
     )?;
     let axes = Some(vec![-1]);
     let inverse_mask = |graph: &mut Graph| -> Result<NodeId> {
-        graph.logical_not(graph.any(mask, axes.clone(), false)?)
+        let any = graph.any(mask, axes.clone(), false)?;
+        graph.logical_not(any)
     };
     let no_self = |graph: &mut Graph, a: NodeId, b: Scalar| -> Result<NodeId> {
         let inverse = inverse_mask(graph)?;
@@ -1205,7 +1234,7 @@ fn lower_scatter_reduce(
         }
         ScatterReduceKind::Prod => {
             let selected = graph.where_false_scalar(mask, src, scatter_one(plan.base_dtype))?;
-            let updates = graph.prod_with_options(selected, axes, false, None)?;
+            let updates = graph.prod_with_options(selected, axes.clone(), false, None)?;
             let self_or_one = if plan.include_self {
                 base
             } else {
@@ -1216,7 +1245,7 @@ fn lower_scatter_reduce(
         ScatterReduceKind::Amax => {
             let identity = scatter_max_identity(plan.base_dtype);
             let selected = graph.where_false_scalar(mask, src, identity)?;
-            let updates = graph.max_with_axes(selected, axes, false)?;
+            let updates = graph.max_with_axes(selected, axes.clone(), false)?;
             let self_or_identity = if plan.include_self {
                 base
             } else {
@@ -1227,7 +1256,7 @@ fn lower_scatter_reduce(
         ScatterReduceKind::Amin => {
             let identity = scatter_min_identity(plan.base_dtype);
             let selected = graph.where_false_scalar(mask, src, identity)?;
-            let updates = graph.min_with_axes(selected, axes, false)?;
+            let updates = graph.min_with_axes(selected, axes.clone(), false)?;
             let self_or_identity = if plan.include_self {
                 base
             } else {
@@ -1244,7 +1273,8 @@ fn lower_scatter_reduce(
                 graph.add_scalar(count, one)?
             } else {
                 let inverse = inverse_mask(graph)?;
-                graph.add(count, graph.where_scalars(inverse, one, zero)?)?
+                let missing_self = graph.where_scalars(inverse, one, zero)?;
+                graph.add(count, missing_self)?
             };
             let updates = selected_sum(graph)?;
             let self_or_zero = if plan.include_self {
@@ -1287,7 +1317,8 @@ fn scatter_plan(
         ScatterSource::Tensor(src) => {
             if mode != ScatterMode::Replace {
                 return Err(Error::InvalidRandom {
-                    reason: "non-scalar src is not supported with scatter reduce; use scatter_reduce",
+                    reason:
+                        "non-scalar src is not supported with scatter reduce; use scatter_reduce",
                 });
             }
             let src_node = graph.node(src)?;
@@ -1477,7 +1508,11 @@ fn chunk_plan(graph: &Graph, input: NodeId, chunks: usize, axis: isize) -> Resul
     // descriptor and byte extent here so no earlier member of this multi-view
     // result can publish when a later descriptor is malformed or too large.
     for view in &bounds {
-        let output = Shape::new(view.iter().map(|(start, end)| end - start));
+        let output = Shape::new(
+            view.iter()
+                .map(|(start, end)| end - start)
+                .collect::<Vec<_>>(),
+        );
         output
             .numel()?
             .checked_mul(source.dtype.itemsize())
@@ -1583,7 +1618,11 @@ fn split_plan(
     // A split is a multi-output operation. Ensure every source and output
     // descriptor is representable before its first Shrink is appended.
     for view in &bounds {
-        let output = Shape::new(view.iter().map(|(start, end)| end - start));
+        let output = Shape::new(
+            view.iter()
+                .map(|(start, end)| end - start)
+                .collect::<Vec<_>>(),
+        );
         output
             .numel()?
             .checked_mul(source.dtype.itemsize())
@@ -4074,44 +4113,42 @@ impl Graph {
                 .map(|&extent| (0, extent))
                 .collect::<Vec<_>>();
             bounds[last_axis] = (i, i + 1);
-            let column = self.squeeze(self.shrink(r, bounds)?, Some(-1))?;
+            let column = self.shrink(r, bounds)?;
+            let column = self.squeeze(column, Some(-1))?;
             let x = self.where_false_scalar(from_i, column, Scalar::I(0))?;
-            let norm =
-                self.sqrt(self.sum_with_options(self.square(x)?, Some(vec![-1]), true, None)?)?;
-            let x0 = self.sum_with_options(
-                self.where_false_scalar(at_i, x, Scalar::I(0))?,
-                Some(vec![-1]),
-                true,
-                None,
-            )?;
-            let sgn = self.where_false_scalar(
-                self.ne_scalar(x0, Scalar::I(0))?,
-                self.sign(x0)?,
-                Scalar::I(1),
-            )?;
+            let squared = self.square(x)?;
+            let norm = self.sum_with_options(squared, Some(vec![-1]), true, None)?;
+            let norm = self.sqrt(norm)?;
+            let x_at_i = self.where_false_scalar(at_i, x, Scalar::I(0))?;
+            let x0 = self.sum_with_options(x_at_i, Some(vec![-1]), true, None)?;
+            let x0_nonzero = self.ne_scalar(x0, Scalar::I(0))?;
+            let x0_sign = self.sign(x0)?;
+            let sgn = self.where_false_scalar(x0_nonzero, x0_sign, Scalar::I(1))?;
             let active = self.ne_scalar(norm, Scalar::I(0))?;
-            let u0 = self.add(x0, self.mul(sgn, norm)?)?;
+            let signed_norm = self.mul(sgn, norm)?;
+            let u0 = self.add(x0, signed_norm)?;
             let numerator = self.select(at_i, u0, x)?;
             let denominator = self.where_false_scalar(active, u0, Scalar::I(1))?;
-            let v = self.unsqueeze(self.div(numerator, denominator)?, -1)?;
-            let w_scale = self.div(
-                self.mul(sgn, u0)?,
-                self.where_false_scalar(active, norm, Scalar::I(1))?,
-            )?;
-            let w = self.mul(
-                self.unsqueeze(self.where_false_scalar(active, w_scale, Scalar::I(0))?, -1)?,
-                v,
-            )?;
+            let v = self.div(numerator, denominator)?;
+            let v = self.unsqueeze(v, -1)?;
+            let signed_u0 = self.mul(sgn, u0)?;
+            let safe_norm = self.where_false_scalar(active, norm, Scalar::I(1))?;
+            let w_scale = self.div(signed_u0, safe_norm)?;
+            let w_scale = self.where_false_scalar(active, w_scale, Scalar::I(0))?;
+            let w_scale = self.unsqueeze(w_scale, -1)?;
+            let w = self.mul(w_scale, v)?;
 
             // `R = R - w @ (v.T @ R)` followed by the source-ordered Q
             // update. `dot` supplies the exact typed accumulation/cast-back
             // contract for each rank-one product.
             let v_t = self.transpose(v, -2, -1)?;
             let r_projection = self.dot_default(v_t, r)?;
-            r = self.sub(r, self.dot_default(w, r_projection)?)?;
+            let r_update = self.dot_default(w, r_projection)?;
+            r = self.sub(r, r_update)?;
             let q_projection = self.dot_default(q, v)?;
             let w_t = self.transpose(w, -2, -1)?;
-            q = self.sub(q, self.dot_default(q_projection, w_t)?)?;
+            let q_update = self.dot_default(q_projection, w_t)?;
+            q = self.sub(q, q_update)?;
         }
         debug_assert_eq!(self.shape(q).expect("qr preflighted"), &plan.q_shape);
         debug_assert_eq!(self.shape(r).expect("qr preflighted"), &plan.r_shape);
@@ -4158,13 +4195,11 @@ impl Graph {
             input
         };
         // `G = self / (sqrt(sum(square(self), (-2,-1), keepdim=True)) + eps)`.
-        let norm = self.sqrt(self.sum_with_options(
-            self.square(working)?,
-            Some(vec![-2, -1]),
-            true,
-            None,
-        )?)?;
-        let mut g = self.div(working, self.add_scalar(norm, Scalar::F(eps))?)?;
+        let squared = self.square(working)?;
+        let norm = self.sum_with_options(squared, Some(vec![-2, -1]), true, None)?;
+        let norm = self.sqrt(norm)?;
+        let denominator = self.add_scalar(norm, Scalar::F(eps))?;
+        let mut g = self.div(working, denominator)?;
 
         for _ in 0..plan.iterations {
             // `functools.reduce` has no initializer: the checked plan only
@@ -4175,7 +4210,8 @@ impl Graph {
             for (power, coefficient) in params.iter().copied().enumerate() {
                 let mut x = base;
                 for _ in 0..power {
-                    let gram = self.dot_default(base, self.transpose(base, -2, -1)?)?;
+                    let base_t = self.transpose(base, -2, -1)?;
+                    let gram = self.dot_default(base, base_t)?;
                     x = self.dot_default(gram, x)?;
                 }
                 let term = self.scalar_mul(Scalar::I(coefficient), x)?;
@@ -4277,18 +4313,54 @@ impl Graph {
     /// Adds a static dense Einstein summation node with NumPy/tinygrad-style
     /// subscript grammar, including ellipses and repeated-label diagonals.
     pub fn einsum(&mut self, equation: &str, inputs: &[NodeId]) -> Result<NodeId> {
+        self.einsum_impl(equation, inputs, None)
+    }
+
+    /// Adds an Einstein summation with an explicit reduction/output dtype.
+    pub fn einsum_with_dtype(
+        &mut self,
+        equation: &str,
+        inputs: &[NodeId],
+        dtype: DType,
+    ) -> Result<NodeId> {
+        self.einsum_impl(equation, inputs, Some(dtype))
+    }
+
+    fn einsum_impl(
+        &mut self,
+        equation: &str,
+        inputs: &[NodeId],
+        accumulation_dtype: Option<DType>,
+    ) -> Result<NodeId> {
         let shapes = inputs
             .iter()
             .map(|id| Ok(self.node(*id)?.shape.clone()))
             .collect::<Result<Vec<_>>>()?;
         let plan = EinsumPlan::parse(equation, &shapes)?;
-        let dtype = inputs.iter().try_fold(DType::Bool, |dtype, id| {
+        let product_dtype = inputs.iter().try_fold(DType::Bool, |dtype, id| {
             Ok::<_, Error>(dtype.promote(self.node(*id)?.dtype))
         })?;
+        if let Some(dtype) = accumulation_dtype {
+            if !matches!(dtype, DType::F32 | DType::F64) {
+                return Err(Error::InvalidEinsum {
+                    equation: equation.to_owned(),
+                    reason: "einsum dtype overrides currently support only f32 or f64",
+                });
+            }
+            if product_dtype.is_float8() {
+                return Err(Error::InvalidEinsum {
+                    equation: equation.to_owned(),
+                    reason: "einsum dtype overrides for float8 products are not implemented",
+                });
+            }
+        }
+        let dtype = accumulation_dtype.unwrap_or(product_dtype);
         Ok(self.push(
             Op::Einsum {
                 inputs: inputs.to_vec(),
                 plan: plan.clone(),
+                product_dtype,
+                accumulation_dtype,
             },
             plan.output_shape(),
             dtype,
@@ -4866,8 +4938,10 @@ impl Graph {
             | Op::RandomPermutation { .. }
             | Op::Sort { .. } => false,
             Op::Cast { input, .. }
+            | Op::TensorGuard { input, .. }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
+            | Op::PrefixScan { input, .. }
             | Op::ArgReduce { input, .. }
             | Op::SumTo { input, .. }
             | Op::Reshape { input, .. }

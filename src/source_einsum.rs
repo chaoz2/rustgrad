@@ -392,7 +392,7 @@ fn diagonal_plan(
                 first_axis,
                 second_axis,
                 extent,
-                permutation,
+                permutation: permutation.clone(),
                 input_shape: shape.clone(),
                 output_shape: output_shape.clone(),
             });
@@ -616,12 +616,10 @@ mod tests {
             .einsum_tinygrad_default(" ij , jk -> ki ", &[lhs, rhs])
             .unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([4, 2]));
-        assert!(
-            !graph
-                .nodes
-                .iter()
-                .any(|node| matches!(&node.op, Op::Einsum { .. }))
-        );
+        assert!(!graph
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, Op::Einsum { .. })));
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
             Op::Binary {
@@ -631,16 +629,14 @@ mod tests {
         )));
         assert!(graph.nodes.iter().any(|node| matches!(&node.op,
             Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: false, .. } if axes == &vec![1])));
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    Op::Constant(data) => Some(data.len()),
-                    _ => None,
-                })
-                .all(|len| len == 1)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Constant(data) => Some(data.len()),
+                _ => None,
+            })
+            .all(|len| len == 1));
     }
 
     #[test]
@@ -659,12 +655,10 @@ mod tests {
             .einsum_tinygrad_default("aabb->ab", &[input])
             .unwrap();
         assert_eq!(diagonal.shape(output).unwrap(), &Shape::new([2, 3]));
-        assert!(
-            diagonal
-                .nodes
-                .iter()
-                .any(|node| matches!(&node.op, Op::Pad { .. }))
-        );
+        assert!(diagonal
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, Op::Pad { .. })));
 
         for dtype in [DType::F16, DType::BF16, DType::F64, DType::I8] {
             let mut explicit = Graph::new();
@@ -698,17 +692,13 @@ mod tests {
         let mut malformed = Graph::new();
         let input = malformed.input_dtype("x", [2, 3], DType::F32);
         let before = malformed.node_count();
-        assert!(
-            malformed
-                .einsum_tinygrad_default("ij->ii", &[input])
-                .is_err()
-        );
+        assert!(malformed
+            .einsum_tinygrad_default("ij->ii", &[input])
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .einsum_tinygrad_default("i", &[crate::NodeId(999)])
-                .is_err()
-        );
+        assert!(malformed
+            .einsum_tinygrad_default("i", &[crate::NodeId(999)])
+            .is_err());
         assert_eq!(malformed.node_count(), before);
 
         let mut overflow = Graph::new();

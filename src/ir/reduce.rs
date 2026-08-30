@@ -1,8 +1,8 @@
 use super::{
-    Graph, NodeId,
-    creation::{LazyArangePlan, lazy_arange_default_int_plan},
+    creation::{lazy_arange_default_int_plan, LazyArangePlan},
     elementwise::{source_lub, source_weak_scalar_dtype},
     shape::{normalize_axes, reduction_shape, unary_dtype},
+    Graph, NodeId,
 };
 use crate::{
     DType, Error, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData, UnaryOp,
@@ -671,7 +671,14 @@ fn max_reduction_identity(dtype: DType) -> Scalar {
         DType::U32 => Scalar::U(0),
         DType::I64 => Scalar::I(i64::MIN),
         DType::U64 => Scalar::U(0),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(f64::NEG_INFINITY),
     }
 }
 
@@ -686,7 +693,14 @@ fn min_reduction_identity(dtype: DType) -> Scalar {
         DType::U32 => Scalar::U(u32::MAX.into()),
         DType::I64 => Scalar::I(i64::MAX),
         DType::U64 => Scalar::U(u64::MAX),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::INFINITY),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(f64::INFINITY),
     }
 }
 
@@ -1093,7 +1107,15 @@ fn argmin_plan(
             DType::U32 => Scalar::U(u64::from(u32::MAX)),
             DType::U64 => Scalar::U(u64::MAX),
             DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(-1),
-            DType::Bool | DType::F16 | DType::BF16 | DType::F32 | DType::F64 => unreachable!(),
+            DType::Bool
+            | DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ
+            | DType::F16
+            | DType::BF16
+            | DType::F32
+            | DType::F64 => unreachable!(),
         };
         let inverse = TensorData::scalar_with_dtype(inverse, dtype);
         if inverse.dtype() != dtype
@@ -2423,7 +2445,11 @@ fn valid_reduction_dtypes(kind: ReduceKind, input: DType, dtypes: ReductionDType
             dtypes == ReductionDType::sum_default(input) || dtypes.accumulator == dtypes.output
         }
         ReduceKind::Product => dtypes.accumulator == dtypes.output,
-        ReduceKind::Mean | ReduceKind::Max | ReduceKind::Min => false,
+        ReduceKind::Mean
+        | ReduceKind::Max
+        | ReduceKind::Min
+        | ReduceKind::Any
+        | ReduceKind::All => false,
     }
 }
 
@@ -3143,16 +3169,14 @@ mod tests {
             &node.op,
             crate::Op::Reshape { shape, .. } if shape == &Shape::new([6])
         )));
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    crate::Op::Constant(data) => Some((data.dtype(), data.scalar_at(0))),
-                    _ => None,
-                })
-                .any(|(dtype, value)| dtype == DType::I32 && value.as_i64() == 6)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                crate::Op::Constant(data) => Some((data.dtype(), data.scalar_at(0))),
+                _ => None,
+            })
+            .any(|(dtype, value)| dtype == DType::I32 && value.as_i64() == 6));
         // ArgMin is source-literal inverse → ArgMax, not raw ArgMin.
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
@@ -3238,20 +3262,18 @@ mod tests {
         let input = empty.input_dtype("input", [0], DType::F16);
         let cumulative = empty.cumsum(input, -1).unwrap();
         assert_eq!(empty.dtype(cumulative).unwrap(), DType::F16);
-        assert!(
-            CpuBackend
-                .execute(
-                    &empty,
-                    cumulative,
-                    &HashMap::from([(
-                        "input".into(),
-                        TensorData::from_scalars([0], DType::F16, []).unwrap(),
-                    )]),
-                )
-                .unwrap()
-                .to_vec_f64()
-                .is_empty()
-        );
+        assert!(CpuBackend
+            .execute(
+                &empty,
+                cumulative,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                )]),
+            )
+            .unwrap()
+            .to_vec_f64()
+            .is_empty());
 
         let mut invalid = Graph::new();
         let input = invalid.input("input", [2]);
@@ -3337,16 +3359,14 @@ mod tests {
                 ..
             }
         )));
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    crate::Op::Constant(data) => Some(data.len()),
-                    _ => None,
-                })
-                .all(|len| len == 1)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                crate::Op::Constant(data) => Some(data.len()),
+                _ => None,
+            })
+            .all(|len| len == 1));
 
         let (minimum, minimum_indices) = graph.cummin_default(input).unwrap();
         assert_eq!(graph.dtype(minimum).unwrap(), DType::F32);
@@ -3416,12 +3436,10 @@ mod tests {
         let output = graph.logcumsumexp_default(input).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
         assert_eq!(graph.dtype(output).unwrap(), DType::F16);
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| matches!(&node.op, crate::Op::Detach { .. }))
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, crate::Op::Detach { .. })));
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
             crate::Op::Compare {
@@ -3429,16 +3447,14 @@ mod tests {
                 ..
             }
         )));
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| matches!(&node.op, crate::Op::Select { .. }))
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, crate::Op::Select { .. })));
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
             crate::Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: false, .. }
-                if axes == &vec![-1]
+                if axes == &vec![2]
         )));
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
@@ -3449,16 +3465,14 @@ mod tests {
         )));
         // Both the CumMax indices and the stabilization mask are composed
         // from scalar-backed lazy ranges; no dense control tensor is allowed.
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    crate::Op::Constant(data) => Some(data.len()),
-                    _ => None,
-                })
-                .all(|len| len == 1)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                crate::Op::Constant(data) => Some(data.len()),
+                _ => None,
+            })
+            .all(|len| len == 1));
         let loss = graph.sum_all(output).unwrap();
         assert!(graph.grad(loss, input).is_ok());
 
@@ -3545,20 +3559,18 @@ mod tests {
         let input = empty.input_dtype("input", [0], DType::F16);
         let cumulative = empty.cumprod(input, -1).unwrap();
         assert_eq!(empty.dtype(cumulative).unwrap(), DType::F16);
-        assert!(
-            CpuBackend
-                .execute(
-                    &empty,
-                    cumulative,
-                    &HashMap::from([(
-                        "input".into(),
-                        TensorData::from_scalars([0], DType::F16, []).unwrap(),
-                    )]),
-                )
-                .unwrap()
-                .to_vec_f64()
-                .is_empty()
-        );
+        assert!(CpuBackend
+            .execute(
+                &empty,
+                cumulative,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                )]),
+            )
+            .unwrap()
+            .to_vec_f64()
+            .is_empty());
 
         let mut invalid = Graph::new();
         let input = invalid.input("input", [2]);
@@ -4069,12 +4081,9 @@ mod tests {
         assert_eq!(graph.dtype(variance).unwrap(), DType::F32);
         assert_eq!(graph.dtype(mean).unwrap(), DType::F32);
 
-        let loss = graph
-            .add(
-                graph.sum_all(variance).unwrap(),
-                graph.sum_all(mean).unwrap(),
-            )
-            .unwrap();
+        let variance_loss = graph.sum_all(variance).unwrap();
+        let mean_loss = graph.sum_all(mean).unwrap();
+        let loss = graph.add(variance_loss, mean_loss).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         let inputs = HashMap::from([("input".into(), data([2, 2], &[1., 3., 5., 7.]))]);
         assert_eq!(
@@ -4117,21 +4126,17 @@ mod tests {
         let mut malformed = Graph::new();
         let input = malformed.input("input", [2, 3]);
         let nodes = malformed.node_count();
-        assert!(
-            malformed
-                .var_mean(input, Some(vec![0, -2]), false, None)
-                .is_err()
-        );
+        assert!(malformed
+            .var_mean(input, Some(vec![0, -2]), false, None)
+            .is_err());
         assert_eq!(malformed.node_count(), nodes);
 
         let mut overflow = Graph::new();
         let input = overflow.input("input", [usize::MAX]);
         let nodes = overflow.node_count();
-        assert!(
-            overflow
-                .var_mean(input, None, false, Some(VarianceCorrection::new(-1)),)
-                .is_err()
-        );
+        assert!(overflow
+            .var_mean(input, None, false, Some(VarianceCorrection::new(-1)),)
+            .is_err());
         assert_eq!(overflow.node_count(), nodes);
     }
 
@@ -4155,12 +4160,9 @@ mod tests {
         assert_eq!(graph.dtype(standard_deviation).unwrap(), DType::F32);
         assert_eq!(graph.dtype(mean).unwrap(), DType::F32);
 
-        let loss = graph
-            .add(
-                graph.sum_all(standard_deviation).unwrap(),
-                graph.sum_all(mean).unwrap(),
-            )
-            .unwrap();
+        let standard_deviation_loss = graph.sum_all(standard_deviation).unwrap();
+        let mean_loss = graph.sum_all(mean).unwrap();
+        let loss = graph.add(standard_deviation_loss, mean_loss).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         let inputs = HashMap::from([("input".into(), data([2, 2], &[1., 3., 5., 7.]))]);
         assert_eq!(
@@ -4204,21 +4206,17 @@ mod tests {
         let mut malformed = Graph::new();
         let input = malformed.input("input", [2, 3]);
         let nodes = malformed.node_count();
-        assert!(
-            malformed
-                .std_mean(input, Some(vec![0, -2]), false, None)
-                .is_err()
-        );
+        assert!(malformed
+            .std_mean(input, Some(vec![0, -2]), false, None)
+            .is_err());
         assert_eq!(malformed.node_count(), nodes);
 
         let mut overflow = Graph::new();
         let input = overflow.input("input", [usize::MAX]);
         let nodes = overflow.node_count();
-        assert!(
-            overflow
-                .std_mean(input, None, false, Some(VarianceCorrection::new(-1)),)
-                .is_err()
-        );
+        assert!(overflow
+            .std_mean(input, None, false, Some(VarianceCorrection::new(-1)),)
+            .is_err());
         assert_eq!(overflow.node_count(), nodes);
     }
 
@@ -4261,12 +4259,9 @@ mod tests {
                 ..
             }
         ));
-        let loss = graph
-            .add(
-                graph.sum_all(pair_variance).unwrap(),
-                graph.sum_all(pair_mean).unwrap(),
-            )
-            .unwrap();
+        let variance_loss = graph.sum_all(pair_variance).unwrap();
+        let mean_loss = graph.sum_all(pair_mean).unwrap();
+        let loss = graph.add(variance_loss, mean_loss).unwrap();
         assert!(graph.grad(loss, input).is_ok());
 
         let mut nonfloat = Graph::new();
@@ -4644,11 +4639,9 @@ mod tests {
         let mut malformed = Graph::new();
         let x = malformed.input("input", [2, 2]);
         let nodes = malformed.node_count();
-        assert!(
-            malformed
-                .mean_with_axes(x, Some(vec![0, -2]), false)
-                .is_err()
-        );
+        assert!(malformed
+            .mean_with_axes(x, Some(vec![0, -2]), false)
+            .is_err());
         assert_eq!(malformed.node_count(), nodes);
 
         let mut overflow = Graph::new();
@@ -4699,11 +4692,9 @@ mod tests {
         let mut malformed = Graph::new();
         let input = malformed.input("input", [2, 2]);
         let nodes = malformed.node_count();
-        assert!(
-            malformed
-                .layernorm_with_axes(input, vec![0, -2], 1e-5)
-                .is_err()
-        );
+        assert!(malformed
+            .layernorm_with_axes(input, vec![0, -2], 1e-5)
+            .is_err());
         assert_eq!(malformed.node_count(), nodes);
 
         let mut overflow = Graph::new();
@@ -4780,20 +4771,16 @@ mod tests {
             )
             .unwrap()
             .to_vec_f64();
-        assert!(
-            values
-                .iter()
-                .all(|value| value.is_infinite() && value.is_sign_negative())
-        );
+        assert!(values
+            .iter()
+            .all(|value| value.is_infinite() && value.is_sign_negative()));
 
         let mut malformed = Graph::new();
         let x = malformed.input("input", [2, 2]);
         let nodes = malformed.node_count();
-        assert!(
-            malformed
-                .max_with_axes(x, Some(vec![0, -2]), false)
-                .is_err()
-        );
+        assert!(malformed
+            .max_with_axes(x, Some(vec![0, -2]), false)
+            .is_err());
         assert_eq!(malformed.node_count(), nodes);
     }
 
@@ -4861,11 +4848,9 @@ mod tests {
             )
             .unwrap()
             .to_vec_f64();
-        assert!(
-            values
-                .iter()
-                .all(|value| value.is_infinite() && value.is_sign_positive())
-        );
+        assert!(values
+            .iter()
+            .all(|value| value.is_infinite() && value.is_sign_positive()));
 
         let mut scalar = Graph::new();
         let x = scalar.input("input", []);
@@ -4875,11 +4860,9 @@ mod tests {
         let mut malformed = Graph::new();
         let x = malformed.input("input", [2, 2]);
         let nodes = malformed.node_count();
-        assert!(
-            malformed
-                .min_with_axes(x, Some(vec![0, -2]), false)
-                .is_err()
-        );
+        assert!(malformed
+            .min_with_axes(x, Some(vec![0, -2]), false)
+            .is_err());
         assert_eq!(malformed.node_count(), nodes);
     }
 
@@ -4922,12 +4905,9 @@ mod tests {
             graph.op(*min_inverse).unwrap(),
             crate::Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
         ));
-        let loss = graph
-            .add(
-                graph.sum_all(maximum).unwrap(),
-                graph.sum_all(minimum).unwrap(),
-            )
-            .unwrap();
+        let maximum_loss = graph.sum_all(maximum).unwrap();
+        let minimum_loss = graph.sum_all(minimum).unwrap();
+        let loss = graph.add(maximum_loss, minimum_loss).unwrap();
         assert!(graph.grad(loss, input).is_ok());
 
         let mut specials = Graph::new();

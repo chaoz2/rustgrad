@@ -1,6 +1,7 @@
 use super::{
-    AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape,
+    matmul_shape,
     shape::{normalize_axes, reduction_shape},
+    AttentionOptions, Graph, NodeId, ReduceKind,
 };
 use crate::{DType, Error, ReductionDType, Result, Scalar, Shape, TensorData};
 
@@ -50,7 +51,14 @@ fn max_identity(dtype: DType) -> Scalar {
         DType::U32 => Scalar::U(0),
         DType::I64 => Scalar::I(i64::MIN),
         DType::U64 => Scalar::U(0),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(f64::NEG_INFINITY),
     }
 }
 
@@ -174,7 +182,11 @@ fn softmax_plan(
                 .enumerate()
                 .map(
                     |(index, &dimension)| {
-                        if index == axis as usize { 1 } else { dimension }
+                        if index == axis as usize {
+                            1
+                        } else {
+                            dimension
+                        }
                     },
                 )
                 .collect::<Vec<_>>(),
@@ -307,14 +319,16 @@ impl Graph {
         } else {
             self.reduce(input, ReduceKind::Max, Some(plan.axes.clone()), true)?
         };
-        let centered = self.sub(input, self.detach(maximum)?)?;
+        let detached_maximum = self.detach(maximum)?;
+        let centered = self.sub(input, detached_maximum)?;
         let exp_work = if plan.exp_work_dtype == plan.source_dtype {
             centered
         } else {
             self.cast(centered, plan.exp_work_dtype)?
         };
         let inv_ln2 = self.constant(plan.inv_ln2);
-        let exponentials = self.exp2(self.mul(exp_work, inv_ln2)?)?;
+        let exponent = self.mul(exp_work, inv_ln2)?;
+        let exponentials = self.exp2(exponent)?;
         let exponentials = if plan.exp_dtype == plan.exp_work_dtype {
             exponentials
         } else {
@@ -380,7 +394,8 @@ impl Graph {
             self.shape(maximum).expect("Softmax max preflighted"),
             &plan.max_shape
         );
-        let centered = self.sub(input, self.detach(maximum)?)?;
+        let detached_maximum = self.detach(maximum)?;
+        let centered = self.sub(input, detached_maximum)?;
         let requested = if plan.requested_dtype == plan.source_dtype {
             centered
         } else {
@@ -392,7 +407,8 @@ impl Graph {
             self.cast(requested, plan.exp_work_dtype)?
         };
         let inv_ln2 = self.constant(plan.inv_ln2);
-        let exponentials = self.exp2(self.mul(exp_work, inv_ln2)?)?;
+        let exponent = self.mul(exp_work, inv_ln2)?;
+        let exponentials = self.exp2(exponent)?;
         let exponentials = if plan.output_dtype == plan.exp_work_dtype {
             exponentials
         } else {
@@ -471,7 +487,8 @@ impl Graph {
         } else {
             input
         };
-        let centered = self.sub(input, self.detach(maximum)?)?;
+        let detached_maximum = self.detach(maximum)?;
+        let centered = self.sub(input, detached_maximum)?;
         let requested = if plan.softmax.requested_dtype == plan.softmax.source_dtype {
             centered
         } else {
@@ -483,7 +500,8 @@ impl Graph {
             self.cast(requested, plan.softmax.exp_work_dtype)?
         };
         let inv_ln2 = self.constant(plan.softmax.inv_ln2);
-        let exponentials = self.exp2(self.mul(exp_work, inv_ln2)?)?;
+        let exponent = self.mul(exp_work, inv_ln2)?;
+        let exponentials = self.exp2(exponent)?;
         let exponentials = if plan.softmax.output_dtype == plan.softmax.exp_work_dtype {
             exponentials
         } else {

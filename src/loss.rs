@@ -1,7 +1,7 @@
 //! Checked-in tinygrad loss helpers composed from inspectable graph operations.
 use crate::ir::{
-    SourceGatherPlan, logsigmoid_plan, lower_source_gather, one_hot_bool_plan, one_hot_plan,
-    source_gather_plan, source_lub, source_weak_scalar_dtype, validate_log_softmax_plan,
+    logsigmoid_plan, lower_source_gather, one_hot_bool_plan, one_hot_plan, source_gather_plan,
+    source_lub, source_weak_scalar_dtype, validate_log_softmax_plan, SourceGatherPlan,
 };
 use crate::{
     DType, Error, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
@@ -229,7 +229,7 @@ fn tinygrad_cross_entropy_plan(
     let target_shape = if one_hot {
         logits_shape.clone()
     } else {
-        target_original_shape
+        target_original_shape.clone()
     };
     let target_dtype = if one_hot {
         DType::Bool
@@ -1007,7 +1007,8 @@ impl Graph {
                     false,
                     ReductionDType::sum_default(DType::Bool),
                 )?;
-                self.div(self.neg(numerator)?, denominator)?
+                let numerator = self.neg(numerator)?;
+                self.div(numerator, denominator)?
             }
         };
         let output_shape = match options.reduction {
@@ -1234,25 +1235,29 @@ impl Graph {
     ) -> Result<NodeId> {
         let plan = nll_loss_plan(self, logp, target, weight, ignore_index, reduction)?;
         let index = self.reshape(target, plan.index_shape)?;
-        let selected = self.squeeze(lower_source_gather(self, logp, index, plan.main)?, Some(1))?;
+        let selected = lower_source_gather(self, logp, index, plan.main)?;
+        let selected = self.squeeze(selected, Some(1))?;
         let gathered_weight = if let (Some(weight), Some(weight_plan)) = (weight, plan.weight) {
             let flat = self.reshape(target, plan.flat_shape)?;
             let gathered = lower_source_gather(self, weight, flat, weight_plan)?;
             self.reshape(gathered, plan.target_shape)?
         } else {
-            self.lazy_full_with_dtype(plan.target_shape.clone(), Scalar::I(1), self.dtype(target)?)?
+            let target_dtype = self.dtype(target)?;
+            self.lazy_full_with_dtype(plan.target_shape.clone(), Scalar::I(1), target_dtype)?
         };
         let factor = if let Some(ignore) = ignore_index {
+            let target_dtype = self.dtype(target)?;
             let scalar = self.constant(TensorData::scalar_with_dtype(
                 Scalar::I(ignore),
-                self.dtype(target)?,
+                target_dtype,
             ));
             let mask = self.ne(target, scalar)?;
             self.mul(gathered_weight, mask)?
         } else {
             gathered_weight
         };
-        let loss = self.mul(self.neg(selected)?, factor)?;
+        let selected = self.neg(selected)?;
+        let loss = self.mul(selected, factor)?;
         match reduction {
             Reduction::None => Ok(loss),
             Reduction::Sum => self.sum_default(loss),
@@ -1333,10 +1338,8 @@ mod tests {
             .unwrap();
         assert_eq!(graph.shape(loss).unwrap(), &Shape::new([2, 4]));
         assert!(graph.trace(loss).unwrap().to_string().contains("select"));
-        assert!(
-            (0..graph.node_count())
-                .any(|n| matches!(graph.op(NodeId(n)).unwrap(), crate::Op::Select { .. }))
-        );
+        assert!((0..graph.node_count())
+            .any(|n| matches!(graph.op(NodeId(n)).unwrap(), crate::Op::Select { .. })));
         assert!((0..graph.node_count()).any(|n| matches!(
             graph.op(NodeId(n)).unwrap(),
             crate::Op::Reduce {
@@ -1344,24 +1347,18 @@ mod tests {
                 ..
             }
         )));
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    crate::Op::Constant(data) => Some(data.len()),
-                    _ => None,
-                })
-                .all(|len| len == 1)
-        );
-        assert!(matches!(
-            graph.grad(graph.sum_default(loss).unwrap(), logp),
-            Ok(_)
-        ));
-        assert!(matches!(
-            graph.grad(graph.sum_default(loss).unwrap(), labels),
-            Err(_)
-        ));
+        assert!(graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                crate::Op::Constant(data) => Some(data.len()),
+                _ => None,
+            })
+            .all(|len| len == 1));
+        let reduced_loss = graph.sum_default(loss).unwrap();
+        assert!(matches!(graph.grad(reduced_loss, logp), Ok(_)));
+        let reduced_loss = graph.sum_default(loss).unwrap();
+        assert!(matches!(graph.grad(reduced_loss, labels), Err(_)));
 
         for reduction in [Reduction::Sum, Reduction::Mean] {
             let mut reduced = Graph::new();
@@ -1754,30 +1751,26 @@ mod tests {
         let scalar = graph.input("scalar", []);
         let target = graph.input_dtype("target", [], crate::DType::I32);
         let nodes = graph.node_count();
-        assert!(
-            sparse_categorical_cross_entropy_tinygrad(
-                &mut graph,
-                scalar,
-                target,
-                SparseCategoricalCrossEntropyOptions::default(),
-            )
-            .is_err()
-        );
+        assert!(sparse_categorical_cross_entropy_tinygrad(
+            &mut graph,
+            scalar,
+            target,
+            SparseCategoricalCrossEntropyOptions::default(),
+        )
+        .is_err());
         assert_eq!(graph.node_count(), nodes);
 
         let mut overflow = Graph::new();
         let logits = overflow.input("x", [usize::MAX, 2]);
         let target = overflow.input_dtype("y", [usize::MAX], crate::DType::I32);
         let nodes = overflow.node_count();
-        assert!(
-            sparse_categorical_cross_entropy_tinygrad(
-                &mut overflow,
-                logits,
-                target,
-                SparseCategoricalCrossEntropyOptions::default(),
-            )
-            .is_err()
-        );
+        assert!(sparse_categorical_cross_entropy_tinygrad(
+            &mut overflow,
+            logits,
+            target,
+            SparseCategoricalCrossEntropyOptions::default(),
+        )
+        .is_err());
         assert_eq!(overflow.node_count(), nodes);
     }
     #[test]
@@ -1807,15 +1800,13 @@ mod tests {
         let mut graph = Graph::new();
         let integer_logits = graph.input_dtype("logits", [1, 2], crate::DType::I32);
         let probability_target = graph.input("target", [1, 2]);
-        assert!(
-            cross_entropy(
-                &mut graph,
-                integer_logits,
-                probability_target,
-                LossOptions::default(),
-            )
-            .is_err()
-        );
+        assert!(cross_entropy(
+            &mut graph,
+            integer_logits,
+            probability_target,
+            LossOptions::default(),
+        )
+        .is_err());
         let logits = graph.input("other_logits", [1, 2]);
         let boolean_target = graph.input_dtype("other_target", [1, 2], crate::DType::Bool);
         assert!(cross_entropy(&mut graph, logits, boolean_target, LossOptions::default()).is_err());
@@ -1950,32 +1941,28 @@ mod tests {
             graph.input_dtype("log_probabilities", [1, 2], crate::DType::I32);
         let target = graph.input_dtype("target", [1], crate::DType::I32);
         let before = graph.node_count();
-        assert!(
-            nll_loss(
-                &mut graph,
-                integer_log_probabilities,
-                target,
-                None,
-                LossOptions::default(),
-            )
-            .is_err()
-        );
+        assert!(nll_loss(
+            &mut graph,
+            integer_log_probabilities,
+            target,
+            None,
+            LossOptions::default(),
+        )
+        .is_err());
         assert_eq!(graph.node_count(), before);
 
         let mut graph = Graph::new();
         let log_probabilities = graph.input("log_probabilities", [1, 2]);
         let float_target = graph.input("target", [1]);
         let before = graph.node_count();
-        assert!(
-            nll_loss(
-                &mut graph,
-                log_probabilities,
-                float_target,
-                None,
-                LossOptions::default(),
-            )
-            .is_err()
-        );
+        assert!(nll_loss(
+            &mut graph,
+            log_probabilities,
+            float_target,
+            None,
+            LossOptions::default(),
+        )
+        .is_err());
         assert_eq!(graph.node_count(), before);
 
         let mut graph = Graph::new();
@@ -1983,16 +1970,14 @@ mod tests {
         let target = graph.input_dtype("target", [1], crate::DType::I32);
         let wrong_weight = graph.input("weight", [3]);
         let before = graph.node_count();
-        assert!(
-            nll_loss(
-                &mut graph,
-                log_probabilities,
-                target,
-                Some(wrong_weight),
-                LossOptions::default(),
-            )
-            .is_err()
-        );
+        assert!(nll_loss(
+            &mut graph,
+            log_probabilities,
+            target,
+            Some(wrong_weight),
+            LossOptions::default(),
+        )
+        .is_err());
         assert_eq!(graph.node_count(), before);
     }
 }

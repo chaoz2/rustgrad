@@ -1,5 +1,5 @@
 use super::{
-    Graph, NodeId, Op, RandomKind, RandomStream, RollDims, RollShifts, shape::normalize_axes,
+    shape::normalize_axes, Graph, NodeId, Op, RandomKind, RandomStream, RollDims, RollShifts,
 };
 use crate::random::reserve;
 use crate::{
@@ -570,16 +570,14 @@ mod tests {
                 .unwrap();
             assert_eq!(graph.dtype(filled).unwrap(), dtype);
         }
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    Op::Constant(data) => Some(data.len()),
-                    _ => None,
-                })
-                .all(|len| len == 1)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Constant(data) => Some(data.len()),
+                _ => None,
+            })
+            .all(|len| len == 1));
 
         let mut invalid = Graph::new();
         let before = invalid.node_count();
@@ -952,17 +950,13 @@ mod tests {
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
-        assert!(
-            malformed
-                .uniform_implicit([2], 1.0, 1.0, DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .uniform_implicit([2], 1.0, 1.0, DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .uniform_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64)
-                .is_err()
-        );
+        assert!(malformed
+            .uniform_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -1025,17 +1019,13 @@ mod tests {
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
-        assert!(
-            malformed
-                .normal_implicit([2], 0.0, -0.5, DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .normal_implicit([2], 0.0, -0.5, DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .normal_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64)
-                .is_err()
-        );
+        assert!(malformed
+            .normal_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -1182,14 +1172,12 @@ mod tests {
         );
         assert_eq!(graph.dtype(replacement).unwrap(), DType::I32);
         assert!(!graph.node(replacement).unwrap().requires_grad);
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| matches!(&node.op, Op::Random {
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, Op::Random {
             kind: RandomKind::Uniform { low, high }, ..
-        } if *low == 0.0 && *high == 1.0))
-        );
+        } if *low == 0.0 && *high == 1.0)));
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
             Op::Unary {
@@ -1270,17 +1258,13 @@ mod tests {
         assert_eq!(malformed.node_count(), before);
         // rank-two zero shape has `fan_in + prod(fan_out) == 0`, whose Python
         // `6 / 0` fails before source uniform can reserve a stream.
-        assert!(
-            malformed
-                .glorot_uniform_implicit([0, 0], DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .glorot_uniform_implicit([0, 0], DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .glorot_uniform_implicit([usize::MAX, 1], DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .glorot_uniform_implicit([usize::MAX, 1], DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -1324,23 +1308,17 @@ mod tests {
         let before = malformed.node_count();
         // A zero tail fan and a zero bound from infinite `a` both make source
         // uniform reject before it can reserve a captured stream.
-        assert!(
-            malformed
-                .kaiming_uniform_implicit([2, 0], 0.01, DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .kaiming_uniform_implicit([2, 0], 0.01, DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .kaiming_uniform_implicit([2], f64::INFINITY, DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .kaiming_uniform_implicit([2], f64::INFINITY, DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .kaiming_uniform_implicit([1, usize::MAX, 2], 0.01, DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .kaiming_uniform_implicit([1, usize::MAX, 2], 0.01, DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -1400,17 +1378,13 @@ mod tests {
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
-        assert!(
-            malformed
-                .kaiming_normal_implicit([2, 0], 0.01, DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .kaiming_normal_implicit([2, 0], 0.01, DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .kaiming_normal_implicit([1, usize::MAX, 2], 0.01, DType::F32)
-                .is_err()
-        );
+        assert!(malformed
+            .kaiming_normal_implicit([1, usize::MAX, 2], 0.01, DType::F32)
+            .is_err());
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -1480,16 +1454,14 @@ mod tests {
                 ..
             }
         )));
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    Op::Constant(data) => Some(data.len()),
-                    _ => None,
-                })
-                .all(|len| len == 1)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Constant(data) => Some(data.len()),
+                _ => None,
+            })
+            .all(|len| len == 1));
 
         for dtype in [
             DType::F32,
@@ -1526,20 +1498,16 @@ mod tests {
         assert_eq!(graph.dtype(square).unwrap(), DType::F32);
         assert_eq!(graph.shape(rectangular).unwrap(), &Shape::new([2, 4]));
         assert_eq!(graph.shape(empty).unwrap(), &Shape::new([0, 3]));
-        assert!(
-            (0..graph.node_count())
-                .any(|n| matches!(graph.op(NodeId(n)).unwrap(), Op::Logical { .. }))
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    Op::Constant(data) => Some(data.len()),
-                    _ => None,
-                })
-                .all(|len| len == 1)
-        );
+        assert!((0..graph.node_count())
+            .any(|n| matches!(graph.op(NodeId(n)).unwrap(), Op::Logical { .. })));
+        assert!(graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Constant(data) => Some(data.len()),
+                _ => None,
+            })
+            .all(|len| len == 1));
         for dtype in [
             DType::Bool,
             DType::I8,
@@ -1649,7 +1617,8 @@ mod tests {
             .to_vec_f64(),
             vec![0., 1., 2., 3., 5., 6., 7., 8.]
         );
-        assert!(graph.grad(graph.sum_all(output).unwrap(), input).is_ok());
+        let loss = graph.sum_all(output).unwrap();
+        assert!(graph.grad(loss, input).is_ok());
         let mut invalid = Graph::new();
         let source = invalid.input("x", [3]);
         let nodes = invalid.node_count();
@@ -1690,16 +1659,12 @@ mod tests {
         // Therefore source returns three views, not five padded empties.
         let outputs = graph.chunk_default(input, 5).unwrap();
         assert_eq!(outputs.len(), 3);
-        assert!(
-            outputs
-                .iter()
-                .all(|&output| graph.shape(output).unwrap() == &Shape::from([1]))
-        );
-        assert!(
-            outputs
-                .iter()
-                .all(|&output| graph.dtype(output).unwrap() == DType::I16)
-        );
+        assert!(outputs
+            .iter()
+            .all(|&output| graph.shape(output).unwrap() == &Shape::from([1])));
+        assert!(outputs
+            .iter()
+            .all(|&output| graph.dtype(output).unwrap() == DType::I16));
 
         let scalar = graph.input("scalar", []);
         let before_scalar = graph.node_count();
@@ -1766,15 +1731,13 @@ mod tests {
         let input = empty.input_dtype("x", [2, 0], DType::I8);
         let output = empty.tril(input, 0).unwrap();
         assert_eq!(empty.dtype(output).unwrap(), DType::I8);
-        assert!(
-            execute(
-                &empty,
-                output,
-                TensorData::from_scalars([2, 0], DType::I8, []).unwrap(),
-            )
-            .to_vec_f64()
-            .is_empty()
-        );
+        assert!(execute(
+            &empty,
+            output,
+            TensorData::from_scalars([2, 0], DType::I8, []).unwrap(),
+        )
+        .to_vec_f64()
+        .is_empty());
     }
 
     #[test]
@@ -1914,21 +1877,17 @@ mod tests {
         let output = empty.diag(input).unwrap();
         assert_eq!(empty.shape(output).unwrap(), &Shape::from([0, 0]));
         assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
-        assert!(
-            empty
-                .nodes
-                .iter()
-                .all(|node| !matches!(&node.op, Op::Pad { .. }))
-        );
-        assert!(
-            execute(
-                &empty,
-                output,
-                TensorData::from_scalars([0], DType::BF16, []).unwrap(),
-            )
-            .to_vec_f64()
-            .is_empty()
-        );
+        assert!(empty
+            .nodes
+            .iter()
+            .all(|node| !matches!(&node.op, Op::Pad { .. })));
+        assert!(execute(
+            &empty,
+            output,
+            TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+        )
+        .to_vec_f64()
+        .is_empty());
 
         let mut invalid = Graph::new();
         let scalar = invalid.input("scalar", []);
@@ -2144,19 +2103,16 @@ mod tests {
         assert_eq!(graph.shape(tuple).unwrap(), &Shape::new([2, 3]));
         // The source literal is Repeat followed by Shrink, not the legacy
         // one-axis concat shortcut.
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| matches!(&node.op, Op::Expand { .. }))
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| matches!(&node.op, Op::Shrink { .. }))
-        );
-        assert!(graph.grad(graph.sum_all(tuple).unwrap(), input).is_ok());
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, Op::Expand { .. })));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, Op::Shrink { .. })));
+        let loss = graph.sum_all(tuple).unwrap();
+        assert!(graph.grad(loss, input).is_ok());
 
         let tuple_one = graph
             .roll_tinygrad_default_dims(input, RollShifts::Tuple(vec![7]))
@@ -2195,27 +2151,21 @@ mod tests {
         let mut invalid = Graph::new();
         let input = invalid.input("x", [2, 3]);
         let before = invalid.node_count();
-        assert!(
-            invalid
-                .roll_tinygrad(input, RollShifts::Tuple(vec![1, 2]), RollDims::None,)
-                .is_err()
-        );
+        assert!(invalid
+            .roll_tinygrad(input, RollShifts::Tuple(vec![1, 2]), RollDims::None,)
+            .is_err());
         assert_eq!(invalid.node_count(), before);
-        assert!(
-            invalid
-                .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Tuple(vec![]))
-                .is_err()
-        );
+        assert!(invalid
+            .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Tuple(vec![]))
+            .is_err());
         assert_eq!(invalid.node_count(), before);
 
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("x", [usize::MAX / 2 + 1], DType::U8);
         let before = overflow.node_count();
-        assert!(
-            overflow
-                .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Scalar(0))
-                .is_err()
-        );
+        assert!(overflow
+            .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Scalar(0))
+            .is_err());
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -2531,46 +2481,36 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("x", [0, 3]);
         let before = graph.node_count();
-        assert!(
-            graph
-                .reshape_with_extents(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
-                .is_err()
-        );
+        assert!(graph
+            .reshape_with_extents(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
+            .is_err());
         assert_eq!(graph.node_count(), before);
-        assert!(
-            graph
-                .reshape_with_extents(
-                    input,
-                    [
-                        ReshapeExtent::Copy,
-                        ReshapeExtent::Copy,
-                        ReshapeExtent::Copy
-                    ]
-                )
-                .is_err()
-        );
+        assert!(graph
+            .reshape_with_extents(
+                input,
+                [
+                    ReshapeExtent::Copy,
+                    ReshapeExtent::Copy,
+                    ReshapeExtent::Copy
+                ]
+            )
+            .is_err());
         assert_eq!(graph.node_count(), before);
-        assert!(
-            graph
-                .reshape_with_extents(input, [ReshapeExtent::Infer, ReshapeExtent::Infer])
-                .is_err()
-        );
+        assert!(graph
+            .reshape_with_extents(input, [ReshapeExtent::Infer, ReshapeExtent::Infer])
+            .is_err());
         assert_eq!(graph.node_count(), before);
-        assert!(
-            graph
-                .view(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
-                .is_err()
-        );
+        assert!(graph
+            .view(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
+            .is_err());
         assert_eq!(graph.node_count(), before);
 
         let mut overflow = Graph::new();
         let input = overflow.input("x", [usize::MAX, 2]);
         let before = overflow.node_count();
-        assert!(
-            overflow
-                .reshape_with_extents(input, [ReshapeExtent::Infer])
-                .is_err()
-        );
+        assert!(overflow
+            .reshape_with_extents(input, [ReshapeExtent::Infer])
+            .is_err());
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -2616,11 +2556,9 @@ mod tests {
         let mut overflow = Graph::new();
         let input = overflow.input("x", [usize::MAX, 2]);
         let before = overflow.node_count();
-        assert!(
-            overflow
-                .expand_with_extents(input, [ExpandExtent::Copy, ExpandExtent::Copy])
-                .is_err()
-        );
+        assert!(overflow
+            .expand_with_extents(input, [ExpandExtent::Copy, ExpandExtent::Copy])
+            .is_err());
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -2655,30 +2593,24 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 3]);
         let before = graph.node_count();
-        assert!(
-            graph
-                .shrink_with_ranges(input, [ShrinkRange::Full])
-                .is_err()
-        );
+        assert!(graph
+            .shrink_with_ranges(input, [ShrinkRange::Full])
+            .is_err());
         assert_eq!(graph.node_count(), before);
-        assert!(
-            graph
-                .shrink_with_ranges(
-                    input,
-                    [ShrinkRange::Full, ShrinkRange::Bounds { start: 2, end: 4 }],
-                )
-                .is_err()
-        );
+        assert!(graph
+            .shrink_with_ranges(
+                input,
+                [ShrinkRange::Full, ShrinkRange::Bounds { start: 2, end: 4 }],
+            )
+            .is_err());
         assert_eq!(graph.node_count(), before);
 
         let mut overflow = Graph::new();
         let input = overflow.input("x", [usize::MAX, 2]);
         let before = overflow.node_count();
-        assert!(
-            overflow
-                .shrink_with_ranges(input, [ShrinkRange::Full, ShrinkRange::Full])
-                .is_err()
-        );
+        assert!(overflow
+            .shrink_with_ranges(input, [ShrinkRange::Full, ShrinkRange::Full])
+            .is_err());
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -2693,10 +2625,8 @@ mod tests {
         assert_eq!(graph.shape(zero).unwrap(), &Shape::from([0, 2]));
         assert_eq!(graph.shrink_to(input, [None, None]).unwrap(), input);
         let loss = graph.sum_all(output).unwrap();
-        assert_eq!(
-            graph.shape(graph.grad(loss, input).unwrap()).unwrap(),
-            &Shape::from([2, 3])
-        );
+        let gradient = graph.grad(loss, input).unwrap();
+        assert_eq!(graph.shape(gradient).unwrap(), &Shape::from([2, 3]));
 
         let scalar = graph.input("scalar", []);
         assert_eq!(graph.shrink_to(scalar, []).unwrap(), scalar);
@@ -2708,11 +2638,9 @@ mod tests {
         assert_eq!(malformed.node_count(), before);
         assert!(malformed.shrink_to(input, [Some(3), None]).is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .shrink_to(NodeId(usize::MAX), [None, None])
-                .is_err()
-        );
+        assert!(malformed
+            .shrink_to(NodeId(usize::MAX), [None, None])
+            .is_err());
         assert_eq!(malformed.node_count(), before);
         let overflow = malformed.input_dtype(
             "overflow",
@@ -2826,19 +2754,15 @@ mod tests {
                 Shape::from([1])
             ]
         );
-        assert!(
-            explicit
-                .iter()
-                .all(|&output| graph.dtype(output).unwrap() == DType::U16)
-        );
+        assert!(explicit
+            .iter()
+            .all(|&output| graph.dtype(output).unwrap() == DType::U16));
 
         let scalar = graph.input("scalar", []);
         let before_scalar = graph.node_count();
-        assert!(
-            graph
-                .split_default(scalar, SplitSections::Uniform(1))
-                .is_err()
-        );
+        assert!(graph
+            .split_default(scalar, SplitSections::Uniform(1))
+            .is_err());
         assert_eq!(graph.node_count(), before_scalar);
 
         let mut overflow = Graph::new();
@@ -2848,14 +2772,12 @@ mod tests {
             DType::F64,
         );
         let before_overflow = overflow.node_count();
-        assert!(
-            overflow
-                .split_default(
-                    overflow_input,
-                    SplitSections::Explicit(vec![1, usize::MAX / DType::F64.itemsize()])
-                )
-                .is_err()
-        );
+        assert!(overflow
+            .split_default(
+                overflow_input,
+                SplitSections::Explicit(vec![1, usize::MAX / DType::F64.itemsize()])
+            )
+            .is_err());
         assert_eq!(overflow.node_count(), before_overflow);
     }
 
@@ -2867,23 +2789,17 @@ mod tests {
 
         assert!(graph.split(input, SplitSections::Uniform(0), 1).is_err());
         assert_eq!(graph.node_count(), node_count);
-        assert!(
-            graph
-                .split(input, SplitSections::Explicit(vec![2, 2]), 1)
-                .is_err()
-        );
+        assert!(graph
+            .split(input, SplitSections::Explicit(vec![2, 2]), 1)
+            .is_err());
         assert_eq!(graph.node_count(), node_count);
-        assert!(
-            graph
-                .split(input, SplitSections::Explicit(vec![usize::MAX, 1]), 1)
-                .is_err()
-        );
+        assert!(graph
+            .split(input, SplitSections::Explicit(vec![usize::MAX, 1]), 1)
+            .is_err());
         assert_eq!(graph.node_count(), node_count);
-        assert!(
-            graph
-                .split(input, SplitSections::Uniform(1), isize::MIN)
-                .is_err()
-        );
+        assert!(graph
+            .split(input, SplitSections::Uniform(1), isize::MIN)
+            .is_err());
         assert_eq!(graph.node_count(), node_count);
     }
 
@@ -4293,10 +4209,13 @@ impl Graph {
             });
         }
 
-        let row = self.reshape(self.arange(0, rows_i64, 1)?, Shape::new([rows, 1]))?;
-        let column = self.reshape(self.arange(0, columns_i64, 1)?, Shape::new([1, columns]))?;
+        let row_range = self.arange(0, rows_i64, 1)?;
+        let row = self.reshape(row_range, Shape::new([rows, 1]))?;
+        let column_range = self.arange(0, columns_i64, 1)?;
+        let column = self.reshape(column_range, Shape::new([1, columns]))?;
         let shift = self.full_with_dtype([], Scalar::I(shift), DType::I64)?;
-        let outside = self.le(self.add(row, shift)?, column)?;
+        let shifted_row = self.add(row, shift)?;
+        let outside = self.le(shifted_row, column)?;
         let zero = self.zeros_with_dtype(shape, dtype)?;
         if lower {
             self.select(outside, zero, input)
@@ -5520,7 +5439,7 @@ impl Graph {
         )
     }
 
-    fn random_stream(
+    pub(crate) fn random_stream(
         &mut self,
         shape: Shape,
         dtype: DType,

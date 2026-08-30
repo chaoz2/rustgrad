@@ -134,7 +134,9 @@ impl Graph {
             ));
             let inverse = self.div(one, weights)?;
             let keys = self.pow(uniform, inverse)?;
-            let output = self.topk(keys, plan.samples, plan.axis as isize, true)?.1;
+            let output = self
+                .topk(keys, plan.samples, plan.axis as isize, true, true)?
+                .1;
             debug_assert_eq!(self.shape(output)?, &plan.output_shape);
             return Ok(output);
         }

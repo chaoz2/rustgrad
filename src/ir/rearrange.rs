@@ -583,7 +583,7 @@ impl Graph {
             Some(axis) => {
                 source.numel()?;
                 let rank = source.rank();
-                (source, resolve_axis(axis, rank)?, false)
+                (source.clone(), resolve_axis(axis, rank)?, false)
             }
             None => {
                 let flat = source.numel()?;
@@ -792,7 +792,8 @@ mod tests {
             .unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([3, 2, 2]));
         assert_eq!(graph.dtype(output).unwrap(), DType::F32);
-        assert!(graph.grad(graph.sum_all(output).unwrap(), input).is_ok());
+        let loss = graph.sum_all(output).unwrap();
+        assert!(graph.grad(loss, input).is_ok());
 
         let ellipsis = graph.input_dtype("ellipsis", [2, 0, 3], DType::I16);
         let ellipsis_output = graph
@@ -807,27 +808,21 @@ mod tests {
         let mut malformed = Graph::new();
         let source = malformed.input_dtype("source", [2, 6], DType::F64);
         let before = malformed.node_count();
-        assert!(
-            malformed
-                .rearrange(source, "b (h w) -> h b w", &BTreeMap::new())
-                .is_err()
-        );
+        assert!(malformed
+            .rearrange(source, "b (h w) -> h b w", &BTreeMap::new())
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .rearrange(source, "b b -> b", &BTreeMap::new())
-                .is_err()
-        );
+        assert!(malformed
+            .rearrange(source, "b b -> b", &BTreeMap::new())
+            .is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(
-            malformed
-                .rearrange(source, "b c -> (b c)", &{
-                    let mut unused = BTreeMap::new();
-                    unused.insert("unused".into(), 1);
-                    unused
-                })
-                .is_err()
-        );
+        assert!(malformed
+            .rearrange(source, "b c -> (b c)", &{
+                let mut unused = BTreeMap::new();
+                unused.insert("unused".into(), 1);
+                unused
+            })
+            .is_err());
         assert_eq!(malformed.node_count(), before);
         assert!(matches!(
             malformed.rearrange(
