@@ -131,9 +131,8 @@ fn logsumexp_plan(
             reason: "logsumexp scalar promotion mismatch",
         });
     }
-    let max_identity = (max_shape.numel()? > 0
-        && axes.iter().any(|axis| shape.dims()[*axis as usize] == 0))
-    .then(|| max_identity(source_dtype));
+    let max_identity = (max_shape.numel()? > 0 && axes.iter().any(|axis| shape.dims()[*axis] == 0))
+        .then(|| max_identity(source_dtype));
     Ok(LogsumexpPlan {
         axes: axes.into_iter().map(|axis| axis as isize).collect(),
         max_shape,

@@ -603,7 +603,7 @@ fn static_one_hot_depth(constants: &BTreeMap<String, TensorData>, name: &str) ->
         .ok_or_else(|| bad("OneHot depth must be a constant initializer"))?;
     let shape = value.shape();
     shape.numel()?;
-    let scalar_or_singleton = shape.rank() == 0 || shape.dims() == &[1];
+    let scalar_or_singleton = shape.rank() == 0 || shape.dims() == [1];
     if !scalar_or_singleton || value.len() != 1 {
         return Err(bad(
             "OneHot depth must be a scalar or length-one rank-1 tensor",
@@ -3002,7 +3002,7 @@ fn static_i32_i64_scalar(
     }
     let shape = value.shape();
     shape.numel()?;
-    let scalar_or_singleton = shape.rank() == 0 || shape.dims() == &[1];
+    let scalar_or_singleton = shape.rank() == 0 || shape.dims() == [1];
     if !scalar_or_singleton || value.len() != 1 {
         return Err(bad(format!(
             "{operator} value must be a scalar or length-one rank-1 tensor"
