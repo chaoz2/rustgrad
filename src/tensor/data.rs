@@ -1214,7 +1214,7 @@ mod tests {
     fn raw_padding_preserves_float8_source_and_fill_bytes() {
         let input = TensorData::from_storage(
             [2],
-            Storage::Float8(super::float8::Float8Storage::from_raw(
+            Storage::Float8(crate::Float8Storage::from_raw(
                 crate::Float8Format::E4M3FNUZ,
                 vec![0x80, 0xff],
             )),
@@ -1222,7 +1222,7 @@ mod tests {
         .unwrap();
         let fill = TensorData::from_storage(
             [],
-            Storage::Float8(super::float8::Float8Storage::from_raw(
+            Storage::Float8(crate::Float8Storage::from_raw(
                 crate::Float8Format::E4M3FNUZ,
                 vec![0x7f],
             )),

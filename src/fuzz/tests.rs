@@ -2480,9 +2480,9 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
             unreachable!("Pad plan")
         };
         let committed = if dtype == DType::F16 {
-            crate::f16_to_f32(fill_bits as u16)
+            crate::tensor::f16_to_f32(fill_bits as u16)
         } else {
-            crate::bf16_to_f32(fill_bits as u16)
+            crate::tensor::bf16_to_f32(fill_bits as u16)
         };
         assert!(if expect_nan {
             committed.is_nan()
