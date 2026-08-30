@@ -152,16 +152,34 @@ fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
     for (actual, expected) in output.values().iter().zip([0.6, 3. / 7., 9. / 13.]) {
         assert!((actual - expected).abs() < 1e-6);
     }
-    // The source composition retains Pad in the Graph. Scheduling a view of
-    // that computed Pad currently fails closed until computed-base affine
-    // views gain an explicit producer edge.
+    // The source composition retains Pad in the Graph. The scheduler must
+    // materialize that Pad as an explicit movement producer before lowering
+    // the downstream affine view and elementwise work.
     assert!(
         graph
             .nodes
             .iter()
             .any(|node| matches!(node.op, crate::Op::Pad { .. }))
     );
-    assert!(crate::schedule(&graph, values["out"]).is_err());
+    let scheduled = crate::schedule(&graph, values["out"]).unwrap();
+    let pad_item = scheduled
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kernel.arg(),
+                crate::UArg::Movement(plan)
+                    if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
+            )
+        })
+        .expect("LRN must schedule its channel Pad as a movement producer");
+    assert!(
+        scheduled
+            .items
+            .iter()
+            .any(|item| item.dependencies.contains(&pad_item.id))
+    );
+    assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
 
     for invalid in [
         lrn(&[]),
@@ -5473,15 +5491,33 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         &[0., 4., 5., 6., 7., 0., 0., 0., 8., 9., 10., 11., 0., 0.]
     );
     // Crop remains an affine view and the final constant Pad remains in the
-    // source Graph. Its downstream view currently fails closed at scheduling
-    // rather than silently dropping the computed producer.
+    // source Graph. The Pad is an explicit movement producer for the final
+    // affine view, so scheduling must retain a checked producer edge.
     assert!(
         mixed_graph
             .nodes
             .iter()
             .any(|node| matches!(node.op, crate::Op::Pad { .. }))
     );
-    assert!(crate::schedule(&mixed_graph, mixed_values["out"]).is_err());
+    let scheduled = crate::schedule(&mixed_graph, mixed_values["out"]).unwrap();
+    let pad_item = scheduled
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kernel.arg(),
+                crate::UArg::Movement(plan)
+                    if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
+            )
+        })
+        .expect("CenterCropPad must schedule Pad as a movement producer");
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == mixed_values["out"])
+        .expect("requested CenterCropPad output must be scheduled");
+    assert!(output_item.dependencies.contains(&pad_item.id));
+    assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
 
     let (_, _, _, default_axes) = run(
         vec![1, 5, 4],
