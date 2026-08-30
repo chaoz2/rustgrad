@@ -420,10 +420,9 @@ mod tests {
     #[test]
     fn rejects_alias_escape_and_malformed_consumers() {
         let (_, mut schedule, left, right) = shared_schedule();
-        let mut aliased = schedule.items[0].output.clone();
+        let mut aliased = schedule.items[0].primary_output().clone();
         aliased.view = Some(crate::ViewMap::identity(Shape::from([2])).into());
-        schedule.items[0].outputs = crate::ScheduledOutputs::single(aliased.clone());
-        schedule.items[0].output = aliased;
+        schedule.items[0].outputs = crate::ScheduledOutputs::single(aliased);
         assert!(matches!(
             MemoryPlan::from_schedule(&schedule, &[left, right], true),
             Err(MemoryPlanError::AliasEscape(_))
@@ -476,7 +475,6 @@ mod tests {
             quantized_input_bindings: vec![],
             external_materializations: vec![],
             outputs: crate::ScheduledOutputs::new(vec![first.clone(), second.clone()]).unwrap(),
-            output: first.clone(),
             kernel: UOp::sink(vec![]),
             boundary: None,
             cache_key: 0,
@@ -494,15 +492,6 @@ mod tests {
                 id: 20 + id,
                 ..input
             }),
-            output: BufferDesc {
-                id: 20 + id,
-                shape: Shape::from([2]),
-                dtype: DType::F32,
-                bytes: 8,
-                alignment: 4,
-                read_only: false,
-                view: None,
-            },
             kernel: UOp::sink(vec![]),
             boundary: None,
             cache_key: 0,
@@ -530,11 +519,11 @@ mod tests {
     fn invalid_temporary_alignment_rejects_before_reuse_planning() {
         for alignment in [0, 3, 16] {
             let (_, mut schedule, _, _) = shared_schedule();
-            let buffer = schedule.items[0].output.id;
-            schedule.items[0].output.alignment = alignment;
-            let output = schedule.items[0].output.clone();
-            schedule.items[0].outputs = crate::ScheduledOutputs::single(output);
-            let temporaries = vec![schedule.items[0].output.clone()];
+            let buffer = schedule.items[0].primary_output().id;
+            let mut output = schedule.items[0].primary_output().clone();
+            output.alignment = alignment;
+            schedule.items[0].outputs = crate::ScheduledOutputs::single(output.clone());
+            let temporaries = vec![output];
             assert!(matches!(
                 MemoryPlan::from_temporaries(&schedule.items, &temporaries, true),
                 Err(MemoryPlanError::InvalidAlignment {

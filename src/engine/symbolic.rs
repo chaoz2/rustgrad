@@ -1731,7 +1731,6 @@ pub(crate) fn specialize_capture(
             .collect::<Result<Vec<_>, _>>()?;
         item.outputs = crate::ScheduledOutputs::new(outputs)
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        item.output = item.primary_output().clone();
         item.kernel = specialize_kernel(
             &item.kernel,
             schema,

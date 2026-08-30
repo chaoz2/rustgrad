@@ -29,7 +29,7 @@ pub(crate) fn pure_add_capture(target_id: u64) -> (CapturedMixedSchedule, crate:
         vec![ScheduleValueBinding {
             producer_item: 0,
             producer_node: sum,
-            producer_output: pure.items[0].output.clone(),
+            producer_output: pure.items[0].primary_output().clone(),
             abi_index: 0,
             effect_item: 0,
             source_position: 0,
@@ -113,7 +113,7 @@ pub(crate) fn signed_state_add_capture() -> (CapturedMixedSchedule, crate::Buffe
         vec![ScheduleValueBinding {
             producer_item: 0,
             producer_node: sum,
-            producer_output: pure.items[0].output.clone(),
+            producer_output: pure.items[0].primary_output().clone(),
             abi_index: 0,
             effect_item: 0,
             source_position: 0,
@@ -155,7 +155,7 @@ pub(crate) fn zero_extent_add_capture() -> (CapturedMixedSchedule, crate::Buffer
         vec![ScheduleValueBinding {
             producer_item: 0,
             producer_node: sum,
-            producer_output: pure.items[0].output.clone(),
+            producer_output: pure.items[0].primary_output().clone(),
             abi_index: 0,
             effect_item: 0,
             source_position: 0,

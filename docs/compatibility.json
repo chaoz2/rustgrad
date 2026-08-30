@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:6305d688a1d74bb8",
+  "source_fingerprint": "fnv1a64:b7e7cba783f6274f",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -153,7 +153,7 @@
       "subject": "Coupled ordering and guarded sampling",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`ScheduledOutputs` preserves the existing checked one-output projection while allowing one static CPU `Sort` producer to own stable input-dtype values plus I32 indices. `argsort` selects indices and `top_k` uses checked slices of the pair; signed axes, direction, empty/scalar domains, raw dtype lanes, and tie order are part of the typed graph/UOp/artifact identity. Only the CPU interpreter materializes this pair; capture/replay, native/JIT, and device routes reject it before work. `TensorGuard` validates finite, nonnegative values and positive row totals as an input-value passthrough, and a session pending reservation commits an implicit Threefry range only after that guard succeeds. Static `multinomial` uses an explicit stream or that guarded implicit transaction: replacement follows normalized inclusive-CDF selection, no-replacement uses deterministic Efraimidis--Spirakis keys plus stable top-k. Guards, ordering, and sampling are nondifferentiable and reject capture/optimized/device routes; no host postprocessing or hidden RNG fallback is claimed."
+        "Acceptance requirement": "`ScheduledOutputs` is the sole nonempty ordered output inventory on each `ScheduleItem`; one-output consumers use the explicit `primary_output()` view, while private artifact codecs retain historical primary descriptors only to preserve and validate RGSA/RGSM/RGSO bytes. One static CPU `Sort` producer owns stable input-dtype values plus I32 indices. `argsort` selects indices and `top_k` uses checked slices of the pair; signed axes, direction, empty/scalar domains, raw dtype lanes, and tie order are part of the typed graph/UOp/artifact identity. Only the CPU interpreter materializes this pair; capture/replay, native/JIT, and device routes reject it before work. `TensorGuard` validates finite, nonnegative values and positive row totals as an input-value passthrough, and a session pending reservation commits an implicit Threefry range only after that guard succeeds. Static `multinomial` uses an explicit stream or that guarded implicit transaction: replacement follows normalized inclusive-CDF selection, no-replacement uses deterministic Efraimidis--Spirakis keys plus stable top-k. Guards, ordering, and sampling are nondifferentiable and reject capture/optimized/device routes; no host postprocessing or hidden RNG fallback is claimed."
       }
     },
     {
