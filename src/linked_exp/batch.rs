@@ -21,10 +21,67 @@ pub struct LinkedF32ExpBatchSlot {
     pub request_identity: String,
     pub resource_identity: String,
     pub rendered_identity: String,
+    #[serde(with = "buffer_desc_serde")]
     pub input: BufferDesc,
+    #[serde(with = "buffer_desc_serde")]
     pub output: BufferDesc,
     pub owner_device: u32,
     pub sm: u32,
+}
+
+mod buffer_desc_serde {
+    use crate::{BufferDesc, DType, Shape};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireBufferDesc {
+        id: u64,
+        shape: Vec<usize>,
+        dtype: DType,
+        bytes: usize,
+        alignment: usize,
+        read_only: bool,
+    }
+
+    pub fn serialize<S>(desc: &BufferDesc, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if desc.view.is_some() {
+            return Err(serde::ser::Error::custom(
+                "linked Exp batch descriptors cannot contain views",
+            ));
+        }
+        WireBufferDesc {
+            id: desc.id,
+            shape: desc.shape.dims().to_vec(),
+            dtype: desc.dtype,
+            bytes: desc.bytes,
+            alignment: desc.alignment,
+            read_only: desc.read_only,
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BufferDesc, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireBufferDesc::deserialize(deserializer)?;
+        let desc = BufferDesc {
+            id: wire.id,
+            shape: Shape::new(wire.shape),
+            dtype: wire.dtype,
+            bytes: wire.bytes,
+            alignment: wire.alignment,
+            read_only: wire.read_only,
+            view: None,
+        };
+        crate::schedule::validate_buffer_desc(&desc)
+            .map_err(|_| D::Error::custom("invalid linked Exp batch buffer descriptor"))?;
+        Ok(desc)
+    }
 }
 
 /// A distinct v2 envelope.  v1 sidecar bytes decode only through their v1

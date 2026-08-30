@@ -5151,6 +5151,7 @@ pub(crate) mod tests {
         stream_create_fail_result: AtomicI32,
         stream_destroy_fail_after: AtomicUsize,
         stream_destroy_fail_result: AtomicI32,
+        output_commit_phase: Mutex<HashMap<PrimaryOutputCommitPhase, (usize, CuResult)>>,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -5223,6 +5224,7 @@ pub(crate) mod tests {
                 stream_create_fail_result: AtomicI32::new(0),
                 stream_destroy_fail_after: AtomicUsize::new(usize::MAX),
                 stream_destroy_fail_result: AtomicI32::new(0),
+                output_commit_phase: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -5804,6 +5806,17 @@ pub(crate) mod tests {
             self.generic_sync_after
                 .store(successful_calls, Ordering::Release);
         }
+        pub(crate) fn fail_output_commit_phase_after(
+            &self,
+            phase: PrimaryOutputCommitPhase,
+            successful_calls: usize,
+            result: CuResult,
+        ) {
+            self.output_commit_phase
+                .lock()
+                .unwrap()
+                .insert(phase, (successful_calls, result));
+        }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
         }
@@ -5917,6 +5930,21 @@ pub(crate) mod tests {
         }
     }
     impl Dispatch for Mock {
+        fn primary_output_commit_checkpoint(&self, phase: PrimaryOutputCommitPhase) -> CuResult {
+            let mut phases = self.output_commit_phase.lock().unwrap();
+            let Some((remaining, result)) = phases.get_mut(&phase) else {
+                return CUDA_SUCCESS;
+            };
+            if *remaining == 0 {
+                let result = *result;
+                phases.remove(&phase);
+                result
+            } else {
+                *remaining -= 1;
+                CUDA_SUCCESS
+            }
+        }
+
         fn driver_version(&self, out: &mut c_int) -> CuResult {
             self.call("version");
             *out = 12000;
