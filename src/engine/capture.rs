@@ -560,9 +560,11 @@ mod tests {
             .unwrap();
         assert!(replay.trace.items.is_empty());
         assert_eq!(replay.outputs[0].storage(), provided_value.storage());
-        let raw_f32 = |value: &TensorData| match value.storage() {
-            crate::Storage::F32(values) => values.iter().map(|value| value.to_bits()).collect(),
-            _ => unreachable!("fixture is F32"),
+        let raw_f32 = |value: &TensorData| -> Vec<u32> {
+            match value.storage() {
+                crate::Storage::F32(values) => values.iter().map(|value| value.to_bits()).collect(),
+                _ => unreachable!("fixture is F32"),
+            }
         };
         assert_eq!(raw_f32(&replay.outputs[1]), raw_f32(&constant_value));
     }
