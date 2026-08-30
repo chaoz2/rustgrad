@@ -164,7 +164,9 @@ pub struct CollectiveCandidateDescriptor {
     pub bytes: usize,
 }
 
-/// Ordered copy from a transaction candidate into its declared final target.
+/// Ordered publication of a transaction candidate at its declared final key.
+/// Runtime preflight proves the typed descriptors and owned leases compatible;
+/// publication then rekeys the candidate lease without a final device copy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectiveCommitRecord {
     pub order: usize,

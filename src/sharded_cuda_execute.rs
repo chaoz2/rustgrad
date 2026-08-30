@@ -487,7 +487,7 @@ pub struct ShardedCudaExecutionEnvironment {
 }
 
 struct DownstreamOutputExecution<'a> {
-    commits: &'a [crate::CollectiveDownstreamOutputCommitRecord],
+    publications: &'a [OwnedLeasePublication],
     inputs: &'a BTreeMap<(usize, usize, u64), u64>,
     outputs: &'a BTreeMap<(usize, usize, u64), u64>,
 }
@@ -505,7 +505,15 @@ pub struct ShardedCudaExecutionResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CollectiveTransaction {
     candidates: Vec<CollectiveCandidateDescriptor>,
-    commits: Vec<CollectiveCommitRecord>,
+    publications: Vec<OwnedLeasePublication>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnedLeasePublication {
+    rank: usize,
+    candidate_buffer: u64,
+    destination_buffer: u64,
+    owner_identity: usize,
+    bytes: usize,
 }
 impl CollectiveTransaction {
     fn preflight(
@@ -559,6 +567,7 @@ impl CollectiveTransaction {
         }
         let mut targets = BTreeSet::new();
         let mut committed = BTreeSet::new();
+        let mut publications = Vec::with_capacity(commits.len());
         for (order, commit) in commits.iter().enumerate() {
             let owner = plan
                 .owners
@@ -589,13 +598,25 @@ impl CollectiveTransaction {
                     "collective transaction commit is duplicate or incompatible",
                 ));
             }
+            publications.push(OwnedLeasePublication {
+                rank: commit.rank,
+                candidate_buffer: commit.candidate_buffer,
+                destination_buffer: commit.target_buffer,
+                owner_identity: owner.identity(),
+                bytes: candidate.bytes,
+            });
         }
         if committed.len() != keys.len() {
             return Err(err("collective transaction commits omit a candidate"));
         }
+        if !keys.is_disjoint(&targets) {
+            return Err(err(
+                "collective transaction candidates overlap destination keys",
+            ));
+        }
         Ok(Self {
             candidates,
-            commits,
+            publications,
         })
     }
 }
@@ -839,12 +860,34 @@ impl ShardedCudaExecutionEnvironment {
         {
             return Err(err("graph-backed unary stage ABI is not unique"));
         }
+        let publications = downstream
+            .output_commits
+            .iter()
+            .map(|commit| {
+                let output = downstream
+                    .outputs
+                    .iter()
+                    .find(|output| {
+                        output.rank == commit.rank
+                            && output.output_candidate_buffer == commit.output_candidate_buffer
+                            && output.destination_buffer == commit.destination_buffer
+                    })
+                    .ok_or_else(|| err("graph-backed unary publication descriptor is absent"))?;
+                Ok(OwnedLeasePublication {
+                    rank: commit.rank,
+                    candidate_buffer: commit.output_candidate_buffer,
+                    destination_buffer: commit.destination_buffer,
+                    owner_identity: output.owner_identity,
+                    bytes: output.bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         self.execute_with_substitutions(
             &plan,
             &BTreeMap::new(),
             Some(&transaction),
             Some(DownstreamOutputExecution {
-                commits: &downstream.output_commits,
+                publications: &publications,
                 inputs: &consumer_inputs,
                 outputs: &outputs,
             }),
@@ -968,6 +1011,49 @@ impl ShardedCudaExecutionEnvironment {
         if actual_external != expected_external {
             return Err(err("external sharded CUDA bindings are missing or extra"));
         }
+        // Validate every caller-owned binding before constructing a collective
+        // runtime, allocating candidates, or entering any Driver operation.
+        // The closure below can then move these leases without discovering a
+        // late owner/extent mismatch after execution has begun.
+        for buffer in plan
+            .buffers
+            .iter()
+            .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+        {
+            let key = (buffer.rank, buffer.buffer);
+            if buffer.bytes == 0 {
+                let zero = self
+                    .zero_external
+                    .get(&key)
+                    .ok_or_else(|| err("missing logical zero binding"))?;
+                if zero.owner_identity != buffer.owner_identity
+                    || zero.rank != buffer.rank
+                    || zero.buffer != buffer.buffer
+                    || zero.dtype != buffer.dtype
+                    || zero.shape != buffer.shape
+                {
+                    return Err(err("logical zero binding metadata mismatch"));
+                }
+            } else {
+                let lease = self
+                    .external
+                    .get(&key)
+                    .ok_or_else(|| err("missing external sharded CUDA lease"))?;
+                let (owner, bytes, _, _) =
+                    lease.execution_metadata().map_err(|e| err(e.to_string()))?;
+                if owner != buffer.owner_identity || bytes < buffer.bytes {
+                    return Err(err("external lease owner or bytes mismatch"));
+                }
+            }
+        }
+        if downstream.is_none()
+            && let Some(transaction) = transaction
+        {
+            Self::preflight_publication_destinations(&self.external, &transaction.publications)?;
+        }
+        if let Some(downstream) = &downstream {
+            Self::preflight_publication_destinations(&self.external, downstream.publications)?;
+        }
         if plan
             .logical
             .stages
@@ -1004,29 +1090,12 @@ impl ShardedCudaExecutionEnvironment {
             for buffer in &plan.buffers {
                 let key = (buffer.rank, buffer.buffer);
                 if matches!(buffer.role, ExecutableBufferRole::External) {
-                    if buffer.bytes == 0 {
-                        let zero = zeros
-                            .get(&key)
-                            .ok_or_else(|| err("missing logical zero binding"))?;
-                        if zero.owner_identity != buffer.owner_identity
-                            || zero.rank != buffer.rank
-                            || zero.buffer != buffer.buffer
-                            || zero.dtype != buffer.dtype
-                            || zero.shape != buffer.shape
-                        {
-                            return Err(err("logical zero binding metadata mismatch"));
-                        }
-                    } else {
-                        let lease = leases
-                            .get(&key)
-                            .ok_or_else(|| err("missing external sharded CUDA lease"))?;
-                        let (owner, bytes, _, _) =
-                            lease.execution_metadata().map_err(|e| err(e.to_string()))?;
-                        if owner != buffer.owner_identity || bytes < buffer.bytes {
-                            return Err(err("external lease owner or bytes mismatch"));
-                        }
-                    }
-                } else if buffer.bytes > 0 {
+                    // Fully validated above, before collective setup or any
+                    // allocation/Driver work. Moving the maps cannot alter the
+                    // sealed lease metadata.
+                    continue;
+                }
+                if buffer.bytes > 0 {
                     let allocator = self
                         .allocators
                         .as_ref()
@@ -1266,31 +1335,10 @@ impl ShardedCudaExecutionEnvironment {
             if let Some(transaction) = transaction
                 && downstream.is_none()
             {
-                for commit in &transaction.commits {
-                    let candidate = leases
-                        .get(&(commit.rank, commit.candidate_buffer))
-                        .ok_or_else(|| err("missing collective transaction candidate lease"))?;
-                    let target = leases
-                        .get(&(commit.rank, commit.target_buffer))
-                        .ok_or_else(|| err("missing collective transaction target lease"))?;
-                    let target_view = target.view().map_err(|e| err(e.to_string()))?;
-                    let candidate_view = candidate.view().map_err(|e| err(e.to_string()))?;
-                    let bytes = candidate_view.len();
-                    let stream = plan.owners[commit.rank]
-                        .stream()
-                        .map_err(|e| err(e.to_string()))?;
-                    let mut copy = target_view
-                        .copy_from_view_async(0, &candidate_view, 0, bytes, &stream)
-                        .map_err(|e| err(format!("collective transaction commit: {e}")))?;
-                    copy.wait()
-                        .map_err(|e| err(format!("collective transaction commit: {e}")))?;
-                }
-                for candidate in &transaction.candidates {
-                    leases.remove(&(candidate.rank, candidate.candidate_buffer));
-                }
+                Self::publish_owned_leases(&mut leases, &transaction.publications)?;
             }
             if let Some(downstream) = downstream {
-                Self::publish_graph_backed_unary_outputs(&mut leases, downstream.commits)?;
+                Self::publish_owned_leases(&mut leases, downstream.publications)?;
                 if let Some(transaction) = transaction {
                     for candidate in &transaction.candidates {
                         leases.remove(&(candidate.rank, candidate.candidate_buffer));
@@ -1332,51 +1380,99 @@ impl ShardedCudaExecutionEnvironment {
         self.zero_external = zeros;
         result
     }
-    /// Publishes all completed output candidates by infallibly rekeying their
-    /// owned leases after complete validation. No caller destination storage is
-    /// modified while a fallible launch, synchronization, or copy remains.
-    fn publish_graph_backed_unary_outputs(
-        leases: &mut BTreeMap<(usize, u64), PrimaryBufferLease>,
-        commits: &[crate::CollectiveDownstreamOutputCommitRecord],
+    /// Validates caller-owned publication destinations before collective setup,
+    /// candidate allocation, or any other Driver operation.
+    fn preflight_publication_destinations(
+        leases: &BTreeMap<(usize, u64), PrimaryBufferLease>,
+        publications: &[OwnedLeasePublication],
     ) -> Result<(), Error> {
         let mut candidate_keys = BTreeSet::new();
         let mut destination_keys = BTreeSet::new();
-        for commit in commits {
-            let candidate_key = (commit.rank, commit.output_candidate_buffer);
-            let destination_key = (commit.rank, commit.destination_buffer);
+        for publication in publications {
+            let candidate_key = (publication.rank, publication.candidate_buffer);
+            let destination_key = (publication.rank, publication.destination_buffer);
             if candidate_key == destination_key
                 || !candidate_keys.insert(candidate_key)
                 || !destination_keys.insert(destination_key)
             {
-                return Err(err("graph-unary output publication keys are inconsistent"));
+                return Err(err("owned output publication keys are inconsistent"));
             }
-            let candidate = leases
-                .get(&candidate_key)
-                .ok_or_else(|| err("missing graph-unary output candidate lease"))?;
+            if leases.contains_key(&candidate_key) {
+                return Err(err("owned output candidate key is already caller-owned"));
+            }
             let target = leases
                 .get(&destination_key)
-                .ok_or_else(|| err("missing graph-unary output destination lease"))?;
-            if candidate.view().map_err(|e| err(e.to_string()))?.len()
-                != target.view().map_err(|e| err(e.to_string()))?.len()
-            {
-                return Err(err("graph-unary output lease sizes do not match"));
+                .ok_or_else(|| err("missing owned output destination lease"))?;
+            let (target_owner, target_bytes, _, _) = target
+                .execution_metadata()
+                .map_err(|e| err(e.to_string()))?;
+            if target_owner != publication.owner_identity || target_bytes != publication.bytes {
+                return Err(err(
+                    "owned output publication destination metadata is inconsistent",
+                ));
             }
         }
         if !candidate_keys.is_disjoint(&destination_keys) {
-            return Err(err(
-                "graph-unary output candidates overlap destination keys",
-            ));
+            return Err(err("owned output candidates overlap destination keys"));
         }
-        let mut replaced_destinations = Vec::with_capacity(commits.len());
-        for commit in commits {
-            let candidate_key = (commit.rank, commit.output_candidate_buffer);
-            let destination_key = (commit.rank, commit.destination_buffer);
+        Ok(())
+    }
+
+    /// Publishes completed candidates by rekeying their owned leases only after
+    /// the complete ordered table and every live lease have been validated.
+    /// No caller destination storage is modified while a fallible launch,
+    /// synchronization, allocation, or copy remains.
+    fn publish_owned_leases(
+        leases: &mut BTreeMap<(usize, u64), PrimaryBufferLease>,
+        publications: &[OwnedLeasePublication],
+    ) -> Result<(), Error> {
+        let mut candidate_keys = BTreeSet::new();
+        let mut destination_keys = BTreeSet::new();
+        for publication in publications {
+            let candidate_key = (publication.rank, publication.candidate_buffer);
+            let destination_key = (publication.rank, publication.destination_buffer);
+            if candidate_key == destination_key
+                || !candidate_keys.insert(candidate_key)
+                || !destination_keys.insert(destination_key)
+            {
+                return Err(err("owned output publication keys are inconsistent"));
+            }
+            let candidate = leases
+                .get(&candidate_key)
+                .ok_or_else(|| err("missing owned output candidate lease"))?;
+            let target = leases
+                .get(&destination_key)
+                .ok_or_else(|| err("missing owned output destination lease"))?;
+            let (candidate_owner, candidate_bytes, _, candidate_block) = candidate
+                .execution_metadata()
+                .map_err(|e| err(e.to_string()))?;
+            let (target_owner, target_bytes, _, target_block) = target
+                .execution_metadata()
+                .map_err(|e| err(e.to_string()))?;
+            if candidate_owner != publication.owner_identity
+                || target_owner != publication.owner_identity
+                || candidate_bytes != publication.bytes
+                || target_bytes != publication.bytes
+                || candidate_block == target_block
+            {
+                return Err(err(
+                    "owned output publication lease metadata is inconsistent",
+                ));
+            }
+        }
+        if !candidate_keys.is_disjoint(&destination_keys) {
+            return Err(err("owned output candidates overlap destination keys"));
+        }
+        let mut replaced_destinations = Vec::with_capacity(publications.len());
+        for publication in publications {
+            let candidate_key = (publication.rank, publication.candidate_buffer);
+            let destination_key = (publication.rank, publication.destination_buffer);
             let candidate = leases
                 .remove(&candidate_key)
-                .expect("graph-unary candidate was preflighted");
+                .expect("owned output candidate was preflighted");
             let replaced = leases
                 .insert(destination_key, candidate)
-                .expect("graph-unary destination was preflighted");
+                .expect("owned output destination was preflighted");
             replaced_destinations.push(replaced);
         }
         drop(replaced_destinations);
@@ -1408,7 +1504,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn graph_unary_publication_atomically_rekeys_completed_leases_without_driver_work() {
+    fn owned_lease_publication_preflights_every_rank_then_rekeys_without_driver_work() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
         let devices = [
@@ -1419,16 +1515,19 @@ mod tests {
             .iter()
             .map(|device| device.retain_primary_context().unwrap())
             .collect::<Vec<_>>();
+        let allocators = owners
+            .iter()
+            .map(|owner| owner.allocator())
+            .collect::<Vec<_>>();
         let mut leases = BTreeMap::new();
         let mut target_descriptors = Vec::new();
         let mut candidate_descriptors = Vec::new();
+        let mut source_descriptors = Vec::new();
         for (rank, owner) in owners.iter().enumerate() {
-            let target = owner
-                .allocator()
+            let target = allocators[rank]
                 .allocate(NonZeroUsize::new(4).unwrap())
                 .unwrap();
-            let candidate = owner
-                .allocator()
+            let source = allocators[rank]
                 .allocate(NonZeroUsize::new(4).unwrap())
                 .unwrap();
             target
@@ -1436,10 +1535,10 @@ mod tests {
                 .unwrap()
                 .copy_from(0, &(10.0_f32 + rank as f32).to_le_bytes())
                 .unwrap();
-            candidate
+            source
                 .view()
                 .unwrap()
-                .copy_from(0, &(-20.0_f32 - rank as f32).to_le_bytes())
+                .copy_from(0, &(30.0_f32 + rank as f32).to_le_bytes())
                 .unwrap();
             target_descriptors.push(
                 mock.allocation_descriptor(
@@ -1448,28 +1547,119 @@ mod tests {
                 )
                 .unwrap(),
             );
-            candidate_descriptors.push(
+            source_descriptors.push(
                 mock.allocation_descriptor(
                     owner.owner(),
-                    candidate.view().unwrap().device_ptr().unwrap(),
+                    source.view().unwrap().device_ptr().unwrap(),
                 )
                 .unwrap(),
             );
             leases.insert((rank, 100 + rank as u64), target);
-            leases.insert((rank, 200 + rank as u64), candidate);
+            leases.insert((rank, 300 + rank as u64), source);
         }
-        let commits = (0..2)
-            .map(|rank| crate::CollectiveDownstreamOutputCommitRecord {
-                order: rank,
+        let mut publications = (0..2)
+            .map(|rank| OwnedLeasePublication {
                 rank,
-                output_candidate_buffer: 200 + rank as u64,
+                candidate_buffer: 200 + rank as u64,
                 destination_buffer: 100 + rank as u64,
+                owner_identity: owners[rank].identity(),
+                bytes: 4,
             })
             .collect::<Vec<_>>();
-        let calls_before = mock.calls().len();
-        ShardedCudaExecutionEnvironment::publish_graph_backed_unary_outputs(&mut leases, &commits)
+
+        // A late destination mismatch must reject the complete table before
+        // collective setup, allocation, or another Driver call. Repairing the
+        // descriptor then permits the same caller-owned destinations to retry.
+        publications[1].bytes = 8;
+        let preflight_calls_before = mock.calls().len();
+        assert!(
+            ShardedCudaExecutionEnvironment::preflight_publication_destinations(
+                &leases,
+                &publications
+            )
+            .is_err()
+        );
+        assert_eq!(mock.calls().len(), preflight_calls_before);
+        publications[1].bytes = 4;
+        ShardedCudaExecutionEnvironment::preflight_publication_destinations(&leases, &publications)
             .unwrap();
-        let publication_calls = &mock.calls()[calls_before..];
+        assert_eq!(mock.calls().len(), preflight_calls_before);
+        for rank in 0..2 {
+            let candidate = allocators[rank]
+                .allocate(NonZeroUsize::new(4).unwrap())
+                .unwrap();
+            candidate
+                .view()
+                .unwrap()
+                .copy_from(0, &(-20.0_f32 - rank as f32).to_le_bytes())
+                .unwrap();
+            candidate_descriptors.push(
+                mock.allocation_descriptor(
+                    owners[rank].owner(),
+                    candidate.view().unwrap().device_ptr().unwrap(),
+                )
+                .unwrap(),
+            );
+            leases.insert((rank, 200 + rank as u64), candidate);
+        }
+
+        // The same full-table validation is retained at the infallible rekey
+        // seam as a defense against internal corruption after execution.
+        publications[1].bytes = 8;
+        let publication_calls_before = mock.calls().len();
+        let leased_before = allocators
+            .iter()
+            .map(|allocator| allocator.stats().logical_leased_bytes)
+            .collect::<Vec<_>>();
+        assert!(
+            ShardedCudaExecutionEnvironment::publish_owned_leases(&mut leases, &publications)
+                .is_err()
+        );
+        assert_eq!(
+            allocators
+                .iter()
+                .map(|allocator| allocator.stats().logical_leased_bytes)
+                .collect::<Vec<_>>(),
+            leased_before,
+            "failed preflight preserves every candidate and destination lease"
+        );
+        for rank in 0..2 {
+            let target = leases.get(&(rank, 100 + rank as u64)).unwrap();
+            let candidate = leases.get(&(rank, 200 + rank as u64)).unwrap();
+            let source = leases.get(&(rank, 300 + rank as u64)).unwrap();
+            assert_eq!(
+                mock.allocation_descriptor(
+                    owners[rank].owner(),
+                    target.view().unwrap().device_ptr().unwrap()
+                ),
+                Some(target_descriptors[rank])
+            );
+            assert_eq!(
+                mock.allocation_descriptor(
+                    owners[rank].owner(),
+                    candidate.view().unwrap().device_ptr().unwrap()
+                ),
+                Some(candidate_descriptors[rank])
+            );
+            assert_eq!(
+                mock.allocation_descriptor(
+                    owners[rank].owner(),
+                    source.view().unwrap().device_ptr().unwrap()
+                ),
+                Some(source_descriptors[rank])
+            );
+            assert_eq!(
+                &mock
+                    .allocation_snapshot(owners[rank].owner(), target_descriptors[rank])
+                    .unwrap()[..4],
+                &(10.0_f32 + rank as f32).to_le_bytes(),
+                "late preflight failure leaves destination bytes unchanged"
+            );
+        }
+
+        publications[1].bytes = 4;
+        ShardedCudaExecutionEnvironment::publish_owned_leases(&mut leases, &publications).unwrap();
+        let publication_calls = &mock.calls()[publication_calls_before..];
         assert!(
             publication_calls.iter().all(|call| !matches!(
                 *call,
@@ -1501,11 +1691,31 @@ mod tests {
             let mut bytes = [0; 4];
             published.view().unwrap().copy_to(0, &mut bytes).unwrap();
             assert_eq!(f32::from_le_bytes(bytes), -20.0 - rank as f32);
-            assert!(
-                mock.allocation_snapshot(owners[rank].owner(), target_descriptors[rank])
-                    .is_none(),
-                "the replaced destination lease is released without a partial copy"
+            let source = leases.get(&(rank, 300 + rank as u64)).unwrap();
+            let mut source_bytes = [0; 4];
+            source
+                .view()
+                .unwrap()
+                .copy_to(0, &mut source_bytes)
+                .unwrap();
+            assert_eq!(f32::from_le_bytes(source_bytes), 30.0 + rank as f32);
+            assert_eq!(
+                mock.allocation_descriptor(
+                    owners[rank].owner(),
+                    source.view().unwrap().device_ptr().unwrap()
+                ),
+                Some(source_descriptors[rank]),
+                "publication preserves an unrelated source lease"
             );
+            assert_eq!(
+                &mock
+                    .allocation_snapshot(owners[rank].owner(), target_descriptors[rank])
+                    .unwrap()[..4],
+                &(10.0_f32 + rank as f32).to_le_bytes(),
+                "the superseded destination is retired without mutation"
+            );
+            assert_eq!(allocators[rank].stats().logical_leased_bytes, 8);
+            assert_eq!(allocators[rank].stats().cached_blocks, 1);
         }
     }
 
@@ -1928,9 +2138,22 @@ mod tests {
                 .copy_from(0, &value.to_le_bytes())
                 .unwrap();
         }
+        let asynchronous_copies_before = mock
+            .calls()
+            .iter()
+            .filter(|&&call| call == "dtod_async")
+            .count();
         environment
             .execute_transaction(&plan, candidates.clone(), commits.clone())
             .unwrap();
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "dtod_async")
+                .count(),
+            asynchronous_copies_before + candidates.len(),
+            "only candidate initialization copies; publication itself rekeys leases"
+        );
         for rank in 0..2 {
             let mut bytes = [0; 4];
             environment
