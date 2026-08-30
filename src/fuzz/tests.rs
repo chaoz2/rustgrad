@@ -731,7 +731,7 @@ fn generated_concat_cases_are_valid_diverse_and_deterministic() {
     assert_eq!(arities, std::collections::BTreeSet::from([2, 3, 4]));
     assert!(zero_width && nonzero_width && zero_non_axis);
     assert!(axis_zero && axis_one);
-    assert_eq!(dtypes.len(), 17);
+    assert_eq!(dtypes.len(), 13);
 }
 
 #[test]

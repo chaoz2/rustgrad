@@ -3311,8 +3311,8 @@ mod tests {
                 let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
                 let scalar_rendered = CpuJit::render(&uop).unwrap();
                 let vector_rendered = CpuJit::render_vectorized(&uop).unwrap();
-                assert!(scalar_rendered.source.contains("rg_f8_decode"));
-                assert!(vector_rendered.source.contains("rg_f8_decode"));
+                assert!(scalar_rendered.source.matches("rg_f8_decode(").count() > 1);
+                assert!(vector_rendered.source.matches("rg_f8_decode(").count() > 1);
                 assert!(!vector_rendered.source.contains("B2 VectorProgram"));
 
                 for kernel in [
@@ -3357,8 +3357,10 @@ mod tests {
             let uop = crate::lower_graph_elementwise(&graph, selected).unwrap();
             let scalar_rendered = CpuJit::render(&uop).unwrap();
             let vector_rendered = CpuJit::render_vectorized(&uop).unwrap();
-            assert!(!scalar_rendered.source.contains("rg_f8_decode"));
-            assert!(!vector_rendered.source.contains("rg_f8_decode"));
+            // The shared helper definition is present in every elementwise C
+            // unit; raw Select must not emit an invocation in the kernel.
+            assert_eq!(scalar_rendered.source.matches("rg_f8_decode(").count(), 1);
+            assert_eq!(vector_rendered.source.matches("rg_f8_decode(").count(), 1);
             assert!(!vector_rendered.source.contains("B2 VectorProgram"));
             for kernel in [
                 CpuJit::compile(&uop).unwrap(),
