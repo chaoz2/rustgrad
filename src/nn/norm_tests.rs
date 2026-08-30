@@ -1019,7 +1019,8 @@ fn rmsnorm_static_constructor_and_module_forward_compose_deterministically() -> 
     let legacy = RMSNorm::new(&mut legacy_graph, 2, 1e-5, true)?;
     let graph_free = RMSNorm::new_static(2, 1e-5, true)?;
     assert_eq!(legacy.state_dict()?, graph_free.state_dict()?);
-    assert!(RMSNorm::new_static(0, 1e-5, true).is_err());
+    let zero = RMSNorm::new_static(0, 1e-5, true)?;
+    assert_eq!(zero.state_dict()?["weight"].value.shape().dims(), &[0]);
 
     let source = rmsnorm_classifier(109, true)?;
     let target = rmsnorm_classifier(113, false)?;

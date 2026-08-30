@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Storage, gguf::GgufErrorKind};
+use crate::Storage;
 
 const SCHEMA: LlamaDecoderSchema = LlamaDecoderSchema {
     vocab_size: 5,
@@ -180,11 +180,12 @@ fn materialization_is_atomic_and_dtype_validation_is_explicit() {
     });
     let bytes = gguf_fixture(&tensors);
     let file = crate::gguf::read_gguf(&bytes).unwrap();
-    assert!(matches!(
+    // GGML kind 3 is now materializable; once materialization succeeds the
+    // decoder schema must still reject the unclaimed tensor by name.
+    assert_eq!(
         SCHEMA.bind(&file).unwrap_err(),
-        LlamaStateError::Gguf(error)
-            if matches!(error.kind(), GgufErrorKind::QuantizedMaterialization { tensor, .. } if tensor == "unsupported.weight")
-    ));
+        LlamaStateError::UnexpectedTensor("unsupported.weight".to_owned())
+    );
 
     let bytes = gguf_fixture(&state_tensors(false));
     let file = crate::gguf::read_gguf(&bytes).unwrap();

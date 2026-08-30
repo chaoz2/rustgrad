@@ -104,7 +104,7 @@ fn graph_logits_match_independent_dense_reference_and_are_inspectable() {
         &[tokens.len(), VOCAB]
     );
     let trace = plan.graph().trace(plan.logits_node()).unwrap();
-    for operation in ["gather(", "matmul(", "Mean(", "where(", "exp("] {
+    for operation in ["gather(", "matmul(", "Mean(", "where(", "exp2("] {
         assert!(
             trace
                 .steps

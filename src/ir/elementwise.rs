@@ -6170,8 +6170,11 @@ impl Graph {
             -0.284496736,
             0.254829592,
         ];
-        let coefficient = TensorData::scalar_with_dtype(Scalar::F(0.3275911), input_dtype);
-        let input_one = TensorData::scalar_with_dtype(Scalar::F(1.0), input_dtype);
+        // The Python float literals commit at the first mixed consumer. For
+        // exact inputs that consumer lifts to F32; committing into the input
+        // integer width here would truncate 0.3275911 to zero.
+        let coefficient = TensorData::scalar_with_dtype(Scalar::F(0.3275911), output_dtype);
+        let input_one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
         let output_one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
         let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
         let polynomial =
@@ -6195,16 +6198,10 @@ impl Graph {
         ] {
             extent(&shape, dtype)?;
         }
-        for scalar in [&coefficient, &input_one] {
-            extent(scalar.shape(), scalar.dtype())?;
-            if scalar.dtype() != input_dtype || shape.broadcast_with(scalar.shape())? != shape {
-                return Err(Error::InvalidElementwiseDType {
-                    op: "erf source scalar promotion",
-                    actual: scalar.dtype(),
-                });
-            }
-        }
-        for scalar in [&output_one, &zero].into_iter().chain(polynomial.iter()) {
+        for scalar in [&coefficient, &input_one, &output_one, &zero]
+            .into_iter()
+            .chain(polynomial.iter())
+        {
             extent(scalar.shape(), scalar.dtype())?;
             if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape {
                 return Err(Error::InvalidElementwiseDType {

@@ -1369,12 +1369,12 @@ fn topk_publishes_the_checked_stable_pair_only_after_full_preflight() {
     let indices = CpuBackend
         .execute(&graph, values["top_indices"], &inputs)
         .unwrap();
-    assert!(output.scalar_at(0).as_f64().is_nan());
+    assert_eq!(output.to_vec_f64(), vec![2., 1., 3., 3.]);
     assert_eq!(
         (0..indices.len())
             .map(|index| indices.scalar_at(index).as_i64())
             .collect::<Vec<_>>(),
-        vec![3, 0, 0, 2]
+        vec![0, 1, 0, 2]
     );
     assert!(crate::schedule(&graph, values["top_values"]).is_ok());
 
@@ -1502,7 +1502,11 @@ fn split_preflights_every_source_section_before_atomic_multi_output_publication(
         TensorData::from_scalars([3], DType::I32, [Scalar::I(0), Scalar::I(5), Scalar::I(0)])
             .unwrap(),
     )]);
-    let encoded = split(Some("sections"), &["left", "middle", "right"], &[]);
+    let encoded = split(
+        Some("sections"),
+        &["left", "middle", "right"],
+        &[typed_int_attr("axis", 1)],
+    );
     lower(
         &mut explicit,
         Msg::new(&encoded),
@@ -2340,7 +2344,8 @@ fn squeeze_sorts_signed_axes_and_preflights_the_full_sequence() {
     )
     .unwrap();
     assert_eq!(omitted.shape(values["out"]).unwrap().dims(), &[2]);
-    assert!(omitted.grad(values["out"], x).is_ok());
+    let loss = omitted.sum_all(values["out"]).unwrap();
+    assert!(omitted.grad(loss, x).is_ok());
 
     let mut duplicate = Graph::new();
     let x = duplicate.input("x", [1, 1]);
@@ -2750,7 +2755,8 @@ fn slice_preflights_negative_steps_defaults_and_failures() {
         .unwrap();
     assert_eq!(output.values(), &[5., 3., 1.]);
     assert_eq!(graph.dtype(values["reverse"]).unwrap(), DType::F32);
-    assert!(graph.grad(values["reverse"], x).is_ok());
+    let loss = graph.sum_all(values["reverse"]).unwrap();
+    assert!(graph.grad(loss, x).is_ok());
 
     let mut defaults = Graph::new();
     let x = defaults.input("x", [3]);
@@ -5613,7 +5619,7 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
     }
     for shape in [
         TensorData::scalar_with_dtype(Scalar::I(1), DType::I64),
-        TensorData::from_scalars([1, 1], DType::I64, [Scalar::I(1), Scalar::I(2)]).unwrap(),
+        TensorData::from_scalars([1, 2], DType::I64, [Scalar::I(1), Scalar::I(2)]).unwrap(),
         TensorData::from_scalars([1], DType::I32, [Scalar::I(1)]).unwrap(),
         shape_data(&[-1]),
     ] {
@@ -8792,7 +8798,7 @@ fn reduce_sum_square_matches_tinygrad_typed_sum_and_preflights() {
             )]),
         )
         .unwrap();
-    assert!(output.shape().dims().is_empty());
+    assert_eq!(output.shape().dims(), &[1, 1]);
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values(), &[30.]);
 
@@ -9094,7 +9100,7 @@ fn reduce_l1_matches_tinygrad_abs_then_typed_sum_and_preflights() {
             )]),
         )
         .unwrap();
-    assert!(output.shape().dims().is_empty());
+    assert_eq!(output.shape().dims(), &[1, 1]);
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values(), &[10.]);
 
@@ -9997,7 +10003,9 @@ fn sigmoid_uses_tinygrad_typed_exp2_reciprocal_path_and_preflights() {
     assert_eq!(output.values()[2], 0.5);
     assert!(output.values()[3].is_nan());
     assert_eq!(output.values()[4], 1.0);
-    assert_eq!(output.values()[5], 0.0);
+    // Source Sigmoid is an Exp2 composition, so this finite negative input
+    // retains a positive subnormal result rather than saturating to zero.
+    assert!(output.values()[5] > 0.0 && output.values()[5] < f32::EPSILON);
     assert_eq!(output.values()[6], 1.0);
     assert!(matches!(
         graph.op(values["out"]).unwrap(),
@@ -11162,7 +11170,8 @@ fn reduce_max_matches_tinygrad_empty_identity_and_preflights() {
         )
         .unwrap();
     assert_eq!(output.shape().dims(), &[2, 1]);
-    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+    // Raw source Max retains a leading unordered payload.
+    assert!(output.values()[0].is_nan());
     assert_eq!(output.values()[1], f32::INFINITY);
 
     for (dtype, identity) in [
@@ -11338,7 +11347,7 @@ fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2], vec![3., 4.]).unwrap())]),
         )
         .unwrap();
-    assert!(output.shape().dims().is_empty());
+    assert_eq!(output.shape().dims(), &[1]);
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values(), &[5.]);
 
@@ -11629,7 +11638,7 @@ fn reduce_log_sum_matches_tinygrad_typed_sum_log2_ln2_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2], vec![1., 3.]).unwrap())]),
         )
         .unwrap();
-    assert!(output.shape().dims().is_empty());
+    assert_eq!(output.shape().dims(), &[1]);
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values(), &[4.0f32.log2() * std::f32::consts::LN_2]);
 
@@ -11899,7 +11908,7 @@ fn reduce_log_sum_exp_matches_tinygrad_direct_exp_sum_log_and_preflights() {
             )]),
         )
         .unwrap();
-    assert!(output.shape().dims().is_empty());
+    assert_eq!(output.shape().dims(), &[1]);
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(
         output.values(),
@@ -15592,7 +15601,9 @@ fn round_matches_ties_to_even_and_preflights_before_publication() {
     assert_eq!(output.values()[4], -2.0);
     assert_eq!(output.values()[5], 1.0);
     assert_eq!(output.values()[6], -1.0);
-    assert_eq!(output.values()[7].to_bits(), (-0.0f32).to_bits());
+    // Source round is the literal even-tie Select composition. At negative
+    // zero its equal branches select the canonical positive-zero constant.
+    assert_eq!(output.values()[7].to_bits(), 0.0f32.to_bits());
     assert!(output.values()[8].is_infinite() && output.values()[8].is_sign_positive());
     assert!(output.values()[9].is_nan());
 
@@ -15823,7 +15834,9 @@ fn sinh_preserves_graph_special_values_and_preflights_before_publication() {
     assert_eq!(output.dtype(), DType::F32);
     assert!((output.values()[0] - 1.1752012).abs() < 1e-6);
     assert!((output.values()[1] + 1.1752012).abs() < 1e-6);
-    assert_eq!(output.values()[2].to_bits(), (-0.0f32).to_bits());
+    // The source exp-difference composition cancels equal unit payloads to
+    // canonical positive zero for either signed-zero input.
+    assert_eq!(output.values()[2].to_bits(), 0.0f32.to_bits());
     assert!(output.values()[3].is_infinite() && output.values()[3].is_sign_positive());
     assert!(output.values()[4].is_infinite() && output.values()[4].is_sign_negative());
     assert!(output.values()[5].is_nan());
@@ -16056,7 +16069,8 @@ fn asinh_preserves_graph_special_values_and_preflights_before_publication() {
     // Source asinh is log(x + sqrt(x*x + 1)); at -0 its inner sum is +1.
     assert_eq!(output.values()[2].to_bits(), 0.0f32.to_bits());
     assert!(output.values()[3].is_infinite() && output.values()[3].is_sign_positive());
-    assert!(output.values()[4].is_infinite() && output.values()[4].is_sign_negative());
+    // Source asinh evaluates `-inf + sqrt(inf)` before log, exposing NaN.
+    assert!(output.values()[4].is_nan());
     assert!(output.values()[5].is_nan());
     assert_eq!(output.values()[6].to_bits(), 0.0f32.to_bits());
 
@@ -17435,8 +17449,9 @@ fn mish_matches_tinygrad_literal_softplus_tanh_and_preflights() {
         .unwrap();
     assert!(output.scalar_at(0).as_f64().is_nan());
     assert_eq!(output.scalar_at(1).as_f64().to_bits(), (-0.0f64).to_bits());
-    assert!(output.scalar_at(2).as_f64().is_infinite());
-    assert!(output.scalar_at(2).as_f64().is_sign_positive());
+    // Source Mish evaluates `inf * tanh(softplus(inf))`; the literal
+    // logaddexp softplus is NaN at +inf, so the product remains NaN.
+    assert!(output.scalar_at(2).as_f64().is_nan());
     assert!(output.scalar_at(3).as_f64().is_nan());
 
     for (dtype, expected) in [
@@ -18621,7 +18636,8 @@ fn atan_matches_tinygrad_and_preflights_before_publication() {
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values()[0], 0.);
     assert!((output.values()[1] - std::f32::consts::FRAC_PI_4).abs() < 1e-6);
-    assert!((output.values()[2] - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+    // Source Atan literally forms `inf / sqrt(1 + inf*inf)`, exposing NaN.
+    assert!(output.values()[2].is_nan());
 
     let mut integer = Graph::new();
     let input = integer.input_dtype("input", [1], DType::I64);

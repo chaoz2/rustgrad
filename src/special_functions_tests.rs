@@ -478,7 +478,9 @@ fn elu_uses_strict_source_relu_branches_and_live_alpha_promotion() {
     // literal Exp VJP still evaluates `0 * exp(NaN)`, which is NaN just as in
     // tinygrad's compositional gradient graph.
     assert!(gradient[4].is_nan());
-    assert_eq!(gradient[5], 1.0);
+    // The inactive exponential branch still evaluates `0 * exp(+inf)` in
+    // the literal compositional VJP, so the positive-infinity lane is NaN.
+    assert!(gradient[5].is_nan());
 
     let mut infinite_alpha = Graph::new();
     let x = infinite_alpha.input_dtype("x", [], DType::F64);
@@ -747,7 +749,9 @@ fn selu_uses_ge_source_branch_and_live_parameter_promotion() {
     assert_eq!(gradient[2], 2.0);
     assert_eq!(gradient[3], 2.0);
     assert!(gradient[4].is_nan());
-    assert_eq!(gradient[5], 2.0);
+    // The inactive exponential branch still evaluates `0 * exp(+inf)` in
+    // the literal compositional VJP, so the positive-infinity lane is NaN.
+    assert!(gradient[5].is_nan());
 
     let mut infinite_gamma = Graph::new();
     let x = infinite_gamma.input_dtype("x", [], DType::F64);
@@ -2434,17 +2438,11 @@ fn parameterized_hardsigmoid_matches_tinygrad_relu_difference() {
     assert!(values[1].is_nan());
     assert_eq!(values[2], 0.0);
     close(values[3], 0.5, 1e-12);
-    let operations = graph
-        .trace(output)
-        .unwrap()
-        .steps
-        .into_iter()
-        .map(|step| step.operation)
-        .collect::<Vec<_>>();
     assert_eq!(
-        operations
+        graph
+            .nodes
             .iter()
-            .filter(|operation| operation.starts_with("relu("))
+            .filter(|node| matches!(&node.op, Op::Select { .. }))
             .count(),
         2
     );
@@ -2509,17 +2507,11 @@ fn hardswish_matches_tinygrad_relu6_composition() {
     assert!(values[3].is_sign_negative());
     assert_eq!(values[4], 0.0);
     assert!(values[4].is_sign_positive());
-    let operations = graph
-        .trace(output)
-        .unwrap()
-        .steps
-        .into_iter()
-        .map(|step| step.operation)
-        .collect::<Vec<_>>();
     assert_eq!(
-        operations
+        graph
+            .nodes
             .iter()
-            .filter(|operation| operation.starts_with("relu("))
+            .filter(|node| matches!(&node.op, Op::Select { .. }))
             .count(),
         2
     );
@@ -2589,17 +2581,11 @@ fn relu6_matches_tinygrad_relu_difference() {
     // at that tie, while both signed zeros are exact numeric results.
     assert_eq!(values[4], 0.0);
     assert!(values[4].is_sign_positive());
-    let operations = graph
-        .trace(output)
-        .unwrap()
-        .steps
-        .into_iter()
-        .map(|step| step.operation)
-        .collect::<Vec<_>>();
     assert_eq!(
-        operations
+        graph
+            .nodes
             .iter()
-            .filter(|operation| operation.starts_with("relu("))
+            .filter(|node| matches!(&node.op, Op::Select { .. }))
             .count(),
         2
     );
@@ -2679,7 +2665,9 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
     .to_vec_f64();
     assert_eq!(logsigmoid_values[0], 0.0);
     assert!(logsigmoid_values[0].is_sign_negative());
-    assert!(logsigmoid_values[1].is_infinite() && logsigmoid_values[1].is_sign_negative());
+    // LogSigmoid is `-softplus(-x)`, and source logaddexp exposes NaN when
+    // its input is positive infinity rather than special-casing it.
+    assert!(logsigmoid_values[1].is_nan());
     assert!(logsigmoid_values[2].is_nan());
     close(logsigmoid_values[3], -std::f64::consts::LN_2, 1e-12);
     let operations = graph

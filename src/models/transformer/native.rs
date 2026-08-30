@@ -1019,6 +1019,11 @@ fn native_stage_graph(
 
 fn movement_name(op: &Op) -> Option<&'static str> {
     Some(match op {
+        // Detach is a value identity at inference time. Keep it as an
+        // explicit staged value copy so native planning preserves the graph
+        // boundary without asking the arithmetic scheduler to lower autograd
+        // metadata.
+        Op::Detach { .. } => "detach",
         Op::Reshape { .. } => "reshape",
         Op::Permute { .. } => "permute",
         Op::Expand { .. } => "expand",
@@ -1086,6 +1091,9 @@ fn execute_movement(
                 .ok_or(LlamaNativeError::MissingStageValue(input.index()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if matches!(op, Op::Detach { .. }) {
+        return Ok(inputs[0].clone());
+    }
     let mut mini = Graph::new();
     let ids = inputs
         .into_iter()
