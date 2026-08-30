@@ -321,40 +321,6 @@ fn operation_fields(operation: &Operation) -> BTreeMap<String, String> {
     out
 }
 
-fn family_name(operation: &Operation) -> &'static str {
-    match operation {
-        Operation::Const(_) | Operation::VConst(_) => "literal",
-        Operation::DefineVar(_)
-        | Operation::DefineGlobal(_)
-        | Operation::DefineLocal(_)
-        | Operation::DefineRegister(_)
-        | Operation::Special(_) => "definition",
-        Operation::Range(_) | Operation::EndRange | Operation::If | Operation::EndIf => "control",
-        Operation::Unary(_) | Operation::Binary(_) | Operation::Ternary(_) => "core_alu",
-        Operation::GraphUnary(_)
-        | Operation::GraphBinary(_)
-        | Operation::GraphCompare(_)
-        | Operation::GraphLogical(_) => "graph_alu",
-        Operation::Matmul(_)
-        | Operation::Conv2d(_)
-        | Operation::Movement(_)
-        | Operation::Random(_)
-        | Operation::PrefixScan(_)
-        | Operation::Sort(_)
-        | Operation::TensorGuard(_) => "materialized",
-        Operation::ReduceInit(_) | Operation::ReduceAccumulate | Operation::ReduceFinalize => {
-            "reduction"
-        }
-        Operation::Cast | Operation::Bitcast | Operation::Vectorize | Operation::Gep(_) => {
-            "conversion"
-        }
-        Operation::Index(_) | Operation::Load | Operation::Store => "memory",
-        Operation::EffectStore(_) | Operation::After(_) | Operation::Barrier | Operation::Sink => {
-            "effect"
-        }
-    }
-}
-
 fn matmul_fields(
     out: &mut BTreeMap<String, String>,
     plan: &crate::MatmulKernelPlan,
@@ -386,8 +352,7 @@ pub fn uop_viz(root: &UOp) -> Result<VizGraph, VizError> {
     let mut viz_nodes = Vec::with_capacity(nodes.len());
     let mut edges = Vec::new();
     for (id, node) in nodes.iter().enumerate() {
-        let mut viz = VizNode::new(format!("u{id}"), "uop", kind_name(node.operation()))
-            .field("family", family_name(node.operation()));
+        let mut viz = VizNode::new(format!("u{id}"), "uop", kind_name(node.operation()));
         if let Some(ty) = node.ty() {
             viz = viz.field("type", format!("{}x{}", dtype_name(ty.scalar), ty.lanes));
         }

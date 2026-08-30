@@ -851,8 +851,6 @@ fn uop_snapshot_preserves_shared_subgraph_and_typed_metadata() {
     assert_eq!(model.edges()[0].to(), "u1");
     assert_eq!(model.edges()[1].to(), "u1");
     assert_ne!(model.edges()[0].label(), model.edges()[1].label());
-    assert_eq!(model.nodes()[0].fields()["family"], "literal");
-    assert_eq!(model.nodes()[1].fields()["family"], "core_alu");
     assert!(model.to_dot().contains("binary.add"));
 }
 
