@@ -656,9 +656,11 @@ fn render(
         &mut lines,
         &mut map,
         "%r3",
-        false,
-        storage_mode,
-        allow_linked_f32_exp,
+        EmitOptions {
+            allow_reduction_narrow: false,
+            storage_mode,
+            allow_linked_f32_exp,
+        },
     )?;
     let out = buffers.iter().find(|b| b.id == *out_id).unwrap();
     let oi = ids[out_id] + 1;
@@ -4008,16 +4010,26 @@ fn emit_select_predicate_value(
         _ => value,
     }
 }
+#[derive(Clone, Copy)]
+struct EmitOptions {
+    allow_reduction_narrow: bool,
+    storage_mode: Option<ScopedStorageMode>,
+    allow_linked_f32_exp: bool,
+}
+
 fn emit(
     n: &UOp,
     ids: &BTreeMap<u64, usize>,
     lines: &mut Vec<String>,
     map: &mut BTreeMap<usize, usize>,
     linear: &str,
-    allow_reduction_narrow: bool,
-    storage_mode: Option<ScopedStorageMode>,
-    allow_linked_f32_exp: bool,
+    options: EmitOptions,
 ) -> Result<String, PtxError> {
+    let EmitOptions {
+        allow_reduction_narrow,
+        storage_mode,
+        allow_linked_f32_exp,
+    } = options;
     let id = map.len();
     map.insert(id, lines.len() + 1);
     let ty = n
@@ -4031,18 +4043,7 @@ fn emit(
     } else {
         reject_dtype(ty)?;
     }
-    let mut child = |i| {
-        emit(
-            &n.sources()[i],
-            ids,
-            lines,
-            map,
-            linear,
-            allow_reduction_narrow,
-            storage_mode,
-            allow_linked_f32_exp,
-        )
-    };
+    let mut child = |i| emit(&n.sources()[i], ids, lines, map, linear, options);
     let dst = match ty {
         _ if storage_mode == Some(ScopedStorageMode::Rsqrt)
             && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)) =>
@@ -5413,9 +5414,11 @@ fn render_reduction(
             &mut lines,
             &mut map,
             "%r4",
-            true,
-            None,
-            false,
+            EmitOptions {
+                allow_reduction_narrow: true,
+                storage_mode: None,
+                allow_linked_f32_exp: false,
+            },
         )?;
         if extrema {
             let convert = match value_dtype {

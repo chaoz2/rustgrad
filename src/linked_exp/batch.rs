@@ -509,17 +509,20 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn fixture() -> (
+    type FixtureRecord = (
+        LinkedF32ExpRequest,
+        LinkedF32ExpResourceDescriptor,
+        Vec<LinkInput>,
+    );
+    type Fixture = (
         Arc<crate::cuda::tests::Mock>,
         CapturedSchedule,
         PrimaryContext,
         LinkedF32ExpBatchArtifact,
-        Vec<(
-            LinkedF32ExpRequest,
-            LinkedF32ExpResourceDescriptor,
-            Vec<LinkInput>,
-        )>,
-    ) {
+        Vec<FixtureRecord>,
+    );
+
+    fn fixture() -> Fixture {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let primary = Driver::from_dispatch(mock.clone())
             .unwrap()

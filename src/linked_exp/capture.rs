@@ -664,8 +664,8 @@ mod tests {
             assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0));
         }
         let trace = mock.calls();
-        assert!(trace[calls..].iter().any(|call| *call == "launch"));
-        assert!(trace[calls..].iter().any(|call| *call == "dtod_async"));
+        assert!(trace[calls..].contains(&"launch"));
+        assert!(trace[calls..].contains(&"dtod_async"));
         let before_bad = mock.calls().len();
         assert!(
             table

@@ -486,7 +486,7 @@ pub enum CudaError {
 }
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum PrimaryOutputCommitPhase {
+pub enum PrimaryOutputCommitPhase {
     Backup,
     Commit,
     Restore,
@@ -1935,7 +1935,7 @@ pub(crate) enum PrimaryOutputCommitError {
     Commit(CudaError),
     CommitAndRollback {
         commit: CudaError,
-        rollback: CudaError,
+        rollback: Box<CudaError>,
     },
 }
 
@@ -2011,7 +2011,7 @@ impl PrimaryContext {
                     Ok(()) => Err(PrimaryOutputCommitError::Commit(commit_error)),
                     Err(rollback) => Err(PrimaryOutputCommitError::CommitAndRollback {
                         commit: commit_error,
-                        rollback,
+                        rollback: Box::new(rollback),
                     }),
                 };
             }
@@ -5244,20 +5244,6 @@ pub(crate) mod tests {
         pub(crate) fn generic_kernel_count(&self) -> usize {
             self.generic_kernels.lock().unwrap().len()
         }
-        pub(crate) fn generic_kernel_is_registered(
-            &self,
-            owner: PrimaryOwner,
-            function: usize,
-        ) -> bool {
-            self.generic_kernels
-                .lock()
-                .unwrap()
-                .contains_key(&(owner.identity, function))
-        }
-        pub(crate) fn last_module_function_identity(&self) -> usize {
-            self.last_function.load(Ordering::Acquire)
-        }
-
         fn call(&self, name: &'static str) {
             self.calls.lock().unwrap().push(name);
         }
@@ -8044,7 +8030,7 @@ pub(crate) mod tests {
                 "link_destroy"
             ]
         );
-        assert!(calls.iter().any(|call| *call == "module_unload"));
+        assert!(calls.contains(&"module_unload"));
     }
 
     #[test]
