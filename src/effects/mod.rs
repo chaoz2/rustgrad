@@ -1149,7 +1149,7 @@ mod tests {
             after.operation(),
             crate::Operation::After(payload) if payload.as_ref() == first.payload()
         ));
-        assert_eq!(after.sources(), &[store.clone()]);
+        assert_eq!(after.sources(), std::slice::from_ref(&store));
         let encoded = crate::uop::artifact::encode_effect_aware(&after).unwrap();
         assert_eq!(crate::uop::artifact::decode(&encoded).unwrap(), after);
         assert_eq!(
