@@ -2970,10 +2970,14 @@ fn sub_scalar_preserves_tinygrad_neg_then_add_and_reflected_order() {
         };
         assert!(matches!(reflected.op(*lhs).unwrap(), Op::Constant(_)));
         if dtype == DType::Bool {
-            assert!(
-                matches!(reflected.op(*rhs).unwrap(), Op::Logical { op: LogicalOp::Not, lhs, rhs: None }
-                if *lhs == input)
-            );
+            assert!(matches!(
+                reflected.op(*rhs).unwrap(),
+                Op::Compare {
+                    op: CompareOp::Ne,
+                    lhs,
+                    ..
+                } if *lhs == input
+            ));
         } else {
             assert!(
                 matches!(reflected.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Neg, input: source }
@@ -4070,7 +4074,7 @@ fn trunc_div_scalar_preserves_source_integer_and_float_branches() {
     )));
     assert!(matches!(
         sentinel.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 
     let mut specials = Graph::new();
@@ -4103,10 +4107,8 @@ fn trunc_div_scalar_preserves_source_integer_and_float_branches() {
             ..
         }
     ));
-    assert!(matches!(
-        specials.grad(negative_zero, input),
-        Err(Error::NoGradient(_))
-    ));
+    let gradient = specials.grad(negative_zero, input).unwrap();
+    assert_eq!(specials.dtype(gradient).unwrap(), DType::F64);
 
     let mut empty = Graph::new();
     let input = empty.input_dtype("input", [0, 2], DType::BF16);
@@ -4329,7 +4331,7 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
     )));
     assert!(matches!(
         sentinel.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 
     let mut specials = Graph::new();
@@ -4341,31 +4343,11 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
     let nan = specials
         .scalar_floor_div(Scalar::F(f64::NAN), input)
         .unwrap();
-    assert!(matches!(
-        specials.op(negative_zero).unwrap(),
-        Op::Unary {
-            op: UnaryOp::Floor,
-            ..
-        }
-    ));
-    assert!(matches!(
-        specials.op(infinity).unwrap(),
-        Op::Unary {
-            op: UnaryOp::Floor,
-            ..
-        }
-    ));
-    assert!(matches!(
-        specials.op(nan).unwrap(),
-        Op::Unary {
-            op: UnaryOp::Floor,
-            ..
-        }
-    ));
-    assert!(matches!(
-        specials.grad(negative_zero, input),
-        Err(Error::NoGradient(_))
-    ));
+    for output in [negative_zero, infinity, nan] {
+        assert!(matches!(specials.op(output).unwrap(), Op::Select { .. }));
+    }
+    let gradient = specials.grad(negative_zero, input).unwrap();
+    assert_eq!(specials.dtype(gradient).unwrap(), DType::F64);
 
     let mut empty = Graph::new();
     let input = empty.input_dtype("input", [0, 2], DType::BF16);
@@ -4632,7 +4614,7 @@ fn modulo_scalar_preserves_floor_composition_and_reflected_roles() {
     );
     assert!(matches!(
         sentinel.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 
     let mut specials = Graph::new();
@@ -4756,7 +4738,7 @@ fn fmod_scalar_preserves_non_reflected_trunc_composition() {
     );
     assert!(matches!(
         sentinel.grad(output, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == output
     ));
 
     let mut specials = Graph::new();
@@ -6355,7 +6337,7 @@ fn exp_uses_tinygrad_exp2_promotion_special_values_and_vjp() {
         Err(Error::UnknownNode(_))
     ));
     assert_eq!(graph.node_count(), node_count);
-    assert!(graph.node(gradient).is_ok());
+    assert!(differentiable.node(gradient).is_ok());
 }
 
 #[test]
