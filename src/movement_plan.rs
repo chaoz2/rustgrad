@@ -503,8 +503,7 @@ impl MovementKernelPlan {
     ) -> Result<TensorData, MovementExecutionError> {
         let source = dense(&desc.shape)?;
         let output = dense(&self.output_shape)?;
-        let fill = scalar_from_bits(self.dtype, fill_bits);
-        let mut values = Vec::with_capacity(output.len());
+        let mut offsets = Vec::with_capacity(output.len());
         for linear in 0..output.len() {
             let coords = output
                 .coords(linear)
@@ -513,22 +512,24 @@ impl MovementKernelPlan {
                 coords.iter().zip(padding).zip(desc.shape.dims()).all(
                     |((coord, (before, _)), dim)| *coord >= *before && *coord - *before < *dim,
                 );
-            values.push(if inside {
+            offsets.push(if inside {
                 let input_coords = coords
                     .iter()
                     .zip(padding)
                     .map(|(coord, (before, _))| coord - before)
                     .collect::<Vec<_>>();
-                input.scalar_at(
+                Some(
                     source
                         .offset(&input_coords)
                         .map_err(|_| MovementExecutionError::InvalidGeometry)?,
                 )
             } else {
-                fill
+                None
             });
         }
-        TensorData::from_scalars(self.output_shape.clone(), self.dtype, values)
+        let fill = scalar_data_from_bits(self.dtype, fill_bits)?;
+        input
+            .pad_raw_offsets(self.output_shape.clone(), &offsets, &fill)
             .map_err(|_| MovementExecutionError::InvalidGeometry)
     }
 
@@ -673,30 +674,16 @@ fn scalar_bits(dtype: DType, value: Scalar) -> u64 {
 fn valid_bits(dtype: DType, bits: u64) -> bool {
     dtype.bits() == 64 || bits >> dtype.bits() == 0
 }
-fn scalar_from_bits(dtype: DType, bits: u64) -> Scalar {
-    match dtype {
-        DType::Bool => Scalar::Bool(bits != 0),
-        DType::I8 => Scalar::I(bits as u8 as i8 as i64),
-        DType::U8 => Scalar::U(bits as u8 as u64),
-        DType::I16 => Scalar::I(bits as u16 as i16 as i64),
-        DType::U16 => Scalar::U(bits as u16 as u64),
-        DType::I32 => Scalar::I(bits as u32 as i32 as i64),
-        DType::U32 => Scalar::U(bits as u32 as u64),
-        DType::I64 => Scalar::I(bits as i64),
-        DType::U64 => Scalar::U(bits),
-        dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
-            Scalar::F(
-                dtype
-                    .float8_format()
-                    .expect("matched float8 dtype")
-                    .decode(bits as u8),
-            )
-        }
-        DType::F16 => Scalar::F(crate::f16_to_f32(bits as u16) as f64),
-        DType::BF16 => Scalar::F(crate::bf16_to_f32(bits as u16) as f64),
-        DType::F32 => Scalar::F(f32::from_bits(bits as u32) as f64),
-        DType::F64 => Scalar::F(f64::from_bits(bits)),
+fn scalar_data_from_bits(dtype: DType, bits: u64) -> Result<TensorData, MovementExecutionError> {
+    if dtype == DType::Bool {
+        return Ok(TensorData::scalar_with_dtype(
+            Scalar::Bool(bits != 0),
+            dtype,
+        ));
     }
+    let bytes = bits.to_le_bytes();
+    TensorData::from_le_bytes([], dtype, &bytes[..dtype.itemsize()])
+        .map_err(|_| MovementExecutionError::InvalidGeometry)
 }
 
 fn dense(shape: &Shape) -> Result<DenseIndex, MovementExecutionError> {

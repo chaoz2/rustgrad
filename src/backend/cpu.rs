@@ -2443,7 +2443,7 @@ fn pad(input: &TensorData, padding: &[(usize, usize)], fill: Scalar) -> Result<T
     let output_shape = Shape::new(dims);
     let source_index = DenseIndex::new(input.shape().clone())?;
     let output_index = DenseIndex::new(output_shape.clone())?;
-    let values = (0..output_index.len())
+    let offsets = (0..output_index.len())
         .map(|linear| {
             let coords = output_index.coords(linear)?;
             let inside =
@@ -2451,18 +2451,19 @@ fn pad(input: &TensorData, padding: &[(usize, usize)], fill: Scalar) -> Result<T
                     |((coord, (before, _)), dim)| *coord >= *before && *coord - *before < *dim,
                 );
             if !inside {
-                Ok(fill)
+                Ok(None)
             } else {
                 let source = coords
                     .iter()
                     .zip(padding)
                     .map(|(coord, (before, _))| coord - before)
                     .collect::<Vec<_>>();
-                Ok(input.scalar_at(source_index.offset(&source)?))
+                Ok(Some(source_index.offset(&source)?))
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    TensorData::from_scalars(output_shape, input.dtype(), values)
+    let fill = TensorData::scalar_with_dtype(fill, input.dtype());
+    input.pad_raw_offsets(output_shape, &offsets, &fill)
 }
 
 fn stride(input: &TensorData, slices: &[crate::Slice]) -> Result<TensorData> {

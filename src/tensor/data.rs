@@ -324,6 +324,69 @@ impl TensorData {
         })
     }
 
+    /// Copies checked source lanes or one already-committed scalar fill into
+    /// a dense output without decoding either storage representation.
+    ///
+    /// Padding uses this path so copied Float8 and floating NaN payloads are
+    /// byte exact. The caller owns geometry construction; `None` selects the
+    /// scalar fill and `Some(offset)` selects one source lane.
+    pub(crate) fn pad_raw_offsets(
+        &self,
+        shape: Shape,
+        offsets: &[Option<usize>],
+        fill: &TensorData,
+    ) -> Result<Self> {
+        if shape.numel()? != offsets.len()
+            || fill.shape.rank() != 0
+            || fill.len() != 1
+            || fill.dtype() != self.dtype()
+            || offsets.iter().flatten().any(|offset| *offset >= self.len())
+        {
+            return Err(Error::InvalidIndex);
+        }
+
+        macro_rules! padded {
+            ($source:ident, $fill:ident, $variant:ident) => {
+                Storage::$variant(
+                    offsets
+                        .iter()
+                        .map(|offset| offset.map_or($fill[0], |offset| $source[offset]))
+                        .collect(),
+                )
+            };
+        }
+        let storage = match (&self.storage, fill.storage()) {
+            (Storage::Bool(source), Storage::Bool(fill)) => padded!(source, fill, Bool),
+            (Storage::I8(source), Storage::I8(fill)) => padded!(source, fill, I8),
+            (Storage::U8(source), Storage::U8(fill)) => padded!(source, fill, U8),
+            (Storage::I16(source), Storage::I16(fill)) => padded!(source, fill, I16),
+            (Storage::U16(source), Storage::U16(fill)) => padded!(source, fill, U16),
+            (Storage::I32(source), Storage::I32(fill)) => padded!(source, fill, I32),
+            (Storage::U32(source), Storage::U32(fill)) => padded!(source, fill, U32),
+            (Storage::I64(source), Storage::I64(fill)) => padded!(source, fill, I64),
+            (Storage::U64(source), Storage::U64(fill)) => padded!(source, fill, U64),
+            (Storage::Float8(source), Storage::Float8(fill))
+                if source.format() == fill.format() =>
+            {
+                Storage::Float8(super::float8::Float8Storage::from_raw(
+                    source.format(),
+                    offsets
+                        .iter()
+                        .map(|offset| {
+                            offset.map_or(fill.as_raw()[0], |offset| source.as_raw()[offset])
+                        })
+                        .collect(),
+                ))
+            }
+            (Storage::F16(source), Storage::F16(fill)) => padded!(source, fill, F16),
+            (Storage::BF16(source), Storage::BF16(fill)) => padded!(source, fill, BF16),
+            (Storage::F32(source), Storage::F32(fill)) => padded!(source, fill, F32),
+            (Storage::F64(source), Storage::F64(fill)) => padded!(source, fill, F64),
+            _ => return Err(Error::InvalidIndex),
+        };
+        Self::from_storage(shape, storage)
+    }
+
     /// Replaces checked destination lanes from checked source lanes without
     /// decoding storage. Row-major callers provide duplicate destinations in
     /// write order, so the final source wins deterministically.
@@ -1144,6 +1207,46 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),
             vec![0x7f80_0001, 0x8000_0000]
+        );
+    }
+
+    #[test]
+    fn raw_padding_preserves_float8_source_and_fill_bytes() {
+        let input = TensorData::from_storage(
+            [2],
+            Storage::Float8(super::float8::Float8Storage::from_raw(
+                crate::Float8Format::E4M3FNUZ,
+                vec![0x80, 0xff],
+            )),
+        )
+        .unwrap();
+        let fill = TensorData::from_storage(
+            [],
+            Storage::Float8(super::float8::Float8Storage::from_raw(
+                crate::Float8Format::E4M3FNUZ,
+                vec![0x7f],
+            )),
+        )
+        .unwrap();
+        let output = input
+            .pad_raw_offsets(Shape::from([4]), &[None, Some(0), Some(1), None], &fill)
+            .unwrap();
+        let Storage::Float8(output) = output.storage() else {
+            panic!("raw Float8 padding changed storage family");
+        };
+        assert_eq!(output.format(), crate::Float8Format::E4M3FNUZ);
+        assert_eq!(output.as_raw(), &[0x7f, 0x80, 0xff, 0x7f]);
+
+        let wrong_fill = TensorData::scalar_with_dtype(Scalar::I(0), DType::U8);
+        assert!(
+            input
+                .pad_raw_offsets(Shape::from([1]), &[None], &wrong_fill)
+                .is_err()
+        );
+        assert!(
+            input
+                .pad_raw_offsets(Shape::from([1]), &[Some(2)], &fill)
+                .is_err()
         );
     }
 
