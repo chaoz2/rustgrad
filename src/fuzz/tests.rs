@@ -899,11 +899,12 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
     let mut found = false;
     let mut ops = std::collections::BTreeSet::new();
     let mut dtypes = std::collections::BTreeSet::new();
+    let mut dtype_operations = std::collections::BTreeSet::new();
     let mut scalar = false;
     let mut empty = false;
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index in 0..8192 {
+        for index in 0..12_288 {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
@@ -913,14 +914,16 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
             found = true;
             ops.insert(op);
             dtypes.insert(input.dtype);
+            dtype_operations.insert((op, input.dtype));
             scalar |= input.shape.is_empty();
             empty |= input.shape.contains(&0);
         }
     }
 
     assert!(found);
-    assert_eq!(ops.len(), 23);
+    assert_eq!(ops.len(), 34);
     assert_eq!(dtypes.len(), 13);
+    assert_eq!(dtype_operations.len(), 253);
     for op in [
         FuzzUnaryOp::Neg,
         FuzzUnaryOp::Abs,
@@ -937,6 +940,17 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
         FuzzUnaryOp::Cos,
         FuzzUnaryOp::Tan,
         FuzzUnaryOp::Log,
+        FuzzUnaryOp::Sinh,
+        FuzzUnaryOp::Cosh,
+        FuzzUnaryOp::Tanh,
+        FuzzUnaryOp::Erf,
+        FuzzUnaryOp::Erfc,
+        FuzzUnaryOp::Asin,
+        FuzzUnaryOp::Acos,
+        FuzzUnaryOp::Atan,
+        FuzzUnaryOp::Asinh,
+        FuzzUnaryOp::Acosh,
+        FuzzUnaryOp::Atanh,
         FuzzUnaryOp::Floor,
         FuzzUnaryOp::Ceil,
         FuzzUnaryOp::Trunc,
@@ -4455,9 +4469,20 @@ fn portable_float_unaries_retain_graph_capture_and_native_contracts() {
         (FuzzUnaryOp::Cos, UnaryOp::Cos, "cos("),
         (FuzzUnaryOp::Tan, UnaryOp::Tan, "tan("),
         (FuzzUnaryOp::Log, UnaryOp::Log, "log("),
+        (FuzzUnaryOp::Sinh, UnaryOp::Sinh, "sinh("),
+        (FuzzUnaryOp::Cosh, UnaryOp::Cosh, "cosh("),
+        (FuzzUnaryOp::Tanh, UnaryOp::Tanh, "tanh("),
+        (FuzzUnaryOp::Erf, UnaryOp::Erf, "rg_erf("),
+        (FuzzUnaryOp::Erfc, UnaryOp::Erfc, "1.0-rg_erf("),
+        (FuzzUnaryOp::Asin, UnaryOp::Asin, "asin("),
+        (FuzzUnaryOp::Acos, UnaryOp::Acos, "acos("),
+        (FuzzUnaryOp::Atan, UnaryOp::Atan, "atan("),
+        (FuzzUnaryOp::Asinh, UnaryOp::Asinh, "asinh("),
+        (FuzzUnaryOp::Acosh, UnaryOp::Acosh, "acosh("),
+        (FuzzUnaryOp::Atanh, UnaryOp::Atanh, "atanh("),
     ];
 
-    for dtype in [DType::F32, DType::F64] {
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
         for (fuzz_op, graph_op, source_token) in operations {
             let input = TensorData::from_scalars(
                 [3],
@@ -4703,7 +4728,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 84);
+    assert_eq!(cases.len(), 95);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

@@ -247,6 +247,77 @@ pub fn regression_cases() -> Vec<FuzzCase> {
                 Storage::F32(vec![-0.0, 0.0, -2.0, 2.0, f32::INFINITY, f32::NAN]),
             ),
         },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Sinh,
+            input: tensor(vec![4], Storage::F16(vec![0x8000, 0x3c00, 0x7c00, 0x7e00])),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Cosh,
+            input: tensor(
+                vec![4],
+                Storage::F64(vec![-0.0, 1.0, f64::INFINITY, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Tanh,
+            input: tensor(vec![4], Storage::BF16(vec![0xff80, 0x8000, 0x7f80, 0x7fc0])),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Erf,
+            input: tensor(
+                vec![5],
+                Storage::F64(vec![f64::NEG_INFINITY, -0.0, 0.0, f64::INFINITY, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Erfc,
+            input: tensor(
+                vec![5],
+                Storage::F32(vec![f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Asin,
+            input: tensor(
+                vec![6],
+                Storage::F64(vec![-1.0, -0.0, 0.0, 1.0, 2.0, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Acos,
+            input: tensor(
+                vec![6],
+                Storage::F32(vec![-1.0, -0.0, 0.0, 1.0, 2.0, f32::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Atan,
+            input: tensor(
+                vec![5],
+                Storage::F64(vec![f64::NEG_INFINITY, -0.0, 0.0, f64::INFINITY, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Asinh,
+            input: tensor(
+                vec![5],
+                Storage::F32(vec![f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Acosh,
+            input: tensor(
+                vec![5],
+                Storage::F64(vec![0.0, 1.0, 2.0, f64::INFINITY, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Atanh,
+            input: tensor(
+                vec![6],
+                Storage::F32(vec![-1.0, -0.0, 0.0, 1.0, 2.0, f32::NAN]),
+            ),
+        },
         FuzzCase::Compare {
             // IEEE partial comparison makes NaN unequal to itself, while
             // signed zero remains equal to positive zero.

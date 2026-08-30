@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v21";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v22";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -769,6 +769,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
         "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
         "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
+        "static double rg_erf(double x){double t,p;if(isnan(x))return x;t=1.0/(1.0+0.3275911*fabs(x));p=((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t;return copysign(1.0,x)*(1.0-p*exp((-x)*x));}".into(),
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
         "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
@@ -2518,6 +2519,21 @@ fn emit(
                 crate::UnaryOp::Tan if ty.is_float() => format!("tan({a})"),
                 crate::UnaryOp::Cos if ty.is_float() => format!("cos({a})"),
                 crate::UnaryOp::Log if ty.is_float() => format!("log({a})"),
+                crate::UnaryOp::Sinh if ty.is_float() => format!("sinh({a})"),
+                crate::UnaryOp::Cosh if ty.is_float() => format!("cosh({a})"),
+                crate::UnaryOp::Tanh if ty.is_float() => format!("tanh({a})"),
+                // CpuBackend and the captured interpreter deliberately use
+                // tinygrad's A&S 7.1.26 polynomial rather than host libc erf.
+                // Keep that same operation order here so F64 native replay is
+                // not weakened to a broad approximation tolerance.
+                crate::UnaryOp::Erf if ty.is_float() => format!("rg_erf({a})"),
+                crate::UnaryOp::Erfc if ty.is_float() => format!("(1.0-rg_erf({a}))"),
+                crate::UnaryOp::Asin if ty.is_float() => format!("asin({a})"),
+                crate::UnaryOp::Acos if ty.is_float() => format!("acos({a})"),
+                crate::UnaryOp::Atan if ty.is_float() => format!("atan({a})"),
+                crate::UnaryOp::Asinh if ty.is_float() => format!("asinh({a})"),
+                crate::UnaryOp::Acosh if ty.is_float() => format!("acosh({a})"),
+                crate::UnaryOp::Atanh if ty.is_float() => format!("atanh({a})"),
                 // CPU/generic evaluate floating Trunc after widening the
                 // storage lane to f64, then narrow only at the output store.
                 // C11's `trunc` has the same double contract and preserves
@@ -3141,7 +3157,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v21");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v22");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -3458,6 +3474,59 @@ mod tests {
                 .source;
             assert!(source.contains(expected), "{dtype:?} {op:?}");
         }
+    }
+
+    #[test]
+    fn extended_float_unaries_use_c11_math_and_source_erf_polynomial() {
+        let operations = [
+            (crate::UnaryOp::Sinh, "sinh("),
+            (crate::UnaryOp::Cosh, "cosh("),
+            (crate::UnaryOp::Tanh, "tanh("),
+            (crate::UnaryOp::Erf, "rg_erf("),
+            (crate::UnaryOp::Erfc, "1.0-rg_erf("),
+            (crate::UnaryOp::Asin, "asin("),
+            (crate::UnaryOp::Acos, "acos("),
+            (crate::UnaryOp::Atan, "atan("),
+            (crate::UnaryOp::Asinh, "asinh("),
+            (crate::UnaryOp::Acosh, "acosh("),
+            (crate::UnaryOp::Atanh, "atanh("),
+        ];
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            for (op, token) in operations {
+                let mut graph = Graph::new();
+                let input = graph.input_dtype("input", Shape::from([3]), dtype);
+                let output = graph.unary(op, input).unwrap();
+                let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+                let scalar = CpuJit::render(&uop).unwrap();
+                assert!(scalar.source.contains(token), "{dtype:?} {op:?}");
+                let vector = CpuJit::render_vectorized(&uop).unwrap();
+                assert!(vector.source.contains(token), "{dtype:?} {op:?}");
+                assert!(
+                    !vector.source.contains("B2 VectorProgram"),
+                    "{dtype:?} {op:?}"
+                );
+            }
+        }
+
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([1]), DType::F64);
+        let output = graph.unary(crate::UnaryOp::Erf, input).unwrap();
+        let source = CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+            .unwrap()
+            .source;
+        for token in [
+            "0.3275911",
+            "1.061405429",
+            "-1.453152027",
+            "1.421413741",
+            "-0.284496736",
+            "0.254829592",
+            "copysign(1.0,x)",
+            "exp((-x)*x)",
+        ] {
+            assert!(source.contains(token), "missing source erf term {token}");
+        }
+        assert!(!source.contains("return erf(x)"));
     }
 
     #[test]

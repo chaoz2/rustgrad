@@ -320,9 +320,8 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
         6 => {
             // Storage-preserving arithmetic, rounding, sign, and predicates
             // exercise every concrete non-Float8 dtype. Float-valued
-            // transcendental operations retain the exact F32/F64
-            // CPU/captured/strict-native intersection; narrow transcendental
-            // admission remains deliberately absent.
+            // transcendental operations retain the complete F16/BF16/F32/F64
+            // CPU/captured/strict-native scalar-per-lane intersection.
             let (op, dtype) = if rng.pick(2) == 0 {
                 (
                     [
@@ -369,8 +368,19 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                         FuzzUnaryOp::Cos,
                         FuzzUnaryOp::Tan,
                         FuzzUnaryOp::Log,
-                    ][rng.pick(10)],
-                    [DType::F32, DType::F64][rng.pick(2)],
+                        FuzzUnaryOp::Sinh,
+                        FuzzUnaryOp::Cosh,
+                        FuzzUnaryOp::Tanh,
+                        FuzzUnaryOp::Erf,
+                        FuzzUnaryOp::Erfc,
+                        FuzzUnaryOp::Asin,
+                        FuzzUnaryOp::Acos,
+                        FuzzUnaryOp::Atan,
+                        FuzzUnaryOp::Asinh,
+                        FuzzUnaryOp::Acosh,
+                        FuzzUnaryOp::Atanh,
+                    ][rng.pick(21)],
+                    [DType::F16, DType::BF16, DType::F32, DType::F64][rng.pick(4)],
                 )
             };
             let shape = static_shape(&mut rng);
