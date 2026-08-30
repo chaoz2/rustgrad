@@ -2255,6 +2255,120 @@ impl Graph {
     pub fn sum(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
         self.reduce(input, ReduceKind::Sum, Some(vec![axis as isize]), false)
     }
+
+    /// Inclusive cumulative sum along one signed axis.
+    pub fn cumsum(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        self.prefix_scan(input, axis, PrefixScanKind::Sum)
+    }
+
+    /// Inclusive cumulative product along one signed axis.
+    pub fn cumprod(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        self.prefix_scan(input, axis, PrefixScanKind::Product)
+    }
+
+    /// Inclusive cumulative maxima and the last matching I32 index per prefix.
+    pub fn cummax(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
+        self.prefix_extrema(input, axis, PrefixScanKind::Max)
+    }
+
+    /// Inclusive cumulative minima and the last matching I32 index per prefix.
+    pub fn cummin(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
+        self.prefix_extrema(input, axis, PrefixScanKind::Min)
+    }
+
+    /// Builds one typed static prefix scan after validating the signed axis
+    /// before mutating the graph. Cumulative sums use the established widened
+    /// output policy; all other scans retain source storage.
+    fn prefix_scan(&mut self, input: NodeId, axis: isize, kind: PrefixScanKind) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let axis = self.prefix_scan_axis(input, source.shape.rank(), axis)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let dtype = match kind {
+            PrefixScanKind::Sum if !input_dtype.is_float() => sum_dtype(input_dtype),
+            PrefixScanKind::Sum
+            | PrefixScanKind::Product
+            | PrefixScanKind::Max
+            | PrefixScanKind::Min => input_dtype,
+        };
+        let elements = shape.numel()?;
+        elements
+            .checked_mul(input_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        elements
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        Ok(self.push(
+            Op::PrefixScan {
+                input,
+                axis,
+                kind,
+                output: PrefixScanOutput::Values,
+            },
+            shape,
+            dtype,
+        ))
+    }
+
+    fn prefix_scan_axis(&self, input: NodeId, rank: usize, axis: isize) -> Result<usize> {
+        if rank == 0 {
+            if matches!(axis, -1 | 0) {
+                Ok(0)
+            } else {
+                Err(Error::InvalidReductionAxes {
+                    node: input,
+                    axes: vec![usize::try_from(axis).unwrap_or(usize::MAX)],
+                    rank: 0,
+                })
+            }
+        } else {
+            Ok(*normalize_axes(input, rank, Some(vec![axis]))?
+                .first()
+                .expect("one scan axis"))
+        }
+    }
+
+    fn prefix_extrema(
+        &mut self,
+        input: NodeId,
+        axis: isize,
+        kind: PrefixScanKind,
+    ) -> Result<(NodeId, NodeId)> {
+        debug_assert!(matches!(kind, PrefixScanKind::Max | PrefixScanKind::Min));
+        let source = self.node(input)?;
+        let axis = self.prefix_scan_axis(input, source.shape.rank(), axis)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let elements = shape.numel()?;
+        elements
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        elements
+            .checked_mul(DType::I32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let values = self.push(
+            Op::PrefixScan {
+                input,
+                axis,
+                kind,
+                output: PrefixScanOutput::Values,
+            },
+            shape.clone(),
+            dtype,
+        );
+        let indices = self.push(
+            Op::PrefixScan {
+                input,
+                axis,
+                kind,
+                output: PrefixScanOutput::Indices,
+            },
+            shape,
+            DType::I32,
+        );
+        Ok((values, indices))
+    }
+
     pub fn reduce(
         &mut self,
         input: NodeId,

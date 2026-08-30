@@ -58,8 +58,9 @@ fn sort_preserves_bool_float_special_values_and_static_edges() {
         vec![1., 0., 2.]
     );
 
-    // tinygrad's left-biased min/max network treats equal signed zero and
-    // unordered NaN comparisons as stable ties, retaining their raw lanes.
+    // tinygrad's ordered bitonic network retains the physical top operand on
+    // equal or unordered comparisons. With padding this can duplicate a
+    // signed-zero or infinity payload; it is not a host total-order sort.
     let mut float_graph = Graph::new();
     let x = float_graph.input_dtype("x", [3], DType::F32);
     let (values, indices) = float_graph.sort(x, 0, false).unwrap();
@@ -74,11 +75,11 @@ fn sort_preserves_bool_float_special_values_and_static_edges() {
         panic!("expected F32 sort output")
     };
     assert_eq!(raw[0].to_bits(), (-0.0f32).to_bits());
-    assert_eq!(raw[1].to_bits(), 0.0f32.to_bits());
-    assert!(raw[2].is_nan());
+    assert_eq!(raw[1].to_bits(), (-0.0f32).to_bits());
+    assert!(raw[2].is_infinite() && raw[2].is_sign_positive());
     assert_eq!(
         cpu(&float_graph, indices, input).to_vec_f64(),
-        vec![0., 1., 2.]
+        vec![0., 1., 0.]
     );
 
     let mut empty = Graph::new();
@@ -93,10 +94,10 @@ fn sort_preserves_bool_float_special_values_and_static_edges() {
 
     let mut scalar = Graph::new();
     let x = scalar.input_dtype("x", [], DType::I8);
-    let (values, indices) = scalar.sort(x, -1, false).unwrap();
-    let input = TensorData::from_scalars([], DType::I8, [Scalar::I(-7)]).unwrap();
-    assert_eq!(cpu(&scalar, values, input.clone()).to_vec_f64(), vec![-7.]);
-    assert_eq!(cpu(&scalar, indices, input).to_vec_f64(), vec![0.]);
+    assert!(matches!(
+        scalar.sort(x, -1, false),
+        Err(Error::InvalidAxis { node, rank: 0, .. }) if node == x
+    ));
 }
 
 #[test]
@@ -194,10 +195,27 @@ fn sort_artifact_trace_rejection_and_invalid_axis_are_explicit() {
         .is_err()
     );
     let loss = graph.sum_all(values).unwrap();
-    assert!(matches!(
-        graph.grad(loss, x),
-        Err(Error::NonDifferentiableIndexing(_))
-    ));
+    let gradient = graph.grad(loss, x).unwrap();
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 2]));
+    assert_eq!(
+        cpu(
+            &graph,
+            gradient,
+            TensorData::from_scalars(
+                [2, 2],
+                DType::F32,
+                [
+                    Scalar::F(2.0),
+                    Scalar::F(1.0),
+                    Scalar::F(1.0),
+                    Scalar::F(3.0)
+                ],
+            )
+            .unwrap(),
+        )
+        .to_vec_f64(),
+        vec![1.0; 4]
+    );
     let capture = crate::CapturedSchedule::capture(
         &graph,
         &crate::schedule_many(&graph, &[values, indices]).unwrap(),

@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn preserves_concrete_ellipsis_letters_and_sorted_source_alphabet() {
         let plan =
-            SourceEinsumPlan::parse(" a... , ...b -> ...ab ", &shapes(&[&[2, 3, 4], &[5, 4]]))
+            SourceEinsumPlan::parse(" a... , ...b -> ...ab ", &shapes(&[&[2, 3, 4], &[4, 5]]))
                 .unwrap();
         // `a` and `b` are occupied, so tinygrad's ascii_letters pool starts
         // at c; unequal ellipses right-align to `cd` and `d`.
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(plan.alphabet, vec!['a', 'b', 'c', 'd']);
         assert_eq!(plan.output_shape, Shape::new([3, 4, 2, 5]));
         let implicit =
-            SourceEinsumPlan::parse("a...,...b", &shapes(&[&[2, 3, 4], &[5, 4]])).unwrap();
+            SourceEinsumPlan::parse("a...,...b", &shapes(&[&[2, 3, 4], &[4, 5]])).unwrap();
         assert_eq!(implicit.expanded_output, "cdab");
     }
 
@@ -647,7 +647,7 @@ mod tests {
     fn public_lowering_covers_ellipsis_diagonals_dtypes_and_zero_contraction() {
         let mut ellipsis = Graph::new();
         let lhs = ellipsis.input_dtype("lhs", [2, 3, 4], DType::F32);
-        let rhs = ellipsis.input_dtype("rhs", [5, 4], DType::F32);
+        let rhs = ellipsis.input_dtype("rhs", [4, 5], DType::F32);
         let output = ellipsis
             .einsum_tinygrad_default("a...,...b->...ab", &[lhs, rhs])
             .unwrap();

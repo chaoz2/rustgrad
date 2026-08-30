@@ -341,106 +341,6 @@ struct CumExtremaPlan {
     index_offset: Option<TensorData>,
 }
 
-/// Descriptor-only contract for tinygrad's `Tensor.cumprod(axis)`.
-///
-/// Tinygrad implements the scan through `_cumalu(Ops.MUL)`: every inclusive
-/// prefix retains the input storage width, is reduced with Product, and the
-/// resulting singleton-axis lanes are concatenated.  RustGrad represents the
-/// same concrete composition with checked Shrink/Product/Concat nodes.  Keep
-/// all of those descriptors here so a malformed late prefix cannot publish
-/// an earlier movement or reduction node.
-struct CumprodPlan {
-    axis: Option<usize>,
-    prefixes: Vec<Vec<(usize, usize)>>,
-    dtypes: ReductionDType,
-}
-
-fn cumulative_product_plan(
-    input: NodeId,
-    shape: &Shape,
-    dtype: DType,
-    axis: isize,
-) -> Result<CumprodPlan> {
-    let extent = |shape: &Shape, dtype: DType| {
-        shape
-            .numel()?
-            .checked_mul(dtype.itemsize())
-            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
-            .map(|_| ())
-    };
-    let dtypes = ReductionDType::product_default(dtype);
-    extent(shape, dtype)?;
-    if !valid_reduction_dtypes(ReduceKind::Product, dtype, dtypes) {
-        return Err(Error::InvalidElementwiseDType {
-            op: "cumprod product storage",
-            actual: dtypes.output,
-        });
-    }
-    if shape.rank() == 0 {
-        // `_split_cumalu` resolves the axis before its rank-zero identity
-        // branch; `_resolve_dim` admits exactly -1 and 0 at rank zero.
-        if !matches!(axis, -1 | 0) {
-            return Err(Error::InvalidAxis {
-                node: input,
-                axis: usize::MAX,
-                rank: 0,
-            });
-        }
-        return Ok(CumprodPlan {
-            axis: None,
-            prefixes: Vec::new(),
-            dtypes,
-        });
-    }
-    let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
-    // `_split_cumalu` is an identity for every zero-extent descriptor after
-    // signed-axis resolution. The source extent above is still checked.
-    if shape.dims().contains(&0) {
-        return Ok(CumprodPlan {
-            axis: None,
-            prefixes: Vec::new(),
-            dtypes,
-        });
-    }
-
-    let mut prefixes = Vec::with_capacity(shape.dims()[axis]);
-    for end in 1..=shape.dims()[axis] {
-        let bounds = shape
-            .dims()
-            .iter()
-            .enumerate()
-            .map(|(dimension, &dimension_extent)| {
-                if dimension == axis {
-                    (0, end)
-                } else {
-                    (0, dimension_extent)
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut prefix_dims = shape.dims().to_vec();
-        prefix_dims[axis] = end;
-        let prefix_shape = Shape::new(prefix_dims);
-        let mut reduced_dims = prefix_shape.dims().to_vec();
-        reduced_dims[axis] = 1;
-        let reduced_shape = Shape::new(reduced_dims);
-        // Product has no widening/narrowing boundary, but validate both the
-        // accumulator and final descriptor explicitly so this remains true
-        // if the shared dtype representation evolves.
-        extent(&prefix_shape, dtype)?;
-        extent(&prefix_shape, dtypes.accumulator)?;
-        extent(&reduced_shape, dtypes.accumulator)?;
-        extent(&reduced_shape, dtypes.output)?;
-        prefixes.push(bounds);
-    }
-    // The concatenated singleton lanes reconstruct the original descriptor.
-    extent(shape, dtypes.output)?;
-    Ok(CumprodPlan {
-        axis: Some(axis),
-        prefixes,
-        dtypes,
-    })
-}
-
 /// Concrete whole-operation plan for tinygrad's stable
 /// `Tensor.logcumsumexp(axis)`.  The source builds the cumulative maxima and
 /// lower-triangle predicate explicitly, rather than using a scan primitive.
@@ -1244,68 +1144,6 @@ impl Graph {
         self.prod_with_options(input, None, false, None)
     }
 
-    /// Cumulative sum along one signed axis.
-    ///
-    /// This is the checked static composition used by tinygrad's `cumsum`:
-    /// each inclusive prefix is reduced with tinygrad's default Sum
-    /// accumulator/output contract, then the prefix results are concatenated.
-    /// Axis, source extent, every prefix bound, and the empty/scalar result
-    /// dtype are all resolved before the first movement or reduction node.
-    pub fn cumsum(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
-        let (shape, dtype) = {
-            let source = self.node(input)?;
-            (source.shape.clone(), source.dtype)
-        };
-        shape.numel()?;
-        let dtypes = ReductionDType::sum_default(dtype);
-        if shape.rank() == 0 {
-            if !matches!(axis, -1 | 0) {
-                return Err(Error::InvalidAxis {
-                    node: input,
-                    axis: usize::MAX,
-                    rank: 0,
-                });
-            }
-            return self.cast(input, dtypes.output);
-        }
-        let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
-        if shape.dims().contains(&0) {
-            return self.cast(input, dtypes.output);
-        }
-
-        let prefixes = (0..shape.dims()[axis])
-            .map(|end| {
-                shape
-                    .dims()
-                    .iter()
-                    .enumerate()
-                    .map(|(dimension, &extent)| {
-                        if dimension == axis {
-                            (0, end + 1)
-                        } else {
-                            (0, extent)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        let values = prefixes
-            .into_iter()
-            .map(|bounds| {
-                let prefix = self.shrink(input, bounds)?;
-                self.reduce_with_dtypes(
-                    prefix,
-                    crate::ReduceKind::Sum,
-                    Some(vec![axis as isize]),
-                    true,
-                    dtypes,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.concat(values, axis)
-    }
-
     /// Checked-in tinygrad's `Tensor.cumsum()` default: cumulative Sum along
     /// the leading axis.
     pub fn cumsum_default(&mut self, input: NodeId) -> Result<NodeId> {
@@ -1459,80 +1297,14 @@ impl Graph {
         Ok((values, indices))
     }
 
-    /// Checked-in tinygrad's literal `Tensor.cummax(axis) -> (values, indices)`.
-    pub fn cummax(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
-        let (shape, dtype) = {
-            let source = self.node(input)?;
-            (source.shape.clone(), source.dtype)
-        };
-        let plan = cumulative_extrema_plan(input, &shape, dtype, axis)?;
-        self.lower_cummax(input, &plan)
-    }
-
     /// Checked-in tinygrad's `Tensor.cummax()` default leading axis.
     pub fn cummax_default(&mut self, input: NodeId) -> Result<(NodeId, NodeId)> {
         self.cummax(input, 0)
     }
 
-    /// Checked-in tinygrad's literal inverse → CumMax → inverse CumMin pair.
-    pub fn cummin(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
-        let (shape, dtype) = {
-            let source = self.node(input)?;
-            (source.shape.clone(), source.dtype)
-        };
-        let plan = cumulative_extrema_plan(input, &shape, dtype, axis)?;
-        let inverse = if dtype.is_float() {
-            self.neg(input)?
-        } else {
-            self.bitwise_not(input)?
-        };
-        let (values, indices) = self.lower_cummax(inverse, &plan)?;
-        let values = if dtype.is_float() {
-            self.neg(values)?
-        } else {
-            self.bitwise_not(values)?
-        };
-        Ok((values, indices))
-    }
-
     /// Checked-in tinygrad's `Tensor.cummin()` default leading axis.
     pub fn cummin_default(&mut self, input: NodeId) -> Result<(NodeId, NodeId)> {
         self.cummin(input, 0)
-    }
-
-    /// Cumulative product along one signed axis.
-    ///
-    /// This is the checked static composition used by tinygrad's `cumprod`:
-    /// each inclusive prefix is reduced with tinygrad's default Product
-    /// accumulator/output contract, then the prefix results are concatenated.
-    /// Axis, source extent, and every prefix bound are resolved before the
-    /// first movement or reduction node.
-    pub fn cumprod(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
-        let (shape, dtype) = {
-            let source = self.node(input)?;
-            (source.shape.clone(), source.dtype)
-        };
-        let plan = cumulative_product_plan(input, &shape, dtype, axis)?;
-        let Some(axis) = plan.axis else {
-            return Ok(input);
-        };
-        let dtypes = plan.dtypes;
-
-        let values = plan
-            .prefixes
-            .into_iter()
-            .map(|bounds| {
-                let prefix = self.shrink(input, bounds)?;
-                self.reduce_with_dtypes(
-                    prefix,
-                    crate::ReduceKind::Product,
-                    Some(vec![axis as isize]),
-                    true,
-                    dtypes,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.concat(values, axis)
     }
 
     /// Boolean all-reduction over optional signed axes.
@@ -3197,30 +2969,15 @@ mod tests {
         let output = graph.cumsum_default(input).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::from([3, 2]));
         assert_eq!(graph.dtype(output).unwrap(), DType::F16);
-        let crate::Op::Concat { inputs, axis } = graph.op(output).unwrap() else {
-            panic!("expected cumsum prefix concatenation");
-        };
-        assert_eq!(*axis, 0);
-        assert_eq!(inputs.len(), 3);
-        for prefix in inputs {
-            let reduced = match graph.op(*prefix).unwrap() {
-                crate::Op::Cast {
-                    input,
-                    dtype: DType::F16,
-                } => *input,
-                op => panic!("expected default F16 prefix narrowing, got {op:?}"),
-            };
-            assert!(matches!(
-                graph.op(reduced).unwrap(),
-                crate::Op::Reduce {
-                    kind: ReduceKind::Sum,
-                    axes,
-                    keepdim: true,
-                    ..
-                } if axes == &vec![0]
-            ));
-            assert_eq!(graph.dtype(reduced).unwrap(), DType::F32);
-        }
+        assert!(matches!(
+            graph.op(output).unwrap(),
+            crate::Op::PrefixScan {
+                input: source,
+                axis: 0,
+                kind: crate::PrefixScanKind::Sum,
+                output: crate::PrefixScanOutput::Values,
+            } if *source == input
+        ));
 
         let scalar = graph.input_dtype("scalar", [], DType::I8);
         let scalar_output = graph.cumsum_default(scalar).unwrap();
@@ -3253,38 +3010,33 @@ mod tests {
         assert_eq!(graph.dtype(indices).unwrap(), DType::I32);
         assert!(graph.requires_grad(values).unwrap());
         assert!(!graph.requires_grad(indices).unwrap());
-        assert!(graph.nodes.iter().any(|node| matches!(
-            &node.op,
-            crate::Op::Compare {
-                op: crate::CompareOp::Eq,
-                ..
-            }
-        )));
-        assert!(graph.nodes.iter().any(|node| matches!(
-            &node.op,
-            crate::Op::Reduce {
-                kind: ReduceKind::Max,
-                ..
-            }
-        )));
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.op {
-                    crate::Op::Constant(data) => Some(data.len()),
-                    _ => None,
-                })
-                .all(|len| len == 1)
-        );
+        assert!(matches!(
+            graph.op(values).unwrap(),
+            crate::Op::PrefixScan {
+                input: source,
+                axis: 0,
+                kind: crate::PrefixScanKind::Max,
+                output: crate::PrefixScanOutput::Values,
+            } if *source == input
+        ));
+        assert!(matches!(
+            graph.op(indices).unwrap(),
+            crate::Op::PrefixScan {
+                input: source,
+                axis: 0,
+                kind: crate::PrefixScanKind::Max,
+                output: crate::PrefixScanOutput::Indices,
+            } if *source == input
+        ));
 
         let (minimum, minimum_indices) = graph.cummin_default(input).unwrap();
         assert_eq!(graph.dtype(minimum).unwrap(), DType::F32);
         assert_eq!(graph.dtype(minimum_indices).unwrap(), DType::I32);
         assert!(matches!(
             graph.op(minimum).unwrap(),
-            crate::Op::Unary {
-                op: crate::UnaryOp::Neg,
+            crate::Op::PrefixScan {
+                kind: crate::PrefixScanKind::Min,
+                output: crate::PrefixScanOutput::Values,
                 ..
             }
         ));
@@ -3312,7 +3064,15 @@ mod tests {
 
         let scalar = graph.input_dtype("scalar", [], DType::I16);
         let (scalar_values, scalar_indices) = graph.cummax_default(scalar).unwrap();
-        assert_eq!(scalar_values, scalar);
+        assert!(matches!(
+            graph.op(scalar_values).unwrap(),
+            crate::Op::PrefixScan {
+                input,
+                axis: 0,
+                kind: crate::PrefixScanKind::Max,
+                output: crate::PrefixScanOutput::Values,
+            } if *input == scalar
+        ));
         assert_eq!(graph.shape(scalar_indices).unwrap(), &Shape::from([]));
         assert_eq!(graph.dtype(scalar_indices).unwrap(), DType::I32);
 
@@ -3429,7 +3189,12 @@ mod tests {
         let cumulative = graph.cumprod(input, -1).unwrap();
         assert!(matches!(
             graph.op(cumulative).unwrap(),
-            crate::Op::Concat { axis: 1, .. }
+            crate::Op::PrefixScan {
+                axis: 1,
+                kind: crate::PrefixScanKind::Product,
+                output: crate::PrefixScanOutput::Values,
+                ..
+            }
         ));
         let loss = graph.sum_all(cumulative).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
@@ -3497,7 +3262,7 @@ mod tests {
         assert_eq!(invalid.node_count(), before_nodes);
 
         // Product has no accumulator widening: source Bool/integer/floating
-        // storage is retained in every checked prefix reduction.
+        // storage is retained by the typed scan result.
         for dtype in [
             DType::Bool,
             DType::I8,
@@ -3520,12 +3285,16 @@ mod tests {
             assert_eq!(typed.dtype(output).unwrap(), dtype);
             assert!(matches!(
                 typed.op(output).unwrap(),
-                crate::Op::Concat { axis: 1, .. }
+                crate::Op::PrefixScan {
+                    axis: 1,
+                    kind: crate::PrefixScanKind::Product,
+                    output: crate::PrefixScanOutput::Values,
+                    ..
+                }
             ));
         }
 
-        // The descriptor-first plan rejects byte overflow before a Shrink or
-        // Product reduction can be appended.
+        // The descriptor-first scan rejects byte overflow before publication.
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("overflow", [usize::MAX, 2], DType::F64);
         let before_nodes = overflow.node_count();

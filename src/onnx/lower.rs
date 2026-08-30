@@ -1910,7 +1910,10 @@ fn global_average_pool_plan(g: &Graph, input: NodeId) -> Result<GlobalAveragePoo
     let axes = (2..shape.rank())
         .map(|axis| axis as isize)
         .collect::<Vec<_>>();
-    let count = shape.dims()[2..]
+    let count = shape
+        .dims()
+        .get(2..)
+        .unwrap_or(&[])
         .iter()
         .try_fold(1usize, |n, d| n.checked_mul(*d))
         .ok_or_else(|| bad("GlobalAveragePool divisor overflow"))?;
