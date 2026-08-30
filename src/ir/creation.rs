@@ -4359,8 +4359,8 @@ impl Graph {
         let dim1 = normalize_axes(input, rank, Some(vec![dim1]))?[0];
         let dim2 = normalize_axes(input, rank, Some(vec![dim2]))?[0];
         if dim1 == dim2 {
-            return Err(Error::InvalidRandom {
-                reason: "diagonal dimensions must differ",
+            return Err(Error::InvalidDiagonal {
+                reason: "diagonal axes must be distinct",
             });
         }
         let rows = shape.dims()[dim1];

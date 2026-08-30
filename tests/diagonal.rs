@@ -46,13 +46,9 @@ fn diagonal_matches_tinygrad_square_rectangular_and_offset_tables() {
             ),
             f32_data(output_shape, expected)
         );
-        assert!(
-            graph
-                .trace(output)
-                .unwrap()
-                .to_string()
-                .contains("static_index")
-        );
+        let trace = graph.trace(output).unwrap().to_string();
+        assert!(trace.contains("pad"));
+        assert!(!trace.contains("static_index"));
     }
 }
 
