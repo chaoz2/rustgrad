@@ -1,4 +1,6 @@
-use crate::{BinaryOp, DType, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp};
+use crate::{
+    BinaryOp, DType, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp,
+};
 use std::collections::BTreeSet;
 
 /// Fully resolved descriptor for tinygrad's Pow VJP. This deliberately leaves
@@ -20,7 +22,12 @@ struct SqrtVjpPlan {
     two: TensorData,
 }
 
-fn sqrt_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) -> Result<SqrtVjpPlan> {
+fn sqrt_vjp_plan(
+    graph: &Graph,
+    node: NodeId,
+    input: NodeId,
+    upstream: NodeId,
+) -> Result<SqrtVjpPlan> {
     let input_data = graph.node(input)?;
     let input_shape = input_data.shape.clone();
     let input_dtype = input_data.dtype;
@@ -39,7 +46,11 @@ fn sqrt_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) -
         actual,
     };
 
-    let expected_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let expected_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
     if result_shape != input_shape
         || result_dtype != expected_dtype
         || upstream_data.shape != result_shape
@@ -87,7 +98,12 @@ struct SinVjpPlan {
     half_pi: TensorData,
 }
 
-fn sin_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) -> Result<SinVjpPlan> {
+fn sin_vjp_plan(
+    graph: &Graph,
+    node: NodeId,
+    input: NodeId,
+    upstream: NodeId,
+) -> Result<SinVjpPlan> {
     let input_data = graph.node(input)?;
     let input_shape = input_data.shape.clone();
     let input_dtype = input_data.dtype;
@@ -106,7 +122,11 @@ fn sin_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) ->
         actual,
     };
 
-    let expected_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let expected_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
     if result_shape != input_shape
         || result_dtype != expected_dtype
         || upstream_data.shape != result_shape
@@ -123,11 +143,16 @@ fn sin_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) ->
         extent(shape, dtype)?;
     }
 
-    let half_pi = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), input_dtype);
+    let half_pi =
+        TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), input_dtype);
     extent(half_pi.shape(), half_pi.dtype())?;
     let phase_shape = half_pi.shape().broadcast_with(&input_shape)?;
     let phase_dtype = half_pi.dtype().promote(input_dtype);
-    let sine_dtype = if phase_dtype.is_float() { phase_dtype } else { DType::F32 };
+    let sine_dtype = if phase_dtype.is_float() {
+        phase_dtype
+    } else {
+        DType::F32
+    };
     let gradient_shape = phase_shape.broadcast_with(&upstream_data.shape)?;
     let gradient_dtype = sine_dtype.promote(upstream_data.dtype);
     if half_pi.dtype() != input_dtype
@@ -150,7 +175,13 @@ fn sin_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) ->
     Ok(SinVjpPlan { half_pi })
 }
 
-fn pow_vjp_plan(graph: &Graph, node: NodeId, lhs: NodeId, rhs: NodeId, upstream: NodeId) -> Result<PowVjpPlan> {
+fn pow_vjp_plan(
+    graph: &Graph,
+    node: NodeId,
+    lhs: NodeId,
+    rhs: NodeId,
+    upstream: NodeId,
+) -> Result<PowVjpPlan> {
     let lhs_node = graph.node(lhs)?;
     let lhs_shape = lhs_node.shape.clone();
     let lhs_dtype = lhs_node.dtype;
@@ -186,7 +217,8 @@ fn pow_vjp_plan(graph: &Graph, node: NodeId, lhs: NodeId, rhs: NodeId, upstream:
     // this phase intentionally does not reinterpret or repair it.
     let pow_shape = lhs_shape.broadcast_with(&rhs_shape)?;
     let pow_dtype = lhs_dtype.promote(rhs_dtype);
-    if output_shape != pow_shape || output_dtype != pow_dtype || upstream_data.shape != output_shape {
+    if output_shape != pow_shape || output_dtype != pow_dtype || upstream_data.shape != output_shape
+    {
         return Err(fail(output_dtype));
     }
     for (shape, dtype) in [
@@ -209,11 +241,22 @@ fn pow_vjp_plan(graph: &Graph, node: NodeId, lhs: NodeId, rhs: NodeId, upstream:
     let one_rhs = TensorData::scalar_with_dtype(Scalar::I(1), rhs_dtype);
     let negative_inf = TensorData::scalar_with_dtype(Scalar::F(f64::NEG_INFINITY), output_dtype);
     let zero_output = TensorData::scalar_with_dtype(Scalar::I(0), output_dtype);
-    let log_dtype = if lhs_dtype.is_float() { lhs_dtype } else { DType::F32 };
+    let log_dtype = if lhs_dtype.is_float() {
+        lhs_dtype
+    } else {
+        DType::F32
+    };
     let log_shape = lhs_shape.clone();
     let tail_dtype = source_promote(output_dtype, log_dtype);
     let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), tail_dtype);
-    for scalar in [&zero_lhs, &zero_rhs, &one_rhs, &negative_inf, &zero_output, &ln2] {
+    for scalar in [
+        &zero_lhs,
+        &zero_rhs,
+        &one_rhs,
+        &negative_inf,
+        &zero_output,
+        &ln2,
+    ] {
         extent(scalar.shape(), scalar.dtype())?;
     }
     if zero_lhs.dtype() != lhs_dtype
@@ -232,10 +275,14 @@ fn pow_vjp_plan(graph: &Graph, node: NodeId, lhs: NodeId, rhs: NodeId, upstream:
     let power_dtype = lhs_dtype.promote(rhs_minus_one_dtype);
     let base_local_shape = rhs_shape.broadcast_with(&power_shape)?;
     let base_local_dtype = source_promote(rhs_dtype, power_dtype);
-    let zero_local_shape = rhs_shape.broadcast_with(negative_inf.shape())?.broadcast_with(zero_output.shape())?;
+    let zero_local_shape = rhs_shape
+        .broadcast_with(negative_inf.shape())?
+        .broadcast_with(zero_output.shape())?;
     let zero_local_dtype = source_promote(output_dtype, output_dtype);
     let tail_shape = output_shape.broadcast_with(&log_shape)?;
-    let final_shape = lhs_shape.broadcast_with(&zero_local_shape)?.broadcast_with(&tail_shape)?;
+    let final_shape = lhs_shape
+        .broadcast_with(&zero_local_shape)?
+        .broadcast_with(&tail_shape)?;
     let final_dtype = source_promote(zero_local_dtype, tail_dtype);
     let lhs_grad_dtype = source_promote(upstream_data.dtype, base_local_dtype);
     let rhs_grad_dtype = source_promote(upstream_data.dtype, final_dtype);
@@ -271,7 +318,14 @@ fn pow_vjp_plan(graph: &Graph, node: NodeId, lhs: NodeId, rhs: NodeId, upstream:
     ] {
         extent(shape, dtype)?;
     }
-    Ok(PowVjpPlan { zero_lhs, zero_rhs, one_rhs, negative_inf, zero_output, ln2 })
+    Ok(PowVjpPlan {
+        zero_lhs,
+        zero_rhs,
+        one_rhs,
+        negative_inf,
+        zero_output,
+        ln2,
+    })
 }
 
 impl Graph {
@@ -703,16 +757,31 @@ impl Graph {
                         "reduction gradient not yet represented",
                     ));
                 }
-                Op::PrefixScan { input, axis, kind: crate::PrefixScanKind::Sum, .. } => {
+                Op::PrefixScan {
+                    input,
+                    axis,
+                    kind: crate::PrefixScanKind::Sum,
+                    ..
+                } => {
                     let gradient = self.cumsum_vjp(upstream, axis)?;
                     self.accumulate(&mut grads, input, gradient)?;
                 }
-                Op::PrefixScan { input, axis, kind: crate::PrefixScanKind::Product, .. } => {
+                Op::PrefixScan {
+                    input,
+                    axis,
+                    kind: crate::PrefixScanKind::Product,
+                    ..
+                } => {
                     let gradient = self.cumprod_vjp(upstream, input, axis)?;
                     self.accumulate(&mut grads, input, gradient)?;
                 }
-                Op::PrefixScan { kind: crate::PrefixScanKind::Max | crate::PrefixScanKind::Min, .. } => {
-                    return Err(Error::NonDifferentiableIndexing("cumulative extrema gradients are not yet represented"));
+                Op::PrefixScan {
+                    kind: crate::PrefixScanKind::Max | crate::PrefixScanKind::Min,
+                    ..
+                } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "cumulative extrema gradients are not yet represented",
+                    ));
                 }
                 Op::Sort {
                     input,
@@ -721,9 +790,7 @@ impl Graph {
                     pair,
                     output: crate::SortOutput::Values,
                 } => {
-                    let indices = self.sort_indices_sibling(
-                        node, input, axis, descending, pair,
-                    )?;
+                    let indices = self.sort_indices_sibling(node, input, axis, descending, pair)?;
                     let source = self.node(input)?;
                     let grad = if source.shape.rank() == 0 {
                         if self.node(upstream)?.dtype == source.dtype {
@@ -749,7 +816,9 @@ impl Graph {
                     return Err(Error::NonDifferentiableIndexing("sort indices"));
                 }
                 Op::TensorGuard { .. } => {
-                    return Err(Error::NonDifferentiableIndexing("tensor guard gradient is not represented"));
+                    return Err(Error::NonDifferentiableIndexing(
+                        "tensor guard gradient is not represented",
+                    ));
                 }
                 Op::ReduceGrad {
                     input,
@@ -1160,13 +1229,27 @@ impl Graph {
         let mut pending = vec![loss];
         let mut visited = BTreeSet::new();
         while let Some(node) = pending.pop() {
-            if !visited.insert(node) { continue; }
+            if !visited.insert(node) {
+                continue;
+            }
             let current = self.node(node)?;
             if let Op::PrefixScan { input, kind, .. } = &current.op {
                 match kind {
-                    crate::PrefixScanKind::Sum if !self.node(*input)?.dtype.is_float() => return Err(Error::NonDifferentiableIndexing("cumsum gradients require floating input")),
-                    crate::PrefixScanKind::Product if !self.node(*input)?.dtype.is_float() => return Err(Error::NonDifferentiableIndexing("cumprod gradients require floating input")),
-                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min => return Err(Error::NonDifferentiableIndexing("cumulative extrema gradients are not yet represented")),
+                    crate::PrefixScanKind::Sum if !self.node(*input)?.dtype.is_float() => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumsum gradients require floating input",
+                        ));
+                    }
+                    crate::PrefixScanKind::Product if !self.node(*input)?.dtype.is_float() => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumprod gradients require floating input",
+                        ));
+                    }
+                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumulative extrema gradients are not yet represented",
+                        ));
+                    }
                     crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => {}
                 }
             }
@@ -1176,7 +1259,10 @@ impl Graph {
     }
 
     fn cumsum_vjp(&mut self, upstream: NodeId, axis: usize) -> Result<NodeId> {
-        self.reverse_axis(self.cumsum(self.reverse_axis(upstream, axis)?, axis as isize)?, axis)
+        self.reverse_axis(
+            self.cumsum(self.reverse_axis(upstream, axis)?, axis as isize)?,
+            axis,
+        )
     }
 
     fn cumprod_vjp(&mut self, upstream: NodeId, input: NodeId, axis: usize) -> Result<NodeId> {
@@ -1198,7 +1284,16 @@ impl Graph {
 
     fn reverse_axis(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
         let shape = self.node(input)?.shape.clone();
-        let slices = shape.dims().iter().enumerate().map(|(current, _)| crate::Slice { start: None, stop: None, step: if current == axis { -1 } else { 1 } }).collect();
+        let slices = shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(current, _)| crate::Slice {
+                start: None,
+                stop: None,
+                step: if current == axis { -1 } else { 1 },
+            })
+            .collect();
         self.stride(input, slices)
     }
 
@@ -1227,7 +1322,10 @@ impl Graph {
                     && *candidate_descending == descending
                     && *candidate_pair == pair
                     && node.shape == values_node.shape
-                    && node.dtype == crate::DType::I32 => Some(NodeId(index)),
+                    && node.dtype == crate::DType::I32 =>
+                {
+                    Some(NodeId(index))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1268,12 +1366,7 @@ mod tests {
     }
 
     fn data_f64(shape: impl Into<Shape>, values: &[f64]) -> TensorData {
-        TensorData::from_scalars(
-            shape,
-            DType::F64,
-            values.iter().copied().map(Scalar::F),
-        )
-        .unwrap()
+        TensorData::from_scalars(shape, DType::F64, values.iter().copied().map(Scalar::F)).unwrap()
     }
 
     #[test]
@@ -1285,7 +1378,10 @@ mod tests {
         let loss = graph.sum_all(graph.mul(values, weights).unwrap()).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
-        assert!(matches!(graph.grad(indices, input), Err(Error::NonDifferentiableIndexing(_))));
+        assert!(matches!(
+            graph.grad(indices, input),
+            Err(Error::NonDifferentiableIndexing(_))
+        ));
         let inputs = HashMap::from([(
             "input".into(),
             data([2, 3], &[1., 1., f32::NAN, -0.0, 0.0, -0.0]),
@@ -1301,11 +1397,19 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("input", [3]);
         let (values, _) = graph.sort(input, 0, false).unwrap();
-        let weighted = graph.mul(values, graph.constant(data([3], &[1., 2., 4.]))).unwrap();
+        let weighted = graph
+            .mul(values, graph.constant(data([3], &[1., 2., 4.])))
+            .unwrap();
         let loss = graph.sum_all(graph.add(weighted, values).unwrap()).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         assert_eq!(
-            CpuBackend.execute(&graph, gradient, &HashMap::from([("input".into(), data([3], &[2., 1., 1.]))])).unwrap(),
+            CpuBackend
+                .execute(
+                    &graph,
+                    gradient,
+                    &HashMap::from([("input".into(), data([3], &[2., 1., 1.]))])
+                )
+                .unwrap(),
             data([3], &[7., 3., 2.])
         );
 
@@ -1333,14 +1437,21 @@ mod tests {
         let loss = graph.sum_all(graph.mul(values, weights).unwrap()).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
-        assert!(matches!(graph.grad(indices, input), Err(Error::NonDifferentiableIndexing(_))));
+        assert!(matches!(
+            graph.grad(indices, input),
+            Err(Error::NonDifferentiableIndexing(_))
+        ));
         assert_eq!(
-            CpuBackend.execute(
-                &graph,
-                gradient,
-                &HashMap::from([("input".into(), data([2, 3], &[1., 1., f32::NAN, -0.0, 0.0, -0.0]))]),
-            )
-            .unwrap(),
+            CpuBackend
+                .execute(
+                    &graph,
+                    gradient,
+                    &HashMap::from([(
+                        "input".into(),
+                        data([2, 3], &[1., 1., f32::NAN, -0.0, 0.0, -0.0])
+                    )]),
+                )
+                .unwrap(),
             data([2, 3], &[1., 2., 0., 4., 8., 0.])
         );
     }
@@ -1651,15 +1762,23 @@ mod tests {
             assert_eq!(graph.shape(base_grad).unwrap(), &Shape::new([2, 1]));
             assert_eq!(graph.shape(exponent_grad).unwrap(), &Shape::new([2]));
             let scalar_dtypes = (0..graph.node_count())
-                .filter_map(|index| match &graph.node(NodeId::from_index(index)).unwrap().op {
-                    Op::Constant(data) if data.shape().rank() == 0 => Some(data.dtype()),
-                    _ => None,
-                })
+                .filter_map(
+                    |index| match &graph.node(NodeId::from_index(index)).unwrap().op {
+                        Op::Constant(data) if data.shape().rank() == 0 => Some(data.dtype()),
+                        _ => None,
+                    },
+                )
                 .collect::<Vec<_>>();
             // The seed/reduction may introduce additional F32 constants, but
             // every Pow-local weak literal must exist at the source storage
             // width: lhs zero; rhs zero/one; result -inf/zero; and ln(2).
-            assert!(scalar_dtypes.iter().filter(|&&actual| actual == dtype).count() >= 6);
+            assert!(
+                scalar_dtypes
+                    .iter()
+                    .filter(|&&actual| actual == dtype)
+                    .count()
+                    >= 6
+            );
         }
 
         let mut graph = Graph::new();
@@ -1703,7 +1822,10 @@ mod tests {
         let rhs = overflow.input_dtype("rhs", [usize::MAX, 2], DType::F64);
         let output = overflow.pow(lhs, rhs).unwrap();
         let node_count = overflow.node_count();
-        assert!(matches!(pow_vjp_plan(&overflow, output, lhs, rhs, output), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            pow_vjp_plan(&overflow, output, lhs, rhs, output),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), node_count);
     }
 
@@ -1914,8 +2036,7 @@ mod tests {
                         ("input".into(), data([0], &[])),
                         (
                             "index".into(),
-                            TensorData::from_scalars([0], crate::DType::I32, [])
-                                .unwrap(),
+                            TensorData::from_scalars([0], crate::DType::I32, []).unwrap(),
                         ),
                     ]),
                 )
@@ -1961,7 +2082,9 @@ mod tests {
 
         let mut scalar = Graph::new();
         let input = scalar.input("input", []);
-        let indices = scalar.nonzero_fixed(input, 2, crate::Scalar::I(-1)).unwrap();
+        let indices = scalar
+            .nonzero_fixed(input, 2, crate::Scalar::I(-1))
+            .unwrap();
         assert_eq!(scalar.shape(indices).unwrap(), &Shape::new([2, 0]));
         assert_eq!(
             CpuBackend
@@ -2139,7 +2262,10 @@ mod tests {
         let selected = graph.shrink(inferred, [(0, 2), (0, 1), (0, 2)]).unwrap();
         let loss = graph.sum_all(selected).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
-        let bindings = HashMap::from([("input".into(), data([2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]))]);
+        let bindings = HashMap::from([(
+            "input".into(),
+            data([2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]),
+        )]);
         assert_eq!(graph.shape(concrete).unwrap(), &Shape::new([2, 2, 2]));
         assert_eq!(graph.shape(inferred).unwrap(), &Shape::new([2, 2, 2]));
         assert_eq!(

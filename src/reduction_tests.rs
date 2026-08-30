@@ -39,7 +39,10 @@ fn arg_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
         }
         .unwrap();
         let input = TensorData::from_scalars([data.len()], dtype, data).unwrap();
-        assert_eq!(execute(&graph, output, input).scalar_at(0).as_i64(), expected);
+        assert_eq!(
+            execute(&graph, output, input).scalar_at(0).as_i64(),
+            expected
+        );
     };
 
     // These adjacent representable integer lanes collapse to equal f64s, but
@@ -81,12 +84,7 @@ fn arg_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
         false,
         0,
     );
-    assert_index(
-        DType::U64,
-        vec![Scalar::U(0), Scalar::U(u64::MAX)],
-        true,
-        1,
-    );
+    assert_index(DType::U64, vec![Scalar::U(0), Scalar::U(u64::MAX)], true, 1);
     assert_index(
         DType::U64,
         vec![Scalar::U(0), Scalar::U(u64::MAX)],
@@ -152,7 +150,10 @@ fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
     );
     assert_value(
         DType::U64,
-        vec![Scalar::U((two_to_53 as u64) + 1), Scalar::U(two_to_53 as u64)],
+        vec![
+            Scalar::U((two_to_53 as u64) + 1),
+            Scalar::U(two_to_53 as u64),
+        ],
         ReduceKind::Min,
         Scalar::U(two_to_53 as u64),
     );
@@ -193,7 +194,10 @@ fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
             output,
             TensorData::new([2], vec![-0.0, 0.0]).unwrap(),
         );
-        assert_eq!(signed_zero.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(
+            signed_zero.scalar_at(0).as_f64().to_bits(),
+            (-0.0f64).to_bits()
+        );
     }
 }
 

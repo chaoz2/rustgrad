@@ -1,5 +1,6 @@
 //! Deterministic module traversal and state loading.
 
+use super::parameter::next_version;
 use super::{
     Parameter, ParameterRestore, ParameterSnapshot,
     norm::{BatchNorm, PendingBatchNormStats},
@@ -12,10 +13,6 @@ use std::{
     io::Read,
     path::Path,
 };
-use super::{Parameter, ParameterRestore, ParameterSnapshot, restore_parameters};
-use super::parameter::next_version;
-use crate::{Error, Graph, Result, TensorData};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub enum StateKind {
     Parameter,
@@ -597,12 +594,8 @@ pub fn get_state_dict(module: &dyn Module, prefix: &str) -> LiveStateDict {
 /// from cloned storage is a checked descriptor change rather than a broadcast
 /// or a value conversion.
 fn singleton_scalar_rank_one_pair(value: &TensorData, snapshot: &ParameterSnapshot) -> bool {
-    (value.shape().rank() == 0
-        && snapshot.shape.rank() == 1
-        && snapshot.shape.dims() == [1])
-        || (value.shape().rank() == 1
-            && value.shape().dims() == [1]
-            && snapshot.shape.rank() == 0)
+    (value.shape().rank() == 0 && snapshot.shape.rank() == 1 && snapshot.shape.dims() == [1])
+        || (value.shape().rank() == 1 && value.shape().dims() == [1] && snapshot.shape.rank() == 0)
 }
 
 pub(super) fn join(prefix: &str, name: &str) -> String {

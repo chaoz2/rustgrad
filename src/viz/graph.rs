@@ -1,5 +1,7 @@
 use super::{VizEdge, VizError, VizGraph, VizNode};
-use crate::{DType, EinsumLabel, EinsumPlan, Graph, NodeId, Op, RandomKind, ReduceKind, Scalar, Shape};
+use crate::{
+    DType, EinsumLabel, EinsumPlan, Graph, NodeId, Op, RandomKind, ReduceKind, Scalar, Shape,
+};
 use std::collections::BTreeSet;
 
 pub(super) fn dtype_name(dtype: DType) -> &'static str {
@@ -171,7 +173,9 @@ fn convolution_gradient_vjp_dependencies(
     bias: Option<NodeId>,
 ) -> Vec<(String, NodeId)> {
     let mut dependencies = vec![dependency("cotangent", cotangent)];
-    dependencies.extend(convolution_gradient_dependencies(upstream, input, weight, bias));
+    dependencies.extend(convolution_gradient_dependencies(
+        upstream, input, weight, bias,
+    ));
     dependencies
 }
 
@@ -284,7 +288,10 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
         ],
         Op::ReduceGrad {
             input, upstream, ..
-        } => vec![dependency("input", *input), dependency("upstream", *upstream)],
+        } => vec![
+            dependency("input", *input),
+            dependency("upstream", *upstream),
+        ],
         Op::ReduceGradVjp {
             cotangent,
             input,
@@ -302,10 +309,16 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
         }
         Op::StaticIndexUpdateGrad { cotangent, .. } => vec![dependency("cotangent", *cotangent)],
         Op::Conv2d {
-            input, weight, bias, ..
+            input,
+            weight,
+            bias,
+            ..
         }
         | Op::ConvTranspose2d {
-            input, weight, bias, ..
+            input,
+            weight,
+            bias,
+            ..
         } => convolution_dependencies(*input, *weight, *bias),
         Op::Conv2dGrad {
             upstream,
@@ -456,10 +469,7 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("axis", axis.to_string())
             .field("contract", "finite_nonnegative_positive_row_sum"),
         Op::ArgReduce {
-            max,
-            axis,
-            keepdim,
-            ..
+            max, axis, keepdim, ..
         } => node
             .field("reduction", if *max { "argmax" } else { "argmin" })
             .field(
@@ -529,21 +539,25 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
         // selection. The unbounded counterpart lives in Graph's separate
         // dynamic-result arena and is rank-one at realization; graph_viz does
         // not claim to execute or differentiate that dynamic result.
-        Op::MaskedSelect {
-            size, fill, ..
-        } => node
+        Op::MaskedSelect { size, fill, .. } => node
             .field("result_policy", "fixed_size_pad_truncate")
             .field("size", size.to_string())
             .field("fill", scalar_name(*fill))
             .field("dynamic_counterpart", "runtime_rank1"),
         Op::Einsum { plan, .. } => node
             .field("plan_key", einsum_plan_key(plan))
-            .field("operand_labels", einsum_operand_labels(&plan.operand_labels))
+            .field(
+                "operand_labels",
+                einsum_operand_labels(&plan.operand_labels),
+            )
             .field("output_labels", einsum_labels(&plan.output_labels))
             .field("contracted_labels", einsum_labels(&plan.contracted_labels)),
         Op::EinsumGrad { plan, target, .. } => node
             .field("plan_key", einsum_plan_key(plan))
-            .field("operand_labels", einsum_operand_labels(&plan.operand_labels))
+            .field(
+                "operand_labels",
+                einsum_operand_labels(&plan.operand_labels),
+            )
             .field("output_labels", einsum_labels(&plan.output_labels))
             .field("contracted_labels", einsum_labels(&plan.contracted_labels))
             .field("target_operand", target.to_string()),
@@ -551,15 +565,17 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             plan, target, wrt, ..
         } => node
             .field("plan_key", einsum_plan_key(plan))
-            .field("operand_labels", einsum_operand_labels(&plan.operand_labels))
+            .field(
+                "operand_labels",
+                einsum_operand_labels(&plan.operand_labels),
+            )
             .field("output_labels", einsum_labels(&plan.output_labels))
             .field("contracted_labels", einsum_labels(&plan.contracted_labels))
             .field("target_operand", target.to_string())
             .field("wrt", wrt.to_string()),
-        Op::MatmulGrad { lhs_gradient, .. } => node.field(
-            "target",
-            if *lhs_gradient { "lhs" } else { "rhs" },
-        ),
+        Op::MatmulGrad { lhs_gradient, .. } => {
+            node.field("target", if *lhs_gradient { "lhs" } else { "rhs" })
+        }
         Op::MatmulGradVjp {
             lhs_gradient, wrt, ..
         } => node
@@ -611,7 +627,10 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             options, target, ..
         } => conv2d_geometry(node, *options).field("target", target.to_string()),
         Op::Conv2dGradVjp {
-            options, target, wrt, ..
+            options,
+            target,
+            wrt,
+            ..
         } => conv2d_geometry(node, *options)
             .field("target", target.to_string())
             .field("wrt", wrt.to_string()),
@@ -620,7 +639,10 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             options, target, ..
         } => conv_transpose2d_geometry(node, *options).field("target", target.to_string()),
         Op::ConvTranspose2dGradVjp {
-            options, target, wrt, ..
+            options,
+            target,
+            wrt,
+            ..
         } => conv_transpose2d_geometry(node, *options)
             .field("target", target.to_string())
             .field("wrt", wrt.to_string()),

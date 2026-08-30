@@ -9,7 +9,7 @@ pub(super) const MAX_RANK: usize = 4;
 pub(super) const MAX_ELEMENTS: usize = 4096;
 pub(super) const MAX_TENSOR_BYTES: usize = MAX_ELEMENTS * 8;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FuzzBinaryOp {
     Add,
@@ -429,7 +429,9 @@ impl FuzzCase {
                     .enumerate()
                     .map(|(position, input)| bind(&mut graph, &format!("input{position}"), input))
                     .collect::<Result<Vec<_>, _>>()?;
-                graph.concat(ids, *axis).map_err(|error| error.to_string())?
+                graph
+                    .concat(ids, *axis)
+                    .map_err(|error| error.to_string())?
             }
             Self::Matmul { lhs, rhs } => {
                 let lhs = bind(&mut graph, "lhs", lhs)?;
@@ -477,7 +479,9 @@ impl FuzzCase {
             }
             Self::LogicalNot { input } => {
                 let input = bind(&mut graph, "input", input)?;
-                graph.logical_not(input).map_err(|error| error.to_string())?
+                graph
+                    .logical_not(input)
+                    .map_err(|error| error.to_string())?
             }
             Self::TensorT { input } => {
                 let input = bind(&mut graph, "input", input)?;
@@ -517,7 +521,9 @@ impl FuzzCase {
                 let extent = input.shape[*axis];
                 let index_value = index.to_tensor()?;
                 if (0..index_value.len()).any(|position| match index_value.scalar_at(position) {
-                    Scalar::I(value) => usize::try_from(value).map_or(true, |value| value >= extent),
+                    Scalar::I(value) => {
+                        usize::try_from(value).map_or(true, |value| value >= extent)
+                    }
                     _ => true,
                 }) {
                     return Err("raw fuzz gather index is negative or out of range".into());
@@ -538,8 +544,7 @@ impl FuzzCase {
                 if !matches!(index.dtype, DType::I32 | DType::I64) {
                     return Err("raw fuzz scatter index dtype must be I32 or I64".into());
                 }
-                if updates.dtype != base.dtype
-                {
+                if updates.dtype != base.dtype {
                     return Err("raw fuzz scatter requires homogeneous portable data dtypes".into());
                 }
                 if *op == FuzzScatterOp::Add && !matches!(base.dtype, DType::F32 | DType::F64) {
@@ -566,7 +571,9 @@ impl FuzzCase {
                 let extent = base.shape[*axis];
                 let index_value = index.to_tensor()?;
                 if (0..index_value.len()).any(|position| match index_value.scalar_at(position) {
-                    Scalar::I(value) => usize::try_from(value).map_or(true, |value| value >= extent),
+                    Scalar::I(value) => {
+                        usize::try_from(value).map_or(true, |value| value >= extent)
+                    }
                     _ => true,
                 }) {
                     return Err("raw fuzz scatter index is negative or out of range".into());

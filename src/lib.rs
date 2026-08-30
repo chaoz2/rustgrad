@@ -4,21 +4,20 @@
 pub mod autograd;
 pub mod backend;
 pub mod collective;
-pub mod conv2d_plan;
 mod collective_inspection;
-pub mod cpu_stable_sort;
+pub mod conv2d_plan;
 pub mod cpu_jit;
+pub mod cpu_stable_sort;
 pub mod cuda;
 mod cuda_profile;
 pub mod datasets;
 pub mod effects;
 pub mod einsum;
-mod source_einsum;
 pub mod engine;
 pub mod error;
 pub mod fuzz;
-pub mod gradcheck;
 pub mod gguf;
+pub mod gradcheck;
 mod host_buffer;
 mod index;
 pub mod interop;
@@ -28,6 +27,7 @@ pub mod linearize;
 pub mod loss;
 pub mod matmul;
 pub mod random;
+mod source_einsum;
 /// Compatibility facade for the original normalized matmul-plan module path.
 pub mod matmul_plan {
     pub use crate::matmul::{MatmulKernelPlan, MatmulPlanError};
@@ -63,21 +63,20 @@ pub mod vector_ir;
 pub mod viz;
 
 pub use backend::{Backend, CpuBackend, CpuJitBackend, JitFallback};
-pub use ir::{ScatterMode, ScatterReduceKind, ScatterSource};
 pub use collective::{
     CollectiveAction, CollectiveExecutor, CollectiveKind, CollectivePlan, CollectivePlanner,
     CollectiveRequest, CudaCollectiveGroup, CudaCollectiveTrace, DeviceGroup,
     InMemoryCollectiveExecutor, LogicalRange, Reduction as CollectiveReduction, StreamLane,
 };
-pub use conv2d_plan::{StaticConv2dPlan, StaticConv2dPlanError};
 pub use collective_inspection::{CollectivePlanInspection, CollectivePlanInspectionError};
-pub use cpu_stable_sort::{
-    BoundCpuStableSortPlan, CpuStableSortDescriptor, CpuStableSortExecutionError,
-    CpuStableSortPlan, CpuStableSortPlanError,
-};
+pub use conv2d_plan::{StaticConv2dPlan, StaticConv2dPlanError};
 pub use cpu_jit::{
     CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, KernelPointerAbi, QuantizedBufferAbi,
     RenderedC, VectorPlan,
+};
+pub use cpu_stable_sort::{
+    BoundCpuStableSortPlan, CpuStableSortDescriptor, CpuStableSortExecutionError,
+    CpuStableSortPlan, CpuStableSortPlanError,
 };
 pub use cuda::{
     BufferLease, BufferView, Capability, Capture, Context, ContextGuard, CudaAllocator, CudaError,
@@ -118,17 +117,17 @@ pub use engine::{
 };
 pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
 pub use fuzz::{
-    FuzzArtifactError, FuzzBinaryOp, FuzzCampaign, FuzzCase, FuzzComparison, FuzzComparisonPolicy,
-    FuzzConfig, FuzzFailureArtifact, FuzzOutcome, FuzzPath, FuzzCompareOp, FuzzLogicalOp,
-    FuzzReduction, FuzzScatterOp, FuzzTensor, FuzzUnaryOp,
-    generate_case, minimize_case, regression_cases, replay_failure, run_campaign, run_case,
-};
-pub use gradcheck::{
-    GradcheckConfig, GradcheckError, GradcheckMismatch, GradcheckReport, gradcheck_cpu,
+    FuzzArtifactError, FuzzBinaryOp, FuzzCampaign, FuzzCase, FuzzCompareOp, FuzzComparison,
+    FuzzComparisonPolicy, FuzzConfig, FuzzFailureArtifact, FuzzLogicalOp, FuzzOutcome, FuzzPath,
+    FuzzReduction, FuzzScatterOp, FuzzTensor, FuzzUnaryOp, generate_case, minimize_case,
+    regression_cases, replay_failure, run_campaign, run_case,
 };
 pub use gguf::{
     GgmlLayout, GgmlType, QuantizedBufferDesc, QuantizedError, QuantizedRowGatherError,
     QuantizedRowGatherPlan, QuantizedTensorData,
+};
+pub use gradcheck::{
+    GradcheckConfig, GradcheckError, GradcheckMismatch, GradcheckReport, gradcheck_cpu,
 };
 pub use host_buffer::HostBufferError;
 pub use ir::pool::MaxPool2dOutput;
@@ -139,9 +138,9 @@ pub use ir::{
     DynamicOutputShape, ExpandExtent, Graph, LogicalOp, NodeId, Op, PadMode, Pool2dOptions,
     PoolOptions, PrefixScanKind, PrefixScanOutput, RandomKind, RandomStream, ReduceKind,
     ReductionDType, ReshapeExtent, RollDims, RollShifts, ShrinkRange, Slice, SortOutput,
-    SplitSections, SplitSizes, StaticIndexUpdateWrt, UnaryOp,
-    UnflattenExtent, VarianceCorrection,
+    SplitSections, SplitSizes, StaticIndexUpdateWrt, UnaryOp, UnflattenExtent, VarianceCorrection,
 };
+pub use ir::{ScatterMode, ScatterReduceKind, ScatterSource};
 pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
     execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_matmul,
@@ -153,9 +152,9 @@ pub use linearize::{
     LinearProgram, LinearizeError, LiveInterval, RegisterAssignment, RegisterClass, allocate,
 };
 pub use loss::{
-    LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
-    nll_loss, sparse_categorical_cross_entropy, sparse_categorical_cross_entropy_tinygrad,
-    SparseCategoricalCrossEntropyOptions,
+    LossOptions, Reduction, SparseCategoricalCrossEntropyOptions, binary_cross_entropy,
+    binary_cross_entropy_with_logits, cross_entropy, nll_loss, sparse_categorical_cross_entropy,
+    sparse_categorical_cross_entropy_tinygrad,
 };
 pub use matmul::{
     MatmulBarrierKind, MatmulBarrierPhase, MatmulKernelPlan, MatmulPlanError,
@@ -178,12 +177,12 @@ pub use movement_plan::{
     MovementPlanError,
 };
 pub use nn::{
-    AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool1d, BatchNorm, BatchNorm2d, BatchNormOutput,
-    CastPolicy, ConvTranspose1d, ConvTranspose2d, Flatten, GroupNorm, InstanceNorm, LoadReport,
-    MaxPool1d, Mode, ModeForwardOutput, ModeModuleForward, ModeSequential, Module, ModuleForward,
-    Parameter, ParameterId, ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU,
-    RealizedBatchNormStats, StateDict as ModuleStateDict, StrictStateLoadLimits, BatchNorm3d,
-    LiveStateDict, get_parameters, get_state_dict,
+    AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool1d, BatchNorm, BatchNorm2d, BatchNorm3d,
+    BatchNormOutput, CastPolicy, ConvTranspose1d, ConvTranspose2d, Flatten, GroupNorm,
+    InstanceNorm, LiveStateDict, LoadReport, MaxPool1d, Mode, ModeForwardOutput, ModeModuleForward,
+    ModeSequential, Module, ModuleForward, Parameter, ParameterId, ParameterSnapshot,
+    PendingBatchNormStats, PendingModeEffects, ReLU, RealizedBatchNormStats,
+    StateDict as ModuleStateDict, StrictStateLoadLimits, get_parameters, get_state_dict,
 };
 pub use onnx::{
     NativeOnnxInferenceResult, NativeOnnxInferenceTrace, OnnxModel, import_onnx,
@@ -197,13 +196,12 @@ pub use ptx::{
 pub use runtime::mapped::{MappedBackingId, MappedTensor, MappedTensorError, MappedTensorPolicy};
 pub use runtime::mapped_mut::{MutableMappedFile, MutableMappedFileError};
 pub use safetensors::{
-    Metadata, SafetensorsFileError, SafetensorsReadLimits, StateDict, load_safetensors,
-    load_safetensors_file, load_safetensors_file_with_limits, save_safetensors,
-    save_safetensors_file, OwnedSafetensorsMetadata, SafetensorsMetadata,
-    inspect_safetensors_metadata, inspect_safetensors_metadata_file, load_safetensors_state_only,
-    load_safetensors_state_only_file,
-    save_safetensors_file_with_json_metadata,
-    save_safetensors_with_json_metadata,
+    Metadata, OwnedSafetensorsMetadata, SafetensorsFileError, SafetensorsMetadata,
+    SafetensorsReadLimits, StateDict, inspect_safetensors_metadata,
+    inspect_safetensors_metadata_file, load_safetensors, load_safetensors_file,
+    load_safetensors_file_with_limits, load_safetensors_state_only,
+    load_safetensors_state_only_file, save_safetensors, save_safetensors_file,
+    save_safetensors_file_with_json_metadata, save_safetensors_with_json_metadata,
 };
 pub use schedule::{
     BufferDesc, ExecutionPlanItemSummary, ExecutionPlanSummary, ExecutionPlanSummaryError,
@@ -254,6 +252,7 @@ pub use tensor::{
     DType, DTypeCategory, Float8Format, Float8Storage, LiteralScalar, Scalar, Shape, Storage,
     TensorData, TensorDataReader, TensorList,
 };
+pub(crate) use tensor::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 pub use torch::{
     TorchStateFileError, TorchStateLimit, TorchStateReadLimits, extract_tar_files,
     load_legacy_torch_state_dict, load_torch_state_dict, load_torch_state_dict_strict,
@@ -268,8 +267,10 @@ pub use uop::{
 };
 pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
 pub use viz::{
-    VizEdge, VizError, VizGraph, VizNode, captured_schedule_viz, graph_viz, linear_viz,
-    captured_replay_trace_viz, captured_specialization_trace_viz, compile_trace_viz, cuda_collective_trace_viz, memory_space_viz, native_mixed_batch_trace_viz, native_mixed_replay_trace_viz, realization_trace_viz, schedule_viz, sharded_cuda_execution_trace_viz, uop_viz, vector_viz,
+    VizEdge, VizError, VizGraph, VizNode, captured_replay_trace_viz, captured_schedule_viz,
+    captured_specialization_trace_viz, compile_trace_viz, cuda_collective_trace_viz, graph_viz,
+    linear_viz, memory_space_viz, native_mixed_batch_trace_viz, native_mixed_replay_trace_viz,
+    realization_trace_viz, schedule_viz, sharded_cuda_execution_trace_viz, uop_viz, vector_viz,
 };
 
 #[cfg(test)]

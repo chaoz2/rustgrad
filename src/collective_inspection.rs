@@ -57,10 +57,18 @@ impl CollectivePlanInspection {
         wire.identity = expected_identity(&wire)?;
         Ok(Self { wire })
     }
-    pub const fn version(&self) -> u16 { self.wire.version }
-    pub const fn identity(&self) -> u64 { self.wire.identity }
-    pub fn plan_cache_key(&self) -> &str { &self.wire.plan.cache_key }
-    pub fn action_count(&self) -> usize { self.wire.plan.actions.len() }
+    pub const fn version(&self) -> u16 {
+        self.wire.version
+    }
+    pub const fn identity(&self) -> u64 {
+        self.wire.identity
+    }
+    pub fn plan_cache_key(&self) -> &str {
+        &self.wire.plan.cache_key
+    }
+    pub fn action_count(&self) -> usize {
+        self.wire.plan.actions.len()
+    }
     pub fn encode(&self) -> Result<Vec<u8>, CollectivePlanInspectionError> {
         validate(&self.wire)?;
         encode_wire(&self.wire)
@@ -80,10 +88,18 @@ impl CollectivePlanInspection {
 }
 
 fn validate(wire: &Wire) -> Result<(), CollectivePlanInspectionError> {
-    if wire.kind != KIND { return Err(CollectivePlanInspectionError::Kind); }
-    if wire.version != VERSION { return Err(CollectivePlanInspectionError::Version(wire.version)); }
-    wire.plan.validate().map_err(|error| CollectivePlanInspectionError::Invalid(error.to_string()))?;
-    if wire.identity != expected_identity(wire)? { return Err(CollectivePlanInspectionError::Identity); }
+    if wire.kind != KIND {
+        return Err(CollectivePlanInspectionError::Kind);
+    }
+    if wire.version != VERSION {
+        return Err(CollectivePlanInspectionError::Version(wire.version));
+    }
+    wire.plan
+        .validate()
+        .map_err(|error| CollectivePlanInspectionError::Invalid(error.to_string()))?;
+    if wire.identity != expected_identity(wire)? {
+        return Err(CollectivePlanInspectionError::Identity);
+    }
     Ok(())
 }
 fn expected_identity(wire: &Wire) -> Result<u64, CollectivePlanInspectionError> {
@@ -103,15 +119,24 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CollectiveKind, CollectivePlanner, CollectiveRequest, DType, DeviceGroup, Reduction};
     use crate::collective::DeviceId;
+    use crate::{
+        CollectiveKind, CollectivePlanner, CollectiveRequest, DType, DeviceGroup, Reduction,
+    };
     fn plan() -> CollectivePlan {
         CollectivePlanner::plan(CollectiveRequest {
-            group: DeviceGroup::new([DeviceId::new("CPU:0").unwrap(), DeviceId::new("CPU:1").unwrap()]).unwrap(),
-            kind: CollectiveKind::AllReduce { reduction: Reduction::Sum },
+            group: DeviceGroup::new([
+                DeviceId::new("CPU:0").unwrap(),
+                DeviceId::new("CPU:1").unwrap(),
+            ])
+            .unwrap(),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
             dtype: DType::F32,
             input_lengths: vec![5, 5],
-        }).unwrap()
+        })
+        .unwrap()
     }
     #[test]
     fn collective_inspection_is_canonical_and_non_replayable() {
@@ -126,7 +151,9 @@ mod tests {
         assert!(CollectivePlanInspection::decode(&serde_json::to_vec(&tampered).unwrap()).is_err());
         let mut bad_topology: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         bad_topology["plan"]["actions"][0]["id"] = serde_json::json!(99);
-        assert!(CollectivePlanInspection::decode(&serde_json::to_vec(&bad_topology).unwrap()).is_err());
+        assert!(
+            CollectivePlanInspection::decode(&serde_json::to_vec(&bad_topology).unwrap()).is_err()
+        );
         let mut unknown: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         unknown["unexpected"] = serde_json::json!(true);
         assert!(CollectivePlanInspection::decode(&serde_json::to_vec(&unknown).unwrap()).is_err());

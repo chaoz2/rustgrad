@@ -16,7 +16,7 @@ fn multinomial_replacement_is_explicit_stream_replayable_and_typed() {
     let mut graph = Graph::new();
     let weights = graph.input_dtype("weights", [2, 3], DType::F32);
     let sampled = graph
-        .multinomial(weights, 4, -1, true, explicit_stream())
+        .multinomial_with_stream(weights, 4, -1, true, explicit_stream())
         .unwrap();
     let values = TensorData::from_scalars(
         [2, 3],
@@ -57,7 +57,7 @@ fn multinomial_without_replacement_uses_checked_stable_topk_indices() {
     let mut graph = Graph::new();
     let weights = graph.input_dtype("weights", [3], DType::F32);
     let sampled = graph
-        .multinomial(weights, 2, 0, false, explicit_stream())
+        .multinomial_with_stream(weights, 2, 0, false, explicit_stream())
         .unwrap();
     let values = TensorData::from_scalars(
         [3],
@@ -87,20 +87,20 @@ fn multinomial_preflights_shape_count_and_dtype_without_graph_mutation() {
     let before = graph.node_count();
     assert!(
         graph
-            .multinomial(integer, 1, 0, true, explicit_stream())
+            .multinomial_with_stream(integer, 1, 0, true, explicit_stream())
             .is_err()
     );
     assert_eq!(graph.node_count(), before);
     let weights = graph.input_dtype("weights", [2, 3], DType::F32);
     let before = graph.node_count();
     assert!(matches!(
-        graph.multinomial(weights, 4, 1, false, explicit_stream()),
+        graph.multinomial_with_stream(weights, 4, 1, false, explicit_stream()),
         Err(Error::InvalidBounds { .. })
     ));
     assert_eq!(graph.node_count(), before);
     assert!(
         graph
-            .multinomial(weights, 1, 2, true, explicit_stream())
+            .multinomial_with_stream(weights, 1, 2, true, explicit_stream())
             .is_err()
     );
     assert_eq!(graph.node_count(), before);

@@ -1,8 +1,11 @@
 //! Checked-in tinygrad loss helpers composed from inspectable graph operations.
+use crate::ir::{
+    SourceGatherPlan, logsigmoid_plan, lower_source_gather, one_hot_bool_plan, one_hot_plan,
+    source_gather_plan, source_lub, source_weak_scalar_dtype, validate_log_softmax_plan,
+};
 use crate::{
     DType, Error, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
 };
-use crate::ir::{logsigmoid_plan, one_hot_bool_plan, one_hot_plan, source_lub, source_weak_scalar_dtype, validate_log_softmax_plan, lower_source_gather, source_gather_plan, SourceGatherPlan};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reduction {
@@ -87,7 +90,9 @@ fn sparse_categorical_cross_entropy_plan(
     let classes = expected.pop().expect("rank checked");
     let target_shape = Shape::new(expected);
     if target_node.shape != target_shape {
-        return Err(invalid("target shape must equal logits without final class axis"));
+        return Err(invalid(
+            "target shape must equal logits without final class axis",
+        ));
     }
     // Reuse the exact lazy default-I32/I64-upgrade descriptor that backs
     // Graph::one_hot. This replaces the stale eager-I64 class-range sidecar
@@ -98,12 +103,17 @@ fn sparse_categorical_cross_entropy_plan(
     // `log_softmax` promotes exact inputs to F32, but preserves every floating
     // storage width. These are the widths subsequently observed by tinygrad's
     // weak smoothing constants and typed sums.
-    let log_dtype = if logits_node.dtype.is_float() { logits_node.dtype } else { DType::F32 };
+    let log_dtype = if logits_node.dtype.is_float() {
+        logits_node.dtype
+    } else {
+        DType::F32
+    };
     let selected_shape = target_shape.clone();
     let selected_sum = ReductionDType::sum_default(log_dtype);
     let total_sum = ReductionDType::sum_default(log_dtype);
     let extent = |shape: &Shape, dtype: DType| {
-        shape.numel()?
+        shape
+            .numel()?
             .checked_mul(dtype.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     };
@@ -130,18 +140,22 @@ fn sparse_categorical_cross_entropy_plan(
             .enumerate()
             .map(|(i, &d)| if i == class_axis { 1 } else { d })
             .collect::<Vec<_>>(),
-    ))? != logits_node.shape {
+    ))? != logits_node.shape
+    {
         return Err(invalid("final class reduction cannot broadcast"));
     }
     let smoothing = TensorData::scalar_with_dtype(Scalar::F(options.label_smoothing), log_dtype);
-    let hard_weight = TensorData::scalar_with_dtype(Scalar::F(1. - options.label_smoothing), log_dtype);
+    let hard_weight =
+        TensorData::scalar_with_dtype(Scalar::F(1. - options.label_smoothing), log_dtype);
     if smoothing.dtype() != log_dtype || hard_weight.dtype() != log_dtype {
         return Err(invalid("sparse smoothing scalar dtype mismatch"));
     }
-    let ignored = (options.ignore_index != -1).then(|| {
-        TensorData::scalar_with_dtype(Scalar::I(options.ignore_index), target_node.dtype)
-    });
-    if ignored.as_ref().is_some_and(|value| value.dtype() != target_node.dtype) {
+    let ignored = (options.ignore_index != -1)
+        .then(|| TensorData::scalar_with_dtype(Scalar::I(options.ignore_index), target_node.dtype));
+    if ignored
+        .as_ref()
+        .is_some_and(|value| value.dtype() != target_node.dtype)
+    {
         return Err(invalid("ignore-index scalar dtype mismatch"));
     }
     Ok(SparseCategoricalCrossEntropyPlan {
@@ -199,7 +213,9 @@ fn tinygrad_cross_entropy_plan(
     // `label_smoothing / int(Y.shape[classes_dim])` is evaluated even for
     // zero smoothing, so Python raises before a graph node can exist.
     if classes == 0 {
-        return Err(Error::DivisionByZero { op: "cross entropy label smoothing" });
+        return Err(Error::DivisionByZero {
+            op: "cross entropy label smoothing",
+        });
     }
     let one_hot = logits_shape != target_original_shape;
     if one_hot {
@@ -210,13 +226,34 @@ fn tinygrad_cross_entropy_plan(
         }
         one_hot_bool_plan(graph, target, classes)?;
     }
-    let target_shape = if one_hot { logits_shape.clone() } else { target_original_shape };
-    let target_dtype = if one_hot { DType::Bool } else { target_node.dtype };
-    let log_dtype = if logits_node.dtype.is_float() { logits_node.dtype } else { DType::F32 };
-    validate_log_softmax_plan(logits, &logits_shape, logits_node.dtype, class_axis as isize, None)?;
+    let target_shape = if one_hot {
+        logits_shape.clone()
+    } else {
+        target_original_shape
+    };
+    let target_dtype = if one_hot {
+        DType::Bool
+    } else {
+        target_node.dtype
+    };
+    let log_dtype = if logits_node.dtype.is_float() {
+        logits_node.dtype
+    } else {
+        DType::F32
+    };
+    validate_log_softmax_plan(
+        logits,
+        &logits_shape,
+        logits_node.dtype,
+        class_axis as isize,
+        None,
+    )?;
     let extent = |shape: &Shape, dtype: DType| {
-        shape.numel()?.checked_mul(dtype.itemsize())
-            .ok_or_else(|| Error::ShapeOverflow(shape.clone())).map(|_| ())
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
     };
     extent(&logits_shape, logits_node.dtype)?;
     extent(&target_original_shape, target_node.dtype)?;
@@ -231,19 +268,28 @@ fn tinygrad_cross_entropy_plan(
     let first_dtype = source_weak_scalar_dtype(target_dtype, Scalar::F(1.0 - label_smoothing));
     let first_weight = TensorData::scalar_with_dtype(Scalar::F(1.0 - label_smoothing), first_dtype);
     let first_product_dtype = source_lub(first_dtype, target_dtype);
-    let smooth_dtype = source_weak_scalar_dtype(first_product_dtype, Scalar::F(label_smoothing / classes as f64));
-    let smooth = TensorData::scalar_with_dtype(Scalar::F(label_smoothing / classes as f64), smooth_dtype);
+    let smooth_dtype = source_weak_scalar_dtype(
+        first_product_dtype,
+        Scalar::F(label_smoothing / classes as f64),
+    );
+    let smooth =
+        TensorData::scalar_with_dtype(Scalar::F(label_smoothing / classes as f64), smooth_dtype);
     let target_dtype = source_lub(first_product_dtype, smooth_dtype);
     for (shape, dtype) in [
         (first_weight.shape(), first_weight.dtype()),
         (&target_shape, first_product_dtype),
         (smooth.shape(), smooth.dtype()),
         (&target_shape, target_dtype),
-    ] { extent(shape, dtype)?; }
-    if first_weight.shape() != &Shape::new([]) || smooth.shape() != &Shape::new([])
+    ] {
+        extent(shape, dtype)?;
+    }
+    if first_weight.shape() != &Shape::new([])
+        || smooth.shape() != &Shape::new([])
         || target_shape.broadcast_with(first_weight.shape())? != target_shape
         || target_shape.broadcast_with(smooth.shape())? != target_shape
-    { return Err(invalid("cross entropy scalar promotion")); }
+    {
+        return Err(invalid("cross entropy scalar promotion"));
+    }
 
     let weighted_shape = logits_shape.broadcast_with(&target_shape)?;
     let weighted_dtype = source_lub(log_dtype, target_dtype);
@@ -270,7 +316,11 @@ fn tinygrad_cross_entropy_plan(
         }
         Reduction::Mean => {
             let dtypes = ReductionDType::sum_default(class_loss_dtype);
-            let division_dtype = if dtypes.accumulator.is_float() { dtypes.accumulator } else { DType::F32 };
+            let division_dtype = if dtypes.accumulator.is_float() {
+                dtypes.accumulator
+            } else {
+                DType::F32
+            };
             extent(&class_loss_shape, dtypes.accumulator)?;
             extent(&scalar, dtypes.accumulator)?;
             extent(&scalar, division_dtype)?;
@@ -278,9 +328,16 @@ fn tinygrad_cross_entropy_plan(
             (scalar, class_loss_dtype)
         }
     };
-    Ok(TinygradCrossEntropyPlan { class_axis, one_hot,
-        first_weight, smooth, class_loss_shape, class_loss_dtype,
-        output_shape, output_dtype })
+    Ok(TinygradCrossEntropyPlan {
+        class_axis,
+        one_hot,
+        first_weight,
+        smooth,
+        class_loss_shape,
+        class_loss_dtype,
+        output_shape,
+        output_dtype,
+    })
 }
 fn axis(graph: &Graph, node: NodeId, axis: isize) -> Result<usize> {
     let rank = graph.shape(node)?.rank() as isize;
@@ -362,7 +419,11 @@ fn binary_crossentropy_logits_plan(
         extent(&logits_shape, DType::Bool)?;
     }
     logsigmoid_plan(&logits_shape, logits_dtype)?;
-    let log_dtype = if logits_dtype.is_float() { logits_dtype } else { DType::F32 };
+    let log_dtype = if logits_dtype.is_float() {
+        logits_dtype
+    } else {
+        DType::F32
+    };
     extent(&logits_shape, log_dtype)?;
 
     // `(1 if pos_weight is None else pos_weight) * Y * log_p`.
@@ -431,8 +492,16 @@ fn binary_crossentropy_logits_plan(
         }
         Reduction::Mean => {
             let dtypes = ReductionDType::sum_default(loss_dtype);
-            let division_dtype = if dtypes.accumulator.is_float() { dtypes.accumulator } else { DType::F32 };
-            let output_dtype = if loss_dtype.is_float() { loss_dtype } else { DType::F32 };
+            let division_dtype = if dtypes.accumulator.is_float() {
+                dtypes.accumulator
+            } else {
+                DType::F32
+            };
+            let output_dtype = if loss_dtype.is_float() {
+                loss_dtype
+            } else {
+                DType::F32
+            };
             extent(&loss_shape, dtypes.accumulator)?;
             extent(&scalar, dtypes.accumulator)?;
             extent(&scalar, division_dtype)?;
@@ -445,7 +514,12 @@ fn binary_crossentropy_logits_plan(
             (scalar, output_dtype)
         }
     };
-    Ok(BinaryCrossEntropyLogitsPlan { loss_shape, loss_dtype, output_shape, output_dtype })
+    Ok(BinaryCrossEntropyLogitsPlan {
+        loss_shape,
+        loss_dtype,
+        output_shape,
+        output_dtype,
+    })
 }
 
 fn binary_crossentropy_plan(
@@ -471,7 +545,11 @@ fn binary_crossentropy_plan(
     extent(&target_shape, target_dtype)?;
 
     // `-Y * self.log()`.
-    let log_input_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let log_input_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
     let left_shape = target_shape.broadcast_with(&input_shape)?;
     let left_dtype = source_lub(target_dtype, log_input_dtype);
     extent(&target_shape, target_dtype)?; // Neg target
@@ -540,7 +618,11 @@ fn binary_crossentropy_plan(
             } else {
                 DType::F32
             };
-            let output_dtype = if loss_dtype.is_float() { loss_dtype } else { DType::F32 };
+            let output_dtype = if loss_dtype.is_float() {
+                loss_dtype
+            } else {
+                DType::F32
+            };
             extent(&loss_shape, dtypes.accumulator)?;
             extent(&scalar, dtypes.accumulator)?;
             extent(&scalar, division_dtype)?; // cast/sum divisor/reciprocal/product
@@ -622,7 +704,13 @@ fn one_hot_bool(graph: &mut Graph, logits: NodeId, target: NodeId, axis: usize) 
     let rank = graph.shape(logits)?.rank();
     let mut axes = Vec::with_capacity(rank);
     for out in 0..rank {
-        axes.push(if out == axis { rank - 1 } else if out < axis { out } else { out - 1 });
+        axes.push(if out == axis {
+            rank - 1
+        } else if out < axis {
+            out
+        } else {
+            out - 1
+        });
     }
     graph.permute(hot, axes)
 }
@@ -684,19 +772,27 @@ impl Graph {
             Reduction::Sum => self.sum_default(loss)?,
             Reduction::Mean => self.mean_default(loss)?,
         };
-        debug_assert_eq!(self.shape(loss).expect("binary crossentropy preflighted"), &plan.loss_shape);
-        debug_assert_eq!(self.dtype(loss).expect("binary crossentropy preflighted"), plan.loss_dtype);
-        debug_assert_eq!(self.shape(output).expect("binary crossentropy preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("binary crossentropy preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(loss).expect("binary crossentropy preflighted"),
+            &plan.loss_shape
+        );
+        debug_assert_eq!(
+            self.dtype(loss).expect("binary crossentropy preflighted"),
+            plan.loss_dtype
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("binary crossentropy preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("binary crossentropy preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
     /// tinygrad's omitted `reduction` argument defaults to `"mean"`.
-    pub fn binary_crossentropy_default(
-        &mut self,
-        input: NodeId,
-        target: NodeId,
-    ) -> Result<NodeId> {
+    pub fn binary_crossentropy_default(&mut self, input: NodeId, target: NodeId) -> Result<NodeId> {
         self.binary_crossentropy(input, target, Reduction::Mean)
     }
 
@@ -728,10 +824,22 @@ impl Graph {
             Reduction::Sum => self.sum_default(loss)?,
             Reduction::Mean => self.mean_default(loss)?,
         };
-        debug_assert_eq!(self.shape(loss).expect("binary logits preflighted"), &plan.loss_shape);
-        debug_assert_eq!(self.dtype(loss).expect("binary logits preflighted"), plan.loss_dtype);
-        debug_assert_eq!(self.shape(output).expect("binary logits preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("binary logits preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(loss).expect("binary logits preflighted"),
+            &plan.loss_shape
+        );
+        debug_assert_eq!(
+            self.dtype(loss).expect("binary logits preflighted"),
+            plan.loss_dtype
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("binary logits preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("binary logits preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -837,8 +945,14 @@ impl Graph {
         // enclosing plan above proves their cross-operation shapes, widths,
         // and scalar promotion contract before this first mutation.
         let logp = self.log_softmax(logits, -1, None)?;
-        debug_assert_eq!(self.shape(logp).expect("sparse CE preflighted"), &plan.logits_shape);
-        debug_assert_eq!(self.dtype(logp).expect("sparse CE preflighted"), plan.log_dtype);
+        debug_assert_eq!(
+            self.shape(logp).expect("sparse CE preflighted"),
+            &plan.logits_shape
+        );
+        debug_assert_eq!(
+            self.dtype(logp).expect("sparse CE preflighted"),
+            plan.log_dtype
+        );
         let hot = one_hot(self, logits, target, plan.class_axis)?;
         let mask = if let Some(ignored) = plan.ignored {
             let ignored = self.constant(ignored);
@@ -900,7 +1014,10 @@ impl Graph {
             Reduction::None => plan.selected_shape,
             Reduction::Sum | Reduction::Mean => Shape::new([]),
         };
-        debug_assert_eq!(self.shape(output).expect("sparse CE preflighted"), &output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("sparse CE preflighted"),
+            &output_shape
+        );
         Ok(output)
     }
 
@@ -952,22 +1069,30 @@ impl Graph {
         let target = self.add(target, smooth)?;
         let logp = self.log_softmax(logits, plan.class_axis as isize, None)?;
         let weighted = self.mul(logp, target)?;
-        let summed = self.sum_with_options(
-            weighted,
-            Some(vec![plan.class_axis as isize]),
-            false,
-            None,
-        )?;
+        let summed =
+            self.sum_with_options(weighted, Some(vec![plan.class_axis as isize]), false, None)?;
         let loss = self.neg(summed)?;
         let output = match reduction {
             Reduction::None => loss,
             Reduction::Sum => self.sum_default(loss)?,
             Reduction::Mean => self.mean_default(loss)?,
         };
-        debug_assert_eq!(self.shape(loss).expect("cross entropy preflighted"), &plan.class_loss_shape);
-        debug_assert_eq!(self.dtype(loss).expect("cross entropy preflighted"), plan.class_loss_dtype);
-        debug_assert_eq!(self.shape(output).expect("cross entropy preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("cross entropy preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(loss).expect("cross entropy preflighted"),
+            &plan.class_loss_shape
+        );
+        debug_assert_eq!(
+            self.dtype(loss).expect("cross entropy preflighted"),
+            plan.class_loss_dtype
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("cross entropy preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("cross entropy preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -1011,35 +1136,136 @@ pub fn cross_entropy(
 }
 /// NLL for log probabilities and sparse integer targets; optional class weights are rank-one.
 
-struct NllLossPlan { main: SourceGatherPlan, weight: Option<SourceGatherPlan>, index_shape: Shape, flat_shape: Shape, target_shape: Shape }
-fn nll_loss_plan(graph:&Graph, logp:NodeId, target:NodeId, weight:Option<NodeId>, ignore:Option<i64>, reduction:Reduction)->Result<NllLossPlan> {
-    let x=graph.node(logp)?; let y=graph.node(target)?;
-    if x.shape.rank()<2 || y.shape.rank()+1!=x.shape.rank() || !y.dtype.is_integer() { return Err(invalid("NLL requires label tensor one rank below data")); }
-    let mut idx=y.shape.dims().to_vec(); idx.insert(1,1); let index_shape=Shape::new(idx);
-    let main=source_gather_plan(&x.shape,x.dtype,&index_shape,y.dtype,1)?;
-    let flat_shape=Shape::new([y.shape.numel()?]);
-    let weight_plan=if let Some(weight)=weight { let w=graph.node(weight)?; if w.shape.rank()!=1 { return Err(invalid("NLL weight must be rank one")); } Some(source_gather_plan(&w.shape,w.dtype,&flat_shape,y.dtype,0)?) } else { None };
-    let extent=|shape:&Shape,dtype:DType|shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(||Error::ShapeOverflow(shape.clone())).map(|_|());
-    extent(&x.shape,x.dtype)?; extent(&y.shape,y.dtype)?; extent(&index_shape,y.dtype)?; extent(&flat_shape,y.dtype)?;
-    let selected_dtype=x.dtype; let factor_dtype=weight.map(|w|graph.dtype(w)).transpose()?.unwrap_or(y.dtype);
-    extent(&y.shape,selected_dtype)?; extent(&y.shape,factor_dtype)?;
-    let product_dtype=source_lub(selected_dtype,factor_dtype); extent(&y.shape,product_dtype)?;
-    if ignore.is_some(){ extent(&y.shape,DType::Bool)?; }
-    let scalar=Shape::new([]); match reduction { Reduction::None=>{}, Reduction::Sum=>{let d=ReductionDType::sum_default(product_dtype);extent(&y.shape,d.accumulator)?;extent(&scalar,d.output)?;}, Reduction::Mean=>{let d=ReductionDType::sum_default(product_dtype);extent(&y.shape,d.accumulator)?;extent(&scalar,d.output)?;extent(&scalar,factor_dtype)?;} }
-    Ok(NllLossPlan{main,weight:weight_plan,index_shape,flat_shape,target_shape:y.shape.clone()})
+struct NllLossPlan {
+    main: SourceGatherPlan,
+    weight: Option<SourceGatherPlan>,
+    index_shape: Shape,
+    flat_shape: Shape,
+    target_shape: Shape,
+}
+fn nll_loss_plan(
+    graph: &Graph,
+    logp: NodeId,
+    target: NodeId,
+    weight: Option<NodeId>,
+    ignore: Option<i64>,
+    reduction: Reduction,
+) -> Result<NllLossPlan> {
+    let x = graph.node(logp)?;
+    let y = graph.node(target)?;
+    if x.shape.rank() < 2 || y.shape.rank() + 1 != x.shape.rank() || !y.dtype.is_integer() {
+        return Err(invalid("NLL requires label tensor one rank below data"));
+    }
+    let mut idx = y.shape.dims().to_vec();
+    idx.insert(1, 1);
+    let index_shape = Shape::new(idx);
+    let main = source_gather_plan(&x.shape, x.dtype, &index_shape, y.dtype, 1)?;
+    let flat_shape = Shape::new([y.shape.numel()?]);
+    let weight_plan = if let Some(weight) = weight {
+        let w = graph.node(weight)?;
+        if w.shape.rank() != 1 {
+            return Err(invalid("NLL weight must be rank one"));
+        }
+        Some(source_gather_plan(
+            &w.shape,
+            w.dtype,
+            &flat_shape,
+            y.dtype,
+            0,
+        )?)
+    } else {
+        None
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(&x.shape, x.dtype)?;
+    extent(&y.shape, y.dtype)?;
+    extent(&index_shape, y.dtype)?;
+    extent(&flat_shape, y.dtype)?;
+    let selected_dtype = x.dtype;
+    let factor_dtype = weight
+        .map(|w| graph.dtype(w))
+        .transpose()?
+        .unwrap_or(y.dtype);
+    extent(&y.shape, selected_dtype)?;
+    extent(&y.shape, factor_dtype)?;
+    let product_dtype = source_lub(selected_dtype, factor_dtype);
+    extent(&y.shape, product_dtype)?;
+    if ignore.is_some() {
+        extent(&y.shape, DType::Bool)?;
+    }
+    let scalar = Shape::new([]);
+    match reduction {
+        Reduction::None => {}
+        Reduction::Sum => {
+            let d = ReductionDType::sum_default(product_dtype);
+            extent(&y.shape, d.accumulator)?;
+            extent(&scalar, d.output)?;
+        }
+        Reduction::Mean => {
+            let d = ReductionDType::sum_default(product_dtype);
+            extent(&y.shape, d.accumulator)?;
+            extent(&scalar, d.output)?;
+            extent(&scalar, factor_dtype)?;
+        }
+    }
+    Ok(NllLossPlan {
+        main,
+        weight: weight_plan,
+        index_shape,
+        flat_shape,
+        target_shape: y.shape.clone(),
+    })
 }
 
 impl Graph {
-    pub fn nll_loss(&mut self, logp:NodeId,target:NodeId,weight:Option<NodeId>,ignore_index:Option<i64>,reduction:Reduction)->Result<NodeId>{
-        let plan=nll_loss_plan(self,logp,target,weight,ignore_index,reduction)?;
-        let index=self.reshape(target,plan.index_shape)?;
-        let selected=self.squeeze(lower_source_gather(self,logp,index,plan.main)?,Some(1))?;
-        let gathered_weight=if let (Some(weight),Some(weight_plan))=(weight,plan.weight){ let flat=self.reshape(target,plan.flat_shape)?; let gathered=lower_source_gather(self,weight,flat,weight_plan)?; self.reshape(gathered,plan.target_shape)? } else { self.lazy_full_with_dtype(plan.target_shape.clone(),Scalar::I(1),self.dtype(target)?)? };
-        let factor=if let Some(ignore)=ignore_index { let scalar=self.constant(TensorData::scalar_with_dtype(Scalar::I(ignore),self.dtype(target)?)); let mask=self.ne(target,scalar)?; self.mul(gathered_weight,mask)? } else { gathered_weight };
-        let loss=self.mul(self.neg(selected)?,factor)?;
-        match reduction { Reduction::None=>Ok(loss), Reduction::Sum=>self.sum_default(loss), Reduction::Mean=>{let n=self.sum_default(loss)?;let d=self.sum_default(factor)?;self.div(n,d)} }
+    pub fn nll_loss(
+        &mut self,
+        logp: NodeId,
+        target: NodeId,
+        weight: Option<NodeId>,
+        ignore_index: Option<i64>,
+        reduction: Reduction,
+    ) -> Result<NodeId> {
+        let plan = nll_loss_plan(self, logp, target, weight, ignore_index, reduction)?;
+        let index = self.reshape(target, plan.index_shape)?;
+        let selected = self.squeeze(lower_source_gather(self, logp, index, plan.main)?, Some(1))?;
+        let gathered_weight = if let (Some(weight), Some(weight_plan)) = (weight, plan.weight) {
+            let flat = self.reshape(target, plan.flat_shape)?;
+            let gathered = lower_source_gather(self, weight, flat, weight_plan)?;
+            self.reshape(gathered, plan.target_shape)?
+        } else {
+            self.lazy_full_with_dtype(plan.target_shape.clone(), Scalar::I(1), self.dtype(target)?)?
+        };
+        let factor = if let Some(ignore) = ignore_index {
+            let scalar = self.constant(TensorData::scalar_with_dtype(
+                Scalar::I(ignore),
+                self.dtype(target)?,
+            ));
+            let mask = self.ne(target, scalar)?;
+            self.mul(gathered_weight, mask)?
+        } else {
+            gathered_weight
+        };
+        let loss = self.mul(self.neg(selected)?, factor)?;
+        match reduction {
+            Reduction::None => Ok(loss),
+            Reduction::Sum => self.sum_default(loss),
+            Reduction::Mean => {
+                let n = self.sum_default(loss)?;
+                let d = self.sum_default(factor)?;
+                self.div(n, d)
+            }
+        }
     }
-    pub fn nll_loss_default(&mut self,logp:NodeId,target:NodeId)->Result<NodeId>{self.nll_loss(logp,target,None,None,Reduction::Mean)}
+    pub fn nll_loss_default(&mut self, logp: NodeId, target: NodeId) -> Result<NodeId> {
+        self.nll_loss(logp, target, None, None, Reduction::Mean)
+    }
 }
 
 pub fn nll_loss(
@@ -1049,13 +1275,7 @@ pub fn nll_loss(
     weight: Option<NodeId>,
     options: LossOptions,
 ) -> Result<NodeId> {
-    let a = nll_inputs(
-        graph,
-        log_probabilities,
-        target,
-        weight,
-        options.class_axis,
-    )?;
+    let a = nll_inputs(graph, log_probabilities, target, weight, options.class_axis)?;
     let hot = one_hot(graph, log_probabilities, target, a)?;
     let weighted = graph.mul(log_probabilities, hot)?;
     let summed = graph.reduce(weighted, ReduceKind::Sum, Some(vec![a as isize]), false)?;
@@ -1108,14 +1328,40 @@ mod tests {
         let logp = graph.input_dtype("logp", [4, 3, 5], crate::DType::F32);
         let labels = graph.input_dtype("labels", [2, 4], crate::DType::I32);
         let weight = graph.input_dtype("weight", [3], crate::DType::F32);
-        let loss = graph.nll_loss(logp, labels, Some(weight), Some(-1), Reduction::None).unwrap();
+        let loss = graph
+            .nll_loss(logp, labels, Some(weight), Some(-1), Reduction::None)
+            .unwrap();
         assert_eq!(graph.shape(loss).unwrap(), &Shape::new([2, 4]));
         assert!(graph.trace(loss).unwrap().to_string().contains("select"));
-        assert!((0..graph.node_count()).any(|n| matches!(graph.op(NodeId(n)).unwrap(), crate::Op::Select { .. })));
-        assert!((0..graph.node_count()).any(|n| matches!(graph.op(NodeId(n)).unwrap(), crate::Op::Reduce { kind: ReduceKind::Sum, .. })));
-        assert!(graph.nodes.iter().filter_map(|node| match &node.op { crate::Op::Constant(data)=>Some(data.len()), _=>None }).all(|len| len==1));
-        assert!(matches!(graph.grad(graph.sum_default(loss).unwrap(), logp), Ok(_)));
-        assert!(matches!(graph.grad(graph.sum_default(loss).unwrap(), labels), Err(_)));
+        assert!(
+            (0..graph.node_count())
+                .any(|n| matches!(graph.op(NodeId(n)).unwrap(), crate::Op::Select { .. }))
+        );
+        assert!((0..graph.node_count()).any(|n| matches!(
+            graph.op(NodeId(n)).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Sum,
+                ..
+            }
+        )));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    crate::Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|len| len == 1)
+        );
+        assert!(matches!(
+            graph.grad(graph.sum_default(loss).unwrap(), logp),
+            Ok(_)
+        ));
+        assert!(matches!(
+            graph.grad(graph.sum_default(loss).unwrap(), labels),
+            Err(_)
+        ));
 
         for reduction in [Reduction::Sum, Reduction::Mean] {
             let mut reduced = Graph::new();
@@ -1125,12 +1371,17 @@ mod tests {
             assert_eq!(reduced.shape(output).unwrap(), &Shape::new([]));
         }
         let mut malformed = Graph::new();
-        let x = malformed.input("x", [2]); let y = malformed.input_dtype("y", [], crate::DType::I32);
-        let before = malformed.node_count(); assert!(malformed.nll_loss_default(x,y).is_err()); assert_eq!(malformed.node_count(),before);
+        let x = malformed.input("x", [2]);
+        let y = malformed.input_dtype("y", [], crate::DType::I32);
+        let before = malformed.node_count();
+        assert!(malformed.nll_loss_default(x, y).is_err());
+        assert_eq!(malformed.node_count(), before);
         let mut overflow = Graph::new();
-        let x = overflow.input_dtype("x", [usize::MAX/4, 3], crate::DType::F32);
-        let y = overflow.input_dtype("y", [usize::MAX/4], crate::DType::I32);
-        let before = overflow.node_count(); assert!(overflow.nll_loss_default(x,y).is_err()); assert_eq!(overflow.node_count(),before);
+        let x = overflow.input_dtype("x", [usize::MAX / 4, 3], crate::DType::F32);
+        let y = overflow.input_dtype("y", [usize::MAX / 4], crate::DType::I32);
+        let before = overflow.node_count();
+        assert!(overflow.nll_loss_default(x, y).is_err());
+        assert_eq!(overflow.node_count(), before);
     }
     #[test]
     fn bce_and_logits_are_stable_and_reduce() {
@@ -1227,10 +1478,17 @@ mod tests {
         // source-literal ADD after negating its right branch.
         assert!(matches!(
             graph.op(loss).unwrap(),
-            crate::Op::Binary { op: crate::BinaryOp::Add, .. }
+            crate::Op::Binary {
+                op: crate::BinaryOp::Add,
+                ..
+            }
         ));
-        let sum = graph.binary_crossentropy(input, target, Reduction::Sum).unwrap();
-        let mean = graph.binary_crossentropy(input, target, Reduction::Mean).unwrap();
+        let sum = graph
+            .binary_crossentropy(input, target, Reduction::Sum)
+            .unwrap();
+        let mean = graph
+            .binary_crossentropy(input, target, Reduction::Mean)
+            .unwrap();
         let default = graph.binary_crossentropy_default(input, target).unwrap();
         assert_eq!(graph.shape(sum).unwrap(), &Shape::new([]));
         assert_eq!(graph.dtype(sum).unwrap(), DType::F16);
@@ -1244,7 +1502,9 @@ mod tests {
         let mut empty = Graph::new();
         let input = empty.input_dtype("input", [0], DType::F32);
         let target = empty.input_dtype("target", [0], DType::F32);
-        let mean = empty.binary_crossentropy(input, target, Reduction::Mean).unwrap();
+        let mean = empty
+            .binary_crossentropy(input, target, Reduction::Mean)
+            .unwrap();
         assert_eq!(empty.shape(mean).unwrap(), &Shape::new([]));
         assert_eq!(empty.dtype(mean).unwrap(), DType::F32);
 
@@ -1284,15 +1544,34 @@ mod tests {
             ("target".into(), TensorData::new([2], vec![1., 0.]).unwrap()),
             ("pos_weight".into(), TensorData::scalar(2.)),
         ]);
-        assert!((values(CpuBackend.execute(&graph, loss, &inputs).unwrap())[0] - 1.349_778).abs() < 1e-5);
+        assert!(
+            (values(CpuBackend.execute(&graph, loss, &inputs).unwrap())[0] - 1.349_778).abs()
+                < 1e-5
+        );
         assert_eq!(
-            values(CpuBackend.execute(&graph, logits_gradient, &inputs).unwrap()),
+            values(
+                CpuBackend
+                    .execute(&graph, logits_gradient, &inputs)
+                    .unwrap()
+            ),
             vec![-0.5, 0.365_529_3]
         );
-        let target_gradient = values(CpuBackend.execute(&graph, target_gradient, &inputs).unwrap());
+        let target_gradient = values(
+            CpuBackend
+                .execute(&graph, target_gradient, &inputs)
+                .unwrap(),
+        );
         assert!((target_gradient[0] - 0.346_573_6).abs() < 1e-6);
         assert!((target_gradient[1] + 0.343_369_2).abs() < 1e-6);
-        assert!((values(CpuBackend.execute(&graph, pos_weight_gradient, &inputs).unwrap())[0] - 0.346_573_6).abs() < 1e-6);
+        assert!(
+            (values(
+                CpuBackend
+                    .execute(&graph, pos_weight_gradient, &inputs)
+                    .unwrap()
+            )[0] - 0.346_573_6)
+                .abs()
+                < 1e-6
+        );
 
         let mut malformed = Graph::new();
         let logits = malformed.input("logits", [2]);
@@ -1336,7 +1615,13 @@ mod tests {
             .unwrap();
         assert_eq!(graph.shape(loss).unwrap(), &Shape::from([2, 2]));
         assert_eq!(graph.dtype(loss).unwrap(), DType::F32);
-        assert!(matches!(graph.op(loss).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, .. }));
+        assert!(matches!(
+            graph.op(loss).unwrap(),
+            crate::Op::Unary {
+                op: crate::UnaryOp::Neg,
+                ..
+            }
+        ));
         let default = graph
             .binary_crossentropy_logits_default(logits, target, None)
             .unwrap();
@@ -1469,26 +1754,30 @@ mod tests {
         let scalar = graph.input("scalar", []);
         let target = graph.input_dtype("target", [], crate::DType::I32);
         let nodes = graph.node_count();
-        assert!(sparse_categorical_cross_entropy_tinygrad(
-            &mut graph,
-            scalar,
-            target,
-            SparseCategoricalCrossEntropyOptions::default(),
-        )
-        .is_err());
+        assert!(
+            sparse_categorical_cross_entropy_tinygrad(
+                &mut graph,
+                scalar,
+                target,
+                SparseCategoricalCrossEntropyOptions::default(),
+            )
+            .is_err()
+        );
         assert_eq!(graph.node_count(), nodes);
 
         let mut overflow = Graph::new();
         let logits = overflow.input("x", [usize::MAX, 2]);
         let target = overflow.input_dtype("y", [usize::MAX], crate::DType::I32);
         let nodes = overflow.node_count();
-        assert!(sparse_categorical_cross_entropy_tinygrad(
-            &mut overflow,
-            logits,
-            target,
-            SparseCategoricalCrossEntropyOptions::default(),
-        )
-        .is_err());
+        assert!(
+            sparse_categorical_cross_entropy_tinygrad(
+                &mut overflow,
+                logits,
+                target,
+                SparseCategoricalCrossEntropyOptions::default(),
+            )
+            .is_err()
+        );
         assert_eq!(overflow.node_count(), nodes);
     }
     #[test]
@@ -1499,23 +1788,34 @@ mod tests {
         let loss = cross_entropy(&mut graph, logits, target, LossOptions::default()).unwrap();
         let gradient = graph.grad(loss, logits).unwrap();
         let inputs = HashMap::from([
-            ("logits".into(), TensorData::new([1, 2], vec![0., 0.]).unwrap()),
-            ("target".into(), TensorData::new([1, 2], vec![1., 0.]).unwrap()),
+            (
+                "logits".into(),
+                TensorData::new([1, 2], vec![0., 0.]).unwrap(),
+            ),
+            (
+                "target".into(),
+                TensorData::new([1, 2], vec![1., 0.]).unwrap(),
+            ),
         ]);
         let output = values(CpuBackend.execute(&graph, loss, &inputs).unwrap());
         assert!((output[0] - std::f32::consts::LN_2).abs() < 1e-6);
-        assert_eq!(values(CpuBackend.execute(&graph, gradient, &inputs).unwrap()), vec![-0.5, 0.5]);
+        assert_eq!(
+            values(CpuBackend.execute(&graph, gradient, &inputs).unwrap()),
+            vec![-0.5, 0.5]
+        );
 
         let mut graph = Graph::new();
         let integer_logits = graph.input_dtype("logits", [1, 2], crate::DType::I32);
         let probability_target = graph.input("target", [1, 2]);
-        assert!(cross_entropy(
-            &mut graph,
-            integer_logits,
-            probability_target,
-            LossOptions::default(),
-        )
-        .is_err());
+        assert!(
+            cross_entropy(
+                &mut graph,
+                integer_logits,
+                probability_target,
+                LossOptions::default(),
+            )
+            .is_err()
+        );
         let logits = graph.input("other_logits", [1, 2]);
         let boolean_target = graph.input_dtype("other_target", [1, 2], crate::DType::Bool);
         assert!(cross_entropy(&mut graph, logits, boolean_target, LossOptions::default()).is_err());
@@ -1541,7 +1841,13 @@ mod tests {
             .unwrap();
         assert_eq!(probabilities.shape(loss).unwrap(), &Shape::new([2]));
         assert_eq!(probabilities.dtype(loss).unwrap(), crate::DType::F32);
-        assert!(matches!(probabilities.op(loss).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, .. }));
+        assert!(matches!(
+            probabilities.op(loss).unwrap(),
+            crate::Op::Unary {
+                op: crate::UnaryOp::Neg,
+                ..
+            }
+        ));
 
         let mut malformed = Graph::new();
         let logits = malformed.input("x", [2, 3]);
@@ -1596,7 +1902,10 @@ mod tests {
                 TensorData::from_scalars([1], crate::DType::I32, [Scalar::I(1)]).unwrap(),
             ),
         ]);
-        assert_eq!(values(CpuBackend.execute(&graph, loss, &inputs).unwrap()), vec![0.25]);
+        assert_eq!(
+            values(CpuBackend.execute(&graph, loss, &inputs).unwrap()),
+            vec![0.25]
+        );
         assert_eq!(
             values(CpuBackend.execute(&graph, gradient, &inputs).unwrap()),
             vec![0., -1.]
@@ -1627,7 +1936,9 @@ mod tests {
             ),
             ("weight".into(), TensorData::new([2], vec![2., 1.]).unwrap()),
         ]);
-        assert!((values(CpuBackend.execute(&graph, loss, &inputs).unwrap())[0] - 5. / 12.).abs() < 1e-6);
+        assert!(
+            (values(CpuBackend.execute(&graph, loss, &inputs).unwrap())[0] - 5. / 12.).abs() < 1e-6
+        );
         let gradient = values(CpuBackend.execute(&graph, gradient, &inputs).unwrap());
         assert!((gradient[0] + 2. / 3.).abs() < 1e-6);
         assert_eq!(gradient[1], 0.);
@@ -1635,31 +1946,36 @@ mod tests {
         assert!((gradient[3] + 1. / 3.).abs() < 1e-6);
 
         let mut graph = Graph::new();
-        let integer_log_probabilities = graph.input_dtype("log_probabilities", [1, 2], crate::DType::I32);
+        let integer_log_probabilities =
+            graph.input_dtype("log_probabilities", [1, 2], crate::DType::I32);
         let target = graph.input_dtype("target", [1], crate::DType::I32);
         let before = graph.node_count();
-        assert!(nll_loss(
-            &mut graph,
-            integer_log_probabilities,
-            target,
-            None,
-            LossOptions::default(),
-        )
-        .is_err());
+        assert!(
+            nll_loss(
+                &mut graph,
+                integer_log_probabilities,
+                target,
+                None,
+                LossOptions::default(),
+            )
+            .is_err()
+        );
         assert_eq!(graph.node_count(), before);
 
         let mut graph = Graph::new();
         let log_probabilities = graph.input("log_probabilities", [1, 2]);
         let float_target = graph.input("target", [1]);
         let before = graph.node_count();
-        assert!(nll_loss(
-            &mut graph,
-            log_probabilities,
-            float_target,
-            None,
-            LossOptions::default(),
-        )
-        .is_err());
+        assert!(
+            nll_loss(
+                &mut graph,
+                log_probabilities,
+                float_target,
+                None,
+                LossOptions::default(),
+            )
+            .is_err()
+        );
         assert_eq!(graph.node_count(), before);
 
         let mut graph = Graph::new();
@@ -1667,14 +1983,16 @@ mod tests {
         let target = graph.input_dtype("target", [1], crate::DType::I32);
         let wrong_weight = graph.input("weight", [3]);
         let before = graph.node_count();
-        assert!(nll_loss(
-            &mut graph,
-            log_probabilities,
-            target,
-            Some(wrong_weight),
-            LossOptions::default(),
-        )
-        .is_err());
+        assert!(
+            nll_loss(
+                &mut graph,
+                log_probabilities,
+                target,
+                Some(wrong_weight),
+                LossOptions::default(),
+            )
+            .is_err()
+        );
         assert_eq!(graph.node_count(), before);
     }
 }

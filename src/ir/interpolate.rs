@@ -1,6 +1,6 @@
 //! Source-literal concrete interpolation for tinygrad's public Tensor helper.
 
-use super::{source_gather, Graph, NodeId};
+use super::{Graph, NodeId, source_gather};
 use crate::{DType, Error, Result, Scalar, Shape};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,11 +132,7 @@ fn interpolate_plan(
     })
 }
 
-fn expand_index(
-    graph: &mut Graph,
-    index: NodeId,
-    stage: &InterpolateStagePlan,
-) -> Result<NodeId> {
+fn expand_index(graph: &mut Graph, index: NodeId, stage: &InterpolateStagePlan) -> Result<NodeId> {
     let index = graph.reshape(index, stage.reshape_shape.clone())?;
     graph.expand(index, stage.output_shape.clone())
 }
@@ -152,8 +148,17 @@ fn lower_linear_stage(
     let arr = graph.lazy_arange_default_int(0, output_size, 1)?;
     let (num, denominator) = if align_corners {
         (
-            graph.mul_scalar(arr, Scalar::I(input_size.checked_sub(1).ok_or_else(|| Error::ShapeOverflow(stage.input_shape.clone()))?))?,
-            output_size.checked_sub(1).ok_or_else(|| Error::ShapeOverflow(stage.output_shape.clone()))?,
+            graph.mul_scalar(
+                arr,
+                Scalar::I(
+                    input_size
+                        .checked_sub(1)
+                        .ok_or_else(|| Error::ShapeOverflow(stage.input_shape.clone()))?,
+                ),
+            )?,
+            output_size
+                .checked_sub(1)
+                .ok_or_else(|| Error::ShapeOverflow(stage.output_shape.clone()))?,
         )
     } else {
         let twice = graph.mul_scalar(arr, Scalar::I(2))?;
@@ -161,7 +166,9 @@ fn lower_linear_stage(
         let scaled = graph.mul_scalar(centered, Scalar::I(input_size))?;
         (
             graph.sub_scalar(scaled, Scalar::I(output_size))?,
-            output_size.checked_mul(2).ok_or_else(|| Error::ShapeOverflow(stage.output_shape.clone()))?,
+            output_size
+                .checked_mul(2)
+                .ok_or_else(|| Error::ShapeOverflow(stage.output_shape.clone()))?,
         )
     };
     let upper = input_size
@@ -229,7 +236,10 @@ fn lower_interpolate(
 ) -> Result<NodeId> {
     let mut value = input;
     for stage in stages {
-        debug_assert_eq!(graph.shape(value).expect("interpolate stage preflighted"), &stage.input_shape);
+        debug_assert_eq!(
+            graph.shape(value).expect("interpolate stage preflighted"),
+            &stage.input_shape
+        );
         let _ = stage.vector_shape.rank();
         let _ = stage.input_extent_dtype;
         value = match mode {
@@ -237,7 +247,10 @@ fn lower_interpolate(
             InterpolateMode::Nearest => lower_nearest_stage(graph, value, stage, false)?,
             InterpolateMode::NearestExact => lower_nearest_stage(graph, value, stage, true)?,
         };
-        debug_assert_eq!(graph.shape(value).expect("interpolate stage preflighted"), &stage.output_shape);
+        debug_assert_eq!(
+            graph.shape(value).expect("interpolate stage preflighted"),
+            &stage.output_shape
+        );
     }
     Ok(value)
 }
@@ -259,8 +272,14 @@ impl Graph {
         } else {
             self.cast(output, plan.input_dtype)?
         };
-        debug_assert_eq!(self.shape(output).expect("interpolate preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("interpolate preflighted"), plan.input_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("interpolate preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("interpolate preflighted"),
+            plan.input_dtype
+        );
         Ok(output)
     }
 
@@ -290,13 +309,33 @@ mod tests {
         assert_eq!(graph.dtype(output).unwrap(), DType::F16);
         // Each linear source stage has two one-hot Select gathers followed by
         // its live-weight Lerp. No dense coordinate payload may appear.
-        assert!(graph.nodes.iter().filter(|node| matches!(&node.op, Op::Select { .. })).count() >= 4);
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Cast { .. })));
-        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
-            Op::Constant(data) => Some(data.len()),
-            _ => None,
-        }).all(|len| len == 1));
-        let gradient = graph.grad(output, input).expect("source gather and lerp compose");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| matches!(&node.op, Op::Select { .. }))
+                .count()
+                >= 4
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Cast { .. }))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|len| len == 1)
+        );
+        let gradient = graph
+            .grad(output, input)
+            .expect("source gather and lerp compose");
         assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 3, 4]));
     }
 
@@ -312,10 +351,16 @@ mod tests {
             let output = graph.interpolate(input, [5], mode, align).unwrap();
             assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 5]));
             assert_eq!(graph.dtype(output).unwrap(), dtype);
-            assert!(graph.nodes.iter().filter_map(|node| match &node.op {
-                Op::Constant(data) => Some(data.len()),
-                _ => None,
-            }).all(|len| len == 1));
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .filter_map(|node| match &node.op {
+                        Op::Constant(data) => Some(data.len()),
+                        _ => None,
+                    })
+                    .all(|len| len == 1)
+            );
         }
 
         let mut integer = Graph::new();
@@ -344,7 +389,9 @@ mod tests {
     fn interpolate_preserves_empty_source_gather_and_late_overflow_atomicity() {
         let mut empty = Graph::new();
         let input = empty.input_dtype("x", [0, 2], DType::F32);
-        let output = empty.interpolate(input, [3], "nearest-exact", false).unwrap();
+        let output = empty
+            .interpolate(input, [3], "nearest-exact", false)
+            .unwrap();
         assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
         let input = empty.input_dtype("linear_empty", [2], DType::F32);
         let output = empty.interpolate(input, [0], "linear", false).unwrap();

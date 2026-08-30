@@ -5,8 +5,8 @@
 //! the concrete ASCII ellipsis names and movement sequence needed by a future
 //! source-literal Graph lowering.
 
-use crate::{Error, Result, Shape};
 use crate::ir::{Graph, NodeId};
+use crate::{Error, Result, Shape};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One zero-offset diagonal extraction in tinygrad's literal implementation.
@@ -93,7 +93,7 @@ impl SourceEinsumPlan {
             for (label, extent) in operand.final_labels.iter().zip(operand.final_shape.dims()) {
                 match label_extents.insert(*label, *extent) {
                     Some(previous) if previous != *extent => {
-                        return invalid(&formula, "labeled dimensions must be equal")
+                        return invalid(&formula, "labeled dimensions must be equal");
                     }
                     _ => {}
                 }
@@ -102,8 +102,13 @@ impl SourceEinsumPlan {
         let alphabet = label_extents.keys().copied().collect::<Vec<_>>();
         let rhs = chars(&expanded_output, &formula)?;
         let output_seen = rhs.iter().copied().collect::<BTreeSet<_>>();
-        if output_seen.len() != rhs.len() || rhs.iter().any(|label| !label_extents.contains_key(label)) {
-            return invalid(&formula, "output labels must be unique and appear in an operand");
+        if output_seen.len() != rhs.len()
+            || rhs.iter().any(|label| !label_extents.contains_key(label))
+        {
+            return invalid(
+                &formula,
+                "output labels must be unique and appear in an operand",
+            );
         }
 
         for operand in &mut operands {
@@ -128,13 +133,22 @@ impl SourceEinsumPlan {
             operand.aligned_shape = Shape::new(
                 alphabet
                     .iter()
-                    .map(|label| if operand.final_labels.contains(label) { label_extents[label] } else { 1 })
+                    .map(|label| {
+                        if operand.final_labels.contains(label) {
+                            label_extents[label]
+                        } else {
+                            1
+                        }
+                    })
                     .collect::<Vec<_>>(),
             );
             operand.aligned_shape.numel()?;
         }
         let product_shape = Shape::new(
-            alphabet.iter().map(|label| label_extents[label]).collect::<Vec<_>>(),
+            alphabet
+                .iter()
+                .map(|label| label_extents[label])
+                .collect::<Vec<_>>(),
         );
         product_shape.numel()?;
         let reduction_axes = alphabet
@@ -148,14 +162,26 @@ impl SourceEinsumPlan {
             .filter(|label| rhs.contains(label))
             .collect::<Vec<_>>();
         let reduced_shape = Shape::new(
-            reduced_labels.iter().map(|label| label_extents[label]).collect::<Vec<_>>(),
+            reduced_labels
+                .iter()
+                .map(|label| label_extents[label])
+                .collect::<Vec<_>>(),
         );
         reduced_shape.numel()?;
         let final_permutation = rhs
             .iter()
-            .map(|label| reduced_labels.iter().position(|x| x == label).expect("validated output label"))
+            .map(|label| {
+                reduced_labels
+                    .iter()
+                    .position(|x| x == label)
+                    .expect("validated output label")
+            })
             .collect::<Vec<_>>();
-        let output_shape = Shape::new(rhs.iter().map(|label| label_extents[label]).collect::<Vec<_>>());
+        let output_shape = Shape::new(
+            rhs.iter()
+                .map(|label| label_extents[label])
+                .collect::<Vec<_>>(),
+        );
         output_shape.numel()?;
         Ok(Self {
             normalized_formula: formula,
@@ -183,9 +209,20 @@ fn lower_source_einsum(
     for (input, operand) in inputs.iter().copied().zip(&plan.operands) {
         let mut value = input;
         for step in &operand.diagonal_steps {
-            debug_assert_eq!(graph.shape(value).expect("source Einsum preflighted"), &step.input_shape);
-            value = graph.diagonal(value, 0, step.first_axis as isize, step.second_axis as isize)?;
-            debug_assert_eq!(graph.shape(value).expect("source Einsum preflighted"), &step.output_shape);
+            debug_assert_eq!(
+                graph.shape(value).expect("source Einsum preflighted"),
+                &step.input_shape
+            );
+            value = graph.diagonal(
+                value,
+                0,
+                step.first_axis as isize,
+                step.second_axis as isize,
+            )?;
+            debug_assert_eq!(
+                graph.shape(value).expect("source Einsum preflighted"),
+                &step.output_shape
+            );
         }
         if !operand.final_labels.is_empty() {
             value = graph.permute(value, operand.alignment_permutation.clone())?;
@@ -193,17 +230,27 @@ fn lower_source_einsum(
         }
         aligned.push(value);
     }
-    let mut product = *aligned.first().ok_or(Error::EinsumOperandCount { expected: 1, actual: 0 })?;
+    let mut product = *aligned.first().ok_or(Error::EinsumOperandCount {
+        expected: 1,
+        actual: 0,
+    })?;
     // `uprod` is an ordered fold. Retain that order rather than using a
     // commutative tree so source LUB casts and narrow storage boundaries stay
     // observable.
     for operand in aligned.into_iter().skip(1) {
         product = graph.mul(product, operand)?;
     }
-    let axes = plan.reduction_axes.iter().map(|axis| *axis as isize).collect::<Vec<_>>();
+    let axes = plan
+        .reduction_axes
+        .iter()
+        .map(|axis| *axis as isize)
+        .collect::<Vec<_>>();
     let reduced = graph.sum_with_options(product, Some(axes), false, dtype)?;
     let output = graph.permute(reduced, plan.final_permutation.clone())?;
-    debug_assert_eq!(graph.shape(output).expect("source Einsum preflighted"), &plan.output_shape);
+    debug_assert_eq!(
+        graph.shape(output).expect("source Einsum preflighted"),
+        &plan.output_shape
+    );
     Ok(output)
 }
 
@@ -217,7 +264,10 @@ impl Graph {
         inputs: &[NodeId],
         dtype: Option<crate::DType>,
     ) -> Result<NodeId> {
-        let shapes = inputs.iter().map(|id| self.shape(*id).map(Clone::clone)).collect::<Result<Vec<_>>>()?;
+        let shapes = inputs
+            .iter()
+            .map(|id| self.shape(*id).map(Clone::clone))
+            .collect::<Result<Vec<_>>>()?;
         let plan = SourceEinsumPlan::parse(equation, &shapes)?;
         // The cloned graph is the whole-operation descriptor pass. It covers
         // every diagonal's internal pad/view path, alignment, source-LUB Mul,
@@ -234,8 +284,14 @@ impl Graph {
             return invalid(equation, "source literal output descriptor mismatch");
         }
         let output = lower_source_einsum(self, inputs, &plan, dtype)?;
-        debug_assert_eq!(self.shape(output).expect("source Einsum preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("source Einsum preflighted"), output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("source Einsum preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("source Einsum preflighted"),
+            output_dtype
+        );
         Ok(output)
     }
 
@@ -245,7 +301,11 @@ impl Graph {
     }
 }
 
-fn diagonal_plan(mut labels: Vec<char>, mut shape: Shape, equation: &str) -> Result<SourceEinsumOperandPlan> {
+fn diagonal_plan(
+    mut labels: Vec<char>,
+    mut shape: Shape,
+    equation: &str,
+) -> Result<SourceEinsumOperandPlan> {
     let input_labels = labels.clone();
     let mut diagonal_steps = Vec::new();
     // tinygrad currently traverses `set(s)`.  That traversal is randomized by
@@ -256,12 +316,17 @@ fn diagonal_plan(mut labels: Vec<char>, mut shape: Shape, equation: &str) -> Res
     // axis renumbering.  Thus values, dtype, final shape, and compositional VJP
     // are invariant; only unobservable movement-node order differs.
     let labels_in_first_occurrence = labels.clone().into_iter().fold(Vec::new(), |mut seen, c| {
-        if !seen.contains(&c) { seen.push(c); }
+        if !seen.contains(&c) {
+            seen.push(c);
+        }
         seen
     });
     for label in labels_in_first_occurrence {
         while labels.iter().filter(|c| **c == label).count() > 1 {
-            let first_axis = labels.iter().position(|c| *c == label).expect("counted label");
+            let first_axis = labels
+                .iter()
+                .position(|c| *c == label)
+                .expect("counted label");
             let second_axis = labels
                 .iter()
                 .enumerate()
@@ -280,21 +345,45 @@ fn diagonal_plan(mut labels: Vec<char>, mut shape: Shape, equation: &str) -> Res
             // flatten(n,n), pad by n, unflatten(n,n+1), then select column 0.
             // Validate them even when a leading zero makes the final numel zero.
             if shape.rank() > 2 {
-                let n_squared = extent.checked_mul(extent).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-                let padded = n_squared.checked_add(extent).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-                let n_plus_one = extent.checked_add(1).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                let n_squared = extent
+                    .checked_mul(extent)
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                let padded = n_squared
+                    .checked_add(extent)
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                let n_plus_one = extent
+                    .checked_add(1)
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
                 let prefix = permutation[..permutation.len() - 2]
-                    .iter().map(|axis| shape.dims()[*axis]).collect::<Vec<_>>();
-                Shape::new(prefix.iter().copied().chain([n_squared]).collect::<Vec<_>>()).numel()?;
+                    .iter()
+                    .map(|axis| shape.dims()[*axis])
+                    .collect::<Vec<_>>();
+                Shape::new(
+                    prefix
+                        .iter()
+                        .copied()
+                        .chain([n_squared])
+                        .collect::<Vec<_>>(),
+                )
+                .numel()?;
                 Shape::new(prefix.iter().copied().chain([padded]).collect::<Vec<_>>()).numel()?;
-                Shape::new(prefix.iter().copied().chain([extent, n_plus_one]).collect::<Vec<_>>()).numel()?;
+                Shape::new(
+                    prefix
+                        .iter()
+                        .copied()
+                        .chain([extent, n_plus_one])
+                        .collect::<Vec<_>>(),
+                )
+                .numel()?;
             }
             // `permute(other_axes + [j, k]) ... [..., 0]` leaves the
             // non-diagonal axes in their original relative order and places
             // the surviving diagonal last. Keep the descriptor labels in
             // that physical movement order for the later Graph lowering.
             let mut output_dims = permutation[..permutation.len() - 2]
-                .iter().map(|axis| shape.dims()[*axis]).collect::<Vec<_>>();
+                .iter()
+                .map(|axis| shape.dims()[*axis])
+                .collect::<Vec<_>>();
             output_dims.push(extent);
             let output_shape = Shape::new(output_dims);
             output_shape.numel()?;
@@ -308,7 +397,9 @@ fn diagonal_plan(mut labels: Vec<char>, mut shape: Shape, equation: &str) -> Res
                 output_shape: output_shape.clone(),
             });
             let mut output_labels = permutation[..permutation.len() - 2]
-                .iter().map(|axis| labels[*axis]).collect::<Vec<_>>();
+                .iter()
+                .map(|axis| labels[*axis])
+                .collect::<Vec<_>>();
             output_labels.push(label);
             labels = output_labels;
             shape = output_shape;
@@ -331,27 +422,48 @@ fn expand_ellipsis(
     explicit_rhs: Option<&str>,
     shapes: &[Shape],
 ) -> Result<(Vec<String>, String)> {
-    let ell = (b'a'..=b'z').chain(b'A'..=b'Z')
+    let ell = (b'a'..=b'z')
+        .chain(b'A'..=b'Z')
         .map(char::from)
         .filter(|c| !formula.contains(*c))
         .collect::<String>();
-    let widths = raw_inputs.iter().zip(shapes).map(|(subscript, shape)| {
-        if subscript.contains("...") {
-            let explicit = subscript.len().checked_sub(3).expect("ellipsis present");
-            shape.rank().checked_sub(explicit).ok_or_else(|| Error::InvalidEinsum {
-                equation: formula.into(), reason: "operand rank is smaller than its subscript",
-            })
-        } else { Ok(0) }
-    }).collect::<Result<Vec<_>>>()?;
+    let widths = raw_inputs
+        .iter()
+        .zip(shapes)
+        .map(|(subscript, shape)| {
+            if subscript.contains("...") {
+                let explicit = subscript.len().checked_sub(3).expect("ellipsis present");
+                shape
+                    .rank()
+                    .checked_sub(explicit)
+                    .ok_or_else(|| Error::InvalidEinsum {
+                        equation: formula.into(),
+                        reason: "operand rank is smaller than its subscript",
+                    })
+            } else {
+                Ok(0)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     let width = widths.iter().copied().max().unwrap_or(0);
-    if width > ell.len() { return invalid(formula, "ellipsis expansion exhausts ASCII labels"); }
-    let expanded_inputs = raw_inputs.iter().zip(widths).map(|(subscript, operand_width)| {
-        if subscript.matches("...").count() > 1 { return invalid(formula, "a subscript may contain only one ellipsis"); }
-        Ok(subscript.replace("...", &ell[width - operand_width..width]))
-    }).collect::<Result<Vec<_>>>()?;
+    if width > ell.len() {
+        return invalid(formula, "ellipsis expansion exhausts ASCII labels");
+    }
+    let expanded_inputs = raw_inputs
+        .iter()
+        .zip(widths)
+        .map(|(subscript, operand_width)| {
+            if subscript.matches("...").count() > 1 {
+                return invalid(formula, "a subscript may contain only one ellipsis");
+            }
+            Ok(subscript.replace("...", &ell[width - operand_width..width]))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let expanded_output = match explicit_rhs {
         Some(output) => {
-            if output.matches("...").count() > 1 { return invalid(formula, "a subscript may contain only one ellipsis"); }
+            if output.matches("...").count() > 1 {
+                return invalid(formula, "a subscript may contain only one ellipsis");
+            }
             output.replace("...", &ell[..width])
         }
         None => {
@@ -369,7 +481,9 @@ fn split_formula(formula: &str) -> Result<(&str, Option<&str>)> {
     let mut pieces = formula.split("->");
     let lhs = pieces.next().unwrap_or_default();
     let rhs = pieces.next();
-    if pieces.next().is_some() { return invalid(formula, "equation must contain at most one arrow"); }
+    if pieces.next().is_some() {
+        return invalid(formula, "equation must contain at most one arrow");
+    }
     Ok((lhs, rhs))
 }
 
@@ -378,8 +492,13 @@ fn implicit_output(text: &str) -> String {
 }
 
 fn implicit_output_excluding(text: &str, excluded: &str) -> String {
-    text.chars().filter(|c| c.is_ascii_alphabetic() && !excluded.contains(*c) && text.matches(*c).count() == 1).collect::<BTreeSet<_>>()
-        .into_iter().collect()
+    text.chars()
+        .filter(|c| {
+            c.is_ascii_alphabetic() && !excluded.contains(*c) && text.matches(*c).count() == 1
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn validate_labels(text: &str, equation: &str) -> Result<()> {
@@ -388,13 +507,19 @@ fn validate_labels(text: &str, equation: &str) -> Result<()> {
 
 fn chars(text: &str, equation: &str) -> Result<Vec<char>> {
     if !text.chars().all(|c| c.is_ascii_alphabetic()) {
-        return invalid(equation, "subscripts use ASCII letters and an optional ellipsis");
+        return invalid(
+            equation,
+            "subscripts use ASCII letters and an optional ellipsis",
+        );
     }
     Ok(text.chars().collect())
 }
 
 fn invalid<T>(equation: &str, reason: &'static str) -> Result<T> {
-    Err(Error::InvalidEinsum { equation: equation.into(), reason })
+    Err(Error::InvalidEinsum {
+        equation: equation.into(),
+        reason,
+    })
 }
 
 #[cfg(test)]
@@ -402,18 +527,26 @@ mod tests {
     use super::*;
     use crate::{DType, Op, ReduceKind};
 
-    fn shapes(dims: &[&[usize]]) -> Vec<Shape> { dims.iter().map(|d| Shape::new(d.to_vec())).collect() }
+    fn shapes(dims: &[&[usize]]) -> Vec<Shape> {
+        dims.iter().map(|d| Shape::new(d.to_vec())).collect()
+    }
 
     #[test]
     fn preserves_concrete_ellipsis_letters_and_sorted_source_alphabet() {
-        let plan = SourceEinsumPlan::parse(" a... , ...b -> ...ab ", &shapes(&[&[2, 3, 4], &[5, 4]])).unwrap();
+        let plan =
+            SourceEinsumPlan::parse(" a... , ...b -> ...ab ", &shapes(&[&[2, 3, 4], &[5, 4]]))
+                .unwrap();
         // `a` and `b` are occupied, so tinygrad's ascii_letters pool starts
         // at c; unequal ellipses right-align to `cd` and `d`.
-        assert_eq!(plan.expanded_inputs, vec!["acd".to_owned(), "db".to_owned()]);
+        assert_eq!(
+            plan.expanded_inputs,
+            vec!["acd".to_owned(), "db".to_owned()]
+        );
         assert_eq!(plan.expanded_output, "cdab");
         assert_eq!(plan.alphabet, vec!['a', 'b', 'c', 'd']);
         assert_eq!(plan.output_shape, Shape::new([3, 4, 2, 5]));
-        let implicit = SourceEinsumPlan::parse("a...,...b", &shapes(&[&[2, 3, 4], &[5, 4]])).unwrap();
+        let implicit =
+            SourceEinsumPlan::parse("a...,...b", &shapes(&[&[2, 3, 4], &[5, 4]])).unwrap();
         assert_eq!(implicit.expanded_output, "cdab");
     }
 
@@ -421,8 +554,22 @@ mod tests {
     fn diagonal_order_is_deterministic_and_semantically_invariant() {
         let left = SourceEinsumPlan::parse("aabb->ab", &shapes(&[&[2, 2, 3, 3]])).unwrap();
         let right = SourceEinsumPlan::parse("bbaa->ab", &shapes(&[&[3, 3, 2, 2]])).unwrap();
-        assert_eq!(left.operands[0].diagonal_steps.iter().map(|s| s.label).collect::<Vec<_>>(), vec!['a', 'b']);
-        assert_eq!(right.operands[0].diagonal_steps.iter().map(|s| s.label).collect::<Vec<_>>(), vec!['b', 'a']);
+        assert_eq!(
+            left.operands[0]
+                .diagonal_steps
+                .iter()
+                .map(|s| s.label)
+                .collect::<Vec<_>>(),
+            vec!['a', 'b']
+        );
+        assert_eq!(
+            right.operands[0]
+                .diagonal_steps
+                .iter()
+                .map(|s| s.label)
+                .collect::<Vec<_>>(),
+            vec!['b', 'a']
+        );
         assert_eq!(left.operands[0].final_labels, vec!['a', 'b']);
         assert_eq!(right.operands[0].final_labels, vec!['b', 'a']);
         // Their later source alignment and explicit output contract agree.
@@ -453,7 +600,10 @@ mod tests {
             ("i,j", shapes(&[&[2]])),
             ("ij", shapes(&[&[usize::MAX, 2]])),
         ] {
-            assert!(SourceEinsumPlan::parse(equation, &input).is_err(), "{equation}");
+            assert!(
+                SourceEinsumPlan::parse(equation, &input).is_err(),
+                "{equation}"
+            );
         }
     }
 
@@ -462,15 +612,35 @@ mod tests {
         let mut graph = Graph::new();
         let lhs = graph.input_dtype("lhs", [2, 3], DType::F16);
         let rhs = graph.input_dtype("rhs", [3, 4], DType::BF16);
-        let output = graph.einsum_tinygrad_default(" ij , jk -> ki ", &[lhs, rhs]).unwrap();
+        let output = graph
+            .einsum_tinygrad_default(" ij , jk -> ki ", &[lhs, rhs])
+            .unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([4, 2]));
-        assert!(!graph.nodes.iter().any(|node| matches!(&node.op, Op::Einsum { .. })));
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Binary { op: crate::BinaryOp::Mul, .. })));
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Einsum { .. }))
+        );
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            Op::Binary {
+                op: crate::BinaryOp::Mul,
+                ..
+            }
+        )));
         assert!(graph.nodes.iter().any(|node| matches!(&node.op,
             Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: false, .. } if axes == &vec![1])));
-        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
-            Op::Constant(data) => Some(data.len()), _ => None,
-        }).all(|len| len == 1));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|len| len == 1)
+        );
     }
 
     #[test]
@@ -478,20 +648,31 @@ mod tests {
         let mut ellipsis = Graph::new();
         let lhs = ellipsis.input_dtype("lhs", [2, 3, 4], DType::F32);
         let rhs = ellipsis.input_dtype("rhs", [5, 4], DType::F32);
-        let output = ellipsis.einsum_tinygrad_default("a...,...b->...ab", &[lhs, rhs]).unwrap();
+        let output = ellipsis
+            .einsum_tinygrad_default("a...,...b->...ab", &[lhs, rhs])
+            .unwrap();
         assert_eq!(ellipsis.shape(output).unwrap(), &Shape::new([3, 4, 2, 5]));
 
         let mut diagonal = Graph::new();
         let input = diagonal.input_dtype("x", [2, 2, 3, 3], DType::F32);
-        let output = diagonal.einsum_tinygrad_default("aabb->ab", &[input]).unwrap();
+        let output = diagonal
+            .einsum_tinygrad_default("aabb->ab", &[input])
+            .unwrap();
         assert_eq!(diagonal.shape(output).unwrap(), &Shape::new([2, 3]));
-        assert!(diagonal.nodes.iter().any(|node| matches!(&node.op, Op::Pad { .. })));
+        assert!(
+            diagonal
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Pad { .. }))
+        );
 
         for dtype in [DType::F16, DType::BF16, DType::F64, DType::I8] {
             let mut explicit = Graph::new();
             let a = explicit.input_dtype("a", [3], DType::F32);
             let b = explicit.input_dtype("b", [3], DType::F32);
-            let output = explicit.einsum_tinygrad("i,i->", &[a, b], Some(dtype)).unwrap();
+            let output = explicit
+                .einsum_tinygrad("i,i->", &[a, b], Some(dtype))
+                .unwrap();
             assert_eq!(explicit.dtype(output).unwrap(), dtype);
         }
         let mut bridge = Graph::new();
@@ -517,15 +698,26 @@ mod tests {
         let mut malformed = Graph::new();
         let input = malformed.input_dtype("x", [2, 3], DType::F32);
         let before = malformed.node_count();
-        assert!(malformed.einsum_tinygrad_default("ij->ii", &[input]).is_err());
+        assert!(
+            malformed
+                .einsum_tinygrad_default("ij->ii", &[input])
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed.einsum_tinygrad_default("i", &[crate::NodeId(999)]).is_err());
+        assert!(
+            malformed
+                .einsum_tinygrad_default("i", &[crate::NodeId(999)])
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
 
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F64);
         let before = overflow.node_count();
-        assert!(matches!(overflow.einsum_tinygrad_default("ij", &[input]), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            overflow.einsum_tinygrad_default("ij", &[input]),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), before);
     }
 }

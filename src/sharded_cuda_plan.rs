@@ -1382,7 +1382,9 @@ impl ExecutableShardedCudaPlan {
             }
         }
         if self.kernels.len() != self.logical.stages.len() {
-            return Err(err("retained PTX artifacts do not match canonical stage count"));
+            return Err(err(
+                "retained PTX artifacts do not match canonical stage count",
+            ));
         }
         let mut canonical_buffers = BTreeSet::new();
         for buffer in &self.buffers {

@@ -216,7 +216,7 @@ impl Graph {
     /// Selects a diagonal across two static axes, retaining all other axes in
     /// source order and appending the diagonal axis. Positive offsets start
     /// above the main diagonal; negative offsets start below it.
-    pub fn diagonal(
+    pub fn diagonal_static(
         &mut self,
         input: NodeId,
         offset: isize,

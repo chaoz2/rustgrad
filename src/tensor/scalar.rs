@@ -1,5 +1,5 @@
 /// A scalar value used at dense tensor conversion boundaries.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Scalar {
     Bool(bool),
     I(i64),

@@ -2793,10 +2793,7 @@ mod tests {
         .unwrap();
         let executor = CapturedReplayExecutor::default();
         let symbols = BTreeMap::from([("extent".into(), 2)]);
-        let bad = BTreeMap::from([(
-            "input".into(),
-            TensorData::new([1], vec![3.0]).unwrap(),
-        )]);
+        let bad = BTreeMap::from([("input".into(), TensorData::new([1], vec![3.0]).unwrap())]);
 
         assert!(matches!(
             executor.replay_symbolic(
@@ -2816,20 +2813,10 @@ mod tests {
             TensorData::new([2], vec![2.0, -3.0]).unwrap(),
         )]);
         let first = executor
-            .replay_symbolic(
-                &capture,
-                &symbols,
-                &good,
-                CapturedReplayOptions::default(),
-            )
+            .replay_symbolic(&capture, &symbols, &good, CapturedReplayOptions::default())
             .unwrap();
         let second = executor
-            .replay_symbolic(
-                &capture,
-                &symbols,
-                &good,
-                CapturedReplayOptions::default(),
-            )
+            .replay_symbolic(&capture, &symbols, &good, CapturedReplayOptions::default())
             .unwrap();
         assert_eq!(first.outputs[0].values(), &[4.0, 9.0]);
         assert!(!first.specialization.unwrap().cache_hit);

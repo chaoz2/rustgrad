@@ -1,6 +1,6 @@
 use super::{
-    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzTensor,
-    FuzzScatterOp, FuzzUnaryOp,
+    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzTensor,
+    FuzzUnaryOp,
 };
 use crate::{DType, Scalar, Shape, TensorData};
 
@@ -64,9 +64,7 @@ fn reduction_tensor(
                 };
                 Scalar::U(value)
             }
-            DType::I8 | DType::I16 | DType::I32 | DType::I64 => {
-                Scalar::I((raw % 3) as i64 - 1)
-            }
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I((raw % 3) as i64 - 1),
             DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
                 let value = (raw % 3) as i64 - 1;
                 Scalar::F(value as f64)
@@ -96,8 +94,7 @@ fn cast_tensor(rng: &mut SplitMix64, shape: Vec<usize>, dtype: DType) -> FuzzTen
         }
     });
     FuzzTensor::from_tensor(
-        &TensorData::from_scalars(shape, dtype, values)
-            .expect("generated cast tensor geometry"),
+        &TensorData::from_scalars(shape, dtype, values).expect("generated cast tensor geometry"),
     )
 }
 
@@ -131,7 +128,21 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     match rng.pick(15) {
         0 => {
             let shape = static_shape(&mut rng);
-            let dtype = [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64][rng.pick(13)];
+            let dtype = [
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ][rng.pick(13)];
             let rhs_shape = if rng.pick(3) == 0 {
                 vec![]
             } else {
@@ -151,7 +162,21 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
         }
         1 => {
             let shape = static_shape(&mut rng);
-            let dtype = [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64][rng.pick(13)];
+            let dtype = [
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ][rng.pick(13)];
             let false_shape = if rng.pick(2) == 0 {
                 vec![]
             } else {
@@ -170,7 +195,21 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
         }
         2 => {
             let shape = static_shape(&mut rng);
-            let choices = [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64];
+            let choices = [
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ];
             let from = choices[rng.pick(choices.len())];
             let to = choices[rng.pick(choices.len())];
             FuzzCase::Cast {
@@ -200,7 +239,11 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 .map(|_| [0, 1, 2, 3][rng.pick(4)])
                 .collect::<Vec<_>>();
             let reduction = if shape[axis] == 0 {
-                [FuzzReduction::Sum, FuzzReduction::Mean, FuzzReduction::Product][rng.pick(3)]
+                [
+                    FuzzReduction::Sum,
+                    FuzzReduction::Mean,
+                    FuzzReduction::Product,
+                ][rng.pick(3)]
             } else {
                 [
                     FuzzReduction::Sum,
@@ -239,14 +282,28 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             let rank = 1 + rng.pick(3);
             let axis = rng.pick(rank);
             let dtype = [
-                DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
-                DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
                 DType::F64,
             ][rng.pick(13)];
             let arity = 2 + rng.pick(3);
             let mut base_shape = Vec::with_capacity(rank);
             for dimension in 0..rank {
-                base_shape.push(if dimension == axis { 0 } else { [0, 1, 2, 3][rng.pick(4)] });
+                base_shape.push(if dimension == axis {
+                    0
+                } else {
+                    [0, 1, 2, 3][rng.pick(4)]
+                });
             }
             FuzzCase::ConcatMany {
                 inputs: (0..arity)
@@ -265,8 +322,18 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             // Both it and direct GraphUnary Abs have a bounded CPU/captured/
             // strict-native path for every concrete local storage dtype.
             let dtype = [
-                DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
-                DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
                 DType::F64,
             ][rng.pick(13)];
             let op = [FuzzUnaryOp::Neg, FuzzUnaryOp::Abs][rng.pick(2)];
@@ -367,8 +434,18 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             // intentionally distinct from source-level signed/mode-aware pad.
             let rank = rng.pick(4);
             let dtype = [
-                DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
-                DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
                 DType::F64,
             ][rng.pick(13)];
             let shape = (0..rank)
@@ -389,8 +466,18 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             let rank = 1 + rng.pick(3);
             let axis = rng.pick(rank);
             let dtype = [
-                DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
-                DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
                 DType::F64,
             ][rng.pick(13)];
             let input_shape = (0..rank)
@@ -406,12 +493,7 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 }
             }
             let index_dtype = [DType::I32, DType::I64][rng.pick(2)];
-            let index = gather_index(
-                &mut rng,
-                index_shape,
-                input_shape[axis],
-                index_dtype,
-            );
+            let index = gather_index(&mut rng, index_shape, input_shape[axis], index_dtype);
             FuzzCase::Gather {
                 input: tensor(&mut rng, input_shape, dtype),
                 index,
@@ -428,7 +510,21 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             let dtype = if op == FuzzScatterOp::Add {
                 [DType::F32, DType::F64][rng.pick(2)]
             } else {
-                [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64][rng.pick(13)]
+                [
+                    DType::Bool,
+                    DType::I8,
+                    DType::U8,
+                    DType::I16,
+                    DType::U16,
+                    DType::I32,
+                    DType::U32,
+                    DType::I64,
+                    DType::U64,
+                    DType::F16,
+                    DType::BF16,
+                    DType::F32,
+                    DType::F64,
+                ][rng.pick(13)]
             };
             let base_shape = (0..rank)
                 .map(|_| [0, 1, 2, 3][rng.pick(4)])
@@ -447,12 +543,7 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 .map(|extent| extent + rng.pick(2))
                 .collect::<Vec<_>>();
             let index_dtype = [DType::I32, DType::I64][rng.pick(2)];
-            let index = gather_index(
-                &mut rng,
-                index_shape,
-                base_shape[axis],
-                index_dtype,
-            );
+            let index = gather_index(&mut rng, index_shape, base_shape[axis], index_dtype);
             FuzzCase::Scatter {
                 base: tensor(&mut rng, base_shape, dtype),
                 index,

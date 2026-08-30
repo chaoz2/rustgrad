@@ -480,8 +480,7 @@ impl Graph {
                     .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
             };
             let total_extent = |size: usize, before: usize, after: usize| {
-                size
-                    .checked_add(before)
+                size.checked_add(before)
                     .and_then(|x| x.checked_add(after))
                     .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
             };
@@ -1162,7 +1161,11 @@ mod tests {
         assert_eq!(
             values(
                 CpuBackend
-                    .execute(&valid, output.values, &HashMap::from([("input".into(), input)]))
+                    .execute(
+                        &valid,
+                        output.values,
+                        &HashMap::from([("input".into(), input)])
+                    )
                     .unwrap()
             ),
             vec![4.]

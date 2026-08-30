@@ -1,7 +1,7 @@
 //! Portable executable schedule descriptors and bindings.
 use super::{
-    BufferDesc, QuantizedScheduleInputBinding, ScheduleBoundary, ScheduleInputBinding, ScheduleItem,
-    ScheduledOutputs,
+    BufferDesc, QuantizedScheduleInputBinding, ScheduleBoundary, ScheduleInputBinding,
+    ScheduleItem, ScheduledOutputs,
 };
 use crate::engine::symbolic::{
     SpecializedFrom, SymbolicGuard, SymbolicItemDomain, SymbolicParameter, SymbolicSchema,
@@ -544,10 +544,7 @@ fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     w.u64(x.cache_key)
 }
 
-fn write_scheduled_outputs_item(
-    w: &mut Writer,
-    x: &ScheduleItem,
-) -> Result<(), ArtifactError> {
+fn write_scheduled_outputs_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     w.u64(x.id)?;
     w.u64(x.node.index() as u64)?;
     write_u64s(w, &x.dependencies)?;
@@ -1162,10 +1159,11 @@ fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError>
             }
         }
         if !item.is_effect()
-            && item
-                .input_bindings
-                .iter()
-                .any(|binding| item.outputs.iter().any(|output| output.id == binding.desc.id))
+            && item.input_bindings.iter().any(|binding| {
+                item.outputs
+                    .iter()
+                    .any(|output| output.id == binding.desc.id)
+            })
         {
             return Err(ArtifactError::Format("scheduled-output binding"));
         }
@@ -1190,13 +1188,11 @@ fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError>
     {
         return Err(ArtifactError::Format("requested output"));
     }
-    if c
-        .inputs
+    if c.inputs
         .iter()
         .any(|input| output_ids.contains(&input.desc.id))
         || c.constants.keys().any(|id| output_ids.contains(id))
-        || c
-            .quantized_constants
+        || c.quantized_constants
             .keys()
             .any(|id| output_ids.contains(id))
     {
@@ -1229,12 +1225,19 @@ fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError>
     }
     validate(&projected, true)?;
 
-    let input_ids = c.inputs.iter().map(|input| input.desc.id).collect::<BTreeSet<_>>();
+    let input_ids = c
+        .inputs
+        .iter()
+        .map(|input| input.desc.id)
+        .collect::<BTreeSet<_>>();
     let mut available = input_ids;
     available.extend(c.constants.keys().copied());
     available.extend(c.quantized_constants.keys().copied());
     for item in &c.items {
-        if item.input_bindings.iter().any(|binding| !available.contains(&binding.desc.id))
+        if item
+            .input_bindings
+            .iter()
+            .any(|binding| !available.contains(&binding.desc.id))
             || item
                 .quantized_input_bindings
                 .iter()
@@ -1916,11 +1919,8 @@ mod tests {
         let mut multi = capture.clone();
         let mut secondary = multi.items[0].output.clone();
         secondary.id = secondary.id.checked_add(1).unwrap();
-        multi.items[0].outputs = ScheduledOutputs::new(vec![
-            multi.items[0].output.clone(),
-            secondary,
-        ])
-        .unwrap();
+        multi.items[0].outputs =
+            ScheduledOutputs::new(vec![multi.items[0].output.clone(), secondary]).unwrap();
         multi.items[0].cache_key = super::super::item_cache_key(&multi.items[0]);
         let bytes = encode_scheduled_outputs(&multi).unwrap();
         let decoded = decode_scheduled_outputs(&bytes).unwrap();
@@ -1934,20 +1934,24 @@ mod tests {
         let mut capture = fixture();
         let mut secondary = capture.items[0].output.clone();
         secondary.id = secondary.id.checked_add(1).unwrap();
-        capture.items[0].outputs = ScheduledOutputs::new(vec![
-            capture.items[0].output.clone(),
-            secondary,
-        ])
-        .unwrap();
+        capture.items[0].outputs =
+            ScheduledOutputs::new(vec![capture.items[0].output.clone(), secondary]).unwrap();
         capture.items[0].cache_key = super::super::item_cache_key(&capture.items[0]);
         let mut bad_projection = capture.clone();
-        bad_projection.items[0].output = bad_projection.items[0].outputs.iter().nth(1).unwrap().clone();
+        bad_projection.items[0].output = bad_projection.items[0]
+            .outputs
+            .iter()
+            .nth(1)
+            .unwrap()
+            .clone();
         assert!(decode_scheduled_outputs(&unchecked_scheduled_outputs(&bad_projection)).is_err());
-        assert!(ScheduledOutputs::new(vec![
-            capture.items[0].output.clone(),
-            capture.items[0].output.clone(),
-        ])
-        .is_err());
+        assert!(
+            ScheduledOutputs::new(vec![
+                capture.items[0].output.clone(),
+                capture.items[0].output.clone(),
+            ])
+            .is_err()
+        );
 
         let mut bad_identity = encode_scheduled_outputs(&capture).unwrap();
         bad_identity[5..13].copy_from_slice(&0u64.to_le_bytes());

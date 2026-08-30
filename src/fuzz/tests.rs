@@ -1,7 +1,8 @@
 use super::*;
+use crate::uop::Ternary;
 use crate::{
-    Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, Op, Scalar,
-    MovementKernelKind, MovementKernelPlan, ReduceKind, Storage, TensorData, Ternary, UArg, UOpKind, UnaryOp,
+    Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, MovementKernelKind,
+    MovementKernelPlan, Op, ReduceKind, Scalar, Storage, TensorData, UArg, UOpKind, UnaryOp,
     schedule,
 };
 use std::{
@@ -196,8 +197,7 @@ fn generated_matmul_cases_cover_portable_generalized_geometry() {
 fn matmul_cases_round_trip_capture_and_keep_f32_storage_rounding() {
     let f32 = FuzzCase::Matmul {
         lhs: FuzzTensor::from_tensor(
-            &TensorData::from_storage([1, 3], Storage::F32(vec![1.0e10, 1.0, -1.0e10]))
-                .unwrap(),
+            &TensorData::from_storage([1, 3], Storage::F32(vec![1.0e10, 1.0, -1.0e10])).unwrap(),
         ),
         rhs: FuzzTensor::from_tensor(
             &TensorData::from_storage([3, 1], Storage::F32(vec![1.0; 3])).unwrap(),
@@ -224,23 +224,37 @@ fn matmul_cases_round_trip_capture_and_keep_f32_storage_rounding() {
 
     let value = serde_json::to_value(&f32).unwrap();
     assert_eq!(value["kind"], "matmul");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), f32);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        f32
+    );
     let mut unknown = value;
-    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
     assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
 
     for case in [f32.clone(), f64_vector, batched] {
         let built = case.build().unwrap();
-        assert!(matches!(built.graph.op(built.output).unwrap(), Op::Matmul { .. }));
+        assert!(matches!(
+            built.graph.op(built.output).unwrap(),
+            Op::Matmul { .. }
+        ));
         let plan = crate::MatmulKernelPlan::from_graph(&built.graph, built.output).unwrap();
-        assert_eq!(plan.output_shape, built.graph.shape(built.output).unwrap().clone());
+        assert_eq!(
+            plan.output_shape,
+            built.graph.shape(built.output).unwrap().clone()
+        );
         assert!(plan.lhs_vector == (plan.lhs_shape.rank() == 1));
         assert!(plan.rhs_vector == (plan.rhs_shape.rank() == 1));
         let scheduled = schedule(&built.graph, built.output).unwrap();
         assert_eq!(scheduled.items.len(), 1);
         let item = &scheduled.items[0];
         assert!(matches!(item.kernel.kind(), UOpKind::Matmul));
-        assert!(matches!(item.kernel.arg(), UArg::Matmul(rendered) if rendered.m == plan.m && rendered.n == plan.n && rendered.k == plan.k && rendered.batch_shape == plan.batch_shape));
+        assert!(
+            matches!(item.kernel.arg(), UArg::Matmul(rendered) if rendered.m == plan.m && rendered.n == plan.n && rendered.k == plan.k && rendered.batch_shape == plan.batch_shape)
+        );
         let rendered = CpuJit::render(&item.kernel).unwrap();
         if plan.dtype == DType::F32 {
             assert!(rendered.source.contains("float rg_acc=0.0f;"));
@@ -254,13 +268,22 @@ fn matmul_cases_round_trip_capture_and_keep_f32_storage_rounding() {
             rendered.source,
             CpuJit::render_vectorized(&item.kernel).unwrap().source
         );
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
-        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
     }
 
     let built = f32.build().unwrap();
-    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
     let Scalar::F(value) = output.scalar_at(0) else {
         panic!("F32 matmul output")
     };
@@ -272,10 +295,16 @@ fn matmul_cases_round_trip_capture_and_keep_f32_storage_rounding() {
         FuzzPath::NativeScalar,
         FuzzComparisonPolicy::ExactBytes,
         FuzzOutcome::value(&output),
-        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic F32 matmul rounding mismatch".into() },
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic F32 matmul rounding mismatch".into(),
+        },
     )
     .unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&f32, |candidate| {
         matches!(candidate, FuzzCase::Matmul { lhs, rhs }
             if lhs.bytes == vec![0; 12] && rhs.bytes == vec![0; 12])
@@ -304,9 +333,15 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
     });
     let value = serde_json::to_value(&cases[2]).unwrap();
     assert_eq!(value["kind"], "reduction");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), cases[2]);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        cases[2]
+    );
     let mut unknown = value;
-    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
     assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
 
     for (case, expected_kind) in cases.iter().cloned().zip([
@@ -317,12 +352,22 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
         ReduceKind::Min,
     ]) {
         let built = case.build().unwrap();
-        let Op::Reduce { kind, axes, keepdim, .. } = built.graph.op(built.output).unwrap() else {
+        let Op::Reduce {
+            kind,
+            axes,
+            keepdim,
+            ..
+        } = built.graph.op(built.output).unwrap()
+        else {
             panic!("raw reduction case must retain its Reduce root");
         };
         assert_eq!(*kind, expected_kind);
         assert_eq!(axes, &vec![1]);
-        let FuzzCase::Reduction { keepdim: expected_keepdim, .. } = &case else {
+        let FuzzCase::Reduction {
+            keepdim: expected_keepdim,
+            ..
+        } = &case
+        else {
             unreachable!("constructed as Reduction")
         };
         assert_eq!(*keepdim, *expected_keepdim);
@@ -330,19 +375,36 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
         assert_eq!(scheduled.items.len(), 1);
         let item = &scheduled.items[0];
         assert!(item.boundary.is_none());
-        assert!(item.kernel.topological().unwrap().iter().any(|uop| {
-            matches!(uop.kind(), UOpKind::ReduceFinalize)
-        }));
+        assert!(
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|uop| { matches!(uop.kind(), UOpKind::ReduceFinalize) })
+        );
         assert!(CpuJit::render(&item.kernel).is_ok());
         assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
-        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
     }
 
-    for reduction in [FuzzReduction::Sum, FuzzReduction::Mean, FuzzReduction::Product] {
+    for reduction in [
+        FuzzReduction::Sum,
+        FuzzReduction::Mean,
+        FuzzReduction::Product,
+    ] {
         let empty = FuzzCase::Reduction {
-            input: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::F32(vec![])).unwrap()),
+            input: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2, 0], Storage::F32(vec![])).unwrap(),
+            ),
             reduction,
             axis: 1,
             keepdim: false,
@@ -354,42 +416,75 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
 
     let product = cases[2].clone();
     let product_built = product.build().unwrap();
-    let product_output = CpuBackend.execute(&product_built.graph, product_built.output, &product_built.oracle).unwrap();
+    let product_output = CpuBackend
+        .execute(
+            &product_built.graph,
+            product_built.output,
+            &product_built.oracle,
+        )
+        .unwrap();
     let artifact = FuzzFailureArtifact::new(
-        15, 23, product.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        15,
+        23,
+        product.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
         FuzzOutcome::value(&product_output),
-        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Product mismatch".into() },
-    ).unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic Product mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&product, |candidate| {
         matches!(candidate, FuzzCase::Reduction { input, reduction: FuzzReduction::Product, axis: 1, keepdim: true }
             if input.bytes == vec![0; 24])
     });
-    assert!(matches!(zeroed, FuzzCase::Reduction { ref input, reduction: FuzzReduction::Product, axis: 1, keepdim: true }
-        if input.bytes == vec![0; 24]));
+    assert!(
+        matches!(zeroed, FuzzCase::Reduction { ref input, reduction: FuzzReduction::Product, axis: 1, keepdim: true }
+        if input.bytes == vec![0; 24])
+    );
 
     let max = FuzzCase::Reduction {
         input: FuzzTensor::from_tensor(
-            &TensorData::from_storage([5], Storage::F32(vec![f32::NEG_INFINITY, f32::NAN, -0.0, 0.0, f32::INFINITY])).unwrap(),
+            &TensorData::from_storage(
+                [5],
+                Storage::F32(vec![f32::NEG_INFINITY, f32::NAN, -0.0, 0.0, f32::INFINITY]),
+            )
+            .unwrap(),
         ),
         reduction: FuzzReduction::Max,
         axis: 0,
         keepdim: false,
     };
     let max_built = max.build().unwrap();
-    let max_value = CpuBackend.execute(&max_built.graph, max_built.output, &max_built.oracle).unwrap();
+    let max_value = CpuBackend
+        .execute(&max_built.graph, max_built.output, &max_built.oracle)
+        .unwrap();
     assert_eq!(max_value.scalar_at(0), Scalar::F(f32::INFINITY as f64));
     let min = FuzzCase::Reduction {
         input: FuzzTensor::from_tensor(
-            &TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), 0.0, f32::INFINITY])).unwrap(),
+            &TensorData::from_storage(
+                [3],
+                Storage::F32(vec![f32::from_bits(0x8000_0000), 0.0, f32::INFINITY]),
+            )
+            .unwrap(),
         ),
         reduction: FuzzReduction::Min,
         axis: 0,
         keepdim: false,
     };
     let min_built = min.build().unwrap();
-    let min_value = CpuBackend.execute(&min_built.graph, min_built.output, &min_built.oracle).unwrap();
-    let Scalar::F(minimum) = min_value.scalar_at(0) else { panic!("F32 min output") };
+    let min_value = CpuBackend
+        .execute(&min_built.graph, min_built.output, &min_built.oracle)
+        .unwrap();
+    let Scalar::F(minimum) = min_value.scalar_at(0) else {
+        panic!("F32 min output")
+    };
     assert_eq!((minimum as f32).to_bits(), 0x8000_0000);
 
     for (dtype, reduction, storage) in [
@@ -415,13 +510,17 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
         ),
     ] {
         let case = FuzzCase::Reduction {
-            input: FuzzTensor::from_tensor(&TensorData::from_storage([storage.len()], storage).unwrap()),
+            input: FuzzTensor::from_tensor(
+                &TensorData::from_storage([storage.len()], storage).unwrap(),
+            ),
             reduction,
             axis: 0,
             keepdim: false,
         };
         let built = case.build().unwrap();
-        let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        let oracle = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
         assert_eq!(
             crate::execute_elementwise(&built.graph, built.output, &built.oracle)
                 .unwrap()
@@ -462,11 +561,12 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
             DType::Bool => Scalar::Bool(index % 2 != 0),
             DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U((index % 3) as u64),
             DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I((index % 3) as i64 - 1),
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F((index % 3) as f64 - 1.0),
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+                Scalar::F((index % 3) as f64 - 1.0)
+            }
         });
-        let input = FuzzTensor::from_tensor(
-            &TensorData::from_scalars([2, 3], dtype, values).unwrap(),
-        );
+        let input =
+            FuzzTensor::from_tensor(&TensorData::from_scalars([2, 3], dtype, values).unwrap());
 
         for (reduction, kind) in reductions {
             let case = FuzzCase::Reduction {
@@ -491,12 +591,18 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
                 | FuzzReduction::Max
                 | FuzzReduction::Min => dtype,
             };
-            assert_eq!(built.graph.dtype(built.output).unwrap(), expected_dtype, "{dtype:?} {reduction:?}");
+            assert_eq!(
+                built.graph.dtype(built.output).unwrap(),
+                expected_dtype,
+                "{dtype:?} {reduction:?}"
+            );
             let Op::Reduce { kind: actual, .. } = built.graph.op(built.output).unwrap() else {
                 panic!("raw fuzz reduction must retain an Op::Reduce root");
             };
             assert_eq!(*actual, kind);
-            let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            let oracle = CpuBackend
+                .execute(&built.graph, built.output, &built.oracle)
+                .unwrap();
             assert_eq!(
                 crate::execute_elementwise(&built.graph, built.output, &built.oracle)
                     .unwrap()
@@ -505,20 +611,39 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
                 "captured {dtype:?} {reduction:?}",
             );
             let scheduled = schedule(&built.graph, built.output).unwrap();
-            assert!(scheduled.items[0]
-                .kernel
-                .topological()
-                .unwrap()
-                .iter()
-                .any(|node| matches!(node.kind(), UOpKind::ReduceFinalize)));
-            assert!(CpuJit::render(&scheduled.items[0].kernel).is_ok(), "{dtype:?} {reduction:?}");
-            assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok(), "{dtype:?} {reduction:?}");
-            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            assert!(
+                scheduled.items[0]
+                    .kernel
+                    .topological()
+                    .unwrap()
+                    .iter()
+                    .any(|node| matches!(node.kind(), UOpKind::ReduceFinalize))
+            );
+            assert!(
+                CpuJit::render(&scheduled.items[0].kernel).is_ok(),
+                "{dtype:?} {reduction:?}"
+            );
+            assert!(
+                CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok(),
+                "{dtype:?} {reduction:?}"
+            );
+            let captured =
+                CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
             let bytes = captured.to_bytes().unwrap();
-            assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+            assert_eq!(
+                CapturedSchedule::from_bytes(&bytes)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                bytes
+            );
         }
 
-        for reduction in [FuzzReduction::Sum, FuzzReduction::Mean, FuzzReduction::Product] {
+        for reduction in [
+            FuzzReduction::Sum,
+            FuzzReduction::Mean,
+            FuzzReduction::Product,
+        ] {
             let empty = FuzzCase::Reduction {
                 input: FuzzTensor::from_tensor(
                     &TensorData::from_scalars([2, 0], dtype, std::iter::empty::<Scalar>()).unwrap(),
@@ -528,7 +653,9 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
                 keepdim: false,
             };
             let built = empty.build().unwrap();
-            let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            let oracle = CpuBackend
+                .execute(&built.graph, built.output, &built.oracle)
+                .unwrap();
             assert_eq!(
                 crate::execute_elementwise(&built.graph, built.output, &built.oracle)
                     .unwrap()
@@ -604,7 +731,9 @@ fn concat_many_cases_preserve_arity_order_and_raw_payloads() {
             FuzzTensor::from_tensor(
                 &TensorData::from_storage([1, 2], Storage::F16(vec![0x8000, 0x7e01])).unwrap(),
             ),
-            FuzzTensor::from_tensor(&TensorData::from_storage([1, 0], Storage::F16(vec![])).unwrap()),
+            FuzzTensor::from_tensor(
+                &TensorData::from_storage([1, 0], Storage::F16(vec![])).unwrap(),
+            ),
             FuzzTensor::from_tensor(
                 &TensorData::from_storage([1, 2], Storage::F16(vec![0x7c00, 0x3c00])).unwrap(),
             ),
@@ -613,15 +742,25 @@ fn concat_many_cases_preserve_arity_order_and_raw_payloads() {
     };
     let encoded = serde_json::to_value(&many).unwrap();
     assert_eq!(encoded["kind"], "concat_many");
-    assert_eq!(serde_json::from_value::<FuzzCase>(encoded.clone()).unwrap(), many);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(encoded.clone()).unwrap(),
+        many
+    );
     let mut unknown = encoded;
-    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
     assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
 
     // The original two-input tag remains decodable without schema migration.
     let legacy = FuzzCase::Concat {
-        lhs: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::U64(vec![7])).unwrap()),
-        rhs: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::U64(vec![9])).unwrap()),
+        lhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::U64(vec![7])).unwrap(),
+        ),
+        rhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::U64(vec![9])).unwrap(),
+        ),
         axis: 0,
     };
     assert_eq!(
@@ -651,43 +790,78 @@ fn concat_many_cases_preserve_arity_order_and_raw_payloads() {
     let built = many.build().unwrap();
     assert_eq!(
         built.ordered.keys().cloned().collect::<Vec<_>>(),
-        vec!["input0".to_string(), "input1".to_string(), "input2".to_string()]
+        vec![
+            "input0".to_string(),
+            "input1".to_string(),
+            "input2".to_string()
+        ]
     );
     let Op::Concat { inputs, axis } = built.graph.op(built.output).unwrap() else {
         panic!("concat_many must retain raw Concat")
     };
     assert_eq!(*axis, 1);
     assert_eq!(inputs.len(), 3);
-    assert_eq!(built.graph.shape(built.output).unwrap(), &crate::Shape::from([1, 4]));
+    assert_eq!(
+        built.graph.shape(built.output).unwrap(),
+        &crate::Shape::from([1, 4])
+    );
     assert_eq!(built.graph.dtype(built.output).unwrap(), DType::F16);
     let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
-    let MovementKernelKind::Concat { inputs: planned, axis } = &plan.kind else {
+    let MovementKernelKind::Concat {
+        inputs: planned,
+        axis,
+    } = &plan.kind
+    else {
         panic!("raw Concat must use a movement plan")
     };
     assert_eq!(*axis, 1);
     assert_eq!(planned.len(), 3);
     let scheduled = schedule(&built.graph, built.output).unwrap();
     assert_eq!(scheduled.items.len(), 1);
-    assert!(matches!(scheduled.items[0].kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Concat { inputs, .. } if inputs.len() == 3)));
+    assert!(
+        matches!(scheduled.items[0].kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Concat { inputs, .. } if inputs.len() == 3))
+    );
     let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
     assert!(scalar.source.contains("else if"));
     assert!(scalar.source.contains("uint16_t"));
     assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
     let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
     let bytes = captured.to_bytes().unwrap();
-    assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+    assert_eq!(
+        CapturedSchedule::from_bytes(&bytes)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        bytes
+    );
 
-    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
     assert_eq!(
         FuzzTensor::from_tensor(&output),
-        FuzzTensor::from_tensor(&TensorData::from_storage([1, 4], Storage::F16(vec![0x8000, 0x7e01, 0x7c00, 0x3c00])).unwrap()),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage([1, 4], Storage::F16(vec![0x8000, 0x7e01, 0x7c00, 0x3c00]))
+                .unwrap()
+        ),
     );
     let artifact = FuzzFailureArtifact::new(
-        17, 29, many.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        17,
+        29,
+        many.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
         FuzzOutcome::value(&output),
-        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic concat_many mismatch".into() },
-    ).unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic concat_many mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&many, |candidate| {
         matches!(candidate, FuzzCase::ConcatMany { inputs, axis: 1 }
             if inputs.len() == 3 && inputs.iter().all(|input| input.bytes.iter().all(|byte| *byte == 0)))
@@ -698,8 +872,19 @@ fn concat_many_cases_preserve_arity_order_and_raw_payloads() {
 #[test]
 fn generated_unary_cases_are_valid_diverse_and_deterministic() {
     let all_dtypes = [
-        DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32,
-        DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64,
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
     ];
     let mut found = false;
     let mut neg = false;
@@ -721,7 +906,10 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
             neg |= op == FuzzUnaryOp::Neg;
             abs |= op == FuzzUnaryOp::Abs;
             dtypes.insert(input.dtype);
-            let dtype_index = all_dtypes.iter().position(|dtype| *dtype == input.dtype).unwrap();
+            let dtype_index = all_dtypes
+                .iter()
+                .position(|dtype| *dtype == input.dtype)
+                .unwrap();
             coverage[dtype_index][usize::from(op == FuzzUnaryOp::Abs)] = true;
             scalar |= input.shape.is_empty();
             empty |= input.shape.iter().any(|extent| *extent == 0);
@@ -731,7 +919,11 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
     assert!(found);
     assert!(neg && abs);
     assert_eq!(dtypes.len(), 13);
-    assert!(coverage.iter().all(|ops| ops.iter().all(|covered| *covered)));
+    assert!(
+        coverage
+            .iter()
+            .all(|ops| ops.iter().all(|covered| *covered))
+    );
     assert!(scalar && empty);
 }
 
@@ -761,9 +953,8 @@ fn generated_compare_cases_are_valid_diverse_and_deterministic() {
             empty |= lhs.shape.iter().any(|extent| *extent == 0);
             scalar_rhs |= rhs.shape.is_empty();
             matching_rhs |= rhs.shape == lhs.shape;
-            right_aligned_rhs |= !rhs.shape.is_empty()
-                && rhs.shape != lhs.shape
-                && lhs.shape.ends_with(&rhs.shape);
+            right_aligned_rhs |=
+                !rhs.shape.is_empty() && rhs.shape != lhs.shape && lhs.shape.ends_with(&rhs.shape);
             assert_eq!(lhs.dtype, rhs.dtype);
         }
     }
@@ -914,15 +1105,31 @@ fn generated_select_cases_cover_homogeneous_dtypes_and_broadcasts() {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
-            let FuzzCase::Select { condition, on_true, on_false } = case else { continue };
+            let FuzzCase::Select {
+                condition,
+                on_true,
+                on_false,
+            } = case
+            else {
+                continue;
+            };
             assert_eq!(on_true.dtype, on_false.dtype);
             assert_eq!(condition.dtype, DType::Bool);
             dtypes.insert(on_true.dtype);
             scalar_condition |= condition.shape.is_empty();
             scalar_branch |= on_false.shape.is_empty();
             aligned_condition |= condition.shape.len() == 2 && condition.shape[0] == 1;
-            let built = FuzzCase::Select { condition, on_true, on_false }.build().unwrap();
-            assert!(matches!(built.graph.op(built.output).unwrap(), Op::Select { .. }));
+            let built = FuzzCase::Select {
+                condition,
+                on_true,
+                on_false,
+            }
+            .build()
+            .unwrap();
+            assert!(matches!(
+                built.graph.op(built.output).unwrap(),
+                Op::Select { .. }
+            ));
         }
     }
     assert_eq!(dtypes.len(), 13);
@@ -931,7 +1138,21 @@ fn generated_select_cases_cover_homogeneous_dtypes_and_broadcasts() {
 
 #[test]
 fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
-    let dtypes = [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64];
+    let dtypes = [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
     for dtype in dtypes {
         let mut graph = crate::Graph::new();
         let condition = graph.input_dtype("condition", crate::Shape::from([2]), DType::Bool);
@@ -944,7 +1165,11 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
         assert!(matches!(uop.kind(), UOpKind::Store));
         assert!(CpuJit::render(&uop).is_ok());
         let vector = CpuJit::render_vectorized(&uop).unwrap();
-        if matches!(dtype, DType::F16 | DType::BF16) { assert!(!vector.source.contains("B2 VectorProgram")); } else if matches!(dtype, DType::F32 | DType::I32) { assert!(vector.source.contains("B2 VectorProgram")); }
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            assert!(!vector.source.contains("B2 VectorProgram"));
+        } else if matches!(dtype, DType::F32 | DType::I32) {
+            assert!(vector.source.contains("B2 VectorProgram"));
+        }
         let scheduled = schedule(&graph, output).unwrap();
         assert_eq!(scheduled.items.len(), 1);
         assert_eq!(
@@ -959,32 +1184,92 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
         );
         let captured = CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
-        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
     }
     let case = FuzzCase::Select {
-        condition: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::Bool(vec![true, false, true])).unwrap()),
-        on_true: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::INFINITY, 3.0])).unwrap()),
-        on_false: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::F32(vec![f32::from_bits(0x7fc0_0001)])).unwrap()),
+        condition: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::Bool(vec![true, false, true])).unwrap(),
+        ),
+        on_true: FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [3],
+                Storage::F32(vec![f32::from_bits(0x8000_0000), f32::INFINITY, 3.0]),
+            )
+            .unwrap(),
+        ),
+        on_false: FuzzTensor::from_tensor(
+            &TensorData::from_storage([], Storage::F32(vec![f32::from_bits(0x7fc0_0001)])).unwrap(),
+        ),
     };
     let encoded = serde_json::to_value(&case).unwrap();
     assert_eq!(serde_json::from_value::<FuzzCase>(encoded).unwrap(), case);
     let built = case.build().unwrap();
-    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
-    assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), 3.0])).unwrap()));
-    let artifact = FuzzFailureArtifact::new(31, 37, case.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes, FuzzOutcome::value(&output), FuzzOutcome::Error { class: "execute".into(), detail: "synthetic select mismatch".into() }).unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
+    assert_eq!(
+        FuzzTensor::from_tensor(&output),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [3],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    3.0
+                ])
+            )
+            .unwrap()
+        )
+    );
+    let artifact = FuzzFailureArtifact::new(
+        31,
+        37,
+        case.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&output),
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic select mismatch".into(),
+        },
+    )
+    .unwrap();
     let artifact_bytes = artifact.to_bytes().unwrap();
     let decoded_artifact = FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap();
     assert_eq!(decoded_artifact, artifact);
     assert_eq!(decoded_artifact.to_bytes().unwrap(), artifact_bytes);
-    let zeroed = minimize_case(&case, |candidate| matches!(candidate, FuzzCase::Select { condition, on_true, on_false } if condition.shape == vec![3] && on_true.shape == vec![3] && on_false.shape.is_empty() && condition.dtype == DType::Bool && on_true.dtype == DType::F32 && on_false.dtype == DType::F32 && condition.bytes.iter().all(|byte| *byte == 0) && on_true.bytes.iter().all(|byte| *byte == 0) && on_false.bytes.iter().all(|byte| *byte == 0)));
-    assert!(matches!(zeroed, FuzzCase::Select { ref condition, ref on_true, ref on_false }
+    let zeroed = minimize_case(
+        &case,
+        |candidate| matches!(candidate, FuzzCase::Select { condition, on_true, on_false } if condition.shape == vec![3] && on_true.shape == vec![3] && on_false.shape.is_empty() && condition.dtype == DType::Bool && on_true.dtype == DType::F32 && on_false.dtype == DType::F32 && condition.bytes.iter().all(|byte| *byte == 0) && on_true.bytes.iter().all(|byte| *byte == 0) && on_false.bytes.iter().all(|byte| *byte == 0)),
+    );
+    assert!(
+        matches!(zeroed, FuzzCase::Select { ref condition, ref on_true, ref on_false }
         if condition.shape == vec![3]
             && on_true.shape == vec![3]
             && on_false.shape.is_empty()
             && condition.dtype == DType::Bool
             && on_true.dtype == DType::F32
-            && on_false.dtype == DType::F32));
-    let malformed = FuzzCase::Select { condition: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I32(vec![1, 0])).unwrap()), on_true: case.on_true.clone(), on_false: case.on_false.clone() };
+            && on_false.dtype == DType::F32)
+    );
+    let FuzzCase::Select {
+        on_true, on_false, ..
+    } = &case
+    else {
+        unreachable!("fixture is a Select case")
+    };
+    let malformed = FuzzCase::Select {
+        condition: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::I32(vec![1, 0])).unwrap(),
+        ),
+        on_true: on_true.clone(),
+        on_false: on_false.clone(),
+    };
     assert!(malformed.validate().is_err());
 }
 
@@ -1011,12 +1296,7 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
             // 0 and 1 are exactly representable and in range for every pair.
             // This intentionally does not claim non-finite/out-of-range
             // float-to-int or implementation-defined signed-overflow parity.
-            let source = TensorData::from_scalars(
-                [2],
-                from,
-                [Scalar::I(0), Scalar::I(1)],
-            )
-            .unwrap();
+            let source = TensorData::from_scalars([2], from, [Scalar::I(0), Scalar::I(1)]).unwrap();
             let case = FuzzCase::Cast {
                 input: FuzzTensor::from_tensor(&source),
                 to,
@@ -1029,7 +1309,10 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
             let oracle = CpuBackend
                 .execute(&built.graph, built.output, &built.oracle)
                 .unwrap();
-            assert_eq!(FuzzTensor::from_tensor(&oracle), FuzzTensor::from_tensor(&source.cast(to)));
+            assert_eq!(
+                FuzzTensor::from_tensor(&oracle),
+                FuzzTensor::from_tensor(&source.cast(to))
+            );
 
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert_eq!(scheduled.items.len(), 1);
@@ -1043,17 +1326,25 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
                     .count(),
                 1,
             );
-            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let captured =
+                CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
             let capture_bytes = captured.to_bytes().unwrap();
-            assert_eq!(CapturedSchedule::from_bytes(&capture_bytes).unwrap().to_bytes().unwrap(), capture_bytes);
+            assert_eq!(
+                CapturedSchedule::from_bytes(&capture_bytes)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                capture_bytes
+            );
 
             let uop = crate::lower_graph_elementwise(&built.graph, built.output).unwrap();
             assert!(CpuJit::render(&uop).is_ok(), "{from:?} -> {to:?}");
             let vector = CpuJit::render_vectorized(&uop).unwrap();
-            if matches!(from, DType::F16 | DType::BF16)
-                || matches!(to, DType::F16 | DType::BF16)
-            {
-                assert!(!vector.source.contains("B2 VectorProgram"), "{from:?} -> {to:?}");
+            if matches!(from, DType::F16 | DType::BF16) || matches!(to, DType::F16 | DType::BF16) {
+                assert!(
+                    !vector.source.contains("B2 VectorProgram"),
+                    "{from:?} -> {to:?}"
+                );
                 assert!(vector.source.contains("C11 ABI v2"), "{from:?} -> {to:?}");
             }
         }
@@ -1066,7 +1357,12 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
     let b2_input = b2_graph.input_dtype("input", [2], DType::F32);
     let b2_output = b2_graph.cast(b2_input, DType::I32).unwrap();
     let b2_uop = crate::lower_graph_elementwise(&b2_graph, b2_output).unwrap();
-    assert!(CpuJit::render_vectorized(&b2_uop).unwrap().source.contains("B2 VectorProgram"));
+    assert!(
+        CpuJit::render_vectorized(&b2_uop)
+            .unwrap()
+            .source
+            .contains("B2 VectorProgram")
+    );
 
     // Finite fractional truncation and unsigned conversion stay in the safe
     // nonnegative domain. Arbitrary half NaN payload identity is not claimed.
@@ -1077,16 +1373,25 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
             to,
         };
         let built = case.build().unwrap();
-        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
-        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&input.cast(to)));
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        assert_eq!(
+            FuzzTensor::from_tensor(&output),
+            FuzzTensor::from_tensor(&input.cast(to))
+        );
     }
 
     let artifact_case = FuzzCase::Cast {
-        input: FuzzTensor::from_tensor(&TensorData::from_scalars([2], DType::BF16, [Scalar::I(0), Scalar::I(1)]).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_scalars([2], DType::BF16, [Scalar::I(0), Scalar::I(1)]).unwrap(),
+        ),
         to: DType::U64,
     };
     let built = artifact_case.build().unwrap();
-    let expected = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let expected = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
     let artifact = FuzzFailureArtifact::new(
         41,
         43,
@@ -1094,19 +1399,32 @@ fn cast_cases_cover_the_safe_all_dtype_matrix_without_claiming_undefined_c_casts
         FuzzPath::NativeScalar,
         FuzzComparisonPolicy::ExactBytes,
         FuzzOutcome::value(&expected),
-        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic safe cast mismatch".into() },
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic safe cast mismatch".into(),
+        },
     )
     .unwrap();
     let artifact_bytes = artifact.to_bytes().unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap().to_bytes().unwrap(), artifact_bytes);
-    let minimized = minimize_case(&artifact_case, |candidate| matches!(candidate,
-        FuzzCase::Cast { input, to: DType::U64 }
-            if input.dtype == DType::BF16
-                && input.shape == vec![2]
-                && input.bytes.iter().all(|byte| *byte == 0)
-    ));
-    assert!(matches!(minimized, FuzzCase::Cast { ref input, to: DType::U64 }
-        if input.dtype == DType::BF16 && input.shape == vec![2]));
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact_bytes)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        artifact_bytes
+    );
+    let minimized = minimize_case(&artifact_case, |candidate| {
+        matches!(candidate,
+            FuzzCase::Cast { input, to: DType::U64 }
+                if input.dtype == DType::BF16
+                    && input.shape == vec![2]
+                    && input.bytes.iter().all(|byte| *byte == 0)
+        )
+    });
+    assert!(
+        matches!(minimized, FuzzCase::Cast { ref input, to: DType::U64 }
+        if input.dtype == DType::BF16 && input.shape == vec![2])
+    );
 }
 
 #[test]
@@ -1117,7 +1435,9 @@ fn generated_cast_cases_reach_every_concrete_dtype_on_the_safe_domain() {
         for index in 0..16_384 {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
-            let FuzzCase::Cast { input, to } = case else { continue };
+            let FuzzCase::Cast { input, to } = case else {
+                continue;
+            };
             input.validate().unwrap();
             let values = input.to_tensor().unwrap();
             for lane in 0..values.len() {
@@ -1134,8 +1454,19 @@ fn generated_cast_cases_reach_every_concrete_dtype_on_the_safe_domain() {
 #[test]
 fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
     const DTYPES: [DType; 13] = [
-        DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32,
-        DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64,
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
     ];
     let ops = [
         (FuzzBinaryOp::Add, crate::BinaryOp::Add),
@@ -1168,46 +1499,99 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             });
             let case = FuzzCase::Binary {
                 op: fuzz_op,
-                lhs: FuzzTensor::from_tensor(&TensorData::from_scalars(shape.clone(), dtype, values).unwrap()),
-                rhs: FuzzTensor::from_tensor(&TensorData::from_scalars(rhs_shape, dtype, rhs_values).unwrap()),
+                lhs: FuzzTensor::from_tensor(
+                    &TensorData::from_scalars(shape.clone(), dtype, values).unwrap(),
+                ),
+                rhs: FuzzTensor::from_tensor(
+                    &TensorData::from_scalars(rhs_shape, dtype, rhs_values).unwrap(),
+                ),
             };
             let built = case.build().unwrap();
-            assert!(matches!(built.graph.op(built.output).unwrap(), Op::Binary { op, .. } if *op == raw_op));
+            assert!(
+                matches!(built.graph.op(built.output).unwrap(), Op::Binary { op, .. } if *op == raw_op)
+            );
             assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
-            assert_eq!(built.graph.shape(built.output).unwrap().dims(), shape.as_slice());
-            let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(
+                built.graph.shape(built.output).unwrap().dims(),
+                shape.as_slice()
+            );
+            let output = CpuBackend
+                .execute(&built.graph, built.output, &built.oracle)
+                .unwrap();
             assert_eq!(output.dtype(), dtype);
 
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert_eq!(scheduled.items.len(), 1);
             assert_eq!(
-                scheduled.items[0].kernel.topological().unwrap().iter()
+                scheduled.items[0]
+                    .kernel
+                    .topological()
+                    .unwrap()
+                    .iter()
                     .filter(|node| matches!(node.kind(), UOpKind::GraphBinary(op) if *op == raw_op))
                     .count(),
                 1,
             );
-            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let captured =
+                CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
             let bytes = captured.to_bytes().unwrap();
-            assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+            assert_eq!(
+                CapturedSchedule::from_bytes(&bytes)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                bytes
+            );
 
             let uop = crate::lower_graph_elementwise(&built.graph, built.output).unwrap();
             assert!(CpuJit::render(&uop).is_ok(), "{fuzz_op:?} {dtype:?}");
             let vector = CpuJit::render_vectorized(&uop).unwrap();
             if matches!(dtype, DType::F16 | DType::BF16) || fuzz_op == FuzzBinaryOp::Maximum {
-                assert!(!vector.source.contains("B2 VectorProgram"), "{fuzz_op:?} {dtype:?}");
+                assert!(
+                    !vector.source.contains("B2 VectorProgram"),
+                    "{fuzz_op:?} {dtype:?}"
+                );
             }
         }
     }
 
     for (dtype, storage, expected) in [
-        (DType::I8, Storage::I8(vec![i8::MAX]), Storage::I8(vec![i8::MIN])),
+        (
+            DType::I8,
+            Storage::I8(vec![i8::MAX]),
+            Storage::I8(vec![i8::MIN]),
+        ),
         (DType::U8, Storage::U8(vec![u8::MAX]), Storage::U8(vec![0])),
-        (DType::I16, Storage::I16(vec![i16::MAX]), Storage::I16(vec![i16::MIN])),
-        (DType::U16, Storage::U16(vec![u16::MAX]), Storage::U16(vec![0])),
-        (DType::I32, Storage::I32(vec![i32::MAX]), Storage::I32(vec![i32::MIN])),
-        (DType::U32, Storage::U32(vec![u32::MAX]), Storage::U32(vec![0])),
-        (DType::I64, Storage::I64(vec![i64::MAX]), Storage::I64(vec![i64::MIN])),
-        (DType::U64, Storage::U64(vec![u64::MAX]), Storage::U64(vec![0])),
+        (
+            DType::I16,
+            Storage::I16(vec![i16::MAX]),
+            Storage::I16(vec![i16::MIN]),
+        ),
+        (
+            DType::U16,
+            Storage::U16(vec![u16::MAX]),
+            Storage::U16(vec![0]),
+        ),
+        (
+            DType::I32,
+            Storage::I32(vec![i32::MAX]),
+            Storage::I32(vec![i32::MIN]),
+        ),
+        (
+            DType::U32,
+            Storage::U32(vec![u32::MAX]),
+            Storage::U32(vec![0]),
+        ),
+        (
+            DType::I64,
+            Storage::I64(vec![i64::MAX]),
+            Storage::I64(vec![i64::MIN]),
+        ),
+        (
+            DType::U64,
+            Storage::U64(vec![u64::MAX]),
+            Storage::U64(vec![0]),
+        ),
     ] {
         let lhs = TensorData::from_storage([1], storage).unwrap();
         let rhs = TensorData::from_scalars([1], dtype, [Scalar::I(1)]).unwrap();
@@ -1217,17 +1601,42 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             rhs: FuzzTensor::from_tensor(&rhs),
         };
         let built = case.build().unwrap();
-        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
-        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([1], expected).unwrap()));
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        assert_eq!(
+            FuzzTensor::from_tensor(&output),
+            FuzzTensor::from_tensor(&TensorData::from_storage([1], expected).unwrap())
+        );
     }
 
     // Finite/signed-zero/infinity arithmetic is storage-exact here. Arbitrary
     // half-NaN arithmetic or payload identity remains intentionally unclaimed.
     for (dtype, lhs, rhs, expected) in [
-        (DType::F16, Storage::F16(vec![0x8000, 0x7c00]), Storage::F16(vec![0x8000, 0x3c00]), Storage::F16(vec![0x8000, 0x7c00])),
-        (DType::BF16, Storage::BF16(vec![0x8000, 0x7f80]), Storage::BF16(vec![0x8000, 0x3f80]), Storage::BF16(vec![0x8000, 0x7f80])),
-        (DType::F32, Storage::F32(vec![-0.0, f32::INFINITY]), Storage::F32(vec![-0.0, 1.0]), Storage::F32(vec![-0.0, f32::INFINITY])),
-        (DType::F64, Storage::F64(vec![-0.0, f64::INFINITY]), Storage::F64(vec![-0.0, 1.0]), Storage::F64(vec![-0.0, f64::INFINITY])),
+        (
+            DType::F16,
+            Storage::F16(vec![0x8000, 0x7c00]),
+            Storage::F16(vec![0x8000, 0x3c00]),
+            Storage::F16(vec![0x8000, 0x7c00]),
+        ),
+        (
+            DType::BF16,
+            Storage::BF16(vec![0x8000, 0x7f80]),
+            Storage::BF16(vec![0x8000, 0x3f80]),
+            Storage::BF16(vec![0x8000, 0x7f80]),
+        ),
+        (
+            DType::F32,
+            Storage::F32(vec![-0.0, f32::INFINITY]),
+            Storage::F32(vec![-0.0, 1.0]),
+            Storage::F32(vec![-0.0, f32::INFINITY]),
+        ),
+        (
+            DType::F64,
+            Storage::F64(vec![-0.0, f64::INFINITY]),
+            Storage::F64(vec![-0.0, 1.0]),
+            Storage::F64(vec![-0.0, f64::INFINITY]),
+        ),
     ] {
         let case = FuzzCase::Binary {
             op: FuzzBinaryOp::Add,
@@ -1235,14 +1644,29 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             rhs: FuzzTensor::from_tensor(&TensorData::from_storage([2], rhs).unwrap()),
         };
         let built = case.build().unwrap();
-        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
-        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([2], expected).unwrap()));
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        assert_eq!(
+            FuzzTensor::from_tensor(&output),
+            FuzzTensor::from_tensor(&TensorData::from_storage([2], expected).unwrap())
+        );
         assert_eq!(output.dtype(), dtype);
     }
 
     for (dtype, lhs, rhs, expected) in [
-        (DType::F32, Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0]), Storage::F32(vec![1.0, 0.0]), Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0])),
-        (DType::F64, Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001), -0.0]), Storage::F64(vec![1.0, 0.0]), Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001), -0.0])),
+        (
+            DType::F32,
+            Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0]),
+            Storage::F32(vec![1.0, 0.0]),
+            Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0]),
+        ),
+        (
+            DType::F64,
+            Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001), -0.0]),
+            Storage::F64(vec![1.0, 0.0]),
+            Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001), -0.0]),
+        ),
     ] {
         let case = FuzzCase::Binary {
             op: FuzzBinaryOp::Maximum,
@@ -1250,57 +1674,115 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
             rhs: FuzzTensor::from_tensor(&TensorData::from_storage([2], rhs).unwrap()),
         };
         let built = case.build().unwrap();
-        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
-        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([2], expected).unwrap()));
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        assert_eq!(
+            FuzzTensor::from_tensor(&output),
+            FuzzTensor::from_tensor(&TensorData::from_storage([2], expected).unwrap())
+        );
         assert_eq!(output.dtype(), dtype);
     }
 
-    let bool_lhs = TensorData::from_storage([4], Storage::Bool(vec![true, true, false, false])).unwrap();
-    let bool_rhs = TensorData::from_storage([4], Storage::Bool(vec![true, false, true, false])).unwrap();
+    let bool_lhs =
+        TensorData::from_storage([4], Storage::Bool(vec![true, true, false, false])).unwrap();
+    let bool_rhs =
+        TensorData::from_storage([4], Storage::Bool(vec![true, false, true, false])).unwrap();
     for (op, expected) in [
         (FuzzBinaryOp::Add, vec![true, true, true, false]),
         (FuzzBinaryOp::Sub, vec![false, true, true, false]),
         (FuzzBinaryOp::Mul, vec![true, false, false, false]),
         (FuzzBinaryOp::Maximum, vec![true, true, true, false]),
     ] {
-        let case = FuzzCase::Binary { op, lhs: FuzzTensor::from_tensor(&bool_lhs), rhs: FuzzTensor::from_tensor(&bool_rhs) };
+        let case = FuzzCase::Binary {
+            op,
+            lhs: FuzzTensor::from_tensor(&bool_lhs),
+            rhs: FuzzTensor::from_tensor(&bool_rhs),
+        };
         let built = case.build().unwrap();
-        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
-        assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&TensorData::from_storage([4], Storage::Bool(expected)).unwrap()));
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        assert_eq!(
+            FuzzTensor::from_tensor(&output),
+            FuzzTensor::from_tensor(
+                &TensorData::from_storage([4], Storage::Bool(expected)).unwrap()
+            )
+        );
     }
 
     for dtype in [DType::F32, DType::I32] {
         let mut b2_graph = crate::Graph::new();
         let b2_lhs = b2_graph.input_dtype("lhs", [2], dtype);
         let b2_rhs = b2_graph.input_dtype("rhs", [2], dtype);
-        for op in [crate::BinaryOp::Add, crate::BinaryOp::Sub, crate::BinaryOp::Mul] {
+        for op in [
+            crate::BinaryOp::Add,
+            crate::BinaryOp::Sub,
+            crate::BinaryOp::Mul,
+        ] {
             let output = b2_graph.binary(op, b2_lhs, b2_rhs).unwrap();
-            assert!(CpuJit::render_vectorized(&crate::lower_graph_elementwise(&b2_graph, output).unwrap()).unwrap().source.contains("B2 VectorProgram"));
+            assert!(
+                CpuJit::render_vectorized(
+                    &crate::lower_graph_elementwise(&b2_graph, output).unwrap()
+                )
+                .unwrap()
+                .source
+                .contains("B2 VectorProgram")
+            );
         }
     }
 
     let artifact_case = FuzzCase::Binary {
         op: FuzzBinaryOp::Sub,
-        lhs: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I16(vec![3, 1])).unwrap()),
+        lhs: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::I16(vec![3, 1])).unwrap(),
+        ),
         rhs: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::I16(vec![1])).unwrap()),
     };
     let json = serde_json::to_value(&artifact_case).unwrap();
-    assert_eq!(serde_json::from_value::<FuzzCase>(json).unwrap(), artifact_case);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(json).unwrap(),
+        artifact_case
+    );
     let built = artifact_case.build().unwrap();
-    let expected = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
-    let artifact = FuzzFailureArtifact::new(47, 53, artifact_case.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes, FuzzOutcome::value(&expected), FuzzOutcome::Error { class: "execute".into(), detail: "synthetic raw binary mismatch".into() }).unwrap();
+    let expected = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
+    let artifact = FuzzFailureArtifact::new(
+        47,
+        53,
+        artifact_case.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&expected),
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic raw binary mismatch".into(),
+        },
+    )
+    .unwrap();
     let artifact_bytes = artifact.to_bytes().unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap().to_bytes().unwrap(), artifact_bytes);
-    let minimized = minimize_case(&artifact_case, |candidate| matches!(candidate,
-        FuzzCase::Binary { op: FuzzBinaryOp::Sub, lhs, rhs }
-            if lhs.dtype == DType::I16 && rhs.dtype == DType::I16
-                && lhs.shape == vec![2] && rhs.shape.is_empty()
-                && lhs.bytes.iter().all(|byte| *byte == 0)
-                && rhs.bytes.iter().all(|byte| *byte == 0)
-    ));
-    assert!(matches!(minimized, FuzzCase::Binary { op: FuzzBinaryOp::Sub, ref lhs, ref rhs }
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact_bytes)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        artifact_bytes
+    );
+    let minimized = minimize_case(&artifact_case, |candidate| {
+        matches!(candidate,
+            FuzzCase::Binary { op: FuzzBinaryOp::Sub, lhs, rhs }
+                if lhs.dtype == DType::I16 && rhs.dtype == DType::I16
+                    && lhs.shape == vec![2] && rhs.shape.is_empty()
+                    && lhs.bytes.iter().all(|byte| *byte == 0)
+                    && rhs.bytes.iter().all(|byte| *byte == 0)
+        )
+    });
+    assert!(
+        matches!(minimized, FuzzCase::Binary { op: FuzzBinaryOp::Sub, ref lhs, ref rhs }
         if lhs.dtype == DType::I16 && rhs.dtype == DType::I16
-            && lhs.shape == vec![2] && rhs.shape.is_empty()));
+            && lhs.shape == vec![2] && rhs.shape.is_empty())
+    );
 }
 
 #[test]
@@ -1314,7 +1796,9 @@ fn generated_binary_cases_reach_all_ops_dtypes_and_broadcast_geometries() {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
-            let FuzzCase::Binary { op, lhs, rhs } = case else { continue };
+            let FuzzCase::Binary { op, lhs, rhs } = case else {
+                continue;
+            };
             pairs.insert((op, lhs.dtype));
             scalar_rhs |= rhs.shape.is_empty();
             scalar |= lhs.shape.is_empty();
@@ -1373,39 +1857,67 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
             &TensorData::from_storage([2, 2], Storage::F32(vec![1.0, 2.0, 3.0, 4.0])).unwrap(),
         ),
         padding: vec![(1, 0), (0, 2)],
-        fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::F32(vec![-0.0])).unwrap()),
+        fill: FuzzTensor::from_tensor(
+            &TensorData::from_storage([], Storage::F32(vec![-0.0])).unwrap(),
+        ),
     };
     let value = serde_json::to_value(&pad).unwrap();
     assert_eq!(value["kind"], "pad");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), pad);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        pad
+    );
     let mut unknown = value;
-    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
     assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
 
     for case in [
         pad.clone(),
         FuzzCase::Pad {
-            input: FuzzTensor::from_tensor(&TensorData::from_storage([0, 2], Storage::I32(vec![])).unwrap()),
+            input: FuzzTensor::from_tensor(
+                &TensorData::from_storage([0, 2], Storage::I32(vec![])).unwrap(),
+            ),
             padding: vec![(1, 1), (1, 0)],
-            fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::I32(vec![-7])).unwrap()),
+            fill: FuzzTensor::from_tensor(
+                &TensorData::from_storage([], Storage::I32(vec![-7])).unwrap(),
+            ),
         },
         FuzzCase::Pad {
-            input: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::Bool(vec![true])).unwrap()),
+            input: FuzzTensor::from_tensor(
+                &TensorData::from_storage([], Storage::Bool(vec![true])).unwrap(),
+            ),
             padding: vec![],
-            fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::Bool(vec![false])).unwrap()),
+            fill: FuzzTensor::from_tensor(
+                &TensorData::from_storage([], Storage::Bool(vec![false])).unwrap(),
+            ),
         },
     ] {
         let built = case.build().unwrap();
-        assert_eq!(built.ordered.len(), 1, "Pad fill is plan metadata, not an input binding");
+        assert_eq!(
+            built.ordered.len(),
+            1,
+            "Pad fill is plan metadata, not an input binding"
+        );
         let Op::Pad { padding, .. } = built.graph.op(built.output).unwrap() else {
             panic!("raw Pad case must retain its Pad root");
         };
-        let FuzzCase::Pad { padding: expected, .. } = &case else {
+        let FuzzCase::Pad {
+            padding: expected, ..
+        } = &case
+        else {
             unreachable!("constructed as Pad")
         };
         assert_eq!(padding, expected);
         let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
-        let MovementKernelKind::Pad { padding: planned, fill_bits, .. } = &plan.kind else {
+        let MovementKernelKind::Pad {
+            padding: planned,
+            fill_bits,
+            ..
+        } = &plan.kind
+        else {
             panic!("Pad root must use a Pad movement plan");
         };
         assert_eq!(planned, expected);
@@ -1417,27 +1929,55 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
         let item = &scheduled.items[0];
         assert!(item.boundary.is_none());
         assert!(matches!(item.kernel.kind(), UOpKind::Movement));
-        assert!(matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Pad { .. })));
+        assert!(
+            matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Pad { .. }))
+        );
         assert!(CpuJit::render(&item.kernel).is_ok());
         assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
-        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
     }
 
     let built = pad.build().unwrap();
-    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
     let expected = TensorData::from_storage(
         [3, 4],
-        Storage::F32(vec![-0.0, -0.0, -0.0, -0.0, 1.0, 2.0, -0.0, -0.0, 3.0, 4.0, -0.0, -0.0]),
-    ).unwrap();
-    assert_eq!(FuzzTensor::from_tensor(&output), FuzzTensor::from_tensor(&expected));
+        Storage::F32(vec![
+            -0.0, -0.0, -0.0, -0.0, 1.0, 2.0, -0.0, -0.0, 3.0, 4.0, -0.0, -0.0,
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        FuzzTensor::from_tensor(&output),
+        FuzzTensor::from_tensor(&expected)
+    );
     let artifact = FuzzFailureArtifact::new(
-        12, 16, pad.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        12,
+        16,
+        pad.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
         FuzzOutcome::value(&output),
-        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Pad mismatch".into() },
-    ).unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic Pad mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&pad, |candidate| {
         matches!(candidate, FuzzCase::Pad { input, fill, .. }
             if input.bytes == vec![0; 16] && fill.bytes == vec![0; 4])
@@ -1446,12 +1986,20 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
         if input.bytes == vec![0; 16] && fill.bytes == vec![0; 4]));
 
     let nan_fill = FuzzCase::Pad {
-        input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap(),
+        ),
         padding: vec![(1, 1)],
-        fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::F32(vec![f32::from_bits(0x7fc0_0001)])).unwrap()),
+        fill: FuzzTensor::from_tensor(
+            &TensorData::from_storage([], Storage::F32(vec![f32::from_bits(0x7fc0_0001)])).unwrap(),
+        ),
     };
     let nan_built = nan_fill.build().unwrap();
-    let MovementKernelKind::Pad { fill_bits, .. } = MovementKernelPlan::from_graph(&nan_built.graph, nan_built.output).unwrap().kind else {
+    let MovementKernelKind::Pad { fill_bits, .. } =
+        MovementKernelPlan::from_graph(&nan_built.graph, nan_built.output)
+            .unwrap()
+            .kind
+    else {
         unreachable!("Pad plan")
     };
     assert!(f32::from_bits(fill_bits as u32).is_nan());
@@ -1461,26 +2009,112 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
     // `MovementKernelPlan::fill_bits`, so raw half-NaN input/fill payload
     // identity is not claimed here.
     let dtype_cases = vec![
-        (DType::Bool, Storage::Bool(vec![false]), Storage::Bool(vec![true]), 1, "uint8_t"),
-        (DType::I8, Storage::I8(vec![i8::MIN]), Storage::I8(vec![-1]), 0xff, "int8_t"),
-        (DType::U8, Storage::U8(vec![u8::MAX]), Storage::U8(vec![u8::MAX]), 0xff, "uint8_t"),
-        (DType::I16, Storage::I16(vec![i16::MIN]), Storage::I16(vec![-1]), 0xffff, "int16_t"),
-        (DType::U16, Storage::U16(vec![u16::MAX]), Storage::U16(vec![u16::MAX]), 0xffff, "uint16_t"),
-        (DType::I32, Storage::I32(vec![i32::MIN]), Storage::I32(vec![-1]), 0xffff_ffff, "int32_t"),
-        (DType::U32, Storage::U32(vec![u32::MAX]), Storage::U32(vec![u32::MAX]), 0xffff_ffff, "uint32_t"),
-        (DType::I64, Storage::I64(vec![i64::MIN]), Storage::I64(vec![-1]), u64::MAX, "int64_t"),
-        (DType::U64, Storage::U64(vec![u64::MAX]), Storage::U64(vec![u64::MAX]), u64::MAX, "uint64_t"),
-        (DType::F16, Storage::F16(vec![0x3c00]), Storage::F16(vec![0x8000]), 0x8000, "uint16_t"),
-        (DType::BF16, Storage::BF16(vec![0x3f80]), Storage::BF16(vec![0x8000]), 0x8000, "uint16_t"),
-        (DType::F32, Storage::F32(vec![1.0]), Storage::F32(vec![-0.0]), 0x8000_0000, "float"),
-        (DType::F64, Storage::F64(vec![1.0]), Storage::F64(vec![-0.0]), 0x8000_0000_0000_0000, "double"),
+        (
+            DType::Bool,
+            Storage::Bool(vec![false]),
+            Storage::Bool(vec![true]),
+            1,
+            "uint8_t",
+        ),
+        (
+            DType::I8,
+            Storage::I8(vec![i8::MIN]),
+            Storage::I8(vec![-1]),
+            0xff,
+            "int8_t",
+        ),
+        (
+            DType::U8,
+            Storage::U8(vec![u8::MAX]),
+            Storage::U8(vec![u8::MAX]),
+            0xff,
+            "uint8_t",
+        ),
+        (
+            DType::I16,
+            Storage::I16(vec![i16::MIN]),
+            Storage::I16(vec![-1]),
+            0xffff,
+            "int16_t",
+        ),
+        (
+            DType::U16,
+            Storage::U16(vec![u16::MAX]),
+            Storage::U16(vec![u16::MAX]),
+            0xffff,
+            "uint16_t",
+        ),
+        (
+            DType::I32,
+            Storage::I32(vec![i32::MIN]),
+            Storage::I32(vec![-1]),
+            0xffff_ffff,
+            "int32_t",
+        ),
+        (
+            DType::U32,
+            Storage::U32(vec![u32::MAX]),
+            Storage::U32(vec![u32::MAX]),
+            0xffff_ffff,
+            "uint32_t",
+        ),
+        (
+            DType::I64,
+            Storage::I64(vec![i64::MIN]),
+            Storage::I64(vec![-1]),
+            u64::MAX,
+            "int64_t",
+        ),
+        (
+            DType::U64,
+            Storage::U64(vec![u64::MAX]),
+            Storage::U64(vec![u64::MAX]),
+            u64::MAX,
+            "uint64_t",
+        ),
+        (
+            DType::F16,
+            Storage::F16(vec![0x3c00]),
+            Storage::F16(vec![0x8000]),
+            0x8000,
+            "uint16_t",
+        ),
+        (
+            DType::BF16,
+            Storage::BF16(vec![0x3f80]),
+            Storage::BF16(vec![0x8000]),
+            0x8000,
+            "uint16_t",
+        ),
+        (
+            DType::F32,
+            Storage::F32(vec![1.0]),
+            Storage::F32(vec![-0.0]),
+            0x8000_0000,
+            "float",
+        ),
+        (
+            DType::F64,
+            Storage::F64(vec![1.0]),
+            Storage::F64(vec![-0.0]),
+            0x8000_0000_0000_0000,
+            "double",
+        ),
     ];
     for (dtype, input_storage, fill_storage, expected_bits, native_type) in dtype_cases {
         let input = FuzzTensor::from_tensor(&TensorData::from_storage([1], input_storage).unwrap());
         let fill = FuzzTensor::from_tensor(&TensorData::from_storage([], fill_storage).unwrap());
-        let case = FuzzCase::Pad { input: input.clone(), padding: vec![(1, 0)], fill };
+        let case = FuzzCase::Pad {
+            input: input.clone(),
+            padding: vec![(1, 0)],
+            fill,
+        };
         let built = case.build().unwrap();
-        let MovementKernelKind::Pad { fill_bits, .. } = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap().kind else {
+        let MovementKernelKind::Pad { fill_bits, .. } =
+            MovementKernelPlan::from_graph(&built.graph, built.output)
+                .unwrap()
+                .kind
+        else {
             unreachable!("Pad plan")
         };
         assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
@@ -1496,10 +2130,19 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
             _ => assert!(scalar.source.contains("UINT64_C")),
         }
         assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
-        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
-        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
         let output = FuzzTensor::from_tensor(&output);
         assert_eq!(&output.bytes[dtype.itemsize()..], input.bytes.as_slice());
     }
@@ -1510,10 +2153,32 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
         (DType::BF16, 0x7fc1_u16, true),
         (DType::BF16, 0x7f80_u16, false),
     ] {
-        let input = FuzzTensor::from_tensor(&TensorData::from_scalars([1], dtype, [Scalar::F(1.0)]).unwrap());
-        let fill = FuzzTensor::from_tensor(&TensorData::from_storage([], if dtype == DType::F16 { Storage::F16(vec![fill]) } else { Storage::BF16(vec![fill]) }).unwrap());
-        let built = FuzzCase::Pad { input, padding: vec![(1, 0)], fill }.build().unwrap();
-        let MovementKernelKind::Pad { fill_bits, .. } = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap().kind else {
+        let input = FuzzTensor::from_tensor(
+            &TensorData::from_scalars([1], dtype, [Scalar::F(1.0)]).unwrap(),
+        );
+        let fill = FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [],
+                if dtype == DType::F16 {
+                    Storage::F16(vec![fill])
+                } else {
+                    Storage::BF16(vec![fill])
+                },
+            )
+            .unwrap(),
+        );
+        let built = FuzzCase::Pad {
+            input,
+            padding: vec![(1, 0)],
+            fill,
+        }
+        .build()
+        .unwrap();
+        let MovementKernelKind::Pad { fill_bits, .. } =
+            MovementKernelPlan::from_graph(&built.graph, built.output)
+                .unwrap()
+                .kind
+        else {
             unreachable!("Pad plan")
         };
         let committed = if dtype == DType::F16 {
@@ -1521,13 +2186,25 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
         } else {
             crate::bf16_to_f32(fill_bits as u16)
         };
-        assert!(if expect_nan { committed.is_nan() } else { committed.is_infinite() });
+        assert!(if expect_nan {
+            committed.is_nan()
+        } else {
+            committed.is_infinite()
+        });
     }
 
     for (dtype, fill, expect_nan) in [
-        (DType::F32, Storage::F32(vec![f32::from_bits(0x7fc0_0001)]), true),
+        (
+            DType::F32,
+            Storage::F32(vec![f32::from_bits(0x7fc0_0001)]),
+            true,
+        ),
         (DType::F32, Storage::F32(vec![f32::INFINITY]), false),
-        (DType::F64, Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001)]), true),
+        (
+            DType::F64,
+            Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001)]),
+            true,
+        ),
         (DType::F64, Storage::F64(vec![f64::INFINITY]), false),
     ] {
         let input = FuzzTensor::from_tensor(
@@ -1542,7 +2219,9 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
         .build()
         .unwrap();
         let MovementKernelKind::Pad { fill_bits, .. } =
-            MovementKernelPlan::from_graph(&built.graph, built.output).unwrap().kind
+            MovementKernelPlan::from_graph(&built.graph, built.output)
+                .unwrap()
+                .kind
         else {
             unreachable!("Pad plan")
         };
@@ -1553,24 +2232,43 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
         };
         assert_eq!(committed, expect_nan);
         if !expect_nan {
-            assert_eq!(fill_bits, if dtype == DType::F32 { f32::INFINITY.to_bits() as u64 } else { f64::INFINITY.to_bits() });
+            assert_eq!(
+                fill_bits,
+                if dtype == DType::F32 {
+                    f32::INFINITY.to_bits() as u64
+                } else {
+                    f64::INFINITY.to_bits()
+                }
+            );
         }
     }
 
     let bad_shape = FuzzCase::Pad {
-        input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap(),
+        ),
         padding: vec![(0, 1)],
-        fill: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![0.0])).unwrap()),
+        fill: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::F32(vec![0.0])).unwrap(),
+        ),
     };
     let bad_dtype = FuzzCase::Pad {
-        input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap(),
+        ),
         padding: vec![(0, 1)],
-        fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::I32(vec![0])).unwrap()),
+        fill: FuzzTensor::from_tensor(
+            &TensorData::from_storage([], Storage::I32(vec![0])).unwrap(),
+        ),
     };
     let bad_padding = FuzzCase::Pad {
-        input: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap(),
+        ),
         padding: vec![],
-        fill: FuzzTensor::from_tensor(&TensorData::from_storage([], Storage::F32(vec![0.0])).unwrap()),
+        fill: FuzzTensor::from_tensor(
+            &TensorData::from_storage([], Storage::F32(vec![0.0])).unwrap(),
+        ),
     };
     assert!(bad_shape.validate().is_err());
     assert!(bad_dtype.validate().is_err());
@@ -1600,7 +2298,9 @@ fn generated_gather_cases_are_valid_diverse_and_deterministic() {
             assert_eq!(index.shape.len(), input.shape.len());
             assert!(axis < input.shape.len());
             assert!(matches!(index.dtype, DType::I32 | DType::I64));
-            for (dimension, (&source, &selected)) in input.shape.iter().zip(&index.shape).enumerate() {
+            for (dimension, (&source, &selected)) in
+                input.shape.iter().zip(&index.shape).enumerate()
+            {
                 if dimension != axis {
                     assert!(selected <= source);
                 }
@@ -1614,7 +2314,8 @@ fn generated_gather_cases_are_valid_diverse_and_deterministic() {
                 assert!(value >= 0 && (value as usize) < input.shape[axis]);
                 duplicate |= !values.insert(value);
             }
-            empty |= input.shape.iter().any(|extent| *extent == 0) || index.shape.iter().any(|extent| *extent == 0);
+            empty |= input.shape.iter().any(|extent| *extent == 0)
+                || index.shape.iter().any(|extent| *extent == 0);
             axes.insert((input.shape.len(), axis));
             dtypes.insert(input.dtype);
             index_i32 |= index.dtype == DType::I32;
@@ -1633,7 +2334,11 @@ fn generated_gather_cases_are_valid_diverse_and_deterministic() {
 fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
     let gather = FuzzCase::Gather {
         input: FuzzTensor::from_tensor(
-            &TensorData::from_storage([2, 4], Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])).unwrap(),
+            &TensorData::from_storage(
+                [2, 4],
+                Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+            )
+            .unwrap(),
         ),
         index: FuzzTensor::from_tensor(
             &TensorData::from_storage([2, 3], Storage::I32(vec![3, 1, 1, 0, 2, 2])).unwrap(),
@@ -1642,21 +2347,35 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
     };
     let value = serde_json::to_value(&gather).unwrap();
     assert_eq!(value["kind"], "gather");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), gather);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        gather
+    );
     let mut unknown = value;
-    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
     assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
 
     for case in [
         gather.clone(),
         FuzzCase::Gather {
-            input: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I32(vec![10, 20, 30])).unwrap()),
-            index: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I64(vec![2, 0, 1])).unwrap()),
+            input: FuzzTensor::from_tensor(
+                &TensorData::from_storage([3], Storage::I32(vec![10, 20, 30])).unwrap(),
+            ),
+            index: FuzzTensor::from_tensor(
+                &TensorData::from_storage([3], Storage::I64(vec![2, 0, 1])).unwrap(),
+            ),
             axis: 0,
         },
         FuzzCase::Gather {
-            input: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap()),
-            index: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::I32(vec![])).unwrap()),
+            input: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap(),
+            ),
+            index: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2, 0], Storage::I32(vec![])).unwrap(),
+            ),
             axis: 1,
         },
     ] {
@@ -1669,7 +2388,12 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         };
         assert_eq!(axis, expected);
         let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
-        let MovementKernelKind::Gather { axis: planned, input, index } = &plan.kind else {
+        let MovementKernelKind::Gather {
+            axis: planned,
+            input,
+            index,
+        } = &plan.kind
+        else {
             panic!("Gather root must use a Gather movement plan");
         };
         assert_eq!(planned, expected);
@@ -1680,61 +2404,134 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         let item = &scheduled.items[0];
         assert!(item.boundary.is_none());
         assert!(matches!(item.kernel.kind(), UOpKind::Movement));
-        assert!(matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Gather { .. })));
+        assert!(
+            matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Gather { .. }))
+        );
         let scalar = CpuJit::render(&item.kernel).unwrap();
-        assert!(scalar.source.contains("rg_selected < 0") && scalar.source.contains("failure[1]=3"));
+        assert!(
+            scalar.source.contains("rg_selected < 0") && scalar.source.contains("failure[1]=3")
+        );
         assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
-        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
     }
 
     let built = gather.build().unwrap();
-    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
     assert_eq!(
         FuzzTensor::from_tensor(&output),
-        FuzzTensor::from_tensor(&TensorData::from_storage([2, 3], Storage::F32(vec![3.0, 1.0, 1.0, 4.0, 6.0, 6.0])).unwrap()),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage([2, 3], Storage::F32(vec![3.0, 1.0, 1.0, 4.0, 6.0, 6.0]))
+                .unwrap()
+        ),
     );
     let artifact = FuzzFailureArtifact::new(
-        13, 17, gather.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        13,
+        17,
+        gather.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
         FuzzOutcome::value(&output),
-        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Gather mismatch".into() },
-    ).unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic Gather mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&gather, |candidate| {
         matches!(candidate, FuzzCase::Gather { input, index, axis }
             if input.bytes == vec![0; 32] && index.bytes == vec![0; 24] && *axis == 1)
     });
-    assert!(matches!(zeroed, FuzzCase::Gather { ref input, ref index, axis }
-        if input.bytes == vec![0; 32] && index.bytes == vec![0; 24] && axis == 1));
+    assert!(
+        matches!(zeroed, FuzzCase::Gather { ref input, ref index, axis }
+        if input.bytes == vec![0; 32] && index.bytes == vec![0; 24] && axis == 1)
+    );
 
     let ieee = FuzzCase::Gather {
-        input: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])).unwrap()),
-        index: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I32(vec![1, 0, 2])).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [3],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::INFINITY,
+                ]),
+            )
+            .unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::I32(vec![1, 0, 2])).unwrap(),
+        ),
         axis: 0,
     };
     let ieee_built = ieee.build().unwrap();
-    let ieee_output = CpuBackend.execute(&ieee_built.graph, ieee_built.output, &ieee_built.oracle).unwrap();
+    let ieee_output = CpuBackend
+        .execute(&ieee_built.graph, ieee_built.output, &ieee_built.oracle)
+        .unwrap();
     assert_eq!(
         FuzzTensor::from_tensor(&ieee_output),
-        FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0, f32::INFINITY])).unwrap()),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [3],
+                Storage::F32(vec![f32::from_bits(0x7fc0_0001), -0.0, f32::INFINITY])
+            )
+            .unwrap()
+        ),
     );
 
     // Raw Gather selects storage lanes directly through MovementKernelPlan;
     // unlike scalar helpers, no value commitment occurs between input and
     // output. These finite lanes also retain exact CPU-oracle payloads.
     let dtype_cases = vec![
-        (DType::Bool, Storage::Bool(vec![true, false, true]), "uint8_t"),
+        (
+            DType::Bool,
+            Storage::Bool(vec![true, false, true]),
+            "uint8_t",
+        ),
         (DType::I8, Storage::I8(vec![i8::MIN, -1, i8::MAX]), "int8_t"),
         (DType::U8, Storage::U8(vec![0, 1, u8::MAX]), "uint8_t"),
-        (DType::I16, Storage::I16(vec![i16::MIN, -1, i16::MAX]), "int16_t"),
+        (
+            DType::I16,
+            Storage::I16(vec![i16::MIN, -1, i16::MAX]),
+            "int16_t",
+        ),
         (DType::U16, Storage::U16(vec![0, 1, u16::MAX]), "uint16_t"),
-        (DType::I32, Storage::I32(vec![i32::MIN, -1, i32::MAX]), "int32_t"),
+        (
+            DType::I32,
+            Storage::I32(vec![i32::MIN, -1, i32::MAX]),
+            "int32_t",
+        ),
         (DType::U32, Storage::U32(vec![0, 1, u32::MAX]), "uint32_t"),
-        (DType::I64, Storage::I64(vec![i64::MIN, -1, i64::MAX]), "int64_t"),
+        (
+            DType::I64,
+            Storage::I64(vec![i64::MIN, -1, i64::MAX]),
+            "int64_t",
+        ),
         (DType::U64, Storage::U64(vec![0, 1, u64::MAX]), "uint64_t"),
-        (DType::F16, Storage::F16(vec![0x3c00, 0x4000, 0x4200]), "uint16_t"),
-        (DType::BF16, Storage::BF16(vec![0x3f80, 0x4000, 0x4040]), "uint16_t"),
+        (
+            DType::F16,
+            Storage::F16(vec![0x3c00, 0x4000, 0x4200]),
+            "uint16_t",
+        ),
+        (
+            DType::BF16,
+            Storage::BF16(vec![0x3f80, 0x4000, 0x4040]),
+            "uint16_t",
+        ),
         (DType::F32, Storage::F32(vec![1.0, 2.0, 3.0]), "float"),
         (DType::F64, Storage::F64(vec![1.0, 2.0, 3.0]), "double"),
     ];
@@ -1758,7 +2555,12 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         };
         let built = case.build().unwrap();
         let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
-        let MovementKernelKind::Gather { input: planned, index: planned_index, .. } = &plan.kind else {
+        let MovementKernelKind::Gather {
+            input: planned,
+            index: planned_index,
+            ..
+        } = &plan.kind
+        else {
             unreachable!("Gather plan")
         };
         assert_eq!(plan.dtype, dtype);
@@ -1769,11 +2571,22 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         assert!(scalar.source.contains(native_type));
         assert!(scalar.source.contains("rg_selected < 0"));
         assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
-        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
-        let selected = plan.execute(&[input.to_tensor().unwrap(), index.to_tensor().unwrap()]).unwrap();
-        let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
+        let selected = plan
+            .execute(&[input.to_tensor().unwrap(), index.to_tensor().unwrap()])
+            .unwrap();
+        let oracle = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
         let expected = [
             &input.bytes[2 * dtype.itemsize()..3 * dtype.itemsize()],
             &input.bytes[..dtype.itemsize()],
@@ -1787,14 +2600,38 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
     for (dtype, storage) in [
         (DType::F16, Storage::F16(vec![0x8000, 0x7e01, 0x7c00])),
         (DType::BF16, Storage::BF16(vec![0x8000, 0x7fc1, 0x7f80])),
-        (DType::F32, Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])),
-        (DType::F64, Storage::F64(vec![f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0x7ff8_0000_0000_0001), f64::INFINITY])),
+        (
+            DType::F32,
+            Storage::F32(vec![
+                f32::from_bits(0x8000_0000),
+                f32::from_bits(0x7fc0_0001),
+                f32::INFINITY,
+            ]),
+        ),
+        (
+            DType::F64,
+            Storage::F64(vec![
+                f64::from_bits(0x8000_0000_0000_0000),
+                f64::from_bits(0x7ff8_0000_0000_0001),
+                f64::INFINITY,
+            ]),
+        ),
     ] {
         let input = FuzzTensor::from_tensor(&TensorData::from_storage([3], storage).unwrap());
-        let index = FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I64(vec![1, 0, 2])).unwrap());
-        let built = FuzzCase::Gather { input: input.clone(), index: index.clone(), axis: 0 }.build().unwrap();
+        let index = FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::I64(vec![1, 0, 2])).unwrap(),
+        );
+        let built = FuzzCase::Gather {
+            input: input.clone(),
+            index: index.clone(),
+            axis: 0,
+        }
+        .build()
+        .unwrap();
         let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
-        let selected = plan.execute(&[input.to_tensor().unwrap(), index.to_tensor().unwrap()]).unwrap();
+        let selected = plan
+            .execute(&[input.to_tensor().unwrap(), index.to_tensor().unwrap()])
+            .unwrap();
         let expected = [
             &input.bytes[dtype.itemsize()..2 * dtype.itemsize()],
             &input.bytes[..dtype.itemsize()],
@@ -1805,13 +2642,21 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
     }
 
     let bad_dtype = FuzzCase::Gather {
-        input: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap()),
-        index: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I16(vec![0])).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::I16(vec![0])).unwrap(),
+        ),
         axis: 0,
     };
     let bad_index = FuzzCase::Gather {
-        input: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap()),
-        index: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I32(vec![2])).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::I32(vec![2])).unwrap(),
+        ),
         axis: 0,
     };
     assert!(bad_dtype.validate().is_err());
@@ -1881,7 +2726,9 @@ fn generated_scatter_cases_are_valid_diverse_and_deterministic() {
             index_i32 |= index.dtype == DType::I32;
             index_i64 |= index.dtype == DType::I64;
             match op {
-                FuzzScatterOp::Replace => { replace_dtypes.insert(base.dtype); },
+                FuzzScatterOp::Replace => {
+                    replace_dtypes.insert(base.dtype);
+                }
                 FuzzScatterOp::Add => {
                     assert!(matches!(base.dtype, DType::F32 | DType::F64));
                     add_f32 |= base.dtype == DType::F32;
@@ -1902,8 +2749,7 @@ fn generated_scatter_cases_are_valid_diverse_and_deterministic() {
 fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
     let replace = FuzzCase::Scatter {
         base: FuzzTensor::from_tensor(
-            &TensorData::from_storage([1, 4], Storage::F32(vec![10.0, 20.0, 30.0, 40.0]))
-                .unwrap(),
+            &TensorData::from_storage([1, 4], Storage::F32(vec![10.0, 20.0, 30.0, 40.0])).unwrap(),
         ),
         index: FuzzTensor::from_tensor(
             &TensorData::from_storage([1, 3], Storage::I32(vec![2, 1, 2])).unwrap(),
@@ -1916,9 +2762,15 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
     };
     let value = serde_json::to_value(&replace).unwrap();
     assert_eq!(value["kind"], "scatter");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), replace);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        replace
+    );
     let mut unknown = value;
-    unknown.as_object_mut().unwrap().insert("unknown".into(), serde_json::json!(true));
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
     assert!(serde_json::from_value::<FuzzCase>(unknown).is_err());
 
     for case in [
@@ -1937,16 +2789,28 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
             op: FuzzScatterOp::Add,
         },
         FuzzCase::Scatter {
-            base: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F64(vec![1.0, 10.0])).unwrap()),
-            index: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I64(vec![1, 1])).unwrap()),
-            updates: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F64(vec![0.5, 4.0])).unwrap()),
+            base: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2], Storage::F64(vec![1.0, 10.0])).unwrap(),
+            ),
+            index: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2], Storage::I64(vec![1, 1])).unwrap(),
+            ),
+            updates: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2], Storage::F64(vec![0.5, 4.0])).unwrap(),
+            ),
             axis: 0,
             op: FuzzScatterOp::Add,
         },
         FuzzCase::Scatter {
-            base: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap()),
-            index: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::I32(vec![])).unwrap()),
-            updates: FuzzTensor::from_tensor(&TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap()),
+            base: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap(),
+            ),
+            index: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2, 0], Storage::I32(vec![])).unwrap(),
+            ),
+            updates: FuzzTensor::from_tensor(
+                &TensorData::from_storage([2, 0], Storage::F16(vec![])).unwrap(),
+            ),
             axis: 1,
             op: FuzzScatterOp::Replace,
         },
@@ -1955,13 +2819,21 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
         let Op::Scatter { axis, add, .. } = built.graph.op(built.output).unwrap() else {
             panic!("raw Scatter case must retain its Scatter root");
         };
-        let FuzzCase::Scatter { axis: expected, op, .. } = &case else {
+        let FuzzCase::Scatter {
+            axis: expected, op, ..
+        } = &case
+        else {
             unreachable!("constructed as Scatter")
         };
         assert_eq!(axis, expected);
         assert_eq!(*add, *op == FuzzScatterOp::Add);
         let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
-        let MovementKernelKind::Scatter { axis: planned, add: planned_add, .. } = &plan.kind else {
+        let MovementKernelKind::Scatter {
+            axis: planned,
+            add: planned_add,
+            ..
+        } = &plan.kind
+        else {
             panic!("Scatter root must use a Scatter movement plan");
         };
         assert_eq!(planned, expected);
@@ -1971,22 +2843,37 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
         let item = &scheduled.items[0];
         assert!(item.boundary.is_none());
         assert!(matches!(item.kernel.kind(), UOpKind::Movement));
-        assert!(matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Scatter { .. })));
+        assert!(
+            matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Scatter { .. }))
+        );
         let scalar = CpuJit::render(&item.kernel).unwrap();
-        assert!(scalar.source.contains("memcpy(") && scalar.source.contains("rg_selected < 0") && scalar.source.contains("failure[1]=3"));
+        assert!(
+            scalar.source.contains("memcpy(")
+                && scalar.source.contains("rg_selected < 0")
+                && scalar.source.contains("failure[1]=3")
+        );
         if *op == FuzzScatterOp::Add {
             assert!(scalar.source.contains("] += ((const"));
         } else {
             assert!(scalar.source.contains("] = ((const"));
         }
         assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
-        assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
     }
 
     let built = replace.build().unwrap();
-    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
     assert_eq!(
         FuzzTensor::from_tensor(&output),
         FuzzTensor::from_tensor(
@@ -2007,7 +2894,9 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
         op: FuzzScatterOp::Add,
     };
     let add_built = add.build().unwrap();
-    let add_output = CpuBackend.execute(&add_built.graph, add_built.output, &add_built.oracle).unwrap();
+    let add_output = CpuBackend
+        .execute(&add_built.graph, add_built.output, &add_built.oracle)
+        .unwrap();
     assert_eq!(
         FuzzTensor::from_tensor(&add_output),
         FuzzTensor::from_tensor(
@@ -2015,45 +2904,92 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
         ),
     );
     let artifact = FuzzFailureArtifact::new(
-        14, 19, replace.clone(), FuzzPath::NativeScalar, FuzzComparisonPolicy::ExactBytes,
+        14,
+        19,
+        replace.clone(),
+        FuzzPath::NativeScalar,
+        FuzzComparisonPolicy::ExactBytes,
         FuzzOutcome::value(&output),
-        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Scatter mismatch".into() },
-    ).unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic Scatter mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&replace, |candidate| {
         matches!(candidate, FuzzCase::Scatter { base, index, updates, axis, op }
             if base.bytes == vec![0; 16] && index.bytes == vec![0; 12]
                 && updates.bytes == vec![0; 12] && *axis == 1 && *op == FuzzScatterOp::Replace)
     });
-    assert!(matches!(zeroed, FuzzCase::Scatter { ref base, ref index, ref updates, axis, op }
+    assert!(
+        matches!(zeroed, FuzzCase::Scatter { ref base, ref index, ref updates, axis, op }
         if base.bytes == vec![0; 16] && index.bytes == vec![0; 12]
-            && updates.bytes == vec![0; 12] && axis == 1 && op == FuzzScatterOp::Replace));
+            && updates.bytes == vec![0; 12] && axis == 1 && op == FuzzScatterOp::Replace)
+    );
 
     let ieee = FuzzCase::Scatter {
-        base: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![0.0, 1.0, 2.0])).unwrap()),
-        index: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::I32(vec![2, 0, 1])).unwrap()),
-        updates: FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])).unwrap()),
+        base: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::F32(vec![0.0, 1.0, 2.0])).unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::I32(vec![2, 0, 1])).unwrap(),
+        ),
+        updates: FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [3],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::INFINITY,
+                ]),
+            )
+            .unwrap(),
+        ),
         axis: 0,
         op: FuzzScatterOp::Replace,
     };
     let ieee_built = ieee.build().unwrap();
-    let ieee_output = CpuBackend.execute(&ieee_built.graph, ieee_built.output, &ieee_built.oracle).unwrap();
+    let ieee_output = CpuBackend
+        .execute(&ieee_built.graph, ieee_built.output, &ieee_built.oracle)
+        .unwrap();
     assert_eq!(
         FuzzTensor::from_tensor(&ieee_output),
-        FuzzTensor::from_tensor(&TensorData::from_storage([3], Storage::F32(vec![f32::from_bits(0x7fc0_0001), f32::INFINITY, -0.0])).unwrap()),
+        FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [3],
+                Storage::F32(vec![f32::from_bits(0x7fc0_0001), f32::INFINITY, -0.0])
+            )
+            .unwrap()
+        ),
     );
 
     let bad_add = FuzzCase::Scatter {
-        base: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::I32(vec![1, 2])).unwrap()),
-        index: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I32(vec![0])).unwrap()),
-        updates: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I32(vec![3])).unwrap()),
+        base: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::I32(vec![1, 2])).unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::I32(vec![0])).unwrap(),
+        ),
+        updates: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::I32(vec![3])).unwrap(),
+        ),
         axis: 0,
         op: FuzzScatterOp::Add,
     };
     let bad_index = FuzzCase::Scatter {
-        base: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap()),
-        index: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::I64(vec![-1])).unwrap()),
-        updates: FuzzTensor::from_tensor(&TensorData::from_storage([1], Storage::F32(vec![3.0])).unwrap()),
+        base: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+        ),
+        index: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::I64(vec![-1])).unwrap(),
+        ),
+        updates: FuzzTensor::from_tensor(
+            &TensorData::from_storage([1], Storage::F32(vec![3.0])).unwrap(),
+        ),
         axis: 0,
         op: FuzzScatterOp::Replace,
     };
@@ -2071,7 +3007,10 @@ fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
     };
     let value = serde_json::to_value(&tensor_t).unwrap();
     assert_eq!(value["kind"], "tensor_t");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), tensor_t);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        tensor_t
+    );
     let mut unknown = value;
     unknown
         .as_object_mut()
@@ -2098,18 +3037,26 @@ fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
         assert_eq!(axes, &vec![1, 0]);
         assert_eq!(
             built.graph.shape(built.output).unwrap().dims(),
-            &[built.graph.shape(*source).unwrap().dims()[1], built.graph.shape(*source).unwrap().dims()[0]]
+            &[
+                built.graph.shape(*source).unwrap().dims()[1],
+                built.graph.shape(*source).unwrap().dims()[0]
+            ]
         );
         let scheduled = schedule(&built.graph, built.output).unwrap();
         for item in &scheduled.items {
             assert!(item.boundary.is_none());
-            assert!(item.kernel.topological().unwrap().iter().any(|node| {
-                matches!(node.arg(), UArg::ViewBufferIndex { .. })
-            }));
+            assert!(
+                item.kernel
+                    .topological()
+                    .unwrap()
+                    .iter()
+                    .any(|node| { matches!(node.arg(), UArg::ViewBufferIndex { .. }) })
+            );
             assert!(CpuJit::render(&item.kernel).is_ok());
             assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
         }
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
         let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.to_bytes().unwrap(), bytes);
@@ -2120,7 +3067,10 @@ fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
     let output = CpuBackend
         .execute(&built.graph, built.output, &built.oracle)
         .unwrap();
-    assert_eq!(output.storage(), &Storage::F32(vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]));
+    assert_eq!(
+        output.storage(),
+        &Storage::F32(vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0])
+    );
     let expected = FuzzOutcome::value(&output);
     let artifact = FuzzFailureArtifact::new(
         11,
@@ -2135,7 +3085,10 @@ fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
         },
     )
     .unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&tensor_t, |candidate| {
         matches!(candidate, FuzzCase::TensorT { input }
             if input.shape == vec![2, 3] && input.bytes == vec![0; 24])
@@ -2208,7 +3161,10 @@ fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
         };
         assert!(matches!(
             built.graph.op(*lhs).unwrap(),
-            Op::Cast { dtype: DType::Bool, .. }
+            Op::Cast {
+                dtype: DType::Bool,
+                ..
+            }
         ));
         assert!(matches!(
             built.graph.op(*rhs).unwrap(),
@@ -2224,9 +3180,11 @@ fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
                 matches!(node.kind(), UOpKind::Cast)
                     && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
             }));
-            assert!(nodes.iter().any(|node| {
-                matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne))
-            }));
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| { matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)) })
+            );
             assert!(!nodes.iter().any(|node| {
                 matches!(node.kind(), UOpKind::GraphLogical(crate::LogicalOp::Not))
             }));
@@ -2234,7 +3192,8 @@ fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
         for item in &scheduled.items {
             assert_kernel(&item.kernel);
         }
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         for item in &captured.items {
             assert_kernel(&item.kernel);
         }
@@ -2262,10 +3221,14 @@ fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
         },
     )
     .unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
-    let zeroed = minimize_case(&logical_not, |candidate| {
-        matches!(candidate, FuzzCase::LogicalNot { input } if input.bytes == vec![0; 28])
-    });
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
+    let zeroed = minimize_case(
+        &logical_not,
+        |candidate| matches!(candidate, FuzzCase::LogicalNot { input } if input.bytes == vec![0; 28]),
+    );
     assert!(matches!(zeroed, FuzzCase::LogicalNot { ref input } if input.bytes == vec![0; 28]));
     let scalarized = minimize_case(&logical_not, |_| true);
     assert!(matches!(scalarized, FuzzCase::LogicalNot { ref input } if input.shape.is_empty()));
@@ -2286,11 +3249,17 @@ fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
         lhs: FuzzTensor::from_tensor(
             &TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap(),
         ),
-        rhs: FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool)),
+        rhs: FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(
+            Scalar::Bool(true),
+            DType::Bool,
+        )),
     };
     let value = serde_json::to_value(&logical).unwrap();
     assert_eq!(value["kind"], "logical");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), logical);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        logical
+    );
     let mut unknown = value;
     unknown
         .as_object_mut()
@@ -2305,13 +3274,22 @@ fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
             FuzzTensor::from_tensor(
                 &TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap(),
             ),
-            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool)),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(
+                Scalar::Bool(true),
+                DType::Bool,
+            )),
         ),
         (
             FuzzLogicalOp::Or,
             LogicalOp::Or,
-            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::Bool(false), DType::Bool)),
-            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool)),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(
+                Scalar::Bool(false),
+                DType::Bool,
+            )),
+            FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(
+                Scalar::Bool(true),
+                DType::Bool,
+            )),
         ),
     ] {
         let case = FuzzCase::Logical { op, lhs, rhs };
@@ -2322,19 +3300,16 @@ fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
         ));
         let scheduled = schedule(&built.graph, built.output).unwrap();
         assert!(scheduled.items.iter().any(|item| {
-            item.kernel
-                .topological()
-                .unwrap()
-                .iter()
-                .any(|uop| matches!(uop.kind(), UOpKind::GraphLogical(actual) if *actual == graph_op))
+            item.kernel.topological().unwrap().iter().any(
+                |uop| matches!(uop.kind(), UOpKind::GraphLogical(actual) if *actual == graph_op),
+            )
         }));
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         assert!(captured.items.iter().any(|item| {
-            item.kernel
-                .topological()
-                .unwrap()
-                .iter()
-                .any(|uop| matches!(uop.kind(), UOpKind::GraphLogical(actual) if *actual == graph_op))
+            item.kernel.topological().unwrap().iter().any(
+                |uop| matches!(uop.kind(), UOpKind::GraphLogical(actual) if *actual == graph_op),
+            )
         }));
     }
 
@@ -2357,7 +3332,10 @@ fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
         },
     )
     .unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&logical, |candidate| {
         matches!(candidate, FuzzCase::Logical { lhs, rhs, .. }
             if lhs.bytes == vec![0; 2] && rhs.bytes == vec![0])
@@ -2365,8 +3343,10 @@ fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
     assert!(matches!(zeroed, FuzzCase::Logical { ref lhs, ref rhs, .. }
         if lhs.bytes == vec![0; 2] && rhs.bytes == vec![0]));
     let scalarized = minimize_case(&logical, |_| true);
-    assert!(matches!(scalarized, FuzzCase::Logical { ref lhs, ref rhs, .. }
-        if lhs.shape.is_empty() && rhs.shape.is_empty()));
+    assert!(
+        matches!(scalarized, FuzzCase::Logical { ref lhs, ref rhs, .. }
+        if lhs.shape.is_empty() && rhs.shape.is_empty())
+    );
     scalarized.validate().unwrap();
 }
 
@@ -2377,7 +3357,10 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
         lhs: FuzzTensor::from_tensor(
             &TensorData::from_storage(
                 [2],
-                Storage::F32(vec![f32::from_bits(0x7fc0_0001), f32::from_bits(0x8000_0000)]),
+                Storage::F32(vec![
+                    f32::from_bits(0x7fc0_0001),
+                    f32::from_bits(0x8000_0000),
+                ]),
             )
             .unwrap(),
         ),
@@ -2385,7 +3368,10 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
     };
     let value = serde_json::to_value(&compare).unwrap();
     assert_eq!(value["kind"], "compare");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), compare);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        compare
+    );
     let mut unknown = value;
     unknown
         .as_object_mut()
@@ -2396,7 +3382,10 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
     let legacy = regression_cases().remove(0);
     let legacy_value = serde_json::to_value(&legacy).unwrap();
     assert_eq!(legacy_value["kind"], "binary");
-    assert_eq!(serde_json::from_value::<FuzzCase>(legacy_value).unwrap(), legacy);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(legacy_value).unwrap(),
+        legacy
+    );
 
     for (op, graph_op, lhs, rhs) in [
         (
@@ -2446,20 +3435,17 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
         ));
         let scheduled = schedule(&built.graph, built.output).unwrap();
         assert!(scheduled.items.iter().any(|item| {
-            item.kernel
-                .topological()
-                .unwrap()
-                .iter()
-                .any(|uop| matches!(uop.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op))
+            item.kernel.topological().unwrap().iter().any(
+                |uop| matches!(uop.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op),
+            )
         }));
-        let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         assert_eq!(captured.items.len(), scheduled.items.len());
         assert!(captured.items.iter().any(|item| {
-            item.kernel
-                .topological()
-                .unwrap()
-                .iter()
-                .any(|uop| matches!(uop.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op))
+            item.kernel.topological().unwrap().iter().any(
+                |uop| matches!(uop.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op),
+            )
         }));
     }
 
@@ -2489,7 +3475,10 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
         },
     )
     .unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&compare, |candidate| {
         matches!(candidate, FuzzCase::Compare { lhs, rhs, .. }
             if lhs.bytes == vec![0; 8] && rhs.bytes == vec![0; 4])
@@ -2497,8 +3486,10 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
     assert!(matches!(zeroed, FuzzCase::Compare { ref lhs, ref rhs, .. }
         if lhs.bytes == vec![0; 8] && rhs.bytes == vec![0; 4]));
     let scalarized = minimize_case(&compare, |_| true);
-    assert!(matches!(scalarized, FuzzCase::Compare { ref lhs, ref rhs, .. }
-        if lhs.shape.is_empty() && rhs.shape.is_empty()));
+    assert!(
+        matches!(scalarized, FuzzCase::Compare { ref lhs, ref rhs, .. }
+        if lhs.shape.is_empty() && rhs.shape.is_empty())
+    );
     scalarized.validate().unwrap();
 }
 
@@ -2536,31 +3527,27 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
                 } else {
                     [false, true, false]
                 })
-                    .into_iter()
-                    .cycle()
-                    .take(if right { 3 } else { 6 })
-                    .map(Scalar::Bool)
-                    .collect(),
-                DType::I8 | DType::I16 | DType::I32 => (if right {
-                    [0, -1, 1]
-                } else {
-                    [-1, 0, 1]
-                })
-                    .into_iter()
-                    .cycle()
-                    .take(if right { 3 } else { 6 })
-                    .map(Scalar::I)
-                    .collect(),
-                DType::U8 | DType::U16 | DType::U32 => (if right {
-                    [1_u64, 0, 2]
-                } else {
-                    [0, 1, 2]
-                })
-                    .into_iter()
-                    .cycle()
-                    .take(if right { 3 } else { 6 })
-                    .map(Scalar::U)
-                    .collect(),
+                .into_iter()
+                .cycle()
+                .take(if right { 3 } else { 6 })
+                .map(Scalar::Bool)
+                .collect(),
+                DType::I8 | DType::I16 | DType::I32 => {
+                    (if right { [0, -1, 1] } else { [-1, 0, 1] })
+                        .into_iter()
+                        .cycle()
+                        .take(if right { 3 } else { 6 })
+                        .map(Scalar::I)
+                        .collect()
+                }
+                DType::U8 | DType::U16 | DType::U32 => {
+                    (if right { [1_u64, 0, 2] } else { [0, 1, 2] })
+                        .into_iter()
+                        .cycle()
+                        .take(if right { 3 } else { 6 })
+                        .map(Scalar::U)
+                        .collect()
+                }
                 DType::I64 => (if right {
                     [-(1_i64 << 53), -((1_i64 << 53) + 1), i64::MIN]
                 } else {
@@ -2576,11 +3563,11 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
                 } else {
                     [(1_u64 << 53) + 1, 1_u64 << 53, u64::MAX]
                 })
-                    .into_iter()
-                    .cycle()
-                    .take(if right { 3 } else { 6 })
-                    .map(Scalar::U)
-                    .collect(),
+                .into_iter()
+                .cycle()
+                .take(if right { 3 } else { 6 })
+                .map(Scalar::U)
+                .collect(),
                 DType::F16 | DType::BF16 | DType::F32 | DType::F64 => (if right {
                     [f64::NAN, 0.0, f64::NEG_INFINITY]
                 } else {
@@ -2611,9 +3598,16 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
             assert_eq!(serde_json::from_value::<FuzzCase>(value).unwrap(), case);
             let built = case.build().unwrap();
             assert_eq!(built.graph.dtype(built.output).unwrap(), DType::Bool);
-            assert_eq!(built.graph.shape(built.output).unwrap(), &crate::Shape::from([2, 1, 3]));
-            assert!(matches!(built.graph.op(built.output).unwrap(), Op::Compare { op: actual, .. } if *actual == graph_op));
-            let oracle = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(
+                built.graph.shape(built.output).unwrap(),
+                &crate::Shape::from([2, 1, 3])
+            );
+            assert!(
+                matches!(built.graph.op(built.output).unwrap(), Op::Compare { op: actual, .. } if *actual == graph_op)
+            );
+            let oracle = CpuBackend
+                .execute(&built.graph, built.output, &built.oracle)
+                .unwrap();
             assert_eq!(
                 crate::execute_elementwise(&built.graph, built.output, &built.oracle)
                     .unwrap()
@@ -2622,12 +3616,9 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
                 "captured {dtype:?} {op:?}",
             );
             let scheduled = schedule(&built.graph, built.output).unwrap();
-            assert!(scheduled.items[0]
-                .kernel
-                .topological()
-                .unwrap()
-                .iter()
-                .any(|node| matches!(node.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op)));
+            assert!(scheduled.items[0].kernel.topological().unwrap().iter().any(
+                |node| matches!(node.kind(), UOpKind::GraphCompare(actual) if *actual == graph_op)
+            ));
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
             if matches!(dtype, DType::F16 | DType::BF16) {
@@ -2636,23 +3627,38 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
             } else if matches!(dtype, DType::F32 | DType::I32) {
                 assert!(vector.source.contains("B2 VectorProgram"), "{dtype:?}");
             }
-            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let captured =
+                CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
             let bytes = captured.to_bytes().unwrap();
-            assert_eq!(CapturedSchedule::from_bytes(&bytes).unwrap().to_bytes().unwrap(), bytes);
+            assert_eq!(
+                CapturedSchedule::from_bytes(&bytes)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                bytes
+            );
         }
     }
 
     let artifact_case = FuzzCase::Compare {
         op: FuzzCompareOp::Gt,
         lhs: FuzzTensor::from_tensor(
-            &TensorData::from_scalars([2], DType::U64, [Scalar::U((1_u64 << 53) + 1), Scalar::U(0)]).unwrap(),
+            &TensorData::from_scalars(
+                [2],
+                DType::U64,
+                [Scalar::U((1_u64 << 53) + 1), Scalar::U(0)],
+            )
+            .unwrap(),
         ),
-        rhs: FuzzTensor::from_tensor(
-            &TensorData::scalar_with_dtype(Scalar::U(1_u64 << 53), DType::U64),
-        ),
+        rhs: FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(
+            Scalar::U(1_u64 << 53),
+            DType::U64,
+        )),
     };
     let built = artifact_case.build().unwrap();
-    let expected = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+    let expected = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
     let artifact = FuzzFailureArtifact::new(
         19,
         31,
@@ -2666,14 +3672,19 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
         },
     )
     .unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
     let zeroed = minimize_case(&artifact_case, |candidate| {
         matches!(candidate, FuzzCase::Compare { lhs, rhs, op: FuzzCompareOp::Gt }
             if lhs.bytes == vec![0; 16] && rhs.bytes == vec![0; 8])
     });
-    assert!(matches!(zeroed, FuzzCase::Compare { ref lhs, ref rhs, op: FuzzCompareOp::Gt }
+    assert!(
+        matches!(zeroed, FuzzCase::Compare { ref lhs, ref rhs, op: FuzzCompareOp::Gt }
         if lhs.dtype == DType::U64 && rhs.dtype == DType::U64
-            && lhs.shape == vec![2] && rhs.shape.is_empty()));
+            && lhs.shape == vec![2] && rhs.shape.is_empty())
+    );
 }
 
 #[test]
@@ -2683,14 +3694,20 @@ fn unary_cases_round_trip_minimize_and_build_as_direct_graph_unaries() {
         input: FuzzTensor::from_tensor(
             &TensorData::from_storage(
                 [2],
-                Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001)]),
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                ]),
             )
             .unwrap(),
         ),
     };
     let value = serde_json::to_value(&unary).unwrap();
     assert_eq!(value["kind"], "unary");
-    assert_eq!(serde_json::from_value::<FuzzCase>(value.clone()).unwrap(), unary);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value.clone()).unwrap(),
+        unary
+    );
     let mut unknown = value;
     unknown
         .as_object_mut()
@@ -2701,7 +3718,10 @@ fn unary_cases_round_trip_minimize_and_build_as_direct_graph_unaries() {
     let legacy = regression_cases().remove(0);
     let legacy_value = serde_json::to_value(&legacy).unwrap();
     assert_eq!(legacy_value["kind"], "binary");
-    assert_eq!(serde_json::from_value::<FuzzCase>(legacy_value).unwrap(), legacy);
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(legacy_value).unwrap(),
+        legacy
+    );
 
     let built = unary.build().unwrap();
     assert!(matches!(
@@ -2744,7 +3764,10 @@ fn unary_cases_round_trip_minimize_and_build_as_direct_graph_unaries() {
         },
     )
     .unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(), artifact);
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
 
     let zeroed = minimize_case(&unary, |candidate| {
         matches!(candidate, FuzzCase::Unary { input, .. }
@@ -2787,7 +3810,8 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
     ];
     for dtype in dtypes {
         for op in [FuzzUnaryOp::Neg, FuzzUnaryOp::Abs] {
-            let source = TensorData::from_scalars([2], dtype, [Scalar::I(0), Scalar::I(1)]).unwrap();
+            let source =
+                TensorData::from_scalars([2], dtype, [Scalar::I(0), Scalar::I(1)]).unwrap();
             let case = FuzzCase::Unary {
                 op,
                 input: FuzzTensor::from_tensor(&source),
@@ -2800,10 +3824,19 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
             if dtype == DType::Bool && op == FuzzUnaryOp::Neg {
                 assert!(matches!(
                     built.graph.op(built.output).unwrap(),
-                    Op::Compare { op: CompareOp::Ne, .. }
+                    Op::Compare {
+                        op: CompareOp::Ne,
+                        ..
+                    }
                 ));
                 assert!((0..built.graph.node_count()).any(|index| {
-                    matches!(built.graph.op(crate::NodeId(index)).unwrap(), Op::Cast { dtype: DType::Bool, .. })
+                    matches!(
+                        built.graph.op(crate::NodeId(index)).unwrap(),
+                        Op::Cast {
+                            dtype: DType::Bool,
+                            ..
+                        }
+                    )
                 }));
             } else {
                 let expected = match op {
@@ -2821,8 +3854,16 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
             let kernel = &scheduled.items[0].kernel;
             let topological = kernel.topological().unwrap();
             if dtype == DType::Bool && op == FuzzUnaryOp::Neg {
-                assert!(topological.iter().any(|node| matches!(node.kind(), UOpKind::Cast)));
-                assert!(topological.iter().any(|node| matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne))));
+                assert!(
+                    topological
+                        .iter()
+                        .any(|node| matches!(node.kind(), UOpKind::Cast))
+                );
+                assert!(
+                    topological
+                        .iter()
+                        .any(|node| matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)))
+                );
             } else {
                 let expected = match op {
                     FuzzUnaryOp::Neg => UnaryOp::Neg,
@@ -2835,14 +3876,29 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
             assert!(CpuJit::render(kernel).is_ok(), "{op:?} {dtype:?}");
             let vector = CpuJit::render_vectorized(kernel).unwrap();
             if matches!(dtype, DType::F16 | DType::BF16) {
-                assert!(!vector.source.contains("B2 VectorProgram"), "{op:?} {dtype:?}");
+                assert!(
+                    !vector.source.contains("B2 VectorProgram"),
+                    "{op:?} {dtype:?}"
+                );
             } else if matches!(dtype, DType::F32 | DType::I32) {
-                assert!(vector.source.contains("B2 VectorProgram"), "{op:?} {dtype:?}");
+                assert!(
+                    vector.source.contains("B2 VectorProgram"),
+                    "{op:?} {dtype:?}"
+                );
             }
-            let captured = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+            let captured =
+                CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
             let capture_bytes = captured.to_bytes().unwrap();
-            assert_eq!(CapturedSchedule::from_bytes(&capture_bytes).unwrap().to_bytes().unwrap(), capture_bytes);
-            let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+            assert_eq!(
+                CapturedSchedule::from_bytes(&capture_bytes)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                capture_bytes
+            );
+            let output = CpuBackend
+                .execute(&built.graph, built.output, &built.oracle)
+                .unwrap();
             assert_eq!(output.dtype(), dtype);
             assert_eq!(output.shape().dims(), &[2]);
             if op == FuzzUnaryOp::Abs
@@ -2860,20 +3916,54 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
     // identity remains outside this assertion because decode/re-encode is the
     // established storage boundary.
     let edges = [
-        (FuzzUnaryOp::Abs, TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap()),
-        (FuzzUnaryOp::Abs, TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap()),
-        (FuzzUnaryOp::Abs, TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap()),
-        (FuzzUnaryOp::Abs, TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap()),
-        (FuzzUnaryOp::Neg, TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap()),
-        (FuzzUnaryOp::Neg, TensorData::from_storage([3], Storage::F32(vec![-0.0, f32::NAN, f32::INFINITY])).unwrap()),
-        (FuzzUnaryOp::Abs, TensorData::from_storage([3], Storage::F64(vec![-0.0, f64::NAN, f64::NEG_INFINITY])).unwrap()),
-        (FuzzUnaryOp::Abs, TensorData::from_storage([3], Storage::F16(vec![0x8000, 0x7e01, 0x7c00])).unwrap()),
-        (FuzzUnaryOp::Abs, TensorData::from_storage([3], Storage::BF16(vec![0x8000, 0x7fc1, 0x7f80])).unwrap()),
+        (
+            FuzzUnaryOp::Abs,
+            TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(),
+        ),
+        (
+            FuzzUnaryOp::Abs,
+            TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(),
+        ),
+        (
+            FuzzUnaryOp::Abs,
+            TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(),
+        ),
+        (
+            FuzzUnaryOp::Abs,
+            TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(),
+        ),
+        (
+            FuzzUnaryOp::Neg,
+            TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap(),
+        ),
+        (
+            FuzzUnaryOp::Neg,
+            TensorData::from_storage([3], Storage::F32(vec![-0.0, f32::NAN, f32::INFINITY]))
+                .unwrap(),
+        ),
+        (
+            FuzzUnaryOp::Abs,
+            TensorData::from_storage([3], Storage::F64(vec![-0.0, f64::NAN, f64::NEG_INFINITY]))
+                .unwrap(),
+        ),
+        (
+            FuzzUnaryOp::Abs,
+            TensorData::from_storage([3], Storage::F16(vec![0x8000, 0x7e01, 0x7c00])).unwrap(),
+        ),
+        (
+            FuzzUnaryOp::Abs,
+            TensorData::from_storage([3], Storage::BF16(vec![0x8000, 0x7fc1, 0x7f80])).unwrap(),
+        ),
     ];
     for (op, input) in edges {
-        let case = FuzzCase::Unary { op, input: FuzzTensor::from_tensor(&input) };
+        let case = FuzzCase::Unary {
+            op,
+            input: FuzzTensor::from_tensor(&input),
+        };
         let built = case.build().unwrap();
-        let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
         assert_eq!(output.dtype(), input.dtype());
         assert_eq!(output.shape(), input.shape());
         match (op, input.dtype()) {
@@ -2904,11 +3994,18 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
 
     let bool_neg = FuzzCase::Unary {
         op: FuzzUnaryOp::Neg,
-        input: FuzzTensor::from_tensor(&TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap()),
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap(),
+        ),
     };
     let built = bool_neg.build().unwrap();
-    let output = CpuBackend.execute(&built.graph, built.output, &built.oracle).unwrap();
-    assert_eq!(output, TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap());
+    let output = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
+        .unwrap();
+    assert_eq!(
+        output,
+        TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap()
+    );
     let artifact = FuzzFailureArtifact::new(
         41,
         43,
@@ -2916,17 +4013,25 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
         FuzzPath::NativeScalar,
         FuzzComparisonPolicy::ExactBytes,
         FuzzOutcome::value(&output),
-        FuzzOutcome::Error { class: "execute".into(), detail: "synthetic Bool unary mismatch".into() },
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "synthetic Bool unary mismatch".into(),
+        },
     )
     .unwrap();
     let artifact_bytes = artifact.to_bytes().unwrap();
-    assert_eq!(FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap(), artifact);
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact_bytes).unwrap(),
+        artifact
+    );
     let minimized = minimize_case(&bool_neg, |candidate| {
         matches!(candidate, FuzzCase::Unary { op: FuzzUnaryOp::Neg, input }
             if input.dtype == DType::Bool && input.shape == vec![2] && input.bytes == vec![0, 0])
     });
-    assert!(matches!(minimized, FuzzCase::Unary { op: FuzzUnaryOp::Neg, ref input }
-        if input.dtype == DType::Bool && input.shape == vec![2] && input.bytes == vec![0, 0]));
+    assert!(
+        matches!(minimized, FuzzCase::Unary { op: FuzzUnaryOp::Neg, ref input }
+        if input.dtype == DType::Bool && input.shape == vec![2] && input.bytes == vec![0, 0])
+    );
 }
 
 #[test]

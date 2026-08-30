@@ -932,7 +932,10 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     };
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add))
         && value.ty().map(|ty| ty.scalar) == Some(DType::Bool)
-        && matches!(value.sources().get(1).map(|node| node.kind()), Some(UOpKind::GraphLogical(crate::LogicalOp::Not)))
+        && matches!(
+            value.sources().get(1).map(|node| node.kind()),
+            Some(UOpKind::GraphLogical(crate::LogicalOp::Not))
+        )
     {
         return scoped_bool_sub_plan(store);
     }
@@ -940,9 +943,15 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         return scoped_eq_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Ne)) {
-        if let Some(mode) = scoped_isfinite_plan(store, sm)? { return Ok(Some(mode)); }
-        if let Some(mode) = scoped_logical_not_plan(store, sm)? { return Ok(Some(mode)); }
-        if let Some(mode) = scoped_inclusive_lt_plan(store, sm)? { return Ok(Some(mode)); }
+        if let Some(mode) = scoped_isfinite_plan(store, sm)? {
+            return Ok(Some(mode));
+        }
+        if let Some(mode) = scoped_logical_not_plan(store, sm)? {
+            return Ok(Some(mode));
+        }
+        if let Some(mode) = scoped_inclusive_lt_plan(store, sm)? {
+            return Ok(Some(mode));
+        }
         return scoped_ne_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Lt)) {
@@ -968,7 +977,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Sub)) {
         if value.ty().map(|ty| ty.scalar) == Some(DType::Bool) {
-            return Err(PtxError::Unsupported("raw Bool Sub is not public subtraction".into()));
+            return Err(PtxError::Unsupported(
+                "raw Bool Sub is not public subtraction".into(),
+            ));
         }
         return scoped_binary_plan(store, sm, crate::BinaryOp::Sub, ScopedStorageMode::Sub);
     }
@@ -988,10 +999,15 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     {
         return scoped_binary_plan(store, sm, crate::BinaryOp::Mul, ScopedStorageMode::Mul);
     }
-    if let UOpKind::GraphBinary(op @ (crate::BinaryOp::Maximum | crate::BinaryOp::Minimum)) = value.kind() {
+    if let UOpKind::GraphBinary(op @ (crate::BinaryOp::Maximum | crate::BinaryOp::Minimum)) =
+        value.kind()
+    {
         return scoped_binary_plan(store, sm, *op, ScopedStorageMode::Extrema);
     }
-    if matches!(value.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)) {
+    if matches!(
+        value.kind(),
+        UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)
+    ) {
         if let Some(mode) = scoped_rsqrt_plan(store, sm)? {
             return Ok(Some(mode));
         }
@@ -1026,13 +1042,17 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         }
         UOpKind::GraphLogical(crate::LogicalOp::Not) => {
             let [load] = value.sources() else {
-                return Err(PtxError::Unsupported("logical Neg must have one input".into()));
+                return Err(PtxError::Unsupported(
+                    "logical Neg must have one input".into(),
+                ));
             };
             (load, ScopedStorageMode::NegBool)
         }
         UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) => {
             let [reciprocal_input] = value.sources() else {
-                return Err(PtxError::Unsupported("Reciprocal must have one input".into()));
+                return Err(PtxError::Unsupported(
+                    "Reciprocal must have one input".into(),
+                ));
             };
             if matches!(reciprocal_input.kind(), UOpKind::Load) {
                 (reciprocal_input, ScopedStorageMode::Reciprocal)
@@ -1041,7 +1061,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
                     return Ok(None);
                 };
                 let [load] = reciprocal_input.sources() else {
-                    return Err(PtxError::Unsupported("Reciprocal Cast must have one input".into()));
+                    return Err(PtxError::Unsupported(
+                        "Reciprocal Cast must have one input".into(),
+                    ));
                 };
                 if !matches!(load.kind(), UOpKind::Load)
                     || reciprocal_input.ty().map(|ty| ty.scalar) != Some(DType::F32)
@@ -1058,9 +1080,13 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             if matches!(sqrt_input.kind(), UOpKind::Load) {
                 (sqrt_input, ScopedStorageMode::Sqrt)
             } else {
-                let UOpKind::Cast = sqrt_input.kind() else { return Ok(None) };
+                let UOpKind::Cast = sqrt_input.kind() else {
+                    return Ok(None);
+                };
                 let [load] = sqrt_input.sources() else {
-                    return Err(PtxError::Unsupported("Sqrt Cast must have one input".into()));
+                    return Err(PtxError::Unsupported(
+                        "Sqrt Cast must have one input".into(),
+                    ));
                 };
                 if !matches!(load.kind(), UOpKind::Load)
                     || sqrt_input.ty().map(|ty| ty.scalar) != Some(DType::F32)
@@ -1094,8 +1120,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         .ty()
         .ok_or_else(|| PtxError::Unsupported("untyped scoped operation".into()))?
         .scalar;
-    if mode == ScopedStorageMode::Abs
-        && value.sources()[1].ty().map(|ty| ty.scalar) != Some(dtype)
+    if mode == ScopedStorageMode::Abs && value.sources()[1].ty().map(|ty| ty.scalar) != Some(dtype)
     {
         return Err(PtxError::Unsupported(
             "Abs narrow-storage ABI requires a preserved Sign dtype".into(),
@@ -1119,8 +1144,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     let reciprocal_cast = mode == ScopedStorageMode::ReciprocalCast;
     let sqrt_direct = mode == ScopedStorageMode::Sqrt;
     let sqrt_cast = mode == ScopedStorageMode::SqrtCast;
-    if ((reciprocal_direct || sqrt_direct)
-        && (!input_dtype.is_float() || input_dtype != dtype))
+    if ((reciprocal_direct || sqrt_direct) && (!input_dtype.is_float() || input_dtype != dtype))
         || ((reciprocal_cast || sqrt_cast) && (input_dtype.is_float() || dtype != DType::F32))
         || (!reciprocal_direct
             && !reciprocal_cast
@@ -1184,37 +1208,82 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
 /// retain the otherwise-fused SQRT storage boundary without admitting generic
 /// unary compounds.
 fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
-    let [output, reciprocal] = store.sources() else { return Err(PtxError::Unsupported("Rsqrt Store needs index and value".into())) };
-    let UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.kind() else { return Ok(None) };
-    let [sqrt] = reciprocal.sources() else { return Err(PtxError::Unsupported("Rsqrt Reciprocal needs Sqrt".into())) };
-    let UOpKind::GraphUnary(crate::UnaryOp::Sqrt) = sqrt.kind() else { return Ok(None) };
-    let [sqrt_input] = sqrt.sources() else { return Err(PtxError::Unsupported("Rsqrt Sqrt needs input".into())) };
-    let UArg::BufferIndex { elements, output_shape, .. } = output.arg() else {
-        return Err(PtxError::Unsupported("Rsqrt needs a concrete output".into()));
+    let [output, reciprocal] = store.sources() else {
+        return Err(PtxError::Unsupported(
+            "Rsqrt Store needs index and value".into(),
+        ));
     };
-    let dtype = reciprocal.ty().ok_or_else(|| PtxError::Unsupported("untyped Rsqrt output".into()))?.scalar;
+    let UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.kind() else {
+        return Ok(None);
+    };
+    let [sqrt] = reciprocal.sources() else {
+        return Err(PtxError::Unsupported("Rsqrt Reciprocal needs Sqrt".into()));
+    };
+    let UOpKind::GraphUnary(crate::UnaryOp::Sqrt) = sqrt.kind() else {
+        return Ok(None);
+    };
+    let [sqrt_input] = sqrt.sources() else {
+        return Err(PtxError::Unsupported("Rsqrt Sqrt needs input".into()));
+    };
+    let UArg::BufferIndex {
+        elements,
+        output_shape,
+        ..
+    } = output.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "Rsqrt needs a concrete output".into(),
+        ));
+    };
+    let dtype = reciprocal
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt output".into()))?
+        .scalar;
     if !dtype.is_float()
         || sqrt.ty().map(|ty| ty.scalar) != Some(dtype)
         || output.ty().map(|ty| ty.scalar) != Some(dtype)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
         || elements.checked_mul(dtype.itemsize()).is_none()
     {
-        return Err(PtxError::Unsupported("Rsqrt result descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "Rsqrt result descriptor is invalid".into(),
+        ));
     }
     let (load, cast) = match sqrt_input.kind() {
         UOpKind::Load => (sqrt_input, None),
         UOpKind::Cast => {
-            let [load] = sqrt_input.sources() else { return Err(PtxError::Unsupported("Rsqrt Cast arity".into())) };
-            if !matches!(load.kind(), UOpKind::Load) { return Err(PtxError::Unsupported("Rsqrt Cast needs direct load".into())) }
+            let [load] = sqrt_input.sources() else {
+                return Err(PtxError::Unsupported("Rsqrt Cast arity".into()));
+            };
+            if !matches!(load.kind(), UOpKind::Load) {
+                return Err(PtxError::Unsupported("Rsqrt Cast needs direct load".into()));
+            }
             (load, Some(sqrt_input))
         }
-        _ => return Err(PtxError::Unsupported("Rsqrt needs direct load or public F32 Cast".into())),
+        _ => {
+            return Err(PtxError::Unsupported(
+                "Rsqrt needs direct load or public F32 Cast".into(),
+            ));
+        }
     };
-    let [index] = load.sources() else { return Err(PtxError::Unsupported("Rsqrt load needs index".into())) };
-    let UArg::BufferIndex { elements: input_elements, input_shape, output_shape: input_output, .. } = index.arg() else {
-        return Err(PtxError::Unsupported("Rsqrt does not admit affine views".into()));
+    let [index] = load.sources() else {
+        return Err(PtxError::Unsupported("Rsqrt load needs index".into()));
     };
-    let input_dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped Rsqrt input".into()))?.scalar;
+    let UArg::BufferIndex {
+        elements: input_elements,
+        input_shape,
+        output_shape: input_output,
+        ..
+    } = index.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "Rsqrt does not admit affine views".into(),
+        ));
+    };
+    let input_dtype = load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt input".into()))?
+        .scalar;
     if index.ty().map(|ty| ty.scalar) != Some(input_dtype)
         || input_output != output_shape
         || input_shape != output_shape
@@ -1225,10 +1294,14 @@ fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         || (cast.is_some() && (input_dtype.is_float() || dtype != DType::F32))
         || (cast.is_none() && (!input_dtype.is_float() || input_dtype != dtype))
     {
-        return Err(PtxError::Unsupported("Rsqrt input/cast chain is not source-exact".into()));
+        return Err(PtxError::Unsupported(
+            "Rsqrt input/cast chain is not source-exact".into(),
+        ));
     }
     if (input_dtype == DType::F16 || dtype == DType::F16) && sm < 53 {
-        return Err(PtxError::Unsupported("F16 public Rsqrt requires sm_53 or newer".into()));
+        return Err(PtxError::Unsupported(
+            "F16 public Rsqrt requires sm_53 or newer".into(),
+        ));
     }
     reject_sign_storage_dtype(input_dtype)?;
     reject_sign_storage_dtype(dtype)?;
@@ -1276,7 +1349,9 @@ fn scoped_binary_plan(
         .scalar;
     if output_index.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+        || output_elements
+            .checked_mul(output_dtype.itemsize())
+            .is_none()
     {
         return Err(PtxError::Unsupported(
             "scoped Mul output descriptor is invalid".into(),
@@ -1329,7 +1404,8 @@ fn scoped_binary_plan(
     } else {
         left_dtype.promote(right_dtype)
     };
-    if source_dtype != output_dtype || left.ty().map(|ty| ty.scalar) != Some(output_dtype)
+    if source_dtype != output_dtype
+        || left.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || right.ty().map(|ty| ty.scalar) != Some(output_dtype)
     {
         return Err(PtxError::Unsupported(
@@ -1418,47 +1494,83 @@ fn scoped_compare_value_proof(
         return Err(PtxError::Unsupported("public Eq needs two inputs".into()));
     };
     if value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-        || domain_shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(DType::Bool.itemsize()).is_none()
+        || domain_shape
+            .numel()
+            .map_err(|_| PtxError::Overflow)?
+            .checked_mul(DType::Bool.itemsize())
+            .is_none()
     {
-        return Err(PtxError::Unsupported("public Eq output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public Eq output descriptor is invalid".into(),
+        ));
     }
     fn operand<'a>(node: &'a UOp) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
         match node.kind() {
             UOpKind::Load => Ok((node, None)),
             UOpKind::Cast => {
                 let [load] = node.sources() else {
-                    return Err(PtxError::Unsupported("public Eq Cast needs one input".into()));
+                    return Err(PtxError::Unsupported(
+                        "public Eq Cast needs one input".into(),
+                    ));
                 };
                 if !matches!(load.kind(), UOpKind::Load) {
-                    return Err(PtxError::Unsupported("public Eq Cast must consume a direct load".into()));
+                    return Err(PtxError::Unsupported(
+                        "public Eq Cast must consume a direct load".into(),
+                    ));
                 }
                 Ok((load, Some(node)))
             }
-            _ => Err(PtxError::Unsupported("public Eq needs only direct loads and source casts".into())),
+            _ => Err(PtxError::Unsupported(
+                "public Eq needs only direct loads and source casts".into(),
+            )),
         }
     }
     fn index<'a>(load: &'a UOp, output: &Shape) -> Result<&'a UOp, PtxError> {
         let [index] = load.sources() else {
-            return Err(PtxError::Unsupported("public Eq load needs one index".into()));
+            return Err(PtxError::Unsupported(
+                "public Eq load needs one index".into(),
+            ));
         };
-        let UArg::BufferIndex { elements, input_shape, output_shape, .. } = index.arg() else {
-            return Err(PtxError::Unsupported("public Eq does not admit affine-view inputs".into()));
+        let UArg::BufferIndex {
+            elements,
+            input_shape,
+            output_shape,
+            ..
+        } = index.arg()
+        else {
+            return Err(PtxError::Unsupported(
+                "public Eq does not admit affine-view inputs".into(),
+            ));
         };
-        let dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped Eq input".into()))?.scalar;
+        let dtype = load
+            .ty()
+            .ok_or_else(|| PtxError::Unsupported("untyped Eq input".into()))?
+            .scalar;
         if index.ty().map(|ty| ty.scalar) != Some(dtype)
             || output_shape != output
             || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
             || elements.checked_mul(dtype.itemsize()).is_none()
         {
-            return Err(PtxError::Unsupported("public Eq input descriptor is invalid".into()));
+            return Err(PtxError::Unsupported(
+                "public Eq input descriptor is invalid".into(),
+            ));
         }
         Ok(index)
     }
     let (left_load, left_cast) = operand(left)?;
     let (right_load, right_cast) = operand(right)?;
-    let left_dtype = left_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Eq lhs".into()))?.scalar;
-    let right_dtype = right_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Eq rhs".into()))?.scalar;
-    let comparison_dtype = if matches!((left_dtype, right_dtype), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+    let left_dtype = left_load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Eq lhs".into()))?
+        .scalar;
+    let right_dtype = right_load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Eq rhs".into()))?
+        .scalar;
+    let comparison_dtype = if matches!(
+        (left_dtype, right_dtype),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
         DType::F32
     } else {
         left_dtype.promote(right_dtype)
@@ -1466,27 +1578,53 @@ fn scoped_compare_value_proof(
     if left.ty().map(|ty| ty.scalar) != Some(comparison_dtype)
         || right.ty().map(|ty| ty.scalar) != Some(comparison_dtype)
     {
-        return Err(PtxError::Unsupported("public Eq operands do not use source promotion".into()));
+        return Err(PtxError::Unsupported(
+            "public Eq operands do not use source promotion".into(),
+        ));
     }
-    for (load, cast, source_dtype) in [(left_load, left_cast, left_dtype), (right_load, right_cast, right_dtype)] {
+    for (load, cast, source_dtype) in [
+        (left_load, left_cast, left_dtype),
+        (right_load, right_cast, right_dtype),
+    ] {
         if (source_dtype == comparison_dtype) != cast.is_none()
             || cast.is_some_and(|node| node.ty().map(|ty| ty.scalar) != Some(comparison_dtype))
         {
-            return Err(PtxError::Unsupported("public Eq must use exactly the source LUB casts".into()));
+            return Err(PtxError::Unsupported(
+                "public Eq must use exactly the source LUB casts".into(),
+            ));
         }
     }
     let left_index = index(left_load, domain_shape)?;
     let right_index = index(right_load, domain_shape)?;
-    let left_shape = match left_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
-    let right_shape = match right_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
-    let comparison_shape = left_shape.broadcast_with(right_shape)
+    let left_shape = match left_index.arg() {
+        UArg::BufferIndex { input_shape, .. } => input_shape,
+        _ => unreachable!(),
+    };
+    let right_shape = match right_index.arg() {
+        UArg::BufferIndex { input_shape, .. } => input_shape,
+        _ => unreachable!(),
+    };
+    let comparison_shape = left_shape
+        .broadcast_with(right_shape)
         .map_err(|_| PtxError::Unsupported("public Eq broadcast is invalid".into()))?;
-    if comparison_shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(comparison_dtype.itemsize()).is_none() {
-        return Err(PtxError::Unsupported("public Eq broadcast/output extent is invalid".into()));
+    if comparison_shape
+        .numel()
+        .map_err(|_| PtxError::Overflow)?
+        .checked_mul(comparison_dtype.itemsize())
+        .is_none()
+    {
+        return Err(PtxError::Unsupported(
+            "public Eq broadcast/output extent is invalid".into(),
+        ));
     }
-    if matches!(left_dtype, DType::F16) || matches!(right_dtype, DType::F16) || comparison_dtype == DType::F16 {
+    if matches!(left_dtype, DType::F16)
+        || matches!(right_dtype, DType::F16)
+        || comparison_dtype == DType::F16
+    {
         if sm < 53 {
-            return Err(PtxError::Unsupported("F16 public Eq conversion requires sm_53 or newer".into()));
+            return Err(PtxError::Unsupported(
+                "F16 public Eq conversion requires sm_53 or newer".into(),
+            ));
         }
     }
     reject_sign_storage_dtype(left_dtype)?;
@@ -1508,16 +1646,28 @@ fn scoped_compare_value_plan(
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output_index.arg() else {
-        return Err(PtxError::Unsupported("public Eq requires a concrete output buffer".into()));
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output_index.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public Eq requires a concrete output buffer".into(),
+        ));
     };
     if output_index.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+        || output_elements
+            .checked_mul(DType::Bool.itemsize())
+            .is_none()
     {
-        return Err(PtxError::Unsupported("public Eq output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public Eq output descriptor is invalid".into(),
+        ));
     }
-    if scoped_compare_value_proof(value, output_shape, sm, expected)?.as_ref() != Some(output_shape) {
+    if scoped_compare_value_proof(value, output_shape, sm, expected)?.as_ref() != Some(output_shape)
+    {
         return Ok(None);
     }
     Ok(Some(mode))
@@ -1538,36 +1688,76 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let Some(value) = store.sources().get(1) else { return Ok(None) };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = value.kind() else { return Ok(None) };
-    let [cast, truth] = value.sources() else { return Ok(None) };
-    let UOpKind::Cast = cast.kind() else { return Ok(None) };
-    let [load] = cast.sources() else { return Ok(None) };
+    let Some(value) = store.sources().get(1) else {
+        return Ok(None);
+    };
+    let UOpKind::GraphCompare(crate::CompareOp::Ne) = value.kind() else {
+        return Ok(None);
+    };
+    let [cast, truth] = value.sources() else {
+        return Ok(None);
+    };
+    let UOpKind::Cast = cast.kind() else {
+        return Ok(None);
+    };
+    let [load] = cast.sources() else {
+        return Ok(None);
+    };
     if !matches!(load.kind(), UOpKind::Load)
         || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || !matches!(truth.kind(), UOpKind::Const)
-        || !matches!(truth.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })
+        || !matches!(
+            truth.arg(),
+            UArg::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            }
+        )
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output.arg() else {
-        return Err(PtxError::Unsupported("public logical-not requires a concrete output buffer".into()));
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public logical-not requires a concrete output buffer".into(),
+        ));
     };
     if output.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+        || output_elements
+            .checked_mul(DType::Bool.itemsize())
+            .is_none()
     {
-        return Err(PtxError::Unsupported("public logical-not output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public logical-not output descriptor is invalid".into(),
+        ));
     }
     let [input] = load.sources() else {
-        return Err(PtxError::Unsupported("public logical-not load needs one index".into()));
+        return Err(PtxError::Unsupported(
+            "public logical-not load needs one index".into(),
+        ));
     };
-    let input_dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped public logical-not input".into()))?.scalar;
-    let UArg::BufferIndex { elements, input_shape, output_shape: input_output, .. } = input.arg() else {
-        return Err(PtxError::Unsupported("public logical-not does not admit affine-view inputs".into()));
+    let input_dtype = load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped public logical-not input".into()))?
+        .scalar;
+    let UArg::BufferIndex {
+        elements,
+        input_shape,
+        output_shape: input_output,
+        ..
+    } = input.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public logical-not does not admit affine-view inputs".into(),
+        ));
     };
     if input.ty().map(|ty| ty.scalar) != Some(input_dtype)
         || input_shape != output_shape
@@ -1575,10 +1765,14 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
         || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
         || elements.checked_mul(input_dtype.itemsize()).is_none()
     {
-        return Err(PtxError::Unsupported("public logical-not input descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public logical-not input descriptor is invalid".into(),
+        ));
     }
     if input_dtype == DType::F16 && sm < 53 {
-        return Err(PtxError::Unsupported("F16 public logical-not conversion requires sm_53 or newer".into()));
+        return Err(PtxError::Unsupported(
+            "F16 public logical-not conversion requires sm_53 or newer".into(),
+        ));
     }
     reject_sign_storage_dtype(input_dtype)?;
     Ok(Some(ScopedStorageMode::LogicalNot))
@@ -1591,29 +1785,58 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let Some(value) = store.sources().get(1) else { return Ok(None) };
-    let UOpKind::GraphUnary(crate::UnaryOp::IsInf) = value.kind() else { return Ok(None) };
-    let [load] = value.sources() else { return Ok(None) };
-    if !matches!(load.kind(), UOpKind::Load)
-        || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+    let Some(value) = store.sources().get(1) else {
+        return Ok(None);
+    };
+    let UOpKind::GraphUnary(crate::UnaryOp::IsInf) = value.kind() else {
+        return Ok(None);
+    };
+    let [load] = value.sources() else {
+        return Ok(None);
+    };
+    if !matches!(load.kind(), UOpKind::Load) || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
     {
         return Ok(None);
     }
-    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output.arg() else {
-        return Err(PtxError::Unsupported("public IsInf requires a concrete output buffer".into()));
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public IsInf requires a concrete output buffer".into(),
+        ));
     };
     if output.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+        || output_elements
+            .checked_mul(DType::Bool.itemsize())
+            .is_none()
     {
-        return Err(PtxError::Unsupported("public IsInf output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public IsInf output descriptor is invalid".into(),
+        ));
     }
     let [input] = load.sources() else {
-        return Err(PtxError::Unsupported("public IsInf load needs one index".into()));
+        return Err(PtxError::Unsupported(
+            "public IsInf load needs one index".into(),
+        ));
     };
-    let input_dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped public IsInf input".into()))?.scalar;
-    let UArg::BufferIndex { elements, input_shape, output_shape: input_output, .. } = input.arg() else {
-        return Err(PtxError::Unsupported("public IsInf does not admit affine-view inputs".into()));
+    let input_dtype = load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped public IsInf input".into()))?
+        .scalar;
+    let UArg::BufferIndex {
+        elements,
+        input_shape,
+        output_shape: input_output,
+        ..
+    } = input.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public IsInf does not admit affine-view inputs".into(),
+        ));
     };
     if input.ty().map(|ty| ty.scalar) != Some(input_dtype)
         || input_shape != output_shape
@@ -1621,10 +1844,14 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
         || elements.checked_mul(input_dtype.itemsize()).is_none()
     {
-        return Err(PtxError::Unsupported("public IsInf input descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public IsInf input descriptor is invalid".into(),
+        ));
     }
     if input_dtype == DType::F16 && sm < 53 {
-        return Err(PtxError::Unsupported("F16 public IsInf conversion requires sm_53 or newer".into()));
+        return Err(PtxError::Unsupported(
+            "F16 public IsInf conversion requires sm_53 or newer".into(),
+        ));
     }
     reject_sign_storage_dtype(input_dtype)?;
     Ok(Some(ScopedStorageMode::IsInf))
@@ -1637,17 +1864,39 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let Some(outer) = store.sources().get(1) else { return Ok(None) };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = outer.kind() else { return Ok(None) };
-    let [cast, truth] = outer.sources() else { return Ok(None) };
-    let UOpKind::Cast = cast.kind() else { return Ok(None) };
-    let [or] = cast.sources() else { return Ok(None) };
-    let UOpKind::GraphLogical(crate::LogicalOp::Or) = or.kind() else { return Ok(None) };
-    let [infinite, nan] = or.sources() else { return Ok(None) };
-    let UOpKind::GraphUnary(crate::UnaryOp::IsInf) = infinite.kind() else { return Ok(None) };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = nan.kind() else { return Ok(None) };
-    let [infinite_load] = infinite.sources() else { return Ok(None) };
-    let [nan_left, nan_right] = nan.sources() else { return Ok(None) };
+    let Some(outer) = store.sources().get(1) else {
+        return Ok(None);
+    };
+    let UOpKind::GraphCompare(crate::CompareOp::Ne) = outer.kind() else {
+        return Ok(None);
+    };
+    let [cast, truth] = outer.sources() else {
+        return Ok(None);
+    };
+    let UOpKind::Cast = cast.kind() else {
+        return Ok(None);
+    };
+    let [or] = cast.sources() else {
+        return Ok(None);
+    };
+    let UOpKind::GraphLogical(crate::LogicalOp::Or) = or.kind() else {
+        return Ok(None);
+    };
+    let [infinite, nan] = or.sources() else {
+        return Ok(None);
+    };
+    let UOpKind::GraphUnary(crate::UnaryOp::IsInf) = infinite.kind() else {
+        return Ok(None);
+    };
+    let UOpKind::GraphCompare(crate::CompareOp::Ne) = nan.kind() else {
+        return Ok(None);
+    };
+    let [infinite_load] = infinite.sources() else {
+        return Ok(None);
+    };
+    let [nan_left, nan_right] = nan.sources() else {
+        return Ok(None);
+    };
     if !matches!(infinite_load.kind(), UOpKind::Load)
         || infinite_load != nan_left
         || nan_left != nan_right
@@ -1658,26 +1907,60 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
         || outer.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || !matches!(truth.kind(), UOpKind::Const)
-        || !matches!(truth.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })
+        || !matches!(
+            truth.arg(),
+            UArg::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            }
+        )
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output.arg() else {
-        return Err(PtxError::Unsupported("public IsFinite requires a concrete output buffer".into()));
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public IsFinite requires a concrete output buffer".into(),
+        ));
     };
     if output.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+        || output_elements
+            .checked_mul(DType::Bool.itemsize())
+            .is_none()
     {
-        return Err(PtxError::Unsupported("public IsFinite output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public IsFinite output descriptor is invalid".into(),
+        ));
     }
-    let isinf_store = UOp::new(UOpKind::Store, None, vec![output.clone(), infinite.clone()], UArg::None);
+    let isinf_store = UOp::new(
+        UOpKind::Store,
+        None,
+        vec![output.clone(), infinite.clone()],
+        UArg::None,
+    );
     if scoped_isinf_plan(&isinf_store, sm)?.is_none() {
         return Ok(None);
     }
-    let isnan_store = UOp::new(UOpKind::Store, None, vec![output.clone(), nan.clone()], UArg::None);
-    if scoped_compare_value_plan(&isnan_store, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)?.is_none() {
+    let isnan_store = UOp::new(
+        UOpKind::Store,
+        None,
+        vec![output.clone(), nan.clone()],
+        UArg::None,
+    );
+    if scoped_compare_value_plan(
+        &isnan_store,
+        sm,
+        crate::CompareOp::Ne,
+        ScopedStorageMode::Ne,
+    )?
+    .is_none()
+    {
         return Ok(None);
     }
     Ok(Some(ScopedStorageMode::IsFinite))
@@ -1687,20 +1970,53 @@ fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorage
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let Some(outer) = store.sources().get(1) else { return Ok(None) };
-    let UOpKind::GraphCompare(crate::CompareOp::Ne) = outer.kind() else { return Ok(None) };
-    let [cast, truth] = outer.sources() else { return Ok(None) };
-    let UOpKind::Cast = cast.kind() else { return Ok(None) };
-    let [inner] = cast.sources() else { return Ok(None) };
+    let Some(outer) = store.sources().get(1) else {
+        return Ok(None);
+    };
+    let UOpKind::GraphCompare(crate::CompareOp::Ne) = outer.kind() else {
+        return Ok(None);
+    };
+    let [cast, truth] = outer.sources() else {
+        return Ok(None);
+    };
+    let UOpKind::Cast = cast.kind() else {
+        return Ok(None);
+    };
+    let [inner] = cast.sources() else {
+        return Ok(None);
+    };
     if outer.ty().map(|t| t.scalar) != Some(DType::Bool)
         || cast.ty().map(|t| t.scalar) != Some(DType::Bool)
         || inner.ty().map(|t| t.scalar) != Some(DType::Bool)
         || !matches!(inner.kind(), UOpKind::GraphCompare(crate::CompareOp::Lt))
         || !matches!(truth.kind(), UOpKind::Const)
-        || !matches!(truth.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })
-        || truth.ty().map(|t| t.scalar) != Some(DType::Bool) { return Ok(None) }
-    let proof = UOp::new(UOpKind::Store, None, vec![output.clone(), inner.clone()], UArg::None);
-    if scoped_compare_value_plan(&proof, sm, crate::CompareOp::Lt, ScopedStorageMode::OrderedLt)?.is_none() { return Ok(None) }
+        || !matches!(
+            truth.arg(),
+            UArg::Scalar {
+                dtype: DType::Bool,
+                bits: 1
+            }
+        )
+        || truth.ty().map(|t| t.scalar) != Some(DType::Bool)
+    {
+        return Ok(None);
+    }
+    let proof = UOp::new(
+        UOpKind::Store,
+        None,
+        vec![output.clone(), inner.clone()],
+        UArg::None,
+    );
+    if scoped_compare_value_plan(
+        &proof,
+        sm,
+        crate::CompareOp::Lt,
+        ScopedStorageMode::OrderedLt,
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
     Ok(Some(ScopedStorageMode::InclusiveLt))
 }
 
@@ -1708,7 +2024,12 @@ fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorage
 /// literal reversed-input CMPLT graph, so it is intentionally structurally
 /// equivalent to Less with the same reversed branches.
 fn scoped_ordered_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
-    scoped_compare_value_plan(store, sm, crate::CompareOp::Lt, ScopedStorageMode::OrderedLt)
+    scoped_compare_value_plan(
+        store,
+        sm,
+        crate::CompareOp::Lt,
+        ScopedStorageMode::OrderedLt,
+    )
 }
 
 /// Returns the source comparison shape only for an already-admitted public
@@ -1727,17 +2048,31 @@ fn scoped_select_predicate_shape(
             scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Lt)
         }
         UOpKind::GraphCompare(crate::CompareOp::Ne) => {
-            if let Some(shape) = scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Ne)? {
+            if let Some(shape) =
+                scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Ne)?
+            {
                 return Ok(Some(shape));
             }
-            let [cast, truth] = value.sources() else { return Ok(None) };
-            let UOpKind::Cast = cast.kind() else { return Ok(None) };
-            let [inner] = cast.sources() else { return Ok(None) };
+            let [cast, truth] = value.sources() else {
+                return Ok(None);
+            };
+            let UOpKind::Cast = cast.kind() else {
+                return Ok(None);
+            };
+            let [inner] = cast.sources() else {
+                return Ok(None);
+            };
             if value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 || inner.ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 || !matches!(truth.kind(), UOpKind::Const)
-                || !matches!(truth.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })
+                || !matches!(
+                    truth.arg(),
+                    UArg::Scalar {
+                        dtype: DType::Bool,
+                        bits: 1
+                    }
+                )
                 || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
             {
                 return Ok(None);
@@ -1765,7 +2100,9 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
         return Ok(None);
     };
     let [condition, on_true, on_false] = value.sources() else {
-        return Err(PtxError::Unsupported("public ReLU needs three Select inputs".into()));
+        return Err(PtxError::Unsupported(
+            "public ReLU needs three Select inputs".into(),
+        ));
     };
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
@@ -1787,7 +2124,9 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
     if output.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || value.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+        || output_elements
+            .checked_mul(output_dtype.itemsize())
+            .is_none()
     {
         return Err(PtxError::Unsupported(
             "public ReLU output descriptor is invalid".into(),
@@ -1844,7 +2183,9 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
         || input_output_shape != output_shape
         || input_shape != output_shape
         || input_shape.numel().map_err(|_| PtxError::Overflow)? != *input_elements
-        || input_elements.checked_mul(output_dtype.itemsize()).is_none()
+        || input_elements
+            .checked_mul(output_dtype.itemsize())
+            .is_none()
         || output_shape
             .numel()
             .map_err(|_| PtxError::Overflow)?
@@ -1868,10 +2209,7 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
 /// `(input < zero).where(slope * input, input)`.  The proof deliberately
 /// ties the predicate load, Mul rhs, and false branch to one graph input, and
 /// admits no other scalar-constant Compare/Select or Mul/Select composition.
-fn scoped_leaky_relu_plan(
-    store: &UOp,
-    sm: u32,
-) -> Result<Option<ScopedStorageMode>, PtxError> {
+fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     if store.sources().len() != 2 {
         return Err(PtxError::Unsupported(
             "public LeakyReLU Store needs exactly an index and value".into(),
@@ -1907,7 +2245,9 @@ fn scoped_leaky_relu_plan(
         .scalar;
     if value.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+        || output_elements
+            .checked_mul(output_dtype.itemsize())
+            .is_none()
     {
         return Err(PtxError::Unsupported(
             "public LeakyReLU output descriptor is invalid".into(),
@@ -1967,7 +2307,11 @@ fn scoped_leaky_relu_plan(
             ))),
         }
     }
-    fn descriptor<'a>(load: &'a UOp, output: &Shape, role: &str) -> Result<(&'a Shape, DType), PtxError> {
+    fn descriptor<'a>(
+        load: &'a UOp,
+        output: &Shape,
+        role: &str,
+    ) -> Result<(&'a Shape, DType), PtxError> {
         let [index] = load.sources() else {
             return Err(PtxError::Unsupported(format!(
                 "public LeakyReLU {role} load needs one index"
@@ -2042,10 +2386,9 @@ fn scoped_leaky_relu_plan(
     let value_shape = input_shape
         .broadcast_with(slope_shape)
         .map_err(|_| PtxError::Unsupported("public LeakyReLU Mul broadcast is invalid".into()))?;
-    if input_shape
-        .broadcast_with(&value_shape)
-        .map_err(|_| PtxError::Unsupported("public LeakyReLU predicate broadcast is invalid".into()))?
-        != output_shape.clone()
+    if input_shape.broadcast_with(&value_shape).map_err(|_| {
+        PtxError::Unsupported("public LeakyReLU predicate broadcast is invalid".into())
+    })? != output_shape.clone()
         || value_shape != output_shape.clone()
         || input_shape
             .numel()
@@ -2075,17 +2418,29 @@ fn scoped_leaky_relu_plan(
 /// into the upper stage.
 fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     let [output, root] = store.sources() else {
-        return Err(PtxError::Unsupported("Clamp Store needs index and value".into()));
+        return Err(PtxError::Unsupported(
+            "Clamp Store needs index and value".into(),
+        ));
     };
-    let UArg::BufferIndex { elements, output_shape, .. } = output.arg() else {
+    let UArg::BufferIndex {
+        elements,
+        output_shape,
+        ..
+    } = output.arg()
+    else {
         return Err(PtxError::Unsupported("Clamp needs concrete output".into()));
     };
-    let output_dtype = output.ty().ok_or_else(|| PtxError::Unsupported("untyped Clamp output".into()))?.scalar;
+    let output_dtype = output
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Clamp output".into()))?
+        .scalar;
     if root.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
         || elements.checked_mul(output_dtype.itemsize()).is_none()
     {
-        return Err(PtxError::Unsupported("Clamp output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "Clamp output descriptor is invalid".into(),
+        ));
     }
     fn source_lub(a: DType, b: DType) -> DType {
         if matches!((a, b), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
@@ -2097,7 +2452,11 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     // A Clamp leaf is an input load or exactly one source-LUB cast of that
     // load. It deliberately excludes constants and affine views: this is an
     // operation-scoped public root, not generic nested Select admission.
-    fn leaf<'a>(node: &'a UOp, target: DType, domain: &Shape) -> Result<(DType, &'a Shape), PtxError> {
+    fn leaf<'a>(
+        node: &'a UOp,
+        target: DType,
+        domain: &Shape,
+    ) -> Result<(DType, &'a Shape), PtxError> {
         let (load, cast) = match node.kind() {
             UOpKind::Load => (node, None),
             UOpKind::Cast => {
@@ -2109,26 +2468,45 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
                 }
                 (load, Some(node))
             }
-            _ => return Err(PtxError::Unsupported("Clamp needs direct loads and source casts".into())),
+            _ => {
+                return Err(PtxError::Unsupported(
+                    "Clamp needs direct loads and source casts".into(),
+                ));
+            }
         };
         let [index] = load.sources() else {
             return Err(PtxError::Unsupported("Clamp load arity".into()));
         };
-        let UArg::BufferIndex { elements, input_shape, output_shape, .. } = index.arg() else {
-            return Err(PtxError::Unsupported("Clamp does not admit affine views".into()));
+        let UArg::BufferIndex {
+            elements,
+            input_shape,
+            output_shape,
+            ..
+        } = index.arg()
+        else {
+            return Err(PtxError::Unsupported(
+                "Clamp does not admit affine views".into(),
+            ));
         };
-        let source = load.ty().ok_or_else(|| PtxError::Unsupported("untyped Clamp load".into()))?.scalar;
+        let source = load
+            .ty()
+            .ok_or_else(|| PtxError::Unsupported("untyped Clamp load".into()))?
+            .scalar;
         if node.ty().map(|ty| ty.scalar) != Some(target)
             || (source == target) != cast.is_none()
             || output_shape != domain
             || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
             || elements.checked_mul(source.itemsize()).is_none()
         {
-            return Err(PtxError::Unsupported("Clamp source-LUB leaf is invalid".into()));
+            return Err(PtxError::Unsupported(
+                "Clamp source-LUB leaf is invalid".into(),
+            ));
         }
         Ok((source, input_shape))
     }
-    fn parts<'a>(node: &'a UOp) -> Result<(&'a UOp, &'a UOp, &'a UOp, &'a UOp, &'a UOp, DType), PtxError> {
+    fn parts<'a>(
+        node: &'a UOp,
+    ) -> Result<(&'a UOp, &'a UOp, &'a UOp, &'a UOp, &'a UOp, DType), PtxError> {
         let UOpKind::Ternary(crate::uop::Ternary::Where) = node.kind() else {
             return Err(PtxError::Unsupported("Clamp stage needs Select".into()));
         };
@@ -2141,14 +2519,21 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         let [left, right] = condition.sources() else {
             return Err(PtxError::Unsupported("Clamp comparison arity".into()));
         };
-        let dtype = node.ty().ok_or_else(|| PtxError::Unsupported("untyped Clamp stage".into()))?.scalar;
+        let dtype = node
+            .ty()
+            .ok_or_else(|| PtxError::Unsupported("untyped Clamp stage".into()))?
+            .scalar;
         if condition.ty().map(|ty| ty.scalar) != Some(DType::Bool) {
             return Err(PtxError::Unsupported("Clamp predicate must be Bool".into()));
         }
         Ok((left, right, bound, value, condition, dtype))
     }
     fn extent(shape: &Shape, dtype: DType) -> Result<(), PtxError> {
-        shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(dtype.itemsize()).ok_or(PtxError::Overflow)?;
+        shape
+            .numel()
+            .map_err(|_| PtxError::Overflow)?
+            .checked_mul(dtype.itemsize())
+            .ok_or(PtxError::Overflow)?;
         Ok(())
     }
 
@@ -2156,7 +2541,9 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     let lower_root = left == value && right == bound;
     let upper_root = left == bound && right == value;
     if !lower_root && !upper_root {
-        return Err(PtxError::Unsupported("Clamp predicate/branch order is not source-literal".into()));
+        return Err(PtxError::Unsupported(
+            "Clamp predicate/branch order is not source-literal".into(),
+        ));
     }
 
     let mut f16 = output_dtype == DType::F16 || root_dtype == DType::F16;
@@ -2166,10 +2553,15 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     if lower_root {
         let (value_source, value_shape) = leaf(value, root_dtype, output_shape)?;
         f16 |= value_source == DType::F16;
-        let stage_shape = value_shape.broadcast_with(bound_shape)
+        let stage_shape = value_shape
+            .broadcast_with(bound_shape)
             .map_err(|_| PtxError::Unsupported("Clamp lower broadcast is invalid".into()))?;
-        if source_lub(value_source, bound_source) != root_dtype || stage_shape != output_shape.clone() {
-            return Err(PtxError::Unsupported("Clamp lower descriptors/promotion are invalid".into()));
+        if source_lub(value_source, bound_source) != root_dtype
+            || stage_shape != output_shape.clone()
+        {
+            return Err(PtxError::Unsupported(
+                "Clamp lower descriptors/promotion are invalid".into(),
+            ));
         }
         extent(&stage_shape, root_dtype)?;
         reject_sign_storage_dtype(value_source)?;
@@ -2182,45 +2574,63 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
             UOpKind::Ternary(crate::uop::Ternary::Where) => Some((value, false)),
             UOpKind::Cast => {
                 let [inner] = value.sources() else {
-                    return Err(PtxError::Unsupported("Clamp intermediate Cast arity".into()));
+                    return Err(PtxError::Unsupported(
+                        "Clamp intermediate Cast arity".into(),
+                    ));
                 };
-                matches!(inner.kind(), UOpKind::Ternary(crate::uop::Ternary::Where)).then_some((inner, true))
+                matches!(inner.kind(), UOpKind::Ternary(crate::uop::Ternary::Where))
+                    .then_some((inner, true))
             }
             _ => None,
         };
         if let Some((lower, casted)) = lower {
-            let (lower_left, lower_right, lower_bound, lower_value, _lower_condition, lower_dtype) = parts(lower)?;
+            let (lower_left, lower_right, lower_bound, lower_value, _lower_condition, lower_dtype) =
+                parts(lower)?;
             if lower_left != lower_value || lower_right != lower_bound {
-                return Err(PtxError::Unsupported("Clamp lower stage is not source-literal".into()));
+                return Err(PtxError::Unsupported(
+                    "Clamp lower stage is not source-literal".into(),
+                ));
             }
             if value.ty().map(|ty| ty.scalar) != Some(root_dtype)
                 || (lower_dtype == root_dtype) != !casted
             {
-                return Err(PtxError::Unsupported("Clamp intermediate storage boundary is invalid".into()));
+                return Err(PtxError::Unsupported(
+                    "Clamp intermediate storage boundary is invalid".into(),
+                ));
             }
             let (input_source, input_shape) = leaf(lower_value, lower_dtype, output_shape)?;
             let (min_source, min_shape) = leaf(lower_bound, lower_dtype, output_shape)?;
-            let lower_shape = input_shape.broadcast_with(min_shape)
+            let lower_shape = input_shape
+                .broadcast_with(min_shape)
                 .map_err(|_| PtxError::Unsupported("Clamp lower broadcast is invalid".into()))?;
-            let final_shape = lower_shape.broadcast_with(bound_shape)
+            let final_shape = lower_shape
+                .broadcast_with(bound_shape)
                 .map_err(|_| PtxError::Unsupported("Clamp upper broadcast is invalid".into()))?;
             if source_lub(input_source, min_source) != lower_dtype
                 || source_lub(lower_dtype, bound_source) != root_dtype
                 || final_shape != output_shape.clone()
             {
-                return Err(PtxError::Unsupported("Clamp stage descriptors/promotion are invalid".into()));
+                return Err(PtxError::Unsupported(
+                    "Clamp stage descriptors/promotion are invalid".into(),
+                ));
             }
             extent(&lower_shape, lower_dtype)?;
             extent(&final_shape, root_dtype)?;
-            f16 |= input_source == DType::F16 || min_source == DType::F16 || lower_dtype == DType::F16;
+            f16 |=
+                input_source == DType::F16 || min_source == DType::F16 || lower_dtype == DType::F16;
             reject_sign_storage_dtype(input_source)?;
             reject_sign_storage_dtype(min_source)?;
         } else {
             let (value_source, value_shape) = leaf(value, root_dtype, output_shape)?;
-            let stage_shape = value_shape.broadcast_with(bound_shape)
+            let stage_shape = value_shape
+                .broadcast_with(bound_shape)
                 .map_err(|_| PtxError::Unsupported("Clamp upper broadcast is invalid".into()))?;
-            if source_lub(value_source, bound_source) != root_dtype || stage_shape != output_shape.clone() {
-                return Err(PtxError::Unsupported("Clamp upper descriptors/promotion are invalid".into()));
+            if source_lub(value_source, bound_source) != root_dtype
+                || stage_shape != output_shape.clone()
+            {
+                return Err(PtxError::Unsupported(
+                    "Clamp upper descriptors/promotion are invalid".into(),
+                ));
             }
             extent(&stage_shape, root_dtype)?;
             f16 |= value_source == DType::F16;
@@ -2228,7 +2638,9 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         }
     }
     if f16 && sm < 53 {
-        return Err(PtxError::Unsupported("F16 Clamp requires sm_53 or newer".into()));
+        return Err(PtxError::Unsupported(
+            "F16 Clamp requires sm_53 or newer".into(),
+        ));
     }
     reject_sign_storage_dtype(bound_source)?;
     reject_sign_storage_dtype(root_dtype)?;
@@ -2246,24 +2658,42 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         return Ok(None);
     };
     let [condition, on_true, on_false] = value.sources() else {
-        return Err(PtxError::Unsupported("public Select needs three inputs".into()));
+        return Err(PtxError::Unsupported(
+            "public Select needs three inputs".into(),
+        ));
     };
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output.arg() else {
-        return Err(PtxError::Unsupported("public Select requires a concrete output buffer".into()));
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public Select requires a concrete output buffer".into(),
+        ));
     };
-    let output_dtype = output.ty().ok_or_else(|| PtxError::Unsupported("untyped Select output".into()))?.scalar;
+    let output_dtype = output
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Select output".into()))?
+        .scalar;
     if value.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+        || output_elements
+            .checked_mul(output_dtype.itemsize())
+            .is_none()
     {
-        return Err(PtxError::Unsupported("public Select output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public Select output descriptor is invalid".into(),
+        ));
     }
     fn direct_load<'a>(node: &'a UOp, role: &str) -> Result<&'a UOp, PtxError> {
         if !matches!(node.kind(), UOpKind::Load) {
-            return Err(PtxError::Unsupported(format!("public Select {role} must be a direct load")));
+            return Err(PtxError::Unsupported(format!(
+                "public Select {role} must be a direct load"
+            )));
         }
         Ok(node)
     }
@@ -2272,54 +2702,94 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
             UOpKind::Load => Ok((node, None)),
             UOpKind::Cast => {
                 let [load] = node.sources() else {
-                    return Err(PtxError::Unsupported("public Select Cast needs one input".into()));
+                    return Err(PtxError::Unsupported(
+                        "public Select Cast needs one input".into(),
+                    ));
                 };
                 if !matches!(load.kind(), UOpKind::Load) {
-                    return Err(PtxError::Unsupported("public Select Cast must consume a direct load".into()));
+                    return Err(PtxError::Unsupported(
+                        "public Select Cast must consume a direct load".into(),
+                    ));
                 }
                 Ok((load, Some(node)))
             }
-            _ => Err(PtxError::Unsupported("public Select payloads need only direct loads and source casts".into())),
+            _ => Err(PtxError::Unsupported(
+                "public Select payloads need only direct loads and source casts".into(),
+            )),
         }
     }
     fn index<'a>(load: &'a UOp, output: &Shape, role: &str) -> Result<&'a UOp, PtxError> {
         let [index] = load.sources() else {
-            return Err(PtxError::Unsupported(format!("public Select {role} load needs one index")));
+            return Err(PtxError::Unsupported(format!(
+                "public Select {role} load needs one index"
+            )));
         };
-        let UArg::BufferIndex { elements, input_shape, output_shape, .. } = index.arg() else {
-            return Err(PtxError::Unsupported(format!("public Select {role} does not admit affine views")));
+        let UArg::BufferIndex {
+            elements,
+            input_shape,
+            output_shape,
+            ..
+        } = index.arg()
+        else {
+            return Err(PtxError::Unsupported(format!(
+                "public Select {role} does not admit affine views"
+            )));
         };
-        let dtype = load.ty().ok_or_else(|| PtxError::Unsupported(format!("untyped Select {role}")))?.scalar;
+        let dtype = load
+            .ty()
+            .ok_or_else(|| PtxError::Unsupported(format!("untyped Select {role}")))?
+            .scalar;
         if index.ty().map(|ty| ty.scalar) != Some(dtype)
             || output_shape != output
             || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
             || elements.checked_mul(dtype.itemsize()).is_none()
         {
-            return Err(PtxError::Unsupported(format!("public Select {role} descriptor is invalid")));
+            return Err(PtxError::Unsupported(format!(
+                "public Select {role} descriptor is invalid"
+            )));
         }
         Ok(index)
     }
 
     let (condition_shape, condition_dtype) = if matches!(condition.kind(), UOpKind::Load) {
         let condition = direct_load(condition, "condition")?;
-        let dtype = condition.ty().ok_or_else(|| PtxError::Unsupported("untyped Select condition".into()))?.scalar;
+        let dtype = condition
+            .ty()
+            .ok_or_else(|| PtxError::Unsupported("untyped Select condition".into()))?
+            .scalar;
         if dtype != DType::Bool {
-            return Err(PtxError::Unsupported("public Select condition must be Bool".into()));
+            return Err(PtxError::Unsupported(
+                "public Select condition must be Bool".into(),
+            ));
         }
         let index = index(condition, output_shape, "condition")?;
-        let shape = match index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape.clone(), _ => unreachable!() };
+        let shape = match index.arg() {
+            UArg::BufferIndex { input_shape, .. } => input_shape.clone(),
+            _ => unreachable!(),
+        };
         (shape, dtype)
     } else {
         let Some(shape) = scoped_select_predicate_shape(condition, output_shape, sm)? else {
-            return Err(PtxError::Unsupported("public Select condition is not an admitted predicate root".into()));
+            return Err(PtxError::Unsupported(
+                "public Select condition is not an admitted predicate root".into(),
+            ));
         };
         (shape, DType::Bool)
     };
     let (true_load, true_cast) = payload(on_true)?;
     let (false_load, false_cast) = payload(on_false)?;
-    let true_dtype = true_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Select true payload".into()))?.scalar;
-    let false_dtype = false_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Select false payload".into()))?.scalar;
-    let payload_dtype = if matches!((true_dtype, false_dtype), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+    let true_dtype = true_load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Select true payload".into()))?
+        .scalar;
+    let false_dtype = false_load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Select false payload".into()))?
+        .scalar;
+    let payload_dtype = if matches!(
+        (true_dtype, false_dtype),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
         DType::F32
     } else {
         true_dtype.promote(false_dtype)
@@ -2328,13 +2798,20 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         || on_true.ty().map(|ty| ty.scalar) != Some(payload_dtype)
         || on_false.ty().map(|ty| ty.scalar) != Some(payload_dtype)
     {
-        return Err(PtxError::Unsupported("public Select payloads do not use source promotion".into()));
+        return Err(PtxError::Unsupported(
+            "public Select payloads do not use source promotion".into(),
+        ));
     }
-    for (load, cast, source_dtype) in [(true_load, true_cast, true_dtype), (false_load, false_cast, false_dtype)] {
+    for (load, cast, source_dtype) in [
+        (true_load, true_cast, true_dtype),
+        (false_load, false_cast, false_dtype),
+    ] {
         if (source_dtype == payload_dtype) != cast.is_none()
             || cast.is_some_and(|node| node.ty().map(|ty| ty.scalar) != Some(payload_dtype))
         {
-            return Err(PtxError::Unsupported("public Select must use exactly the source LUB casts".into()));
+            return Err(PtxError::Unsupported(
+                "public Select must use exactly the source LUB casts".into(),
+            ));
         }
     }
     let true_index = index(true_load, output_shape, "true payload")?;
@@ -2353,10 +2830,14 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         .map_err(|_| PtxError::Unsupported("public Select condition broadcast is invalid".into()))?
         != output_shape.clone()
     {
-        return Err(PtxError::Unsupported("public Select does not prove a three-way broadcast".into()));
+        return Err(PtxError::Unsupported(
+            "public Select does not prove a three-way broadcast".into(),
+        ));
     }
     if [condition_dtype, true_dtype, false_dtype, payload_dtype].contains(&DType::F16) && sm < 53 {
-        return Err(PtxError::Unsupported("F16 public Select conversion requires sm_53 or newer".into()));
+        return Err(PtxError::Unsupported(
+            "F16 public Select conversion requires sm_53 or newer".into(),
+        ));
     }
     reject_sign_storage_dtype(condition_dtype)?;
     reject_sign_storage_dtype(true_dtype)?;
@@ -2378,70 +2859,117 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
         return Ok(None);
     };
     let [dividend, reciprocal] = value.sources() else {
-        return Err(PtxError::Unsupported("public Div Mul needs two inputs".into()));
+        return Err(PtxError::Unsupported(
+            "public Div Mul needs two inputs".into(),
+        ));
     };
     let UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.kind() else {
         return Ok(None);
     };
     let [divisor] = reciprocal.sources() else {
-        return Err(PtxError::Unsupported("public Div Reciprocal needs one input".into()));
+        return Err(PtxError::Unsupported(
+            "public Div Reciprocal needs one input".into(),
+        ));
     };
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output_index.arg() else {
-        return Err(PtxError::Unsupported("public Div requires a concrete output buffer".into()));
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output_index.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public Div requires a concrete output buffer".into(),
+        ));
     };
-    let output_dtype = value.ty().ok_or_else(|| PtxError::Unsupported("untyped Div output".into()))?.scalar;
+    let output_dtype = value
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Div output".into()))?
+        .scalar;
     if !output_dtype.is_float()
         || output_index.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+        || output_elements
+            .checked_mul(output_dtype.itemsize())
+            .is_none()
     {
-        return Err(PtxError::Unsupported("public Div output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "public Div output descriptor is invalid".into(),
+        ));
     }
 
     fn source_promote(left: DType, right: DType) -> DType {
-        if matches!((left, right), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        if matches!(
+            (left, right),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
             DType::F32
         } else {
             left.promote(right)
         }
     }
-    fn path<'a>(mut node: &'a UOp, original: DType, targets: &[DType]) -> Result<&'a UOp, PtxError> {
+    fn path<'a>(
+        mut node: &'a UOp,
+        original: DType,
+        targets: &[DType],
+    ) -> Result<&'a UOp, PtxError> {
         for target in targets.iter().rev() {
             let UOpKind::Cast = node.kind() else {
-                return Err(PtxError::Unsupported("public Div is missing a required source cast".into()));
+                return Err(PtxError::Unsupported(
+                    "public Div is missing a required source cast".into(),
+                ));
             };
             if node.ty().map(|ty| ty.scalar) != Some(*target) {
-                return Err(PtxError::Unsupported("public Div cast target is not source-exact".into()));
+                return Err(PtxError::Unsupported(
+                    "public Div cast target is not source-exact".into(),
+                ));
             }
             let [input] = node.sources() else {
-                return Err(PtxError::Unsupported("public Div Cast needs one input".into()));
+                return Err(PtxError::Unsupported(
+                    "public Div Cast needs one input".into(),
+                ));
             };
             node = input;
         }
-        if !matches!(node.kind(), UOpKind::Load)
-            || node.ty().map(|ty| ty.scalar) != Some(original)
+        if !matches!(node.kind(), UOpKind::Load) || node.ty().map(|ty| ty.scalar) != Some(original)
         {
-            return Err(PtxError::Unsupported("public Div needs direct typed input loads".into()));
+            return Err(PtxError::Unsupported(
+                "public Div needs direct typed input loads".into(),
+            ));
         }
         Ok(node)
     }
     fn index<'a>(load: &'a UOp, output: &Shape) -> Result<&'a UOp, PtxError> {
         let [index] = load.sources() else {
-            return Err(PtxError::Unsupported("public Div load needs one index".into()));
+            return Err(PtxError::Unsupported(
+                "public Div load needs one index".into(),
+            ));
         };
-        let UArg::BufferIndex { elements, input_shape, output_shape, .. } = index.arg() else {
-            return Err(PtxError::Unsupported("public Div does not admit affine-view inputs".into()));
+        let UArg::BufferIndex {
+            elements,
+            input_shape,
+            output_shape,
+            ..
+        } = index.arg()
+        else {
+            return Err(PtxError::Unsupported(
+                "public Div does not admit affine-view inputs".into(),
+            ));
         };
-        let dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped Div input".into()))?.scalar;
+        let dtype = load
+            .ty()
+            .ok_or_else(|| PtxError::Unsupported("untyped Div input".into()))?
+            .scalar;
         if index.ty().map(|ty| ty.scalar) != Some(dtype)
             || output_shape != output
             || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
             || elements.checked_mul(dtype.itemsize()).is_none()
         {
-            return Err(PtxError::Unsupported("public Div input descriptor is invalid".into()));
+            return Err(PtxError::Unsupported(
+                "public Div input descriptor is invalid".into(),
+            ));
         }
         Ok(index)
     }
@@ -2450,48 +2978,95 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     fn load_dtype(mut node: &UOp) -> Result<DType, PtxError> {
         while matches!(node.kind(), UOpKind::Cast) {
             let [input] = node.sources() else {
-                return Err(PtxError::Unsupported("public Div Cast needs one input".into()));
+                return Err(PtxError::Unsupported(
+                    "public Div Cast needs one input".into(),
+                ));
             };
             node = input;
         }
         if !matches!(node.kind(), UOpKind::Load) {
-            return Err(PtxError::Unsupported("public Div needs direct input loads".into()));
+            return Err(PtxError::Unsupported(
+                "public Div needs direct input loads".into(),
+            ));
         }
-        node.ty().map(|ty| ty.scalar).ok_or_else(|| PtxError::Unsupported("untyped Div input".into()))
+        node.ty()
+            .map(|ty| ty.scalar)
+            .ok_or_else(|| PtxError::Unsupported("untyped Div input".into()))
     }
     let lhs_dtype = load_dtype(dividend)?;
     let rhs_dtype = load_dtype(divisor)?;
     let division_dtype = source_promote(lhs_dtype, rhs_dtype);
-    let dividend_dtype = if division_dtype.is_float() { division_dtype } else { DType::F32 };
-    let reciprocal_dtype = if division_dtype.is_float() { division_dtype } else { DType::F32 };
+    let dividend_dtype = if division_dtype.is_float() {
+        division_dtype
+    } else {
+        DType::F32
+    };
+    let reciprocal_dtype = if division_dtype.is_float() {
+        division_dtype
+    } else {
+        DType::F32
+    };
     let expected_output = source_promote(dividend_dtype, reciprocal_dtype);
     if output_dtype != expected_output
         || dividend.ty().map(|ty| ty.scalar) != Some(dividend_dtype)
         || reciprocal.ty().map(|ty| ty.scalar) != Some(reciprocal_dtype)
         || divisor.ty().map(|ty| ty.scalar) != Some(reciprocal_dtype)
     {
-        return Err(PtxError::Unsupported("public Div dtype flow is not source-exact".into()));
+        return Err(PtxError::Unsupported(
+            "public Div dtype flow is not source-exact".into(),
+        ));
     }
     let mut lhs_targets = Vec::new();
-    if lhs_dtype != division_dtype { lhs_targets.push(division_dtype); }
-    if division_dtype != dividend_dtype { lhs_targets.push(dividend_dtype); }
+    if lhs_dtype != division_dtype {
+        lhs_targets.push(division_dtype);
+    }
+    if division_dtype != dividend_dtype {
+        lhs_targets.push(dividend_dtype);
+    }
     let mut rhs_targets = Vec::new();
-    if rhs_dtype != division_dtype { rhs_targets.push(division_dtype); }
-    if division_dtype != reciprocal_dtype { rhs_targets.push(reciprocal_dtype); }
+    if rhs_dtype != division_dtype {
+        rhs_targets.push(division_dtype);
+    }
+    if division_dtype != reciprocal_dtype {
+        rhs_targets.push(reciprocal_dtype);
+    }
     let lhs_load = path(dividend, lhs_dtype, &lhs_targets)?;
     let rhs_load = path(divisor, rhs_dtype, &rhs_targets)?;
     let lhs_index = index(lhs_load, output_shape)?;
     let rhs_index = index(rhs_load, output_shape)?;
-    let lhs_shape = match lhs_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
-    let rhs_shape = match rhs_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
-    if lhs_shape.broadcast_with(rhs_shape).map_err(|_| PtxError::Unsupported("public Div broadcast is invalid".into()))? != output_shape.clone() {
-        return Err(PtxError::Unsupported("public Div inputs do not produce the output broadcast shape".into()));
+    let lhs_shape = match lhs_index.arg() {
+        UArg::BufferIndex { input_shape, .. } => input_shape,
+        _ => unreachable!(),
+    };
+    let rhs_shape = match rhs_index.arg() {
+        UArg::BufferIndex { input_shape, .. } => input_shape,
+        _ => unreachable!(),
+    };
+    if lhs_shape
+        .broadcast_with(rhs_shape)
+        .map_err(|_| PtxError::Unsupported("public Div broadcast is invalid".into()))?
+        != output_shape.clone()
+    {
+        return Err(PtxError::Unsupported(
+            "public Div inputs do not produce the output broadcast shape".into(),
+        ));
     }
-    for dtype in [division_dtype, dividend_dtype, reciprocal_dtype, output_dtype] {
-        output_shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(dtype.itemsize()).ok_or(PtxError::Overflow)?;
+    for dtype in [
+        division_dtype,
+        dividend_dtype,
+        reciprocal_dtype,
+        output_dtype,
+    ] {
+        output_shape
+            .numel()
+            .map_err(|_| PtxError::Overflow)?
+            .checked_mul(dtype.itemsize())
+            .ok_or(PtxError::Overflow)?;
     }
     if output_dtype == DType::F16 && sm < 53 {
-        return Err(PtxError::Unsupported("F16 public Div conversion requires sm_53 or newer".into()));
+        return Err(PtxError::Unsupported(
+            "F16 public Div conversion requires sm_53 or newer".into(),
+        ));
     }
     reject_sign_storage_dtype(output_dtype)?;
     Ok(Some(ScopedStorageMode::Div))
@@ -2511,13 +3086,19 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
         return Err(PtxError::Unsupported("Bool Sub needs two inputs".into()));
     };
     let UOpKind::Load = lhs.kind() else {
-        return Err(PtxError::Unsupported("Bool Sub lhs must be a direct load".into()));
+        return Err(PtxError::Unsupported(
+            "Bool Sub lhs must be a direct load".into(),
+        ));
     };
     let UOpKind::GraphLogical(crate::LogicalOp::Not) = not_rhs.kind() else {
-        return Err(PtxError::Unsupported("Bool Sub rhs must be LogicalNot".into()));
+        return Err(PtxError::Unsupported(
+            "Bool Sub rhs must be LogicalNot".into(),
+        ));
     };
     let [rhs] = not_rhs.sources() else {
-        return Err(PtxError::Unsupported("Bool Sub Not must have one input".into()));
+        return Err(PtxError::Unsupported(
+            "Bool Sub Not must have one input".into(),
+        ));
     };
     if !matches!(rhs.kind(), UOpKind::Load)
         || lhs.ty().map(|ty| ty.scalar) != Some(DType::Bool)
@@ -2538,17 +3119,25 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
         ..
     } = output_index.arg()
     else {
-        return Err(PtxError::Unsupported("Bool Sub requires a concrete output".into()));
+        return Err(PtxError::Unsupported(
+            "Bool Sub requires a concrete output".into(),
+        ));
     };
     if output_index.ty().map(|ty| ty.scalar) != Some(DType::Bool)
         || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+        || output_elements
+            .checked_mul(DType::Bool.itemsize())
+            .is_none()
     {
-        return Err(PtxError::Unsupported("Bool Sub output descriptor is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "Bool Sub output descriptor is invalid".into(),
+        ));
     }
     fn input_shape<'a>(load: &'a UOp, output: &Shape) -> Result<&'a Shape, PtxError> {
         let [index] = load.sources() else {
-            return Err(PtxError::Unsupported("Bool Sub load needs one index".into()));
+            return Err(PtxError::Unsupported(
+                "Bool Sub load needs one index".into(),
+            ));
         };
         let UArg::BufferIndex {
             elements,
@@ -2566,7 +3155,9 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
             || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
             || elements.checked_mul(DType::Bool.itemsize()).is_none()
         {
-            return Err(PtxError::Unsupported("Bool Sub input descriptor is invalid".into()));
+            return Err(PtxError::Unsupported(
+                "Bool Sub input descriptor is invalid".into(),
+            ));
         }
         Ok(input_shape)
     }
@@ -2577,7 +3168,9 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
         .map_err(|_| PtxError::Unsupported("Bool Sub broadcast is invalid".into()))?
         != output_shape.clone()
     {
-        return Err(PtxError::Unsupported("Bool Sub output shape is invalid".into()));
+        return Err(PtxError::Unsupported(
+            "Bool Sub output shape is invalid".into(),
+        ));
     }
     Ok(Some(ScopedStorageMode::SubBool))
 }
@@ -2607,10 +3200,18 @@ fn narrow_storage_result(
         mode,
         Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
     );
-    let sqrt = matches!(mode, Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt));
+    let sqrt = matches!(
+        mode,
+        Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt)
+    );
     let scoped_binary = matches!(
         mode,
-        Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div)
+        Some(
+            ScopedStorageMode::Mul
+                | ScopedStorageMode::Add
+                | ScopedStorageMode::Sub
+                | ScopedStorageMode::Div
+        )
     );
     match dtype {
         DType::F16 => {
@@ -2734,8 +3335,15 @@ fn emit_typed_binary_cast(
                 lines.push(format!("  cvt.rn.f32.f64 %f31, {source};"));
                 Ok("%f31".into())
             }
-            DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32
-            | DType::U32 | DType::I64 | DType::U64 => {
+            DType::Bool
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16
+            | DType::I32
+            | DType::U32
+            | DType::I64
+            | DType::U64 => {
                 lines.push(format!(
                     "  cvt.rn.f32.{} %f31, {source};",
                     ptx_type(source_dtype)
@@ -2775,16 +3383,24 @@ fn emit_typed_binary_cast(
             lines.push(format!("  mov.b32 {dst}, %r91;"));
         }
         DType::F32 => match source_dtype {
-            DType::F16 | DType::BF16 | DType::F32 => lines.push(format!("  mov.f32 {dst}, {source};")),
+            DType::F16 | DType::BF16 | DType::F32 => {
+                lines.push(format!("  mov.f32 {dst}, {source};"))
+            }
             DType::F64 => lines.push(format!("  cvt.rn.f32.f64 {dst}, {source};")),
-            _ => lines.push(format!("  cvt.rn.f32.{} {dst}, {source};", ptx_type(source_dtype))),
+            _ => lines.push(format!(
+                "  cvt.rn.f32.{} {dst}, {source};",
+                ptx_type(source_dtype)
+            )),
         },
         DType::F64 => match source_dtype {
             DType::F64 => lines.push(format!("  mov.f64 {dst}, {source};")),
             DType::F16 | DType::BF16 | DType::F32 => {
                 lines.push(format!("  cvt.rn.f64.f32 {dst}, {source};"));
             }
-            _ => lines.push(format!("  cvt.rn.f64.{} {dst}, {source};", ptx_type(source_dtype))),
+            _ => lines.push(format!(
+                "  cvt.rn.f64.{} {dst}, {source};",
+                ptx_type(source_dtype)
+            )),
         },
         _ => lines.push(format!(
             "  cvt.{}.{} {dst}, {source};",
@@ -2812,7 +3428,9 @@ fn emit_logical_not_bool_cast(
     let zero = if source_dtype.is_float() { "0.0" } else { "0" };
     // Ordered equality is false for NaN; inverting it therefore gives the
     // required source truthiness for NaN as well as every nonzero value.
-    lines.push(format!("  setp.eq.{predicate_dtype} %p1, {source}, {zero};"));
+    lines.push(format!(
+        "  setp.eq.{predicate_dtype} %p1, {source}, {zero};"
+    ));
     lines.push("  not.pred %p1, %p1;".into());
     lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
 }
@@ -2822,7 +3440,15 @@ fn emit_logical_not_bool_cast(
 /// before the Bool result is formed, and integral source lanes never convert.
 fn emit_isinf_predicate(lines: &mut Vec<String>, dst: &str, source: String, dtype: DType) {
     match dtype {
-        DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32 | DType::U32 | DType::I64 | DType::U64 => {
+        DType::Bool
+        | DType::I8
+        | DType::U8
+        | DType::I16
+        | DType::U16
+        | DType::I32
+        | DType::U32
+        | DType::I64
+        | DType::U64 => {
             lines.push(format!("  mov.u32 {dst}, 0;"));
             return;
         }
@@ -2858,7 +3484,11 @@ fn emit_typed_select_cast(
     source_dtype: DType,
     target: DType,
 ) -> Result<(), PtxError> {
-    fn source_f32(lines: &mut Vec<String>, source: String, dtype: DType) -> Result<String, PtxError> {
+    fn source_f32(
+        lines: &mut Vec<String>,
+        source: String,
+        dtype: DType,
+    ) -> Result<String, PtxError> {
         match dtype {
             DType::F16 => {
                 lines.push(format!("  cvt.rn.f32.f16 %f31, {source};"));
@@ -2918,9 +3548,16 @@ fn emit_typed_select_cast(
                 let value = source_f32(lines, source, source_dtype)?;
                 lines.push(format!("  cvt.rn.f64.f32 {dst}, {value};"));
             }
-            _ => lines.push(format!("  cvt.rn.f64.{} {dst}, {source};", ptx_type(source_dtype))),
+            _ => lines.push(format!(
+                "  cvt.rn.f64.{} {dst}, {source};",
+                ptx_type(source_dtype)
+            )),
         },
-        _ => lines.push(format!("  cvt.{}.{} {dst}, {source};", ptx_type(target), ptx_type(source_dtype))),
+        _ => lines.push(format!(
+            "  cvt.{}.{} {dst}, {source};",
+            ptx_type(target),
+            ptx_type(source_dtype)
+        )),
     }
     Ok(())
 }
@@ -2972,7 +3609,11 @@ fn emit_rsqrt_sqrt_boundary(
         }
         DType::F32 => lines.push(format!("  cvt.rn.f32.f64 {dst}, %fd30;")),
         DType::F64 => lines.push(format!("  mov.f64 {dst}, %fd30;")),
-        _ => return Err(PtxError::Unsupported("public Rsqrt Sqrt is not floating".into())),
+        _ => {
+            return Err(PtxError::Unsupported(
+                "public Rsqrt Sqrt is not floating".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3025,7 +3666,11 @@ fn emit_div_reciprocal_boundary(
         }
         DType::F32 => lines.push(format!("  cvt.rn.f32.f64 {dst}, %fd30;")),
         DType::F64 => lines.push(format!("  mov.f64 {dst}, %fd30;")),
-        _ => return Err(PtxError::Unsupported("public Div reciprocal is not floating".into())),
+        _ => {
+            return Err(PtxError::Unsupported(
+                "public Div reciprocal is not floating".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3101,28 +3746,39 @@ fn emit(
                     | ScopedStorageMode::Sqrt
                     | ScopedStorageMode::SqrtCast
             )
-        )
-            && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal | crate::UnaryOp::Sqrt)) =>
+        ) && matches!(
+            n.kind(),
+            UOpKind::GraphUnary(crate::UnaryOp::Reciprocal | crate::UnaryOp::Sqrt)
+        ) =>
         {
             format!("%fd{id}")
         }
         _ if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt)
-        )
-            && matches!(
-                n.kind(),
-                UOpKind::GraphBinary(
-                    crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub
-                )
+            Some(
+                ScopedStorageMode::Mul
+                    | ScopedStorageMode::Add
+                    | ScopedStorageMode::Sub
+                    | ScopedStorageMode::Div
+                    | ScopedStorageMode::Eq
+                    | ScopedStorageMode::Ne
+                    | ScopedStorageMode::OrderedLt
             )
-            && ty.is_float() =>
+        ) && matches!(
+            n.kind(),
+            UOpKind::GraphBinary(
+                crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub
+            )
+        ) && ty.is_float() =>
         {
             format!("%fd{id}")
         }
         DType::F16 | DType::BF16
             if storage_mode == Some(ScopedStorageMode::Neg)
-                && matches!(n.kind(), UOpKind::Load | UOpKind::GraphUnary(crate::UnaryOp::Neg)) =>
+                && matches!(
+                    n.kind(),
+                    UOpKind::Load | UOpKind::GraphUnary(crate::UnaryOp::Neg)
+                ) =>
         {
             format!("%r{id}")
         }
@@ -3133,8 +3789,10 @@ fn emit(
             format!("%r{id}")
         }
         DType::F16 | DType::BF16
-            if matches!(storage_mode, Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite))
-                && matches!(n.kind(), UOpKind::Load) =>
+            if matches!(
+                storage_mode,
+                Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite)
+            ) && matches!(n.kind(), UOpKind::Load) =>
         {
             format!("%r{id}")
         }
@@ -3210,7 +3868,10 @@ fn emit(
                 DType::F16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
-                        && !matches!(storage_mode, Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite))
+                        && !matches!(
+                            storage_mode,
+                            Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite)
+                        )
                         && !matches!(
                             storage_mode,
                             Some(
@@ -3228,7 +3889,10 @@ fn emit(
                 DType::BF16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
-                        && !matches!(storage_mode, Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite))
+                        && !matches!(
+                            storage_mode,
+                            Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite)
+                        )
                         && !matches!(
                             storage_mode,
                             Some(
@@ -3247,10 +3911,30 @@ fn emit(
                 _ => lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty))),
             }
         }
-        UOpKind::Cast if matches!(
-            storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::LogicalNot | ScopedStorageMode::IsFinite | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp | ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt)
-        ) => {
+        UOpKind::Cast
+            if matches!(
+                storage_mode,
+                Some(
+                    ScopedStorageMode::Mul
+                        | ScopedStorageMode::Add
+                        | ScopedStorageMode::Sub
+                        | ScopedStorageMode::Div
+                        | ScopedStorageMode::Eq
+                        | ScopedStorageMode::Ne
+                        | ScopedStorageMode::LogicalNot
+                        | ScopedStorageMode::IsFinite
+                        | ScopedStorageMode::OrderedLt
+                        | ScopedStorageMode::InclusiveLt
+                        | ScopedStorageMode::Select
+                        | ScopedStorageMode::LeakyRelu
+                        | ScopedStorageMode::Extrema
+                        | ScopedStorageMode::Clamp
+                        | ScopedStorageMode::Sqrt
+                        | ScopedStorageMode::SqrtCast
+                        | ScopedStorageMode::Rsqrt
+                )
+            ) =>
+        {
             let a = child(0)?;
             let source = n.sources()[0]
                 .ty()
@@ -3258,7 +3942,9 @@ fn emit(
                 .scalar;
             if storage_mode == Some(ScopedStorageMode::LogicalNot) {
                 if ty != DType::Bool {
-                    return Err(PtxError::Unsupported("public logical-not cast must target Bool".into()));
+                    return Err(PtxError::Unsupported(
+                        "public logical-not cast must target Bool".into(),
+                    ));
                 }
                 emit_logical_not_bool_cast(lines, &dst, a, source);
             } else if storage_mode == Some(ScopedStorageMode::IsFinite)
@@ -3276,7 +3962,15 @@ fn emit(
                 // predicate and its canonical `!= true` inversion. Preserve
                 // that explicitly without admitting arbitrary Bool casts.
                 lines.push(format!("  mov.u32 {dst}, {a};"));
-            } else if matches!(storage_mode, Some(ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp)) {
+            } else if matches!(
+                storage_mode,
+                Some(
+                    ScopedStorageMode::Select
+                        | ScopedStorageMode::LeakyRelu
+                        | ScopedStorageMode::Extrema
+                        | ScopedStorageMode::Clamp
+                )
+            ) {
                 emit_typed_select_cast(lines, &dst, a, source, ty)?;
             } else {
                 emit_typed_binary_cast(lines, &dst, a, source, ty)?;
@@ -3297,14 +3991,19 @@ fn emit(
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
             if *op == crate::UnaryOp::IsInf
-                && matches!(storage_mode, Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite))
+                && matches!(
+                    storage_mode,
+                    Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite)
+                )
             {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped public IsInf source".into()))?
                     .scalar;
                 if ty != DType::Bool {
-                    return Err(PtxError::Unsupported("public IsInf must produce Bool".into()));
+                    return Err(PtxError::Unsupported(
+                        "public IsInf must produce Bool".into(),
+                    ));
                 }
                 emit_isinf_predicate(lines, &dst, a, source_dtype);
                 return Ok(dst);
@@ -3332,7 +4031,10 @@ fn emit(
                 return Ok(dst);
             }
             if *op == crate::UnaryOp::Sqrt
-                && matches!(storage_mode, Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast))
+                && matches!(
+                    storage_mode,
+                    Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast)
+                )
             {
                 // The generic and materialized CPU evaluators widen the
                 // typed lane to F64 before SQRT. PTX's rounded F64 SQRT is
@@ -3352,25 +4054,33 @@ fn emit(
                 return Ok(dst);
             }
             if *op == crate::UnaryOp::Sqrt && storage_mode == Some(ScopedStorageMode::Rsqrt) {
-                let source_dtype = n.sources()[0].ty().ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Sqrt input".into()))?.scalar;
+                let source_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Sqrt input".into()))?
+                    .scalar;
                 emit_rsqrt_sqrt_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
             }
             if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Rsqrt) {
-                let source_dtype = n.sources()[0].ty().ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Reciprocal input".into()))?.scalar;
-                let wide = if source_dtype == DType::F64 { a } else {
+                let source_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Reciprocal input".into()))?
+                    .scalar;
+                let wide = if source_dtype == DType::F64 {
+                    a
+                } else {
                     lines.push(format!("  cvt.rn.f64.f32 %fd31, {a};"));
                     "%fd31".into()
                 };
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
                 return Ok(dst);
             }
-            if *op == crate::UnaryOp::Reciprocal
-                && storage_mode == Some(ScopedStorageMode::Div)
-            {
+            if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Div) {
                 let source_dtype = n.sources()[0]
                     .ty()
-                    .ok_or_else(|| PtxError::Unsupported("untyped public Div reciprocal input".into()))?
+                    .ok_or_else(|| {
+                        PtxError::Unsupported("untyped public Div reciprocal input".into())
+                    })?
                     .scalar;
                 emit_div_reciprocal_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
@@ -3551,39 +4261,87 @@ fn emit(
                         | ScopedStorageMode::Div
                         | ScopedStorageMode::SubBool
                 )
-            ) && matches!(*op, crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub)
-            {
+            ) && matches!(
+                *op,
+                crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub
+            ) {
                 let is_add = *op == crate::BinaryOp::Add;
                 let is_sub = *op == crate::BinaryOp::Sub;
                 match ty {
                     DType::Bool if is_add => lines.push(format!("  or.b32 {dst}, {a}, {b};")),
-                    DType::Bool => return Err(PtxError::Unsupported("raw Bool binary is not scoped Sub".into())),
+                    DType::Bool => {
+                        return Err(PtxError::Unsupported(
+                            "raw Bool binary is not scoped Sub".into(),
+                        ));
+                    }
                     DType::I8 | DType::I16 | DType::I32 => {
-                        if is_add { lines.push(format!("  add.s32 {dst}, {a}, {b};")); }
-                        else if is_sub { lines.push(format!("  sub.s32 {dst}, {a}, {b};")); }
-                        else { lines.push(format!("  mul.lo.s32 {dst}, {a}, {b};")); }
+                        if is_add {
+                            lines.push(format!("  add.s32 {dst}, {a}, {b};"));
+                        } else if is_sub {
+                            lines.push(format!("  sub.s32 {dst}, {a}, {b};"));
+                        } else {
+                            lines.push(format!("  mul.lo.s32 {dst}, {a}, {b};"));
+                        }
                     }
                     DType::U8 | DType::U16 | DType::U32 => {
-                        if is_add { lines.push(format!("  add.u32 {dst}, {a}, {b};")); }
-                        else if is_sub { lines.push(format!("  sub.u32 {dst}, {a}, {b};")); }
-                        else { lines.push(format!("  mul.lo.u32 {dst}, {a}, {b};")); }
+                        if is_add {
+                            lines.push(format!("  add.u32 {dst}, {a}, {b};"));
+                        } else if is_sub {
+                            lines.push(format!("  sub.u32 {dst}, {a}, {b};"));
+                        } else {
+                            lines.push(format!("  mul.lo.u32 {dst}, {a}, {b};"));
+                        }
                     }
-                    DType::I64 => lines.push(format!("  {}.s64 {dst}, {a}, {b};", if is_add { "add" } else if is_sub { "sub" } else { "mul.lo" })),
-                    DType::U64 => lines.push(format!("  {}.u64 {dst}, {a}, {b};", if is_add { "add" } else if is_sub { "sub" } else { "mul.lo" })),
+                    DType::I64 => lines.push(format!(
+                        "  {}.s64 {dst}, {a}, {b};",
+                        if is_add {
+                            "add"
+                        } else if is_sub {
+                            "sub"
+                        } else {
+                            "mul.lo"
+                        }
+                    )),
+                    DType::U64 => lines.push(format!(
+                        "  {}.u64 {dst}, {a}, {b};",
+                        if is_add {
+                            "add"
+                        } else if is_sub {
+                            "sub"
+                        } else {
+                            "mul.lo"
+                        }
+                    )),
                     DType::F16 | DType::BF16 | DType::F32 => {
                         lines.push(format!("  cvt.rn.f64.f32 %fd29, {a};"));
                         lines.push(format!("  cvt.rn.f64.f32 %fd30, {b};"));
-                        lines.push(format!("  {}.rn.f64 {dst}, %fd29, %fd30;", if is_add { "add" } else if is_sub { "sub" } else { "mul" }));
+                        lines.push(format!(
+                            "  {}.rn.f64 {dst}, %fd29, %fd30;",
+                            if is_add {
+                                "add"
+                            } else if is_sub {
+                                "sub"
+                            } else {
+                                "mul"
+                            }
+                        ));
                     }
                     DType::F64 => {
-                        lines.push(format!("  {}.rn.f64 {dst}, {a}, {b};", if is_add { "add" } else if is_sub { "sub" } else { "mul" }));
+                        lines.push(format!(
+                            "  {}.rn.f64 {dst}, {a}, {b};",
+                            if is_add {
+                                "add"
+                            } else if is_sub {
+                                "sub"
+                            } else {
+                                "mul"
+                            }
+                        ));
                     }
                 }
                 return Ok(dst);
             }
-            if storage_mode == Some(ScopedStorageMode::Abs)
-                && *op == crate::BinaryOp::Mul
-            {
+            if storage_mode == Some(ScopedStorageMode::Abs) && *op == crate::BinaryOp::Mul {
                 let mnemonic = match ty {
                     DType::Bool => {
                         lines.push(format!("  and.b32 {dst}, {a}, {b};"));
@@ -3619,15 +4377,31 @@ fn emit(
                 // Ordered predicates select rhs only when it strictly wins.
                 // Equality, signed-zero ties, and every unordered NaN case
                 // retain lhs and its exact stored payload.
-                let predicate = if *op == crate::BinaryOp::Maximum { "lt" } else { "gt" };
-                lines.push(format!("  setp.{predicate}.{predicate_dtype} %p1, {a}, {b};"));
+                let predicate = if *op == crate::BinaryOp::Maximum {
+                    "lt"
+                } else {
+                    "gt"
+                };
+                lines.push(format!(
+                    "  setp.{predicate}.{predicate_dtype} %p1, {a}, {b};"
+                ));
                 let select_type = match ty {
-                    DType::F16 | DType::BF16 | DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32 | DType::U32 => "b32",
+                    DType::F16
+                    | DType::BF16
+                    | DType::Bool
+                    | DType::I8
+                    | DType::U8
+                    | DType::I16
+                    | DType::U16
+                    | DType::I32
+                    | DType::U32 => "b32",
                     DType::I64 | DType::U64 => "b64",
                     DType::F32 => "f32",
                     DType::F64 => "f64",
                 };
-                lines.push(format!("  selp.{select_type} {dst}, {raw_b}, {raw_a}, %p1;"));
+                lines.push(format!(
+                    "  selp.{select_type} {dst}, {raw_b}, {raw_a}, %p1;"
+                ));
                 return Ok(dst);
             }
             if matches!(*op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) {
@@ -3636,8 +4410,15 @@ fn emit(
                         "ordered maximum/minimum for narrow float lacks an exact PTX path".into(),
                     ));
                 }
-                let predicate = if *op == crate::BinaryOp::Maximum { "lt" } else { "gt" };
-                lines.push(format!("  setp.{predicate}.{} %p1, {a}, {b};", ptx_type(ty)));
+                let predicate = if *op == crate::BinaryOp::Maximum {
+                    "lt"
+                } else {
+                    "gt"
+                };
+                lines.push(format!(
+                    "  setp.{predicate}.{} %p1, {a}, {b};",
+                    ptx_type(ty)
+                ));
                 lines.push(format!("  selp.{} {dst}, {b}, {a}, %p1;", ptx_type(ty)));
                 return Ok(dst);
             }
@@ -3671,15 +4452,12 @@ fn emit(
                         | ScopedStorageMode::Clamp
                 )
             ) {
-                if storage_mode == Some(ScopedStorageMode::Relu)
-                    && *op != crate::CompareOp::Lt
-                {
+                if storage_mode == Some(ScopedStorageMode::Relu) && *op != crate::CompareOp::Lt {
                     return Err(PtxError::Unsupported(
                         "public ReLU requires ordered zero < input".into(),
                     ));
                 }
-                if storage_mode == Some(ScopedStorageMode::LeakyRelu)
-                    && *op != crate::CompareOp::Lt
+                if storage_mode == Some(ScopedStorageMode::LeakyRelu) && *op != crate::CompareOp::Lt
                 {
                     return Err(PtxError::Unsupported(
                         "public LeakyReLU requires ordered input < zero".into(),
@@ -3687,7 +4465,9 @@ fn emit(
                 }
                 let operand_dtype = n.sources()[0]
                     .ty()
-                    .ok_or_else(|| PtxError::Unsupported("untyped public Select predicate operand".into()))?
+                    .ok_or_else(|| {
+                        PtxError::Unsupported("untyped public Select predicate operand".into())
+                    })?
                     .scalar;
                 let a = emit_select_predicate_value(lines, a, operand_dtype, 30);
                 let b = emit_select_predicate_value(lines, b, operand_dtype, 31);
@@ -3709,7 +4489,11 @@ fn emit(
                     crate::CompareOp::Lt => {
                         lines.push(format!("  setp.lt.{predicate_dtype} %p1, {a}, {b};"));
                     }
-                    _ => return Err(PtxError::Unsupported("public Select predicate is not an admitted comparison".into())),
+                    _ => {
+                        return Err(PtxError::Unsupported(
+                            "public Select predicate is not an admitted comparison".into(),
+                        ));
+                    }
                 }
                 lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
                 return Ok(dst);
@@ -3719,7 +4503,9 @@ fn emit(
                     crate::CompareOp::Lt => {
                         let operand_dtype = n.sources()[0]
                             .ty()
-                            .ok_or_else(|| PtxError::Unsupported("untyped public inclusive operand".into()))?
+                            .ok_or_else(|| {
+                                PtxError::Unsupported("untyped public inclusive operand".into())
+                            })?
                             .scalar;
                         let predicate_dtype = match operand_dtype {
                             DType::F16 | DType::BF16 | DType::F32 => "f32",
@@ -3736,13 +4522,19 @@ fn emit(
                         if n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                             || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                         {
-                            return Err(PtxError::Unsupported("inclusive comparison needs Bool inversion".into()));
+                            return Err(PtxError::Unsupported(
+                                "inclusive comparison needs Bool inversion".into(),
+                            ));
                         }
                         lines.push(format!("  setp.eq.u8 %p1, {a}, {b};"));
                         lines.push("  not.pred %p1, %p1;".into());
                         lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
                     }
-                    _ => return Err(PtxError::Unsupported("scoped inclusive predicate does not match its root plan".into())),
+                    _ => {
+                        return Err(PtxError::Unsupported(
+                            "scoped inclusive predicate does not match its root plan".into(),
+                        ));
+                    }
                 }
                 return Ok(dst);
             }
@@ -3751,7 +4543,9 @@ fn emit(
                     || n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                     || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 {
-                    return Err(PtxError::Unsupported("scoped logical-not does not match its Bool Ne root".into()));
+                    return Err(PtxError::Unsupported(
+                        "scoped logical-not does not match its Bool Ne root".into(),
+                    ));
                 }
                 // The root proof requires the RHS to be the exact scalar
                 // UOp Const Bool(true). Keep the literal Ne rather than
@@ -3763,13 +4557,17 @@ fn emit(
             }
             if storage_mode == Some(ScopedStorageMode::IsFinite) {
                 if *op != crate::CompareOp::Ne {
-                    return Err(PtxError::Unsupported("scoped IsFinite has a non-Ne comparison".into()));
+                    return Err(PtxError::Unsupported(
+                        "scoped IsFinite has a non-Ne comparison".into(),
+                    ));
                 }
                 if matches!(n.sources()[1].kind(), UOpKind::Const) {
                     if n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                         || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                     {
-                        return Err(PtxError::Unsupported("public IsFinite final inversion needs Bool values".into()));
+                        return Err(PtxError::Unsupported(
+                            "public IsFinite final inversion needs Bool values".into(),
+                        ));
                     }
                     lines.push(format!("  setp.eq.u8 %p1, {a}, {b};"));
                     lines.push("  not.pred %p1, %p1;".into());
@@ -3777,10 +4575,14 @@ fn emit(
                 } else {
                     let source_dtype = n.sources()[0]
                         .ty()
-                        .ok_or_else(|| PtxError::Unsupported("untyped public IsFinite IsNaN input".into()))?
+                        .ok_or_else(|| {
+                            PtxError::Unsupported("untyped public IsFinite IsNaN input".into())
+                        })?
                         .scalar;
                     if n.sources()[1].ty().map(|ty| ty.scalar) != Some(source_dtype) {
-                        return Err(PtxError::Unsupported("public IsFinite IsNaN needs matching input dtypes".into()));
+                        return Err(PtxError::Unsupported(
+                            "public IsFinite IsNaN needs matching input dtypes".into(),
+                        ));
                     }
                     let a = emit_select_predicate_value(lines, a, source_dtype, 30);
                     let b = emit_select_predicate_value(lines, b, source_dtype, 31);
@@ -3795,7 +4597,10 @@ fn emit(
                 }
                 return Ok(dst);
             }
-            if matches!(storage_mode, Some(ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt)) {
+            if matches!(
+                storage_mode,
+                Some(ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt)
+            ) {
                 let expected = if storage_mode == Some(ScopedStorageMode::Eq) {
                     crate::CompareOp::Eq
                 } else if storage_mode == Some(ScopedStorageMode::Ne) {
@@ -3804,7 +4609,9 @@ fn emit(
                     crate::CompareOp::Lt
                 };
                 if *op != expected {
-                    return Err(PtxError::Unsupported("scoped predicate does not match its root plan".into()));
+                    return Err(PtxError::Unsupported(
+                        "scoped predicate does not match its root plan".into(),
+                    ));
                 }
                 let operand_dtype = n.sources()[0]
                     .ty()
@@ -3865,7 +4672,9 @@ fn emit(
                 || n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
             {
-                return Err(PtxError::Unsupported("public IsFinite requires Bool IsInf/IsNaN OR".into()));
+                return Err(PtxError::Unsupported(
+                    "public IsFinite requires Bool IsInf/IsNaN OR".into(),
+                ));
             }
             lines.push(format!("  or.b32 {dst}, {a}, {b};"));
         }
@@ -3889,7 +4698,15 @@ fn emit(
                 )
             ) {
                 let select_type = match ty {
-                    DType::F16 | DType::BF16 | DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32 | DType::U32 => "b32",
+                    DType::F16
+                    | DType::BF16
+                    | DType::Bool
+                    | DType::I8
+                    | DType::U8
+                    | DType::I16
+                    | DType::U16
+                    | DType::I32
+                    | DType::U32 => "b32",
                     DType::I64 | DType::U64 => "b64",
                     DType::F32 => "f32",
                     DType::F64 => "f64",
@@ -4199,7 +5016,15 @@ fn render_reduction(
             reduction.axes,
             reduction.keepdim,
         )?);
-        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4", true, None)?;
+        let value = emit(
+            reduction.value,
+            &ids,
+            &mut lines,
+            &mut map,
+            "%r4",
+            true,
+            None,
+        )?;
         if extrema {
             let convert = match value_dtype {
                 DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
@@ -5339,18 +6164,45 @@ mod tests {
                 .source;
             assert_eq!(graph.shape(maximum).unwrap(), &crate::Shape::from([2, 3]));
             assert_eq!(graph.dtype(maximum).unwrap(), dtype);
-            assert!(max_first.source.contains(PTX_RENDERER_VERSION), "{dtype:?} version");
-            assert!(max_first.source.contains(predicate), "{dtype:?} maximum predicate");
-            assert!(minimum.contains(&predicate.replacen("lt", "gt", 1)), "{dtype:?} minimum predicate");
-            assert!(max_first.source.contains(select), "{dtype:?} maximum raw lhs select");
+            assert!(
+                max_first.source.contains(PTX_RENDERER_VERSION),
+                "{dtype:?} version"
+            );
+            assert!(
+                max_first.source.contains(predicate),
+                "{dtype:?} maximum predicate"
+            );
+            assert!(
+                minimum.contains(&predicate.replacen("lt", "gt", 1)),
+                "{dtype:?} minimum predicate"
+            );
+            assert!(
+                max_first.source.contains(select),
+                "{dtype:?} maximum raw lhs select"
+            );
             assert!(minimum.contains(select), "{dtype:?} minimum raw lhs select");
-            assert!(max_first.source.contains(store), "{dtype:?} maximum typed store");
+            assert!(
+                max_first.source.contains(store),
+                "{dtype:?} maximum typed store"
+            );
             assert!(minimum.contains(store), "{dtype:?} minimum typed store");
-            assert!(!max_first.source.contains("max."), "{dtype:?} no native max");
+            assert!(
+                !max_first.source.contains("max."),
+                "{dtype:?} no native max"
+            );
             assert!(!minimum.contains("min."), "{dtype:?} no native min");
-            assert!(matches!(&max_first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
-            assert_eq!(max_first.source, max_second.source, "{dtype:?} deterministic source");
-            assert_eq!(max_first.cache_key, max_second.cache_key, "{dtype:?} deterministic key");
+            assert!(matches!(
+                &max_first.semantic_program,
+                Some(KernelSemanticProgram::UOp(_))
+            ));
+            assert_eq!(
+                max_first.source, max_second.source,
+                "{dtype:?} deterministic source"
+            );
+            assert_eq!(
+                max_first.cache_key, max_second.cache_key,
+                "{dtype:?} deterministic key"
+            );
         }
 
         // Same-kind I64/U64 remains exact, while the mixed source-LUB bridge
@@ -5388,12 +6240,24 @@ mod tests {
         let lhs = scalar.input_dtype("lhs", [], DType::F64);
         let rhs = scalar.input_dtype("rhs", [], DType::F64);
         let output = scalar.maximum(lhs, rhs).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&scalar, output).unwrap())
+                .unwrap()
+                .extent,
+            1
+        );
         let mut empty = Graph::new();
         let lhs = empty.input_dtype("lhs", [0, 2], DType::BF16);
         let rhs = empty.input_dtype("rhs", [1, 2], DType::BF16);
         let output = empty.minimum(lhs, rhs).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         let mut vjp = Graph::new();
         let lhs = vjp.input_dtype_requires_grad("lhs", [2, 1], DType::F32, true);
@@ -5413,14 +6277,20 @@ mod tests {
         let lhs = non_lub.cast(lhs, DType::F64).unwrap();
         let rhs = non_lub.cast(rhs, DType::F64).unwrap();
         let output = non_lub.maximum(lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut viewed = Graph::new();
         let raw_lhs = viewed.input_dtype("lhs", [1, 2], DType::F16);
         let lhs = viewed.permute(raw_lhs, [1, 0]).unwrap();
         let rhs = viewed.input_dtype("rhs", [2, 1], DType::F16);
         let output = viewed.maximum(lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut compound = Graph::new();
         let lhs = compound.input_dtype("lhs", [1], DType::F16);
@@ -5428,22 +6298,40 @@ mod tests {
         let zero = compound.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
         let lhs = compound.add(lhs, zero).unwrap();
         let output = compound.maximum(lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&compound, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&compound, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut gate = Graph::new();
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.maximum(lhs, rhs).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
     fn clamp_ptx_has_strict_lower_upper_and_two_stage_roots() {
         let renderer = PtxRenderer::new(80).unwrap();
         for dtype in [
-            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
-            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
-            DType::BF16, DType::F32, DType::F64,
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [2, 1], dtype);
@@ -5453,16 +6341,29 @@ mod tests {
             let upper = graph.clamp(input, None, Some(max)).unwrap();
             let both = graph.clamp(input, Some(min), Some(max)).unwrap();
             for output in [lower, upper, both] {
-                let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-                let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                let first = renderer
+                    .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                    .unwrap();
+                let second = renderer
+                    .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                    .unwrap();
                 assert_eq!(graph.shape(output).unwrap(), &crate::Shape::from([2, 3]));
                 assert_eq!(graph.dtype(output).unwrap(), dtype);
                 assert!(first.source.contains(PTX_RENDERER_VERSION));
                 assert!(first.source.contains("setp.lt"));
                 assert!(first.source.contains("selp."));
-                assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
-                assert_eq!(first.source, second.source, "{dtype:?} deterministic source");
-                assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+                assert!(matches!(
+                    &first.semantic_program,
+                    Some(KernelSemanticProgram::UOp(_))
+                ));
+                assert_eq!(
+                    first.source, second.source,
+                    "{dtype:?} deterministic source"
+                );
+                assert_eq!(
+                    first.cache_key, second.cache_key,
+                    "{dtype:?} deterministic key"
+                );
             }
         }
 
@@ -5473,7 +6374,9 @@ mod tests {
         let min = bridge.input_dtype("min", [1], DType::U64);
         let max = bridge.input_dtype("max", [1], DType::F32);
         let output = bridge.clamp(input, Some(min), Some(max)).unwrap();
-        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
         assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
         assert!(rendered.source.contains("cvt.rn.f32.s64"));
         assert!(rendered.source.contains("cvt.rn.f32.u64"));
@@ -5484,7 +6387,13 @@ mod tests {
         let input = scalar.input_dtype_requires_grad("input", [], DType::F32, true);
         let min = scalar.input_dtype("min", [], DType::F32);
         let output = scalar.clamp(input, Some(min), None).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&scalar, output).unwrap())
+                .unwrap()
+                .extent,
+            1
+        );
         let loss = scalar.sum_all(output).unwrap();
         let gradient = scalar.grad(loss, input).unwrap();
         assert_eq!(scalar.dtype(gradient).unwrap(), DType::F32);
@@ -5492,13 +6401,24 @@ mod tests {
         let input = empty.input_dtype("input", [0, 1], DType::BF16);
         let max = empty.input_dtype("max", [1, 3], DType::BF16);
         let output = empty.clamp(input, None, Some(max)).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         let mut rejected = Graph::new();
         let input = rejected.input_dtype("input", [1], DType::F16);
         let min = rejected.input_dtype("min", [1], DType::F16);
         let output = rejected.clamp(input, Some(min), None).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&rejected, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&rejected, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let nodes = rejected.node_count();
         assert!(rejected.clamp(input, None, None).is_err());
         assert_eq!(rejected.node_count(), nodes);
@@ -6688,8 +7608,10 @@ mod tests {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", [1], dtype);
             let output = graph.reciprocal(input).unwrap();
-            assert!(matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Reciprocal, input: source }
-                if *source == input));
+            assert!(
+                matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Reciprocal, input: source }
+                if *source == input)
+            );
             let first = renderer
                 .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
                 .unwrap();
@@ -6697,7 +7619,10 @@ mod tests {
                 .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
                 .unwrap();
             assert!(first.source.contains(load), "{dtype:?} load");
-            assert!(first.source.contains("div.rn.f64"), "{dtype:?} F64 division");
+            assert!(
+                first.source.contains("div.rn.f64"),
+                "{dtype:?} F64 division"
+            );
             assert!(first.source.contains(store), "{dtype:?} storage rounding");
             assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
         }
@@ -6719,14 +7644,22 @@ mod tests {
             let crate::Op::Unary { input: cast, .. } = graph.op(output).unwrap() else {
                 panic!("nonfloat Reciprocal must retain its raw terminal ALU");
             };
-            assert!(matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 }
-                if *source == input));
+            assert!(
+                matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 }
+                if *source == input)
+            );
             let rendered = renderer
                 .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
                 .unwrap();
             assert!(rendered.source.contains("cvt.f32"), "{dtype:?} public cast");
-            assert!(rendered.source.contains("div.rn.f64"), "{dtype:?} F64 division");
-            assert!(rendered.source.contains("st.global.f32"), "{dtype:?} F32 result");
+            assert!(
+                rendered.source.contains("div.rn.f64"),
+                "{dtype:?} F64 division"
+            );
+            assert!(
+                rendered.source.contains("st.global.f32"),
+                "{dtype:?} F32 result"
+            );
         }
 
         // The root exception is deliberately exact: F16 keeps its established
@@ -6771,29 +7704,67 @@ mod tests {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", [1], dtype);
             let output = graph.sqrt(input).unwrap();
-            assert!(matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Sqrt, input: source }
-                if *source == input));
-            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(
+                matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Sqrt, input: source }
+                if *source == input)
+            );
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
             assert!(first.source.contains(load), "{dtype:?} load");
-            assert!(first.source.contains("sqrt.rn.f64"), "{dtype:?} exact F64 sqrt");
-            assert!(!first.source.contains("sqrt.approx"), "{dtype:?} no approximate sqrt");
+            assert!(
+                first.source.contains("sqrt.rn.f64"),
+                "{dtype:?} exact F64 sqrt"
+            );
+            assert!(
+                !first.source.contains("sqrt.approx"),
+                "{dtype:?} no approximate sqrt"
+            );
             assert!(first.source.contains(store), "{dtype:?} storage rounding");
-            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert!(matches!(
+                &first.semantic_program,
+                Some(KernelSemanticProgram::UOp(_))
+            ));
             assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
         }
-        for dtype in [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64] {
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+        ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", [1], dtype);
             let output = graph.sqrt(input).unwrap();
             let crate::Op::Unary { input: cast, .. } = graph.op(output).unwrap() else {
                 panic!("nonfloat Sqrt must retain its raw terminal ALU");
             };
-            assert!(matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 } if *source == input));
-            let rendered = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            assert!(rendered.source.contains("cvt.rn.f32"), "{dtype:?} public cast");
-            assert!(rendered.source.contains("sqrt.rn.f64"), "{dtype:?} exact F64 sqrt");
-            assert!(rendered.source.contains("st.global.f32"), "{dtype:?} F32 result");
+            assert!(
+                matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 } if *source == input)
+            );
+            let rendered = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(
+                rendered.source.contains("cvt.rn.f32"),
+                "{dtype:?} public cast"
+            );
+            assert!(
+                rendered.source.contains("sqrt.rn.f64"),
+                "{dtype:?} exact F64 sqrt"
+            );
+            assert!(
+                rendered.source.contains("st.global.f32"),
+                "{dtype:?} F32 result"
+            );
         }
 
         // The root exception retains the existing F16 target gate, scalar and
@@ -6801,21 +7772,42 @@ mod tests {
         let mut f16 = Graph::new();
         let input = f16.input_dtype("x", [1], DType::F16);
         let output = f16.sqrt(input).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&f16, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&f16, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut floor = Graph::new();
         let input = floor.input_dtype("x", [1], DType::F64);
         let output = floor.sqrt(input).unwrap();
-        let floor_source = PtxRenderer::new(20).unwrap().render(&crate::lower_graph_elementwise(&floor, output).unwrap()).unwrap().source;
+        let floor_source = PtxRenderer::new(20)
+            .unwrap()
+            .render(&crate::lower_graph_elementwise(&floor, output).unwrap())
+            .unwrap()
+            .source;
         assert!(floor_source.contains(".target sm_20"));
         assert!(floor_source.contains("sqrt.rn.f64"));
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("x", [], DType::F64);
         let output = scalar.sqrt(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&scalar, output).unwrap())
+                .unwrap()
+                .extent,
+            1
+        );
         let mut empty = Graph::new();
         let input = empty.input_dtype("x", [0], DType::BF16);
         let output = empty.sqrt(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("x", [], DType::F32, true);
         let output = vjp.sqrt(input).unwrap();
@@ -6826,55 +7818,126 @@ mod tests {
         let input = compound.input_dtype("x", [1], DType::F32);
         let root = compound.sqrt(input).unwrap();
         let combined = compound.add(input, root).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut viewed = Graph::new();
         let input = viewed.input_dtype("x", [1, 1], DType::F32);
         let input = viewed.permute(input, [1, 0]).unwrap();
         let output = viewed.sqrt(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
     fn public_rsqrt_has_a_scoped_typed_sqrt_boundary() {
         let renderer = PtxRenderer::new(80).unwrap();
         for (dtype, store) in [
-            (DType::F16, "cvt.rn.f16.f32"), (DType::BF16, "selp.b32 %r91"),
-            (DType::F32, "cvt.rn.f32.f64"), (DType::F64, "st.global.f64"),
+            (DType::F16, "cvt.rn.f16.f32"),
+            (DType::BF16, "selp.b32 %r91"),
+            (DType::F32, "cvt.rn.f32.f64"),
+            (DType::F64, "st.global.f64"),
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", [1], dtype);
             let output = graph.rsqrt(input).unwrap();
-            let crate::Op::Unary { op: crate::UnaryOp::Reciprocal, input: sqrt } = graph.op(output).unwrap() else { panic!("public rsqrt must end in Reciprocal") };
-            assert!(matches!(graph.op(*sqrt).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Sqrt, input: source } if *source == input));
-            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            assert_eq!(first.source.matches("sqrt.rn.f64").count(), 1, "{dtype:?} one typed sqrt boundary");
-            assert!(first.source.contains("div.rn.f64"), "{dtype:?} reciprocal after sqrt");
-            assert!(!first.source.contains("sqrt.approx"), "{dtype:?} no approximate sqrt");
+            let crate::Op::Unary {
+                op: crate::UnaryOp::Reciprocal,
+                input: sqrt,
+            } = graph.op(output).unwrap()
+            else {
+                panic!("public rsqrt must end in Reciprocal")
+            };
+            assert!(
+                matches!(graph.op(*sqrt).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Sqrt, input: source } if *source == input)
+            );
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert_eq!(
+                first.source.matches("sqrt.rn.f64").count(),
+                1,
+                "{dtype:?} one typed sqrt boundary"
+            );
+            assert!(
+                first.source.contains("div.rn.f64"),
+                "{dtype:?} reciprocal after sqrt"
+            );
+            assert!(
+                !first.source.contains("sqrt.approx"),
+                "{dtype:?} no approximate sqrt"
+            );
             assert!(first.source.contains(store), "{dtype:?} typed final store");
-            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
-            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert_eq!(
+                first.cache_key, second.cache_key,
+                "{dtype:?} deterministic key"
+            );
+            assert!(matches!(
+                &first.semantic_program,
+                Some(KernelSemanticProgram::UOp(_))
+            ));
         }
-        for dtype in [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64] {
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+        ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", [1], dtype);
             let output = graph.rsqrt(input).unwrap();
-            let crate::Op::Unary { input: sqrt, .. } = graph.op(output).unwrap() else { panic!("public rsqrt must end in Reciprocal") };
-            let crate::Op::Unary { input: cast, .. } = graph.op(*sqrt).unwrap() else { panic!("public rsqrt must contain Sqrt") };
-            assert!(matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 } if *source == input));
-            let rendered = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            let crate::Op::Unary { input: sqrt, .. } = graph.op(output).unwrap() else {
+                panic!("public rsqrt must end in Reciprocal")
+            };
+            let crate::Op::Unary { input: cast, .. } = graph.op(*sqrt).unwrap() else {
+                panic!("public rsqrt must contain Sqrt")
+            };
+            assert!(
+                matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 } if *source == input)
+            );
+            let rendered = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
             assert!(rendered.source.contains("sqrt.rn.f64"), "{dtype:?} sqrt");
-            assert!(rendered.source.contains("div.rn.f64"), "{dtype:?} reciprocal");
-            assert!(rendered.source.contains("st.global.f32"), "{dtype:?} F32 result");
+            assert!(
+                rendered.source.contains("div.rn.f64"),
+                "{dtype:?} reciprocal"
+            );
+            assert!(
+                rendered.source.contains("st.global.f32"),
+                "{dtype:?} F32 result"
+            );
         }
         let mut f16 = Graph::new();
         let input = f16.input_dtype("x", [1], DType::F16);
         let output = f16.rsqrt(input).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&f16, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&f16, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut empty = Graph::new();
         let input = empty.input_dtype("x", [0], DType::BF16);
         let output = empty.rsqrt(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("x", [], DType::F32, true);
         let output = vjp.rsqrt(input).unwrap();
@@ -7121,8 +8184,10 @@ mod tests {
         let lhs = boolean.input_dtype("lhs", [2, 1], DType::Bool);
         let rhs = boolean.input_dtype("rhs", [1, 3], DType::Bool);
         let output = boolean.sub(lhs, rhs).unwrap();
-        assert!(matches!(boolean.op(output).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Add, lhs: left, rhs: right }
-            if *left == lhs && matches!(boolean.op(*right).unwrap(), crate::Op::Logical { op: crate::LogicalOp::Not, .. })));
+        assert!(
+            matches!(boolean.op(output).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Add, lhs: left, rhs: right }
+            if *left == lhs && matches!(boolean.op(*right).unwrap(), crate::Op::Logical { op: crate::LogicalOp::Not, .. }))
+        );
         let rendered = renderer
             .render(&crate::lower_graph_elementwise(&boolean, output).unwrap())
             .unwrap();
@@ -7172,16 +8237,24 @@ mod tests {
             let lhs = graph.input_dtype("lhs", [2, 1], dtype);
             let rhs = graph.input_dtype("rhs", [1, 3], dtype);
             let output = graph.div(lhs, rhs).unwrap();
-            assert!(matches!(graph.op(output).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Mul, lhs: _, rhs }
-                if matches!(graph.op(*rhs).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Reciprocal, .. })));
+            assert!(
+                matches!(graph.op(output).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Mul, lhs: _, rhs }
+                if matches!(graph.op(*rhs).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Reciprocal, .. }))
+            );
             let first = renderer
                 .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
                 .unwrap();
             let second = renderer
                 .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
                 .unwrap();
-            assert!(first.source.contains("div.rn.f64 %fd30"), "{dtype:?} reciprocal");
-            assert!(first.source.contains(reciprocal_boundary), "{dtype:?} reciprocal boundary");
+            assert!(
+                first.source.contains("div.rn.f64 %fd30"),
+                "{dtype:?} reciprocal"
+            );
+            assert!(
+                first.source.contains(reciprocal_boundary),
+                "{dtype:?} reciprocal boundary"
+            );
             assert!(first.source.contains("mul.rn.f64"), "{dtype:?} final Mul");
             assert!(first.source.contains(store), "{dtype:?} store");
             assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
@@ -7207,8 +8280,14 @@ mod tests {
                 .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
                 .unwrap();
             assert!(rendered.source.contains("cvt.rn.f32"), "{dtype:?} lift");
-            assert!(rendered.source.contains("div.rn.f64 %fd30"), "{dtype:?} reciprocal");
-            assert!(rendered.source.contains("mul.rn.f64"), "{dtype:?} final Mul");
+            assert!(
+                rendered.source.contains("div.rn.f64 %fd30"),
+                "{dtype:?} reciprocal"
+            );
+            assert!(
+                rendered.source.contains("mul.rn.f64"),
+                "{dtype:?} final Mul"
+            );
         }
 
         // The I64/U64 meet is explicitly F32 before the reciprocal, and an
@@ -7327,7 +8406,13 @@ mod tests {
         let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
         let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
         let output = empty.eq(lhs, rhs).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         // Raw/narrow and ordered predicates, swapped compounds, and views do
         // not inherit Eq's public-root admission.
@@ -7337,17 +8422,28 @@ mod tests {
         let lhs = raw.cast(lhs, DType::F64).unwrap();
         let rhs = raw.cast(rhs, DType::F64).unwrap();
         let output = raw.compare(crate::CompareOp::Eq, lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut ordered = Graph::new();
         let lhs = ordered.input_dtype("lhs", [1], DType::F16);
         let rhs = ordered.input_dtype("rhs", [1], DType::F16);
         let output = ordered.ne(lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&ordered, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&ordered, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut gate = Graph::new();
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.eq(lhs, rhs).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -7382,8 +8478,14 @@ mod tests {
             assert!(first.source.contains(predicate), "{dtype:?} predicate");
             // Complementing ordered equality is explicitly unordered Ne:
             // NaN is true while +0/-0 are false, matching `Scalar::compare`.
-            assert!(first.source.contains("not.pred %p1, %p1"), "{dtype:?} unordered Ne");
-            assert!(first.source.contains("st.global.u8"), "{dtype:?} Bool store");
+            assert!(
+                first.source.contains("not.pred %p1, %p1"),
+                "{dtype:?} unordered Ne"
+            );
+            assert!(
+                first.source.contains("st.global.u8"),
+                "{dtype:?} Bool store"
+            );
             assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
         }
 
@@ -7413,7 +8515,13 @@ mod tests {
         let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
         let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
         let output = empty.ne(lhs, rhs).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         let mut non_lub = Graph::new();
         let lhs = non_lub.input_dtype("lhs", [1], DType::I64);
@@ -7421,17 +8529,28 @@ mod tests {
         let lhs = non_lub.cast(lhs, DType::F64).unwrap();
         let rhs = non_lub.cast(rhs, DType::F64).unwrap();
         let output = non_lub.compare(crate::CompareOp::Ne, lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut ordered = Graph::new();
         let lhs = ordered.input_dtype("lhs", [1], DType::F16);
         let rhs = ordered.input_dtype("rhs", [1], DType::F16);
         let output = ordered.lt(lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&ordered, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&ordered, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut gate = Graph::new();
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.ne(lhs, rhs).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -7455,34 +8574,72 @@ mod tests {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [2, 1], dtype);
             let output = graph.logical_not(input).unwrap();
-            assert!(matches!(graph.op(output).unwrap(), crate::Op::Compare { op: crate::CompareOp::Ne, lhs, rhs }
+            assert!(
+                matches!(graph.op(output).unwrap(), crate::Op::Compare { op: crate::CompareOp::Ne, lhs, rhs }
                 if matches!(graph.op(*lhs).unwrap(), crate::Op::Cast { input: source, dtype: DType::Bool } if *source == input)
-                && matches!(graph.op(*rhs).unwrap(), crate::Op::Constant(_))));
-            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                && matches!(graph.op(*rhs).unwrap(), crate::Op::Constant(_)))
+            );
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
             // Ordered equality then inversion makes both zero signs false at
             // the cast boundary and preserves NaN/infinity as truthy.
-            assert!(first.source.contains(predicate), "{dtype:?} truthiness predicate");
-            assert!(first.source.contains("mov.b8") && first.source.contains("0x01"), "{dtype:?} canonical true");
-            assert!(first.source.matches("not.pred %p1, %p1").count() >= 2, "{dtype:?} cast and Ne inversions");
-            assert!(first.source.contains("st.global.u8"), "{dtype:?} Bool store");
+            assert!(
+                first.source.contains(predicate),
+                "{dtype:?} truthiness predicate"
+            );
+            assert!(
+                first.source.contains("mov.b8") && first.source.contains("0x01"),
+                "{dtype:?} canonical true"
+            );
+            assert!(
+                first.source.matches("not.pred %p1, %p1").count() >= 2,
+                "{dtype:?} cast and Ne inversions"
+            );
+            assert!(
+                first.source.contains("st.global.u8"),
+                "{dtype:?} Bool store"
+            );
             assert!(first.source.contains(PTX_RENDERER_VERSION));
-            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+            assert_eq!(
+                first.cache_key, second.cache_key,
+                "{dtype:?} deterministic key"
+            );
         }
 
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("input", [], DType::F64);
         let output = scalar.logical_not(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&scalar, output).unwrap())
+                .unwrap()
+                .extent,
+            1
+        );
         let mut empty = Graph::new();
         let input = empty.input_dtype("input", [0], DType::BF16);
         let output = empty.logical_not(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         let mut gate = Graph::new();
         let input = gate.input_dtype("input", [1], DType::F16);
         let output = gate.logical_not(input).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         // A runtime true, a raw Ne shell, and an affine view cannot inherit
         // the public literal cast/Const provenance exception.
@@ -7490,22 +8647,36 @@ mod tests {
         let input = runtime.input_dtype("input", [1], DType::F32);
         let boolean = runtime.cast(input, DType::Bool).unwrap();
         let truth = runtime.input_dtype("truth", [1], DType::Bool);
-        let output = runtime.compare(crate::CompareOp::Ne, boolean, truth).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&runtime, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let output = runtime
+            .compare(crate::CompareOp::Ne, boolean, truth)
+            .unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&runtime, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut raw = Graph::new();
         let input = raw.input_dtype("input", [1], DType::Bool);
         let truth = raw.constant(crate::Scalar::Bool(true));
         let output = raw.compare(crate::CompareOp::Ne, input, truth).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut viewed = Graph::new();
         let input = viewed.input_dtype("input", [1, 1], DType::F32);
         let input = viewed.permute(input, [1, 0]).unwrap();
         let output = viewed.logical_not(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut finite = Graph::new();
         let input = finite.input_dtype("input", [1], DType::F32);
         let output = finite.isfinite(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&finite, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&finite, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -7529,14 +8700,32 @@ mod tests {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [2], dtype);
             let output = graph.isinf(input).unwrap();
-            assert!(matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::IsInf, input: source } if *source == input));
-            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            assert!(first.source.contains(required), "{dtype:?} exact classifier");
-            assert!(first.source.contains("st.global.u8"), "{dtype:?} Bool store");
+            assert!(
+                matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::IsInf, input: source } if *source == input)
+            );
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(
+                first.source.contains(required),
+                "{dtype:?} exact classifier"
+            );
+            assert!(
+                first.source.contains("st.global.u8"),
+                "{dtype:?} Bool store"
+            );
             assert!(first.source.contains(PTX_RENDERER_VERSION));
-            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
-            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+            assert!(matches!(
+                &first.semantic_program,
+                Some(KernelSemanticProgram::UOp(_))
+            ));
+            assert_eq!(
+                first.cache_key, second.cache_key,
+                "{dtype:?} deterministic key"
+            );
         }
 
         // The masked exact encodings classify both infinity signs while
@@ -7545,18 +8734,40 @@ mod tests {
         let mut f16 = Graph::new();
         let input = f16.input_dtype("input", [1], DType::F16);
         let output = f16.isinf(input).unwrap();
-        let source = renderer.render(&crate::lower_graph_elementwise(&f16, output).unwrap()).unwrap().source;
-        assert!(source.contains("and.b32") && source.contains("0x7fff") && source.contains("0x7c00"));
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&f16, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let source = renderer
+            .render(&crate::lower_graph_elementwise(&f16, output).unwrap())
+            .unwrap()
+            .source;
+        assert!(
+            source.contains("and.b32") && source.contains("0x7fff") && source.contains("0x7c00")
+        );
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&f16, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("input", [], DType::F64);
         let output = scalar.isinf(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&scalar, output).unwrap())
+                .unwrap()
+                .extent,
+            1
+        );
         let mut empty = Graph::new();
         let input = empty.input_dtype("input", [0], DType::BF16);
         let output = empty.isinf(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         // The direct raw IsInf predicate is public-equivalent. Casted/raw
         // compounds, IsFinite, sign-select composition, and views do not
@@ -7566,33 +8777,62 @@ mod tests {
         let input = mixed.input_dtype("input", [1], DType::F32);
         let input = mixed.cast(input, DType::F64).unwrap();
         let output = mixed.unary(crate::UnaryOp::IsInf, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&mixed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&mixed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut isnan = Graph::new();
         let input = isnan.input_dtype("input", [1], DType::F32);
         let output = isnan.isnan(input).unwrap();
-        let first = renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()).unwrap();
-        let second = renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()).unwrap();
-        assert!(first.source.contains("setp.eq.f32") && first.source.contains("not.pred") && first.source.contains("st.global.u8"));
-        assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
-        assert_eq!(first.cache_key, second.cache_key, "IsNaN inherits the scoped Ne key");
+        let first = renderer
+            .render(&crate::lower_graph_elementwise(&isnan, output).unwrap())
+            .unwrap();
+        let second = renderer
+            .render(&crate::lower_graph_elementwise(&isnan, output).unwrap())
+            .unwrap();
+        assert!(
+            first.source.contains("setp.eq.f32")
+                && first.source.contains("not.pred")
+                && first.source.contains("st.global.u8")
+        );
+        assert!(matches!(
+            &first.semantic_program,
+            Some(KernelSemanticProgram::UOp(_))
+        ));
+        assert_eq!(
+            first.cache_key, second.cache_key,
+            "IsNaN inherits the scoped Ne key"
+        );
         let mut finite = Graph::new();
         let input = finite.input_dtype("input", [1], DType::F32);
         let output = finite.isfinite(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&finite, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&finite, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut signs = Graph::new();
         let input = signs.input_dtype("input", [1], DType::F32);
         let output = signs.isinf_with_signs(input, true, false).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&signs, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&signs, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut viewed = Graph::new();
         let input = viewed.input_dtype("input", [1, 1], DType::F32);
         let input = viewed.permute(input, [1, 0]).unwrap();
         let output = viewed.isinf(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
         let output = vjp.isinf(input).unwrap();
-        assert!(matches!(vjp.grad(output, input), Err(crate::Error::NoGradient(_))));
+        assert!(matches!(
+            vjp.grad(output, input),
+            Err(crate::Error::NoGradient(_))
+        ));
     }
 
     #[test]
@@ -7616,22 +8856,53 @@ mod tests {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [2], dtype);
             let output = graph.isfinite(input).unwrap();
-            let crate::Op::Compare { op: crate::CompareOp::Ne, lhs: cast, rhs: truth } = graph.op(output).unwrap() else { panic!("public IsFinite must end in public logical-not") };
-            assert!(matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: or, dtype: DType::Bool }
-                if matches!(graph.op(*or).unwrap(), crate::Op::Logical { op: crate::LogicalOp::Or, .. })));
+            let crate::Op::Compare {
+                op: crate::CompareOp::Ne,
+                lhs: cast,
+                rhs: truth,
+            } = graph.op(output).unwrap()
+            else {
+                panic!("public IsFinite must end in public logical-not")
+            };
+            assert!(
+                matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: or, dtype: DType::Bool }
+                if matches!(graph.op(*or).unwrap(), crate::Op::Logical { op: crate::LogicalOp::Or, .. }))
+            );
             assert!(matches!(graph.op(*truth).unwrap(), crate::Op::Constant(_)));
-            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            assert!(first.source.contains(infinity_classifier), "{dtype:?} IsInf classifier");
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(
+                first.source.contains(infinity_classifier),
+                "{dtype:?} IsInf classifier"
+            );
             assert!(first.source.contains("or.b32"), "{dtype:?} Bool OR");
-            assert!(first.source.contains("mov.b8") && first.source.contains("0x01"), "{dtype:?} canonical true");
+            assert!(
+                first.source.contains("mov.b8") && first.source.contains("0x01"),
+                "{dtype:?} canonical true"
+            );
             // One inversion is IsNaN self-Ne and one is the source-literal
             // logical-not after the IsInf/IsNaN OR.
-            assert!(first.source.matches("not.pred %p1, %p1").count() >= 2, "{dtype:?} IsNaN and final inversions");
-            assert!(first.source.contains("st.global.u8"), "{dtype:?} Bool store");
+            assert!(
+                first.source.matches("not.pred %p1, %p1").count() >= 2,
+                "{dtype:?} IsNaN and final inversions"
+            );
+            assert!(
+                first.source.contains("st.global.u8"),
+                "{dtype:?} Bool store"
+            );
             assert!(first.source.contains(PTX_RENDERER_VERSION));
-            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
-            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+            assert!(matches!(
+                &first.semantic_program,
+                Some(KernelSemanticProgram::UOp(_))
+            ));
+            assert_eq!(
+                first.cache_key, second.cache_key,
+                "{dtype:?} deterministic key"
+            );
         }
 
         // Infinity masks only match zero mantissas, so both signs of infinity
@@ -7640,18 +8911,42 @@ mod tests {
         let mut f16 = Graph::new();
         let input = f16.input_dtype("input", [1], DType::F16);
         let output = f16.isfinite(input).unwrap();
-        let source = renderer.render(&crate::lower_graph_elementwise(&f16, output).unwrap()).unwrap().source;
-        assert!(source.contains("0x7fff") && source.contains("0x7c00") && source.contains("cvt.rn.f32.f16"));
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&f16, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let source = renderer
+            .render(&crate::lower_graph_elementwise(&f16, output).unwrap())
+            .unwrap()
+            .source;
+        assert!(
+            source.contains("0x7fff")
+                && source.contains("0x7c00")
+                && source.contains("cvt.rn.f32.f16")
+        );
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&f16, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("input", [], DType::F64);
         let output = scalar.isfinite(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&scalar, output).unwrap())
+                .unwrap()
+                .extent,
+            1
+        );
         let mut empty = Graph::new();
         let input = empty.input_dtype("input", [0], DType::BF16);
         let output = empty.isfinite(input).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         // Shared source identity and literal public shells are mandatory.
         // A mixed-input OR, raw IsFinite, and a view stay outside this
@@ -7664,29 +8959,55 @@ mod tests {
         let nan = mismatched.isnan(rhs).unwrap();
         let either = mismatched.logical_or(infinite, nan).unwrap();
         let output = mismatched.logical_not(either).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&mismatched, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&mismatched, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut isnan = Graph::new();
         let input = isnan.input_dtype("input", [1], DType::F32);
         let output = isnan.isnan(input).unwrap();
-        let first = renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()).unwrap();
-        let second = renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()).unwrap();
-        assert!(first.source.contains("setp.eq.f32") && first.source.contains("not.pred") && first.source.contains("st.global.u8"));
-        assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
-        assert_eq!(first.cache_key, second.cache_key, "IsNaN remains deterministic beside IsFinite");
+        let first = renderer
+            .render(&crate::lower_graph_elementwise(&isnan, output).unwrap())
+            .unwrap();
+        let second = renderer
+            .render(&crate::lower_graph_elementwise(&isnan, output).unwrap())
+            .unwrap();
+        assert!(
+            first.source.contains("setp.eq.f32")
+                && first.source.contains("not.pred")
+                && first.source.contains("st.global.u8")
+        );
+        assert!(matches!(
+            &first.semantic_program,
+            Some(KernelSemanticProgram::UOp(_))
+        ));
+        assert_eq!(
+            first.cache_key, second.cache_key,
+            "IsNaN remains deterministic beside IsFinite"
+        );
         let mut raw = Graph::new();
         let input = raw.input_dtype("input", [1], DType::F32);
         let output = raw.unary(crate::UnaryOp::IsFinite, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut viewed = Graph::new();
         let input = viewed.input_dtype("input", [1, 1], DType::F32);
         let input = viewed.permute(input, [1, 0]).unwrap();
         let output = viewed.isfinite(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
         let output = vjp.isfinite(input).unwrap();
-        assert!(matches!(vjp.grad(output, input), Err(crate::Error::NoGradient(_))));
+        assert!(matches!(
+            vjp.grad(output, input),
+            Err(crate::Error::NoGradient(_))
+        ));
     }
 
     #[test]
@@ -7711,12 +9032,26 @@ mod tests {
                 let mut graph = Graph::new();
                 let lhs = graph.input_dtype("lhs", [2, 1], dtype);
                 let rhs = graph.input_dtype("rhs", [1, 3], dtype);
-                let output = if greater { graph.gt(lhs, rhs).unwrap() } else { graph.lt(lhs, rhs).unwrap() };
+                let output = if greater {
+                    graph.gt(lhs, rhs).unwrap()
+                } else {
+                    graph.lt(lhs, rhs).unwrap()
+                };
                 assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
-                let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-                let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-                assert!(first.source.contains(predicate), "{greater} {dtype:?} predicate");
-                assert!(first.source.contains("st.global.u8"), "{greater} {dtype:?} Bool store");
+                let first = renderer
+                    .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                    .unwrap();
+                let second = renderer
+                    .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                    .unwrap();
+                assert!(
+                    first.source.contains(predicate),
+                    "{greater} {dtype:?} predicate"
+                );
+                assert!(
+                    first.source.contains("st.global.u8"),
+                    "{greater} {dtype:?} Bool store"
+                );
                 assert_eq!(first.cache_key, second.cache_key, "{greater} {dtype:?} key");
             }
         }
@@ -7726,14 +9061,18 @@ mod tests {
         let lhs = orientation.input_dtype("lhs", [1], DType::F32);
         let rhs = orientation.input_dtype("rhs", [1], DType::F32);
         let output = orientation.gt(lhs, rhs).unwrap();
-        assert!(matches!(orientation.op(output).unwrap(), crate::Op::Compare { op: crate::CompareOp::Lt, lhs: left, rhs: right }
-            if *left == rhs && *right == lhs));
+        assert!(
+            matches!(orientation.op(output).unwrap(), crate::Op::Compare { op: crate::CompareOp::Lt, lhs: left, rhs: right }
+            if *left == rhs && *right == lhs)
+        );
 
         let mut bridge = Graph::new();
         let lhs = bridge.input_dtype("lhs", [1], DType::I64);
         let rhs = bridge.input_dtype("rhs", [1], DType::U64);
         let output = bridge.lt(lhs, rhs).unwrap();
-        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
         assert!(rendered.source.contains("cvt.rn.f32.s64"));
         assert!(rendered.source.contains("cvt.rn.f32.u64"));
         assert!(rendered.source.contains("setp.lt.f32"));
@@ -7742,7 +9081,9 @@ mod tests {
         let lhs = narrow_cast.input_dtype("lhs", [1], DType::I16);
         let rhs = narrow_cast.input_dtype("rhs", [1], DType::F16);
         let output = narrow_cast.lt(lhs, rhs).unwrap();
-        let rendered = renderer.render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap()).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap())
+            .unwrap();
         assert!(rendered.source.contains("cvt.rn.f32.s16"));
         assert!(rendered.source.contains("cvt.rn.f16.f32"));
         assert!(rendered.source.contains("setp.lt.f32"));
@@ -7751,7 +9092,13 @@ mod tests {
         let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
         let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
         let output = empty.gt(lhs, rhs).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         // A raw Gt, source-inexact LUB casts, and Le remain outside this
         // ordered-CMPLT root exception.
@@ -7759,24 +9106,38 @@ mod tests {
         let lhs = raw_gt.input_dtype("lhs", [1], DType::F16);
         let rhs = raw_gt.input_dtype("rhs", [1], DType::F16);
         let output = raw_gt.compare(crate::CompareOp::Gt, lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw_gt, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw_gt, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut non_lub = Graph::new();
         let lhs = non_lub.input_dtype("lhs", [1], DType::I64);
         let rhs = non_lub.input_dtype("rhs", [1], DType::U64);
         let lhs = non_lub.cast(lhs, DType::F64).unwrap();
         let rhs = non_lub.cast(rhs, DType::F64).unwrap();
         let output = non_lub.compare(crate::CompareOp::Lt, lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut le = Graph::new();
         let lhs = le.input_dtype("lhs", [1], DType::F16);
         let rhs = le.input_dtype("rhs", [1], DType::F16);
         let output = le.le(lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&le, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&le, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut gate = Graph::new();
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.lt(lhs, rhs).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -7801,17 +9162,40 @@ mod tests {
                 let mut graph = Graph::new();
                 let lhs = graph.input_dtype("lhs", [2, 1], dtype);
                 let rhs = graph.input_dtype("rhs", [1, 3], dtype);
-                let output = if greater_or_equal { graph.ge(lhs, rhs).unwrap() } else { graph.le(lhs, rhs).unwrap() };
-                let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-                let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                let output = if greater_or_equal {
+                    graph.ge(lhs, rhs).unwrap()
+                } else {
+                    graph.le(lhs, rhs).unwrap()
+                };
+                let first = renderer
+                    .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                    .unwrap();
+                let second = renderer
+                    .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                    .unwrap();
                 assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
-                assert!(first.source.contains(predicate), "{greater_or_equal} {dtype:?} ordered Lt");
-                assert!(first.source.contains("mov.b8") && first.source.contains("0x01"), "{greater_or_equal} {dtype:?} Const Bool(true)");
+                assert!(
+                    first.source.contains(predicate),
+                    "{greater_or_equal} {dtype:?} ordered Lt"
+                );
+                assert!(
+                    first.source.contains("mov.b8") && first.source.contains("0x01"),
+                    "{greater_or_equal} {dtype:?} Const Bool(true)"
+                );
                 // Inverting ordered Lt makes NaN true while both zero signs
                 // remain equal/true, exactly as tinygrad's literal Not path.
-                assert!(first.source.contains("not.pred %p1, %p1"), "{greater_or_equal} {dtype:?} inversion");
-                assert!(first.source.contains("st.global.u8"), "{greater_or_equal} {dtype:?} Bool store");
-                assert_eq!(first.cache_key, second.cache_key, "{greater_or_equal} {dtype:?} key");
+                assert!(
+                    first.source.contains("not.pred %p1, %p1"),
+                    "{greater_or_equal} {dtype:?} inversion"
+                );
+                assert!(
+                    first.source.contains("st.global.u8"),
+                    "{greater_or_equal} {dtype:?} Bool store"
+                );
+                assert_eq!(
+                    first.cache_key, second.cache_key,
+                    "{greater_or_equal} {dtype:?} key"
+                );
             }
         }
 
@@ -7821,18 +9205,51 @@ mod tests {
             let mut graph = Graph::new();
             let lhs = graph.input_dtype("lhs", [1], DType::F32);
             let rhs = graph.input_dtype("rhs", [1], DType::F32);
-            let output = if greater_or_equal { graph.ge(lhs, rhs).unwrap() } else { graph.le(lhs, rhs).unwrap() };
-            let crate::Op::Compare { op: crate::CompareOp::Ne, lhs: outer, .. } = graph.op(output).unwrap() else { panic!("public inclusive outer Ne") };
-            let crate::Op::Cast { input: inner, dtype: DType::Bool } = graph.op(*outer).unwrap() else { panic!("public inclusive Bool Cast") };
-            let crate::Op::Compare { op: crate::CompareOp::Lt, lhs: left, rhs: right } = graph.op(*inner).unwrap() else { panic!("public inclusive inner Lt") };
-            assert_eq!((*left, *right), if greater_or_equal { (lhs, rhs) } else { (rhs, lhs) });
+            let output = if greater_or_equal {
+                graph.ge(lhs, rhs).unwrap()
+            } else {
+                graph.le(lhs, rhs).unwrap()
+            };
+            let crate::Op::Compare {
+                op: crate::CompareOp::Ne,
+                lhs: outer,
+                ..
+            } = graph.op(output).unwrap()
+            else {
+                panic!("public inclusive outer Ne")
+            };
+            let crate::Op::Cast {
+                input: inner,
+                dtype: DType::Bool,
+            } = graph.op(*outer).unwrap()
+            else {
+                panic!("public inclusive Bool Cast")
+            };
+            let crate::Op::Compare {
+                op: crate::CompareOp::Lt,
+                lhs: left,
+                rhs: right,
+            } = graph.op(*inner).unwrap()
+            else {
+                panic!("public inclusive inner Lt")
+            };
+            assert_eq!(
+                (*left, *right),
+                if greater_or_equal {
+                    (lhs, rhs)
+                } else {
+                    (rhs, lhs)
+                }
+            );
         }
 
         let mut bridge = Graph::new();
         let lhs = bridge.input_dtype("lhs", [1], DType::I64);
         let rhs = bridge.input_dtype("rhs", [1], DType::U64);
         let output = bridge.ge(lhs, rhs).unwrap();
-        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
         assert!(rendered.source.contains("cvt.rn.f32.s64"));
         assert!(rendered.source.contains("cvt.rn.f32.u64"));
 
@@ -7840,7 +9257,13 @@ mod tests {
         let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
         let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
         let output = empty.le(lhs, rhs).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         // The scalar role and exact true bits are part of the root proof:
         // runtime truth buffers, false/wrong constants, raw Le, and F16 below
@@ -7852,16 +9275,25 @@ mod tests {
         let boolean = runtime_truth.cast(ordered, DType::Bool).unwrap();
         let truth = runtime_truth.input_dtype("truth", [], DType::Bool);
         let output = runtime_truth.ne(boolean, truth).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&runtime_truth, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&runtime_truth, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut false_truth = Graph::new();
         let lhs = false_truth.input_dtype("lhs", [1], DType::F16);
         let rhs = false_truth.input_dtype("rhs", [1], DType::F16);
         let ordered = false_truth.lt(lhs, rhs).unwrap();
         let boolean = false_truth.cast(ordered, DType::Bool).unwrap();
-        let truth = false_truth.constant(TensorData::scalar_with_dtype(Scalar::Bool(false), DType::Bool));
+        let truth = false_truth.constant(TensorData::scalar_with_dtype(
+            Scalar::Bool(false),
+            DType::Bool,
+        ));
         let output = false_truth.ne(boolean, truth).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&false_truth, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&false_truth, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut wrong_truth = Graph::new();
         let lhs = wrong_truth.input_dtype("lhs", [1], DType::F16);
@@ -7870,18 +9302,29 @@ mod tests {
         let boolean = wrong_truth.cast(ordered, DType::Bool).unwrap();
         let truth = wrong_truth.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I8));
         let output = wrong_truth.ne(boolean, truth).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&wrong_truth, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&wrong_truth, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut raw = Graph::new();
         let lhs = raw.input_dtype("lhs", [1], DType::F16);
         let rhs = raw.input_dtype("rhs", [1], DType::F16);
         let output = raw.compare(crate::CompareOp::Le, lhs, rhs).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut gate = Graph::new();
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.ge(lhs, rhs).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -7908,11 +9351,18 @@ mod tests {
             let on_true = graph.input_dtype("on_true", [1, 3], dtype);
             let on_false = graph.input_dtype("on_false", [2, 3], dtype);
             let output = graph.select(condition, on_true, on_false).unwrap();
-            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
             assert_eq!(graph.dtype(output).unwrap(), dtype);
             assert_eq!(graph.shape(output).unwrap(), &crate::Shape::from([2, 3]));
-            assert!(first.source.contains("setp.ne.u32 %p2"), "{dtype:?} Bool condition");
+            assert!(
+                first.source.contains("setp.ne.u32 %p2"),
+                "{dtype:?} Bool condition"
+            );
             assert!(first.source.contains(selection), "{dtype:?} typed select");
             assert!(first.source.contains(store), "{dtype:?} typed store");
             assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
@@ -7925,7 +9375,9 @@ mod tests {
         let on_true = bridge.input_dtype("on_true", [1], DType::I64);
         let on_false = bridge.input_dtype("on_false", [1], DType::U64);
         let output = bridge.select(condition, on_true, on_false).unwrap();
-        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
         assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
         assert!(rendered.source.contains("cvt.rn.f32.s64"));
         assert!(rendered.source.contains("cvt.rn.f32.u64"));
@@ -7938,7 +9390,9 @@ mod tests {
         let on_true = narrow_cast.input_dtype("on_true", [1], DType::I16);
         let on_false = narrow_cast.input_dtype("on_false", [1], DType::F16);
         let output = narrow_cast.select(condition, on_true, on_false).unwrap();
-        let rendered = renderer.render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap()).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap())
+            .unwrap();
         assert_eq!(narrow_cast.dtype(output).unwrap(), DType::F16);
         assert!(rendered.source.contains("cvt.rn.f16.f32"));
         assert!(rendered.source.contains("selp.b32"));
@@ -7948,7 +9402,13 @@ mod tests {
         let on_true = empty.input_dtype("on_true", [1, 3], DType::F32);
         let on_false = empty.input_dtype("on_false", [0, 3], DType::F32);
         let output = empty.select(condition, on_true, on_false).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         // Select's VJP keeps the condition nondifferentiable and routes only
         // the payload gradient; the scoped forward admission adds no new VJP.
@@ -7971,7 +9431,10 @@ mod tests {
         let on_true = non_lub.cast(raw_true, DType::F64).unwrap();
         let on_false = non_lub.cast(raw_false, DType::F64).unwrap();
         let output = non_lub.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut non_bool = Graph::new();
         let condition = non_bool.input_dtype("condition", [1], DType::I8);
@@ -7987,14 +9450,22 @@ mod tests {
         let on_true = viewed.permute(raw_true, [1, 0]).unwrap();
         let on_false = viewed.input_dtype("on_false", [1, 2], DType::F16);
         let output = viewed.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut gate = Graph::new();
         let condition = gate.input_dtype("condition", [1], DType::Bool);
         let on_true = gate.input_dtype("on_true", [1], DType::F16);
         let on_false = gate.input_dtype("on_false", [1], DType::F16);
         let output = gate.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -8008,7 +9479,17 @@ mod tests {
             ("le", "setp.lt"),
             ("ge", "setp.lt"),
         ] {
-            for dtype in [DType::Bool, DType::I8, DType::U16, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64] {
+            for dtype in [
+                DType::Bool,
+                DType::I8,
+                DType::U16,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ] {
                 let mut graph = Graph::new();
                 let lhs = graph.input_dtype("lhs", [2, 1], dtype);
                 let rhs = graph.input_dtype("rhs", [1, 3], dtype);
@@ -8024,13 +9505,29 @@ mod tests {
                 let on_true = graph.input_dtype("on_true", [1, 3], DType::F16);
                 let on_false = graph.input_dtype("on_false", [2, 3], DType::F16);
                 let output = graph.select(condition, on_true, on_false).unwrap();
-                let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-                let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-                assert!(first.source.contains(predicate), "{label} {dtype:?} predicate");
-                assert!(first.source.contains("selp.b32"), "{label} {dtype:?} payload bits");
-                assert!(first.source.contains("st.global.b16"), "{label} {dtype:?} payload store");
+                let first = renderer
+                    .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                    .unwrap();
+                let second = renderer
+                    .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                    .unwrap();
+                assert!(
+                    first.source.contains(predicate),
+                    "{label} {dtype:?} predicate"
+                );
+                assert!(
+                    first.source.contains("selp.b32"),
+                    "{label} {dtype:?} payload bits"
+                );
+                assert!(
+                    first.source.contains("st.global.b16"),
+                    "{label} {dtype:?} payload store"
+                );
                 if matches!(label, "ne" | "le" | "ge") {
-                    assert!(first.source.contains("not.pred %p1, %p1"), "{label} {dtype:?} NaN-aware inversion");
+                    assert!(
+                        first.source.contains("not.pred %p1, %p1"),
+                        "{label} {dtype:?} NaN-aware inversion"
+                    );
                 }
                 assert_eq!(first.cache_key, second.cache_key, "{label} {dtype:?} key");
             }
@@ -8046,7 +9543,9 @@ mod tests {
         let on_true = bridge.input_dtype("on_true", [1], DType::I16);
         let on_false = bridge.input_dtype("on_false", [1], DType::F16);
         let output = bridge.select(condition, on_true, on_false).unwrap();
-        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
         assert!(rendered.source.contains("cvt.rn.f32.s64"));
         assert!(rendered.source.contains("cvt.rn.f32.u64"));
         assert!(rendered.source.contains("cvt.rn.f16.f32"));
@@ -8064,7 +9563,10 @@ mod tests {
         let on_true = raw_le.input_dtype("on_true", [1], DType::F16);
         let on_false = raw_le.input_dtype("on_false", [1], DType::F16);
         let output = raw_le.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw_le, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw_le, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut nested = Graph::new();
         let base = nested.input_dtype("base", [1], DType::Bool);
@@ -8074,7 +9576,10 @@ mod tests {
         let on_true = nested.input_dtype("on_true", [1], DType::F16);
         let on_false = nested.input_dtype("on_false", [1], DType::F16);
         let output = nested.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&nested, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&nested, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut logical = Graph::new();
         let lhs = logical.input_dtype("lhs", [1], DType::Bool);
@@ -8083,14 +9588,22 @@ mod tests {
         let on_true = logical.input_dtype("on_true", [1], DType::F16);
         let on_false = logical.input_dtype("on_false", [1], DType::F16);
         let output = logical.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&logical, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&logical, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut reversed_scalar_relu = Graph::new();
         let input = reversed_scalar_relu.input_dtype("input", [1], DType::F16);
-        let zero = reversed_scalar_relu.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let zero =
+            reversed_scalar_relu.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
         let condition = reversed_scalar_relu.lt(input, zero).unwrap();
         let output = reversed_scalar_relu.select(condition, input, zero).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&reversed_scalar_relu, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&reversed_scalar_relu, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut viewed = Graph::new();
         let lhs = viewed.input_dtype("lhs", [2, 1], DType::F16);
@@ -8100,7 +9613,10 @@ mod tests {
         let on_true = viewed.permute(raw_true, [1, 0]).unwrap();
         let on_false = viewed.input_dtype("on_false", [1, 2], DType::F16);
         let output = viewed.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut gate = Graph::new();
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
@@ -8109,26 +9625,109 @@ mod tests {
         let on_true = gate.input_dtype("on_true", [1], DType::F16);
         let on_false = gate.input_dtype("on_false", [1], DType::F16);
         let output = gate.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
     fn public_relu_has_a_scoped_typed_scalar_zero_root() {
         let renderer = PtxRenderer::new(80).unwrap();
         for (dtype, predicate, select, store, zero) in [
-            (DType::Bool, "setp.lt.u8", "selp.b32", "st.global.u8", "mov.b8"),
-            (DType::I8, "setp.lt.s8", "selp.b32", "st.global.s8", "mov.b8"),
-            (DType::U8, "setp.lt.u8", "selp.b32", "st.global.u8", "mov.b8"),
-            (DType::I16, "setp.lt.s16", "selp.b32", "st.global.s16", "mov.b16"),
-            (DType::U16, "setp.lt.u16", "selp.b32", "st.global.u16", "mov.b16"),
-            (DType::I32, "setp.lt.s32", "selp.b32", "st.global.s32", "mov.b32"),
-            (DType::U32, "setp.lt.u32", "selp.b32", "st.global.u32", "mov.b32"),
-            (DType::I64, "setp.lt.s64", "selp.b64", "st.global.s64", "mov.b64"),
-            (DType::U64, "setp.lt.u64", "selp.b64", "st.global.u64", "mov.b64"),
-            (DType::F16, "setp.lt.f32", "selp.b32", "st.global.b16", "mov.b16"),
-            (DType::BF16, "setp.lt.f32", "selp.b32", "st.global.b16", "mov.b16"),
-            (DType::F32, "setp.lt.f32", "selp.f32", "st.global.f32", "mov.b32"),
-            (DType::F64, "setp.lt.f64", "selp.f64", "st.global.f64", "mov.b64"),
+            (
+                DType::Bool,
+                "setp.lt.u8",
+                "selp.b32",
+                "st.global.u8",
+                "mov.b8",
+            ),
+            (
+                DType::I8,
+                "setp.lt.s8",
+                "selp.b32",
+                "st.global.s8",
+                "mov.b8",
+            ),
+            (
+                DType::U8,
+                "setp.lt.u8",
+                "selp.b32",
+                "st.global.u8",
+                "mov.b8",
+            ),
+            (
+                DType::I16,
+                "setp.lt.s16",
+                "selp.b32",
+                "st.global.s16",
+                "mov.b16",
+            ),
+            (
+                DType::U16,
+                "setp.lt.u16",
+                "selp.b32",
+                "st.global.u16",
+                "mov.b16",
+            ),
+            (
+                DType::I32,
+                "setp.lt.s32",
+                "selp.b32",
+                "st.global.s32",
+                "mov.b32",
+            ),
+            (
+                DType::U32,
+                "setp.lt.u32",
+                "selp.b32",
+                "st.global.u32",
+                "mov.b32",
+            ),
+            (
+                DType::I64,
+                "setp.lt.s64",
+                "selp.b64",
+                "st.global.s64",
+                "mov.b64",
+            ),
+            (
+                DType::U64,
+                "setp.lt.u64",
+                "selp.b64",
+                "st.global.u64",
+                "mov.b64",
+            ),
+            (
+                DType::F16,
+                "setp.lt.f32",
+                "selp.b32",
+                "st.global.b16",
+                "mov.b16",
+            ),
+            (
+                DType::BF16,
+                "setp.lt.f32",
+                "selp.b32",
+                "st.global.b16",
+                "mov.b16",
+            ),
+            (
+                DType::F32,
+                "setp.lt.f32",
+                "selp.f32",
+                "st.global.f32",
+                "mov.b32",
+            ),
+            (
+                DType::F64,
+                "setp.lt.f64",
+                "selp.f64",
+                "st.global.f64",
+                "mov.b64",
+            ),
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [2, 1], dtype);
@@ -8141,12 +9740,27 @@ mod tests {
                 .unwrap();
             assert_eq!(graph.dtype(output).unwrap(), dtype);
             assert_eq!(graph.shape(output).unwrap(), &crate::Shape::from([2, 1]));
-            assert!(first.source.contains(PTX_RENDERER_VERSION), "{dtype:?} version");
-            assert!(first.source.contains(predicate), "{dtype:?} ordered zero < input");
-            assert!(first.source.contains(select), "{dtype:?} raw payload select");
+            assert!(
+                first.source.contains(PTX_RENDERER_VERSION),
+                "{dtype:?} version"
+            );
+            assert!(
+                first.source.contains(predicate),
+                "{dtype:?} ordered zero < input"
+            );
+            assert!(
+                first.source.contains(select),
+                "{dtype:?} raw payload select"
+            );
             assert!(first.source.contains(store), "{dtype:?} typed store");
-            assert!(first.source.contains(zero) && first.source.contains("0x00"), "{dtype:?} canonical zero Const");
-            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert!(
+                first.source.contains(zero) && first.source.contains("0x00"),
+                "{dtype:?} canonical zero Const"
+            );
+            assert!(matches!(
+                &first.semantic_program,
+                Some(KernelSemanticProgram::UOp(_))
+            ));
             assert_eq!(first.source, second.source, "{dtype:?} source");
             assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
         }
@@ -8192,14 +9806,20 @@ mod tests {
         let zero = reversed.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
         let condition = reversed.lt(input, zero).unwrap();
         let output = reversed.select(condition, input, zero).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&reversed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&reversed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut swapped = Graph::new();
         let input = swapped.input_dtype("input", [1], DType::F16);
         let zero = swapped.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
         let condition = swapped.gt(input, zero).unwrap();
         let output = swapped.select(condition, zero, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut negative_zero = Graph::new();
         let input = negative_zero.input_dtype("input", [1], DType::F16);
@@ -8209,32 +9829,47 @@ mod tests {
         );
         let condition = negative_zero.gt(input, zero).unwrap();
         let output = negative_zero.select(condition, input, zero).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&negative_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&negative_zero, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut nonzero = Graph::new();
         let input = nonzero.input_dtype("input", [1], DType::F16);
         let zero = nonzero.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::F16));
         let condition = nonzero.gt(input, zero).unwrap();
         let output = nonzero.select(condition, input, zero).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&nonzero, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&nonzero, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut runtime_zero = Graph::new();
         let input = runtime_zero.input_dtype("input", [1], DType::F16);
         let zero = runtime_zero.input_dtype("zero", [1], DType::F16);
         let condition = runtime_zero.gt(input, zero).unwrap();
         let output = runtime_zero.select(condition, input, zero).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&runtime_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&runtime_zero, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut raw = Graph::new();
         let input = raw.input_dtype("input", [1], DType::F16);
         let output = raw.unary(crate::UnaryOp::Relu, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut viewed = Graph::new();
         let raw_input = viewed.input_dtype("input", [1, 2], DType::F16);
         let input = viewed.permute(raw_input, [1, 0]).unwrap();
         let output = viewed.relu(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut gate = Graph::new();
         let input = gate.input_dtype("input", [1], DType::F16);
@@ -8251,19 +9886,97 @@ mod tests {
     fn public_leaky_relu_has_a_scoped_mul_select_root() {
         let renderer = PtxRenderer::new(80).unwrap();
         for (dtype, predicate, branch, select, store) in [
-            (DType::Bool, "setp.lt.u8", "and.b32", "selp.b32", "st.global.u8"),
-            (DType::I8, "setp.lt.s8", "mul.lo.s32", "selp.b32", "st.global.s8"),
-            (DType::U8, "setp.lt.u8", "mul.lo.u32", "selp.b32", "st.global.u8"),
-            (DType::I16, "setp.lt.s16", "mul.lo.s32", "selp.b32", "st.global.s16"),
-            (DType::U16, "setp.lt.u16", "mul.lo.u32", "selp.b32", "st.global.u16"),
-            (DType::I32, "setp.lt.s32", "mul.lo.s32", "selp.b32", "st.global.s32"),
-            (DType::U32, "setp.lt.u32", "mul.lo.u32", "selp.b32", "st.global.u32"),
-            (DType::I64, "setp.lt.s64", "mul.lo.s64", "selp.b64", "st.global.s64"),
-            (DType::U64, "setp.lt.u64", "mul.lo.u64", "selp.b64", "st.global.u64"),
-            (DType::F16, "setp.lt.f32", "mul.rn.f64", "selp.b32", "st.global.b16"),
-            (DType::BF16, "setp.lt.f32", "mul.rn.f64", "selp.b32", "st.global.b16"),
-            (DType::F32, "setp.lt.f32", "mul.rn.f64", "selp.f32", "st.global.f32"),
-            (DType::F64, "setp.lt.f64", "mul.rn.f64", "selp.f64", "st.global.f64"),
+            (
+                DType::Bool,
+                "setp.lt.u8",
+                "and.b32",
+                "selp.b32",
+                "st.global.u8",
+            ),
+            (
+                DType::I8,
+                "setp.lt.s8",
+                "mul.lo.s32",
+                "selp.b32",
+                "st.global.s8",
+            ),
+            (
+                DType::U8,
+                "setp.lt.u8",
+                "mul.lo.u32",
+                "selp.b32",
+                "st.global.u8",
+            ),
+            (
+                DType::I16,
+                "setp.lt.s16",
+                "mul.lo.s32",
+                "selp.b32",
+                "st.global.s16",
+            ),
+            (
+                DType::U16,
+                "setp.lt.u16",
+                "mul.lo.u32",
+                "selp.b32",
+                "st.global.u16",
+            ),
+            (
+                DType::I32,
+                "setp.lt.s32",
+                "mul.lo.s32",
+                "selp.b32",
+                "st.global.s32",
+            ),
+            (
+                DType::U32,
+                "setp.lt.u32",
+                "mul.lo.u32",
+                "selp.b32",
+                "st.global.u32",
+            ),
+            (
+                DType::I64,
+                "setp.lt.s64",
+                "mul.lo.s64",
+                "selp.b64",
+                "st.global.s64",
+            ),
+            (
+                DType::U64,
+                "setp.lt.u64",
+                "mul.lo.u64",
+                "selp.b64",
+                "st.global.u64",
+            ),
+            (
+                DType::F16,
+                "setp.lt.f32",
+                "mul.rn.f64",
+                "selp.b32",
+                "st.global.b16",
+            ),
+            (
+                DType::BF16,
+                "setp.lt.f32",
+                "mul.rn.f64",
+                "selp.b32",
+                "st.global.b16",
+            ),
+            (
+                DType::F32,
+                "setp.lt.f32",
+                "mul.rn.f64",
+                "selp.f32",
+                "st.global.f32",
+            ),
+            (
+                DType::F64,
+                "setp.lt.f64",
+                "mul.rn.f64",
+                "selp.f64",
+                "st.global.f64",
+            ),
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [2, 1], dtype);
@@ -8277,13 +9990,25 @@ mod tests {
                 .unwrap();
             assert_eq!(graph.dtype(output).unwrap(), dtype);
             assert_eq!(graph.shape(output).unwrap(), &crate::Shape::from([2, 3]));
-            assert!(first.source.contains(PTX_RENDERER_VERSION), "{dtype:?} version");
-            assert!(first.source.contains("mov.b") && first.source.contains("0x00"), "{dtype:?} canonical zero Const");
+            assert!(
+                first.source.contains(PTX_RENDERER_VERSION),
+                "{dtype:?} version"
+            );
+            assert!(
+                first.source.contains("mov.b") && first.source.contains("0x00"),
+                "{dtype:?} canonical zero Const"
+            );
             assert!(first.source.contains(predicate), "{dtype:?} input < zero");
             assert!(first.source.contains(branch), "{dtype:?} slope * input");
-            assert!(first.source.contains(select), "{dtype:?} typed branch select");
+            assert!(
+                first.source.contains(select),
+                "{dtype:?} typed branch select"
+            );
             assert!(first.source.contains(store), "{dtype:?} typed store");
-            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert!(matches!(
+                &first.semantic_program,
+                Some(KernelSemanticProgram::UOp(_))
+            ));
             assert_eq!(first.source, second.source, "{dtype:?} source");
             assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
         }
@@ -8327,12 +10052,24 @@ mod tests {
         let input = scalar.input_dtype("input", [], DType::F64);
         let slope = scalar.input_dtype("slope", [], DType::F64);
         let output = scalar.leaky_relu(input, slope).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&scalar, output).unwrap())
+                .unwrap()
+                .extent,
+            1
+        );
         let mut empty = Graph::new();
         let input = empty.input_dtype("input", [0, 2], DType::BF16);
         let slope = empty.input_dtype("slope", [1, 2], DType::BF16);
         let output = empty.leaky_relu(input, slope).unwrap();
-        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
 
         // Select owns the strict boundary VJP; the predicate is
         // nondifferentiable and both broadcastable value branches retain
@@ -8357,7 +10094,10 @@ mod tests {
         let condition = reversed.gt(input, zero).unwrap();
         let scaled = reversed.mul(slope, input).unwrap();
         let output = reversed.select(condition, scaled, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&reversed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&reversed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut wrong_zero = Graph::new();
         let input = wrong_zero.input_dtype("input", [1], DType::F16);
@@ -8366,7 +10106,10 @@ mod tests {
         let condition = wrong_zero.lt(input, zero).unwrap();
         let scaled = wrong_zero.mul(slope, input).unwrap();
         let output = wrong_zero.select(condition, scaled, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&wrong_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&wrong_zero, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut negative_zero = Graph::new();
         let input = negative_zero.input_dtype("input", [1], DType::F16);
@@ -8378,7 +10121,10 @@ mod tests {
         let condition = negative_zero.lt(input, zero).unwrap();
         let scaled = negative_zero.mul(slope, input).unwrap();
         let output = negative_zero.select(condition, scaled, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&negative_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&negative_zero, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut runtime_zero = Graph::new();
         let input = runtime_zero.input_dtype("input", [1], DType::F16);
@@ -8387,7 +10133,10 @@ mod tests {
         let condition = runtime_zero.lt(input, zero).unwrap();
         let scaled = runtime_zero.mul(slope, input).unwrap();
         let output = runtime_zero.select(condition, scaled, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&runtime_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&runtime_zero, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut swapped = Graph::new();
         let input = swapped.input_dtype("input", [1], DType::F16);
@@ -8396,7 +10145,10 @@ mod tests {
         let condition = swapped.lt(input, zero).unwrap();
         let scaled = swapped.mul(slope, input).unwrap();
         let output = swapped.select(condition, input, scaled).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut unrelated = Graph::new();
         let input = unrelated.input_dtype("input", [1], DType::F16);
@@ -8406,20 +10158,31 @@ mod tests {
         let condition = unrelated.lt(input, zero).unwrap();
         let scaled = unrelated.mul(slope, other).unwrap();
         let output = unrelated.select(condition, scaled, input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&unrelated, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&unrelated, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut viewed = Graph::new();
         let raw_input = viewed.input_dtype("input", [1, 2], DType::F16);
         let input = viewed.permute(raw_input, [1, 0]).unwrap();
         let slope = viewed.input_dtype("slope", [2, 1], DType::F16);
         let output = viewed.leaky_relu(input, slope).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
 
         let mut gate = Graph::new();
         let input = gate.input_dtype("input", [1], DType::F16);
         let slope = gate.input_dtype("slope", [1], DType::F16);
         let output = gate.leaky_relu(input, slope).unwrap();
-        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -8433,8 +10196,18 @@ mod tests {
             (DType::U16, "ld.global.u16", "setp.ne.u16", "st.global.u16"),
             (DType::I32, "ld.global.s32", "setp.lt.s32", "st.global.s32"),
             (DType::U32, "ld.global.u32", "setp.ne.u32", "st.global.u32"),
-            (DType::I64, "ld.global.s64 %rd", "setp.lt.s64", "st.global.s64"),
-            (DType::U64, "ld.global.u64 %rd", "setp.ne.u64", "st.global.u64"),
+            (
+                DType::I64,
+                "ld.global.s64 %rd",
+                "setp.lt.s64",
+                "st.global.s64",
+            ),
+            (
+                DType::U64,
+                "ld.global.u64 %rd",
+                "setp.ne.u64",
+                "st.global.u64",
+            ),
             (DType::F16, "cvt.rn.f32.f16", "setp.eq.f32", "st.global.b16"),
             (DType::BF16, "shl.b32", "setp.eq.f32", "st.global.b16"),
             (DType::F32, "ld.global.f32", "setp.eq.f32", "st.global.f32"),
@@ -8452,14 +10225,22 @@ mod tests {
         }
 
         let f16 = renderer
-            .render(&unary_kernel(DType::F16, crate::UnaryOp::Sign, crate::Shape::new(vec![1])))
+            .render(&unary_kernel(
+                DType::F16,
+                crate::UnaryOp::Sign,
+                crate::Shape::new(vec![1]),
+            ))
             .unwrap()
             .source;
         assert!(f16.contains("selp.b32 %r"));
         assert!(f16.contains("0xbc00"));
         assert!(f16.contains("0x3c00"));
         let bf16 = renderer
-            .render(&unary_kernel(DType::BF16, crate::UnaryOp::Sign, crate::Shape::new(vec![1])))
+            .render(&unary_kernel(
+                DType::BF16,
+                crate::UnaryOp::Sign,
+                crate::Shape::new(vec![1]),
+            ))
             .unwrap()
             .source;
         assert!(bf16.contains("0xbf80"));
@@ -8469,13 +10250,19 @@ mod tests {
         // kernel does not admit another operation, and F16 still observes its
         // explicit ISA gate before cache/module publication.
         assert!(matches!(
-            renderer.render(&unary_kernel(DType::F16, crate::UnaryOp::Neg, crate::Shape::new(vec![1]))),
+            renderer.render(&unary_kernel(
+                DType::F16,
+                crate::UnaryOp::Neg,
+                crate::Shape::new(vec![1])
+            )),
             Err(PtxError::Unsupported(_))
         ));
         assert!(matches!(
-            PtxRenderer::new(52)
-                .unwrap()
-                .render(&unary_kernel(DType::F16, crate::UnaryOp::Sign, crate::Shape::new(vec![1]))),
+            PtxRenderer::new(52).unwrap().render(&unary_kernel(
+                DType::F16,
+                crate::UnaryOp::Sign,
+                crate::Shape::new(vec![1])
+            )),
             Err(PtxError::Unsupported(_))
         ));
 
@@ -8513,7 +10300,11 @@ mod tests {
         // Raw Unary Abs remains outside the public-composition-only admission.
         // Public Mul has its own strict root proof below.
         assert!(matches!(
-            renderer.render(&unary_kernel(DType::F16, crate::UnaryOp::Abs, crate::Shape::new(vec![1]))),
+            renderer.render(&unary_kernel(
+                DType::F16,
+                crate::UnaryOp::Abs,
+                crate::Shape::new(vec![1])
+            )),
             Err(PtxError::Unsupported(_))
         ));
 
@@ -8575,10 +10366,12 @@ mod tests {
         let mut legacy_f16 = Graph::new();
         let input = legacy_f16.input_dtype("x", [1], DType::F16);
         let output = legacy_f16.neg(input).unwrap();
-        assert!(PtxRenderer::new(52)
-            .unwrap()
-            .render(&crate::lower_graph_elementwise(&legacy_f16, output).unwrap())
-            .is_ok());
+        assert!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&legacy_f16, output).unwrap())
+                .is_ok()
+        );
         let bf16 = {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", [1], DType::BF16);
@@ -8594,7 +10387,11 @@ mod tests {
         // The raw-bit exception is root-scoped: no other narrow unary or
         // compound expression inherits this admission.
         assert!(matches!(
-            renderer.render(&unary_kernel(DType::F16, crate::UnaryOp::Abs, crate::Shape::new(vec![1]))),
+            renderer.render(&unary_kernel(
+                DType::F16,
+                crate::UnaryOp::Abs,
+                crate::Shape::new(vec![1])
+            )),
             Err(PtxError::Unsupported(_))
         ));
         let mut compound = Graph::new();
@@ -8614,7 +10411,10 @@ mod tests {
         let gradient = vjp.grad(output, input).unwrap();
         assert!(matches!(
             &vjp.node(gradient).unwrap().op,
-            &crate::Op::Unary { op: crate::UnaryOp::Neg, .. }
+            &crate::Op::Unary {
+                op: crate::UnaryOp::Neg,
+                ..
+            }
         ));
     }
 

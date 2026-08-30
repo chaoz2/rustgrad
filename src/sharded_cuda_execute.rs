@@ -320,16 +320,12 @@ impl ShardedCudaPlanComposition {
                     },
                 ));
             }
-            let owner = self
-                .plan
-                .owners
-                .get(substitution.rank)
-                .ok_or_else(|| {
-                    composition_error(CompositionError::MissingLocalExternal {
-                        rank: substitution.rank,
-                        buffer: substitution.local_buffer,
-                    })
-                })?;
+            let owner = self.plan.owners.get(substitution.rank).ok_or_else(|| {
+                composition_error(CompositionError::MissingLocalExternal {
+                    rank: substitution.rank,
+                    buffer: substitution.local_buffer,
+                })
+            })?;
             if source.owner_identity != owner.identity() {
                 return Err(composition_error(CompositionError::DescriptorMismatch {
                     rank: substitution.rank,
@@ -371,7 +367,9 @@ impl ShardedCudaPlanComposition {
             }
         }
         if aliases.is_empty() {
-            return Err(err("composition requires at least one explicit substitution"));
+            return Err(err(
+                "composition requires at least one explicit substitution",
+            ));
         }
         Ok(aliases)
     }
@@ -2470,7 +2468,10 @@ mod tests {
                 .iter()
                 .all(|pool| pool.stats().logical_leased_bytes == 112)
         );
-        assert_external_bytes(&environment, "successful composition preserves external bytes");
+        assert_external_bytes(
+            &environment,
+            "successful composition preserves external bytes",
+        );
         drop(result);
         assert!(
             pools

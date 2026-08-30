@@ -171,7 +171,8 @@ fn repeat_preflights_extent_overflow_before_lowering() {
     let input = valid.constant(data([2], &[3, 4]));
     let output = valid.repeat(input, &[2]).unwrap();
     assert_eq!(
-        CpuBackend.execute(&valid, output, &HashMap::new())
+        CpuBackend
+            .execute(&valid, output, &HashMap::new())
             .unwrap()
             .to_vec_f64(),
         vec![3., 4., 3., 4.]
@@ -223,7 +224,8 @@ fn repeat_interleave_preflights_extent_overflow_before_lowering() {
     let input = valid.constant(data([2], &[3, 4]));
     let output = valid.repeat_interleave(input, 2, Some(0)).unwrap();
     assert_eq!(
-        CpuBackend.execute(&valid, output, &HashMap::new())
+        CpuBackend
+            .execute(&valid, output, &HashMap::new())
             .unwrap()
             .to_vec_f64(),
         vec![3., 3., 4., 4.]
@@ -252,7 +254,10 @@ fn public_cat_uses_tinygrad_stack_or_pad_sum_with_atomic_preflight() {
     assert_eq!(graph.dtype(padded).unwrap(), DType::F32);
     assert!(matches!(
         graph.op(padded).unwrap(),
-        crate::Op::Binary { op: crate::BinaryOp::Add, .. }
+        crate::Op::Binary {
+            op: crate::BinaryOp::Add,
+            ..
+        }
     ));
     let loss = graph.sum_all(padded).unwrap();
     let first_grad = graph.grad(loss, first).unwrap();

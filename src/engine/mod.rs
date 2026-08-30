@@ -658,7 +658,7 @@ fn interpret_sort_pair(
     if source.shape() != input_shape || source.dtype() != *dtype {
         return Err("sort input descriptor mismatch".into());
     }
-    crate::backend::cpu::stable_sort_pair(&source, *axis, *descending, *dtype)
+    crate::backend::cpu::stable_sort_pair(&source, *axis, *descending)
         .map_err(|error| error.to_string())
 }
 

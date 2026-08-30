@@ -251,8 +251,14 @@ impl DType {
             Self::U32 => Scalar::U(u32::MIN as u64),
             Self::I64 => Scalar::I(i64::MIN),
             Self::U64 => Scalar::U(u64::MIN),
-            Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3FNUZ | Self::F8E5M2FNUZ
-            | Self::F16 | Self::BF16 | Self::F32 | Self::F64 => Scalar::F(f64::NEG_INFINITY),
+            Self::F8E4M3
+            | Self::F8E5M2
+            | Self::F8E4M3FNUZ
+            | Self::F8E5M2FNUZ
+            | Self::F16
+            | Self::BF16
+            | Self::F32
+            | Self::F64 => Scalar::F(f64::NEG_INFINITY),
         }
     }
 
@@ -268,8 +274,14 @@ impl DType {
             Self::U32 => Scalar::U(u32::MAX as u64),
             Self::I64 => Scalar::I(i64::MAX),
             Self::U64 => Scalar::U(u64::MAX),
-            Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3FNUZ | Self::F8E5M2FNUZ
-            | Self::F16 | Self::BF16 | Self::F32 | Self::F64 => Scalar::F(f64::INFINITY),
+            Self::F8E4M3
+            | Self::F8E5M2
+            | Self::F8E4M3FNUZ
+            | Self::F8E5M2FNUZ
+            | Self::F16
+            | Self::BF16
+            | Self::F32
+            | Self::F64 => Scalar::F(f64::INFINITY),
         }
     }
 
@@ -346,8 +358,9 @@ impl DType {
             Self::U32 => packed[..4].copy_from_slice(&(value.as_u64() as u32).to_le_bytes()),
             Self::I64 => packed.copy_from_slice(&value.as_i64().to_le_bytes()),
             Self::U64 => packed.copy_from_slice(&value.as_u64().to_le_bytes()),
-            Self::F16 => packed[..2]
-                .copy_from_slice(&f32_to_f16(value.as_f64() as f32).to_le_bytes()),
+            Self::F16 => {
+                packed[..2].copy_from_slice(&f32_to_f16(value.as_f64() as f32).to_le_bytes())
+            }
             Self::BF16 => packed[..2].copy_from_slice(&(value.as_u64() as u16).to_le_bytes()),
             Self::F32 => packed[..4].copy_from_slice(&(value.as_f64() as f32).to_le_bytes()),
             Self::F64 => packed.copy_from_slice(&value.as_f64().to_le_bytes()),
@@ -365,23 +378,23 @@ impl DType {
             Self::U8 => Scalar::U(packed[0] as u64),
             Self::I16 => Scalar::I(i16::from_le_bytes([packed[0], packed[1]]) as i64),
             Self::U16 => Scalar::U(u16::from_le_bytes([packed[0], packed[1]]) as u64),
-            Self::I32 => Scalar::I(
-                i32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as i64,
-            ),
-            Self::U32 => Scalar::U(
-                u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as u64,
-            ),
+            Self::I32 => {
+                Scalar::I(i32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as i64)
+            }
+            Self::U32 => {
+                Scalar::U(u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as u64)
+            }
             Self::I64 => Scalar::I(i64::from_le_bytes(packed)),
             Self::U64 => Scalar::U(u64::from_le_bytes(packed)),
-            Self::F16 => Scalar::F(
-                f16_to_f32(u16::from_le_bytes([packed[0], packed[1]])) as f64,
-            ),
+            Self::F16 => Scalar::F(f16_to_f32(u16::from_le_bytes([packed[0], packed[1]])) as f64),
             Self::BF16 => Scalar::U(u16::from_le_bytes([packed[0], packed[1]]) as u64),
-            Self::F32 => Scalar::F(
-                f32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as f64,
-            ),
+            Self::F32 => {
+                Scalar::F(f32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as f64)
+            }
             Self::F64 => Scalar::F(f64::from_le_bytes(packed)),
-            Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3FNUZ | Self::F8E5M2FNUZ => Scalar::U(packed[0] as u64),
+            Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3FNUZ | Self::F8E5M2FNUZ => {
+                Scalar::U(packed[0] as u64)
+            }
         };
         self.from_storage_scalar(value)
     }
@@ -392,7 +405,7 @@ impl DType {
     }
 
     /// Returns whether every value in `self` is representable by `target`.
-    pub const fn can_losslessly_cast_to(self, target: Self) -> bool {
+    pub fn can_losslessly_cast_to(self, target: Self) -> bool {
         use DType::*;
         if self == target || self == Bool {
             return true;
@@ -418,8 +431,13 @@ impl DType {
             Self::U8 | Self::U16 | Self::U32 => Self::U32,
             Self::I64 => Self::I64,
             Self::U64 => Self::U64,
-            Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3FNUZ | Self::F8E5M2FNUZ
-            | Self::F16 | Self::BF16 | Self::F32 => Self::F32,
+            Self::F8E4M3
+            | Self::F8E5M2
+            | Self::F8E4M3FNUZ
+            | Self::F8E5M2FNUZ
+            | Self::F16
+            | Self::BF16
+            | Self::F32 => Self::F32,
             Self::F64 => Self::F64,
         }
     }
@@ -603,32 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn dtype_parser_accepts_tinygrad_attribute_names_and_aliases() {
-        let cases = [
-            ("int8", DType::I8),
-            ("char", DType::I8),
-            ("uint8", DType::U8),
-            ("int16", DType::I16),
-            ("uint16", DType::U16),
-            ("int32", DType::I32),
-            ("uint32", DType::U32),
-            ("int64", DType::I64),
-            ("uint64", DType::U64),
-            ("float16", DType::F16),
-            ("half", DType::F16),
-            ("bfloat16", DType::BF16),
-            ("float32", DType::F32),
-            ("float", DType::F32),
-            ("float64", DType::F64),
-            ("double", DType::F64),
-        ];
-        for (name, dtype) in cases {
-            assert_eq!(name.parse(), Ok(dtype), "{name}");
-        }
-        assert_eq!("Float32".parse::<DType>(), Err(()));
-    }
-
-    #[test]
     fn tinygrad_concrete_metadata_matches_every_supported_dtype() {
         let cases = [
             (DType::Bool, 0, 1, 1, "bool", Some('?'), "bool"),
@@ -651,13 +643,12 @@ mod tests {
             assert_eq!(dtype.itemsize(), itemsize, "{dtype:?}");
             assert_eq!(dtype.tinygrad_source_name(), source_name, "{dtype:?}");
             assert_eq!(dtype.tinygrad_format(), format, "{dtype:?}");
-            assert_eq!(
-                dtype.canonical_tinygrad_name(),
-                canonical_name,
-                "{dtype:?}"
-            );
+            assert_eq!(dtype.canonical_tinygrad_name(), canonical_name, "{dtype:?}");
         }
-        assert_ne!(DType::I8.tinygrad_source_name(), DType::I8.canonical_tinygrad_name());
+        assert_ne!(
+            DType::I8.tinygrad_source_name(),
+            DType::I8.canonical_tinygrad_name()
+        );
         assert_ne!(
             DType::BF16.tinygrad_source_name(),
             DType::BF16.canonical_tinygrad_name()
@@ -670,8 +661,14 @@ mod tests {
         assert_eq!(DType::INT16S, [DType::U16, DType::I16]);
         assert_eq!(DType::INT32S, [DType::U32, DType::I32]);
         assert_eq!(DType::INT64S, [DType::U64, DType::I64]);
-        assert_eq!(DType::UINTS, [DType::U8, DType::U16, DType::U32, DType::U64]);
-        assert_eq!(DType::SINTS, [DType::I8, DType::I16, DType::I32, DType::I64]);
+        assert_eq!(
+            DType::UINTS,
+            [DType::U8, DType::U16, DType::U32, DType::U64]
+        );
+        assert_eq!(
+            DType::SINTS,
+            [DType::I8, DType::I16, DType::I32, DType::I64]
+        );
         assert_eq!(
             DType::INTS,
             [
@@ -705,7 +702,11 @@ mod tests {
         ] {
             assert_eq!(dtype.bitsize(), dtype.bits(), "{dtype:?}");
             assert_eq!(dtype.is_int(), dtype.is_integer(), "{dtype:?}");
-            assert_eq!(DType::INTS.contains(&dtype), dtype.is_integer(), "{dtype:?}");
+            assert_eq!(
+                DType::INTS.contains(&dtype),
+                dtype.is_integer(),
+                "{dtype:?}"
+            );
         }
         assert!(!DType::INTS.contains(&DType::Bool));
         for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
@@ -759,7 +760,10 @@ mod tests {
     #[test]
     fn scalar_commitment_uses_existing_storage_width_conversions() {
         assert_scalar_eq(DType::Bool.commit_scalar(Scalar::I(-1)), Scalar::Bool(true));
-        assert_scalar_eq(DType::Bool.commit_scalar(Scalar::F(-0.0)), Scalar::Bool(false));
+        assert_scalar_eq(
+            DType::Bool.commit_scalar(Scalar::F(-0.0)),
+            Scalar::Bool(false),
+        );
         assert_scalar_eq(DType::I8.commit_scalar(Scalar::I(257)), Scalar::I(1));
         assert_scalar_eq(
             DType::U8.commit_scalar(Scalar::I(-1)),
@@ -789,15 +793,18 @@ mod tests {
         assert_scalar_eq(DType::BF16.commit_scalar(Scalar::F(1.003)), Scalar::F(1.0));
         assert_scalar_eq(
             DType::F32.commit_scalar(Scalar::F(1.1)),
-            Scalar::F(1.1_f32 as f64)
+            Scalar::F(1.1_f32 as f64),
         );
         assert_scalar_eq(DType::F64.commit_scalar(Scalar::F(1.1)), Scalar::F(1.1));
         for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
             let zero = dtype.commit_scalar(Scalar::F(-0.0)).as_f64();
             assert_eq!(zero.to_bits(), (-0.0f64).to_bits());
-            assert!(dtype.commit_scalar(Scalar::F(f64::from_bits(0x7ff8_0000_0000_1234)))
-                .as_f64()
-                .is_nan());
+            assert!(
+                dtype
+                    .commit_scalar(Scalar::F(f64::from_bits(0x7ff8_0000_0000_1234)))
+                    .as_f64()
+                    .is_nan()
+            );
         }
     }
 
@@ -819,24 +826,63 @@ mod tests {
             DType::F64,
         ];
         const LOSSLESS: [[bool; 13]; 13] = [
-            [true, true, true, true, true, true, true, true, true, true, true, true, true],
-            [false, true, false, true, false, true, false, true, false, true, false, true, true],
-            [false, false, true, true, true, true, true, true, true, true, false, true, true],
-            [false, false, false, true, false, true, false, true, false, false, false, true, true],
-            [false, false, false, false, true, true, true, true, true, false, false, true, true],
-            [false, false, false, false, false, true, false, true, false, false, false, false, true],
-            [false, false, false, false, false, false, true, true, true, false, false, false, true],
-            [false, false, false, false, false, false, false, true, false, false, false, false, false],
-            [false, false, false, false, false, false, false, false, true, false, false, false, false],
-            [false, false, false, false, false, false, false, false, false, true, false, true, true],
-            [false, false, false, false, false, false, false, false, false, false, true, true, true],
-            [false, false, false, false, false, false, false, false, false, false, false, true, true],
-            [false, false, false, false, false, false, false, false, false, false, false, false, true],
+            [
+                true, true, true, true, true, true, true, true, true, true, true, true, true,
+            ],
+            [
+                false, true, false, true, false, true, false, true, false, true, false, true, true,
+            ],
+            [
+                false, false, true, true, true, true, true, true, true, true, false, true, true,
+            ],
+            [
+                false, false, false, true, false, true, false, true, false, false, false, true,
+                true,
+            ],
+            [
+                false, false, false, false, true, true, true, true, true, false, false, true, true,
+            ],
+            [
+                false, false, false, false, false, true, false, true, false, false, false, false,
+                true,
+            ],
+            [
+                false, false, false, false, false, false, true, true, true, false, false, false,
+                true,
+            ],
+            [
+                false, false, false, false, false, false, false, true, false, false, false, false,
+                false,
+            ],
+            [
+                false, false, false, false, false, false, false, false, true, false, false, false,
+                false,
+            ],
+            [
+                false, false, false, false, false, false, false, false, false, true, false, true,
+                true,
+            ],
+            [
+                false, false, false, false, false, false, false, false, false, false, true, true,
+                true,
+            ],
+            [
+                false, false, false, false, false, false, false, false, false, false, false, true,
+                true,
+            ],
+            [
+                false, false, false, false, false, false, false, false, false, false, false, false,
+                true,
+            ],
         ];
         for (source_index, source) in DTYPES.into_iter().enumerate() {
             assert_eq!(
                 source.least_upper_float(),
-                if source.is_float() { source } else { DType::F32 }
+                if source.is_float() {
+                    source
+                } else {
+                    DType::F32
+                }
             );
             for (target_index, target) in DTYPES.into_iter().enumerate() {
                 assert_eq!(
@@ -944,15 +990,21 @@ mod tests {
             Scalar::U(0xff),
         );
         assert_scalar_eq(
-            DType::U8.bitcast_scalar(Scalar::U(0x80), DType::I8).unwrap(),
+            DType::U8
+                .bitcast_scalar(Scalar::U(0x80), DType::I8)
+                .unwrap(),
             Scalar::I(i8::MIN as i64),
         );
         assert_scalar_eq(
-            DType::I16.bitcast_scalar(Scalar::I(-2), DType::U16).unwrap(),
+            DType::I16
+                .bitcast_scalar(Scalar::I(-2), DType::U16)
+                .unwrap(),
             Scalar::U(0xfffe),
         );
         assert_scalar_eq(
-            DType::U16.bitcast_scalar(Scalar::U(0x8000), DType::I16).unwrap(),
+            DType::U16
+                .bitcast_scalar(Scalar::U(0x8000), DType::I16)
+                .unwrap(),
             Scalar::I(i16::MIN as i64),
         );
         assert_scalar_eq(
@@ -986,21 +1038,27 @@ mod tests {
                 .unwrap(),
             Scalar::F((-0.0f32) as f64),
         );
-        assert!(DType::U32
-            .bitcast_scalar(Scalar::U(0x7fc0_1234), DType::F32)
-            .unwrap()
-            .as_f64()
-            .is_nan());
-        assert!(DType::U64
-            .bitcast_scalar(Scalar::U(0x7ff8_0000_0000_1234), DType::F64)
-            .unwrap()
-            .as_f64()
-            .is_nan());
-        assert!(DType::U64
-            .bitcast_scalar(Scalar::U(0x7ff0_0000_0000_0000), DType::F64)
-            .unwrap()
-            .as_f64()
-            .is_infinite());
+        assert!(
+            DType::U32
+                .bitcast_scalar(Scalar::U(0x7fc0_1234), DType::F32)
+                .unwrap()
+                .as_f64()
+                .is_nan()
+        );
+        assert!(
+            DType::U64
+                .bitcast_scalar(Scalar::U(0x7ff8_0000_0000_1234), DType::F64)
+                .unwrap()
+                .as_f64()
+                .is_nan()
+        );
+        assert!(
+            DType::U64
+                .bitcast_scalar(Scalar::U(0x7ff0_0000_0000_0000), DType::F64)
+                .unwrap()
+                .as_f64()
+                .is_infinite()
+        );
     }
 
     #[test]
@@ -1040,8 +1098,8 @@ mod tests {
             (DType::F64, &["float64", "double"][..]),
         ];
         let canonical = [
-            "bool", "char", "uchar", "short", "ushort", "int", "uint", "long", "ulong",
-            "half", "bfloat16", "float", "double",
+            "bool", "char", "uchar", "short", "ushort", "int", "uint", "long", "ulong", "half",
+            "bfloat16", "float", "double",
         ];
 
         for ((dtype, names), canonical) in aliases.into_iter().zip(canonical) {
@@ -1096,7 +1154,12 @@ mod tests {
             (DType::I8, "dtypes.char", &["int8", "char"][..], "I8"),
             (DType::U8, "dtypes.uchar", &["uint8", "uchar"][..], "U8"),
             (DType::I16, "dtypes.short", &["int16", "short"][..], "I16"),
-            (DType::U16, "dtypes.ushort", &["uint16", "ushort"][..], "U16"),
+            (
+                DType::U16,
+                "dtypes.ushort",
+                &["uint16", "ushort"][..],
+                "U16",
+            ),
             (DType::I32, "dtypes.int", &["int32", "int"][..], "I32"),
             (DType::U32, "dtypes.uint", &["uint32", "uint"][..], "U32"),
             (DType::I64, "dtypes.long", &["int64", "long"][..], "I64"),
@@ -1104,7 +1167,12 @@ mod tests {
             (DType::F16, "dtypes.half", &["float16", "half"][..], "F16"),
             (DType::BF16, "dtypes.bfloat16", &["bfloat16"][..], "BF16"),
             (DType::F32, "dtypes.float", &["float32", "float"][..], "F32"),
-            (DType::F64, "dtypes.double", &["float64", "double"][..], "F64"),
+            (
+                DType::F64,
+                "dtypes.double",
+                &["float64", "double"][..],
+                "F64",
+            ),
         ];
         for (dtype, display, aliases, debug) in cases {
             assert_eq!(dtype.to_string(), display);

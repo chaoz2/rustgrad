@@ -350,7 +350,7 @@ impl RearrangePattern {
 impl Graph {
     /// Circularly shifts a tensor by static signed amounts. With `dims=None`,
     /// the row-major flattened tensor is shifted and reshaped back.
-    pub fn roll(
+    pub fn roll_static(
         &mut self,
         input: NodeId,
         shifts: &[isize],
@@ -380,7 +380,7 @@ impl Graph {
     /// Splits an axis into static sections. A scalar size creates equal
     /// sections plus a smaller final section; explicit sections cover the
     /// axis exactly. Results are immutable `Shrink` views of `input`.
-    pub fn split(
+    pub fn split_static(
         &mut self,
         input: NodeId,
         sizes: impl Into<SplitSizes>,
@@ -397,7 +397,12 @@ impl Graph {
     /// Splits an axis into at most `chunks` near-equal static sections.
     /// Following tinygrad, a zero-length selected axis yields `chunks` empty
     /// sections, while a non-empty axis may yield fewer sections.
-    pub fn chunk(&mut self, input: NodeId, chunks: usize, axis: isize) -> Result<Vec<NodeId>> {
+    pub fn chunk_static(
+        &mut self,
+        input: NodeId,
+        chunks: usize,
+        axis: isize,
+    ) -> Result<Vec<NodeId>> {
         let shape = self.node(input)?.shape.clone();
         let plan = StaticSplitPlan::chunk(input, &shape, chunks, axis)?;
         plan.bounds(&shape)?
@@ -793,30 +798,43 @@ mod tests {
         let ellipsis_output = graph
             .rearrange(ellipsis, "b ... c -> ... b c", &BTreeMap::new())
             .unwrap();
-        assert_eq!(graph.shape(ellipsis_output).unwrap(), &Shape::new([0, 2, 3]));
+        assert_eq!(
+            graph.shape(ellipsis_output).unwrap(),
+            &Shape::new([0, 2, 3])
+        );
         assert_eq!(graph.dtype(ellipsis_output).unwrap(), DType::I16);
 
         let mut malformed = Graph::new();
         let source = malformed.input_dtype("source", [2, 6], DType::F64);
         let before = malformed.node_count();
-        assert!(malformed
-            .rearrange(source, "b (h w) -> h b w", &BTreeMap::new())
-            .is_err());
+        assert!(
+            malformed
+                .rearrange(source, "b (h w) -> h b w", &BTreeMap::new())
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed
-            .rearrange(source, "b b -> b", &BTreeMap::new())
-            .is_err());
+        assert!(
+            malformed
+                .rearrange(source, "b b -> b", &BTreeMap::new())
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed
-            .rearrange(source, "b c -> (b c)", &{
-                let mut unused = BTreeMap::new();
-                unused.insert("unused".into(), 1);
-                unused
-            })
-            .is_err());
+        assert!(
+            malformed
+                .rearrange(source, "b c -> (b c)", &{
+                    let mut unused = BTreeMap::new();
+                    unused.insert("unused".into(), 1);
+                    unused
+                })
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
         assert!(matches!(
-            malformed.rearrange(NodeId::from_index(usize::MAX), "b c -> c b", &BTreeMap::new()),
+            malformed.rearrange(
+                NodeId::from_index(usize::MAX),
+                "b c -> c b",
+                &BTreeMap::new()
+            ),
             Err(Error::UnknownNode(_))
         ));
         assert_eq!(malformed.node_count(), before);

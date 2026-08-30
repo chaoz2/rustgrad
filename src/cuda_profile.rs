@@ -421,7 +421,10 @@ mod tests {
         first.ready(Some(7));
         let records = session.records();
         assert_eq!(
-            records.iter().map(|record| record.sequence).collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
             vec![0, 1],
             "inspection is always canonical by submission sequence"
         );

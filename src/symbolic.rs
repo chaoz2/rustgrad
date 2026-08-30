@@ -82,7 +82,10 @@ impl Bounds {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SymbolicError {
-    InvalidBounds { min: i64, max: i64 },
+    InvalidBounds {
+        min: i64,
+        max: i64,
+    },
     IdentityExhausted,
     DivisionByZero,
     Overflow {

@@ -174,20 +174,18 @@ fn zero_token_generation_preflights_prompt_vocabulary_before_cache_work() {
     let mut direct = LlamaGenerator::new(&model, &tokenizer);
     assert_eq!(
         direct.generate_ids(&[invalid], 0, LlamaSampling::Greedy),
-        Err(LlamaGenerationError::Model(LlamaModelError::TokenOutOfRange {
-            token: invalid,
-            vocab_size: VOCAB,
-        }))
+        Err(LlamaGenerationError::Model(
+            LlamaModelError::TokenOutOfRange {
+                token: invalid,
+                vocab_size: VOCAB,
+            }
+        ))
     );
     assert_eq!(direct.cache_len(), 0);
 
     let mut batch = LlamaBatchGenerator::new(&model, &tokenizer, 2).unwrap();
     assert_eq!(
-        batch.generate_ids(
-            &[vec![3], vec![invalid]],
-            0,
-            LlamaBatchSampling::Greedy,
-        ),
+        batch.generate_ids(&[vec![3], vec![invalid]], 0, LlamaBatchSampling::Greedy,),
         Err(LlamaBatchGenerationError::Model(
             LlamaModelError::BatchTokenOutOfRange {
                 row: 1,

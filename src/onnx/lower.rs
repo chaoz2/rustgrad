@@ -4,16 +4,16 @@ use super::{
     bad,
     schema::{
         attrs, axes_usize, const_i64, conv_pads, conv_pair, conv_same_padding, onnx_pool_options,
-        packed_i64, scalar_f32, scalar_i64, strict_typed_scalar_i64_attr,
-        strict_typed_packed_i64_attr, strict_typed_string_attr, typed_scalar_f32_attr,
+        packed_i64, scalar_f32, scalar_i64, strict_typed_packed_i64_attr,
+        strict_typed_scalar_i64_attr, strict_typed_string_attr, typed_scalar_f32_attr,
         typed_scalar_i64_attr,
     },
     tensor::{onnx_dtype, tensor_data},
     wire::{Msg, var},
 };
 use crate::{
-    ir::reduction_shape, Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType,
-    Result, Scalar, Shape, Slice, TensorData,
+    Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, Slice,
+    TensorData, ir::reduction_shape,
 };
 use std::collections::BTreeMap;
 
@@ -21,7 +21,10 @@ fn prelu_dtype(x: DType, slope: DType) -> DType {
     // tinygrad's weak binary lowering resolves the only supported lattice
     // disagreement, U64 mixed with I64, at its default F32 width. RustGrad's
     // generic promotion intentionally chooses F64 for that pair.
-    if matches!((x, slope), (DType::U64, DType::I64) | (DType::I64, DType::U64)) {
+    if matches!(
+        (x, slope),
+        (DType::U64, DType::I64) | (DType::I64, DType::U64)
+    ) {
         DType::F32
     } else {
         x.promote(slope)
@@ -50,7 +53,10 @@ fn variadic_max_dtype(lhs: DType, rhs: DType) -> DType {
     // This is the same checked-in tinygrad least-upper-dtype exception used
     // by PRelu: mixed I64/U64 falls to default F32 rather than RustGrad's
     // broader generic F64 lattice.
-    if matches!((lhs, rhs), (DType::U64, DType::I64) | (DType::I64, DType::U64)) {
+    if matches!(
+        (lhs, rhs),
+        (DType::U64, DType::I64) | (DType::I64, DType::U64)
+    ) {
         DType::F32
     } else {
         lhs.promote(rhs)
@@ -152,8 +158,14 @@ fn lower_variadic_sum_plan(g: &mut Graph, plan: VariadicSumPlan) -> Result<NodeI
         debug_assert_eq!(g.shape(sum).expect("Sum shape preflighted"), &fold.shape);
         debug_assert_eq!(g.dtype(sum).expect("Sum dtype preflighted"), fold.dtype);
     }
-    debug_assert_eq!(g.shape(sum).expect("Sum output shape preflighted"), &plan.output_shape);
-    debug_assert_eq!(g.dtype(sum).expect("Sum output dtype preflighted"), plan.output_dtype);
+    debug_assert_eq!(
+        g.shape(sum).expect("Sum output shape preflighted"),
+        &plan.output_shape
+    );
+    debug_assert_eq!(
+        g.dtype(sum).expect("Sum output dtype preflighted"),
+        plan.output_dtype
+    );
     Ok(sum)
 }
 
@@ -297,7 +309,10 @@ struct VariadicMinPlan {
 fn variadic_min_dtype(lhs: DType, rhs: DType) -> DType {
     // Match Tensor.minimum's `_broadcasted` least-upper dtype, including the
     // checked-in default-F32 resolution for the mixed I64/U64 pair.
-    if matches!((lhs, rhs), (DType::U64, DType::I64) | (DType::I64, DType::U64)) {
+    if matches!(
+        (lhs, rhs),
+        (DType::U64, DType::I64) | (DType::I64, DType::U64)
+    ) {
         DType::F32
     } else {
         lhs.promote(rhs)
@@ -390,7 +405,10 @@ struct ClipPlan {
 fn clip_dtype(value: DType, bound: DType) -> DType {
     // `Tensor.clamp` reaches `_broadcasted` for each strict comparison and
     // select value pair, including tinygrad's I64/U64 default-F32 exception.
-    if matches!((value, bound), (DType::U64, DType::I64) | (DType::I64, DType::U64)) {
+    if matches!(
+        (value, bound),
+        (DType::U64, DType::I64) | (DType::I64, DType::U64)
+    ) {
         DType::F32
     } else {
         value.promote(bound)
@@ -572,10 +590,7 @@ struct OneHotPlan {
 /// a scalar or a singleton sequence.  Rust's primitive float casts saturate
 /// NaNs/infinities, so keep that conversion explicit rather than reusing the
 /// I32/I64-only axis helper.
-fn static_one_hot_depth(
-    constants: &BTreeMap<String, TensorData>,
-    name: &str,
-) -> Result<i64> {
+fn static_one_hot_depth(constants: &BTreeMap<String, TensorData>, name: &str) -> Result<i64> {
     let value = constants
         .get(name)
         .ok_or_else(|| bad("OneHot depth must be a constant initializer"))?;
@@ -589,15 +604,14 @@ fn static_one_hot_depth(
     match value.scalar_at(0) {
         Scalar::Bool(value) => Ok(i64::from(value)),
         Scalar::I(value) => Ok(value),
-        Scalar::U(value) => i64::try_from(value)
-            .map_err(|_| bad("OneHot depth is not representable by arange")),
+        Scalar::U(value) => {
+            i64::try_from(value).map_err(|_| bad("OneHot depth is not representable by arange"))
+        }
         Scalar::F(value) => {
             // Python rejects non-finite float-to-int conversion.  The upper
             // bound is exclusive because `i64::MAX as f64` rounds to 2^63.
             let value = value.trunc();
-            if !value.is_finite()
-                || value < i64::MIN as f64
-                || value >= 9_223_372_036_854_775_808.0
+            if !value.is_finite() || value < i64::MIN as f64 || value >= 9_223_372_036_854_775_808.0
             {
                 return Err(bad("OneHot depth is not representable by arange"));
             }
@@ -629,13 +643,14 @@ fn one_hot_plan(
         // `arange` itself returns empty for every negative endpoint, but the
         // subsequent shape uses the endpoint literally.  Only -1 is its
         // reshape inference sentinel, producing a zero class extent.
-        return Err(bad("OneHot depth below -1 is unsupported by source reshape"));
+        return Err(bad(
+            "OneHot depth below -1 is unsupported by source reshape",
+        ));
     }
     let classes = if raw_depth <= 0 {
         0usize
     } else {
-        usize::try_from(raw_depth)
-            .map_err(|_| bad("OneHot depth is not representable by shape"))?
+        usize::try_from(raw_depth).map_err(|_| bad("OneHot depth is not representable by shape"))?
     };
     let rank = indices_shape.rank();
     let output_rank = rank
@@ -675,7 +690,8 @@ fn one_hot_plan(
     // tinygrad creates this Python integer as a weak scalar, then promotes it
     // to the concrete I32 index width.  Retain Rust's defined wrapping cast
     // for depths outside I32, which is observable on the negative branch.
-    let index_depth = TensorData::scalar_with_dtype(Scalar::I(i64::from(raw_depth as i32)), DType::I32);
+    let index_depth =
+        TensorData::scalar_with_dtype(Scalar::I(i64::from(raw_depth as i32)), DType::I32);
     let index_zero = TensorData::scalar_with_dtype(Scalar::I(0), DType::I32);
     let classes_data = TensorData::arange(0, raw_depth.max(0), 1)?;
     if classes_data.shape() != &Shape::new([classes]) || classes_data.dtype() != DType::I64 {
@@ -823,7 +839,11 @@ fn argmax_plan(
         .ok_or_else(|| bad("ArgMax index byte extent overflow"))?;
     let mut first_bounds = Vec::with_capacity(rank);
     for (dimension, &extent) in shape.dims().iter().enumerate() {
-        first_bounds.push(if dimension == axis { (0, 1) } else { (0, extent) });
+        first_bounds.push(if dimension == axis {
+            (0, 1)
+        } else {
+            (0, extent)
+        });
     }
     let first_shape = Shape::new(
         first_bounds
@@ -935,8 +955,8 @@ fn hardmax_plan(
     };
     let axis = usize::try_from(axis).map_err(|_| bad("Hardmax axis overflow"))?;
     let axis_extent = shape.dims()[axis];
-    let sentinel = i32::try_from(axis_extent)
-        .map_err(|_| bad("Hardmax axis extent exceeds I32 indices"))?;
+    let sentinel =
+        i32::try_from(axis_extent).map_err(|_| bad("Hardmax axis extent exceeds I32 indices"))?;
 
     // ArgReduce removes the axis, while the checked first-lane Shrink then
     // Squeeze reaches exactly the same descriptor before isnan/select.
@@ -955,7 +975,11 @@ fn hardmax_plan(
         .ok_or_else(|| bad("Hardmax ArgMax index byte extent overflow"))?;
     let mut first_bounds = Vec::with_capacity(rank);
     for (dimension, &extent) in shape.dims().iter().enumerate() {
-        first_bounds.push(if dimension == axis { (0, 1) } else { (0, extent) });
+        first_bounds.push(if dimension == axis {
+            (0, 1)
+        } else {
+            (0, extent)
+        });
     }
     let first_shape = Shape::new(
         first_bounds
@@ -1007,9 +1031,11 @@ fn hardmax_plan(
     if class_shape.broadcast_with(&restored_index_shape)? != shape {
         return Err(bad("Hardmax classes cannot broadcast to input"));
     }
-    let classes = TensorData::arange(0, i64::try_from(axis_extent).map_err(|_| {
-        bad("Hardmax axis extent exceeds arange range")
-    })?, 1)?
+    let classes = TensorData::arange(
+        0,
+        i64::try_from(axis_extent).map_err(|_| bad("Hardmax axis extent exceeds arange range"))?,
+        1,
+    )?
     .cast(DType::I32);
     if classes.shape() != &Shape::new([axis_extent]) || classes.dtype() != DType::I32 {
         return Err(bad("Hardmax class range does not match validated axis"));
@@ -1156,14 +1182,21 @@ struct SwishPlan {
     empty: bool,
 }
 
-struct ModPlan { fmod: bool, shape: Shape, dtype: DType }
+struct ModPlan {
+    fmod: bool,
+    shape: Shape,
+    dtype: DType,
+}
 
 /// The importer has a single-value environment, whereas tinygrad's Dropout
 /// always returns `(data, bool_mask)`.  This plan therefore admits only the
 /// source identity path when the ONNX node requests its first output alone.
 /// Ratio and seed are semantically dead there, but supplied controls still
 /// need static descriptor validation before X is republished.
-struct DropoutPlan { shape: Shape, dtype: DType }
+struct DropoutPlan {
+    shape: Shape,
+    dtype: DType,
+}
 
 /// Complete static descriptor plan for the first output of tinygrad's
 /// LayerNormalization adapter. The source always computes its statistics in
@@ -1210,32 +1243,69 @@ struct RmsNormalizationPlan {
     epsilon: TensorData,
 }
 
-struct EinsumPlan { equation: String, inputs: Vec<NodeId>, output_shape: Shape, output_dtype: DType }
+struct EinsumPlan {
+    equation: String,
+    inputs: Vec<NodeId>,
+    output_shape: Shape,
+    output_dtype: DType,
+}
 
-fn einsum_plan(g: &Graph, inputs: &[NodeId], n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<EinsumPlan> {
-    if inputs.is_empty() || attrs.keys().any(|key| key != "equation") { return Err(bad("unsupported Einsum input or attribute")); }
+fn einsum_plan(
+    g: &Graph,
+    inputs: &[NodeId],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<EinsumPlan> {
+    if inputs.is_empty() || attrs.keys().any(|key| key != "equation") {
+        return Err(bad("unsupported Einsum input or attribute"));
+    }
     // Tensor.einsum removes literal spaces before parsing; retain its entire
     // grammar by forwarding the normalized equation to Graph::einsum.
-    let equation = strict_typed_string_attr(n, "equation")?.ok_or_else(|| bad("Einsum requires equation"))?.replace(' ', "");
-    if equation.is_empty() { return Err(bad("Einsum equation is empty")); }
+    let equation = strict_typed_string_attr(n, "equation")?
+        .ok_or_else(|| bad("Einsum requires equation"))?
+        .replace(' ', "");
+    if equation.is_empty() {
+        return Err(bad("Einsum equation is empty"));
+    }
     let mut output_dtype = DType::Bool;
     for input in inputs {
         let shape = g.shape(*input)?.clone();
         let dtype = g.dtype(*input)?;
-        shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad("Einsum input byte extent overflow"))?;
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Einsum input byte extent overflow"))?;
         output_dtype = output_dtype.promote(dtype);
     }
     // Parse against the complete static shape inventory before Graph::einsum
     // appends its single Einsum node.
-    let shapes = inputs.iter().map(|input| Ok(g.shape(*input)?.clone())).collect::<Result<Vec<_>>>()?;
+    let shapes = inputs
+        .iter()
+        .map(|input| Ok(g.shape(*input)?.clone()))
+        .collect::<Result<Vec<_>>>()?;
     let parsed = crate::EinsumPlan::parse(&equation, &shapes)?;
     let output_shape = parsed.output_shape();
-    output_shape.numel()?.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Einsum output byte extent overflow"))?;
-    Ok(EinsumPlan { equation, inputs: inputs.to_vec(), output_shape, output_dtype })
+    output_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Einsum output byte extent overflow"))?;
+    Ok(EinsumPlan {
+        equation,
+        inputs: inputs.to_vec(),
+        output_shape,
+        output_dtype,
+    })
 }
 
-fn lp_normalization_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<LpNormalizationPlan> {
-    if attrs.keys().any(|key| key != "axis" && key != "p") { return Err(bad("unsupported LpNormalization attribute")); }
+fn lp_normalization_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<LpNormalizationPlan> {
+    if attrs.keys().any(|key| key != "axis" && key != "p") {
+        return Err(bad("unsupported LpNormalization attribute"));
+    }
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let extent = |shape: &Shape, dtype: DType, what: &str| {
@@ -1253,11 +1323,21 @@ fn lp_normalization_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap
     let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
     let rank = i64::try_from(shape.rank()).map_err(|_| bad("LpNormalization rank overflow"))?;
     let axes = if rank == 0 {
-        if !matches!(raw_axis, -1 | 0) { return Err(bad("invalid LpNormalization scalar axis")); }
+        if !matches!(raw_axis, -1 | 0) {
+            return Err(bad("invalid LpNormalization scalar axis"));
+        }
         Vec::new()
     } else {
-        let axis = if raw_axis < 0 { raw_axis.checked_add(rank).ok_or_else(|| bad("invalid LpNormalization axis"))? } else { raw_axis };
-        if axis < 0 || axis >= rank { return Err(bad("invalid LpNormalization axis")); }
+        let axis = if raw_axis < 0 {
+            raw_axis
+                .checked_add(rank)
+                .ok_or_else(|| bad("invalid LpNormalization axis"))?
+        } else {
+            raw_axis
+        };
+        if axis < 0 || axis >= rank {
+            return Err(bad("invalid LpNormalization axis"));
+        }
         vec![isize::try_from(axis).map_err(|_| bad("invalid LpNormalization axis"))?]
     };
     // Tinygrad only distinguishes p == 1; any other INT takes its square
@@ -1271,27 +1351,59 @@ fn lp_normalization_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap
     } else {
         DType::F32
     };
-    let output_dtype = input_dtype.promote(if denominator_dtype.is_float() { denominator_dtype } else { DType::F32 });
+    let output_dtype = input_dtype.promote(if denominator_dtype.is_float() {
+        denominator_dtype
+    } else {
+        DType::F32
+    });
     extent(&shape, sum_dtypes.accumulator, "Sum accumulator")?;
     extent(&shape, output_dtype, "output")?;
     let mut denom_dims = shape.dims().to_vec();
-    for axis in &axes { denom_dims[*axis as usize] = 1; }
+    for axis in &axes {
+        denom_dims[*axis as usize] = 1;
+    }
     let denominator_shape = Shape::new(denom_dims);
-    extent(&denominator_shape, sum_dtypes.accumulator, "Sum reduction accumulator")?;
+    extent(
+        &denominator_shape,
+        sum_dtypes.accumulator,
+        "Sum reduction accumulator",
+    )?;
     extent(&denominator_shape, sum_dtypes.output, "Sum output")?;
     extent(&denominator_shape, denominator_dtype, "denominator")?;
-    let reciprocal_dtype = if denominator_dtype.is_float() { denominator_dtype } else { DType::F32 };
+    let reciprocal_dtype = if denominator_dtype.is_float() {
+        denominator_dtype
+    } else {
+        DType::F32
+    };
     extent(&denominator_shape, reciprocal_dtype, "reciprocal")?;
-    if denominator_shape.broadcast_with(&shape)? != shape || input_dtype.promote(reciprocal_dtype) != output_dtype {
+    if denominator_shape.broadcast_with(&shape)? != shape
+        || input_dtype.promote(reciprocal_dtype) != output_dtype
+    {
         return Err(bad("LpNormalization promotion mismatch"));
     }
-    Ok(LpNormalizationPlan { input_dtype, output_dtype, denominator_dtype, shape, axes, sum_dtypes, l1, empty: numel == 0 })
+    Ok(LpNormalizationPlan {
+        input_dtype,
+        output_dtype,
+        denominator_dtype,
+        shape,
+        axes,
+        sum_dtypes,
+        l1,
+        empty: numel == 0,
+    })
 }
 
 fn rms_normalization_plan(
-    g: &Graph, input: NodeId, scale: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>,
+    g: &Graph,
+    input: NodeId,
+    scale: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
 ) -> Result<RmsNormalizationPlan> {
-    if attrs.keys().any(|key| !matches!(key.as_str(), "axis" | "epsilon" | "stash_type")) {
+    if attrs
+        .keys()
+        .any(|key| !matches!(key.as_str(), "axis" | "epsilon" | "stash_type"))
+    {
         return Err(bad("unsupported RMSNormalization attribute"));
     }
     if strict_typed_scalar_i64_attr(n, "stash_type")?.unwrap_or(1) != 1 {
@@ -1302,7 +1414,9 @@ fn rms_normalization_plan(
     let scale_shape = g.shape(scale)?.clone();
     let scale_dtype = g.dtype(scale)?;
     let extent = |shape: &Shape, dtype: DType, what: &str| {
-        shape.numel()?.checked_mul(dtype.itemsize())
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
             .ok_or_else(|| bad(&format!("RMSNormalization {what} byte extent overflow")))
     };
     extent(&shape, input_dtype, "input")?;
@@ -1310,18 +1424,41 @@ fn rms_normalization_plan(
     let rank = i64::try_from(shape.rank()).map_err(|_| bad("RMSNormalization rank overflow"))?;
     let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
     let axis = if rank == 0 {
-        if !matches!(raw_axis, -1 | 0) { return Err(bad("invalid RMSNormalization scalar axis")); }
+        if !matches!(raw_axis, -1 | 0) {
+            return Err(bad("invalid RMSNormalization scalar axis"));
+        }
         0usize
     } else {
-        let normalized = if raw_axis < 0 { raw_axis.checked_add(rank).ok_or_else(|| bad("invalid RMSNormalization axis"))? } else { raw_axis };
-        if normalized < 0 || normalized >= rank { return Err(bad("invalid RMSNormalization axis")); }
+        let normalized = if raw_axis < 0 {
+            raw_axis
+                .checked_add(rank)
+                .ok_or_else(|| bad("invalid RMSNormalization axis"))?
+        } else {
+            raw_axis
+        };
+        if normalized < 0 || normalized >= rank {
+            return Err(bad("invalid RMSNormalization axis"));
+        }
         usize::try_from(normalized).map_err(|_| bad("invalid RMSNormalization axis"))?
     };
-    let axes = if rank == 0 { Vec::new() } else { (axis..shape.rank()).map(|i| i as isize).collect::<Vec<_>>() };
+    let axes = if rank == 0 {
+        Vec::new()
+    } else {
+        (axis..shape.rank()).map(|i| i as isize).collect::<Vec<_>>()
+    };
     let mut statistic_dims = shape.dims().to_vec();
-    for dimension in statistic_dims.iter_mut().skip(axis) { *dimension = 1; }
+    for dimension in statistic_dims.iter_mut().skip(axis) {
+        *dimension = 1;
+    }
     let statistic_shape = Shape::new(statistic_dims);
-    let count = if rank == 0 { 1 } else { shape.dims()[axis..].iter().try_fold(1usize, |n, d| n.checked_mul(*d)).ok_or_else(|| bad("RMSNormalization normalized extent overflow"))? };
+    let count = if rank == 0 {
+        1
+    } else {
+        shape.dims()[axis..]
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul(*d))
+            .ok_or_else(|| bad("RMSNormalization normalized extent overflow"))?
+    };
     let epsilon = typed_scalar_f32_attr(n, "epsilon")?.unwrap_or(1e-5);
     let count = TensorData::scalar_with_dtype(Scalar::F(count as f64), DType::F32);
     let epsilon = TensorData::scalar_with_dtype(Scalar::F(f64::from(epsilon)), DType::F32);
@@ -1330,18 +1467,28 @@ fn rms_normalization_plan(
     extent(&shape, DType::F32, "F32 cast/square")?;
     extent(&statistic_shape, DType::F32, "mean/add/rsqrt")?;
     for scalar in [&count, &epsilon] {
-        if scalar.dtype() != DType::F32 || statistic_shape.broadcast_with(scalar.shape())? != statistic_shape {
+        if scalar.dtype() != DType::F32
+            || statistic_shape.broadcast_with(scalar.shape())? != statistic_shape
+        {
             return Err(bad("RMSNormalization scalar promotion mismatch"));
         }
     }
-    if statistic_shape.broadcast_with(&shape)? != shape || shape.broadcast_with(&scale_shape)? != shape {
+    if statistic_shape.broadcast_with(&shape)? != shape
+        || shape.broadcast_with(&scale_shape)? != shape
+    {
         return Err(bad("RMSNormalization scale cannot broadcast to X"));
     }
     let normalized_dtype = input_dtype.promote(DType::F32);
     let output_dtype = normalized_dtype.promote(scale_dtype);
     extent(&shape, normalized_dtype, "X times norm")?;
     extent(&shape, output_dtype, "output")?;
-    Ok(RmsNormalizationPlan { output_dtype, shape, axes, count, epsilon })
+    Ok(RmsNormalizationPlan {
+        output_dtype,
+        shape,
+        axes,
+        count,
+        epsilon,
+    })
 }
 
 fn mean_variance_normalization_plan(
@@ -1352,36 +1499,84 @@ fn mean_variance_normalization_plan(
 ) -> Result<MeanVarianceNormalizationPlan> {
     // The checked-in tinygrad adapter exposes the control as singular `axis`
     // even though other reduction operators use `axes`.
-    if attrs.keys().any(|key| key != "axis") { return Err(bad("unsupported MeanVarianceNormalization attribute")); }
+    if attrs.keys().any(|key| key != "axis") {
+        return Err(bad("unsupported MeanVarianceNormalization attribute"));
+    }
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("MeanVarianceNormalization input byte extent overflow"))?;
-    let rank = i64::try_from(shape.rank()).map_err(|_| bad("MeanVarianceNormalization rank overflow"))?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("MeanVarianceNormalization input byte extent overflow"))?;
+    let rank =
+        i64::try_from(shape.rank()).map_err(|_| bad("MeanVarianceNormalization rank overflow"))?;
     let raw_axes = strict_typed_packed_i64_attr(n, "axis")?.unwrap_or_else(|| vec![0, 2, 3]);
     let mut seen = std::collections::BTreeSet::new();
     let mut axes = Vec::with_capacity(raw_axes.len());
     for raw in raw_axes {
-        let axis = if raw < 0 { raw.checked_add(rank).ok_or_else(|| bad("invalid MeanVarianceNormalization axis"))? } else { raw };
-        if axis < 0 || axis >= rank { return Err(bad("invalid MeanVarianceNormalization axis")); }
-        let axis = usize::try_from(axis).map_err(|_| bad("invalid MeanVarianceNormalization axis"))?;
-        if !seen.insert(axis) { return Err(bad("duplicate MeanVarianceNormalization axis")); }
+        let axis = if raw < 0 {
+            raw.checked_add(rank)
+                .ok_or_else(|| bad("invalid MeanVarianceNormalization axis"))?
+        } else {
+            raw
+        };
+        if axis < 0 || axis >= rank {
+            return Err(bad("invalid MeanVarianceNormalization axis"));
+        }
+        let axis =
+            usize::try_from(axis).map_err(|_| bad("invalid MeanVarianceNormalization axis"))?;
+        if !seen.insert(axis) {
+            return Err(bad("duplicate MeanVarianceNormalization axis"));
+        }
         axes.push(axis);
     }
-    let count = axes.iter().try_fold(1usize, |count, axis| count.checked_mul(shape.dims()[*axis])).ok_or_else(|| bad("MeanVarianceNormalization reduction extent overflow"))?;
+    let count = axes
+        .iter()
+        .try_fold(1usize, |count, axis| count.checked_mul(shape.dims()[*axis]))
+        .ok_or_else(|| bad("MeanVarianceNormalization reduction extent overflow"))?;
     let sum_dtype = ReductionDType::sum_default(input_dtype).accumulator;
-    let work_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    numel.checked_mul(work_dtype.itemsize()).ok_or_else(|| bad("MeanVarianceNormalization output byte extent overflow"))?;
-    let mean_shape = Shape::new(shape.dims().iter().enumerate().map(|(i, dim)| if seen.contains(&i) { 1 } else { *dim }).collect::<Vec<_>>());
-    mean_shape.numel()?.checked_mul(work_dtype.itemsize()).ok_or_else(|| bad("MeanVarianceNormalization mean byte extent overflow"))?;
-    mean_shape.numel()?.checked_mul(sum_dtype.itemsize()).ok_or_else(|| bad("MeanVarianceNormalization sum byte extent overflow"))?;
+    let work_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    numel
+        .checked_mul(work_dtype.itemsize())
+        .ok_or_else(|| bad("MeanVarianceNormalization output byte extent overflow"))?;
+    let mean_shape = Shape::new(
+        shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(i, dim)| if seen.contains(&i) { 1 } else { *dim })
+            .collect::<Vec<_>>(),
+    );
+    mean_shape
+        .numel()?
+        .checked_mul(work_dtype.itemsize())
+        .ok_or_else(|| bad("MeanVarianceNormalization mean byte extent overflow"))?;
+    mean_shape
+        .numel()?
+        .checked_mul(sum_dtype.itemsize())
+        .ok_or_else(|| bad("MeanVarianceNormalization sum byte extent overflow"))?;
     let count = TensorData::scalar_with_dtype(Scalar::F(count as f64), sum_dtype);
     let epsilon = TensorData::scalar_with_dtype(Scalar::F(1e-9), work_dtype);
-    if count.dtype() != sum_dtype || epsilon.dtype() != work_dtype || mean_shape.broadcast_with(count.shape())? != mean_shape || mean_shape.broadcast_with(epsilon.shape())? != mean_shape {
+    if count.dtype() != sum_dtype
+        || epsilon.dtype() != work_dtype
+        || mean_shape.broadcast_with(count.shape())? != mean_shape
+        || mean_shape.broadcast_with(epsilon.shape())? != mean_shape
+    {
         return Err(bad("MeanVarianceNormalization scalar promotion mismatch"));
     }
     Ok(MeanVarianceNormalizationPlan {
-        input_dtype, work_dtype, sum_dtype, shape, axes: axes.into_iter().map(|axis| axis as isize).collect(), count, epsilon, empty: numel == 0,
+        input_dtype,
+        work_dtype,
+        sum_dtype,
+        shape,
+        axes: axes.into_iter().map(|axis| axis as isize).collect(),
+        count,
+        epsilon,
+        empty: numel == 0,
     })
 }
 
@@ -1393,19 +1588,30 @@ fn layer_normalization_plan(
     n: &Msg<'_>,
     attrs: &BTreeMap<String, Vec<u8>>,
 ) -> Result<LayerNormalizationPlan> {
-    if attrs.keys().any(|key| !matches!(key.as_str(), "axis" | "epsilon" | "stash_type")) {
+    if attrs
+        .keys()
+        .any(|key| !matches!(key.as_str(), "axis" | "epsilon" | "stash_type"))
+    {
         return Err(bad("unsupported LayerNormalization attribute"));
     }
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("LayerNormalization input byte extent overflow"))?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("LayerNormalization input byte extent overflow"))?;
     let rank = i64::try_from(shape.rank()).map_err(|_| bad("LayerNormalization rank overflow"))?;
     let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
     if rank == 0 || raw_axis < -rank || raw_axis >= rank {
         return Err(bad("invalid LayerNormalization axis"));
     }
-    let axis = if raw_axis < 0 { raw_axis.checked_add(rank).ok_or_else(|| bad("invalid LayerNormalization axis"))? } else { raw_axis };
+    let axis = if raw_axis < 0 {
+        raw_axis
+            .checked_add(rank)
+            .ok_or_else(|| bad("invalid LayerNormalization axis"))?
+    } else {
+        raw_axis
+    };
     let axis = usize::try_from(axis).map_err(|_| bad("invalid LayerNormalization axis"))?;
     // The local source asserts this exact stash dtype rather than changing
     // execution precision based on it.
@@ -1416,7 +1622,10 @@ fn layer_normalization_plan(
 
     let scale_shape = g.shape(scale)?.clone();
     let scale_dtype = g.dtype(scale)?;
-    scale_shape.numel()?.checked_mul(scale_dtype.itemsize()).ok_or_else(|| bad("LayerNormalization scale byte extent overflow"))?;
+    scale_shape
+        .numel()?
+        .checked_mul(scale_dtype.itemsize())
+        .ok_or_else(|| bad("LayerNormalization scale byte extent overflow"))?;
     if shape.broadcast_with(&scale_shape)? != shape {
         return Err(bad("LayerNormalization scale cannot broadcast to X"));
     }
@@ -1424,26 +1633,51 @@ fn layer_normalization_plan(
     if let Some(bias) = bias {
         let bias_shape = g.shape(bias)?.clone();
         let bias_dtype = g.dtype(bias)?;
-        bias_shape.numel()?.checked_mul(bias_dtype.itemsize()).ok_or_else(|| bad("LayerNormalization bias byte extent overflow"))?;
+        bias_shape
+            .numel()?
+            .checked_mul(bias_dtype.itemsize())
+            .ok_or_else(|| bad("LayerNormalization bias byte extent overflow"))?;
         if shape.broadcast_with(&bias_shape)? != shape {
             return Err(bad("LayerNormalization bias cannot broadcast to X"));
         }
         output_dtype = output_dtype.promote(bias_dtype);
     }
-    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("LayerNormalization output byte extent overflow"))?;
-    let count = shape.dims()[axis..].iter().try_fold(1usize, |count, dim| count.checked_mul(*dim)).ok_or_else(|| bad("LayerNormalization normalized extent overflow"))?;
+    numel
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("LayerNormalization output byte extent overflow"))?;
+    let count = shape.dims()[axis..]
+        .iter()
+        .try_fold(1usize, |count, dim| count.checked_mul(*dim))
+        .ok_or_else(|| bad("LayerNormalization normalized extent overflow"))?;
     let count = TensorData::scalar_with_dtype(Scalar::F(count as f64), DType::F32);
     let epsilon = TensorData::scalar_with_dtype(Scalar::F(f64::from(epsilon)), DType::F32);
-    let mean_shape = Shape::new(shape.dims().iter().enumerate().map(|(i, dim)| if i < axis { *dim } else { 1 }).collect::<Vec<_>>());
-    mean_shape.numel()?.checked_mul(DType::F32.itemsize()).ok_or_else(|| bad("LayerNormalization statistic byte extent overflow"))?;
+    let mean_shape = Shape::new(
+        shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(i, dim)| if i < axis { *dim } else { 1 })
+            .collect::<Vec<_>>(),
+    );
+    mean_shape
+        .numel()?
+        .checked_mul(DType::F32.itemsize())
+        .ok_or_else(|| bad("LayerNormalization statistic byte extent overflow"))?;
     for scalar in [&count, &epsilon] {
-        if scalar.dtype() != DType::F32 || mean_shape.broadcast_with(scalar.shape())? != mean_shape {
+        if scalar.dtype() != DType::F32 || mean_shape.broadcast_with(scalar.shape())? != mean_shape
+        {
             return Err(bad("LayerNormalization scalar promotion mismatch"));
         }
     }
     Ok(LayerNormalizationPlan {
-        input_dtype, output_dtype, shape, axes: (axis..shape.rank()).map(|i| i as isize).collect(),
-        sum_dtypes: ReductionDType::new(DType::F32, DType::F32), count, epsilon, empty: numel == 0,
+        input_dtype,
+        output_dtype,
+        shape,
+        axes: (axis..shape.rank()).map(|i| i as isize).collect(),
+        sum_dtypes: ReductionDType::new(DType::F32, DType::F32),
+        count,
+        epsilon,
+        empty: numel == 0,
     })
 }
 
@@ -1455,30 +1689,53 @@ fn dropout_plan(
     attrs: &BTreeMap<String, Vec<u8>>,
     constants: &BTreeMap<String, TensorData>,
 ) -> Result<DropoutPlan> {
-    if attrs.keys().any(|key| key != "seed") { return Err(bad("unsupported Dropout attribute")); }
+    if attrs.keys().any(|key| key != "seed") {
+        return Err(bad("unsupported Dropout attribute"));
+    }
     // ONNX's seed is an INT attribute. It is ignored by tinygrad before the
     // training branch, but malformed aliases must not sneak through the
     // inference-only adapter.
     let _ = strict_typed_scalar_i64_attr(n, "seed")?;
     let shape = g.shape(input)?.clone();
     let dtype = g.dtype(input)?;
-    shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad("Dropout input byte extent overflow"))?;
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Dropout input byte extent overflow"))?;
 
     if let Some(name) = ins.get(1).filter(|name| !name.is_empty()) {
-        let ratio = constants.get(*name).ok_or_else(|| bad("Dropout ratio must be constant"))?;
+        let ratio = constants
+            .get(*name)
+            .ok_or_else(|| bad("Dropout ratio must be constant"))?;
         // `_get_python_const` passes this value through, but `dropout_7`
         // never reads it when training_mode is false. Retain that exact
         // identity behavior for every statically representable descriptor.
-        ratio.shape().numel()?.checked_mul(ratio.dtype().itemsize()).ok_or_else(|| bad("Dropout ratio byte extent overflow"))?;
+        ratio
+            .shape()
+            .numel()?
+            .checked_mul(ratio.dtype().itemsize())
+            .ok_or_else(|| bad("Dropout ratio byte extent overflow"))?;
     }
     if let Some(name) = ins.get(2).filter(|name| !name.is_empty()) {
-        let training = constants.get(*name).ok_or_else(|| bad("Dropout training_mode must be constant"))?;
-        training.shape().numel()?.checked_mul(training.dtype().itemsize()).ok_or_else(|| bad("Dropout training_mode byte extent overflow"))?;
+        let training = constants
+            .get(*name)
+            .ok_or_else(|| bad("Dropout training_mode must be constant"))?;
+        training
+            .shape()
+            .numel()?
+            .checked_mul(training.dtype().itemsize())
+            .ok_or_else(|| bad("Dropout training_mode byte extent overflow"))?;
         // This is the closed ONNX Bool-scalar inference subset. A rank-one
         // `[false]` is a truthy Python list in tinygrad and must not be
         // mistaken for inference.
-        if training.dtype() != DType::Bool || training.shape().rank() != 0 || training.len() != 1 || training.scalar_at(0).as_bool() {
-            return Err(bad("only inference Dropout with scalar training_mode=false is supported"));
+        if training.dtype() != DType::Bool
+            || training.shape().rank() != 0
+            || training.len() != 1
+            || training.scalar_at(0).as_bool()
+        {
+            return Err(bad(
+                "only inference Dropout with scalar training_mode=false is supported",
+            ));
         }
     }
     Ok(DropoutPlan { shape, dtype })
@@ -1512,19 +1769,33 @@ struct SoftsignPlan {
     empty: bool,
 }
 
-fn softsign_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SoftsignPlan> {
-    if !attrs.is_empty() { return Err(bad("unsupported Softsign attribute")); }
+fn softsign_plan(
+    g: &Graph,
+    input: NodeId,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<SoftsignPlan> {
+    if !attrs.is_empty() {
+        return Err(bad("unsupported Softsign attribute"));
+    }
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Softsign input byte extent overflow"))?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("Softsign input byte extent overflow"))?;
 
     // `1 + x.abs()` stays at X's concrete storage dtype. Tensor.div then
     // lowers literally to `x * reciprocal(denominator)`, so exact storage
     // becomes F32 only at reciprocal for Bool/integer inputs.
-    let reciprocal_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let reciprocal_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
     let output_dtype = input_dtype.promote(reciprocal_dtype);
-    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Softsign output byte extent overflow"))?;
+    numel
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Softsign output byte extent overflow"))?;
     let one = TensorData::scalar_with_dtype(Scalar::I(1), input_dtype);
     if one.dtype() != input_dtype
         || shape.broadcast_with(one.shape())? != shape
@@ -1533,30 +1804,59 @@ fn softsign_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) ->
     {
         return Err(bad("Softsign scalar promotion mismatch"));
     }
-    Ok(SoftsignPlan { input_dtype, output_dtype, shape, one, empty: numel == 0 })
+    Ok(SoftsignPlan {
+        input_dtype,
+        output_dtype,
+        shape,
+        one,
+        empty: numel == 0,
+    })
 }
 
-fn softplus_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SoftplusPlan> {
-    if !attrs.is_empty() { return Err(bad("unsupported Softplus attribute")); }
+fn softplus_plan(
+    g: &Graph,
+    input: NodeId,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<SoftplusPlan> {
+    if !attrs.is_empty() {
+        return Err(bad("unsupported Softplus attribute"));
+    }
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Softplus input byte extent overflow"))?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("Softplus input byte extent overflow"))?;
 
     // The generic ONNX dispatcher calls `Tensor.softplus()` without an
     // argument.  Its Python default is a weak `1.0`, committed by the first
     // `x * beta` to X's float storage width, or to default F32 for exact
     // storage.  Keep that default as a concrete scalar only after proving the
     // complete public composition below.
-    let beta_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let beta_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
     let beta = TensorData::scalar_with_dtype(Scalar::F(1.0), beta_dtype);
     let beta_shape = beta.shape().clone();
-    beta_shape.numel()?.checked_mul(beta.dtype().itemsize()).ok_or_else(|| bad("Softplus beta byte extent overflow"))?;
+    beta_shape
+        .numel()?
+        .checked_mul(beta.dtype().itemsize())
+        .ok_or_else(|| bad("Softplus beta byte extent overflow"))?;
     let source_promote = |lhs: DType, rhs: DType| prelu_dtype(lhs, rhs);
     let scaled_shape = shape.broadcast_with(&beta_shape)?;
     let scaled_dtype = source_promote(input_dtype, beta_dtype);
-    let log_dtype = if scaled_dtype.is_float() { scaled_dtype } else { DType::F32 };
-    let inverse_dtype = if beta_dtype.is_float() { beta_dtype } else { DType::F32 };
+    let log_dtype = if scaled_dtype.is_float() {
+        scaled_dtype
+    } else {
+        DType::F32
+    };
+    let inverse_dtype = if beta_dtype.is_float() {
+        beta_dtype
+    } else {
+        DType::F32
+    };
     let output_shape = scaled_shape.broadcast_with(&beta_shape)?;
     let output_dtype = source_promote(log_dtype, inverse_dtype);
     for (extent_shape, dtype, what) in [
@@ -1565,7 +1865,10 @@ fn softplus_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) ->
         (&beta_shape, inverse_dtype, "reciprocal beta"),
         (&output_shape, output_dtype, "output"),
     ] {
-        extent_shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad(format!("Softplus {what} byte extent overflow")))?;
+        extent_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Softplus {what} byte extent overflow")))?;
     }
     let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), log_dtype);
     let one = TensorData::scalar_with_dtype(Scalar::F(1.0), inverse_dtype);
@@ -1583,35 +1886,79 @@ fn softplus_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) ->
     {
         return Err(bad("Softplus scalar promotion mismatch"));
     }
-    Ok(SoftplusPlan { input_dtype, output_dtype, shape, beta })
+    Ok(SoftplusPlan {
+        input_dtype,
+        output_dtype,
+        shape,
+        beta,
+    })
 }
 
 fn global_average_pool_plan(g: &Graph, input: NodeId) -> Result<GlobalAveragePoolPlan> {
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("GlobalAveragePool input byte extent overflow"))?;
-    let axes = (2..shape.rank()).map(|axis| axis as isize).collect::<Vec<_>>();
-    let count = shape.dims()[2..].iter().try_fold(1usize, |n, d| n.checked_mul(*d)).ok_or_else(|| bad("GlobalAveragePool divisor overflow"))?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("GlobalAveragePool input byte extent overflow"))?;
+    let axes = (2..shape.rank())
+        .map(|axis| axis as isize)
+        .collect::<Vec<_>>();
+    let count = shape.dims()[2..]
+        .iter()
+        .try_fold(1usize, |n, d| n.checked_mul(*d))
+        .ok_or_else(|| bad("GlobalAveragePool divisor overflow"))?;
     let sum_dtypes = ReductionDType::sum_default(input_dtype);
-    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    let work_dtype = if input_dtype.is_float() { sum_dtypes.accumulator } else { DType::F32 };
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let work_dtype = if input_dtype.is_float() {
+        sum_dtypes.accumulator
+    } else {
+        DType::F32
+    };
     let mut output_dims = shape.dims().to_vec();
-    for dim in output_dims.iter_mut().skip(2) { *dim = 1; }
+    for dim in output_dims.iter_mut().skip(2) {
+        *dim = 1;
+    }
     let output_shape = Shape::new(output_dims);
     // `Tensor.mean` casts to its sum accumulator before the reduction, even
     // when GlobalAveragePool's trailing spatial axis tuple is empty.  Validate
     // every same-shaped stage before either a cast, reduction, or divisor
     // constant can be published.
-    output_shape.numel()?.checked_mul(sum_dtypes.accumulator.itemsize()).ok_or_else(|| bad("GlobalAveragePool accumulator byte extent overflow"))?;
-    output_shape.numel()?.checked_mul(work_dtype.itemsize()).ok_or_else(|| bad("GlobalAveragePool division byte extent overflow"))?;
-    output_shape.numel()?.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("GlobalAveragePool output byte extent overflow"))?;
+    output_shape
+        .numel()?
+        .checked_mul(sum_dtypes.accumulator.itemsize())
+        .ok_or_else(|| bad("GlobalAveragePool accumulator byte extent overflow"))?;
+    output_shape
+        .numel()?
+        .checked_mul(work_dtype.itemsize())
+        .ok_or_else(|| bad("GlobalAveragePool division byte extent overflow"))?;
+    output_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("GlobalAveragePool output byte extent overflow"))?;
     let divisor = TensorData::scalar_with_dtype(Scalar::F(count as f64), work_dtype);
-    divisor.shape().numel()?.checked_mul(divisor.dtype().itemsize()).ok_or_else(|| bad("GlobalAveragePool divisor byte extent overflow"))?;
-    if output_shape.broadcast_with(divisor.shape())? != output_shape || output_dtype.promote(output_dtype) != output_dtype {
+    divisor
+        .shape()
+        .numel()?
+        .checked_mul(divisor.dtype().itemsize())
+        .ok_or_else(|| bad("GlobalAveragePool divisor byte extent overflow"))?;
+    if output_shape.broadcast_with(divisor.shape())? != output_shape
+        || output_dtype.promote(output_dtype) != output_dtype
+    {
         return Err(bad("GlobalAveragePool scalar promotion mismatch"));
     }
-    Ok(GlobalAveragePoolPlan { axes, sum_dtypes, work_dtype, output_dtype, divisor, output_shape })
+    Ok(GlobalAveragePoolPlan {
+        axes,
+        sum_dtypes,
+        work_dtype,
+        output_dtype,
+        divisor,
+        output_shape,
+    })
 }
 
 fn mod_plan(
@@ -1623,24 +1970,37 @@ fn mod_plan(
     attrs: &BTreeMap<String, Vec<u8>>,
     constants: &BTreeMap<String, TensorData>,
 ) -> Result<ModPlan> {
-    if attrs.keys().any(|key| key != "fmod") { return Err(bad("unsupported Mod attribute")); }
+    if attrs.keys().any(|key| key != "fmod") {
+        return Err(bad("unsupported Mod attribute"));
+    }
     let fmod = strict_typed_scalar_i64_attr(n, "fmod")?.unwrap_or(0) != 0;
     let lhs_shape = g.shape(lhs)?.clone();
     let rhs_shape = g.shape(rhs)?.clone();
     let lhs_dtype = g.dtype(lhs)?;
     let rhs_dtype = g.dtype(rhs)?;
-    lhs_shape.numel()?.checked_mul(lhs_dtype.itemsize()).ok_or_else(|| bad("Mod lhs byte extent overflow"))?;
-    rhs_shape.numel()?.checked_mul(rhs_dtype.itemsize()).ok_or_else(|| bad("Mod rhs byte extent overflow"))?;
+    lhs_shape
+        .numel()?
+        .checked_mul(lhs_dtype.itemsize())
+        .ok_or_else(|| bad("Mod lhs byte extent overflow"))?;
+    rhs_shape
+        .numel()?
+        .checked_mul(rhs_dtype.itemsize())
+        .ok_or_else(|| bad("Mod rhs byte extent overflow"))?;
     // Tensor.mod/fmod first use `_broadcasted`, whose I64/U64 meet is
     // tinygrad's default F32 rather than RustGrad's generic F64 fallback.
     // Keep the import plan's descriptor and byte checks aligned with the
     // source casts that Graph::modulo/fmod will emit.
     let dtype = prelu_dtype(lhs_dtype, rhs_dtype);
     let shape = lhs_shape.broadcast_with(&rhs_shape)?;
-    shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad("Mod output byte extent overflow"))?;
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Mod output byte extent overflow"))?;
     if dtype.is_integer() {
         if let Some(value) = constants.get(rhs_name) {
-            if value.dtype().is_integer() && (0..value.len()).any(|i| value.scalar_at(i).as_i64() == 0) {
+            if value.dtype().is_integer()
+                && (0..value.len()).any(|i| value.scalar_at(i).as_i64() == 0)
+            {
                 return Err(bad("Mod integer divisor constant contains zero"));
             }
         }
@@ -1648,36 +2008,76 @@ fn mod_plan(
     Ok(ModPlan { fmod, shape, dtype })
 }
 
-fn swish_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SwishPlan> {
-    if attrs.keys().any(|key| key != "alpha") { return Err(bad("unsupported Swish attribute")); }
+fn swish_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<SwishPlan> {
+    if attrs.keys().any(|key| key != "alpha") {
+        return Err(bad("unsupported Swish attribute"));
+    }
     let alpha = typed_scalar_f32_attr(n, "alpha")?.unwrap_or(1.0);
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
     let extent = |shape: &Shape, dtype: DType, what: &str| {
-        shape.numel()?.checked_mul(dtype.itemsize())
-            .ok_or_else(|| bad(format!("Swish {what} byte extent overflow"))).map(|_| ())
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Swish {what} byte extent overflow")))
+            .map(|_| ())
     };
     extent(&shape, input_dtype, "input")?;
-    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
     // The source is `x * (x * alpha).sigmoid()`: after its nonfloat cast,
     // each named elementwise sigmoid stage has the same output descriptor.
     // Resolve them all before any cast or constant is published.
-    for what in ["cast/work", "inner multiply", "sigmoid exponent", "Exp2", "sigmoid denominator", "reciprocal", "outer multiply/output"] {
+    for what in [
+        "cast/work",
+        "inner multiply",
+        "sigmoid exponent",
+        "Exp2",
+        "sigmoid denominator",
+        "reciprocal",
+        "outer multiply/output",
+    ] {
         extent(&shape, output_dtype, what)?;
     }
     let alpha = TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), output_dtype);
     let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
-    let neg_inv_ln2 = TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), output_dtype);
+    let neg_inv_ln2 =
+        TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), output_dtype);
     for scalar in [&alpha, &one, &neg_inv_ln2] {
         extent(scalar.shape(), scalar.dtype(), "scalar")?;
-        if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape { return Err(bad("Swish scalar promotion mismatch")); }
+        if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape {
+            return Err(bad("Swish scalar promotion mismatch"));
+        }
     }
-    if output_dtype.promote(output_dtype) != output_dtype { return Err(bad("Swish output promotion mismatch")); }
-    Ok(SwishPlan { input_dtype, output_dtype, shape, alpha, one, neg_inv_ln2, empty: numel == 0 })
+    if output_dtype.promote(output_dtype) != output_dtype {
+        return Err(bad("Swish output promotion mismatch"));
+    }
+    Ok(SwishPlan {
+        input_dtype,
+        output_dtype,
+        shape,
+        alpha,
+        one,
+        neg_inv_ln2,
+        empty: numel == 0,
+    })
 }
 
-fn selu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SeluPlan> {
+fn selu_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<SeluPlan> {
     if attrs.keys().any(|key| key != "alpha" && key != "gamma") {
         return Err(bad("unsupported Selu attribute"));
     }
@@ -1686,9 +2086,17 @@ fn selu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Selu input byte extent overflow"))?;
-    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Selu output byte extent overflow"))?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("Selu input byte extent overflow"))?;
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    numel
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Selu output byte extent overflow"))?;
     let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
     let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
     let alpha = TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), output_dtype);
@@ -1698,11 +2106,27 @@ fn selu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec
             return Err(bad("Selu scalar promotion mismatch"));
         }
     }
-    if output_dtype.promote(output_dtype) != output_dtype { return Err(bad("Selu output promotion mismatch")); }
-    Ok(SeluPlan { input_dtype, output_dtype, shape, zero, one, alpha, gamma, empty: numel == 0 })
+    if output_dtype.promote(output_dtype) != output_dtype {
+        return Err(bad("Selu output promotion mismatch"));
+    }
+    Ok(SeluPlan {
+        input_dtype,
+        output_dtype,
+        shape,
+        zero,
+        one,
+        alpha,
+        gamma,
+        empty: numel == 0,
+    })
 }
 
-fn elu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<EluPlan> {
+fn elu_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<EluPlan> {
     if attrs.keys().any(|key| key != "alpha") {
         return Err(bad("unsupported Elu attribute"));
     }
@@ -1710,9 +2134,17 @@ fn elu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Elu input byte extent overflow"))?;
-    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Elu output byte extent overflow"))?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("Elu input byte extent overflow"))?;
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    numel
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Elu output byte extent overflow"))?;
     let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
     let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
     let alpha = TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), output_dtype);
@@ -1724,7 +2156,15 @@ fn elu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<
     if output_dtype.promote(output_dtype) != output_dtype {
         return Err(bad("Elu output promotion mismatch"));
     }
-    Ok(EluPlan { input_dtype, output_dtype, shape, zero, one, alpha, empty: numel == 0 })
+    Ok(EluPlan {
+        input_dtype,
+        output_dtype,
+        shape,
+        zero,
+        one,
+        alpha,
+        empty: numel == 0,
+    })
 }
 
 fn lrn_plan(
@@ -1739,8 +2179,8 @@ fn lrn_plan(
     {
         return Err(bad("unsupported LRN attribute"));
     }
-    let raw_size = strict_typed_scalar_i64_attr(n, "size")?
-        .ok_or_else(|| bad("LRN requires size"))?;
+    let raw_size =
+        strict_typed_scalar_i64_attr(n, "size")?.ok_or_else(|| bad("LRN requires size"))?;
     let size = usize::try_from(raw_size).map_err(|_| bad("LRN size must be positive"))?;
     if size == 0 {
         return Err(bad("LRN size must be positive"));
@@ -1866,10 +2306,26 @@ fn lrn_plan(
         let start = isize::try_from(offset).map_err(|_| bad("LRN window offset overflow"))?;
         let end = isize::try_from(end).map_err(|_| bad("LRN window extent overflow"))?;
         windows.push(vec![
-            Slice { start: None, stop: None, step: 1 },
-            Slice { start: None, stop: None, step: 1 },
-            Slice { start: Some(start), stop: Some(end), step: 1 },
-            Slice { start: None, stop: None, step: 1 },
+            Slice {
+                start: None,
+                stop: None,
+                step: 1,
+            },
+            Slice {
+                start: None,
+                stop: None,
+                step: 1,
+            },
+            Slice {
+                start: Some(start),
+                stop: Some(end),
+                step: 1,
+            },
+            Slice {
+                start: None,
+                stop: None,
+                step: 1,
+            },
         ]);
     }
 
@@ -1898,7 +2354,9 @@ fn fast_gelu_plan(
     values: &BTreeMap<String, NodeId>,
 ) -> Result<FastGeluPlan> {
     if !(1..=2).contains(&ins.len()) || !attrs.is_empty() {
-        return Err(bad("FastGelu requires one input, optional bias, and no attributes"));
+        return Err(bad(
+            "FastGelu requires one input, optional bias, and no attributes",
+        ));
     }
     let input = values
         .get(ins[0])
@@ -1915,12 +2373,16 @@ fn fast_gelu_plan(
     };
     extent(&input_shape, input_dtype, "input")?;
 
-    let bias = ins.get(1).filter(|name| !name.is_empty()).map(|name| {
-        values
-            .get(*name)
-            .copied()
-            .ok_or_else(|| bad("missing ONNX FastGelu bias"))
-    }).transpose()?;
+    let bias = ins
+        .get(1)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX FastGelu bias"))
+        })
+        .transpose()?;
     let (gelu_input_shape, gelu_input_dtype) = if let Some(bias) = bias {
         let bias_shape = g.shape(bias)?.clone();
         let bias_dtype = g.dtype(bias)?;
@@ -1957,11 +2419,19 @@ fn fast_gelu_plan(
     ] {
         let scalar = TensorData::scalar_with_dtype(Scalar::F(value), output_dtype);
         extent(scalar.shape(), scalar.dtype(), "tanh scalar")?;
-        if scalar.dtype() != output_dtype || gelu_input_shape.broadcast_with(scalar.shape())? != gelu_input_shape {
+        if scalar.dtype() != output_dtype
+            || gelu_input_shape.broadcast_with(scalar.shape())? != gelu_input_shape
+        {
             return Err(bad("FastGelu scalar promotion mismatch"));
         }
     }
-    Ok(FastGeluPlan { input, bias, gelu_input_shape, gelu_input_dtype, output_dtype })
+    Ok(FastGeluPlan {
+        input,
+        bias,
+        gelu_input_shape,
+        gelu_input_dtype,
+        output_dtype,
+    })
 }
 
 fn bias_gelu_plan(
@@ -1981,29 +2451,52 @@ fn bias_gelu_plan(
         return Err(bad("unsupported BiasGelu approximation"));
     }
     let add = add_plan(g, ins, &BTreeMap::new(), values)?;
-    let output_dtype = if add.output_dtype.is_float() { add.output_dtype } else { DType::F32 };
+    let output_dtype = if add.output_dtype.is_float() {
+        add.output_dtype
+    } else {
+        DType::F32
+    };
     let extent = |shape: &Shape, dtype: DType, what: &str| {
-        shape.numel()?.checked_mul(dtype.itemsize())
-            .ok_or_else(|| bad(format!("BiasGelu {what} byte extent overflow"))).map(|_| ())
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("BiasGelu {what} byte extent overflow")))
+            .map(|_| ())
     };
     // `Graph::gelu` owns the literal arithmetic, but it runs after Add. Close
     // its cast, every source-width intermediate, and weak constants here so a
     // late GELU overflow cannot leave a published Add behind.
     extent(&add.output_shape, add.output_dtype, "add input")?;
     let operations = if mode == "none" { 6 } else { 14 };
-    for _ in 0..operations { extent(&add.output_shape, output_dtype, "GELU intermediate")?; }
+    for _ in 0..operations {
+        extent(&add.output_shape, output_dtype, "GELU intermediate")?;
+    }
     for value in if mode == "none" {
         vec![0.5, 1.0, std::f64::consts::SQRT_2]
     } else {
-        vec![0.5, 1.0, 2.0, (2.0 / std::f64::consts::PI).sqrt(), 0.044_715, 3.0, -1.0 / std::f64::consts::LN_2]
+        vec![
+            0.5,
+            1.0,
+            2.0,
+            (2.0 / std::f64::consts::PI).sqrt(),
+            0.044_715,
+            3.0,
+            -1.0 / std::f64::consts::LN_2,
+        ]
     } {
         let scalar = TensorData::scalar_with_dtype(Scalar::F(value), output_dtype);
         extent(scalar.shape(), scalar.dtype(), "GELU scalar")?;
-        if scalar.dtype() != output_dtype || add.output_shape.broadcast_with(scalar.shape())? != add.output_shape {
+        if scalar.dtype() != output_dtype
+            || add.output_shape.broadcast_with(scalar.shape())? != add.output_shape
+        {
             return Err(bad("BiasGelu scalar promotion mismatch"));
         }
     }
-    Ok(BiasGeluPlan { add, mode, output_dtype })
+    Ok(BiasGeluPlan {
+        add,
+        mode,
+        output_dtype,
+    })
 }
 
 fn center_crop_pad_zero(dtype: DType) -> Scalar {
@@ -2089,7 +2582,12 @@ fn center_crop_pad_plan(
         }
     }
 
-    let shrink_shape = Shape::new(bounds.iter().map(|(start, end)| end - start).collect::<Vec<_>>());
+    let shrink_shape = Shape::new(
+        bounds
+            .iter()
+            .map(|(start, end)| end - start)
+            .collect::<Vec<_>>(),
+    );
     let shrink_numel = shrink_shape.numel()?;
     shrink_numel
         .checked_mul(dtype.itemsize())
@@ -2111,9 +2609,17 @@ fn center_crop_pad_plan(
     output_numel
         .checked_mul(dtype.itemsize())
         .ok_or_else(|| bad("CenterCropPad output byte extent overflow"))?;
-    let shrink = (bounds != input_shape.dims().iter().map(|&dimension| (0, dimension)).collect::<Vec<_>>())
-        .then_some(bounds);
-    let padding = padding.iter().any(|&(before, after)| before != 0 || after != 0).then_some(padding);
+    let shrink = (bounds
+        != input_shape
+            .dims()
+            .iter()
+            .map(|&dimension| (0, dimension))
+            .collect::<Vec<_>>())
+    .then_some(bounds);
+    let padding = padding
+        .iter()
+        .any(|&(before, after)| before != 0 || after != 0)
+        .then_some(padding);
     Ok(CenterCropPadPlan {
         shrink,
         padding,
@@ -2155,7 +2661,9 @@ fn depth_to_space_plan(
     // therefore rejects these otherwise representable empty domains before
     // it can construct the rearrange views.
     if batch == 0 || height == 0 || width == 0 {
-        return Err(bad("DepthToSpace source reshape rejects empty batch or spatial extent"));
+        return Err(bad(
+            "DepthToSpace source reshape rejects empty batch or spatial extent",
+        ));
     }
     let input_numel = input_shape.numel()?;
     input_numel
@@ -2165,7 +2673,9 @@ fn depth_to_space_plan(
         .checked_mul(blocksize)
         .ok_or_else(|| bad("DepthToSpace block area overflow"))?;
     if channels % block_area != 0 {
-        return Err(bad("DepthToSpace channels must be divisible by blocksize squared"));
+        return Err(bad(
+            "DepthToSpace channels must be divisible by blocksize squared",
+        ));
     }
     let output_channels = channels / block_area;
     let output_height = height
@@ -2189,7 +2699,9 @@ fn depth_to_space_plan(
     };
     let first_numel = first_shape.numel()?;
     if first_numel != input_numel {
-        return Err(bad("DepthToSpace intermediate reshape changes element count"));
+        return Err(bad(
+            "DepthToSpace intermediate reshape changes element count",
+        ));
     }
     first_numel
         .checked_mul(dtype.itemsize())
@@ -2247,7 +2759,9 @@ fn space_to_depth_plan(
         .try_into()
         .expect("rank-four input preflighted");
     if height % blocksize != 0 || width % blocksize != 0 {
-        return Err(bad("SpaceToDepth spatial dimensions must be divisible by blocksize"));
+        return Err(bad(
+            "SpaceToDepth spatial dimensions must be divisible by blocksize",
+        ));
     }
     let reduced_height = height / blocksize;
     let reduced_width = width / blocksize;
@@ -2267,7 +2781,9 @@ fn space_to_depth_plan(
     ]);
     let first_numel = first_shape.numel()?;
     if first_numel != input_numel {
-        return Err(bad("SpaceToDepth intermediate reshape changes element count"));
+        return Err(bad(
+            "SpaceToDepth intermediate reshape changes element count",
+        ));
     }
     first_numel
         .checked_mul(dtype.itemsize())
@@ -2315,8 +2831,7 @@ fn eye_like_plan(
     let rows = shape.dims()[0];
     let columns = shape.dims()[1];
     let rows_i64 = i64::try_from(rows).map_err(|_| bad("EyeLike row extent overflow"))?;
-    let columns_i64 =
-        i64::try_from(columns).map_err(|_| bad("EyeLike column extent overflow"))?;
+    let columns_i64 = i64::try_from(columns).map_err(|_| bad("EyeLike column extent overflow"))?;
     let dtype = match strict_typed_scalar_i64_attr(n, "dtype")? {
         Some(code) => onnx_dtype(u64::try_from(code).map_err(|_| bad("unsupported ONNX dtype"))?)?,
         None => g.dtype(input)?,
@@ -2442,10 +2957,7 @@ fn shrink_activation_plan(
         narrow,
         // Unary negation happens on the source FLOAT payload before weak
         // promotion, preserving signed zero and every IEEE special payload.
-        negative_lambda: TensorData::scalar_with_dtype(
-            Scalar::F(f64::from(-lambd)),
-            work_dtype,
-        ),
+        negative_lambda: TensorData::scalar_with_dtype(Scalar::F(f64::from(-lambd)), work_dtype),
         lambda: TensorData::scalar_with_dtype(Scalar::F(f64::from(lambd)), work_dtype),
         bias: TensorData::scalar_with_dtype(Scalar::F(f64::from(bias)), work_dtype),
         output_shape,
@@ -2568,7 +3080,9 @@ fn unsqueeze_plan(
     constants: &BTreeMap<String, TensorData>,
 ) -> Result<UnsqueezePlan> {
     if ins.len() != 2 || !attrs.is_empty() || ins[1].is_empty() {
-        return Err(bad("Unsqueeze requires a static axes input and no attributes"));
+        return Err(bad(
+            "Unsqueeze requires a static axes input and no attributes",
+        ));
     }
     let source_shape = g.shape(x)?.clone();
     let dtype = g.dtype(x)?;
@@ -2622,7 +3136,9 @@ fn squeeze_plan(
     constants: &BTreeMap<String, TensorData>,
 ) -> Result<SqueezePlan> {
     if !(1..=2).contains(&ins.len()) || !attrs.is_empty() {
-        return Err(bad("Squeeze requires one optional axes input and no attributes"));
+        return Err(bad(
+            "Squeeze requires one optional axes input and no attributes",
+        ));
     }
     let source_shape = g.shape(x)?.clone();
     let dtype = g.dtype(x)?;
@@ -2768,10 +3284,7 @@ fn concat_dtype(dtypes: &[DType]) -> DType {
     } else if has(DType::I64) && has(DType::U64) {
         DType::F32
     } else {
-        dtypes[1..]
-            .iter()
-            .copied()
-            .fold(dtypes[0], DType::promote)
+        dtypes[1..].iter().copied().fold(dtypes[0], DType::promote)
     }
 }
 
@@ -2810,11 +3323,9 @@ fn concat_plan(
             .checked_mul(dtype.itemsize())
             .ok_or_else(|| bad("Concat input byte extent overflow"))?;
         if shape.rank() != rank
-            || shape
-                .dims()
-                .iter()
-                .enumerate()
-                .any(|(dimension, extent)| dimension != axis && *extent != first_shape.dims()[dimension])
+            || shape.dims().iter().enumerate().any(|(dimension, extent)| {
+                dimension != axis && *extent != first_shape.dims()[dimension]
+            })
         {
             return Err(bad("Concat input shapes disagree outside axis"));
         }
@@ -2827,7 +3338,9 @@ fn concat_plan(
     let mut output_dims = first_shape.dims().to_vec();
     output_dims[axis] = axis_extent;
     let output_shape = Shape::new(output_dims);
-    let equal_axis_extents = shapes.iter().all(|shape| shape.dims()[axis] == first_shape.dims()[axis]);
+    let equal_axis_extents = shapes
+        .iter()
+        .all(|shape| shape.dims()[axis] == first_shape.dims()[axis]);
     let (output_dtype, lowering) = if equal_axis_extents {
         let output_dtype = concat_dtype(&dtypes);
         output_shape
@@ -2859,7 +3372,13 @@ fn concat_plan(
                     .dims()
                     .iter()
                     .enumerate()
-                    .map(|(dimension, _)| if dimension == axis { (before, after) } else { (0, 0) })
+                    .map(|(dimension, _)| {
+                        if dimension == axis {
+                            (before, after)
+                        } else {
+                            (0, 0)
+                        }
+                    })
                     .collect::<Vec<_>>();
                 // `Tensor.pad` preserves the input storage dtype and fills
                 // with its source-typed zero before `usum` starts.
@@ -3156,7 +3675,9 @@ fn less_or_equal_plan(
     values: &BTreeMap<String, NodeId>,
 ) -> Result<LessOrEqualPlan> {
     if ins.len() != 2 || !attrs.is_empty() {
-        return Err(bad("LessOrEqual requires exactly two inputs and no attributes"));
+        return Err(bad(
+            "LessOrEqual requires exactly two inputs and no attributes",
+        ));
     }
     let inputs = ins
         .iter()
@@ -3216,11 +3737,18 @@ fn greater_or_equal_plan(
     values: &BTreeMap<String, NodeId>,
 ) -> Result<GreaterOrEqualPlan> {
     if ins.len() != 2 || !attrs.is_empty() {
-        return Err(bad("GreaterOrEqual requires exactly two inputs and no attributes"));
+        return Err(bad(
+            "GreaterOrEqual requires exactly two inputs and no attributes",
+        ));
     }
     let inputs = ins
         .iter()
-        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let lhs_shape = g.shape(inputs[0])?.clone();
     let rhs_shape = g.shape(inputs[1])?.clone();
@@ -3274,7 +3802,12 @@ fn add_plan(
     }
     let inputs = ins
         .iter()
-        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let lhs_shape = g.shape(inputs[0])?.clone();
     let rhs_shape = g.shape(inputs[1])?.clone();
@@ -3288,7 +3821,11 @@ fn add_plan(
     }
     let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
     let output_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
-    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast"), (&output_shape, "output")] {
+    for (shape, what) in [
+        (&lhs_shape, "left cast"),
+        (&rhs_shape, "right cast"),
+        (&output_shape, "output"),
+    ] {
         shape
             .numel()?
             .checked_mul(output_dtype.itemsize())
@@ -3312,22 +3849,31 @@ fn optional_has_element_plan(
     values: &BTreeMap<String, NodeId>,
 ) -> Result<TensorData> {
     if ins.len() > 1 || !attrs.is_empty() {
-        return Err(bad("OptionalHasElement accepts zero or one input and no attributes"));
+        return Err(bad(
+            "OptionalHasElement accepts zero or one input and no attributes",
+        ));
     }
     let present = match ins.first().filter(|name| !name.is_empty()) {
         None => false,
         Some(name) => {
-            let input = values.get(*name).copied().ok_or_else(|| bad("missing OptionalHasElement input"))?;
+            let input = values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing OptionalHasElement input"))?;
             let shape = g.shape(input)?.clone();
             let dtype = g.dtype(input)?;
             let numel = shape.numel()?;
-            numel.checked_mul(dtype.itemsize())
+            numel
+                .checked_mul(dtype.itemsize())
                 .ok_or_else(|| bad("OptionalHasElement input byte extent overflow"))?;
             numel > 0
         }
     };
     let output = TensorData::scalar_with_dtype(Scalar::Bool(present), DType::Bool);
-    output.shape().numel()?.checked_mul(output.dtype().itemsize())
+    output
+        .shape()
+        .numel()?
+        .checked_mul(output.dtype().itemsize())
         .ok_or_else(|| bad("OptionalHasElement output byte extent overflow"))?;
     Ok(output)
 }
@@ -3347,14 +3893,21 @@ fn optional_get_element_plan(
     values: &BTreeMap<String, NodeId>,
 ) -> Result<OptionalGetElementPlan> {
     if ins.len() > 1 || !attrs.is_empty() {
-        return Err(bad("OptionalGetElement accepts zero or one input and no attributes"));
+        return Err(bad(
+            "OptionalGetElement accepts zero or one input and no attributes",
+        ));
     }
     match ins.first().filter(|name| !name.is_empty()) {
         Some(name) => {
-            let input = values.get(*name).copied().ok_or_else(|| bad("missing OptionalGetElement input"))?;
+            let input = values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing OptionalGetElement input"))?;
             let shape = g.shape(input)?.clone();
             let dtype = g.dtype(input)?;
-            shape.numel()?.checked_mul(dtype.itemsize())
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
                 .ok_or_else(|| bad("OptionalGetElement input byte extent overflow"))?;
             Ok(OptionalGetElementPlan::Alias(input))
         }
@@ -3362,7 +3915,10 @@ fn optional_get_element_plan(
             // `dtypes.from_py([])` is tinygrad's default float. The literal
             // empty list has rank one and a zero extent, not scalar shape.
             let empty = TensorData::zeros_with_dtype([0], DType::F32)?;
-            empty.shape().numel()?.checked_mul(empty.dtype().itemsize())
+            empty
+                .shape()
+                .numel()?
+                .checked_mul(empty.dtype().itemsize())
                 .ok_or_else(|| bad("OptionalGetElement fallback byte extent overflow"))?;
             Ok(OptionalGetElementPlan::Empty(empty))
         }
@@ -3389,7 +3945,12 @@ fn sub_plan(
     }
     let inputs = ins
         .iter()
-        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let lhs_shape = g.shape(inputs[0])?.clone();
     let rhs_shape = g.shape(inputs[1])?.clone();
@@ -3403,7 +3964,11 @@ fn sub_plan(
     }
     let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
     let output_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
-    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast"), (&output_shape, "output")] {
+    for (shape, what) in [
+        (&lhs_shape, "left cast"),
+        (&rhs_shape, "right cast"),
+        (&output_shape, "output"),
+    ] {
         shape
             .numel()?
             .checked_mul(output_dtype.itemsize())
@@ -3437,7 +4002,12 @@ fn mul_plan(
     }
     let inputs = ins
         .iter()
-        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let lhs_shape = g.shape(inputs[0])?.clone();
     let rhs_shape = g.shape(inputs[1])?.clone();
@@ -3451,7 +4021,11 @@ fn mul_plan(
     }
     let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
     let output_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
-    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast"), (&output_shape, "output")] {
+    for (shape, what) in [
+        (&lhs_shape, "left cast"),
+        (&rhs_shape, "right cast"),
+        (&output_shape, "output"),
+    ] {
         shape
             .numel()?
             .checked_mul(output_dtype.itemsize())
@@ -3483,11 +4057,18 @@ fn bitwise_binary_plan(
     operator: &str,
 ) -> Result<BitwiseBinaryPlan> {
     if ins.len() != 2 || !attrs.is_empty() {
-        return Err(bad(format!("{operator} requires exactly two inputs and no attributes")));
+        return Err(bad(format!(
+            "{operator} requires exactly two inputs and no attributes"
+        )));
     }
     let inputs = ins
         .iter()
-        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let lhs_shape = g.shape(inputs[0])?.clone();
     let rhs_shape = g.shape(inputs[1])?.clone();
@@ -3504,7 +4085,11 @@ fn bitwise_binary_plan(
     if output_dtype.is_float() {
         return Err(bad(format!("{operator} requires Bool or integer operands")));
     }
-    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast"), (&output_shape, "output")] {
+    for (shape, what) in [
+        (&lhs_shape, "left cast"),
+        (&rhs_shape, "right cast"),
+        (&output_shape, "output"),
+    ] {
         shape
             .numel()?
             .checked_mul(output_dtype.itemsize())
@@ -3542,7 +4127,12 @@ fn div_plan(
     }
     let inputs = ins
         .iter()
-        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let lhs_shape = g.shape(inputs[0])?.clone();
     let rhs_shape = g.shape(inputs[1])?.clone();
@@ -3569,7 +4159,13 @@ fn div_plan(
             .checked_mul(work_dtype.itemsize())
             .ok_or_else(|| bad(format!("Div {what} byte extent overflow")))?;
     }
-    let operation_count = if integer_division { 1 } else if truncate { 3 } else { 2 };
+    let operation_count = if integer_division {
+        1
+    } else if truncate {
+        3
+    } else {
+        2
+    };
     for _ in 0..operation_count {
         output_shape
             .numel()?
@@ -3609,7 +4205,12 @@ fn pow_plan(
     }
     let inputs = ins
         .iter()
-        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let base_shape = g.shape(inputs[0])?.clone();
     let exponent_shape = g.shape(inputs[1])?.clone();
@@ -3676,7 +4277,11 @@ fn leaky_relu_plan(
     numel
         .checked_mul(input_dtype.itemsize())
         .ok_or_else(|| bad("LeakyRelu input byte extent overflow"))?;
-    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
     // `x < 0` remains at x's source width; Bool is compared through the
     // existing Bool scalar semantics, while arithmetic follows weak-FLOAT
     // promotion to F32 for every nonfloating input.
@@ -3726,14 +4331,12 @@ fn cast_plan(
     if ins.len() != 1 || attrs.keys().any(|name| name != "to" && name != "saturate") {
         return Err(bad("Cast requires one input and only to or saturate"));
     }
-    let raw_to = strict_typed_scalar_i64_attr(n, "to")?
-        .ok_or_else(|| bad("Cast needs to"))?;
+    let raw_to = strict_typed_scalar_i64_attr(n, "to")?.ok_or_else(|| bad("Cast needs to"))?;
     // tinygrad accepts but ignores `saturate`: it applies only to FP8 targets,
     // none of which are present in RustGrad's checked ONNX dtype mapping.
     let _ = strict_typed_scalar_i64_attr(n, "saturate")?;
-    let output_dtype = onnx_dtype(
-        u64::try_from(raw_to).map_err(|_| bad("unsupported ONNX dtype"))?,
-    )?;
+    let output_dtype =
+        onnx_dtype(u64::try_from(raw_to).map_err(|_| bad("unsupported ONNX dtype"))?)?;
     let input_dtype = g.dtype(input)?;
     let numel = g.shape(input)?.numel()?;
     numel
@@ -3809,9 +4412,14 @@ fn constant_plan(
     attrs: &BTreeMap<String, Vec<u8>>,
 ) -> Result<TensorData> {
     if !ins.is_empty() || attrs.len() != 1 {
-        return Err(bad("Constant requires zero inputs and one payload attribute"));
+        return Err(bad(
+            "Constant requires zero inputs and one payload attribute",
+        ));
     }
-    let name = attrs.keys().next().expect("Constant attribute count checked");
+    let name = attrs
+        .keys()
+        .next()
+        .expect("Constant attribute count checked");
     let data = match name.as_str() {
         "value" => {
             let raw = strict_constant_attr(n, "value", 4, 5, 2)?
@@ -3884,7 +4492,10 @@ fn constant_plan(
 /// The public Graph lattice deliberately differs only for I64/U64, where
 /// tinygrad's least-upper dtype remains its default F32 width.
 fn batch_norm_dtype(lhs: DType, rhs: DType) -> DType {
-    if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+    if matches!(
+        (lhs, rhs),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
         DType::F32
     } else {
         lhs.promote(rhs)
@@ -3917,7 +4528,10 @@ fn batch_norm_plan(
 ) -> Result<BatchNormPlan> {
     if ins.len() != 5
         || attrs.keys().any(|name| {
-            !matches!(name.as_str(), "epsilon" | "momentum" | "training_mode" | "spatial" | "is_test")
+            !matches!(
+                name.as_str(),
+                "epsilon" | "momentum" | "training_mode" | "spatial" | "is_test"
+            )
         })
     {
         return Err(bad("unsupported BatchNormalization inputs or attributes"));
@@ -3962,12 +4576,18 @@ fn batch_norm_plan(
     }
     for shape in [&shapes[1], &shapes[2], &shapes[3]] {
         if shape.numel()? != channels {
-            return Err(bad("BatchNormalization scale, bias, and mean must contain C values"));
+            return Err(bad(
+                "BatchNormalization scale, bias, and mean must contain C values",
+            ));
         }
     }
     let variance_shape = shapes[4].clone();
     let variance_is_vector = variance_shape.rank() == 1;
-    let epsilon_dtype = if dtypes[4].is_float() { dtypes[4] } else { DType::F32 };
+    let epsilon_dtype = if dtypes[4].is_float() {
+        dtypes[4]
+    } else {
+        DType::F32
+    };
     let variance_dtype = batch_norm_dtype(dtypes[4], epsilon_dtype);
     let invstd_dtype = variance_dtype;
     let centered_dtype = batch_norm_dtype(dtypes[0], dtypes[3]);
@@ -4179,19 +4799,20 @@ fn slice_plan(
     if starts.len() < axes.len() || ends.len() < axes.len() || steps.len() < axes.len() {
         return Err(bad("Slice controls are shorter than axes"));
     }
-    let mut slices = vec![Slice {
-        start: None,
-        stop: None,
-        step: 1,
-    }; rank];
+    let mut slices = vec![
+        Slice {
+            start: None,
+            stop: None,
+            step: 1,
+        };
+        rank
+    ];
     for index in 0..axes.len() {
         // Python assignment validates each axis immediately, even if a later
         // duplicate replaces its range.
         let axis = axes_usize(&[axes[index]], rank)?[0];
         slices[axis] = Slice {
-            start: Some(
-                isize::try_from(starts[index]).map_err(|_| bad("Slice start overflow"))?,
-            ),
+            start: Some(isize::try_from(starts[index]).map_err(|_| bad("Slice start overflow"))?),
             stop: Some(isize::try_from(ends[index]).map_err(|_| bad("Slice end overflow"))?),
             step: isize::try_from(steps[index]).map_err(|_| bad("Slice step overflow"))?,
         };
@@ -4316,9 +4937,11 @@ fn split_plan(
         // tinygrad's runner supplies the node output count when this
         // attribute is absent. An explicit attribute wins, exactly as the
         // source call-site's `if 'num_outputs' not in opts` does.
-        let default_count = i64::try_from(outs.len()).map_err(|_| bad("Split output count overflow"))?;
+        let default_count =
+            i64::try_from(outs.len()).map_err(|_| bad("Split output count overflow"))?;
         let count = raw_num_outputs.unwrap_or(default_count);
-        let count = usize::try_from(count).map_err(|_| bad("Split num_outputs must be positive"))?;
+        let count =
+            usize::try_from(count).map_err(|_| bad("Split num_outputs must be positive"))?;
         if count == 0 {
             return Err(bad("Split num_outputs must be positive"));
         }
@@ -4457,7 +5080,10 @@ fn cumsum_plan(
     attrs: &BTreeMap<String, Vec<u8>>,
     constants: &BTreeMap<String, TensorData>,
 ) -> Result<CumSumPlan> {
-    if attrs.keys().any(|key| key != "exclusive" && key != "reverse") {
+    if attrs
+        .keys()
+        .any(|key| key != "exclusive" && key != "reverse")
+    {
         return Err(bad("unsupported CumSum attribute"));
     }
     let exclusive = typed_scalar_i64_attr(n, "exclusive")?.unwrap_or(0) != 0;
@@ -4506,9 +5132,11 @@ fn cumsum_plan(
                     .dims()
                     .iter()
                     .enumerate()
-                    .map(|(dimension, &extent)| {
-                        if dimension == axis { end + 1 } else { extent }
-                    })
+                    .map(
+                        |(dimension, &extent)| {
+                            if dimension == axis { end + 1 } else { extent }
+                        },
+                    )
                     .collect(),
             );
             prefix.numel()?;
@@ -4598,8 +5226,7 @@ fn trilu_plan(
     let rows = shape.dims()[shape.rank() - 2];
     let columns = shape.dims()[shape.rank() - 1];
     let rows_i64 = i64::try_from(rows).map_err(|_| bad("Trilu row extent exceeds I64"))?;
-    let columns_i64 =
-        i64::try_from(columns).map_err(|_| bad("Trilu column extent exceeds I64"))?;
+    let columns_i64 = i64::try_from(columns).map_err(|_| bad("Trilu column extent exceeds I64"))?;
     let mask_shape = Shape::new([rows, columns]);
     mask_shape.numel()?;
     if mask_shape.broadcast_with(&shape).as_ref() != Ok(&shape) {
@@ -4789,7 +5416,11 @@ fn reduce_mean_plan(
     };
     extent(&source_shape, source_dtype, "input")?;
     extent(&source_shape, sum_dtypes.accumulator, "accumulator cast")?;
-    extent(&reduction.output_shape, sum_dtypes.accumulator, "Sum output")?;
+    extent(
+        &reduction.output_shape,
+        sum_dtypes.accumulator,
+        "Sum output",
+    )?;
     extent(&reduction.output_shape, division_dtype, "true division")?;
     extent(&reduction.output_shape, output_dtype, "output")?;
     let divisor = TensorData::scalar_with_dtype(Scalar::F(count as f64), division_dtype);
@@ -4880,7 +5511,11 @@ fn reduce_prod_plan(
             .ok_or_else(|| bad(format!("ReduceProd {what} byte extent overflow")))
     };
     extent(&source_shape, source_dtype, "input")?;
-    extent(&reduction.output_shape, dtypes.accumulator, "accumulator reduction")?;
+    extent(
+        &reduction.output_shape,
+        dtypes.accumulator,
+        "accumulator reduction",
+    )?;
     extent(&reduction.output_shape, dtypes.output, "output")?;
     Ok(ReduceProdPlan { reduction, dtypes })
 }
@@ -5067,7 +5702,9 @@ fn log_softmax_plan(
                 .dims()
                 .iter()
                 .enumerate()
-                .map(|(index, &dimension)| (index == axis as usize).then_some(1).unwrap_or(dimension))
+                .map(|(index, &dimension)| {
+                    (index == axis as usize).then_some(1).unwrap_or(dimension)
+                })
                 .collect::<Vec<_>>(),
         ),
     };
@@ -5079,9 +5716,18 @@ fn log_softmax_plan(
 
     // Tensor.exp first promotes narrow and exact storage to F32, computes
     // `exp2(x * (1 / ln(2)))`, then restores the original floating storage.
-    let exp_work_dtype = if source_dtype == DType::F64 { DType::F64 } else { DType::F32 };
-    let exp_dtype = if source_dtype.is_float() { source_dtype } else { DType::F32 };
-    let inv_ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LOG2_E), exp_work_dtype);
+    let exp_work_dtype = if source_dtype == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
+    let exp_dtype = if source_dtype.is_float() {
+        source_dtype
+    } else {
+        DType::F32
+    };
+    let inv_ln2 =
+        TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LOG2_E), exp_work_dtype);
     if shape.broadcast_with(inv_ln2.shape())? != shape
         || exp_work_dtype.promote(inv_ln2.dtype()) != exp_work_dtype
     {
@@ -5183,7 +5829,9 @@ fn softmax_plan(
                 .dims()
                 .iter()
                 .enumerate()
-                .map(|(index, &dimension)| (index == axis as usize).then_some(1).unwrap_or(dimension))
+                .map(|(index, &dimension)| {
+                    (index == axis as usize).then_some(1).unwrap_or(dimension)
+                })
                 .collect::<Vec<_>>(),
         ),
     };
@@ -5193,9 +5841,18 @@ fn softmax_plan(
     }
     extent(&shape, source_dtype, "centered")?;
 
-    let exp_work_dtype = if source_dtype == DType::F64 { DType::F64 } else { DType::F32 };
-    let exp_dtype = if source_dtype.is_float() { source_dtype } else { DType::F32 };
-    let inv_ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LOG2_E), exp_work_dtype);
+    let exp_work_dtype = if source_dtype == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
+    let exp_dtype = if source_dtype.is_float() {
+        source_dtype
+    } else {
+        DType::F32
+    };
+    let inv_ln2 =
+        TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LOG2_E), exp_work_dtype);
     if shape.broadcast_with(inv_ln2.shape())? != shape
         || exp_work_dtype.promote(inv_ln2.dtype()) != exp_work_dtype
     {
@@ -5265,10 +5922,7 @@ fn reduce_log_sum_plan(
     {
         return Err(bad("ReduceLogSum scalar promotion mismatch"));
     }
-    Ok(ReduceLogSumPlan {
-        reduction,
-        ln2,
-    })
+    Ok(ReduceLogSumPlan { reduction, ln2 })
 }
 
 /// Read-only planning for tinygrad ONNX ReduceLogSumExp: `exp`, typed Sum,
@@ -5378,10 +6032,10 @@ fn global_max_pool_plan(g: &Graph, x: NodeId) -> Result<GlobalMaxPoolPlan> {
         .numel()?
         .checked_mul(dtype.itemsize())
         .ok_or_else(|| bad("GlobalMaxPool input byte extent overflow"))?;
-    let axes = (2..shape.rank()).map(|axis| axis as isize).collect::<Vec<_>>();
-    let empty_spatial = axes
-        .iter()
-        .any(|&axis| shape.dims()[axis as usize] == 0);
+    let axes = (2..shape.rank())
+        .map(|axis| axis as isize)
+        .collect::<Vec<_>>();
+    let empty_spatial = axes.iter().any(|&axis| shape.dims()[axis as usize] == 0);
     let output_shape = if axes.is_empty() {
         shape
     } else {
@@ -5456,66 +6110,188 @@ fn reduce_l2_plan(
 }
 
 #[derive(Clone)]
-enum QuantParameterPlan { Keep, Reshape(Shape), Repeat { repeats: isize, axis: isize, shape: Shape } }
+enum QuantParameterPlan {
+    Keep,
+    Reshape(Shape),
+    Repeat {
+        repeats: isize,
+        axis: isize,
+        shape: Shape,
+    },
+}
 
 struct DequantizeLinearPlan {
-    x: NodeId, scale: NodeId, zero: Option<NodeId>, scale_plan: QuantParameterPlan,
-    zero_plan: Option<QuantParameterPlan>, subtract_dtype: DType, multiply_dtype: DType,
-    output_dtype: DType, shape: Shape,
+    x: NodeId,
+    scale: NodeId,
+    zero: Option<NodeId>,
+    scale_plan: QuantParameterPlan,
+    zero_plan: Option<QuantParameterPlan>,
+    subtract_dtype: DType,
+    multiply_dtype: DType,
+    output_dtype: DType,
+    shape: Shape,
 }
 
 fn dequantize_dtype(lhs: DType, rhs: DType) -> DType {
     // `x.int()` is I32. tinygrad's weak quantization lattice deliberately
     // chooses its default float width for the otherwise-unrepresentable U64
     // pairing, rather than RustGrad's generic F64 promotion.
-    if matches!((lhs, rhs), (DType::I32, DType::U64) | (DType::U64, DType::I32)) { DType::F32 } else { lhs.promote(rhs) }
+    if matches!(
+        (lhs, rhs),
+        (DType::I32, DType::U64) | (DType::U64, DType::I32)
+    ) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
 }
 
-fn quant_parameter_plan(g: &Graph, parameter: NodeId, data_shape: &Shape, axis: i64, block_size: i64) -> Result<QuantParameterPlan> {
+fn quant_parameter_plan(
+    g: &Graph,
+    parameter: NodeId,
+    data_shape: &Shape,
+    axis: i64,
+    block_size: i64,
+) -> Result<QuantParameterPlan> {
     let shape = g.shape(parameter)?.clone();
     let numel = shape.numel()?;
-    numel.checked_mul(g.dtype(parameter)?.itemsize()).ok_or_else(|| bad("DequantizeLinear parameter byte extent overflow"))?;
-    if numel == 1 { return Ok(QuantParameterPlan::Keep); }
+    numel
+        .checked_mul(g.dtype(parameter)?.itemsize())
+        .ok_or_else(|| bad("DequantizeLinear parameter byte extent overflow"))?;
+    if numel == 1 {
+        return Ok(QuantParameterPlan::Keep);
+    }
     let rank = data_shape.rank();
-    let normalized = if axis < 0 { axis.checked_add(i64::try_from(rank).map_err(|_| bad("DequantizeLinear rank overflow"))?).ok_or_else(|| bad("invalid DequantizeLinear axis"))? } else { axis };
-    let axis = usize::try_from(normalized).ok().filter(|axis| *axis < rank).ok_or_else(|| bad("invalid DequantizeLinear axis"))?;
+    let normalized = if axis < 0 {
+        axis.checked_add(i64::try_from(rank).map_err(|_| bad("DequantizeLinear rank overflow"))?)
+            .ok_or_else(|| bad("invalid DequantizeLinear axis"))?
+    } else {
+        axis
+    };
+    let axis = usize::try_from(normalized)
+        .ok()
+        .filter(|axis| *axis < rank)
+        .ok_or_else(|| bad("invalid DequantizeLinear axis"))?;
     let prepared = if block_size == 0 {
-        let target = Shape::new((0..rank).map(|dim| if dim == axis { data_shape.dims()[dim] } else { 1 }).collect::<Vec<_>>());
-        if numel != target.numel()? { return Err(bad("DequantizeLinear per-axis parameter cardinality mismatch")); }
+        let target = Shape::new(
+            (0..rank)
+                .map(|dim| {
+                    if dim == axis {
+                        data_shape.dims()[dim]
+                    } else {
+                        1
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        if numel != target.numel()? {
+            return Err(bad(
+                "DequantizeLinear per-axis parameter cardinality mismatch",
+            ));
+        }
         QuantParameterPlan::Reshape(target)
     } else {
-        let repeats = isize::try_from(block_size).map_err(|_| bad("invalid DequantizeLinear block_size"))?;
-        if repeats < 0 || axis >= shape.rank() { return Err(bad("invalid DequantizeLinear blocked parameter")); }
+        let repeats =
+            isize::try_from(block_size).map_err(|_| bad("invalid DequantizeLinear block_size"))?;
+        if repeats < 0 || axis >= shape.rank() {
+            return Err(bad("invalid DequantizeLinear blocked parameter"));
+        }
         let mut dims = shape.dims().to_vec();
-        dims[axis] = dims[axis].checked_mul(usize::try_from(repeats).map_err(|_| bad("invalid DequantizeLinear block_size"))?).ok_or_else(|| bad("DequantizeLinear blocked extent overflow"))?;
-        QuantParameterPlan::Repeat { repeats, axis: axis as isize, shape: Shape::new(dims) }
+        dims[axis] = dims[axis]
+            .checked_mul(
+                usize::try_from(repeats).map_err(|_| bad("invalid DequantizeLinear block_size"))?,
+            )
+            .ok_or_else(|| bad("DequantizeLinear blocked extent overflow"))?;
+        QuantParameterPlan::Repeat {
+            repeats,
+            axis: axis as isize,
+            shape: Shape::new(dims),
+        }
     };
-    let prepared_shape = match &prepared { QuantParameterPlan::Keep => shape, QuantParameterPlan::Reshape(s) => s.clone(), QuantParameterPlan::Repeat { shape, .. } => shape.clone() };
-    prepared_shape.numel()?.checked_mul(g.dtype(parameter)?.itemsize()).ok_or_else(|| bad("DequantizeLinear prepared parameter byte extent overflow"))?;
-    if prepared_shape.broadcast_with(data_shape)? != data_shape.clone() { return Err(bad("DequantizeLinear parameter cannot broadcast to X")); }
+    let prepared_shape = match &prepared {
+        QuantParameterPlan::Keep => shape,
+        QuantParameterPlan::Reshape(s) => s.clone(),
+        QuantParameterPlan::Repeat { shape, .. } => shape.clone(),
+    };
+    prepared_shape
+        .numel()?
+        .checked_mul(g.dtype(parameter)?.itemsize())
+        .ok_or_else(|| bad("DequantizeLinear prepared parameter byte extent overflow"))?;
+    if prepared_shape.broadcast_with(data_shape)? != data_shape.clone() {
+        return Err(bad("DequantizeLinear parameter cannot broadcast to X"));
+    }
     Ok(prepared)
 }
 
-fn dequantize_linear_plan(g: &Graph, inputs: &[NodeId], ins: &[&str], n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<DequantizeLinearPlan> {
-    if !(2..=3).contains(&inputs.len()) || ins.len() != inputs.len() || attrs.keys().any(|x| x != "axis" && x != "block_size") { return Err(bad("unsupported DequantizeLinear inputs or attributes")); }
+fn dequantize_linear_plan(
+    g: &Graph,
+    inputs: &[NodeId],
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<DequantizeLinearPlan> {
+    if !(2..=3).contains(&inputs.len())
+        || ins.len() != inputs.len()
+        || attrs.keys().any(|x| x != "axis" && x != "block_size")
+    {
+        return Err(bad("unsupported DequantizeLinear inputs or attributes"));
+    }
     let axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(1);
     let block_size = strict_typed_scalar_i64_attr(n, "block_size")?.unwrap_or(0);
-    let x = inputs[0]; let scale = inputs[1]; let zero = inputs.get(2).copied();
-    let shape = g.shape(x)?.clone(); let sd = g.dtype(scale)?;
-    for id in inputs { let s=g.shape(*id)?; s.numel()?.checked_mul(g.dtype(*id)?.itemsize()).ok_or_else(|| bad("DequantizeLinear input byte extent overflow"))?; }
+    let x = inputs[0];
+    let scale = inputs[1];
+    let zero = inputs.get(2).copied();
+    let shape = g.shape(x)?.clone();
+    let sd = g.dtype(scale)?;
+    for id in inputs {
+        let s = g.shape(*id)?;
+        s.numel()?
+            .checked_mul(g.dtype(*id)?.itemsize())
+            .ok_or_else(|| bad("DequantizeLinear input byte extent overflow"))?;
+    }
     let scale_plan = quant_parameter_plan(g, scale, &shape, axis, block_size)?;
-    let zero_plan = zero.map(|z| quant_parameter_plan(g, z, &shape, axis, block_size)).transpose()?;
-    let subtract_dtype=dequantize_dtype(DType::I32, zero.map(|z|g.dtype(z)).transpose()?.unwrap_or(DType::I32));
-    let multiply_dtype=dequantize_dtype(subtract_dtype, sd);
-    for (s,d) in [(&shape,DType::I32),(&shape,subtract_dtype),(&shape,multiply_dtype),(&shape,sd)] { s.numel()?.checked_mul(d.itemsize()).ok_or_else(|| bad("DequantizeLinear output byte extent overflow"))?; }
-    Ok(DequantizeLinearPlan{x,scale,zero,scale_plan,zero_plan,subtract_dtype,multiply_dtype,output_dtype:sd,shape})
+    let zero_plan = zero
+        .map(|z| quant_parameter_plan(g, z, &shape, axis, block_size))
+        .transpose()?;
+    let subtract_dtype = dequantize_dtype(
+        DType::I32,
+        zero.map(|z| g.dtype(z)).transpose()?.unwrap_or(DType::I32),
+    );
+    let multiply_dtype = dequantize_dtype(subtract_dtype, sd);
+    for (s, d) in [
+        (&shape, DType::I32),
+        (&shape, subtract_dtype),
+        (&shape, multiply_dtype),
+        (&shape, sd),
+    ] {
+        s.numel()?
+            .checked_mul(d.itemsize())
+            .ok_or_else(|| bad("DequantizeLinear output byte extent overflow"))?;
+    }
+    Ok(DequantizeLinearPlan {
+        x,
+        scale,
+        zero,
+        scale_plan,
+        zero_plan,
+        subtract_dtype,
+        multiply_dtype,
+        output_dtype: sd,
+        shape,
+    })
 }
 
-fn emit_quant_parameter(g: &mut Graph, parameter: NodeId, plan: QuantParameterPlan) -> Result<NodeId> {
+fn emit_quant_parameter(
+    g: &mut Graph,
+    parameter: NodeId,
+    plan: QuantParameterPlan,
+) -> Result<NodeId> {
     match plan {
         QuantParameterPlan::Keep => Ok(parameter),
         QuantParameterPlan::Reshape(shape) => g.reshape(parameter, shape),
-        QuantParameterPlan::Repeat { repeats, axis, .. } => g.repeat_interleave(parameter, repeats, Some(axis)),
+        QuantParameterPlan::Repeat { repeats, axis, .. } => {
+            g.repeat_interleave(parameter, repeats, Some(axis))
+        }
     }
 }
 
@@ -5576,7 +6352,11 @@ pub(super) fn lower(
         // `Graph::split` establishes the full coverage/range list before its
         // first Shrink. The plan above independently proves every emitted
         // descriptor, and output names were all reserved before construction.
-        let outputs = g.split(input, crate::SplitSections::Explicit(plan.sections), plan.axis)?;
+        let outputs = g.split(
+            input,
+            crate::SplitSections::Explicit(plan.sections),
+            plan.axis,
+        )?;
         debug_assert_eq!(outputs.len(), outs.len());
         for (name, output) in outs.iter().zip(outputs) {
             values.insert((*name).to_owned(), output);
@@ -5652,7 +6432,11 @@ pub(super) fn lower(
                 // separate accumulator widening.
                 let squared = g.mul(input, input)?;
                 let reshaped = g.reshape(squared, plan.reshaped.clone())?;
-                let padded = g.pad(reshaped, plan.padding, center_crop_pad_zero(plan.input_dtype))?;
+                let padded = g.pad(
+                    reshaped,
+                    plan.padding,
+                    center_crop_pad_zero(plan.input_dtype),
+                )?;
                 let padded = if plan.input_dtype == plan.sum_dtypes.accumulator {
                     padded
                 } else {
@@ -5712,7 +6496,8 @@ pub(super) fn lower(
             // exact `none` (unlike Tensor.gelu's public tanh default).  The
             // shared helper then validates and lowers the complete selected
             // literal composition before publishing any constants or nodes.
-            let mode = strict_typed_string_attr(&n, "approximate")?.unwrap_or_else(|| "none".into());
+            let mode =
+                strict_typed_string_attr(&n, "approximate")?.unwrap_or_else(|| "none".into());
             if mode != "none" && mode != "tanh" {
                 return Err(bad("unsupported Gelu approximation"));
             }
@@ -5721,11 +6506,23 @@ pub(super) fn lower(
         "BiasGelu" if ins.len() == 2 => {
             let plan = bias_gelu_plan(g, &ins, &n, &attrs, values)?;
             let gelu_input = g.add(plan.add.lhs, plan.add.rhs)?;
-            debug_assert_eq!(g.shape(gelu_input).expect("BiasGelu add preflighted"), &plan.add.output_shape);
-            debug_assert_eq!(g.dtype(gelu_input).expect("BiasGelu add preflighted"), plan.add.output_dtype);
+            debug_assert_eq!(
+                g.shape(gelu_input).expect("BiasGelu add preflighted"),
+                &plan.add.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(gelu_input).expect("BiasGelu add preflighted"),
+                plan.add.output_dtype
+            );
             let output = g.gelu(gelu_input, &plan.mode)?;
-            debug_assert_eq!(g.shape(output).expect("BiasGelu GELU preflighted"), &plan.add.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("BiasGelu GELU preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("BiasGelu GELU preflighted"),
+                &plan.add.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("BiasGelu GELU preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "OptionalHasElement" if ins.len() <= 1 => {
@@ -5771,9 +6568,17 @@ pub(super) fn lower(
             let input = get(0)?;
             let plan = elu_plan(g, input, &n, &attrs)?;
             if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+                if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                }
             } else {
-                let x = if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? };
+                let x = if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                };
                 let zero = g.constant(plan.zero);
                 let one = g.constant(plan.one);
                 let alpha = g.constant(plan.alpha);
@@ -5785,13 +6590,18 @@ pub(super) fn lower(
                 let negative = g.select(g.gt(negative_raw, zero)?, negative_raw, zero)?;
                 let output = g.sub(positive, g.mul(alpha, negative)?)?;
                 debug_assert_eq!(g.shape(output).expect("Elu shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("Elu dtype preflighted"), plan.output_dtype);
+                debug_assert_eq!(
+                    g.dtype(output).expect("Elu dtype preflighted"),
+                    plan.output_dtype
+                );
                 output
             }
         }
         "Celu" if ins.len() == 1 => {
             let input = get(0)?;
-            if attrs.keys().any(|key| key != "alpha") { return Err(bad("unsupported Celu attribute")); }
+            if attrs.keys().any(|key| key != "alpha") {
+                return Err(bad("unsupported Celu attribute"));
+            }
             // ONNX's declared FLOAT is the same weak Python scalar accepted
             // by parameterless Tensor.celu.  The shared scalar helper proves
             // all source-order descriptors before it publishes alpha or any
@@ -5803,9 +6613,17 @@ pub(super) fn lower(
             let input = get(0)?;
             let plan = selu_plan(g, input, &n, &attrs)?;
             if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+                if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                }
             } else {
-                let x = if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? };
+                let x = if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                };
                 let zero = g.constant(plan.zero);
                 let one = g.constant(plan.one);
                 let alpha = g.constant(plan.alpha);
@@ -5816,8 +6634,14 @@ pub(super) fn lower(
                 let negative = g.mul(alpha, g.sub(g.exp(x)?, one)?)?;
                 let branch = g.select(condition, x, negative)?;
                 let output = g.mul(gamma, branch)?;
-                debug_assert_eq!(g.shape(output).expect("Selu shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("Selu dtype preflighted"), plan.output_dtype);
+                debug_assert_eq!(
+                    g.shape(output).expect("Selu shape preflighted"),
+                    &plan.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(output).expect("Selu dtype preflighted"),
+                    plan.output_dtype
+                );
                 output
             }
         }
@@ -5825,9 +6649,17 @@ pub(super) fn lower(
             let input = get(0)?;
             let plan = swish_plan(g, input, &n, &attrs)?;
             if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+                if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                }
             } else {
-                let x = if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? };
+                let x = if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                };
                 let alpha = g.constant(plan.alpha);
                 let one = g.constant(plan.one);
                 let neg_inv_ln2 = g.constant(plan.neg_inv_ln2);
@@ -5835,8 +6667,14 @@ pub(super) fn lower(
                 let exponent = g.mul(scaled, neg_inv_ln2)?;
                 let sigmoid = g.reciprocal(g.add(one, g.exp2(exponent)?)?)?;
                 let output = g.mul(x, sigmoid)?;
-                debug_assert_eq!(g.shape(output).expect("Swish shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("Swish dtype preflighted"), plan.output_dtype);
+                debug_assert_eq!(
+                    g.shape(output).expect("Swish shape preflighted"),
+                    &plan.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(output).expect("Swish dtype preflighted"),
+                    plan.output_dtype
+                );
                 output
             }
         }
@@ -5847,15 +6685,25 @@ pub(super) fn lower(
             // parameterless ONNX dispatch invokes the literal public
             // `(1/beta) * (x*beta).logaddexp(0)` composition.
             let output = g.softplus(input, g.constant(plan.beta))?;
-            debug_assert_eq!(g.shape(output).expect("Softplus shape preflighted"), &plan.shape);
-            debug_assert_eq!(g.dtype(output).expect("Softplus dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("Softplus shape preflighted"),
+                &plan.shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Softplus dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "Softsign" if ins.len() == 1 => {
             let input = get(0)?;
             let plan = softsign_plan(g, input, &attrs)?;
             if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+                if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                }
             } else {
                 let one = g.constant(plan.one);
                 // Keep tinygrad's literal `x / (1 + x.abs())` decomposition:
@@ -5865,8 +6713,14 @@ pub(super) fn lower(
                 let absolute = g.mul(input, g.sign(input)?)?;
                 let denominator = g.add(one, absolute)?;
                 let output = g.mul(input, g.reciprocal(denominator)?)?;
-                debug_assert_eq!(g.shape(output).expect("Softsign shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("Softsign dtype preflighted"), plan.output_dtype);
+                debug_assert_eq!(
+                    g.shape(output).expect("Softsign shape preflighted"),
+                    &plan.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(output).expect("Softsign dtype preflighted"),
+                    plan.output_dtype
+                );
                 output
             }
         }
@@ -5874,7 +6728,11 @@ pub(super) fn lower(
             let lhs = get(0)?;
             let rhs = get(1)?;
             let plan = mod_plan(g, lhs, rhs, ins[1], &n, &attrs, constants)?;
-            let output = if plan.fmod { g.fmod(lhs, rhs)? } else { g.modulo(lhs, rhs)? };
+            let output = if plan.fmod {
+                g.fmod(lhs, rhs)?
+            } else {
+                g.modulo(lhs, rhs)?
+            };
             debug_assert_eq!(g.shape(output).expect("Mod shape preflighted"), &plan.shape);
             debug_assert_eq!(g.dtype(output).expect("Mod dtype preflighted"), plan.dtype);
             output
@@ -5981,10 +6839,7 @@ pub(super) fn lower(
                 g.shape(output).expect("Relu shape preflighted"),
                 &plan.shape
             );
-            debug_assert_eq!(
-                g.dtype(output).expect("Relu dtype preflighted"),
-                plan.dtype
-            );
+            debug_assert_eq!(g.dtype(output).expect("Relu dtype preflighted"), plan.dtype);
             output
         }
         "Sigmoid" => {
@@ -6016,8 +6871,14 @@ pub(super) fn lower(
                 g.cast(plan.rhs, plan.output_dtype)?
             };
             let output = g.add(lhs, rhs)?;
-            debug_assert_eq!(g.shape(output).expect("Add shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("Add dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("Add shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Add dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "Max" => {
@@ -6043,10 +6904,7 @@ pub(super) fn lower(
                     g.shape(maximum).expect("Max shape preflighted"),
                     &fold.shape
                 );
-                debug_assert_eq!(
-                    g.dtype(maximum).expect("Max dtype preflighted"),
-                    fold.dtype
-                );
+                debug_assert_eq!(g.dtype(maximum).expect("Max dtype preflighted"), fold.dtype);
             }
             debug_assert_eq!(
                 g.shape(maximum).expect("Max output shape preflighted"),
@@ -6081,10 +6939,7 @@ pub(super) fn lower(
                     g.shape(minimum).expect("Min shape preflighted"),
                     &fold.shape
                 );
-                debug_assert_eq!(
-                    g.dtype(minimum).expect("Min dtype preflighted"),
-                    fold.dtype
-                );
+                debug_assert_eq!(g.dtype(minimum).expect("Min dtype preflighted"), fold.dtype);
             }
             debug_assert_eq!(
                 g.shape(minimum).expect("Min output shape preflighted"),
@@ -6110,8 +6965,14 @@ pub(super) fn lower(
             };
             let divisor = g.constant(plan.divisor);
             let output = g.div(sum, divisor)?;
-            debug_assert_eq!(g.shape(output).expect("Mean shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("Mean dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("Mean shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Mean dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "Sub" if ins.len() == 2 => {
@@ -6127,8 +6988,14 @@ pub(super) fn lower(
                 g.cast(plan.rhs, plan.output_dtype)?
             };
             let output = g.sub(lhs, rhs)?;
-            debug_assert_eq!(g.shape(output).expect("Sub shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("Sub dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("Sub shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Sub dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "Mul" if ins.len() == 2 => {
@@ -6144,68 +7011,102 @@ pub(super) fn lower(
                 g.cast(plan.rhs, plan.output_dtype)?
             };
             let output = g.mul(lhs, rhs)?;
-            debug_assert_eq!(g.shape(output).expect("Mul shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("Mul dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("Mul shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Mul dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "BitwiseAnd" if ins.len() == 2 => {
             let plan = bitwise_binary_plan(g, &ins, &attrs, values, "BitwiseAnd")?;
-            let lhs = if g.dtype(plan.lhs).expect("BitwiseAnd lhs preflighted") == plan.output_dtype {
+            let lhs = if g.dtype(plan.lhs).expect("BitwiseAnd lhs preflighted") == plan.output_dtype
+            {
                 plan.lhs
             } else {
                 g.cast(plan.lhs, plan.output_dtype)?
             };
-            let rhs = if g.dtype(plan.rhs).expect("BitwiseAnd rhs preflighted") == plan.output_dtype {
+            let rhs = if g.dtype(plan.rhs).expect("BitwiseAnd rhs preflighted") == plan.output_dtype
+            {
                 plan.rhs
             } else {
                 g.cast(plan.rhs, plan.output_dtype)?
             };
             let output = g.bit_and(lhs, rhs)?;
-            debug_assert_eq!(g.shape(output).expect("BitwiseAnd shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("BitwiseAnd dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("BitwiseAnd shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("BitwiseAnd dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "BitwiseOr" if ins.len() == 2 => {
             let plan = bitwise_binary_plan(g, &ins, &attrs, values, "BitwiseOr")?;
-            let lhs = if g.dtype(plan.lhs).expect("BitwiseOr lhs preflighted") == plan.output_dtype {
+            let lhs = if g.dtype(plan.lhs).expect("BitwiseOr lhs preflighted") == plan.output_dtype
+            {
                 plan.lhs
             } else {
                 g.cast(plan.lhs, plan.output_dtype)?
             };
-            let rhs = if g.dtype(plan.rhs).expect("BitwiseOr rhs preflighted") == plan.output_dtype {
+            let rhs = if g.dtype(plan.rhs).expect("BitwiseOr rhs preflighted") == plan.output_dtype
+            {
                 plan.rhs
             } else {
                 g.cast(plan.rhs, plan.output_dtype)?
             };
             let output = g.bit_or(lhs, rhs)?;
-            debug_assert_eq!(g.shape(output).expect("BitwiseOr shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("BitwiseOr dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("BitwiseOr shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("BitwiseOr dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "BitwiseXor" if ins.len() == 2 => {
             let plan = bitwise_binary_plan(g, &ins, &attrs, values, "BitwiseXor")?;
-            let lhs = if g.dtype(plan.lhs).expect("BitwiseXor lhs preflighted") == plan.output_dtype {
+            let lhs = if g.dtype(plan.lhs).expect("BitwiseXor lhs preflighted") == plan.output_dtype
+            {
                 plan.lhs
             } else {
                 g.cast(plan.lhs, plan.output_dtype)?
             };
-            let rhs = if g.dtype(plan.rhs).expect("BitwiseXor rhs preflighted") == plan.output_dtype {
+            let rhs = if g.dtype(plan.rhs).expect("BitwiseXor rhs preflighted") == plan.output_dtype
+            {
                 plan.rhs
             } else {
                 g.cast(plan.rhs, plan.output_dtype)?
             };
             let output = g.bit_xor(lhs, rhs)?;
-            debug_assert_eq!(g.shape(output).expect("BitwiseXor shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("BitwiseXor dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("BitwiseXor shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("BitwiseXor dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "BitwiseNot" if ins.len() == 1 => {
             if !attrs.is_empty() {
-                return Err(bad("BitwiseNot requires exactly one input and no attributes"));
+                return Err(bad(
+                    "BitwiseNot requires exactly one input and no attributes",
+                ));
             }
-            g.bitwise_not(*values
-                .get(ins[0])
-                .ok_or_else(|| bad("missing ONNX input"))?)?
+            g.bitwise_not(
+                *values
+                    .get(ins[0])
+                    .ok_or_else(|| bad("missing ONNX input"))?,
+            )?
         }
         "Div" if ins.len() == 2 => {
             let plan = div_plan(g, &ins, &attrs, values)?;
@@ -6229,8 +7130,14 @@ pub(super) fn lower(
                     quotient
                 }
             };
-            debug_assert_eq!(g.shape(output).expect("Div shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("Div dtype preflighted"), plan.work_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("Div shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Div dtype preflighted"),
+                plan.work_dtype
+            );
             output
         }
         "MatMul" if ins.len() == 2 && attrs.is_empty() => {
@@ -6385,7 +7292,9 @@ pub(super) fn lower(
                             .inputs
                             .iter()
                             .map(|&input| {
-                                if g.dtype(input).expect("Concat stack input preflighted") == plan.output_dtype {
+                                if g.dtype(input).expect("Concat stack input preflighted")
+                                    == plan.output_dtype
+                                {
                                     Ok(input)
                                 } else {
                                     g.cast(input, plan.output_dtype)
@@ -6402,11 +7311,7 @@ pub(super) fn lower(
                             .zip(paddings)
                             .map(|(input, padding)| {
                                 let dtype = g.dtype(input).expect("Concat pad input preflighted");
-                                g.pad(
-                                    input,
-                                    padding,
-                                    center_crop_pad_zero(dtype),
-                                )
+                                g.pad(input, padding, center_crop_pad_zero(dtype))
                             })
                             .collect::<Result<Vec<_>>>()?
                             .into_iter();
@@ -6614,12 +7519,14 @@ pub(super) fn lower(
         }
         "Equal" if ins.len() == 2 => {
             let plan = equal_plan(g, &ins, &attrs, values)?;
-            let lhs = if g.dtype(plan.lhs).expect("Equal lhs preflighted") == plan.comparison_dtype {
+            let lhs = if g.dtype(plan.lhs).expect("Equal lhs preflighted") == plan.comparison_dtype
+            {
                 plan.lhs
             } else {
                 g.cast(plan.lhs, plan.comparison_dtype)?
             };
-            let rhs = if g.dtype(plan.rhs).expect("Equal rhs preflighted") == plan.comparison_dtype {
+            let rhs = if g.dtype(plan.rhs).expect("Equal rhs preflighted") == plan.comparison_dtype
+            {
                 plan.rhs
             } else {
                 g.cast(plan.rhs, plan.comparison_dtype)?
@@ -6629,7 +7536,10 @@ pub(super) fn lower(
                 g.shape(output).expect("Equal shape preflighted"),
                 &plan.output_shape
             );
-            debug_assert_eq!(g.dtype(output).expect("Equal dtype preflighted"), DType::Bool);
+            debug_assert_eq!(
+                g.dtype(output).expect("Equal dtype preflighted"),
+                DType::Bool
+            );
             output
         }
         "Less" if ins.len() == 2 => {
@@ -6649,7 +7559,10 @@ pub(super) fn lower(
                 g.shape(output).expect("Less shape preflighted"),
                 &plan.output_shape
             );
-            debug_assert_eq!(g.dtype(output).expect("Less dtype preflighted"), DType::Bool);
+            debug_assert_eq!(
+                g.dtype(output).expect("Less dtype preflighted"),
+                DType::Bool
+            );
             output
         }
         "LessOrEqual" if ins.len() == 2 => {
@@ -6684,16 +7597,18 @@ pub(super) fn lower(
         }
         "Greater" if ins.len() == 2 => {
             let plan = greater_plan(g, &ins, &attrs, values)?;
-            let lhs = if g.dtype(plan.lhs).expect("Greater lhs preflighted") == plan.comparison_dtype {
-                plan.lhs
-            } else {
-                g.cast(plan.lhs, plan.comparison_dtype)?
-            };
-            let rhs = if g.dtype(plan.rhs).expect("Greater rhs preflighted") == plan.comparison_dtype {
-                plan.rhs
-            } else {
-                g.cast(plan.rhs, plan.comparison_dtype)?
-            };
+            let lhs =
+                if g.dtype(plan.lhs).expect("Greater lhs preflighted") == plan.comparison_dtype {
+                    plan.lhs
+                } else {
+                    g.cast(plan.lhs, plan.comparison_dtype)?
+                };
+            let rhs =
+                if g.dtype(plan.rhs).expect("Greater rhs preflighted") == plan.comparison_dtype {
+                    plan.rhs
+                } else {
+                    g.cast(plan.rhs, plan.comparison_dtype)?
+                };
             let output = g.gt(lhs, rhs)?;
             debug_assert_eq!(
                 g.shape(output).expect("Greater shape preflighted"),
@@ -6734,14 +7649,18 @@ pub(super) fn lower(
         }
         "Where" if ins.len() == 3 => {
             let plan = where_plan(g, &ins, &attrs, values)?;
-            let on_true = if g.dtype(plan.on_true).expect("Where true branch preflighted")
+            let on_true = if g
+                .dtype(plan.on_true)
+                .expect("Where true branch preflighted")
                 == plan.output_dtype
             {
                 plan.on_true
             } else {
                 g.cast(plan.on_true, plan.output_dtype)?
             };
-            let on_false = if g.dtype(plan.on_false).expect("Where false branch preflighted")
+            let on_false = if g
+                .dtype(plan.on_false)
+                .expect("Where false branch preflighted")
                 == plan.output_dtype
             {
                 plan.on_false
@@ -6881,19 +7800,26 @@ pub(super) fn lower(
             } else {
                 g.cast(plan.base, plan.work_dtype)?
             };
-            let exponent = if g.dtype(plan.exponent).expect("Pow exponent preflighted") == plan.work_dtype {
-                plan.exponent
-            } else {
-                g.cast(plan.exponent, plan.work_dtype)?
-            };
+            let exponent =
+                if g.dtype(plan.exponent).expect("Pow exponent preflighted") == plan.work_dtype {
+                    plan.exponent
+                } else {
+                    g.cast(plan.exponent, plan.work_dtype)?
+                };
             let value = g.pow(base, exponent)?;
             let output = if plan.integer_base {
                 g.cast(g.round(value)?, plan.output_dtype)?
             } else {
                 value
             };
-            debug_assert_eq!(g.shape(output).expect("Pow shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("Pow dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("Pow shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Pow dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "Sqrt" if ins.len() == 1 && attrs.is_empty() => {
@@ -7100,7 +8026,10 @@ pub(super) fn lower(
             let alpha = g.constant(plan.alpha);
             let scaled = g.mul(alpha, value)?;
             let output = g.select(negative, scaled, value)?;
-            debug_assert_eq!(g.shape(output).expect("LeakyRelu shape preflighted"), &plan.shape);
+            debug_assert_eq!(
+                g.shape(output).expect("LeakyRelu shape preflighted"),
+                &plan.shape
+            );
             debug_assert_eq!(
                 g.dtype(output).expect("LeakyRelu dtype preflighted"),
                 plan.output_dtype
@@ -7255,10 +8184,8 @@ pub(super) fn lower(
             extent(&branch_shape, output_dtype, "true branch")?;
             extent(&branch_shape, output_dtype, "false branch")?;
             extent(&output_shape, output_dtype, "output")?;
-            let alpha_value = TensorData::scalar_with_dtype(
-                Scalar::F(f64::from(alpha)),
-                comparison_dtype,
-            );
+            let alpha_value =
+                TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), comparison_dtype);
             let zero_value = TensorData::scalar_with_dtype(Scalar::I(0), output_dtype);
             extent(alpha_value.shape(), alpha_value.dtype(), "alpha scalar")?;
             extent(zero_value.shape(), zero_value.dtype(), "zero scalar")?;
@@ -7364,7 +8291,11 @@ pub(super) fn lower(
             } else {
                 x_dtype.promote(slope_dtype)
             };
-            let selected_x_dtype = if exceptional_promotion { DType::F32 } else { x_dtype };
+            let selected_x_dtype = if exceptional_promotion {
+                DType::F32
+            } else {
+                x_dtype
+            };
             if scaled_dtype != output_dtype
                 || selected_x_dtype.promote(scaled_dtype) != output_dtype
             {
@@ -7418,8 +8349,14 @@ pub(super) fn lower(
                 // Source clamp is `(value < min).where(min, value)`: ties
                 // and NaNs retain the prior value rather than using extrema.
                 value = g.select(g.lt(lhs, bound)?, bound, lhs)?;
-                debug_assert_eq!(g.shape(value).expect("Clip minimum preflighted"), &stage.shape);
-                debug_assert_eq!(g.dtype(value).expect("Clip minimum dtype preflighted"), stage.dtype);
+                debug_assert_eq!(
+                    g.shape(value).expect("Clip minimum preflighted"),
+                    &stage.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(value).expect("Clip minimum dtype preflighted"),
+                    stage.dtype
+                );
             }
             if let Some(stage) = plan.max {
                 let lhs = if g.dtype(value)? == stage.dtype {
@@ -7434,11 +8371,23 @@ pub(super) fn lower(
                 };
                 // Source then applies `(value > max).where(max, value)`.
                 value = g.select(g.gt(lhs, bound)?, bound, lhs)?;
-                debug_assert_eq!(g.shape(value).expect("Clip maximum preflighted"), &stage.shape);
-                debug_assert_eq!(g.dtype(value).expect("Clip maximum dtype preflighted"), stage.dtype);
+                debug_assert_eq!(
+                    g.shape(value).expect("Clip maximum preflighted"),
+                    &stage.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(value).expect("Clip maximum dtype preflighted"),
+                    stage.dtype
+                );
             }
-            debug_assert_eq!(g.shape(value).expect("Clip output preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(value).expect("Clip output dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(value).expect("Clip output preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(value).expect("Clip output dtype preflighted"),
+                plan.output_dtype
+            );
             value
         }
         "Dropout" if (1..=3).contains(&ins.len()) => {
@@ -7480,11 +8429,7 @@ pub(super) fn lower(
                         .map_err(|_| bad("Shape dimension exceeds I64"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let data = TensorData::from_scalars(
-                [values.len()],
-                DType::I64,
-                values,
-            )?;
+            let data = TensorData::from_scalars([values.len()], DType::I64, values)?;
             constants.insert(outs[0].to_owned(), data.clone());
             g.constant(data)
         }
@@ -7574,8 +8519,8 @@ pub(super) fn lower(
                 // Materialize the equivalent fixed-rank index only after all
                 // bounds and resulting-view extents have been checked.
                 let dim = input_shape.dims()[axis];
-                let dim_i64 = i64::try_from(dim)
-                    .map_err(|_| bad("Gather scalar axis extent exceeds I64"))?;
+                let dim_i64 =
+                    i64::try_from(dim).map_err(|_| bad("Gather scalar axis extent exceeds I64"))?;
                 let raw = data.scalar_at(0).as_i64();
                 let index = if raw < 0 {
                     raw.checked_add(dim_i64)
@@ -7583,12 +8528,7 @@ pub(super) fn lower(
                 } else {
                     raw
                 };
-                if index < 0
-                    || usize::try_from(index)
-                        .ok()
-                        .filter(|&i| i < dim)
-                        .is_none()
-                {
+                if index < 0 || usize::try_from(index).ok().filter(|&i| i < dim).is_none() {
                     return Err(bad("Gather scalar index is out of bounds"));
                 }
                 let mut index_dims = input_shape.dims().to_vec();
@@ -7632,7 +8572,10 @@ pub(super) fn lower(
                 g.shape(output).expect("Slice shape preflighted"),
                 &plan.output_shape
             );
-            debug_assert_eq!(g.dtype(output).expect("Slice dtype preflighted"), plan.dtype);
+            debug_assert_eq!(
+                g.dtype(output).expect("Slice dtype preflighted"),
+                plan.dtype
+            );
             output
         }
         "Pad" if (2..=3).contains(&ins.len()) => {
@@ -7711,9 +8654,7 @@ pub(super) fn lower(
             };
             g.full_with_dtype(shape, value, dtype)?
         }
-        "ReduceMin"
-            if (1..=2).contains(&ins.len()) =>
-        {
+        "ReduceMin" if (1..=2).contains(&ins.len()) => {
             if attrs
                 .keys()
                 .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
@@ -8113,7 +9054,11 @@ pub(super) fn lower(
             let inputs = [get(0)?, get(1)?, get(2)?, get(3)?, get(4)?];
             let plan = batch_norm_plan(g, inputs, &ins, &n, &attrs)?;
             let cast = |g: &mut Graph, input: NodeId, dtype: DType| -> Result<NodeId> {
-                if g.dtype(input)? == dtype { Ok(input) } else { g.cast(input, dtype) }
+                if g.dtype(input)? == dtype {
+                    Ok(input)
+                } else {
+                    g.cast(input, dtype)
+                }
             };
             // Tensor.batchnorm is literal: center, apply scale, then apply
             // the separately-rounded inverse standard deviation, then bias.
@@ -8145,17 +9090,33 @@ pub(super) fn lower(
             let normalized = cast(g, normalized, plan.output_dtype)?;
             let bias = cast(g, bias, plan.output_dtype)?;
             let output = g.add(normalized, bias)?;
-            debug_assert_eq!(g.shape(output).expect("BatchNormalization shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("BatchNormalization dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output)
+                    .expect("BatchNormalization shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output)
+                    .expect("BatchNormalization dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "LayerNormalization" if (2..=3).contains(&ins.len()) => {
             let input = get(0)?;
             let scale = get(1)?;
-            let bias = ins.get(2).filter(|name| !name.is_empty()).map(|_| get(2)).transpose()?;
+            let bias = ins
+                .get(2)
+                .filter(|name| !name.is_empty())
+                .map(|_| get(2))
+                .transpose()?;
             let plan = layer_normalization_plan(g, input, scale, bias, &n, &attrs)?;
             if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+                if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                }
             } else {
                 let count = g.constant(plan.count);
                 let epsilon = g.constant(plan.epsilon);
@@ -8163,18 +9124,42 @@ pub(super) fn lower(
                 // F32 sums/divisions for both moments, then restore X before
                 // the live scale/bias promotion boundary.
                 let x32 = g.cast(input, DType::F32)?;
-                let mean_sum = g.reduce_with_dtypes(x32, ReduceKind::Sum, Some(plan.axes.clone()), true, plan.sum_dtypes)?;
+                let mean_sum = g.reduce_with_dtypes(
+                    x32,
+                    ReduceKind::Sum,
+                    Some(plan.axes.clone()),
+                    true,
+                    plan.sum_dtypes,
+                )?;
                 let mean = g.mul(mean_sum, g.reciprocal(count)?)?;
                 let centered = g.sub(x32, mean)?;
-                let variance_sum = g.reduce_with_dtypes(g.mul(centered, centered)?, ReduceKind::Sum, Some(plan.axes), true, plan.sum_dtypes)?;
+                let variance_sum = g.reduce_with_dtypes(
+                    g.mul(centered, centered)?,
+                    ReduceKind::Sum,
+                    Some(plan.axes),
+                    true,
+                    plan.sum_dtypes,
+                )?;
                 let variance = g.mul(variance_sum, g.reciprocal(count)?)?;
                 let inv_std_dev = g.rsqrt(g.add(variance, epsilon)?)?;
                 let normalized = g.mul(centered, inv_std_dev)?;
                 let restored = g.cast(normalized, plan.input_dtype)?;
                 let output = g.mul(restored, scale)?;
-                let output = if let Some(bias) = bias { g.add(output, bias)? } else { output };
-                debug_assert_eq!(g.shape(output).expect("LayerNormalization shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("LayerNormalization dtype preflighted"), plan.output_dtype);
+                let output = if let Some(bias) = bias {
+                    g.add(output, bias)?
+                } else {
+                    output
+                };
+                debug_assert_eq!(
+                    g.shape(output)
+                        .expect("LayerNormalization shape preflighted"),
+                    &plan.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(output)
+                        .expect("LayerNormalization dtype preflighted"),
+                    plan.output_dtype
+                );
                 output
             }
         }
@@ -8197,15 +9182,25 @@ pub(super) fn lower(
             let norm = g.rsqrt(g.add(mean, epsilon)?)?;
             let normalized = g.mul(input, norm)?;
             let output = g.mul(normalized, scale)?;
-            debug_assert_eq!(g.shape(output).expect("RMSNormalization shape preflighted"), &plan.shape);
-            debug_assert_eq!(g.dtype(output).expect("RMSNormalization dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("RMSNormalization shape preflighted"),
+                &plan.shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("RMSNormalization dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "MeanVarianceNormalization" if ins.len() == 1 => {
             let input = get(0)?;
             let plan = mean_variance_normalization_plan(g, input, &n, &attrs)?;
             if plan.empty {
-                if plan.input_dtype == plan.work_dtype { input } else { g.cast(input, plan.work_dtype)? }
+                if plan.input_dtype == plan.work_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.work_dtype)?
+                }
             } else {
                 let count = g.constant(plan.count);
                 let epsilon = g.constant(plan.epsilon);
@@ -8213,22 +9208,52 @@ pub(super) fn lower(
                 // The source computes X.mean twice: once for the numerator
                 // and again inside std(correction=0). Keep their narrowing
                 // points separate rather than reusing a generic variance.
-                let mean_sum = g.reduce_with_dtypes(input, ReduceKind::Sum, Some(plan.axes.clone()), true, sum_dtypes)?;
+                let mean_sum = g.reduce_with_dtypes(
+                    input,
+                    ReduceKind::Sum,
+                    Some(plan.axes.clone()),
+                    true,
+                    sum_dtypes,
+                )?;
                 let mean = g.cast(g.mul(mean_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
                 let numerator = g.sub(input, mean)?;
-                let variance_mean_sum = g.reduce_with_dtypes(input, ReduceKind::Sum, Some(plan.axes.clone()), true, sum_dtypes)?;
-                let variance_mean = g.cast(g.mul(variance_mean_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
+                let variance_mean_sum = g.reduce_with_dtypes(
+                    input,
+                    ReduceKind::Sum,
+                    Some(plan.axes.clone()),
+                    true,
+                    sum_dtypes,
+                )?;
+                let variance_mean = g.cast(
+                    g.mul(variance_mean_sum, g.reciprocal(count)?)?,
+                    plan.work_dtype,
+                )?;
                 let deviations = g.sub(input, variance_mean)?;
                 let squares = g.square(deviations)?;
                 // `Tensor.var` explicitly recasts the storage-width squares
                 // to sum_acc_dtype(original X), including its integer paths.
                 let squares = g.cast(squares, plan.sum_dtype)?;
-                let variance_sum = g.reduce_with_dtypes(squares, ReduceKind::Sum, Some(plan.axes), true, sum_dtypes)?;
-                let variance = g.cast(g.mul(variance_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
+                let variance_sum = g.reduce_with_dtypes(
+                    squares,
+                    ReduceKind::Sum,
+                    Some(plan.axes),
+                    true,
+                    sum_dtypes,
+                )?;
+                let variance =
+                    g.cast(g.mul(variance_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
                 let denominator = g.add(g.sqrt(variance)?, epsilon)?;
                 let output = g.mul(numerator, g.reciprocal(denominator)?)?;
-                debug_assert_eq!(g.shape(output).expect("MeanVarianceNormalization shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("MeanVarianceNormalization dtype preflighted"), plan.work_dtype);
+                debug_assert_eq!(
+                    g.shape(output)
+                        .expect("MeanVarianceNormalization shape preflighted"),
+                    &plan.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(output)
+                        .expect("MeanVarianceNormalization dtype preflighted"),
+                    plan.work_dtype
+                );
                 output
             }
         }
@@ -8236,7 +9261,11 @@ pub(super) fn lower(
             let input = get(0)?;
             let plan = lp_normalization_plan(g, input, &n, &attrs)?;
             if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+                if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                }
             } else {
                 let base = if plan.l1 {
                     // Tensor.abs is `x * sign(x)`, retaining -0 and wrapping
@@ -8246,12 +9275,28 @@ pub(super) fn lower(
                     // Tensor.square is literally x*x, not UnaryOp::Square.
                     g.mul(input, input)?
                 };
-                let summed = g.reduce_with_dtypes(base, ReduceKind::Sum, Some(plan.axes), true, plan.sum_dtypes)?;
+                let summed = g.reduce_with_dtypes(
+                    base,
+                    ReduceKind::Sum,
+                    Some(plan.axes),
+                    true,
+                    plan.sum_dtypes,
+                )?;
                 let denominator = if plan.l1 { summed } else { g.sqrt(summed)? };
-                debug_assert_eq!(g.dtype(denominator).expect("LpNormalization denominator preflighted"), plan.denominator_dtype);
+                debug_assert_eq!(
+                    g.dtype(denominator)
+                        .expect("LpNormalization denominator preflighted"),
+                    plan.denominator_dtype
+                );
                 let output = g.mul(input, g.reciprocal(denominator)?)?;
-                debug_assert_eq!(g.shape(output).expect("LpNormalization shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("LpNormalization dtype preflighted"), plan.output_dtype);
+                debug_assert_eq!(
+                    g.shape(output).expect("LpNormalization shape preflighted"),
+                    &plan.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(output).expect("LpNormalization dtype preflighted"),
+                    plan.output_dtype
+                );
                 output
             }
         }
@@ -8259,8 +9304,14 @@ pub(super) fn lower(
             let inputs = (0..ins.len()).map(get).collect::<Result<Vec<_>>>()?;
             let plan = einsum_plan(g, &inputs, &n, &attrs)?;
             let output = g.einsum(&plan.equation, &plan.inputs)?;
-            debug_assert_eq!(g.shape(output).expect("Einsum shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("Einsum dtype preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("Einsum shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Einsum dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "GlobalAveragePool" if ins.len() == 1 && attrs.is_empty() => {
@@ -8277,11 +9328,27 @@ pub(super) fn lower(
                 true,
                 ReductionDType::new(plan.sum_dtypes.accumulator, plan.sum_dtypes.accumulator),
             )?;
-            let summed = if plan.work_dtype == plan.sum_dtypes.accumulator { summed } else { g.cast(summed, plan.work_dtype)? };
+            let summed = if plan.work_dtype == plan.sum_dtypes.accumulator {
+                summed
+            } else {
+                g.cast(summed, plan.work_dtype)?
+            };
             let average = g.div(summed, g.constant(plan.divisor))?;
-            let output = if plan.output_dtype == plan.work_dtype { average } else { g.cast(average, plan.output_dtype)? };
-            debug_assert_eq!(g.shape(output).expect("GlobalAveragePool shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("GlobalAveragePool dtype preflighted"), plan.output_dtype);
+            let output = if plan.output_dtype == plan.work_dtype {
+                average
+            } else {
+                g.cast(average, plan.output_dtype)?
+            };
+            debug_assert_eq!(
+                g.shape(output)
+                    .expect("GlobalAveragePool shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output)
+                    .expect("GlobalAveragePool dtype preflighted"),
+                plan.output_dtype
+            );
             output
         }
         "GlobalMaxPool" if ins.len() == 1 && attrs.is_empty() => {
@@ -8301,8 +9368,14 @@ pub(super) fn lower(
                 // than becoming a populated identity tensor.
                 g.reduce(x, ReduceKind::Max, Some(plan.axes), true)?
             };
-            debug_assert_eq!(g.shape(output).expect("GlobalMaxPool shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(output).expect("GlobalMaxPool dtype preflighted"), plan.dtype);
+            debug_assert_eq!(
+                g.shape(output).expect("GlobalMaxPool shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("GlobalMaxPool dtype preflighted"),
+                plan.dtype
+            );
             output
         }
         "CumSum" if ins.len() == 2 => {
@@ -8361,10 +9434,30 @@ pub(super) fn lower(
         "DequantizeLinear" if (2..=3).contains(&ins.len()) => {
             let inputs = (0..ins.len()).map(|i| get(i)).collect::<Result<Vec<_>>>()?;
             let plan = dequantize_linear_plan(g, &inputs, &ins, &n, &attrs)?;
-            let DequantizeLinearPlan { x: plan_x, scale: plan_scale, zero: plan_zero, scale_plan, zero_plan, subtract_dtype, multiply_dtype, output_dtype, shape } = plan;
-            let cast = |g: &mut Graph, id: NodeId, dtype: DType| -> Result<NodeId> { if g.dtype(id)? == dtype { Ok(id) } else { g.cast(id, dtype) } };
+            let DequantizeLinearPlan {
+                x: plan_x,
+                scale: plan_scale,
+                zero: plan_zero,
+                scale_plan,
+                zero_plan,
+                subtract_dtype,
+                multiply_dtype,
+                output_dtype,
+                shape,
+            } = plan;
+            let cast = |g: &mut Graph, id: NodeId, dtype: DType| -> Result<NodeId> {
+                if g.dtype(id)? == dtype {
+                    Ok(id)
+                } else {
+                    g.cast(id, dtype)
+                }
+            };
             let scale = emit_quant_parameter(g, plan_scale, scale_plan)?;
-            let zero = match (plan_zero, zero_plan) { (Some(z), Some(parameter_plan)) => emit_quant_parameter(g, z, parameter_plan)?, (None, None) => g.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32)), _ => unreachable!("DequantizeLinear plan pairs zero with its preparation") };
+            let zero = match (plan_zero, zero_plan) {
+                (Some(z), Some(parameter_plan)) => emit_quant_parameter(g, z, parameter_plan)?,
+                (None, None) => g.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32)),
+                _ => unreachable!("DequantizeLinear plan pairs zero with its preparation"),
+            };
             let x = cast(g, plan_x, DType::I32)?;
             let x = cast(g, x, subtract_dtype)?;
             let zero = cast(g, zero, subtract_dtype)?;
@@ -8373,7 +9466,10 @@ pub(super) fn lower(
             let scale = cast(g, scale, multiply_dtype)?;
             let output = g.mul(difference, scale)?;
             let output = cast(g, output, output_dtype)?;
-            debug_assert_eq!(g.shape(output).expect("DequantizeLinear shape preflighted"), &shape);
+            debug_assert_eq!(
+                g.shape(output).expect("DequantizeLinear shape preflighted"),
+                &shape
+            );
             output
         }
         "Conv" if ins.len() == 2 || ins.len() == 3 => {

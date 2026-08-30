@@ -1,9 +1,9 @@
-use super::*;
 use super::creation::lazy_arange_default_int_plan;
+use super::*;
 use crate::nn::{ParameterId, ParameterSnapshot};
 use crate::{
-    CompileTrace, DType, EinsumPlan, Error, ReduceKind, ReductionDType, Result, Scalar, Shape,
-    SplitSections, SymbolicShape, SymbolicVar, TensorData, TraceStep,
+    CompileTrace, DType, EinsumPlan, Error, LiteralScalar, ReduceKind, ReductionDType, Result,
+    Scalar, Shape, SplitSections, SymbolicShape, SymbolicVar, TensorData, TraceStep,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -370,7 +370,8 @@ fn source_dot_plan(
     lhs_dims.push(lhs_source_shape.dims()[lhs_source_shape.rank() - 1]);
     let lhs_shape = Shape::new(lhs_dims);
 
-    let mut rhs_dims = rhs_source_shape.dims()[..rhs_source_shape.rank().saturating_sub(2)].to_vec();
+    let mut rhs_dims =
+        rhs_source_shape.dims()[..rhs_source_shape.rank().saturating_sub(2)].to_vec();
     if insert_singleton {
         rhs_dims.push(1);
     }
@@ -391,7 +392,9 @@ fn source_dot_plan(
     let rhs_shape = Shape::new(rhs_transposed_dims);
     let product_shape = lhs_shape.broadcast_with(&rhs_shape)?;
     let mut output_dims = product_shape.dims().to_vec();
-    output_dims.pop().expect("source dot inputs have rank at least one");
+    output_dims
+        .pop()
+        .expect("source dot inputs have rank at least one");
     let output_shape = Shape::new(output_dims);
     let operand_dtype = super::elementwise::source_lub(lhs_dtype, rhs_dtype);
     let sum_dtypes = dtype
@@ -504,8 +507,16 @@ fn lower_linear(
     bias: Option<NodeId>,
     dtype: Option<DType>,
 ) -> Result<NodeId> {
-    let input = if let Some(dtype) = dtype { graph.cast(input, dtype)? } else { input };
-    let weight = if let Some(dtype) = dtype { graph.cast(weight, dtype)? } else { weight };
+    let input = if let Some(dtype) = dtype {
+        graph.cast(input, dtype)?
+    } else {
+        input
+    };
+    let weight = if let Some(dtype) = dtype {
+        graph.cast(weight, dtype)?
+    } else {
+        weight
+    };
     let bias = if let (Some(bias), Some(dtype)) = (bias, dtype) {
         Some(graph.cast(bias, dtype)?)
     } else {
@@ -516,7 +527,11 @@ fn lower_linear(
     } else {
         graph.dot_default(input, weight)?
     };
-    if let Some(bias) = bias { graph.add(output, bias) } else { Ok(output) }
+    if let Some(bias) = bias {
+        graph.add(output, bias)
+    } else {
+        Ok(output)
+    }
 }
 
 fn pad_zero(value: Scalar) -> bool {
@@ -535,7 +550,8 @@ fn signed_pad_bounds(shape: &Shape, padding: &[(i64, i64)]) -> Result<Vec<(usize
         .zip(padding)
         .enumerate()
         .map(|(axis, (&dimension, &(before, after)))| {
-            let dimension = i128::try_from(dimension).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            let dimension =
+                i128::try_from(dimension).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
             let start = (-i128::from(before)).max(0);
             let end = (dimension + i128::from(after)).min(dimension);
             if end < 0 || start > end {
@@ -597,16 +613,27 @@ fn lower_pad_mode(
                 // `_pad_constant`: Bool const_like -> zero Pad ->
                 // `mask.where(base, Python_fill)`. The scalar false branch
                 // owns tinygrad's weak commitment and possible output lift.
-                let mask = graph.lazy_full_with_dtype(graph.shape(value)?.clone(), Scalar::Bool(true), DType::Bool)?;
+                let mask = graph.lazy_full_with_dtype(
+                    graph.shape(value)?.clone(),
+                    Scalar::Bool(true),
+                    DType::Bool,
+                )?;
                 let mask = graph.pad(mask, positive, Scalar::Bool(false))?;
                 graph.where_false_scalar(mask, base, fill)
             }
         }
         PadMode::Circular => {
             let cropped_shape = graph.shape(value)?.clone();
-            for (axis, (&dimension, &(before, after))) in cropped_shape.dims().iter().zip(&positive).enumerate() {
+            for (axis, (&dimension, &(before, after))) in
+                cropped_shape.dims().iter().zip(&positive).enumerate()
+            {
                 if before > dimension || after > dimension {
-                    return Err(Error::InvalidBounds { axis, start: before, end: after, dim: dimension });
+                    return Err(Error::InvalidBounds {
+                        axis,
+                        start: before,
+                        end: after,
+                        dim: dimension,
+                    });
                 }
             }
             let repeats = positive
@@ -616,15 +643,32 @@ fn lower_pad_mode(
             // tinygrad permits `repeat(())` for the rank-zero circular
             // no-op, while RustGrad's public repeat intentionally rejects an
             // empty repeat list. Keep that source-local scalar identity here.
-            let repeated = if repeats.is_empty() { value } else { graph.repeat(value, &repeats)? };
+            let repeated = if repeats.is_empty() {
+                value
+            } else {
+                graph.repeat(value, &repeats)?
+            };
             let repeated_shape = graph.shape(repeated)?.clone();
             let bounds = positive
                 .iter()
                 .zip(cropped_shape.dims())
                 .zip(repeated_shape.dims())
                 .map(|((&(before, after), &original), &expanded)| {
-                    let start = if before == 0 { 0 } else { original.checked_sub(before).ok_or_else(|| Error::ShapeOverflow(cropped_shape.clone()))? };
-                    let end = if after == 0 { expanded } else { expanded.checked_sub(original).and_then(|value| value.checked_add(after)).ok_or_else(|| Error::ShapeOverflow(cropped_shape.clone()))? };
+                    let start = if before == 0 {
+                        0
+                    } else {
+                        original
+                            .checked_sub(before)
+                            .ok_or_else(|| Error::ShapeOverflow(cropped_shape.clone()))?
+                    };
+                    let end = if after == 0 {
+                        expanded
+                    } else {
+                        expanded
+                            .checked_sub(original)
+                            .and_then(|value| value.checked_add(after))
+                            .ok_or_else(|| Error::ShapeOverflow(cropped_shape.clone()))?
+                    };
                     Ok((start, end))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -636,19 +680,47 @@ fn lower_pad_mode(
                 let current_shape = graph.shape(value)?.clone();
                 let dimension = current_shape.dims()[axis];
                 if mode == PadMode::Reflect && (before >= dimension || after >= dimension) {
-                    return Err(Error::InvalidBounds { axis, start: before, end: after, dim: dimension });
+                    return Err(Error::InvalidBounds {
+                        axis,
+                        start: before,
+                        end: after,
+                        dim: dimension,
+                    });
                 }
                 if mode == PadMode::Replicate && (before != 0 || after != 0) && dimension == 0 {
-                    return Err(Error::InvalidBounds { axis, start: before, end: after, dim: dimension });
+                    return Err(Error::InvalidBounds {
+                        axis,
+                        start: before,
+                        end: after,
+                        dim: dimension,
+                    });
                 }
                 let mut pieces = Vec::with_capacity(3);
                 if before != 0 {
                     let part = if mode == PadMode::Reflect {
-                        let mut slices = vec![Slice { start: None, stop: None, step: 1 }; shape.rank()];
-                        slices[axis] = Slice { start: Some(isize::try_from(before).map_err(|_| Error::ShapeOverflow(current_shape.clone()))?), stop: Some(0), step: -1 };
+                        let mut slices = vec![
+                            Slice {
+                                start: None,
+                                stop: None,
+                                step: 1
+                            };
+                            shape.rank()
+                        ];
+                        slices[axis] = Slice {
+                            start: Some(
+                                isize::try_from(before)
+                                    .map_err(|_| Error::ShapeOverflow(current_shape.clone()))?,
+                            ),
+                            stop: Some(0),
+                            step: -1,
+                        };
                         graph.stride(value, slices)?
                     } else {
-                        let mut bounds = current_shape.dims().iter().map(|&end| (0, end)).collect::<Vec<_>>();
+                        let mut bounds = current_shape
+                            .dims()
+                            .iter()
+                            .map(|&end| (0, end))
+                            .collect::<Vec<_>>();
                         bounds[axis] = (0, 1);
                         let part = graph.shrink(value, bounds)?;
                         let mut expanded = current_shape.dims().to_vec();
@@ -660,17 +732,40 @@ fn lower_pad_mode(
                 pieces.push(value);
                 if after != 0 {
                     let part = if mode == PadMode::Reflect {
-                        let start = dimension.checked_sub(2).ok_or_else(|| Error::ShapeOverflow(current_shape.clone()))?;
-                        let stop = dimension.checked_sub(2).and_then(|value| value.checked_sub(after));
-                        let mut slices = vec![Slice { start: None, stop: None, step: 1 }; shape.rank()];
+                        let start = dimension
+                            .checked_sub(2)
+                            .ok_or_else(|| Error::ShapeOverflow(current_shape.clone()))?;
+                        let stop = dimension
+                            .checked_sub(2)
+                            .and_then(|value| value.checked_sub(after));
+                        let mut slices = vec![
+                            Slice {
+                                start: None,
+                                stop: None,
+                                step: 1
+                            };
+                            shape.rank()
+                        ];
                         slices[axis] = Slice {
-                            start: Some(isize::try_from(start).map_err(|_| Error::ShapeOverflow(current_shape.clone()))?),
-                            stop: stop.map(|value| isize::try_from(value).map_err(|_| Error::ShapeOverflow(current_shape.clone()))).transpose()?,
+                            start: Some(
+                                isize::try_from(start)
+                                    .map_err(|_| Error::ShapeOverflow(current_shape.clone()))?,
+                            ),
+                            stop: stop
+                                .map(|value| {
+                                    isize::try_from(value)
+                                        .map_err(|_| Error::ShapeOverflow(current_shape.clone()))
+                                })
+                                .transpose()?,
                             step: -1,
                         };
                         graph.stride(value, slices)?
                     } else {
-                        let mut bounds = current_shape.dims().iter().map(|&end| (0, end)).collect::<Vec<_>>();
+                        let mut bounds = current_shape
+                            .dims()
+                            .iter()
+                            .map(|&end| (0, end))
+                            .collect::<Vec<_>>();
                         bounds[axis] = (dimension - 1, dimension);
                         let part = graph.shrink(value, bounds)?;
                         let mut expanded = current_shape.dims().to_vec();
@@ -679,7 +774,11 @@ fn lower_pad_mode(
                     };
                     pieces.push(part);
                 }
-                value = if pieces.len() == 1 { value } else { graph.cat(pieces[0], pieces[1..].to_vec(), axis as isize)? };
+                value = if pieces.len() == 1 {
+                    value
+                } else {
+                    graph.cat(pieces[0], pieces[1..].to_vec(), axis as isize)?
+                };
             }
             let bounds = signed_pad_bounds(graph.shape(value)?, padding)?;
             graph.shrink(value, bounds)
@@ -696,15 +795,31 @@ fn pad_mode_plan(
 ) -> Result<PadModePlan> {
     let node = graph.node(input)?;
     if padding.len() != node.shape.rank() {
-        return Err(Error::InvalidMovementRank { op: "pad_with_mode", expected: node.shape.rank(), actual: padding.len() });
+        return Err(Error::InvalidMovementRank {
+            op: "pad_with_mode",
+            expected: node.shape.rank(),
+            actual: padding.len(),
+        });
     }
-    node.shape.numel()?.checked_mul(node.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))?;
+    node.shape
+        .numel()?
+        .checked_mul(node.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))?;
     let mut rehearsal = graph.clone();
     let output = lower_pad_mode(&mut rehearsal, input, &padding, mode, fill)?;
     let output_shape = rehearsal.shape(output)?.clone();
     let output_dtype = rehearsal.dtype(output)?;
-    output_shape.numel()?.checked_mul(output_dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
-    Ok(PadModePlan { padding, mode, fill, output_shape, output_dtype })
+    output_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    Ok(PadModePlan {
+        padding,
+        mode,
+        fill,
+        output_shape,
+        output_dtype,
+    })
 }
 
 fn pad_to_plan(
@@ -758,7 +873,10 @@ fn lower_pad_to(graph: &mut Graph, input: NodeId, plan: &PadToPlan) -> Result<No
         .iter()
         .zip(plan.source_shape.dims())
         .any(|(&(start, end), &dimension)| start != 0 || end != dimension);
-    let padded = plan.positive.iter().any(|&(before, after)| before != 0 || after != 0);
+    let padded = plan
+        .positive
+        .iter()
+        .any(|&(before, after)| before != 0 || after != 0);
     let base = if cropped {
         graph.shrink(input, plan.bounds.clone())?
     } else {
@@ -774,7 +892,8 @@ fn lower_pad_to(graph: &mut Graph, input: NodeId, plan: &PadToPlan) -> Result<No
     if !plan.changed || pad_zero(plan.fill) {
         return Ok(base);
     }
-    let mask = graph.lazy_full_with_dtype(plan.source_shape.clone(), Scalar::Bool(true), DType::Bool)?;
+    let mask =
+        graph.lazy_full_with_dtype(plan.source_shape.clone(), Scalar::Bool(true), DType::Bool)?;
     let mask = if cropped {
         graph.shrink(mask, plan.bounds.clone())?
     } else {
@@ -829,7 +948,10 @@ fn shrink_to_plan(
         .numel()?
         .checked_mul(source.dtype.itemsize())
         .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
-    Ok(ShrinkToPlan { bounds, output_shape })
+    Ok(ShrinkToPlan {
+        bounds,
+        output_shape,
+    })
 }
 
 fn cat_source_lub(lhs: DType, rhs: DType) -> DType {
@@ -891,7 +1013,12 @@ fn scatter_min_identity(dtype: DType) -> Scalar {
     }
 }
 
-fn scatter_pad_to(graph: &mut Graph, input: NodeId, target: &Shape, fill: Scalar) -> Result<NodeId> {
+fn scatter_pad_to(
+    graph: &mut Graph,
+    input: NodeId,
+    target: &Shape,
+    fill: Scalar,
+) -> Result<NodeId> {
     let shape = graph.shape(input)?.clone();
     if shape.rank() != target.rank() {
         return Err(Error::InvalidMovementRank {
@@ -906,12 +1033,15 @@ fn scatter_pad_to(graph: &mut Graph, input: NodeId, target: &Shape, fill: Scalar
         .zip(target.dims())
         .enumerate()
         .map(|(axis, (&current, &wanted))| {
-            wanted.checked_sub(current).map(|after| (0, after)).ok_or(Error::InvalidBounds {
-                axis,
-                start: current,
-                end: current,
-                dim: wanted,
-            })
+            wanted
+                .checked_sub(current)
+                .map(|after| (0, after))
+                .ok_or(Error::InvalidBounds {
+                    axis,
+                    start: current,
+                    end: current,
+                    dim: wanted,
+                })
         })
         .collect::<Result<Vec<_>>>()?;
     graph.pad(input, padding, fill)
@@ -998,7 +1128,11 @@ fn scatter_reduce_plan(
         .numel()?
         .checked_mul(output_dtype.itemsize())
         .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
-    Ok(ScatterReducePlan { output_shape, output_dtype, ..plan })
+    Ok(ScatterReducePlan {
+        output_shape,
+        output_dtype,
+        ..plan
+    })
 }
 
 fn lower_pre_scatter(
@@ -1062,27 +1196,43 @@ fn lower_scatter_reduce(
     match plan.kind {
         ScatterReduceKind::Sum => {
             let updates = selected_sum(graph)?;
-            let self_or_zero = if plan.include_self { base } else { no_self(graph, base, cat_zero(plan.base_dtype))? };
+            let self_or_zero = if plan.include_self {
+                base
+            } else {
+                no_self(graph, base, cat_zero(plan.base_dtype))?
+            };
             graph.add(updates, self_or_zero)
         }
         ScatterReduceKind::Prod => {
             let selected = graph.where_false_scalar(mask, src, scatter_one(plan.base_dtype))?;
             let updates = graph.prod_with_options(selected, axes, false, None)?;
-            let self_or_one = if plan.include_self { base } else { no_self(graph, base, scatter_one(plan.base_dtype))? };
+            let self_or_one = if plan.include_self {
+                base
+            } else {
+                no_self(graph, base, scatter_one(plan.base_dtype))?
+            };
             graph.mul(updates, self_or_one)
         }
         ScatterReduceKind::Amax => {
             let identity = scatter_max_identity(plan.base_dtype);
             let selected = graph.where_false_scalar(mask, src, identity)?;
             let updates = graph.max_with_axes(selected, axes, false)?;
-            let self_or_identity = if plan.include_self { base } else { no_self(graph, base, identity)? };
+            let self_or_identity = if plan.include_self {
+                base
+            } else {
+                no_self(graph, base, identity)?
+            };
             graph.maximum(updates, self_or_identity)
         }
         ScatterReduceKind::Amin => {
             let identity = scatter_min_identity(plan.base_dtype);
             let selected = graph.where_false_scalar(mask, src, identity)?;
             let updates = graph.min_with_axes(selected, axes, false)?;
-            let self_or_identity = if plan.include_self { base } else { no_self(graph, base, identity)? };
+            let self_or_identity = if plan.include_self {
+                base
+            } else {
+                no_self(graph, base, identity)?
+            };
             graph.minimum(updates, self_or_identity)
         }
         ScatterReduceKind::Mean => {
@@ -1097,7 +1247,11 @@ fn lower_scatter_reduce(
                 graph.add(count, graph.where_scalars(inverse, one, zero)?)?
             };
             let updates = selected_sum(graph)?;
-            let self_or_zero = if plan.include_self { base } else { no_self(graph, base, cat_zero(plan.base_dtype))? };
+            let self_or_zero = if plan.include_self {
+                base
+            } else {
+                no_self(graph, base, cat_zero(plan.base_dtype))?
+            };
             let values = graph.add(updates, self_or_zero)?;
             graph.div(values, count)
         }
@@ -1117,7 +1271,9 @@ fn scatter_plan(
     let base_shape = base_node.shape.clone();
     let index_shape = index_node.shape.clone();
     if !index_node.dtype.is_integer() {
-        return Err(Error::InvalidRandom { reason: "scatter requires integer indices" });
+        return Err(Error::InvalidRandom {
+            reason: "scatter requires integer indices",
+        });
     }
     if base_shape.rank() != index_shape.rank() {
         return Err(Error::InvalidMovementRank {
@@ -1147,7 +1303,10 @@ fn scatter_plan(
         });
     }
     if src_dtype != base_node.dtype {
-        return Err(Error::InvalidElementwiseDType { op: "scatter", actual: src_dtype });
+        return Err(Error::InvalidElementwiseDType {
+            op: "scatter",
+            actual: src_dtype,
+        });
     }
     for (axis, ((&base_extent, &index_extent), &src_extent)) in base_shape
         .dims()
@@ -1192,7 +1351,11 @@ fn scatter_plan(
         .numel()?
         .checked_mul(output_dtype.itemsize())
         .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
-    Ok(ScatterPlan { output_shape, output_dtype, ..plan })
+    Ok(ScatterPlan {
+        output_shape,
+        output_dtype,
+        ..plan
+    })
 }
 
 fn lower_scatter(
@@ -1239,9 +1402,9 @@ fn lower_scatter(
                 .split(mask, SplitSections::Uniform(1), -1)?
                 .into_iter()
                 .zip(graph.split(values, SplitSections::Uniform(1), -1)?);
-            let (mut mask, mut values) = parts
-                .next()
-                .ok_or(Error::InvalidRandom { reason: "scatter masked merge requires a synthetic axis" })?;
+            let (mut mask, mut values) = parts.next().ok_or(Error::InvalidRandom {
+                reason: "scatter masked merge requires a synthetic axis",
+            })?;
             for (next_mask, next_value) in parts {
                 values = graph.select(next_mask, next_value, values)?;
                 mask = graph.logical_or(mask, next_mask)?;
@@ -1373,7 +1536,9 @@ fn split_plan(
         }
         SplitSections::Explicit(lengths) => {
             let total = lengths.iter().try_fold(0usize, |total, &length| {
-                total.checked_add(length).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                total
+                    .checked_add(length)
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
             })?;
             if total != axis_len {
                 return Err(Error::InvalidBounds {
@@ -1454,7 +1619,8 @@ fn cat_plan(graph: &Graph, input: NodeId, args: Vec<NodeId>, dim: isize) -> Resu
             rank,
         });
     }
-    let rank_isize = isize::try_from(rank).map_err(|_| Error::ShapeOverflow(first_shape.clone()))?;
+    let rank_isize =
+        isize::try_from(rank).map_err(|_| Error::ShapeOverflow(first_shape.clone()))?;
     let resolved = if dim < 0 {
         dim.checked_add(rank_isize).ok_or(Error::InvalidAxis {
             node: input,
@@ -1508,7 +1674,9 @@ fn cat_plan(graph: &Graph, input: NodeId, args: Vec<NodeId>, dim: isize) -> Resu
         let output_dtype = descriptors
             .iter()
             .skip(1)
-            .fold(descriptors[0].1, |dtype, (_, next)| cat_source_lub(dtype, *next));
+            .fold(descriptors[0].1, |dtype, (_, next)| {
+                cat_source_lub(dtype, *next)
+            });
         let mut stack_dims = first_shape.dims().to_vec();
         stack_dims.insert(axis, inputs.len());
         let stack_shape = Shape::new(stack_dims);
@@ -1535,7 +1703,13 @@ fn cat_plan(graph: &Graph, input: NodeId, args: Vec<NodeId>, dim: isize) -> Resu
                     .dims()
                     .iter()
                     .enumerate()
-                    .map(|(index, _)| if index == axis { (before, after) } else { (0, 0) })
+                    .map(|(index, _)| {
+                        if index == axis {
+                            (before, after)
+                        } else {
+                            (0, 0)
+                        }
+                    })
                     .collect::<Vec<_>>())
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1577,6 +1751,40 @@ impl Graph {
         Self::default()
     }
 
+    /// Preserves a floating probability tensor after CPU validation that every
+    /// lane is finite and nonnegative and every row along `axis` has positive
+    /// total weight. Validation happens at realization, before dependent work.
+    pub fn tensor_guard_distribution(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        let source = self.node(input)?;
+        if !source.dtype.is_float() {
+            return Err(Error::InvalidRandom {
+                reason: "tensor guard distribution requires floating dtype",
+            });
+        }
+        let rank = source.shape.rank();
+        if !(1..=2).contains(&rank) {
+            return Err(Error::InvalidRandom {
+                reason: "tensor guard distribution requires rank one or two",
+            });
+        }
+        let axis = if axis < 0 { axis + rank as isize } else { axis };
+        if axis < 0 || axis >= rank as isize {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank,
+            });
+        }
+        Ok(self.push(
+            Op::TensorGuard {
+                input,
+                axis: axis as usize,
+            },
+            source.shape.clone(),
+            source.dtype,
+        ))
+    }
+
     /// Stable graph identity used by diagnostics and graph-owned resources.
     pub fn id(&self) -> u64 {
         self.id
@@ -1591,7 +1799,10 @@ impl Graph {
     /// concrete shape is `[count, input_rank]` after realization.
     pub fn nonzero(&mut self, input: NodeId) -> Result<DynamicNodeId> {
         self.node(input)?;
-        let id = DynamicNodeId(self.dynamic_nodes.len());
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
         self.dynamic_nodes.push(DynamicNode::nonzero(input));
         Ok(id)
     }
@@ -1665,22 +1876,122 @@ impl Graph {
                 index: mask_node.shape.clone(),
             });
         }
-        let id = DynamicNodeId(self.dynamic_nodes.len());
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
         self.dynamic_nodes
             .push(DynamicNode::masked_select(input, mask, source.dtype));
         Ok(id)
     }
 
+    /// Builds the exact CPU allocation contract for one runtime-cardinality
+    /// result without introducing a bounded placeholder into the static graph.
+    pub fn dynamic_allocation_plan(
+        &self,
+        output: DynamicNodeId,
+    ) -> std::result::Result<DynamicAllocationPlan, DynamicAllocationError> {
+        DynamicAllocationPlan::for_output(self, output)
+    }
+
     /// Reduces a dynamic result to a scalar dynamic loss.
     pub fn dynamic_sum(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
         let dtype = self.dynamic_node(input)?.dtype;
-        let id = DynamicNodeId(self.dynamic_nodes.len());
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
         self.dynamic_nodes.push(DynamicNode::sum(input, dtype));
         Ok(id)
     }
 
+    /// Reduces a dynamic rank-one result using the ordinary mean dtype policy.
+    pub fn dynamic_mean(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
+        let source = self.dynamic_node(input)?;
+        let dtype = if source.dtype.is_float() {
+            source.dtype
+        } else {
+            DType::F32
+        };
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
+        self.dynamic_nodes.push(DynamicNode::mean(input, dtype));
+        Ok(id)
+    }
+
+    /// Applies a supported unary operation pointwise to a dynamic value.
+    pub fn dynamic_unary(&mut self, input: DynamicNodeId, op: UnaryOp) -> Result<DynamicNodeId> {
+        if !matches!(op, UnaryOp::Neg | UnaryOp::Square) {
+            return Err(Error::NonDifferentiableIndexing(
+                "unsupported dynamic unary",
+            ));
+        }
+        let dtype = self.dynamic_node(input)?.dtype;
+        if !dtype.is_float() {
+            return Err(Error::InvalidElementwiseDType {
+                op: op.name(),
+                actual: dtype,
+            });
+        }
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
+        self.dynamic_nodes
+            .push(DynamicNode::unary(op, input, dtype));
+        Ok(id)
+    }
+
+    /// Pointwise dynamic arithmetic. Static operands must be scalar.
+    pub fn dynamic_binary(
+        &mut self,
+        lhs: DynamicNodeId,
+        rhs: DynamicInput,
+        op: BinaryOp,
+    ) -> Result<DynamicNodeId> {
+        if !matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) {
+            return Err(Error::NonDifferentiableIndexing(
+                "unsupported dynamic binary",
+            ));
+        }
+        let lhs_node = self.dynamic_node(lhs)?;
+        let rhs_dtype = match rhs {
+            DynamicInput::Dynamic(id) => self.dynamic_node(id)?.dtype,
+            DynamicInput::StaticScalar(id) => {
+                let node = self.node(id)?;
+                if node.shape.numel()? != 1 {
+                    return Err(Error::InvalidIndex);
+                }
+                node.dtype
+            }
+        };
+        let dtype = lhs_node.dtype.promote(rhs_dtype);
+        if !dtype.is_float() {
+            return Err(Error::InvalidElementwiseDType {
+                op: "dynamic_binary",
+                actual: dtype,
+            });
+        }
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
+        self.dynamic_nodes.push(DynamicNode::binary(
+            op,
+            DynamicInput::Dynamic(lhs),
+            rhs,
+            dtype,
+        ));
+        Ok(id)
+    }
+
     pub(crate) fn dynamic_node(&self, id: DynamicNodeId) -> Result<&DynamicNode> {
-        self.dynamic_nodes.get(id.0).ok_or(Error::InvalidIndex)
+        if id.graph != self.id {
+            return Err(Error::ParameterGraphMismatch);
+        }
+        self.dynamic_nodes.get(id.index).ok_or(Error::InvalidIndex)
     }
 
     pub(crate) fn bind_parameter(&mut self, snapshot: ParameterSnapshot) -> Result<NodeId> {
@@ -1782,6 +2093,40 @@ impl Graph {
         self.push_with_grad(Op::Constant(data), shape, dtype, false)
     }
 
+    /// Adds a scalar literal after resolving it to a concrete default dtype.
+    pub fn constant_literal(&mut self, literal: LiteralScalar) -> Result<NodeId> {
+        let data = TensorData::from_scalars([], literal.default_dtype(), [literal.scalar()])?;
+        Ok(self.constant(data))
+    }
+
+    /// Applies a binary operation with a right scalar literal resolved against
+    /// the left node's concrete dtype before lowering.
+    pub fn binary_literal(
+        &mut self,
+        op: BinaryOp,
+        lhs: NodeId,
+        literal: LiteralScalar,
+    ) -> Result<NodeId> {
+        let dtype = self.node(lhs)?.dtype;
+        let data = TensorData::from_scalars([], literal.dtype_against(dtype), [literal.scalar()])?;
+        let rhs = self.constant(data);
+        self.binary(op, lhs, rhs)
+    }
+
+    /// Applies a binary operation with a left scalar literal resolved against
+    /// the right node's concrete dtype before lowering.
+    pub fn literal_binary(
+        &mut self,
+        literal: LiteralScalar,
+        op: BinaryOp,
+        rhs: NodeId,
+    ) -> Result<NodeId> {
+        let dtype = self.node(rhs)?.dtype;
+        let data = TensorData::from_scalars([], literal.dtype_against(dtype), [literal.scalar()])?;
+        let lhs = self.constant(data);
+        self.binary(op, lhs, rhs)
+    }
+
     /// Returns whether future graph operations record reverse-mode edges.
     pub fn grad_enabled(&self) -> bool {
         self.grad_enabled
@@ -1819,6 +2164,57 @@ impl Graph {
     /// Returns the explicit gradient-tracking state of a graph node.
     pub fn requires_grad(&self, id: NodeId) -> Result<bool> {
         Ok(self.node(id)?.requires_grad)
+    }
+
+    pub(crate) fn backward_slice_contains(&self, loss: NodeId, target: NodeId) -> Result<bool> {
+        self.node(loss)?;
+        self.node(target)?;
+        self.reaches_input(loss, target, |op| op.backward_inputs())
+    }
+
+    pub(crate) fn value_slice_contains(&self, loss: NodeId, target: NodeId) -> Result<bool> {
+        self.node(loss)?;
+        self.node(target)?;
+        self.reaches_input(loss, target, |op| op.value_inputs())
+    }
+
+    pub(crate) fn value_slice_contains_detach(&self, loss: NodeId, target: NodeId) -> Result<bool> {
+        self.node(loss)?;
+        self.node(target)?;
+        let mut pending = vec![(loss, false)];
+        let mut seen = BTreeSet::new();
+        while let Some((node, detached)) = pending.pop() {
+            if !seen.insert((node.index(), detached)) {
+                continue;
+            }
+            if node == target && detached {
+                return Ok(true);
+            }
+            let op = &self.node(node)?.op;
+            let detached = detached || matches!(op, Op::Detach { .. });
+            pending.extend(op.value_inputs().into_iter().map(|input| (input, detached)));
+        }
+        Ok(false)
+    }
+
+    fn reaches_input(
+        &self,
+        root: NodeId,
+        target: NodeId,
+        inputs: impl Fn(&Op) -> Vec<NodeId>,
+    ) -> Result<bool> {
+        let mut pending = vec![root];
+        let mut seen = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node.index()) {
+                continue;
+            }
+            if node == target {
+                return Ok(true);
+            }
+            pending.extend(inputs(&self.node(node)?.op));
+        }
+        Ok(false)
     }
 
     pub fn sum(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
@@ -2060,11 +2456,16 @@ impl Graph {
                     && *candidate_axis == axis
                     && *candidate_descending == descending
                     && *candidate_pair == pair
-                    && node.shape == shape => match output {
-                    SortOutput::Values if node.dtype == dtype => (value_count + 1, index_count),
-                    SortOutput::Indices if node.dtype == DType::I32 => (value_count, index_count + 1),
-                    _ => (value_count, index_count),
-                },
+                    && node.shape == shape =>
+                {
+                    match output {
+                        SortOutput::Values if node.dtype == dtype => (value_count + 1, index_count),
+                        SortOutput::Indices if node.dtype == DType::I32 => {
+                            (value_count, index_count + 1)
+                        }
+                        _ => (value_count, index_count),
+                    }
+                }
                 _ => (value_count, index_count),
             },
         );
@@ -2281,7 +2682,9 @@ impl Graph {
         let inferred = extents
             .iter()
             .enumerate()
-            .filter_map(|(index, extent)| matches!(extent, crate::ReshapeExtent::Infer).then_some(index))
+            .filter_map(|(index, extent)| {
+                matches!(extent, crate::ReshapeExtent::Infer).then_some(index)
+            })
             .collect::<Vec<_>>();
         if inferred.len() > 1 {
             return Err(Error::InvalidReshape {
@@ -2294,12 +2697,12 @@ impl Graph {
         for (index, extent) in extents.iter().enumerate() {
             let extent = match extent {
                 crate::ReshapeExtent::Exact(extent) => Some(*extent),
-                crate::ReshapeExtent::Copy => Some(*source_shape.dims().get(index).ok_or_else(|| {
-                    Error::InvalidReshape {
+                crate::ReshapeExtent::Copy => Some(*source_shape.dims().get(index).ok_or_else(
+                    || Error::InvalidReshape {
                         from: source_shape.clone(),
                         to: Shape::new(Vec::new()),
-                    }
-                })?),
+                    },
+                )?),
                 crate::ReshapeExtent::Infer => None,
             };
             if let Some(extent) = extent {
@@ -2382,11 +2785,7 @@ impl Graph {
     /// Permutes an explicit sequence of signed axes, matching tinygrad's
     /// public `Tensor.permute(order)` axis normalization. The legacy unsigned
     /// `permute` remains available for existing callers.
-    pub fn permute_signed(
-        &mut self,
-        input: NodeId,
-        axes: impl Into<Vec<isize>>,
-    ) -> Result<NodeId> {
+    pub fn permute_signed(&mut self, input: NodeId, axes: impl Into<Vec<isize>>) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
         let rank = isize::try_from(shape.rank()).map_err(|_| Error::InvalidPermutation {
             shape: shape.clone(),
@@ -2402,10 +2801,11 @@ impl Graph {
         let mut normalized = Vec::with_capacity(raw_axes.len());
         for axis in raw_axes {
             let axis = if axis < 0 {
-                axis.checked_add(rank).ok_or_else(|| Error::InvalidPermutation {
-                    shape: shape.clone(),
-                    axes: Vec::new(),
-                })?
+                axis.checked_add(rank)
+                    .ok_or_else(|| Error::InvalidPermutation {
+                        shape: shape.clone(),
+                        axes: Vec::new(),
+                    })?
             } else {
                 axis
             };
@@ -2500,7 +2900,9 @@ impl Graph {
         let inferred = sizes
             .iter()
             .enumerate()
-            .filter_map(|(index, size)| matches!(size, crate::UnflattenExtent::Infer).then_some(index))
+            .filter_map(|(index, size)| {
+                matches!(size, crate::UnflattenExtent::Infer).then_some(index)
+            })
             .collect::<Vec<_>>();
         if inferred.len() > 1 {
             return Err(Error::InvalidRandom {
@@ -2740,7 +3142,10 @@ impl Graph {
     ) -> Result<NodeId> {
         let plan = shrink_to_plan(self, input, target.into())?;
         let output = self.shrink(input, plan.bounds)?;
-        debug_assert_eq!(self.shape(output).expect("shrink_to preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("shrink_to preflighted"),
+            &plan.output_shape
+        );
         Ok(output)
     }
 
@@ -2777,8 +3182,15 @@ impl Graph {
         // descriptors before publishing the graph node.
         source.shape.numel()?;
         output_shape.numel()?;
-        source.shape.numel()?.checked_mul(source.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
-        output_shape.numel()?.checked_mul(source.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        source
+            .shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        output_shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
         Ok(self.push(
             Op::Pad {
                 input,
@@ -2818,7 +3230,8 @@ impl Graph {
         let mut final_dims = Vec::with_capacity(shape.rank());
         let mut cropped = false;
         let mut padded = false;
-        for (axis, (&dimension, &(before, after))) in shape.dims().iter().zip(&padding).enumerate() {
+        for (axis, (&dimension, &(before, after))) in shape.dims().iter().zip(&padding).enumerate()
+        {
             let dimension_i128 = dimension as i128;
             let start = (-(before as i128)).max(0);
             let end = (dimension_i128 + after as i128).min(dimension_i128);
@@ -2837,10 +3250,10 @@ impl Graph {
                     dim: dimension,
                 });
             }
-            let before = usize::try_from(before.max(0))
-                .map_err(|_| Error::ShapeOverflow(shape.clone()))?;
-            let after = usize::try_from(after.max(0))
-                .map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            let before =
+                usize::try_from(before.max(0)).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            let after =
+                usize::try_from(after.max(0)).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
             let retained = end - start;
             retained
                 .checked_add(before)
@@ -2850,14 +3263,29 @@ impl Graph {
             padded |= before != 0 || after != 0;
             bounds.push((start, end));
             positive.push((before, after));
-            final_dims.push(retained.checked_add(before).and_then(|x| x.checked_add(after)).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?);
+            final_dims.push(
+                retained
+                    .checked_add(before)
+                    .and_then(|x| x.checked_add(after))
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
+            );
         }
         let final_shape = Shape::new(final_dims);
         shape.numel()?;
         final_shape.numel()?;
-        shape.numel()?.checked_mul(self.node(input)?.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-        final_shape.numel()?.checked_mul(self.node(input)?.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(final_shape.clone()))?;
-        let value = if cropped { self.shrink(input, bounds)? } else { input };
+        shape
+            .numel()?
+            .checked_mul(self.node(input)?.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        final_shape
+            .numel()?
+            .checked_mul(self.node(input)?.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(final_shape.clone()))?;
+        let value = if cropped {
+            self.shrink(input, bounds)?
+        } else {
+            input
+        };
         if padded {
             self.pad(value, positive, fill)
         } else {
@@ -2900,7 +3328,10 @@ impl Graph {
             .ok_or_else(|| Error::ShapeOverflow(rehearsed_shape.clone()))?;
         debug_assert_eq!(rehearsed_shape, plan.output_shape);
         let output = lower_pad_to(self, input, &plan)?;
-        debug_assert_eq!(self.shape(output).expect("pad_to preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("pad_to preflighted"),
+            &plan.output_shape
+        );
         Ok(output)
     }
 
@@ -2919,8 +3350,14 @@ impl Graph {
     ) -> Result<NodeId> {
         let plan = pad_mode_plan(self, input, padding.into(), mode, fill)?;
         let output = lower_pad_mode(self, input, &plan.padding, plan.mode, plan.fill)?;
-        debug_assert_eq!(self.shape(output).expect("pad mode preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("pad mode preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("pad mode preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("pad mode preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3024,15 +3461,9 @@ impl Graph {
     /// Splits a concrete axis into at most `chunks` ordered, contiguous
     /// shrink views. Uneven nonempty axes use the tinygrad tail rule; a
     /// zero-sized axis returns exactly `chunks` empty views.
-    pub fn chunk(
-        &mut self,
-        input: NodeId,
-        chunks: usize,
-        axis: isize,
-    ) -> Result<Vec<NodeId>> {
+    pub fn chunk(&mut self, input: NodeId, chunks: usize, axis: isize) -> Result<Vec<NodeId>> {
         let plan = chunk_plan(self, input, chunks, axis)?;
-        plan
-            .bounds
+        plan.bounds
             .into_iter()
             .map(|bounds| self.shrink(input, bounds))
             .collect()
@@ -3042,11 +3473,7 @@ impl Graph {
     ///
     /// This accepts both source section forms and is equivalent to
     /// `split(input, sections, 0)`.
-    pub fn split_default(
-        &mut self,
-        input: NodeId,
-        sections: SplitSections,
-    ) -> Result<Vec<NodeId>> {
+    pub fn split_default(&mut self, input: NodeId, sections: SplitSections) -> Result<Vec<NodeId>> {
         self.split(input, sections, 0)
     }
 
@@ -3059,8 +3486,7 @@ impl Graph {
         axis: isize,
     ) -> Result<Vec<NodeId>> {
         let plan = split_plan(self, input, sections, axis)?;
-        plan
-            .bounds
+        plan.bounds
             .into_iter()
             .map(|bounds| self.shrink(input, bounds))
             .collect()
@@ -3252,8 +3678,7 @@ impl Graph {
     /// equal rank, and every non-axis extent before constructing the node.
     pub fn gather_signed(&mut self, input: NodeId, index: NodeId, axis: isize) -> Result<NodeId> {
         let rank = self.node(input)?.shape.rank();
-        let axis = normalize_axes(input, rank, Some(vec![axis]))
-            .map(|axes| axes[0])?;
+        let axis = normalize_axes(input, rank, Some(vec![axis])).map(|axes| axes[0])?;
         self.gather(input, index, axis)
     }
 
@@ -3397,8 +3822,14 @@ impl Graph {
     ) -> Result<NodeId> {
         let plan = scatter_plan(self, base, dim, index, source, mode)?;
         let output = lower_scatter(self, base, index, &plan)?;
-        debug_assert_eq!(self.shape(output).expect("scatter preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("scatter preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("scatter preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("scatter preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3427,8 +3858,14 @@ impl Graph {
     ) -> Result<NodeId> {
         let plan = scatter_reduce_plan(self, base, index, src, dim, kind, include_self)?;
         let output = lower_scatter_reduce(self, base, index, src, &plan)?;
-        debug_assert_eq!(self.shape(output).expect("scatter_reduce preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("scatter_reduce preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("scatter_reduce preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("scatter_reduce preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3552,11 +3989,26 @@ impl Graph {
         } else {
             self.cast(reduced, plan.output_dtype)?
         };
-        debug_assert_eq!(self.shape(rhs).expect("source dot preflighted"), &plan.rhs_shape);
-        debug_assert_eq!(self.dtype(product).expect("source dot preflighted"), plan.operand_dtype);
-        debug_assert_eq!(self.shape(product).expect("source dot preflighted"), &plan.product_shape);
-        debug_assert_eq!(self.shape(output).expect("source dot preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("source dot preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(rhs).expect("source dot preflighted"),
+            &plan.rhs_shape
+        );
+        debug_assert_eq!(
+            self.dtype(product).expect("source dot preflighted"),
+            plan.operand_dtype
+        );
+        debug_assert_eq!(
+            self.shape(product).expect("source dot preflighted"),
+            &plan.product_shape
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("source dot preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("source dot preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3609,7 +4061,9 @@ impl Graph {
         let last_axis = plan.r_shape.rank() - 1;
 
         for i in 0..plan.stages {
-            let i_scalar = Scalar::I(i64::try_from(i).map_err(|_| Error::ShapeOverflow(plan.r_shape.clone()))?);
+            let i_scalar = Scalar::I(
+                i64::try_from(i).map_err(|_| Error::ShapeOverflow(plan.r_shape.clone()))?,
+            );
             // `at_i, x = idx.eq(i), (idx >= i).where(R[..., :, i], 0)`.
             let at_i = self.eq_scalar(index, i_scalar)?;
             let from_i = self.ge_scalar(index, i_scalar)?;
@@ -3622,14 +4076,19 @@ impl Graph {
             bounds[last_axis] = (i, i + 1);
             let column = self.squeeze(self.shrink(r, bounds)?, Some(-1))?;
             let x = self.where_false_scalar(from_i, column, Scalar::I(0))?;
-            let norm = self.sqrt(self.sum_with_options(self.square(x)?, Some(vec![-1]), true, None)?)?;
+            let norm =
+                self.sqrt(self.sum_with_options(self.square(x)?, Some(vec![-1]), true, None)?)?;
             let x0 = self.sum_with_options(
                 self.where_false_scalar(at_i, x, Scalar::I(0))?,
                 Some(vec![-1]),
                 true,
                 None,
             )?;
-            let sgn = self.where_false_scalar(self.ne_scalar(x0, Scalar::I(0))?, self.sign(x0)?, Scalar::I(1))?;
+            let sgn = self.where_false_scalar(
+                self.ne_scalar(x0, Scalar::I(0))?,
+                self.sign(x0)?,
+                Scalar::I(1),
+            )?;
             let active = self.ne_scalar(norm, Scalar::I(0))?;
             let u0 = self.add(x0, self.mul(sgn, norm)?)?;
             let numerator = self.select(at_i, u0, x)?;
@@ -3669,8 +4128,14 @@ impl Graph {
         // graph-visible effect and retains the same input NodeIds.
         let mut staged = self.clone();
         let (staged_q, staged_r) = staged.lower_qr(input, &plan)?;
-        debug_assert_eq!(staged.shape(staged_q).expect("qr stage preflighted"), &plan.q_shape);
-        debug_assert_eq!(staged.shape(staged_r).expect("qr stage preflighted"), &plan.r_shape);
+        debug_assert_eq!(
+            staged.shape(staged_q).expect("qr stage preflighted"),
+            &plan.q_shape
+        );
+        debug_assert_eq!(
+            staged.shape(staged_r).expect("qr stage preflighted"),
+            &plan.r_shape
+        );
         self.lower_qr(input, &plan)
     }
 
@@ -3683,7 +4148,10 @@ impl Graph {
     ) -> Result<NodeId> {
         // The source handles tall matrices through an exact transpose recurse
         // shell; the working matrix is therefore always no taller than wide.
-        debug_assert_eq!(self.dtype(input).expect("newton_schulz preflighted"), plan.dtype);
+        debug_assert_eq!(
+            self.dtype(input).expect("newton_schulz preflighted"),
+            plan.dtype
+        );
         let working = if plan.transpose_input {
             self.transpose(input, -2, -1)?
         } else {
@@ -3723,7 +4191,10 @@ impl Graph {
         } else {
             g
         };
-        debug_assert_eq!(self.shape(output).expect("newton_schulz preflighted"), &plan.input_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("newton_schulz preflighted"),
+            &plan.input_shape
+        );
         Ok(output)
     }
 
@@ -3741,7 +4212,10 @@ impl Graph {
         // live constant or node is emitted.
         let mut staged = self.clone();
         let staged_output = staged.lower_newton_schulz(input, &plan, params, eps)?;
-        debug_assert_eq!(staged.shape(staged_output).expect("newton_schulz staged"), &plan.input_shape);
+        debug_assert_eq!(
+            staged.shape(staged_output).expect("newton_schulz staged"),
+            &plan.input_shape
+        );
         self.lower_newton_schulz(input, &plan, params, eps)
     }
 
@@ -3785,8 +4259,14 @@ impl Graph {
     ) -> Result<NodeId> {
         let plan = linear_plan(self, input, weight, bias, dtype)?;
         let output = lower_linear(self, input, weight, bias, plan.dtype)?;
-        debug_assert_eq!(self.shape(output).expect("linear preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("linear preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("linear preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("linear preflighted"),
+            plan.output_dtype
+        );
         debug_assert_eq!(
             self.shape(weight).expect("linear preflighted").rank() == 1,
             plan.rank_one_weight
@@ -3990,14 +4470,8 @@ impl Graph {
                 reason: "bias must be [output_channels]",
             });
         }
-        let x4 = self.reshape(
-            input,
-            x4_shape,
-        )?;
-        let w4 = self.reshape(
-            weight,
-            w4_shape,
-        )?;
+        let x4 = self.reshape(input, x4_shape)?;
+        let w4 = self.reshape(weight, w4_shape)?;
         let y4 = self.conv_transpose2d(x4, w4, bias, options_2d)?;
         let y = self.node(y4)?.shape.clone();
         self.reshape(y4, Shape::new([y.dims()[0], y.dims()[1], y.dims()[3]]))

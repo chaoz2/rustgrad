@@ -119,7 +119,9 @@ impl ShardLayout {
         if self.group.devices().is_empty()
             || self.group.devices().iter().collect::<BTreeSet<_>>().len() != self.group.len()
         {
-            return Err(shard_error("shard layout requires distinct nonempty device owners"));
+            return Err(shard_error(
+                "shard layout requires distinct nonempty device owners",
+            ));
         }
         self.global_shape.numel()?;
         if let ShardDistribution::Axis { axis, ranges } = &self.distribution {
@@ -898,8 +900,8 @@ mod tests {
     #[test]
     fn shard_assembly_revalidates_deserialized_layout_identity_before_consuming_shards() {
         let layout = ShardLayout::axis_sharded(group(2), [4], DType::I32, 0).unwrap();
-        let layout: ShardLayout = serde_json::from_value(serde_json::to_value(layout).unwrap())
-            .unwrap();
+        let layout: ShardLayout =
+            serde_json::from_value(serde_json::to_value(layout).unwrap()).unwrap();
         assert!(layout.validate().is_ok());
 
         let mut reversed_range = layout.clone();

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{DType, Error, Result, TensorData};
+use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 
 /// Descriptor-only plan for tinygrad's `Tensor.bitwise_not` spelling. Bool
 /// delegates to `logical_not`; integer values XOR a scalar mask committed at
@@ -101,7 +101,10 @@ fn bitwise_binary_plan(
     rhs_dtype: DType,
     op: BinaryOp,
 ) -> Result<BitwiseBinaryPlan> {
-    debug_assert!(matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor));
+    debug_assert!(matches!(
+        op,
+        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+    ));
     // tinygrad's least-upper lattice bridges I64/U64 through its default
     // float (F32). Bitwise ALU then rejects that result before any cast.
     let output_dtype = if matches!(
@@ -147,7 +150,11 @@ fn bitwise_scalar_dtype(input_dtype: DType, value: Scalar, op: BinaryOp) -> Resu
         // floating operand.
         return Err(Error::InvalidElementwiseDType {
             op: op.name(),
-            actual: if input_dtype.is_float() { input_dtype } else { DType::F32 },
+            actual: if input_dtype.is_float() {
+                input_dtype
+            } else {
+                DType::F32
+            },
         });
     }
     if input_dtype.is_integer() {
@@ -308,7 +315,11 @@ pub(crate) fn source_weak_scalar_dtype(input_dtype: DType, value: Scalar) -> DTy
             }
         }
         Scalar::U(value) if input_dtype == DType::Bool => {
-            if value > i32::MAX as u64 { DType::I64 } else { DType::I32 }
+            if value > i32::MAX as u64 {
+                DType::I64
+            } else {
+                DType::I32
+            }
         }
         Scalar::I(_) | Scalar::U(_) => input_dtype,
         // Python floats are weakfloat. A concrete floating tensor commits the
@@ -459,7 +470,11 @@ fn where_scalar_plan(
         }
         WhereBranch::Scalar(value) => {
             let dtype = source_weak_scalar_dtype(true_reference_dtype, value);
-            (Shape::new([]), dtype, Some(TensorData::scalar_with_dtype(value, dtype)))
+            (
+                Shape::new([]),
+                dtype,
+                Some(TensorData::scalar_with_dtype(value, dtype)),
+            )
         }
     };
     let (false_shape, false_dtype, on_false_scalar) = match on_false {
@@ -469,7 +484,11 @@ fn where_scalar_plan(
         }
         WhereBranch::Scalar(value) => {
             let dtype = source_weak_scalar_dtype(true_dtype, value);
-            (Shape::new([]), dtype, Some(TensorData::scalar_with_dtype(value, dtype)))
+            (
+                Shape::new([]),
+                dtype,
+                Some(TensorData::scalar_with_dtype(value, dtype)),
+            )
         }
     };
     let value_shape = true_shape.broadcast_with(&false_shape)?;
@@ -503,8 +522,12 @@ fn where_scalar_plan(
     ] {
         extent(shape, dtype)?;
     }
-    if on_true_scalar.as_ref().is_some_and(|scalar| scalar.shape() != &Shape::new([]) || scalar.dtype() != true_dtype)
-        || on_false_scalar.as_ref().is_some_and(|scalar| scalar.shape() != &Shape::new([]) || scalar.dtype() != false_dtype)
+    if on_true_scalar
+        .as_ref()
+        .is_some_and(|scalar| scalar.shape() != &Shape::new([]) || scalar.dtype() != true_dtype)
+        || on_false_scalar.as_ref().is_some_and(|scalar| {
+            scalar.shape() != &Shape::new([]) || scalar.dtype() != false_dtype
+        })
         || true_shape.broadcast_with(&false_shape)? != value_shape
         || condition_shape.broadcast_with(&value_shape)? != output_shape
         || source_lub(true_dtype, false_dtype) != output_dtype
@@ -616,7 +639,11 @@ fn comparison_scalar_plan(
             actual: comparison_dtype,
         });
     }
-    Ok(ComparisonScalarPlan { output_shape, comparison_dtype, scalar })
+    Ok(ComparisonScalarPlan {
+        output_shape,
+        comparison_dtype,
+        scalar,
+    })
 }
 
 fn sub_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<SubScalarPlan> {
@@ -956,11 +983,7 @@ fn trunc_div_scalar_plan(
     })
 }
 
-fn modulo_scalar_plan(
-    graph: &Graph,
-    input: NodeId,
-    value: Scalar,
-) -> Result<ModuloScalarPlan> {
+fn modulo_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<ModuloScalarPlan> {
     let input_node = graph.node(input)?;
     let input_shape = input_node.shape.clone();
     let input_dtype = input_node.dtype;
@@ -1000,32 +1023,56 @@ fn modulo_scalar_plan(
         extent(shape, dtype)?;
     }
     if operand_dtype.is_integer() {
-        for _ in 0..5 { extent(&input_shape, operand_dtype)?; }
-        for _ in 0..5 { extent(&input_shape, DType::Bool)?; }
+        for _ in 0..5 {
+            extent(&input_shape, operand_dtype)?;
+        }
+        for _ in 0..5 {
+            extent(&input_shape, DType::Bool)?;
+        }
         let zero = TensorData::scalar_with_dtype(Scalar::I(0), operand_dtype);
         let one = TensorData::scalar_with_dtype(Scalar::I(1), operand_dtype);
         extent(zero.shape(), zero.dtype())?;
         extent(one.shape(), one.dtype())?;
-        if zero.shape() != &Shape::new([]) || one.shape() != &Shape::new([])
-            || zero.dtype() != operand_dtype || one.dtype() != operand_dtype {
-            return Err(Error::InvalidElementwiseDType { op: "mod floor_div scalar promotion", actual: operand_dtype });
+        if zero.shape() != &Shape::new([])
+            || one.shape() != &Shape::new([])
+            || zero.dtype() != operand_dtype
+            || one.dtype() != operand_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "mod floor_div scalar promotion",
+                actual: operand_dtype,
+            });
         }
     } else {
         extent(&input_shape, floor_dividend_dtype)?;
         extent(scalar.shape(), reciprocal_dtype)?;
         if unary_dtype(UnaryOp::Reciprocal, operand_dtype) != reciprocal_dtype
-            || source_lub(floor_dividend_dtype, reciprocal_dtype) != quotient_dtype {
-            return Err(Error::InvalidElementwiseDType { op: "mod scalar promotion", actual: output_dtype });
+            || source_lub(floor_dividend_dtype, reciprocal_dtype) != quotient_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "mod scalar promotion",
+                actual: output_dtype,
+            });
         }
     }
-    if scalar.shape() != &Shape::new([]) || scalar.dtype() != scalar_dtype
-        || scalar_dtype != operand_dtype || source_lub(input_dtype, scalar_dtype) != operand_dtype
+    if scalar.shape() != &Shape::new([])
+        || scalar.dtype() != scalar_dtype
+        || scalar_dtype != operand_dtype
+        || source_lub(input_dtype, scalar_dtype) != operand_dtype
         || source_lub(quotient_dtype, operand_dtype) != product_dtype
         || source_lub(operand_dtype, product_dtype) != output_dtype
-        || input_shape.broadcast_with(scalar.shape())? != input_shape {
-        return Err(Error::InvalidElementwiseDType { op: "mod scalar promotion", actual: output_dtype });
+        || input_shape.broadcast_with(scalar.shape())? != input_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "mod scalar promotion",
+            actual: output_dtype,
+        });
     }
-    Ok(ModuloScalarPlan { output_shape: input_shape, output_dtype, scalar })
+    Ok(ModuloScalarPlan {
+        output_shape: input_shape,
+        output_dtype,
+        scalar,
+    })
 }
 
 fn fmod_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<FmodScalarPlan> {
@@ -1113,7 +1160,11 @@ fn fmod_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<FmodS
             actual: output_dtype,
         });
     }
-    Ok(FmodScalarPlan { output_shape: input_shape, output_dtype, scalar })
+    Ok(FmodScalarPlan {
+        output_shape: input_shape,
+        output_dtype,
+        scalar,
+    })
 }
 
 fn bitwise_not_plan(graph: &Graph, input: NodeId) -> Result<BitwiseNotPlan> {
@@ -1259,12 +1310,24 @@ struct SeluScalarPlan {
 /// Descriptor for one strict tinygrad clamp stage. Bounds deliberately stay
 /// outside this plan: the same fully preflighted descriptor serves live and
 /// Python-scalar bounds without carrying unpublished NodeIds.
-struct ClampStagePlan { shape: Shape, dtype: DType }
-struct ClampPlan { lower: Option<ClampStagePlan>, upper: Option<ClampStagePlan>, output_shape: Shape, output_dtype: DType }
+struct ClampStagePlan {
+    shape: Shape,
+    dtype: DType,
+}
+struct ClampPlan {
+    lower: Option<ClampStagePlan>,
+    upper: Option<ClampStagePlan>,
+    output_shape: Shape,
+    output_dtype: DType,
+}
 
 /// Scalar-bound commitment for tinygrad's staged `clip`/`hardtanh` surface.
 /// Each bound commits against the value entering *its own* strict Select.
-struct ClampScalarPlan { core: ClampPlan, min: Option<TensorData>, max: Option<TensorData> }
+struct ClampScalarPlan {
+    core: ClampPlan,
+    min: Option<TensorData>,
+    max: Option<TensorData>,
+}
 
 struct SwishPlan {
     shape: Shape,
@@ -1463,7 +1526,10 @@ struct BatchNormPlan {
 /// tinygrad's source LUB, including its default-F32 bridge for the concrete
 /// I64/U64 pair that RustGrad's raw storage promotion represents as F64.
 pub(crate) fn source_lub(lhs: DType, rhs: DType) -> DType {
-    if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+    if matches!(
+        (lhs, rhs),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
         DType::F32
     } else {
         lhs.promote(rhs)
@@ -1488,23 +1554,38 @@ fn batchnorm_plan(
     let invstd_node = graph.node(invstd)?;
     let invstd_shape = invstd_node.shape.clone();
     let invstd_dtype = invstd_node.dtype;
-    let weight_descriptor = weight.map(|node| {
-        graph
-            .node(node)
-            .map(|value| (value.shape.clone(), value.dtype))
-    }).transpose()?;
-    let bias_descriptor = bias.map(|node| {
-        graph
-            .node(node)
-            .map(|value| (value.shape.clone(), value.dtype))
-    }).transpose()?;
+    let weight_descriptor = weight
+        .map(|node| {
+            graph
+                .node(node)
+                .map(|value| (value.shape.clone(), value.dtype))
+        })
+        .transpose()?;
+    let bias_descriptor = bias
+        .map(|node| {
+            graph
+                .node(node)
+                .map(|value| (value.shape.clone(), value.dtype))
+        })
+        .transpose()?;
 
     // `argfix` preserves the supplied integers exactly. In particular,
     // negative and out-of-range entries do not match enumerate()'s unsigned
     // indices, while duplicates still affect `len(axis_)` below.
-    let parameter_shape = Shape::new(input_shape.dims().iter().enumerate().map(|(axis, &extent)| {
-        if axes.contains(&(axis as isize)) { extent } else { 1 }
-    }).collect::<Vec<_>>());
+    let parameter_shape = Shape::new(
+        input_shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(axis, &extent)| {
+                if axes.contains(&(axis as isize)) {
+                    extent
+                } else {
+                    1
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
     let extent = |shape: &Shape, dtype: DType| {
         shape
             .numel()?
@@ -1528,12 +1609,22 @@ fn batchnorm_plan(
     // movement or arithmetic node can be published.
     extent(&input_shape, input_dtype)?;
     reshape(&mean_shape, mean_dtype)?;
-    if let Some((shape, dtype)) = &weight_descriptor { reshape(shape, *dtype)?; }
-    if let Some((shape, dtype)) = &bias_descriptor { reshape(shape, *dtype)?; }
+    if let Some((shape, dtype)) = &weight_descriptor {
+        reshape(shape, *dtype)?;
+    }
+    if let Some((shape, dtype)) = &bias_descriptor {
+        reshape(shape, *dtype)?;
+    }
     extent(&invstd_shape, invstd_dtype)?;
     let reshape_invstd = invstd_shape.rank() == axes.len();
-    if reshape_invstd { reshape(&invstd_shape, invstd_dtype)?; }
-    let invstd_stage_shape = if reshape_invstd { parameter_shape.clone() } else { invstd_shape };
+    if reshape_invstd {
+        reshape(&invstd_shape, invstd_dtype)?;
+    }
+    let invstd_stage_shape = if reshape_invstd {
+        parameter_shape.clone()
+    } else {
+        invstd_shape
+    };
 
     let centered_shape = input_shape.broadcast_with(&parameter_shape)?;
     let centered_dtype = source_lub(input_dtype, mean_dtype);
@@ -1702,7 +1793,12 @@ fn lerp_plan(
     })
 }
 
-fn lerp_scalar_plan(graph: &Graph, start: NodeId, end: NodeId, weight: Scalar) -> Result<LerpScalarPlan> {
+fn lerp_scalar_plan(
+    graph: &Graph,
+    start: NodeId,
+    end: NodeId,
+    weight: Scalar,
+) -> Result<LerpScalarPlan> {
     let start_node = graph.node(start)?;
     let start_shape = start_node.shape.clone();
     let start_dtype = start_node.dtype;
@@ -1858,7 +1954,11 @@ fn copysign_plan(
     })
 }
 
-fn copysign_scalar_plan(graph: &Graph, magnitude: NodeId, sign: Scalar) -> Result<CopysignScalarPlan> {
+fn copysign_scalar_plan(
+    graph: &Graph,
+    magnitude: NodeId,
+    sign: Scalar,
+) -> Result<CopysignScalarPlan> {
     let magnitude_node = graph.node(magnitude)?;
     let magnitude_shape = magnitude_node.shape.clone();
     let magnitude_dtype = magnitude_node.dtype;
@@ -1884,7 +1984,10 @@ fn copysign_scalar_plan(graph: &Graph, magnitude: NodeId, sign: Scalar) -> Resul
 
 pub(crate) fn logsigmoid_plan(input_shape: &Shape, input_dtype: DType) -> Result<LogsigmoidPlan> {
     let source_promote = |lhs: DType, rhs: DType| {
-        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        if matches!(
+            (lhs, rhs),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
             DType::F32
         } else {
             lhs.promote(rhs)
@@ -1904,8 +2007,16 @@ pub(crate) fn logsigmoid_plan(input_shape: &Shape, input_dtype: DType) -> Result
         DType::F32
     };
     let scaled_dtype = source_promote(negated_dtype, beta_dtype);
-    let log_dtype = if scaled_dtype.is_float() { scaled_dtype } else { DType::F32 };
-    let inverse_dtype = if beta_dtype.is_float() { beta_dtype } else { DType::F32 };
+    let log_dtype = if scaled_dtype.is_float() {
+        scaled_dtype
+    } else {
+        DType::F32
+    };
+    let inverse_dtype = if beta_dtype.is_float() {
+        beta_dtype
+    } else {
+        DType::F32
+    };
     let output_dtype = source_promote(log_dtype, inverse_dtype);
 
     extent(input_shape, input_dtype)?;
@@ -1936,7 +2047,12 @@ pub(crate) fn logsigmoid_plan(input_shape: &Shape, input_dtype: DType) -> Result
         || input_shape.broadcast_with(beta.shape())? != *input_shape
         || input_shape.broadcast_with(softplus_zero.shape())? != *input_shape
         || input_shape.broadcast_with(softplus_one.shape())? != *input_shape
-        || output_dtype != if input_dtype.is_float() { input_dtype } else { DType::F32 }
+        || output_dtype
+            != if input_dtype.is_float() {
+                input_dtype
+            } else {
+                DType::F32
+            }
         || source_promote(negated_dtype, beta_dtype) != scaled_dtype
         || source_promote(log_dtype, inverse_dtype) != output_dtype
         || unary_dtype(UnaryOp::Reciprocal, inverse_dtype) != inverse_dtype
@@ -2015,7 +2131,16 @@ fn logaddexp_plan(
     // source float storage dtype, including the nonfloat-to-F32 lift.
     extent(lhs_shape, operand_dtype)?;
     extent(rhs_shape, operand_dtype)?;
-    for dtype in [operand_dtype, operand_dtype, operand_dtype, exp_dtype, exp_dtype, exp_dtype, exp_dtype, output_dtype] {
+    for dtype in [
+        operand_dtype,
+        operand_dtype,
+        operand_dtype,
+        exp_dtype,
+        exp_dtype,
+        exp_dtype,
+        exp_dtype,
+        output_dtype,
+    ] {
         extent(&shape, dtype)?;
     }
     if (!operand_dtype.is_float() && exp_dtype != DType::F32)
@@ -2054,7 +2179,11 @@ fn logaddexp_scalar_plan(graph: &Graph, lhs: NodeId, rhs: Scalar) -> Result<Loga
             actual: rhs_dtype,
         });
     }
-    Ok(LogaddexpScalarPlan { core, lhs_dtype, scalar })
+    Ok(LogaddexpScalarPlan {
+        core,
+        lhs_dtype,
+        scalar,
+    })
 }
 
 fn allclose_plan(
@@ -2083,7 +2212,11 @@ fn allclose_plan(
     extent(&output_shape, difference_dtype)?; // absolute difference
     extent(rhs_shape, rhs_dtype)?; // other.abs()
 
-    let tolerance_dtype = if rhs_dtype.is_float() { rhs_dtype } else { DType::F32 };
+    let tolerance_dtype = if rhs_dtype.is_float() {
+        rhs_dtype
+    } else {
+        DType::F32
+    };
     let rtol = TensorData::scalar_with_dtype(Scalar::F(rtol), tolerance_dtype);
     let atol = TensorData::scalar_with_dtype(Scalar::F(atol), tolerance_dtype);
     extent(rtol.shape(), rtol.dtype())?;
@@ -2121,9 +2254,7 @@ fn allclose_plan(
         });
     }
 
-    Ok(AllclosePlan {
-        output_shape,
-    })
+    Ok(AllclosePlan { output_shape })
 }
 
 fn isclose_scalar_plan(
@@ -2143,7 +2274,10 @@ fn isclose_scalar_plan(
             .map(|_| ())
     };
     let source_lub = |lhs: DType, rhs: DType| {
-        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        if matches!(
+            (lhs, rhs),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
             DType::F32
         } else {
             lhs.promote(rhs)
@@ -2152,7 +2286,11 @@ fn isclose_scalar_plan(
     let output_shape = lhs_shape.broadcast_with(rhs_shape)?;
     let difference_dtype = source_lub(lhs_dtype, rhs_dtype);
     // `other.abs()` retains other storage; the first weak float commits here.
-    let tolerance_dtype = if rhs_dtype.is_float() { rhs_dtype } else { DType::F32 };
+    let tolerance_dtype = if rhs_dtype.is_float() {
+        rhs_dtype
+    } else {
+        DType::F32
+    };
     let comparison_dtype = source_lub(difference_dtype, tolerance_dtype);
     extent(lhs_shape, lhs_dtype)?;
     extent(rhs_shape, rhs_dtype)?;
@@ -2398,10 +2536,8 @@ fn mish_plan(input_shape: &Shape, input_dtype: DType) -> Result<MishPlan> {
     let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), dtype);
     let one = TensorData::scalar_with_dtype(Scalar::F(1.0), dtype);
     let two = TensorData::scalar_with_dtype(Scalar::F(2.0), dtype);
-    let neg_inv_ln2 = TensorData::scalar_with_dtype(
-        Scalar::F(-1.0 / std::f64::consts::LN_2),
-        dtype,
-    );
+    let neg_inv_ln2 =
+        TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), dtype);
     if beta.dtype() != dtype
         || zero.dtype() != dtype
         || one.dtype() != dtype
@@ -2451,14 +2587,19 @@ fn swish_plan(input_shape: &Shape, input_dtype: DType) -> Result<SwishPlan> {
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     };
     extent(input_shape, input_dtype)?;
-    for _ in ["cast", "scaled", "exp2", "denominator", "reciprocal", "output"] {
+    for _ in [
+        "cast",
+        "scaled",
+        "exp2",
+        "denominator",
+        "reciprocal",
+        "output",
+    ] {
         extent(input_shape, dtype)?;
     }
     let one = TensorData::scalar_with_dtype(Scalar::F(1.0), dtype);
-    let neg_inv_ln2 = TensorData::scalar_with_dtype(
-        Scalar::F(-1.0 / std::f64::consts::LN_2),
-        dtype,
-    );
+    let neg_inv_ln2 =
+        TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), dtype);
     if one.dtype() != dtype
         || neg_inv_ln2.dtype() != dtype
         || input_shape.broadcast_with(one.shape())? != *input_shape
@@ -2491,7 +2632,8 @@ fn quick_gelu_plan(input_shape: &Shape, input_dtype: DType) -> Result<QuickGeluP
         DType::F32
     };
     let extent = |shape: &Shape, dtype: DType| {
-        shape.numel()?
+        shape
+            .numel()?
             .checked_mul(dtype.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     };
@@ -2509,10 +2651,8 @@ fn quick_gelu_plan(input_shape: &Shape, input_dtype: DType) -> Result<QuickGeluP
     }
     let scale = TensorData::scalar_with_dtype(Scalar::F(1.702), dtype);
     let one = TensorData::scalar_with_dtype(Scalar::F(1.0), dtype);
-    let neg_inv_ln2 = TensorData::scalar_with_dtype(
-        Scalar::F(-1.0 / std::f64::consts::LN_2),
-        dtype,
-    );
+    let neg_inv_ln2 =
+        TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), dtype);
     if scale.dtype() != dtype
         || one.dtype() != dtype
         || neg_inv_ln2.dtype() != dtype
@@ -2569,7 +2709,10 @@ fn celu_plan_with_alphas(
     // bridge.  CELU's reciprocal normally moves later arithmetic to float,
     // but retaining the source rule in the plan closes every stage.
     let source_promote = |lhs: DType, rhs: DType| {
-        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        if matches!(
+            (lhs, rhs),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
             DType::F32
         } else {
             lhs.promote(rhs)
@@ -2673,7 +2816,11 @@ fn celu_scalar_plan(
     let division_alpha_dtype = source_weak_scalar_dtype(input_dtype, alpha);
     let division_alpha = TensorData::scalar_with_dtype(alpha, division_alpha_dtype);
     let division_dtype = source_lub(input_dtype, division_alpha_dtype);
-    let dividend_dtype = if division_dtype.is_float() { division_dtype } else { DType::F32 };
+    let dividend_dtype = if division_dtype.is_float() {
+        division_dtype
+    } else {
+        DType::F32
+    };
     let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, division_dtype);
     let scaled_dtype = source_lub(dividend_dtype, reciprocal_dtype);
     let exp_dtype = unary_dtype(UnaryOp::Exp, scaled_dtype);
@@ -2707,7 +2854,11 @@ fn celu_scalar_plan(
             actual: core.output_dtype,
         });
     }
-    Ok(CeluScalarPlan { core, division_alpha, multiply_alpha })
+    Ok(CeluScalarPlan {
+        core,
+        division_alpha,
+        multiply_alpha,
+    })
 }
 
 fn elu_plan(
@@ -2802,8 +2953,20 @@ fn elu_scalar_plan(
     Ok(EluScalarPlan { core, alpha })
 }
 
-fn selu_plan(input_shape: &Shape, input_dtype: DType, alpha_shape: &Shape, alpha_dtype: DType, gamma_shape: &Shape, gamma_dtype: DType) -> Result<SeluPlan> {
-    let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+fn selu_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    alpha_shape: &Shape,
+    alpha_dtype: DType,
+    gamma_shape: &Shape,
+    gamma_dtype: DType,
+) -> Result<SeluPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
     extent(input_shape, input_dtype)?;
     extent(alpha_shape, alpha_dtype)?;
     extent(gamma_shape, gamma_dtype)?;
@@ -2828,18 +2991,46 @@ fn selu_plan(input_shape: &Shape, input_dtype: DType, alpha_shape: &Shape, alpha
         (gamma_shape, output_dtype),
         (&branch_shape, output_dtype),
         (&output_shape, output_dtype),
-    ] { extent(shape,dtype)?; }
+    ] {
+        extent(shape, dtype)?;
+    }
     let zero_input = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
     let one_exp = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
     extent(zero_input.shape(), zero_input.dtype())?;
     extent(one_exp.shape(), one_exp.dtype())?;
-    if zero_input.dtype()!=input_dtype || one_exp.dtype()!=exp_dtype || input_shape.broadcast_with(zero_input.shape())? != *input_shape || input_shape.broadcast_with(one_exp.shape())? != *input_shape || input_dtype.promote(zero_input.dtype())!=input_dtype || exp_dtype.promote(one_exp.dtype())!=exp_dtype || condition_shape.broadcast_with(&branch_shape)?!=branch_shape {
-        return Err(Error::InvalidElementwiseDType { op:"selu scalar promotion", actual:output_dtype });
+    if zero_input.dtype() != input_dtype
+        || one_exp.dtype() != exp_dtype
+        || input_shape.broadcast_with(zero_input.shape())? != *input_shape
+        || input_shape.broadcast_with(one_exp.shape())? != *input_shape
+        || input_dtype.promote(zero_input.dtype()) != input_dtype
+        || exp_dtype.promote(one_exp.dtype()) != exp_dtype
+        || condition_shape.broadcast_with(&branch_shape)? != branch_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "selu scalar promotion",
+            actual: output_dtype,
+        });
     }
-    Ok(SeluPlan { exp_dtype, condition_shape, negative_shape, negative_dtype, branch_shape, branch_dtype, output_shape, output_dtype, zero_input, one_exp })
+    Ok(SeluPlan {
+        exp_dtype,
+        condition_shape,
+        negative_shape,
+        negative_dtype,
+        branch_shape,
+        branch_dtype,
+        output_shape,
+        output_dtype,
+        zero_input,
+        one_exp,
+    })
 }
 
-fn selu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: Scalar, gamma: Scalar) -> Result<SeluScalarPlan> {
+fn selu_scalar_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    alpha: Scalar,
+    gamma: Scalar,
+) -> Result<SeluScalarPlan> {
     // Both Python parameters are untyped and are first wrapped where their
     // literal multiplication consumes them: alpha beside Exp's result, then
     // gamma beside the fully promoted Select result.
@@ -2850,57 +3041,158 @@ fn selu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: Scalar, gamm
     let branch_dtype = source_lub(input_dtype, negative_dtype);
     let gamma_dtype = source_weak_scalar_dtype(branch_dtype, gamma);
     let gamma = TensorData::scalar_with_dtype(gamma, gamma_dtype);
-    let core = selu_plan(input_shape,input_dtype,alpha.shape(),alpha.dtype(),gamma.shape(),gamma.dtype())?;
-    for scalar in [&alpha,&gamma] {
-        let bytes=scalar.shape().numel()?.checked_mul(scalar.dtype().itemsize()).ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?;
-        if bytes != scalar.dtype().itemsize() || input_shape.broadcast_with(scalar.shape())? != *input_shape {
-            return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:scalar.dtype() });
+    let core = selu_plan(
+        input_shape,
+        input_dtype,
+        alpha.shape(),
+        alpha.dtype(),
+        gamma.shape(),
+        gamma.dtype(),
+    )?;
+    for scalar in [&alpha, &gamma] {
+        let bytes = scalar
+            .shape()
+            .numel()?
+            .checked_mul(scalar.dtype().itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?;
+        if bytes != scalar.dtype().itemsize()
+            || input_shape.broadcast_with(scalar.shape())? != *input_shape
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "selu scalar parameter promotion",
+                actual: scalar.dtype(),
+            });
         }
     }
-    if core.output_shape != *input_shape || core.output_dtype != gamma_dtype { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:core.output_dtype }); }
+    if core.output_shape != *input_shape || core.output_dtype != gamma_dtype {
+        return Err(Error::InvalidElementwiseDType {
+            op: "selu scalar parameter promotion",
+            actual: core.output_dtype,
+        });
+    }
     Ok(SeluScalarPlan { core, alpha, gamma })
 }
 
 fn softplus_plan(
-    input_shape: &Shape, input_dtype: DType,
-    scale_beta_shape: &Shape, scale_beta_dtype: DType,
-    inverse_beta_shape: &Shape, inverse_beta_dtype: DType,
+    input_shape: &Shape,
+    input_dtype: DType,
+    scale_beta_shape: &Shape,
+    scale_beta_dtype: DType,
+    inverse_beta_shape: &Shape,
+    inverse_beta_dtype: DType,
 ) -> Result<SoftplusPlan> {
-    let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
     let scaled_shape = input_shape.broadcast_with(scale_beta_shape)?;
     let scaled_dtype = source_lub(input_dtype, scale_beta_dtype);
-    let log_dtype = if scaled_dtype.is_float() { scaled_dtype } else { DType::F32 };
-    let inverse_dtype = if inverse_beta_dtype.is_float() { inverse_beta_dtype } else { DType::F32 };
+    let log_dtype = if scaled_dtype.is_float() {
+        scaled_dtype
+    } else {
+        DType::F32
+    };
+    let inverse_dtype = if inverse_beta_dtype.is_float() {
+        inverse_beta_dtype
+    } else {
+        DType::F32
+    };
     let output_shape = scaled_shape.broadcast_with(inverse_beta_shape)?;
     let output_dtype = source_lub(log_dtype, inverse_dtype);
-    for (shape,dtype) in [
-        (input_shape,input_dtype), (scale_beta_shape,scale_beta_dtype), (inverse_beta_shape,inverse_beta_dtype),
-        (input_shape,scaled_dtype), (scale_beta_shape,scaled_dtype), (&scaled_shape,scaled_dtype),
-        (&scaled_shape,log_dtype), (inverse_beta_shape,inverse_dtype), (&scaled_shape,log_dtype),
-        (&scaled_shape,output_dtype), (inverse_beta_shape,output_dtype), (&output_shape,output_dtype),
-    ] { extent(shape,dtype)?; }
-    let zero=TensorData::scalar_with_dtype(Scalar::F(0.0),log_dtype);
-    let one=TensorData::scalar_with_dtype(Scalar::F(1.0),inverse_dtype);
-    extent(zero.shape(),zero.dtype())?; extent(one.shape(),one.dtype())?;
-    if zero.dtype()!=log_dtype || one.dtype()!=inverse_dtype
+    for (shape, dtype) in [
+        (input_shape, input_dtype),
+        (scale_beta_shape, scale_beta_dtype),
+        (inverse_beta_shape, inverse_beta_dtype),
+        (input_shape, scaled_dtype),
+        (scale_beta_shape, scaled_dtype),
+        (&scaled_shape, scaled_dtype),
+        (&scaled_shape, log_dtype),
+        (inverse_beta_shape, inverse_dtype),
+        (&scaled_shape, log_dtype),
+        (&scaled_shape, output_dtype),
+        (inverse_beta_shape, output_dtype),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), log_dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), inverse_dtype);
+    extent(zero.shape(), zero.dtype())?;
+    extent(one.shape(), one.dtype())?;
+    if zero.dtype() != log_dtype
+        || one.dtype() != inverse_dtype
         || scaled_shape.broadcast_with(zero.shape())? != scaled_shape
         || inverse_beta_shape.broadcast_with(one.shape())? != *inverse_beta_shape
-        || unary_dtype(UnaryOp::Reciprocal,inverse_dtype)!=inverse_dtype
-    { return Err(Error::InvalidElementwiseDType { op:"softplus scalar promotion", actual:output_dtype }); }
-    Ok(SoftplusPlan { scaled_shape,scaled_dtype,log_dtype,inverse_dtype,output_shape,output_dtype,zero,one })
+        || unary_dtype(UnaryOp::Reciprocal, inverse_dtype) != inverse_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "softplus scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(SoftplusPlan {
+        scaled_shape,
+        scaled_dtype,
+        log_dtype,
+        inverse_dtype,
+        output_shape,
+        output_dtype,
+        zero,
+        one,
+    })
 }
 
-fn softplus_scalar_plan(input_shape:&Shape,input_dtype:DType,beta:Scalar)->Result<SoftplusScalarPlan> {
-    let scale_dtype=source_weak_scalar_dtype(input_dtype,beta);
-    let scale_beta=TensorData::scalar_with_dtype(beta,scale_dtype);
-    let scaled_dtype=source_lub(input_dtype,scale_dtype);
-    let log_dtype=if scaled_dtype.is_float(){scaled_dtype}else{DType::F32};
-    let inverse_dtype=source_weak_scalar_dtype(log_dtype,beta);
-    let inverse_beta=TensorData::scalar_with_dtype(beta,inverse_dtype);
-    let core=softplus_plan(input_shape,input_dtype,scale_beta.shape(),scale_beta.dtype(),inverse_beta.shape(),inverse_beta.dtype())?;
-    for scalar in [&scale_beta,&inverse_beta] { let bytes=scalar.shape().numel()?.checked_mul(scalar.dtype().itemsize()).ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?; if bytes!=scalar.dtype().itemsize() || input_shape.broadcast_with(scalar.shape())?!=*input_shape { return Err(Error::InvalidElementwiseDType { op:"softplus scalar beta promotion",actual:scalar.dtype() }); } }
-    if core.output_shape!=*input_shape { return Err(Error::InvalidElementwiseDType { op:"softplus scalar beta promotion",actual:core.output_dtype }); }
-    Ok(SoftplusScalarPlan { core,scale_beta,inverse_beta })
+fn softplus_scalar_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    beta: Scalar,
+) -> Result<SoftplusScalarPlan> {
+    let scale_dtype = source_weak_scalar_dtype(input_dtype, beta);
+    let scale_beta = TensorData::scalar_with_dtype(beta, scale_dtype);
+    let scaled_dtype = source_lub(input_dtype, scale_dtype);
+    let log_dtype = if scaled_dtype.is_float() {
+        scaled_dtype
+    } else {
+        DType::F32
+    };
+    let inverse_dtype = source_weak_scalar_dtype(log_dtype, beta);
+    let inverse_beta = TensorData::scalar_with_dtype(beta, inverse_dtype);
+    let core = softplus_plan(
+        input_shape,
+        input_dtype,
+        scale_beta.shape(),
+        scale_beta.dtype(),
+        inverse_beta.shape(),
+        inverse_beta.dtype(),
+    )?;
+    for scalar in [&scale_beta, &inverse_beta] {
+        let bytes = scalar
+            .shape()
+            .numel()?
+            .checked_mul(scalar.dtype().itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?;
+        if bytes != scalar.dtype().itemsize()
+            || input_shape.broadcast_with(scalar.shape())? != *input_shape
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "softplus scalar beta promotion",
+                actual: scalar.dtype(),
+            });
+        }
+    }
+    if core.output_shape != *input_shape {
+        return Err(Error::InvalidElementwiseDType {
+            op: "softplus scalar beta promotion",
+            actual: core.output_dtype,
+        });
+    }
+    Ok(SoftplusScalarPlan {
+        core,
+        scale_beta,
+        inverse_beta,
+    })
 }
 
 fn clamp_stage_plan(
@@ -2909,16 +3201,26 @@ fn clamp_stage_plan(
     bound_shape: &Shape,
     bound_dtype: DType,
 ) -> Result<ClampStagePlan> {
-    let extent = |shape:&Shape,dtype:DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
-    let shape=value_shape.broadcast_with(bound_shape)?;
-    let dtype=source_lub(value_dtype,bound_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    let shape = value_shape.broadcast_with(bound_shape)?;
+    let dtype = source_lub(value_dtype, bound_dtype);
     // Original value/bound, both source-LUB casts, strict predicate, and
     // Select result all have concrete extents before graph publication.
     for (shape, dtype) in [
-        (value_shape, value_dtype), (bound_shape, bound_dtype),
-        (value_shape, dtype), (bound_shape, dtype),
-        (&shape, DType::Bool), (&shape, dtype),
-    ] { extent(shape,dtype)?; }
+        (value_shape, value_dtype),
+        (bound_shape, bound_dtype),
+        (value_shape, dtype),
+        (bound_shape, dtype),
+        (&shape, DType::Bool),
+        (&shape, dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
     Ok(ClampStagePlan { shape, dtype })
 }
 
@@ -2928,14 +3230,46 @@ fn clamp_plan(
     min: Option<(&Shape, DType)>,
     max: Option<(&Shape, DType)>,
 ) -> Result<ClampPlan> {
-    if min.is_none() && max.is_none() { return Err(Error::InvalidElementwiseDType { op:"clamp requires a bound", actual:input_dtype }); }
-    let extent = |shape:&Shape,dtype:DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
-    extent(input_shape,input_dtype)?;
-    let mut shape=input_shape.clone(); let mut dtype=input_dtype;
-    let lower=match min { Some((bound_shape,bound_dtype))=>{let s=clamp_stage_plan(&shape,dtype,bound_shape,bound_dtype)?; shape=s.shape.clone(); dtype=s.dtype; Some(s)},None=>None};
-    let upper=match max { Some((bound_shape,bound_dtype))=>{let s=clamp_stage_plan(&shape,dtype,bound_shape,bound_dtype)?; shape=s.shape.clone(); dtype=s.dtype; Some(s)},None=>None};
-    extent(&shape,dtype)?;
-    Ok(ClampPlan { lower, upper, output_shape:shape, output_dtype:dtype })
+    if min.is_none() && max.is_none() {
+        return Err(Error::InvalidElementwiseDType {
+            op: "clamp requires a bound",
+            actual: input_dtype,
+        });
+    }
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    let mut shape = input_shape.clone();
+    let mut dtype = input_dtype;
+    let lower = match min {
+        Some((bound_shape, bound_dtype)) => {
+            let s = clamp_stage_plan(&shape, dtype, bound_shape, bound_dtype)?;
+            shape = s.shape.clone();
+            dtype = s.dtype;
+            Some(s)
+        }
+        None => None,
+    };
+    let upper = match max {
+        Some((bound_shape, bound_dtype)) => {
+            let s = clamp_stage_plan(&shape, dtype, bound_shape, bound_dtype)?;
+            shape = s.shape.clone();
+            dtype = s.dtype;
+            Some(s)
+        }
+        None => None,
+    };
+    extent(&shape, dtype)?;
+    Ok(ClampPlan {
+        lower,
+        upper,
+        output_shape: shape,
+        output_dtype: dtype,
+    })
 }
 
 fn clamp_scalar_plan(
@@ -2944,22 +3278,44 @@ fn clamp_scalar_plan(
     min: Option<Scalar>,
     max: Option<Scalar>,
 ) -> Result<ClampScalarPlan> {
-    if min.is_none() && max.is_none() { return Err(Error::InvalidElementwiseDType { op:"clamp requires a bound", actual:input_dtype }); }
-    let min = min.map(|value| TensorData::scalar_with_dtype(value, source_weak_scalar_dtype(input_dtype, value)));
+    if min.is_none() && max.is_none() {
+        return Err(Error::InvalidElementwiseDType {
+            op: "clamp requires a bound",
+            actual: input_dtype,
+        });
+    }
+    let min = min.map(|value| {
+        TensorData::scalar_with_dtype(value, source_weak_scalar_dtype(input_dtype, value))
+    });
     let after_lower = match &min {
-        Some(bound) => clamp_stage_plan(input_shape,input_dtype,bound.shape(),bound.dtype())?.dtype,
+        Some(bound) => {
+            clamp_stage_plan(input_shape, input_dtype, bound.shape(), bound.dtype())?.dtype
+        }
         None => input_dtype,
     };
-    let max = max.map(|value| TensorData::scalar_with_dtype(value, source_weak_scalar_dtype(after_lower, value)));
-    let core=clamp_plan(
-        input_shape,input_dtype,
-        min.as_ref().map(|bound|(bound.shape(),bound.dtype())),
-        max.as_ref().map(|bound|(bound.shape(),bound.dtype())),
+    let max = max.map(|value| {
+        TensorData::scalar_with_dtype(value, source_weak_scalar_dtype(after_lower, value))
+    });
+    let core = clamp_plan(
+        input_shape,
+        input_dtype,
+        min.as_ref().map(|bound| (bound.shape(), bound.dtype())),
+        max.as_ref().map(|bound| (bound.shape(), bound.dtype())),
     )?;
-    let extent = |shape:&Shape,dtype:DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
     for bound in min.iter().chain(max.iter()) {
-        extent(bound.shape(),bound.dtype())?;
-        if bound.shape().numel()? != 1 { return Err(Error::InvalidElementwiseDType { op:"clamp scalar promotion", actual:bound.dtype() }); }
+        extent(bound.shape(), bound.dtype())?;
+        if bound.shape().numel()? != 1 {
+            return Err(Error::InvalidElementwiseDType {
+                op: "clamp scalar promotion",
+                actual: bound.dtype(),
+            });
+        }
     }
     Ok(ClampScalarPlan { core, min, max })
 }
@@ -2971,7 +3327,10 @@ fn leaky_relu_plan(
     slope_dtype: DType,
 ) -> Result<LeakyReluPlan> {
     let source_promote = |lhs: DType, rhs: DType| {
-        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        if matches!(
+            (lhs, rhs),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
             DType::F32
         } else {
             lhs.promote(rhs)
@@ -3052,7 +3411,10 @@ fn hardsigmoid_plan(
     // tinygrad's weak promotion has one local disagreement with RustGrad's
     // generic lattice: the I64/U64 pair resolves through default F32.
     let source_promote = |lhs: DType, rhs: DType| {
-        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        if matches!(
+            (lhs, rhs),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
             DType::F32
         } else {
             lhs.promote(rhs)
@@ -3124,10 +3486,18 @@ fn hardsigmoid_scalar_plan(
     // alpha is the left Python float in `alpha * self`; for non-float x it
     // weak-promotes to tinygrad's default F32. Its product is then the live
     // reference which commits the subsequent `+ beta` Python float.
-    let alpha_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let alpha_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
     let alpha = TensorData::scalar_with_dtype(Scalar::F(alpha), alpha_dtype);
     let product_dtype = source_lub(input_dtype, alpha_dtype);
-    let beta_dtype = if product_dtype.is_float() { product_dtype } else { DType::F32 };
+    let beta_dtype = if product_dtype.is_float() {
+        product_dtype
+    } else {
+        DType::F32
+    };
     let beta = TensorData::scalar_with_dtype(Scalar::F(beta), beta_dtype);
     let core = hardsigmoid_plan(
         &input_shape,
@@ -3199,8 +3569,14 @@ impl Graph {
             let bias = self.reshape(bias, plan.parameter_shape.clone())?;
             output = self.add(output, bias)?;
         }
-        debug_assert_eq!(self.shape(output).expect("batchnorm preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("batchnorm preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("batchnorm preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("batchnorm preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3237,8 +3613,14 @@ impl Graph {
     pub fn usum(&mut self, input: NodeId, inputs: &[NodeId]) -> Result<NodeId> {
         let plan = ufold_plan(self, input, inputs, UfoldKind::Sum)?;
         let output = lower_ufold(self, input, inputs, UfoldKind::Sum, plan.bool_operator)?;
-        debug_assert_eq!(self.shape(output).expect("usum preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("usum preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("usum preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("usum preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3248,8 +3630,14 @@ impl Graph {
     pub fn uprod(&mut self, input: NodeId, inputs: &[NodeId]) -> Result<NodeId> {
         let plan = ufold_plan(self, input, inputs, UfoldKind::Prod)?;
         let output = lower_ufold(self, input, inputs, UfoldKind::Prod, plan.bool_operator)?;
-        debug_assert_eq!(self.shape(output).expect("uprod preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("uprod preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("uprod preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("uprod preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3319,8 +3707,14 @@ impl Graph {
         } else {
             self.add(input, scalar)?
         };
-        debug_assert_eq!(self.shape(output).expect("add scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("add scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("add scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("add scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3418,8 +3812,14 @@ impl Graph {
         } else {
             self.sub(input, scalar)?
         };
-        debug_assert_eq!(self.shape(output).expect("sub scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("sub scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("sub scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("sub scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3500,8 +3900,14 @@ impl Graph {
         } else {
             self.mul(input, scalar)?
         };
-        debug_assert_eq!(self.shape(output).expect("mul scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("mul scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("mul scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("mul scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3608,8 +4014,14 @@ impl Graph {
         } else {
             self.div(input, scalar)?
         };
-        debug_assert_eq!(self.shape(output).expect("div scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("div scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("div scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("div scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3648,8 +4060,16 @@ impl Graph {
             BinaryOp::Minimum => self.minimum(input, scalar)?,
             _ => unreachable!("extrema scalar plan only admits extrema"),
         };
-        debug_assert_eq!(self.shape(output).expect("extrema scalar shape preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("extrema scalar dtype preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output)
+                .expect("extrema scalar shape preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output)
+                .expect("extrema scalar dtype preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     /// Source-compatible scalar-right form of tinygrad's
@@ -3773,8 +4193,8 @@ impl Graph {
             self.cast(rhs, division_dtype)?
         };
         if division_dtype.is_integer() {
-            let (zero_data, one_data) = integer_scalars
-                .expect("integer floor_div scalar plan was preflighted");
+            let (zero_data, one_data) =
+                integer_scalars.expect("integer floor_div scalar plan was preflighted");
             let zero = self.constant(zero_data);
             let one = self.constant(one_data);
             let is_zero = self.eq(rhs, zero)?;
@@ -3817,8 +4237,14 @@ impl Graph {
         } else {
             self.floor_div(input, scalar)?
         };
-        debug_assert_eq!(self.shape(output).expect("floor_div scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("floor_div scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("floor_div scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("floor_div scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3848,8 +4274,14 @@ impl Graph {
         } else {
             self.trunc_div(input, scalar)?
         };
-        debug_assert_eq!(self.shape(output).expect("trunc_div scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("trunc_div scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("trunc_div scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("trunc_div scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -3968,8 +4400,8 @@ impl Graph {
             // tinygrad's checked-in CDIV helper returns zero for a zero
             // divisor. Select a nonzero placeholder before RustGrad's raw
             // integer op, then restore that typed source sentinel.
-            let (zero_data, one_data) = integer_scalars
-                .expect("integer trunc_div scalar plan was preflighted");
+            let (zero_data, one_data) =
+                integer_scalars.expect("integer trunc_div scalar plan was preflighted");
             let zero = self.constant(zero_data);
             let one = self.constant(one_data);
             let is_zero = self.eq(rhs, zero)?;
@@ -4114,8 +4546,14 @@ impl Graph {
         } else {
             self.modulo(input, scalar)?
         };
-        debug_assert_eq!(self.shape(output).expect("mod scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("mod scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("mod scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("mod scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -4249,8 +4687,14 @@ impl Graph {
         let plan = fmod_scalar_plan(self, input, value)?;
         let scalar = self.constant(plan.scalar);
         let output = self.fmod(input, scalar)?;
-        debug_assert_eq!(self.shape(output).expect("fmod scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("fmod scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("fmod scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("fmod scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -4261,13 +4705,7 @@ impl Graph {
         let rhs_node = self.node(rhs)?;
         let rhs_shape = rhs_node.shape.clone();
         let rhs_dtype = rhs_node.dtype;
-        let plan = bitwise_binary_plan(
-            &lhs_shape,
-            lhs_dtype,
-            &rhs_shape,
-            rhs_dtype,
-            op,
-        )?;
+        let plan = bitwise_binary_plan(&lhs_shape, lhs_dtype, &rhs_shape, rhs_dtype, op)?;
         let lhs = if plan.lhs_dtype == plan.output_dtype {
             lhs
         } else {
@@ -4279,8 +4717,16 @@ impl Graph {
             self.cast(rhs, plan.output_dtype)?
         };
         let output = self.binary(op, lhs, rhs)?;
-        debug_assert_eq!(self.shape(output).expect("bitwise binary shape preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("bitwise binary dtype preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output)
+                .expect("bitwise binary shape preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output)
+                .expect("bitwise binary dtype preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -4328,8 +4774,16 @@ impl Graph {
             self.cast(rhs, plan.output_dtype)?
         };
         let output = self.binary(op, lhs, rhs)?;
-        debug_assert_eq!(self.shape(output).expect("bitwise scalar shape preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("bitwise scalar dtype preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output)
+                .expect("bitwise scalar shape preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output)
+                .expect("bitwise scalar dtype preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -4401,8 +4855,14 @@ impl Graph {
         } else {
             self.bit_xor(input, self.constant(plan.mask))?
         };
-        debug_assert_eq!(self.shape(output).expect("bitwise_not shape preflighted"), &plan.shape);
-        debug_assert_eq!(self.dtype(output).expect("bitwise_not dtype preflighted"), plan.dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("bitwise_not shape preflighted"),
+            &plan.shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("bitwise_not dtype preflighted"),
+            plan.dtype
+        );
         Ok(output)
     }
 
@@ -4449,7 +4909,9 @@ impl Graph {
         extent(&output_shape, DType::Bool)?;
         let truth = TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool);
         extent(truth.shape(), truth.dtype())?;
-        if truth.dtype() != DType::Bool || output_shape.broadcast_with(truth.shape())? != output_shape {
+        if truth.dtype() != DType::Bool
+            || output_shape.broadcast_with(truth.shape())? != output_shape
+        {
             return Err(Error::InvalidElementwiseDType {
                 op: "eq logical_not promotion",
                 actual: comparison_dtype,
@@ -4469,12 +4931,7 @@ impl Graph {
         self.logical_not(unequal)
     }
 
-    fn comparison_scalar(
-        &mut self,
-        input: NodeId,
-        value: Scalar,
-        op: CompareOp,
-    ) -> Result<NodeId> {
+    fn comparison_scalar(&mut self, input: NodeId, value: Scalar, op: CompareOp) -> Result<NodeId> {
         debug_assert!(matches!(op, CompareOp::Eq | CompareOp::Ne));
         let plan = comparison_scalar_plan(self, input, value)?;
         let scalar = self.constant(plan.scalar);
@@ -4483,9 +4940,18 @@ impl Graph {
             CompareOp::Ne => self.ne(input, scalar)?,
             _ => unreachable!("only equality predicates use comparison_scalar"),
         };
-        debug_assert_eq!(self.shape(output).expect("comparison scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("comparison scalar preflighted"), DType::Bool);
-        debug_assert_eq!(self.dtype(scalar).expect("comparison scalar preflighted"), plan.comparison_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("comparison scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("comparison scalar preflighted"),
+            DType::Bool
+        );
+        debug_assert_eq!(
+            self.dtype(scalar).expect("comparison scalar preflighted"),
+            plan.comparison_dtype
+        );
         Ok(output)
     }
 
@@ -4554,7 +5020,10 @@ impl Graph {
         op: CompareOp,
         reverse: bool,
     ) -> Result<NodeId> {
-        debug_assert!(matches!(op, CompareOp::Lt | CompareOp::Gt | CompareOp::Le | CompareOp::Ge));
+        debug_assert!(matches!(
+            op,
+            CompareOp::Lt | CompareOp::Gt | CompareOp::Le | CompareOp::Ge
+        ));
         let plan = comparison_scalar_plan(self, input, value)?;
         let scalar = self.constant(plan.scalar);
         // Python's reflected comparison dispatch invokes the complementary
@@ -4571,9 +5040,18 @@ impl Graph {
             (CompareOp::Ge, true) => self.le(input, scalar)?,
             _ => unreachable!("only ordered predicates use ordered_comparison_scalar"),
         };
-        debug_assert_eq!(self.shape(output).expect("ordered scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("ordered scalar preflighted"), DType::Bool);
-        debug_assert_eq!(self.dtype(scalar).expect("ordered scalar preflighted"), plan.comparison_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("ordered scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("ordered scalar preflighted"),
+            DType::Bool
+        );
+        debug_assert_eq!(
+            self.dtype(scalar).expect("ordered scalar preflighted"),
+            plan.comparison_dtype
+        );
         Ok(output)
     }
 
@@ -4812,12 +5290,20 @@ impl Graph {
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
         let truth = TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool);
-        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
         extent(&shape, input_dtype)?;
         extent(&shape, DType::Bool)?;
         extent(truth.shape(), truth.dtype())?;
         if truth.dtype() != DType::Bool || shape.broadcast_with(truth.shape())? != shape {
-            return Err(Error::InvalidLogicalDType { op: "logical_not", actual: input_dtype });
+            return Err(Error::InvalidLogicalDType {
+                op: "logical_not",
+                actual: input_dtype,
+            });
         }
         let boolean = self.cast(input, DType::Bool)?;
         self.ne(boolean, self.constant(truth))
@@ -4942,8 +5428,14 @@ impl Graph {
             _ => unreachable!("where scalar plan must match its false branch"),
         };
         let output = self.select(condition, on_true, on_false)?;
-        debug_assert_eq!(self.shape(output).expect("where scalar preflighted"), &output_shape);
-        debug_assert_eq!(self.dtype(output).expect("where scalar preflighted"), output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("where scalar preflighted"),
+            &output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("where scalar preflighted"),
+            output_dtype
+        );
         Ok(output)
     }
 
@@ -4997,12 +5489,7 @@ impl Graph {
     ///
     /// This is the named counterpart to tinygrad's `masked_fill`; it retains
     /// `select`'s checked broadcasting and value-dtype promotion contract.
-    pub fn masked_fill(
-        &mut self,
-        input: NodeId,
-        mask: NodeId,
-        value: NodeId,
-    ) -> Result<NodeId> {
+    pub fn masked_fill(&mut self, input: NodeId, mask: NodeId, value: NodeId) -> Result<NodeId> {
         self.select(mask, value, input)
     }
 
@@ -5021,8 +5508,14 @@ impl Graph {
         // separate scalar WHERE surface.
         let value = self.constant(plan.scalar);
         let output = self.masked_fill(input, mask, value)?;
-        debug_assert_eq!(self.shape(output).expect("masked_fill scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("masked_fill scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("masked_fill scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("masked_fill scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -5075,13 +5568,17 @@ impl Graph {
                 .checked_mul(dtype.itemsize())
                 .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
-        for dtype in [input_dtype, source_dtype, work_dtype, work_dtype, output_dtype] {
+        for dtype in [
+            input_dtype,
+            source_dtype,
+            work_dtype,
+            work_dtype,
+            output_dtype,
+        ] {
             extent(&shape, dtype)?;
         }
-        let scale = TensorData::scalar_with_dtype(
-            Scalar::F(1.0 / std::f64::consts::LN_2),
-            work_dtype,
-        );
+        let scale =
+            TensorData::scalar_with_dtype(Scalar::F(1.0 / std::f64::consts::LN_2), work_dtype);
         extent(scale.shape(), work_dtype)?;
         if (!input_dtype.is_float() && source_dtype != DType::F32)
             || (input_dtype.is_float() && source_dtype != input_dtype)
@@ -5302,7 +5799,8 @@ impl Graph {
         extent(sqrt_dtype)?;
         extent(output_dtype)?;
         if (!input_dtype.is_float() && (sqrt_dtype != DType::F32 || output_dtype != DType::F32))
-            || (input_dtype.is_float() && (sqrt_dtype != input_dtype || output_dtype != input_dtype))
+            || (input_dtype.is_float()
+                && (sqrt_dtype != input_dtype || output_dtype != input_dtype))
         {
             return Err(Error::InvalidElementwiseDType {
                 op: "rsqrt sqrt/reciprocal source promotion",
@@ -5399,9 +5897,14 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let work_dtype = output_dtype.promote(DType::F32);
-        let half_pi = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), work_dtype);
+        let half_pi =
+            TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), work_dtype);
         let extent = |shape: &Shape, dtype: DType| {
             shape
                 .numel()?
@@ -5428,11 +5931,23 @@ impl Graph {
                 actual: sine_dtype,
             });
         }
-        let lifted = if input_dtype == output_dtype { input } else { self.cast(input, output_dtype)? };
-        let widened = if output_dtype == work_dtype { lifted } else { self.cast(lifted, work_dtype)? };
+        let lifted = if input_dtype == output_dtype {
+            input
+        } else {
+            self.cast(input, output_dtype)?
+        };
+        let widened = if output_dtype == work_dtype {
+            lifted
+        } else {
+            self.cast(lifted, work_dtype)?
+        };
         let phase = self.sub(self.constant(half_pi), widened)?;
         let sine = self.sin(phase)?;
-        if work_dtype == output_dtype { Ok(sine) } else { self.cast(sine, output_dtype) }
+        if work_dtype == output_dtype {
+            Ok(sine)
+        } else {
+            self.cast(sine, output_dtype)
+        }
     }
     pub fn tan(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.tan is literally `self.sin() / self.cos()`. Plan both
@@ -5442,7 +5957,11 @@ impl Graph {
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
         let sin_dtype = unary_dtype(UnaryOp::Sin, input_dtype);
-        let cos_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let cos_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let output_dtype = sin_dtype.promote(cos_dtype);
         let extent = |dtype: DType| {
             shape
@@ -5474,12 +5993,19 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let neg_dtype = unary_dtype(UnaryOp::Neg, input_dtype);
         let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
         let two = TensorData::scalar_with_dtype(Scalar::I(2), output_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         extent(&shape, input_dtype)?;
         for dtype in [neg_dtype, exp_dtype, exp_dtype, output_dtype, output_dtype] {
@@ -5494,7 +6020,10 @@ impl Graph {
             || shape.broadcast_with(two.shape())? != shape
             || output_dtype.promote(output_dtype) != output_dtype
         {
-            return Err(Error::InvalidElementwiseDType { op: "sinh exp/sub/div source promotion", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "sinh exp/sub/div source promotion",
+                actual: output_dtype,
+            });
         }
         let positive = self.exp(input)?;
         let negative = self.exp(self.neg(input)?)?;
@@ -5507,12 +6036,19 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let neg_dtype = unary_dtype(UnaryOp::Neg, input_dtype);
         let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
         let two = TensorData::scalar_with_dtype(Scalar::I(2), output_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         extent(&shape, input_dtype)?;
         for dtype in [neg_dtype, exp_dtype, exp_dtype, output_dtype, output_dtype] {
@@ -5527,7 +6063,10 @@ impl Graph {
             || shape.broadcast_with(two.shape())? != shape
             || output_dtype.promote(output_dtype) != output_dtype
         {
-            return Err(Error::InvalidElementwiseDType { op: "cosh exp/add/div source promotion", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "cosh exp/add/div source promotion",
+                actual: output_dtype,
+            });
         }
         let positive = self.exp(input)?;
         let negative = self.exp(self.neg(input)?)?;
@@ -5567,10 +6106,8 @@ impl Graph {
         }
         let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
         let two = TensorData::scalar_with_dtype(Scalar::F(2.0), output_dtype);
-        let neg_inv_ln2 = TensorData::scalar_with_dtype(
-            Scalar::F(-1.0 / std::f64::consts::LN_2),
-            output_dtype,
-        );
+        let neg_inv_ln2 =
+            TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), output_dtype);
         if one.dtype() != output_dtype
             || two.dtype() != output_dtype
             || neg_inv_ln2.dtype() != output_dtype
@@ -5611,29 +6148,59 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-        let coefficients = [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592];
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
+        let coefficients = [
+            1.061405429,
+            -1.453152027,
+            1.421413741,
+            -0.284496736,
+            0.254829592,
+        ];
         let coefficient = TensorData::scalar_with_dtype(Scalar::F(0.3275911), input_dtype);
         let input_one = TensorData::scalar_with_dtype(Scalar::F(1.0), input_dtype);
         let output_one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
         let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
-        let polynomial = coefficients.map(|value| TensorData::scalar_with_dtype(Scalar::F(value), output_dtype));
+        let polynomial =
+            coefficients.map(|value| TensorData::scalar_with_dtype(Scalar::F(value), output_dtype));
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
-        for dtype in [input_dtype, input_dtype, input_dtype, input_dtype, output_dtype, output_dtype, output_dtype, output_dtype, output_dtype] {
+        for dtype in [
+            input_dtype,
+            input_dtype,
+            input_dtype,
+            input_dtype,
+            output_dtype,
+            output_dtype,
+            output_dtype,
+            output_dtype,
+            output_dtype,
+        ] {
             extent(&shape, dtype)?;
         }
         for scalar in [&coefficient, &input_one] {
             extent(scalar.shape(), scalar.dtype())?;
             if scalar.dtype() != input_dtype || shape.broadcast_with(scalar.shape())? != shape {
-                return Err(Error::InvalidElementwiseDType { op: "erf source scalar promotion", actual: scalar.dtype() });
+                return Err(Error::InvalidElementwiseDType {
+                    op: "erf source scalar promotion",
+                    actual: scalar.dtype(),
+                });
             }
         }
         for scalar in [&output_one, &zero].into_iter().chain(polynomial.iter()) {
             extent(scalar.shape(), scalar.dtype())?;
             if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape {
-                return Err(Error::InvalidElementwiseDType { op: "erf source scalar promotion", actual: scalar.dtype() });
+                return Err(Error::InvalidElementwiseDType {
+                    op: "erf source scalar promotion",
+                    actual: scalar.dtype(),
+                });
             }
         }
         if unary_dtype(UnaryOp::Sign, input_dtype) != input_dtype
@@ -5643,10 +6210,16 @@ impl Graph {
             || (input_dtype.is_float() && output_dtype != input_dtype)
             || input_dtype.promote(output_dtype) != output_dtype
         {
-            return Err(Error::InvalidElementwiseDType { op: "erf source promotion", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "erf source promotion",
+                actual: output_dtype,
+            });
         }
         let absolute = self.abs(input)?;
-        let denominator = self.add(self.constant(input_one.clone()), self.mul(self.constant(coefficient), absolute)?)?;
+        let denominator = self.add(
+            self.constant(input_one.clone()),
+            self.mul(self.constant(coefficient), absolute)?,
+        )?;
         let t = self.div(self.constant(input_one), denominator)?;
         let mut poly = self.constant(zero);
         for coefficient in polynomial {
@@ -5669,24 +6242,42 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let coefficients = [
-            -0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810,
-            -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050,
+            -0.0012624911,
+            0.0066700901,
+            -0.0170881256,
+            0.0308918810,
+            -0.0501743046,
+            0.0889789874,
+            -0.2145988016,
+            1.5707963050,
         ];
-        let scalars = coefficients.map(|value| TensorData::scalar_with_dtype(Scalar::F(value), output_dtype));
+        let scalars =
+            coefficients.map(|value| TensorData::scalar_with_dtype(Scalar::F(value), output_dtype));
         let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
         let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
-        let half_pi = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), output_dtype);
+        let half_pi =
+            TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), output_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         extent(&shape, input_dtype)?;
         extent(&shape, output_dtype)?;
         for scalar in scalars.iter().chain([&zero, &one, &half_pi]) {
             extent(scalar.shape(), scalar.dtype())?;
             if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape {
-                return Err(Error::InvalidElementwiseDType { op: "asin polynomial scalar promotion", actual: scalar.dtype() });
+                return Err(Error::InvalidElementwiseDType {
+                    op: "asin polynomial scalar promotion",
+                    actual: scalar.dtype(),
+                });
             }
         }
         if (!input_dtype.is_float() && output_dtype != DType::F32)
@@ -5694,15 +6285,25 @@ impl Graph {
             || input_dtype.promote(output_dtype) != output_dtype
             || unary_dtype(UnaryOp::Sqrt, output_dtype) != output_dtype
         {
-            return Err(Error::InvalidElementwiseDType { op: "asin source promotion", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "asin source promotion",
+                actual: output_dtype,
+            });
         }
         let absolute = self.abs(input)?;
-        let absolute_work = if input_dtype == output_dtype { absolute } else { self.cast(absolute, output_dtype)? };
+        let absolute_work = if input_dtype == output_dtype {
+            absolute
+        } else {
+            self.cast(absolute, output_dtype)?
+        };
         let one = self.constant(one);
         let radius = self.sqrt(self.sub(one, absolute_work)?)?;
         let mut polynomial = self.constant(zero);
         for coefficient in scalars {
-            polynomial = self.add(self.mul(polynomial, absolute_work)?, self.constant(coefficient))?;
+            polynomial = self.add(
+                self.mul(polynomial, absolute_work)?,
+                self.constant(coefficient),
+            )?;
         }
         let magnitude = self.sub(self.constant(half_pi), self.mul(radius, polynomial)?)?;
         self.mul(self.sign(input)?, magnitude)
@@ -5714,10 +6315,18 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-        let half_pi = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), output_dtype);
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
+        let half_pi =
+            TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), output_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         extent(&shape, input_dtype)?;
         extent(&shape, output_dtype)?;
@@ -5728,7 +6337,10 @@ impl Graph {
             || shape.broadcast_with(half_pi.shape())? != shape
             || output_dtype.promote(output_dtype) != output_dtype
         {
-            return Err(Error::InvalidElementwiseDType { op: "acos asin source promotion", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "acos asin source promotion",
+                actual: output_dtype,
+            });
         }
         let asin = self.asin(input)?;
         self.sub(self.constant(half_pi), asin)
@@ -5740,10 +6352,17 @@ impl Graph {
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
         let sqrt_dtype = unary_dtype(UnaryOp::Sqrt, input_dtype);
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let one = TensorData::scalar_with_dtype(Scalar::I(1), input_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         extent(&shape, input_dtype)?;
         extent(&shape, sqrt_dtype)?;
@@ -5755,7 +6374,10 @@ impl Graph {
             || input_dtype.promote(input_dtype) != input_dtype
             || input_dtype.promote(sqrt_dtype) != output_dtype
         {
-            return Err(Error::InvalidElementwiseDType { op: "atan source promotion", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "atan source promotion",
+                actual: output_dtype,
+            });
         }
         let square = self.mul(input, input)?;
         let denominator = self.sqrt(self.add(self.constant(one), square)?)?;
@@ -5770,12 +6392,26 @@ impl Graph {
         let input_dtype = source.dtype;
         let square_dtype = input_dtype.promote(input_dtype);
         let root_dtype = unary_dtype(UnaryOp::Sqrt, square_dtype);
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let one = TensorData::scalar_with_dtype(Scalar::I(1), square_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
-        for dtype in [input_dtype, square_dtype, square_dtype, root_dtype, output_dtype, output_dtype] {
+        for dtype in [
+            input_dtype,
+            square_dtype,
+            square_dtype,
+            root_dtype,
+            output_dtype,
+            output_dtype,
+        ] {
             extent(&shape, dtype)?;
         }
         extent(one.shape(), one.dtype())?;
@@ -5789,7 +6425,10 @@ impl Graph {
             || one.dtype() != square_dtype
             || shape.broadcast_with(one.shape())? != shape
         {
-            return Err(Error::InvalidElementwiseDType { op: "asinh square/sqrt/add/log source promotion", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "asinh square/sqrt/add/log source promotion",
+                actual: output_dtype,
+            });
         }
         let square = self.square(input)?;
         let radicand = self.add(square, self.constant(one))?;
@@ -5805,12 +6444,26 @@ impl Graph {
         let input_dtype = source.dtype;
         let square_dtype = input_dtype.promote(input_dtype);
         let root_dtype = unary_dtype(UnaryOp::Sqrt, square_dtype);
-        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let one = TensorData::scalar_with_dtype(Scalar::I(1), square_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
-        for dtype in [input_dtype, square_dtype, square_dtype, root_dtype, output_dtype, output_dtype] {
+        for dtype in [
+            input_dtype,
+            square_dtype,
+            square_dtype,
+            root_dtype,
+            output_dtype,
+            output_dtype,
+        ] {
             extent(&shape, dtype)?;
         }
         extent(one.shape(), one.dtype())?;
@@ -5824,7 +6477,10 @@ impl Graph {
             || one.dtype() != square_dtype
             || shape.broadcast_with(one.shape())? != shape
         {
-            return Err(Error::InvalidElementwiseDType { op: "acosh square/sub/sqrt/add/log source promotion", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "acosh square/sub/sqrt/add/log source promotion",
+                actual: output_dtype,
+            });
         }
         let square = self.square(input)?;
         let radicand = self.sub(square, self.constant(one))?;
@@ -5839,21 +6495,39 @@ impl Graph {
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
         let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, input_dtype);
-        let dividend_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let dividend_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
         let ratio_dtype = dividend_dtype.promote(reciprocal_dtype);
         let log_dtype = unary_dtype(UnaryOp::Log2, ratio_dtype);
         let one = TensorData::scalar_with_dtype(Scalar::I(1), input_dtype);
         let two = TensorData::scalar_with_dtype(Scalar::I(2), log_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
-        for dtype in [input_dtype, input_dtype, input_dtype, dividend_dtype, reciprocal_dtype, ratio_dtype, log_dtype, log_dtype] {
+        for dtype in [
+            input_dtype,
+            input_dtype,
+            input_dtype,
+            dividend_dtype,
+            reciprocal_dtype,
+            ratio_dtype,
+            log_dtype,
+            log_dtype,
+        ] {
             extent(&shape, dtype)?;
         }
         extent(one.shape(), one.dtype())?;
         extent(two.shape(), two.dtype())?;
-        if (!input_dtype.is_float() && (dividend_dtype != DType::F32 || reciprocal_dtype != DType::F32))
-            || (input_dtype.is_float() && (dividend_dtype != input_dtype || reciprocal_dtype != input_dtype))
+        if (!input_dtype.is_float()
+            && (dividend_dtype != DType::F32 || reciprocal_dtype != DType::F32))
+            || (input_dtype.is_float()
+                && (dividend_dtype != input_dtype || reciprocal_dtype != input_dtype))
             || dividend_dtype.promote(reciprocal_dtype) != ratio_dtype
             || log_dtype != ratio_dtype
             || one.dtype() != input_dtype
@@ -5861,7 +6535,10 @@ impl Graph {
             || shape.broadcast_with(one.shape())? != shape
             || shape.broadcast_with(two.shape())? != shape
         {
-            return Err(Error::InvalidElementwiseDType { op: "atanh add/sub/div/log source promotion", actual: log_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "atanh add/sub/div/log source promotion",
+                actual: log_dtype,
+            });
         }
         let numerator = self.add(self.constant(one.clone()), input)?;
         let denominator = self.sub(self.constant(one), input)?;
@@ -5886,12 +6563,7 @@ impl Graph {
         let sign_node = self.node(sign)?;
         let sign_shape = sign_node.shape.clone();
         let sign_dtype = sign_node.dtype;
-        let plan = copysign_plan(
-            &magnitude_shape,
-            magnitude_dtype,
-            &sign_shape,
-            sign_dtype,
-        )?;
+        let plan = copysign_plan(&magnitude_shape, magnitude_dtype, &sign_shape, sign_dtype)?;
 
         let magnitude = if magnitude_dtype == plan.operand_dtype {
             magnitude
@@ -5911,11 +6583,26 @@ impl Graph {
         let negative = self.logical_or(negative, reciprocal_negative)?;
         let magnitude = self.abs(magnitude)?;
         let output = self.select(negative, self.neg(magnitude)?, magnitude)?;
-        debug_assert_eq!(self.shape(output).expect("copysign preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("copysign preflighted"), plan.operand_dtype);
-        debug_assert_eq!(self.shape(sign).expect("copysign preflighted"), &plan.sign_shape);
-        debug_assert_eq!(self.shape(magnitude).expect("copysign preflighted"), &plan.magnitude_shape);
-        debug_assert_eq!(self.dtype(reciprocal).expect("copysign preflighted"), plan.reciprocal_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("copysign preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("copysign preflighted"),
+            plan.operand_dtype
+        );
+        debug_assert_eq!(
+            self.shape(sign).expect("copysign preflighted"),
+            &plan.sign_shape
+        );
+        debug_assert_eq!(
+            self.shape(magnitude).expect("copysign preflighted"),
+            &plan.magnitude_shape
+        );
+        debug_assert_eq!(
+            self.dtype(reciprocal).expect("copysign preflighted"),
+            plan.reciprocal_dtype
+        );
         Ok(output)
     }
     /// Source-compatible scalar-right form of tinygrad's
@@ -5929,9 +6616,18 @@ impl Graph {
         // source casts, branch ordering, and VJP behavior.
         let sign = self.constant(plan.scalar);
         let output = self.copysign(magnitude, sign)?;
-        debug_assert_eq!(self.dtype(magnitude).expect("copysign scalar preflighted"), plan.magnitude_dtype);
-        debug_assert_eq!(self.shape(output).expect("copysign scalar preflighted"), &plan.core.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("copysign scalar preflighted"), plan.core.operand_dtype);
+        debug_assert_eq!(
+            self.dtype(magnitude).expect("copysign scalar preflighted"),
+            plan.magnitude_dtype
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("copysign scalar preflighted"),
+            &plan.core.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("copysign scalar preflighted"),
+            plan.core.operand_dtype
+        );
         Ok(output)
     }
     /// Compositional tinygrad-style sigmoid, retaining an inspectable graph.
@@ -5961,10 +6657,8 @@ impl Graph {
             extent(&input_shape, output_dtype)?;
         }
         let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
-        let neg_inv_ln2 = TensorData::scalar_with_dtype(
-            Scalar::F(-1.0 / std::f64::consts::LN_2),
-            output_dtype,
-        );
+        let neg_inv_ln2 =
+            TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), output_dtype);
         if one.dtype() != output_dtype
             || neg_inv_ln2.dtype() != output_dtype
             || input_shape.broadcast_with(one.shape())? != input_shape
@@ -5998,10 +6692,17 @@ impl Graph {
         max: Option<NodeId>,
     ) -> Result<NodeId> {
         let input_node = self.node(input)?;
-        let min_node = match min { Some(bound) => Some(self.node(bound)?), None => None };
-        let max_node = match max { Some(bound) => Some(self.node(bound)?), None => None };
+        let min_node = match min {
+            Some(bound) => Some(self.node(bound)?),
+            None => None,
+        };
+        let max_node = match max {
+            Some(bound) => Some(self.node(bound)?),
+            None => None,
+        };
         let plan = clamp_plan(
-            &input_node.shape, input_node.dtype,
+            &input_node.shape,
+            input_node.dtype,
             min_node.map(|node| (&node.shape, node.dtype)),
             max_node.map(|node| (&node.shape, node.dtype)),
         )?;
@@ -6052,8 +6753,14 @@ impl Graph {
             };
             let below = self.lt(value, bound)?;
             value = self.select(below, bound, value)?;
-            debug_assert_eq!(self.shape(value).expect("clamp lower preflighted"), &stage.shape);
-            debug_assert_eq!(self.dtype(value).expect("clamp lower preflighted"), stage.dtype);
+            debug_assert_eq!(
+                self.shape(value).expect("clamp lower preflighted"),
+                &stage.shape
+            );
+            debug_assert_eq!(
+                self.dtype(value).expect("clamp lower preflighted"),
+                stage.dtype
+            );
         }
         if let (Some(bound), Some(stage)) = (max, plan.upper.as_ref()) {
             let dtype = stage.dtype;
@@ -6067,11 +6774,23 @@ impl Graph {
             };
             let above = self.gt(value, bound)?;
             value = self.select(above, bound, value)?;
-            debug_assert_eq!(self.shape(value).expect("clamp upper preflighted"), &stage.shape);
-            debug_assert_eq!(self.dtype(value).expect("clamp upper preflighted"), stage.dtype);
+            debug_assert_eq!(
+                self.shape(value).expect("clamp upper preflighted"),
+                &stage.shape
+            );
+            debug_assert_eq!(
+                self.dtype(value).expect("clamp upper preflighted"),
+                stage.dtype
+            );
         }
-        debug_assert_eq!(self.shape(value).expect("clamp preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(value).expect("clamp preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(value).expect("clamp preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(value).expect("clamp preflighted"),
+            plan.output_dtype
+        );
         Ok(value)
     }
 
@@ -6133,11 +6852,7 @@ impl Graph {
     /// Source-compatible untyped concrete-scalar slope form. This preserves
     /// tinygrad's runtime `ConstType` surface without changing the established
     /// f64-only [`Self::leaky_relu_scalar`] API.
-    pub fn leaky_relu_with_scalar(
-        &mut self,
-        input: NodeId,
-        neg_slope: Scalar,
-    ) -> Result<NodeId> {
+    pub fn leaky_relu_with_scalar(&mut self, input: NodeId, neg_slope: Scalar) -> Result<NodeId> {
         let input_node = self.node(input)?;
         let input_shape = input_node.shape.clone();
         let input_dtype = input_node.dtype;
@@ -6160,7 +6875,6 @@ impl Graph {
         slope_dtype: DType,
         plan: LeakyReluPlan,
     ) -> Result<NodeId> {
-
         // tinygrad spells this as `(x < 0).where(slope * x, x)`.  Keep the
         // source operand order: it determines the selected NaN payload and
         // its weak common dtype for the I64/U64 bridge.
@@ -6178,8 +6892,14 @@ impl Graph {
         };
         let scaled = self.mul(slope_value, input_value)?;
         let output = self.select(negative, scaled, input_value)?;
-        debug_assert_eq!(self.shape(output).expect("LeakyRelu preflighted"), &plan.shape);
-        debug_assert_eq!(self.dtype(output).expect("LeakyRelu preflighted"), plan.dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("LeakyRelu preflighted"),
+            &plan.shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("LeakyRelu preflighted"),
+            plan.dtype
+        );
         Ok(output)
     }
     pub fn silu(&mut self, input: NodeId) -> Result<NodeId> {
@@ -6194,20 +6914,21 @@ impl Graph {
     /// Source-compatible `Tensor.hardsigmoid(alpha, beta)` public float
     /// form. The checked-in source is the literal
     /// `(alpha * x + beta).relu() - (alpha * x + beta - 1).relu()`.
-    pub fn hardsigmoid_scalar(
-        &mut self,
-        input: NodeId,
-        alpha: f64,
-        beta: f64,
-    ) -> Result<NodeId> {
+    pub fn hardsigmoid_scalar(&mut self, input: NodeId, alpha: f64, beta: f64) -> Result<NodeId> {
         let plan = hardsigmoid_scalar_plan(self, input, alpha, beta)?;
         let output_shape = plan.core.output_shape.clone();
         let output_dtype = plan.core.output_dtype;
         let alpha = self.constant(plan.alpha);
         let beta = self.constant(plan.beta);
         let output = self.lower_hardsigmoid(input, alpha, beta, plan.core)?;
-        debug_assert_eq!(self.shape(output).expect("Hardsigmoid scalar preflighted"), &output_shape);
-        debug_assert_eq!(self.dtype(output).expect("Hardsigmoid scalar preflighted"), output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("Hardsigmoid scalar preflighted"),
+            &output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("Hardsigmoid scalar preflighted"),
+            output_dtype
+        );
         Ok(output)
     }
 
@@ -6273,8 +6994,14 @@ impl Graph {
         let shifted = self.sub(scaled, one)?;
         let negative = self.select(self.gt(shifted, zero)?, shifted, zero)?;
         let output = self.sub(positive, negative)?;
-        debug_assert_eq!(self.shape(output).expect("Hardsigmoid preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("Hardsigmoid preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("Hardsigmoid preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("Hardsigmoid preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     pub fn hardtanh(&mut self, input: NodeId, min: NodeId, max: NodeId) -> Result<NodeId> {
@@ -6328,17 +7055,19 @@ impl Graph {
         let positive = self.select(self.gt(shifted, zero)?, shifted, zero)?;
         let six = self.constant(plan.six);
         let shifted_minus_six = self.sub(shifted, six)?;
-        let upper = self.select(
-            self.gt(shifted_minus_six, zero)?,
-            shifted_minus_six,
-            zero,
-        )?;
+        let upper = self.select(self.gt(shifted_minus_six, zero)?, shifted_minus_six, zero)?;
         let relu6 = self.sub(positive, upper)?;
         let scaled = self.mul(work, relu6)?;
         let sixth = self.constant(plan.sixth);
         let output = self.mul(scaled, sixth)?;
-        debug_assert_eq!(self.shape(output).expect("Hardswish preflighted"), &plan.shape);
-        debug_assert_eq!(self.dtype(output).expect("Hardswish preflighted"), plan.dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("Hardswish preflighted"),
+            &plan.shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("Hardswish preflighted"),
+            plan.dtype
+        );
         Ok(output)
     }
     pub fn quick_gelu(&mut self, input: NodeId) -> Result<NodeId> {
@@ -6358,8 +7087,14 @@ impl Graph {
         let one = self.constant(plan.one);
         let sigmoid = self.reciprocal(self.add(one, self.exp2(exponent)?)?)?;
         let output = self.mul(work, sigmoid)?;
-        debug_assert_eq!(self.shape(output).expect("QuickGELU preflighted"), &plan.shape);
-        debug_assert_eq!(self.dtype(output).expect("QuickGELU preflighted"), plan.dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("QuickGELU preflighted"),
+            &plan.shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("QuickGELU preflighted"),
+            plan.dtype
+        );
         Ok(output)
     }
     /// Applies GELU using tinygrad's `"tanh"` approximation or the exact
@@ -6534,13 +7269,31 @@ impl Graph {
         let negative_condition = self.gt(negative_raw, zero_exp)?;
         let negative_relu = self.select(negative_condition, negative_raw, zero_exp)?;
         let negative = self.mul(alpha, negative_relu)?;
-        debug_assert_eq!(self.shape(positive).expect("ELU preflighted"), &plan.positive_shape);
-        debug_assert_eq!(self.shape(negative_raw).expect("ELU preflighted"), &plan.negative_shape);
-        debug_assert_eq!(self.shape(negative).expect("ELU preflighted"), &plan.scaled_shape);
-        debug_assert_eq!(self.dtype(negative).expect("ELU preflighted"), plan.scaled_dtype);
+        debug_assert_eq!(
+            self.shape(positive).expect("ELU preflighted"),
+            &plan.positive_shape
+        );
+        debug_assert_eq!(
+            self.shape(negative_raw).expect("ELU preflighted"),
+            &plan.negative_shape
+        );
+        debug_assert_eq!(
+            self.shape(negative).expect("ELU preflighted"),
+            &plan.scaled_shape
+        );
+        debug_assert_eq!(
+            self.dtype(negative).expect("ELU preflighted"),
+            plan.scaled_dtype
+        );
         let output = self.sub(positive, negative)?;
-        debug_assert_eq!(self.shape(output).expect("ELU preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("ELU preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("ELU preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("ELU preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     pub fn celu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
@@ -6607,7 +7360,6 @@ impl Graph {
         multiply_alpha_dtype: DType,
         plan: CeluPlan,
     ) -> Result<NodeId> {
-
         // tinygrad literally evaluates
         // `x.maximum(0) + (alpha * ((x / alpha).exp() - 1)).minimum(0)`.
         // Its division is reciprocal then multiply, and the shared extrema
@@ -6635,8 +7387,14 @@ impl Graph {
             plan.reciprocal_dtype
         );
         let scaled = self.mul(dividend, reciprocal_alpha)?;
-        debug_assert_eq!(self.shape(scaled).expect("CELU preflighted"), &plan.scaled_shape);
-        debug_assert_eq!(self.dtype(scaled).expect("CELU preflighted"), plan.scaled_dtype);
+        debug_assert_eq!(
+            self.shape(scaled).expect("CELU preflighted"),
+            &plan.scaled_shape
+        );
+        debug_assert_eq!(
+            self.dtype(scaled).expect("CELU preflighted"),
+            plan.scaled_dtype
+        );
         let exp = self.exp(scaled)?;
         debug_assert_eq!(self.dtype(exp).expect("CELU preflighted"), plan.exp_dtype);
         let one = self.constant(plan.one);
@@ -6658,8 +7416,14 @@ impl Graph {
         let negative_zero = self.constant(plan.negative_zero);
         let negative = self.minimum(scaled_negative, negative_zero)?;
         let output = self.add(positive, negative)?;
-        debug_assert_eq!(self.shape(output).expect("CELU preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("CELU preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("CELU preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("CELU preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     pub fn selu(&mut self, input: NodeId, alpha: NodeId, gamma: NodeId) -> Result<NodeId> {
@@ -6677,7 +7441,14 @@ impl Graph {
         let alpha_dtype = alpha_node.dtype;
         let gamma_shape = gamma_node.shape.clone();
         let gamma_dtype = gamma_node.dtype;
-        let plan = selu_plan(&input_shape,input_dtype,&alpha_shape,alpha_dtype,&gamma_shape,gamma_dtype)?;
+        let plan = selu_plan(
+            &input_shape,
+            input_dtype,
+            &alpha_shape,
+            alpha_dtype,
+            &gamma_shape,
+            gamma_dtype,
+        )?;
         self.lower_selu(input, alpha, gamma, plan)
     }
 
@@ -6702,9 +7473,17 @@ impl Graph {
     }
 
     /// Checked-in tinygrad's `Tensor.selu()` defaults.
-    pub fn selu_default(&mut self, input: NodeId) -> Result<NodeId> { self.selu_scalar(input, 1.67326, 1.0507) }
+    pub fn selu_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.selu_scalar(input, 1.67326, 1.0507)
+    }
 
-    fn lower_selu(&mut self, input: NodeId, alpha: NodeId, gamma: NodeId, plan: SeluPlan) -> Result<NodeId> {
+    fn lower_selu(
+        &mut self,
+        input: NodeId,
+        alpha: NodeId,
+        gamma: NodeId,
+        plan: SeluPlan,
+    ) -> Result<NodeId> {
         let zero_input = self.constant(plan.zero_input);
         let condition = self.ge(input, zero_input)?;
         let exp = self.exp(input)?;
@@ -6713,44 +7492,136 @@ impl Graph {
         let negative = self.mul(alpha, negative_raw)?;
         let branch = self.select(condition, input, negative)?;
         debug_assert_eq!(self.dtype(exp).expect("SELU preflighted"), plan.exp_dtype);
-        debug_assert_eq!(self.shape(condition).expect("SELU preflighted"), &plan.condition_shape);
-        debug_assert_eq!(self.shape(negative).expect("SELU preflighted"), &plan.negative_shape);
-        debug_assert_eq!(self.dtype(negative).expect("SELU preflighted"), plan.negative_dtype);
-        debug_assert_eq!(self.shape(branch).expect("SELU preflighted"), &plan.branch_shape);
-        debug_assert_eq!(self.dtype(branch).expect("SELU preflighted"), plan.branch_dtype);
+        debug_assert_eq!(
+            self.shape(condition).expect("SELU preflighted"),
+            &plan.condition_shape
+        );
+        debug_assert_eq!(
+            self.shape(negative).expect("SELU preflighted"),
+            &plan.negative_shape
+        );
+        debug_assert_eq!(
+            self.dtype(negative).expect("SELU preflighted"),
+            plan.negative_dtype
+        );
+        debug_assert_eq!(
+            self.shape(branch).expect("SELU preflighted"),
+            &plan.branch_shape
+        );
+        debug_assert_eq!(
+            self.dtype(branch).expect("SELU preflighted"),
+            plan.branch_dtype
+        );
         let output = self.mul(gamma, branch)?;
-        debug_assert_eq!(self.shape(output).expect("SELU preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("SELU preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("SELU preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("SELU preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     pub fn softplus(&mut self, input: NodeId, beta: NodeId) -> Result<NodeId> {
         let input_node = self.node(input)?;
         let beta_node = self.node(beta)?;
-        let plan=softplus_plan(&input_node.shape,input_node.dtype,&beta_node.shape,beta_node.dtype,&beta_node.shape,beta_node.dtype)?;
-        self.lower_softplus(input,input_node.dtype,beta,beta_node.dtype,beta,beta_node.dtype,plan)
+        let plan = softplus_plan(
+            &input_node.shape,
+            input_node.dtype,
+            &beta_node.shape,
+            beta_node.dtype,
+            &beta_node.shape,
+            beta_node.dtype,
+        )?;
+        self.lower_softplus(
+            input,
+            input_node.dtype,
+            beta,
+            beta_node.dtype,
+            beta,
+            beta_node.dtype,
+            plan,
+        )
     }
 
-    pub fn softplus_scalar(&mut self,input:NodeId,beta:f64)->Result<NodeId>{ self.softplus_with_scalar(input,Scalar::F(beta)) }
-    pub fn softplus_default(&mut self,input:NodeId)->Result<NodeId>{ self.softplus_scalar(input,1.0) }
-    pub fn softplus_with_scalar(&mut self,input:NodeId,beta:Scalar)->Result<NodeId>{
-        let node=self.node(input)?; let plan=softplus_scalar_plan(&node.shape,node.dtype,beta)?;
-        let scale_dtype=plan.scale_beta.dtype(); let inverse_dtype=plan.inverse_beta.dtype();
-        let scale_beta=self.constant(plan.scale_beta); let inverse_beta=self.constant(plan.inverse_beta);
-        self.lower_softplus(input,node.dtype,scale_beta,scale_dtype,inverse_beta,inverse_dtype,plan.core)
+    pub fn softplus_scalar(&mut self, input: NodeId, beta: f64) -> Result<NodeId> {
+        self.softplus_with_scalar(input, Scalar::F(beta))
     }
-    fn lower_softplus(&mut self,input:NodeId,input_dtype:DType,scale_beta:NodeId,scale_beta_dtype:DType,inverse_beta:NodeId,inverse_beta_dtype:DType,plan:SoftplusPlan)->Result<NodeId>{
-        let scaled_input=if input_dtype==plan.scaled_dtype{input}else{self.cast(input,plan.scaled_dtype)?};
-        let scale_beta=if scale_beta_dtype==plan.scaled_dtype{scale_beta}else{self.cast(scale_beta,plan.scaled_dtype)?};
-        let scaled=self.mul(scaled_input,scale_beta)?;
-        let logged_input=if plan.scaled_dtype==plan.log_dtype{scaled}else{self.cast(scaled,plan.log_dtype)?};
-        let zero=self.constant(plan.zero); let logged=self.logaddexp(logged_input,zero)?;
-        let inverse_beta=if inverse_beta_dtype==plan.inverse_dtype{inverse_beta}else{self.cast(inverse_beta,plan.inverse_dtype)?};
-        let one=self.constant(plan.one); let inverse=self.mul(one,self.reciprocal(inverse_beta)?)?;
-        let logged=if plan.log_dtype==plan.output_dtype{logged}else{self.cast(logged,plan.output_dtype)?};
-        let inverse=if plan.inverse_dtype==plan.output_dtype{inverse}else{self.cast(inverse,plan.output_dtype)?};
-        let output=self.mul(inverse,logged)?;
-        debug_assert_eq!(self.shape(output).expect("Softplus preflighted"),&plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("Softplus preflighted"),plan.output_dtype);
+    pub fn softplus_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.softplus_scalar(input, 1.0)
+    }
+    pub fn softplus_with_scalar(&mut self, input: NodeId, beta: Scalar) -> Result<NodeId> {
+        let node = self.node(input)?;
+        let plan = softplus_scalar_plan(&node.shape, node.dtype, beta)?;
+        let scale_dtype = plan.scale_beta.dtype();
+        let inverse_dtype = plan.inverse_beta.dtype();
+        let scale_beta = self.constant(plan.scale_beta);
+        let inverse_beta = self.constant(plan.inverse_beta);
+        self.lower_softplus(
+            input,
+            node.dtype,
+            scale_beta,
+            scale_dtype,
+            inverse_beta,
+            inverse_dtype,
+            plan.core,
+        )
+    }
+    fn lower_softplus(
+        &mut self,
+        input: NodeId,
+        input_dtype: DType,
+        scale_beta: NodeId,
+        scale_beta_dtype: DType,
+        inverse_beta: NodeId,
+        inverse_beta_dtype: DType,
+        plan: SoftplusPlan,
+    ) -> Result<NodeId> {
+        let scaled_input = if input_dtype == plan.scaled_dtype {
+            input
+        } else {
+            self.cast(input, plan.scaled_dtype)?
+        };
+        let scale_beta = if scale_beta_dtype == plan.scaled_dtype {
+            scale_beta
+        } else {
+            self.cast(scale_beta, plan.scaled_dtype)?
+        };
+        let scaled = self.mul(scaled_input, scale_beta)?;
+        let logged_input = if plan.scaled_dtype == plan.log_dtype {
+            scaled
+        } else {
+            self.cast(scaled, plan.log_dtype)?
+        };
+        let zero = self.constant(plan.zero);
+        let logged = self.logaddexp(logged_input, zero)?;
+        let inverse_beta = if inverse_beta_dtype == plan.inverse_dtype {
+            inverse_beta
+        } else {
+            self.cast(inverse_beta, plan.inverse_dtype)?
+        };
+        let one = self.constant(plan.one);
+        let inverse = self.mul(one, self.reciprocal(inverse_beta)?)?;
+        let logged = if plan.log_dtype == plan.output_dtype {
+            logged
+        } else {
+            self.cast(logged, plan.output_dtype)?
+        };
+        let inverse = if plan.inverse_dtype == plan.output_dtype {
+            inverse
+        } else {
+            self.cast(inverse, plan.output_dtype)?
+        };
+        let output = self.mul(inverse, logged)?;
+        debug_assert_eq!(
+            self.shape(output).expect("Softplus preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("Softplus preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     pub fn mish(&mut self, input: NodeId) -> Result<NodeId> {
@@ -6777,13 +7648,32 @@ impl Graph {
         let beta = self.constant(plan.beta);
         let softplus = self.softplus(negated, beta)?;
         let output = self.neg(softplus)?;
-        debug_assert_eq!(self.shape(softplus).expect("logsigmoid preflighted"), &plan.shape);
-        debug_assert_eq!(self.shape(output).expect("logsigmoid preflighted"), &plan.shape);
-        debug_assert_eq!(self.dtype(negated).expect("logsigmoid preflighted"), plan.negated_dtype);
-        debug_assert_eq!(self.dtype(output).expect("logsigmoid preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(softplus).expect("logsigmoid preflighted"),
+            &plan.shape
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("logsigmoid preflighted"),
+            &plan.shape
+        );
+        debug_assert_eq!(
+            self.dtype(negated).expect("logsigmoid preflighted"),
+            plan.negated_dtype
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("logsigmoid preflighted"),
+            plan.output_dtype
+        );
         // These nested weak constants were validated above; Softplus creates
         // its own typed instances while lowering the literal source graph.
-        debug_assert_eq!(plan.softplus_zero.dtype(), if plan.output_dtype.is_float() { plan.output_dtype } else { DType::F32 });
+        debug_assert_eq!(
+            plan.softplus_zero.dtype(),
+            if plan.output_dtype.is_float() {
+                plan.output_dtype
+            } else {
+                DType::F32
+            }
+        );
         debug_assert_eq!(plan.softplus_one.dtype(), plan.output_dtype);
         Ok(output)
     }
@@ -6840,7 +7730,10 @@ impl Graph {
         let output = self.mul(log, scale)?;
         debug_assert_eq!(self.shape(output).expect("log10 preflighted"), &plan.shape);
         debug_assert_eq!(self.dtype(log).expect("log10 preflighted"), plan.log_dtype);
-        debug_assert_eq!(self.dtype(output).expect("log10 preflighted"), plan.log_dtype);
+        debug_assert_eq!(
+            self.dtype(output).expect("log10 preflighted"),
+            plan.log_dtype
+        );
         Ok(output)
     }
     pub fn logaddexp(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
@@ -6871,10 +7764,22 @@ impl Graph {
         let sum = self.add(left_exp, right_exp)?;
         let log = self.log(sum)?;
         let output = self.add(log, maximum)?;
-        debug_assert_eq!(self.shape(output).expect("logaddexp preflighted"), &plan.shape);
-        debug_assert_eq!(self.dtype(left_exp).expect("logaddexp preflighted"), plan.exp_dtype);
-        debug_assert_eq!(self.dtype(right_exp).expect("logaddexp preflighted"), plan.exp_dtype);
-        debug_assert_eq!(self.dtype(output).expect("logaddexp preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("logaddexp preflighted"),
+            &plan.shape
+        );
+        debug_assert_eq!(
+            self.dtype(left_exp).expect("logaddexp preflighted"),
+            plan.exp_dtype
+        );
+        debug_assert_eq!(
+            self.dtype(right_exp).expect("logaddexp preflighted"),
+            plan.exp_dtype
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("logaddexp preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     /// Source-compatible scalar-right form of tinygrad's
@@ -6887,9 +7792,18 @@ impl Graph {
         // the live helper preserves one shared Max/Sub/Exp/Add/Log formula.
         let rhs = self.constant(plan.scalar);
         let output = self.logaddexp(lhs, rhs)?;
-        debug_assert_eq!(self.dtype(lhs).expect("logaddexp scalar preflighted"), plan.lhs_dtype);
-        debug_assert_eq!(self.shape(output).expect("logaddexp scalar preflighted"), &plan.core.shape);
-        debug_assert_eq!(self.dtype(output).expect("logaddexp scalar preflighted"), plan.core.output_dtype);
+        debug_assert_eq!(
+            self.dtype(lhs).expect("logaddexp scalar preflighted"),
+            plan.lhs_dtype
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("logaddexp scalar preflighted"),
+            &plan.core.shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("logaddexp scalar preflighted"),
+            plan.core.output_dtype
+        );
         Ok(output)
     }
     pub fn logaddexp2(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
@@ -6925,11 +7839,28 @@ impl Graph {
             let delta = self.sub(end, start)?;
             let weighted = self.mul(delta, weight)?;
             let output = self.add(start, weighted)?;
-            debug_assert_eq!(self.shape(delta).expect("lerp preflighted"), &end_shape.broadcast_with(&start_shape).expect("lerp preflighted"));
-            debug_assert_eq!(self.dtype(delta).expect("lerp preflighted"), plan.difference_dtype);
-            debug_assert_eq!(self.dtype(weighted).expect("lerp preflighted"), plan.weighted_dtype);
-            debug_assert_eq!(self.shape(output).expect("lerp preflighted"), &plan.output_shape);
-            debug_assert_eq!(self.dtype(output).expect("lerp preflighted"), plan.output_dtype);
+            debug_assert_eq!(
+                self.shape(delta).expect("lerp preflighted"),
+                &end_shape
+                    .broadcast_with(&start_shape)
+                    .expect("lerp preflighted")
+            );
+            debug_assert_eq!(
+                self.dtype(delta).expect("lerp preflighted"),
+                plan.difference_dtype
+            );
+            debug_assert_eq!(
+                self.dtype(weighted).expect("lerp preflighted"),
+                plan.weighted_dtype
+            );
+            debug_assert_eq!(
+                self.shape(output).expect("lerp preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                self.dtype(output).expect("lerp preflighted"),
+                plan.output_dtype
+            );
             return Ok(output);
         }
 
@@ -6944,14 +7875,20 @@ impl Graph {
         } else {
             self.cast(weight, plan.weight_scale_dtype)?
         };
-        let scaled = self.mul(weight, self.constant(plan.scale.clone().expect("lerp U8 plan")))?;
+        let scaled = self.mul(
+            weight,
+            self.constant(plan.scale.clone().expect("lerp U8 plan")),
+        )?;
         let scaled = if plan.weight_scale_dtype == plan.weight_fraction_dtype {
             scaled
         } else {
             self.cast(scaled, plan.weight_fraction_dtype)?
         };
         let weight = self.cast(
-            self.add(scaled, self.constant(plan.half.clone().expect("lerp U8 plan")))?,
+            self.add(
+                scaled,
+                self.constant(plan.half.clone().expect("lerp U8 plan")),
+            )?,
             DType::I16,
         )?;
         let product = self.mul(difference, weight)?;
@@ -6964,8 +7901,14 @@ impl Graph {
             self.constant(plan.shift.clone().expect("lerp U8 plan")),
         )?;
         let output = self.cast(self.add(start, shifted)?, DType::U8)?;
-        debug_assert_eq!(self.shape(output).expect("lerp preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("lerp preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("lerp preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("lerp preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     /// Source-compatible scalar-weight form of tinygrad's `Tensor.lerp`.
@@ -6980,12 +7923,30 @@ impl Graph {
         let difference = self.sub(end, start)?;
         let weighted = self.mul(difference, weight)?;
         let output = self.add(start, weighted)?;
-        debug_assert_eq!(self.shape(difference).expect("lerp scalar preflighted"), &plan.difference_shape);
-        debug_assert_eq!(self.dtype(difference).expect("lerp scalar preflighted"), plan.difference_dtype);
-        debug_assert_eq!(self.shape(weighted).expect("lerp scalar preflighted"), &plan.weighted_shape);
-        debug_assert_eq!(self.dtype(weighted).expect("lerp scalar preflighted"), plan.weighted_dtype);
-        debug_assert_eq!(self.shape(output).expect("lerp scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("lerp scalar preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(difference).expect("lerp scalar preflighted"),
+            &plan.difference_shape
+        );
+        debug_assert_eq!(
+            self.dtype(difference).expect("lerp scalar preflighted"),
+            plan.difference_dtype
+        );
+        debug_assert_eq!(
+            self.shape(weighted).expect("lerp scalar preflighted"),
+            &plan.weighted_shape
+        );
+        debug_assert_eq!(
+            self.dtype(weighted).expect("lerp scalar preflighted"),
+            plan.weighted_dtype
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("lerp scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("lerp scalar preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
     pub fn isclose(
@@ -7041,13 +8002,7 @@ impl Graph {
         let rhs_shape = rhs_node.shape.clone();
         let rhs_dtype = rhs_node.dtype;
         let plan = isclose_scalar_plan(
-            &lhs_shape,
-            lhs_dtype,
-            &rhs_shape,
-            rhs_dtype,
-            rtol,
-            atol,
-            equal_nan,
+            &lhs_shape, lhs_dtype, &rhs_shape, rhs_dtype, rtol, atol, equal_nan,
         )?;
 
         // Keep the checked-in literal ordering. `other.abs()` owns the weak
@@ -7076,12 +8031,33 @@ impl Graph {
         let both_nan = self.logical_and(lhs_nan, rhs_nan)?;
         let nan_close = self.logical_and(both_nan, self.constant(plan.equal_nan.clone()))?;
         let output = self.logical_or(result, nan_close)?;
-        debug_assert_eq!(self.shape(output).expect("isclose scalar preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("isclose scalar preflighted"), DType::Bool);
-        debug_assert_eq!(self.dtype(raw_difference).expect("isclose scalar preflighted"), plan.difference_dtype);
-        debug_assert_eq!(self.dtype(relative).expect("isclose scalar preflighted"), plan.tolerance_dtype);
-        debug_assert_eq!(self.dtype(tolerance).expect("isclose scalar preflighted"), plan.tolerance_dtype);
-        debug_assert_eq!(self.dtype(difference).expect("isclose scalar preflighted").promote(self.dtype(tolerance).expect("isclose scalar preflighted")), plan.comparison_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("isclose scalar preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("isclose scalar preflighted"),
+            DType::Bool
+        );
+        debug_assert_eq!(
+            self.dtype(raw_difference)
+                .expect("isclose scalar preflighted"),
+            plan.difference_dtype
+        );
+        debug_assert_eq!(
+            self.dtype(relative).expect("isclose scalar preflighted"),
+            plan.tolerance_dtype
+        );
+        debug_assert_eq!(
+            self.dtype(tolerance).expect("isclose scalar preflighted"),
+            plan.tolerance_dtype
+        );
+        debug_assert_eq!(
+            self.dtype(difference)
+                .expect("isclose scalar preflighted")
+                .promote(self.dtype(tolerance).expect("isclose scalar preflighted")),
+            plan.comparison_dtype
+        );
         Ok(output)
     }
 
@@ -7115,10 +8091,22 @@ impl Graph {
         // Bool special-value tree are validated before either is published.
         let close = self.isclose_scalar(lhs, rhs, rtol, atol, equal_nan)?;
         let output = self.all(close, None, false)?;
-        debug_assert_eq!(self.shape(close).expect("allclose preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.shape(output).expect("allclose preflighted"), &Shape::new([]));
-        debug_assert_eq!(self.dtype(output).expect("allclose preflighted"), DType::Bool);
-        debug_assert_eq!(self.dtype(close).expect("allclose preflighted"), DType::Bool);
+        debug_assert_eq!(
+            self.shape(close).expect("allclose preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("allclose preflighted"),
+            &Shape::new([])
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("allclose preflighted"),
+            DType::Bool
+        );
+        debug_assert_eq!(
+            self.dtype(close).expect("allclose preflighted"),
+            DType::Bool
+        );
         Ok(output)
     }
 
@@ -7136,7 +8124,10 @@ impl Graph {
         let trunc_dtype = unary_dtype(UnaryOp::Trunc, dtype);
         let one = TensorData::scalar_with_dtype(Scalar::I(1), dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         for dtype in [dtype, trunc_dtype, DType::Bool, dtype, dtype] {
             extent(&shape, dtype)?;
@@ -7147,7 +8138,10 @@ impl Graph {
             || dtype.promote(dtype) != dtype
             || shape.broadcast_with(one.shape())? != shape
         {
-            return Err(Error::InvalidElementwiseDType { op: "floor trunc/compare/select source promotion", actual: dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "floor trunc/compare/select source promotion",
+                actual: dtype,
+            });
         }
         let truncated = self.trunc(input)?;
         let condition = self.lt(input, truncated)?;
@@ -7163,7 +8157,10 @@ impl Graph {
         let trunc_dtype = unary_dtype(UnaryOp::Trunc, dtype);
         let one = TensorData::scalar_with_dtype(Scalar::I(1), dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         for dtype in [dtype, trunc_dtype, DType::Bool, dtype, dtype] {
             extent(&shape, dtype)?;
@@ -7174,7 +8171,10 @@ impl Graph {
             || dtype.promote(dtype) != dtype
             || shape.broadcast_with(one.shape())? != shape
         {
-            return Err(Error::InvalidElementwiseDType { op: "ceil trunc/compare/select source promotion", actual: dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "ceil trunc/compare/select source promotion",
+                actual: dtype,
+            });
         }
         let truncated = self.trunc(input)?;
         let condition = self.gt(input, truncated)?;
@@ -7190,12 +8190,18 @@ impl Graph {
         let input_dtype = source.dtype;
         let output_dtype = unary_dtype(UnaryOp::Trunc, input_dtype);
         let extent = |shape: &Shape, dtype: DType| {
-            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         extent(&shape, input_dtype)?;
         extent(&shape, output_dtype)?;
         if output_dtype != input_dtype {
-            return Err(Error::InvalidElementwiseDType { op: "trunc output dtype", actual: output_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "trunc output dtype",
+                actual: output_dtype,
+            });
         }
         self.unary(UnaryOp::Trunc, input)
     }
@@ -7209,16 +8215,42 @@ impl Graph {
         let zero = TensorData::scalar_with_dtype(Scalar::I(0), dtype);
         let half = TensorData::scalar_with_dtype(Scalar::F(0.5), dtype);
         let two = TensorData::scalar_with_dtype(Scalar::F(2.0), dtype);
-        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
-        for dtype in [dtype, DType::Bool, division_dtype, DType::Bool, DType::Bool, dtype, dtype, dtype, dtype] { extent(&shape, dtype)?; }
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for dtype in [
+            dtype,
+            DType::Bool,
+            division_dtype,
+            DType::Bool,
+            DType::Bool,
+            dtype,
+            dtype,
+            dtype,
+            dtype,
+        ] {
+            extent(&shape, dtype)?;
+        }
         for scalar in [&zero, &half, &two] {
             extent(scalar.shape(), scalar.dtype())?;
             if scalar.dtype() != dtype || shape.broadcast_with(scalar.shape())? != shape {
-                return Err(Error::InvalidElementwiseDType { op: "round source scalar promotion", actual: scalar.dtype() });
+                return Err(Error::InvalidElementwiseDType {
+                    op: "round source scalar promotion",
+                    actual: scalar.dtype(),
+                });
             }
         }
-        if unary_dtype(UnaryOp::Trunc, dtype) != dtype || (!dtype.is_float() && division_dtype != DType::F32) || (dtype.is_float() && division_dtype != dtype) {
-            return Err(Error::InvalidElementwiseDType { op: "round trunc/div/select source promotion", actual: division_dtype });
+        if unary_dtype(UnaryOp::Trunc, dtype) != dtype
+            || (!dtype.is_float() && division_dtype != DType::F32)
+            || (dtype.is_float() && division_dtype != dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "round trunc/div/select source promotion",
+                actual: division_dtype,
+            });
         }
         let truncated = self.trunc(input)?;
         let positive = self.gt(input, self.constant(zero))?;
@@ -7260,11 +8292,19 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let dtype = source.dtype;
-        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
         extent(&shape, dtype)?;
         extent(&shape, DType::Bool)?;
         if dtype.promote(dtype) != dtype {
-            return Err(Error::InvalidElementwiseDType { op: "isnan self comparison promotion", actual: dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "isnan self comparison promotion",
+                actual: dtype,
+            });
         }
         self.ne(input, input)
     }
@@ -7275,11 +8315,19 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
         extent(&shape, input_dtype)?;
         extent(&shape, DType::Bool)?;
         if unary_dtype(UnaryOp::IsInf, input_dtype) != DType::Bool {
-            return Err(Error::InvalidElementwiseDType { op: "isinf output dtype", actual: input_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "isinf output dtype",
+                actual: input_dtype,
+            });
         }
         self.unary(UnaryOp::IsInf, input)
     }
@@ -7314,15 +8362,32 @@ impl Graph {
         let bound = self.constant(TensorData::scalar(infinity));
         self.eq(input, bound)
     }
+
+    /// Backward-compatible singular spelling for the signed infinity filter.
+    pub fn isinf_with_sign(
+        &mut self,
+        input: NodeId,
+        detect_positive: bool,
+        detect_negative: bool,
+    ) -> Result<NodeId> {
+        self.isinf_with_signs(input, detect_positive, detect_negative)
+    }
     pub fn isfinite(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.isfinite is `(isinf() | isnan()).logical_not()`, not raw
         // ISFINITE. Validate every Bool intermediate before publication.
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
         extent(&shape, input_dtype)?;
-        for _ in 0..4 { extent(&shape, DType::Bool)?; }
+        for _ in 0..4 {
+            extent(&shape, DType::Bool)?;
+        }
         let infinite = self.isinf(input)?;
         let nan = self.isnan(input)?;
         self.logical_not(self.logical_or(infinite, nan)?)
@@ -7383,7 +8448,11 @@ impl Graph {
                 (lhs_dtype, rhs_dtype),
                 (DType::I64, DType::U64) | (DType::U64, DType::I64)
             );
-        let dtype = if extrema_i64_u64_bridge { DType::F32 } else { dtype };
+        let dtype = if extrema_i64_u64_bridge {
+            DType::F32
+        } else {
+            dtype
+        };
         let lhs = if extrema_i64_u64_bridge {
             self.cast(lhs, dtype)?
         } else {

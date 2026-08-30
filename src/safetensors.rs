@@ -370,10 +370,7 @@ impl<'de> Deserialize<'de> for Header {
                 f.write_str("a safetensors header object")
             }
 
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                map: A,
-            ) -> std::result::Result<Header, A::Error> {
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> std::result::Result<Header, A::Error> {
                 parse_header_map(map, true)
             }
         }
@@ -692,7 +689,10 @@ pub fn save_safetensors_file_with_json_metadata(
     tensors: &StateDict,
     metadata: Option<&Value>,
 ) -> Result<()> {
-    save_safetensors_file_bytes(path, save_safetensors_with_json_metadata(tensors, metadata)?)
+    save_safetensors_file_bytes(
+        path,
+        save_safetensors_with_json_metadata(tensors, metadata)?,
+    )
 }
 
 #[cfg(test)]
@@ -794,10 +794,7 @@ mod tests {
 
     #[test]
     fn raw_json_metadata_save_round_trips_state_and_preserves_bytes() {
-        let tensors = StateDict::from([(
-            "x".into(),
-            raw([2], Storage::F16(vec![0x8000, 0x7e55])),
-        )]);
+        let tensors = StateDict::from([("x".into(), raw([2], Storage::F16(vec![0x8000, 0x7e55])))]);
         let metadata = serde_json::json!({
             "nested": {"flags": [true, null], "count": 7},
             "number": 1.5
@@ -812,7 +809,10 @@ mod tests {
         );
         assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
         assert!(load_safetensors(&bytes).is_err());
-        assert_eq!(bytes, save_safetensors_with_json_metadata(&tensors, Some(&metadata)).unwrap());
+        assert_eq!(
+            bytes,
+            save_safetensors_with_json_metadata(&tensors, Some(&metadata)).unwrap()
+        );
         assert_eq!(tensors, original_tensors);
         assert_eq!(metadata, original_metadata);
 
@@ -822,11 +822,13 @@ mod tests {
             absent,
             save_safetensors_with_json_metadata(&tensors, Some(&empty)).unwrap()
         );
-        assert!(inspect_safetensors_metadata(&absent)
-            .unwrap()
-            .header
-            .get("__metadata__")
-            .is_none());
+        assert!(
+            inspect_safetensors_metadata(&absent)
+                .unwrap()
+                .header
+                .get("__metadata__")
+                .is_none()
+        );
     }
 
     #[test]
@@ -853,7 +855,8 @@ mod tests {
     fn raw_json_metadata_file_save_is_atomic_wrapper() {
         let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![4])))]);
         let metadata = serde_json::json!({"nested": [1, true]});
-        let directory = std::env::temp_dir().join(format!("rustgrad-safe-json-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("rustgrad-safe-json-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("state.safetensors");
 
@@ -872,7 +875,8 @@ mod tests {
     fn state_only_file_and_owned_metadata_inspection_preserve_file_boundaries() {
         let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![4])))]);
         let metadata = serde_json::json!({"nested": [1, true], "number": 3});
-        let directory = std::env::temp_dir().join(format!("rustgrad-safe-load-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("rustgrad-safe-load-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let valid = directory.join("valid.safetensors");
         save_safetensors_file_with_json_metadata(&valid, &tensors, Some(&metadata)).unwrap();
@@ -880,7 +884,10 @@ mod tests {
 
         let inspection = inspect_safetensors_metadata_file(&valid).unwrap();
         assert_eq!(inspection.source, original);
-        assert_eq!(inspection.data_start, 8 + u64::from_le_bytes(original[..8].try_into().unwrap()) as usize);
+        assert_eq!(
+            inspection.data_start,
+            8 + u64::from_le_bytes(original[..8].try_into().unwrap()) as usize
+        );
         assert_eq!(inspection.header["__metadata__"], metadata);
         assert_eq!(load_safetensors_state_only_file(&valid).unwrap(), tensors);
         assert!(load_safetensors(&inspection.source).is_err());

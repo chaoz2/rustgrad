@@ -1,12 +1,12 @@
 use super::{
-    creation::{lazy_arange_default_int_plan, LazyArangePlan},
+    Graph, NodeId,
+    creation::{LazyArangePlan, lazy_arange_default_int_plan},
     elementwise::{source_lub, source_weak_scalar_dtype},
     shape::{normalize_axes, reduction_shape, unary_dtype},
-    Graph, NodeId,
 };
 use crate::{
-    DType, Error, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
-    UnaryOp, VarianceCorrection,
+    DType, Error, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData, UnaryOp,
+    VarianceCorrection,
 };
 
 struct MeanPlan {
@@ -33,7 +33,9 @@ struct LayerNormPlan {
 }
 
 enum NormalizeLowering {
-    Zero { sum: ReductionDType },
+    Zero {
+        sum: ReductionDType,
+    },
     Pow {
         pow_dtype: DType,
         sum: ReductionDType,
@@ -54,12 +56,22 @@ struct NormalizePlan {
 
 fn normalize_output_dtype(input: DType, denominator: DType) -> DType {
     let division = source_lub(input, denominator);
-    let dividend = if division.is_float() { division } else { DType::F32 };
+    let dividend = if division.is_float() {
+        division
+    } else {
+        DType::F32
+    };
     let reciprocal = unary_dtype(UnaryOp::Reciprocal, division);
     source_lub(dividend, reciprocal)
 }
 
-fn normalize_plan(graph: &Graph, input: NodeId, p: f64, dim: isize, eps: f64) -> Result<NormalizePlan> {
+fn normalize_plan(
+    graph: &Graph,
+    input: NodeId,
+    p: f64,
+    dim: isize,
+    eps: f64,
+) -> Result<NormalizePlan> {
     let source = graph.node(input)?;
     let shape = source.shape.clone();
     let dtype = source.dtype;
@@ -67,9 +79,17 @@ fn normalize_plan(graph: &Graph, input: NodeId, p: f64, dim: isize, eps: f64) ->
         .into_iter()
         .map(|axis| axis as isize)
         .collect::<Vec<_>>();
-    let output_shape = reduction_shape(&shape, &axes.iter().map(|axis| *axis as usize).collect::<Vec<_>>(), true);
+    let output_shape = reduction_shape(
+        &shape,
+        &axes.iter().map(|axis| *axis as usize).collect::<Vec<_>>(),
+        true,
+    );
     let extent = |shape: &Shape, dtype: DType| {
-        shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone())).map(|_| ())
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
     };
     extent(&shape, dtype)?;
     let (denominator_dtype, lowering) = if p == 0.0 {
@@ -79,7 +99,9 @@ fn normalize_plan(graph: &Graph, input: NodeId, p: f64, dim: isize, eps: f64) ->
             (&shape, sum.accumulator),
             (&output_shape, sum.accumulator),
             (&output_shape, sum.output),
-        ] { extent(candidate, storage)?; }
+        ] {
+            extent(candidate, storage)?;
+        }
         (sum.output, NormalizeLowering::Zero { sum })
     } else {
         // `abs().pow(p)`: Python `p: float` weak-commits at a floating
@@ -93,7 +115,8 @@ fn normalize_plan(graph: &Graph, input: NodeId, p: f64, dim: isize, eps: f64) ->
         let reciprocal_value = 1.0 / p;
         let reciprocal_dtype = source_weak_scalar_dtype(sum.output, Scalar::F(reciprocal_value));
         let denominator_dtype = source_lub(sum.output, reciprocal_dtype);
-        let reciprocal_exponent = TensorData::scalar_with_dtype(Scalar::F(reciprocal_value), reciprocal_dtype);
+        let reciprocal_exponent =
+            TensorData::scalar_with_dtype(Scalar::F(reciprocal_value), reciprocal_dtype);
         for (candidate, storage) in [
             (&shape, dtype), // abs
             (exponent.shape(), exponent.dtype()),
@@ -103,7 +126,9 @@ fn normalize_plan(graph: &Graph, input: NodeId, p: f64, dim: isize, eps: f64) ->
             (&output_shape, sum.output),
             (reciprocal_exponent.shape(), reciprocal_exponent.dtype()),
             (&output_shape, denominator_dtype), // second Pow cast/result
-        ] { extent(candidate, storage)?; }
+        ] {
+            extent(candidate, storage)?;
+        }
         if !pow_dtype.is_float()
             || !denominator_dtype.is_float()
             || exponent.shape() != &Shape::new([])
@@ -111,9 +136,20 @@ fn normalize_plan(graph: &Graph, input: NodeId, p: f64, dim: isize, eps: f64) ->
             || source_lub(dtype, exponent_dtype) != pow_dtype
             || source_lub(sum.output, reciprocal_dtype) != denominator_dtype
         {
-            return Err(Error::InvalidElementwiseDType { op: "normalize scalar pow promotion", actual: denominator_dtype });
+            return Err(Error::InvalidElementwiseDType {
+                op: "normalize scalar pow promotion",
+                actual: denominator_dtype,
+            });
         }
-        (denominator_dtype, NormalizeLowering::Pow { pow_dtype, sum, exponent, reciprocal_exponent })
+        (
+            denominator_dtype,
+            NormalizeLowering::Pow {
+                pow_dtype,
+                sum,
+                exponent,
+                reciprocal_exponent,
+            },
+        )
     };
     let epsilon_dtype = source_weak_scalar_dtype(denominator_dtype, Scalar::F(eps));
     let maximum_dtype = source_lub(denominator_dtype, epsilon_dtype);
@@ -123,18 +159,34 @@ fn normalize_plan(graph: &Graph, input: NodeId, p: f64, dim: isize, eps: f64) ->
         (epsilon.shape(), epsilon.dtype()),
         (&output_shape, maximum_dtype),
         (&shape, source_lub(dtype, maximum_dtype)),
-        (&output_shape, unary_dtype(UnaryOp::Reciprocal, source_lub(dtype, maximum_dtype))),
+        (
+            &output_shape,
+            unary_dtype(UnaryOp::Reciprocal, source_lub(dtype, maximum_dtype)),
+        ),
         (&shape, final_dtype),
-    ] { extent(candidate, storage)?; }
+    ] {
+        extent(candidate, storage)?;
+    }
     if epsilon.shape() != &Shape::new([])
         || epsilon.dtype() != epsilon_dtype
         || output_shape.broadcast_with(epsilon.shape())? != output_shape
         || source_lub(denominator_dtype, epsilon_dtype) != maximum_dtype
         || shape.broadcast_with(&output_shape)? != shape
     {
-        return Err(Error::InvalidElementwiseDType { op: "normalize epsilon promotion", actual: maximum_dtype });
+        return Err(Error::InvalidElementwiseDType {
+            op: "normalize epsilon promotion",
+            actual: maximum_dtype,
+        });
     }
-    Ok(NormalizePlan { axes, denominator_shape: output_shape, denominator_dtype: maximum_dtype, epsilon, output_shape: shape, output_dtype: final_dtype, lowering })
+    Ok(NormalizePlan {
+        axes,
+        denominator_shape: output_shape,
+        denominator_dtype: maximum_dtype,
+        epsilon,
+        output_shape: shape,
+        output_dtype: final_dtype,
+        lowering,
+    })
 }
 
 fn layernorm_plan(
@@ -449,7 +501,11 @@ fn logcumsumexp_plan(
     matrix_dimensions.insert(matrix_dimensions.len() - 1, axis_extent);
     let matrix_shape = Shape::new(matrix_dimensions);
     let mask_shape = Shape::new([axis_extent, axis_extent]);
-    let range = lazy_arange_default_int_plan(0, i64::try_from(axis_extent).map_err(|_| Error::ShapeOverflow(transposed_shape.clone()))?, 1)?;
+    let range = lazy_arange_default_int_plan(
+        0,
+        i64::try_from(axis_extent).map_err(|_| Error::ShapeOverflow(transposed_shape.clone()))?,
+        1,
+    )?;
     let cumulative_max = cumulative_extrema_plan(input, &transposed_shape, dtype, -1)?;
 
     // `exp` is literally a source-width cast, F32-or-wider scale/multiply,
@@ -597,7 +653,10 @@ fn cumulative_extrema_plan(
         prefixes,
         ascending: Some(ascending),
         descending: Some(descending),
-        index_offset: Some(TensorData::scalar_with_dtype(Scalar::I(axis_i64), index_dtype)),
+        index_offset: Some(TensorData::scalar_with_dtype(
+            Scalar::I(axis_i64),
+            index_dtype,
+        )),
     })
 }
 
@@ -645,10 +704,15 @@ fn max_plan(
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     };
     let axes = if shape.rank() == 0 {
-        if axes.as_ref().is_some_and(|axes| {
-            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
-        }) {
-            return Err(Error::InvalidReductionAxes { node: input, axes: vec![usize::MAX], rank: 0 });
+        if axes
+            .as_ref()
+            .is_some_and(|axes| axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0)))
+        {
+            return Err(Error::InvalidReductionAxes {
+                node: input,
+                axes: vec![usize::MAX],
+                rank: 0,
+            });
         }
         Vec::new()
     } else {
@@ -686,9 +750,10 @@ fn min_plan(
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     };
     let axes = if shape.rank() == 0 {
-        if axes.as_ref().is_some_and(|axes| {
-            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
-        }) {
+        if axes
+            .as_ref()
+            .is_some_and(|axes| axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0)))
+        {
             return Err(Error::InvalidReductionAxes {
                 node: input,
                 axes: vec![usize::MAX],
@@ -726,9 +791,10 @@ fn variance_plan(
     correction: Option<VarianceCorrection>,
 ) -> Result<VariancePlan> {
     let axes = if shape.rank() == 0 {
-        if axes.as_ref().is_some_and(|axes| {
-            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
-        }) {
+        if axes
+            .as_ref()
+            .is_some_and(|axes| axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0)))
+        {
             return Err(Error::InvalidReductionAxes {
                 node: input,
                 axes: vec![usize::MAX],
@@ -815,9 +881,10 @@ fn all_plan(
     keepdim: bool,
 ) -> Result<AllPlan> {
     let axes = if shape.rank() == 0 {
-        if axes.as_ref().is_some_and(|axes| {
-            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
-        }) {
+        if axes
+            .as_ref()
+            .is_some_and(|axes| axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0)))
+        {
             return Err(Error::InvalidReductionAxes {
                 node: input,
                 axes: vec![usize::MAX],
@@ -852,9 +919,10 @@ fn any_plan(
     keepdim: bool,
 ) -> Result<AnyPlan> {
     let axes = if shape.rank() == 0 {
-        if axes.as_ref().is_some_and(|axes| {
-            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
-        }) {
+        if axes
+            .as_ref()
+            .is_some_and(|axes| axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0)))
+        {
             return Err(Error::InvalidReductionAxes {
                 node: input,
                 axes: vec![usize::MAX],
@@ -924,8 +992,8 @@ fn argmax_plan(
         .checked_mul(DType::I32.itemsize())
         .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
     let axis_extent = work_shape.dims()[axis];
-    let axis_extent = i64::try_from(axis_extent)
-        .map_err(|_| Error::ShapeOverflow(work_shape.clone()))?;
+    let axis_extent =
+        i64::try_from(axis_extent).map_err(|_| Error::ShapeOverflow(work_shape.clone()))?;
     let empty = axis_extent == 0 && output_numel > 0;
     let first_bounds = if axis_extent == 0 {
         Vec::new()
@@ -1056,9 +1124,10 @@ fn mean_plan(
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     };
     let axes = if shape.rank() == 0 {
-        if axes.as_ref().is_some_and(|axes| {
-            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
-        }) {
+        if axes
+            .as_ref()
+            .is_some_and(|axes| axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0)))
+        {
             return Err(Error::InvalidReductionAxes {
                 node: input,
                 axes: vec![usize::MAX],
@@ -1361,14 +1430,38 @@ impl Graph {
         let logged = self.log(summed)?;
         let output = self.add(logged, cumulative_max)?;
         let output = self.transpose(output, -1, plan.axis as isize)?;
-        debug_assert_eq!(self.shape(output).expect("logcumsumexp preflighted"), &shape);
-        debug_assert_eq!(self.dtype(output).expect("logcumsumexp preflighted"), plan.output_dtype);
-        debug_assert_eq!(self.shape(transposed).expect("logcumsumexp preflighted"), &plan.transposed_shape);
-        debug_assert_eq!(self.shape(masked).expect("logcumsumexp preflighted"), &plan.matrix_shape);
-        debug_assert_eq!(self.dtype(masked).expect("logcumsumexp preflighted"), plan.source_dtype);
-        debug_assert_eq!(self.dtype(exponentiated).expect("logcumsumexp preflighted"), plan.exp_source_dtype);
-        debug_assert_eq!(self.dtype(logged).expect("logcumsumexp preflighted"), plan.log_dtype);
-        debug_assert_eq!(plan.exp_source_dtype.promote(DType::F32), plan.exp_work_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("logcumsumexp preflighted"),
+            &shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("logcumsumexp preflighted"),
+            plan.output_dtype
+        );
+        debug_assert_eq!(
+            self.shape(transposed).expect("logcumsumexp preflighted"),
+            &plan.transposed_shape
+        );
+        debug_assert_eq!(
+            self.shape(masked).expect("logcumsumexp preflighted"),
+            &plan.matrix_shape
+        );
+        debug_assert_eq!(
+            self.dtype(masked).expect("logcumsumexp preflighted"),
+            plan.source_dtype
+        );
+        debug_assert_eq!(
+            self.dtype(exponentiated).expect("logcumsumexp preflighted"),
+            plan.exp_source_dtype
+        );
+        debug_assert_eq!(
+            self.dtype(logged).expect("logcumsumexp preflighted"),
+            plan.log_dtype
+        );
+        debug_assert_eq!(
+            plan.exp_source_dtype.promote(DType::F32),
+            plan.exp_work_dtype
+        );
         Ok(output)
     }
 
@@ -1411,7 +1504,8 @@ impl Graph {
         let column = self.reshape(column_range, Shape::new([1, plan.extent]))?;
         let upper = self.le(row, column)?;
         let matched = self.mul(equality, upper)?;
-        let descending = self.lower_lazy_arange(plan.descending.clone().expect("non-scalar plan"))?;
+        let descending =
+            self.lower_lazy_arange(plan.descending.clone().expect("non-scalar plan"))?;
         let descending = self.reshape(descending, Shape::new([plan.extent, 1]))?;
         let candidates = self.mul(matched, descending)?;
         let maximum = self.max_with_axes(candidates, Some(vec![-2]), false)?;
@@ -1420,9 +1514,18 @@ impl Graph {
         let indices_t = self.add(negative, index_offset)?;
         let indices_t = self.cast(indices_t, DType::I32)?;
         let indices = self.transpose(indices_t, -1, plan.axis as isize)?;
-        debug_assert_eq!(self.shape(values).expect("cummax preflighted"), self.shape(input).expect("cummax preflighted"));
-        debug_assert_eq!(self.dtype(values).expect("cummax preflighted"), self.dtype(input).expect("cummax preflighted"));
-        debug_assert_eq!(self.shape(indices).expect("cummax preflighted"), self.shape(input).expect("cummax preflighted"));
+        debug_assert_eq!(
+            self.shape(values).expect("cummax preflighted"),
+            self.shape(input).expect("cummax preflighted")
+        );
+        debug_assert_eq!(
+            self.dtype(values).expect("cummax preflighted"),
+            self.dtype(input).expect("cummax preflighted")
+        );
+        debug_assert_eq!(
+            self.shape(indices).expect("cummax preflighted"),
+            self.shape(input).expect("cummax preflighted")
+        );
         debug_assert_eq!(self.dtype(indices).expect("cummax preflighted"), DType::I32);
         Ok((values, indices))
     }
@@ -1531,7 +1634,10 @@ impl Graph {
             Some(plan.axes),
             keepdim,
         )?;
-        debug_assert_eq!(self.shape(output).expect("all preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("all preflighted"),
+            &plan.output_shape
+        );
         debug_assert_eq!(self.dtype(output).expect("all preflighted"), DType::Bool);
         Ok(output)
     }
@@ -1568,14 +1674,14 @@ impl Graph {
             AnyLowering::IdentityValue => {
                 self.full_with_dtype(plan.output_shape.clone(), Scalar::Bool(false), DType::Bool)?
             }
-            AnyLowering::Reduce => self.reduce(
-                boolean,
-                crate::ReduceKind::Max,
-                Some(plan.axes),
-                keepdim,
-            )?,
+            AnyLowering::Reduce => {
+                self.reduce(boolean, crate::ReduceKind::Max, Some(plan.axes), keepdim)?
+            }
         };
-        debug_assert_eq!(self.shape(output).expect("any preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("any preflighted"),
+            &plan.output_shape
+        );
         debug_assert_eq!(self.dtype(output).expect("any preflighted"), DType::Bool);
         Ok(output)
     }
@@ -1603,7 +1709,11 @@ impl Graph {
         };
         let plan = argmax_plan(input, &shape, dtype, axis, keepdim)?;
         let output = if plan.empty {
-            self.full_with_dtype(plan.output_shape.clone(), Scalar::I(i32::MIN.into()), DType::I32)?
+            self.full_with_dtype(
+                plan.output_shape.clone(),
+                Scalar::I(i32::MIN.into()),
+                DType::I32,
+            )?
         } else {
             let source = if plan.flatten {
                 self.reshape(input, plan.work_shape.clone())?
@@ -1621,7 +1731,10 @@ impl Graph {
             let sentinel = self.constant(plan.sentinel);
             self.select(leading_nan, sentinel, indices)?
         };
-        debug_assert_eq!(self.shape(output).expect("argmax preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("argmax preflighted"),
+            &plan.output_shape
+        );
         debug_assert_eq!(self.dtype(output).expect("argmax preflighted"), DType::I32);
         Ok(output)
     }
@@ -1680,7 +1793,10 @@ impl Graph {
             let sentinel = self.constant(plan.argmax.sentinel);
             self.select(leading_nan, sentinel, indices)?
         };
-        debug_assert_eq!(self.shape(output).expect("argmin preflighted"), &plan.argmax.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("argmin preflighted"),
+            &plan.argmax.output_shape
+        );
         debug_assert_eq!(self.dtype(output).expect("argmin preflighted"), DType::I32);
         Ok(output)
     }
@@ -1800,8 +1916,14 @@ impl Graph {
         } else {
             self.cast(divided, plan.output_dtype)?
         };
-        debug_assert_eq!(self.shape(output).expect("Mean preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("Mean preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("Mean preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("Mean preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -1829,14 +1951,38 @@ impl Graph {
         let invstd = self.add(variance, epsilon)?;
         let invstd = self.rsqrt(invstd)?;
         let output = self.mul(centered, invstd)?;
-        debug_assert_eq!(self.shape(mean).expect("layernorm preflighted"), &plan.mean_shape);
-        debug_assert_eq!(self.dtype(mean).expect("layernorm preflighted"), plan.mean_dtype);
-        debug_assert_eq!(self.shape(centered).expect("layernorm preflighted"), &plan.centered_shape);
-        debug_assert_eq!(self.dtype(centered).expect("layernorm preflighted"), plan.centered_dtype);
-        debug_assert_eq!(self.shape(variance).expect("layernorm preflighted"), &plan.variance_shape);
-        debug_assert_eq!(self.dtype(variance).expect("layernorm preflighted"), plan.variance_dtype);
-        debug_assert_eq!(self.shape(output).expect("layernorm preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("layernorm preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(mean).expect("layernorm preflighted"),
+            &plan.mean_shape
+        );
+        debug_assert_eq!(
+            self.dtype(mean).expect("layernorm preflighted"),
+            plan.mean_dtype
+        );
+        debug_assert_eq!(
+            self.shape(centered).expect("layernorm preflighted"),
+            &plan.centered_shape
+        );
+        debug_assert_eq!(
+            self.dtype(centered).expect("layernorm preflighted"),
+            plan.centered_dtype
+        );
+        debug_assert_eq!(
+            self.shape(variance).expect("layernorm preflighted"),
+            &plan.variance_shape
+        );
+        debug_assert_eq!(
+            self.dtype(variance).expect("layernorm preflighted"),
+            plan.variance_dtype
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("layernorm preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("layernorm preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -1869,7 +2015,10 @@ impl Graph {
             }
             MaxLowering::Reduce => self.reduce(input, ReduceKind::Max, Some(plan.axes), keepdim)?,
         };
-        debug_assert_eq!(self.shape(output).expect("Max preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("Max preflighted"),
+            &plan.output_shape
+        );
         debug_assert_eq!(self.dtype(output).expect("Max preflighted"), plan.dtype);
         Ok(output)
     }
@@ -1911,7 +2060,10 @@ impl Graph {
         } else {
             self.bitwise_not(maximum)?
         };
-        debug_assert_eq!(self.shape(output).expect("Min preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("Min preflighted"),
+            &plan.output_shape
+        );
         debug_assert_eq!(self.dtype(output).expect("Min preflighted"), plan.dtype);
         Ok(output)
     }
@@ -1989,9 +2141,18 @@ impl Graph {
         } else {
             self.cast(variance, plan.output_dtype)?
         };
-        debug_assert_eq!(self.shape(output).expect("variance preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.shape(mean).expect("variance preflighted"), &plan.mean_shape);
-        debug_assert_eq!(self.dtype(output).expect("variance preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("variance preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.shape(mean).expect("variance preflighted"),
+            &plan.mean_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("variance preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -2018,14 +2179,7 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let dtype = source.dtype;
-        let variance_plan = variance_plan(
-            input,
-            &shape,
-            dtype,
-            axes.clone(),
-            keepdim,
-            correction,
-        )?;
+        let variance_plan = variance_plan(input, &shape, dtype, axes.clone(), keepdim, correction)?;
         let mean_plan = mean_plan(input, &shape, dtype, axes.clone(), keepdim)?;
 
         let variance = self.var(input, axes.clone(), keepdim, correction)?;
@@ -2088,14 +2242,7 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let dtype = source.dtype;
-        let variance_plan = variance_plan(
-            input,
-            &shape,
-            dtype,
-            axes.clone(),
-            keepdim,
-            correction,
-        )?;
+        let variance_plan = variance_plan(input, &shape, dtype, axes.clone(), keepdim, correction)?;
         let mean_plan = mean_plan(input, &shape, dtype, axes.clone(), keepdim)?;
 
         // `variance_plan` establishes a floating result descriptor.  The
@@ -2105,11 +2252,13 @@ impl Graph {
         let standard_deviation = self.std(input, axes.clone(), keepdim, correction)?;
         let mean = self.mean_with_axes(input, axes, keepdim)?;
         debug_assert_eq!(
-            self.shape(standard_deviation).expect("std_mean preflighted"),
+            self.shape(standard_deviation)
+                .expect("std_mean preflighted"),
             &variance_plan.output_shape
         );
         debug_assert_eq!(
-            self.dtype(standard_deviation).expect("std_mean preflighted"),
+            self.dtype(standard_deviation)
+                .expect("std_mean preflighted"),
             variance_plan.output_dtype
         );
         debug_assert_eq!(
@@ -2180,15 +2329,40 @@ impl Graph {
         let denominator = match plan.lowering {
             NormalizeLowering::Zero { sum } => {
                 let nonzero = self.ne_scalar(input, Scalar::I(0))?;
-                self.reduce_with_dtypes(nonzero, ReduceKind::Sum, Some(plan.axes.clone()), true, sum)?
+                self.reduce_with_dtypes(
+                    nonzero,
+                    ReduceKind::Sum,
+                    Some(plan.axes.clone()),
+                    true,
+                    sum,
+                )?
             }
-            NormalizeLowering::Pow { pow_dtype, sum, exponent, reciprocal_exponent } => {
+            NormalizeLowering::Pow {
+                pow_dtype,
+                sum,
+                exponent,
+                reciprocal_exponent,
+            } => {
                 let absolute = self.abs(input)?;
-                let base = if self.dtype(absolute)? == pow_dtype { absolute } else { self.cast(absolute, pow_dtype)? };
+                let base = if self.dtype(absolute)? == pow_dtype {
+                    absolute
+                } else {
+                    self.cast(absolute, pow_dtype)?
+                };
                 let exponent = self.constant(exponent);
                 let powers = self.binary(crate::BinaryOp::Pow, base, exponent)?;
-                let summed = self.reduce_with_dtypes(powers, ReduceKind::Sum, Some(plan.axes.clone()), true, sum)?;
-                let base = if self.dtype(summed)? == plan.denominator_dtype { summed } else { self.cast(summed, plan.denominator_dtype)? };
+                let summed = self.reduce_with_dtypes(
+                    powers,
+                    ReduceKind::Sum,
+                    Some(plan.axes.clone()),
+                    true,
+                    sum,
+                )?;
+                let base = if self.dtype(summed)? == plan.denominator_dtype {
+                    summed
+                } else {
+                    self.cast(summed, plan.denominator_dtype)?
+                };
                 let exponent = self.constant(reciprocal_exponent);
                 self.binary(crate::BinaryOp::Pow, base, exponent)?
             }
@@ -2199,10 +2373,22 @@ impl Graph {
         let _ = plan.epsilon;
         let denominator = self.maximum_scalar(denominator, Scalar::F(eps))?;
         let output = self.div(input, denominator)?;
-        debug_assert_eq!(self.shape(denominator).expect("normalize preflighted"), &plan.denominator_shape);
-        debug_assert_eq!(self.dtype(denominator).expect("normalize preflighted"), plan.denominator_dtype);
-        debug_assert_eq!(self.shape(output).expect("normalize preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("normalize preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(denominator).expect("normalize preflighted"),
+            &plan.denominator_shape
+        );
+        debug_assert_eq!(
+            self.dtype(denominator).expect("normalize preflighted"),
+            plan.denominator_dtype
+        );
+        debug_assert_eq!(
+            self.shape(output).expect("normalize preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("normalize preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -2219,7 +2405,8 @@ fn variance_denominator(
 ) -> Result<usize> {
     let correction = correction.value();
     if correction >= 0 {
-        let correction = usize::try_from(correction).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let correction =
+            usize::try_from(correction).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
         Ok(count.saturating_sub(correction))
     } else {
         let magnitude = usize::try_from(correction.unsigned_abs())
@@ -2233,8 +2420,7 @@ fn variance_denominator(
 fn valid_reduction_dtypes(kind: ReduceKind, input: DType, dtypes: ReductionDType) -> bool {
     match kind {
         ReduceKind::Sum => {
-            dtypes == ReductionDType::sum_default(input)
-                || dtypes.accumulator == dtypes.output
+            dtypes == ReductionDType::sum_default(input) || dtypes.accumulator == dtypes.output
         }
         ReduceKind::Product => dtypes.accumulator == dtypes.output,
         ReduceKind::Mean | ReduceKind::Max | ReduceKind::Min => false,
@@ -2374,10 +2560,7 @@ mod tests {
 
         let product = graph.prod(input, Some(vec![0, -1]), true).unwrap();
         let gradient = graph.grad(product, input).unwrap();
-        let bindings = HashMap::from([(
-            "input".into(),
-            data([2, 3], &[1., 2., 3., 4., 5., 6.]),
-        )]);
+        let bindings = HashMap::from([("input".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.]))]);
         assert_eq!(graph.shape(product).unwrap(), &Shape::new([1, 1]));
         assert_eq!(
             CpuBackend.execute(&graph, product, &bindings).unwrap(),
@@ -2415,10 +2598,7 @@ mod tests {
         assert_eq!(graph.node_count(), original_nodes);
 
         let all = graph.all(input, Some(vec![0, -1]), true).unwrap();
-        let bindings = HashMap::from([(
-            "input".into(),
-            data([2, 2], &[1., -2., f32::NAN, 4.]),
-        )]);
+        let bindings = HashMap::from([("input".into(), data([2, 2], &[1., -2., f32::NAN, 4.]))]);
         let output = CpuBackend.execute(&graph, all, &bindings).unwrap();
         assert_eq!(graph.shape(all).unwrap(), &Shape::new([1, 1]));
         assert_eq!(output.dtype(), DType::Bool);
@@ -2464,8 +2644,18 @@ mod tests {
         assert_eq!(output.to_vec_f64(), vec![0., 1.]);
 
         for dtype in [
-            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
-            DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
             DType::F64,
         ] {
             let mut typed = Graph::new();
@@ -2503,10 +2693,7 @@ mod tests {
         assert_eq!(graph.node_count(), original_nodes);
 
         let any = graph.any(input, Some(vec![0, -1]), true).unwrap();
-        let bindings = HashMap::from([(
-            "input".into(),
-            data([2, 2], &[0., 0., f32::NAN, 0.]),
-        )]);
+        let bindings = HashMap::from([("input".into(), data([2, 2], &[0., 0., f32::NAN, 0.]))]);
         let output = CpuBackend.execute(&graph, any, &bindings).unwrap();
         assert_eq!(graph.shape(any).unwrap(), &Shape::new([1, 1]));
         assert_eq!(output.dtype(), DType::Bool);
@@ -2561,8 +2748,19 @@ mod tests {
         assert_eq!(output.to_vec_f64(), vec![0., 1.]);
 
         for dtype in [
-            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
-            DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64,
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
         ] {
             let mut typed = Graph::new();
             let input = typed.input_dtype("input", [], dtype);
@@ -2597,19 +2795,50 @@ mod tests {
         assert_eq!(graph.shape(all).unwrap(), &Shape::new([]));
         assert_eq!(graph.dtype(any).unwrap(), DType::Bool);
         assert_eq!(graph.dtype(all).unwrap(), DType::Bool);
-        assert!(matches!(graph.op(any).unwrap(), crate::Op::Reduce { kind: ReduceKind::Max, .. }));
-        assert!(matches!(graph.op(all).unwrap(), crate::Op::Reduce { kind: ReduceKind::Product, .. }));
+        assert!(matches!(
+            graph.op(any).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Max,
+                ..
+            }
+        ));
+        assert!(matches!(
+            graph.op(all).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Product,
+                ..
+            }
+        ));
         assert!(matches!(graph.grad(any, input), Err(Error::NoGradient(_))));
         assert!(matches!(graph.grad(all, input), Err(Error::NoGradient(_))));
         let bindings = HashMap::from([(
             "input".into(),
             TensorData::from_scalars(
-                [2, 2], DType::F64,
-                [Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(f64::NAN), Scalar::F(f64::INFINITY)],
-            ).unwrap(),
+                [2, 2],
+                DType::F64,
+                [
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(f64::INFINITY),
+                ],
+            )
+            .unwrap(),
         )]);
-        assert_eq!(CpuBackend.execute(&graph, any, &bindings).unwrap().to_vec_f64(), vec![1.]);
-        assert_eq!(CpuBackend.execute(&graph, all, &bindings).unwrap().to_vec_f64(), vec![0.]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, any, &bindings)
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, all, &bindings)
+                .unwrap()
+                .to_vec_f64(),
+            vec![0.]
+        );
 
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("input", [], DType::I32);
@@ -2625,8 +2854,20 @@ mod tests {
         let any = empty.any_default(input).unwrap();
         let all = empty.all_default(input).unwrap();
         let bindings = HashMap::from([("input".into(), data([0, 2], &[]))]);
-        assert_eq!(CpuBackend.execute(&empty, any, &bindings).unwrap().to_vec_f64(), vec![0.]);
-        assert_eq!(CpuBackend.execute(&empty, all, &bindings).unwrap().to_vec_f64(), vec![1.]);
+        assert_eq!(
+            CpuBackend
+                .execute(&empty, any, &bindings)
+                .unwrap()
+                .to_vec_f64(),
+            vec![0.]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&empty, all, &bindings)
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.]
+        );
 
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F32);
@@ -2648,16 +2889,25 @@ mod tests {
                 [3, 3],
                 DType::F64,
                 [
-                    Scalar::F(f64::NAN), Scalar::F(2.0), Scalar::F(3.0),
-                    Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(-1.0),
-                    Scalar::F(1.0), Scalar::F(f64::NAN), Scalar::F(3.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(2.0),
+                    Scalar::F(3.0),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(-1.0),
+                    Scalar::F(1.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(3.0),
                 ],
             )
             .unwrap(),
         )]);
         let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
         assert_eq!(values.to_vec_f64(), vec![3., 0., 2.]);
-        assert!(matches!(graph.grad(output, input), Err(Error::NoGradient(_))));
+        assert!(matches!(
+            graph.grad(output, input),
+            Err(Error::NoGradient(_))
+        ));
 
         let mut flattened = Graph::new();
         let input = flattened.input("input", [2, 2]);
@@ -2737,16 +2987,25 @@ mod tests {
                 [3, 3],
                 DType::F64,
                 [
-                    Scalar::F(f64::NAN), Scalar::F(2.0), Scalar::F(-3.0),
-                    Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(1.0),
-                    Scalar::F(3.0), Scalar::F(f64::NAN), Scalar::F(-1.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(2.0),
+                    Scalar::F(-3.0),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(1.0),
+                    Scalar::F(3.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(-1.0),
                 ],
             )
             .unwrap(),
         )]);
         let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
         assert_eq!(values.to_vec_f64(), vec![3., 0., 2.]);
-        assert!(matches!(graph.grad(output, input), Err(Error::NoGradient(_))));
+        assert!(matches!(
+            graph.grad(output, input),
+            Err(Error::NoGradient(_))
+        ));
 
         let mut flattened = Graph::new();
         let input = flattened.input("input", [2, 2]);
@@ -2805,12 +3064,8 @@ mod tests {
                 output,
                 &HashMap::from([(
                     "input".into(),
-                    TensorData::from_scalars(
-                        [2],
-                        DType::I64,
-                        [Scalar::I(i64::MIN), Scalar::I(-1)],
-                    )
-                    .unwrap(),
+                    TensorData::from_scalars([2], DType::I64, [Scalar::I(i64::MIN), Scalar::I(-1)])
+                        .unwrap(),
                 )]),
             )
             .unwrap();
@@ -2875,17 +3130,29 @@ mod tests {
             assert_eq!(graph.dtype(output).unwrap(), DType::I32);
             // The explicit source plan keeps first-tie ArgReduce and its
             // leading-NaN sentinel as a Select over the flattened operand.
-            assert!(matches!(graph.op(output).unwrap(), crate::Op::Select { .. }));
-            assert!(matches!(graph.grad(output, input), Err(Error::NoGradient(_))));
+            assert!(matches!(
+                graph.op(output).unwrap(),
+                crate::Op::Select { .. }
+            ));
+            assert!(matches!(
+                graph.grad(output, input),
+                Err(Error::NoGradient(_))
+            ));
         }
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
             crate::Op::Reshape { shape, .. } if shape == &Shape::new([6])
         )));
-        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
-            crate::Op::Constant(data) => Some((data.dtype(), data.scalar_at(0))),
-            _ => None,
-        }).any(|(dtype, value)| dtype == DType::I32 && value.as_i64() == 6));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    crate::Op::Constant(data) => Some((data.dtype(), data.scalar_at(0))),
+                    _ => None,
+                })
+                .any(|(dtype, value)| dtype == DType::I32 && value.as_i64() == 6)
+        );
         // ArgMin is source-literal inverse → ArgMax, not raw ArgMin.
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
@@ -2910,9 +3177,15 @@ mod tests {
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("overflow", [usize::MAX, 2], DType::F32);
         let nodes = overflow.node_count();
-        assert!(matches!(overflow.argmax_default(input), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            overflow.argmax_default(input),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), nodes);
-        assert!(matches!(overflow.argmin_default(input), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            overflow.argmin_default(input),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), nodes);
     }
 
@@ -2928,11 +3201,17 @@ mod tests {
             TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
         )]);
         assert_eq!(
-            CpuBackend.execute(&graph, cumulative, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, cumulative, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, gradient, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, gradient, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![3.0, 2.0, 1.0, 3.0, 2.0, 1.0]
         );
 
@@ -2959,18 +3238,20 @@ mod tests {
         let input = empty.input_dtype("input", [0], DType::F16);
         let cumulative = empty.cumsum(input, -1).unwrap();
         assert_eq!(empty.dtype(cumulative).unwrap(), DType::F16);
-        assert!(CpuBackend
-            .execute(
-                &empty,
-                cumulative,
-                &HashMap::from([(
-                    "input".into(),
-                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
-                )]),
-            )
-            .unwrap()
-            .to_vec_f64()
-            .is_empty());
+        assert!(
+            CpuBackend
+                .execute(
+                    &empty,
+                    cumulative,
+                    &HashMap::from([(
+                        "input".into(),
+                        TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                    )]),
+                )
+                .unwrap()
+                .to_vec_f64()
+                .is_empty()
+        );
 
         let mut invalid = Graph::new();
         let input = invalid.input("input", [2]);
@@ -2993,7 +3274,10 @@ mod tests {
         assert_eq!(inputs.len(), 3);
         for prefix in inputs {
             let reduced = match graph.op(*prefix).unwrap() {
-                crate::Op::Cast { input, dtype: DType::F16 } => *input,
+                crate::Op::Cast {
+                    input,
+                    dtype: DType::F16,
+                } => *input,
                 op => panic!("expected default F16 prefix narrowing, got {op:?}"),
             };
             assert!(matches!(
@@ -3041,24 +3325,39 @@ mod tests {
         assert!(!graph.requires_grad(indices).unwrap());
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
-            crate::Op::Compare { op: crate::CompareOp::Eq, .. }
+            crate::Op::Compare {
+                op: crate::CompareOp::Eq,
+                ..
+            }
         )));
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
-            crate::Op::Reduce { kind: ReduceKind::Max, .. }
+            crate::Op::Reduce {
+                kind: ReduceKind::Max,
+                ..
+            }
         )));
-        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
-            crate::Op::Constant(data) => Some(data.len()),
-            _ => None,
-        }).all(|len| len == 1));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    crate::Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|len| len == 1)
+        );
 
         let (minimum, minimum_indices) = graph.cummin_default(input).unwrap();
         assert_eq!(graph.dtype(minimum).unwrap(), DType::F32);
         assert_eq!(graph.dtype(minimum_indices).unwrap(), DType::I32);
-        assert!(matches!(graph.op(minimum).unwrap(), crate::Op::Unary {
-            op: crate::UnaryOp::Neg,
-            ..
-        }));
+        assert!(matches!(
+            graph.op(minimum).unwrap(),
+            crate::Op::Unary {
+                op: crate::UnaryOp::Neg,
+                ..
+            }
+        ));
 
         for dtype in [
             DType::Bool,
@@ -3103,7 +3402,10 @@ mod tests {
         let mut overflow = Graph::new();
         let input = overflow.input("input", [usize::MAX, 2]);
         let before = overflow.node_count();
-        assert!(matches!(overflow.cummax_default(input), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            overflow.cummax_default(input),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -3114,15 +3416,25 @@ mod tests {
         let output = graph.logcumsumexp_default(input).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
         assert_eq!(graph.dtype(output).unwrap(), DType::F16);
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, crate::Op::Detach { .. })));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, crate::Op::Detach { .. }))
+        );
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
-            crate::Op::Compare { op: crate::CompareOp::Ge, .. }
+            crate::Op::Compare {
+                op: crate::CompareOp::Ge,
+                ..
+            }
         )));
-        assert!(graph.nodes.iter().any(|node| matches!(
-            &node.op,
-            crate::Op::Select { .. }
-        )));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, crate::Op::Select { .. }))
+        );
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
             crate::Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: false, .. }
@@ -3130,14 +3442,23 @@ mod tests {
         )));
         assert!(graph.nodes.iter().any(|node| matches!(
             &node.op,
-            crate::Op::Reduce { kind: ReduceKind::Max, .. }
+            crate::Op::Reduce {
+                kind: ReduceKind::Max,
+                ..
+            }
         )));
         // Both the CumMax indices and the stabilization mask are composed
         // from scalar-backed lazy ranges; no dense control tensor is allowed.
-        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
-            crate::Op::Constant(data) => Some(data.len()),
-            _ => None,
-        }).all(|len| len == 1));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    crate::Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|len| len == 1)
+        );
         let loss = graph.sum_all(output).unwrap();
         assert!(graph.grad(loss, input).is_ok());
 
@@ -3176,7 +3497,10 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("input", [2, 3]);
         let cumulative = graph.cumprod(input, -1).unwrap();
-        assert!(matches!(graph.op(cumulative).unwrap(), crate::Op::Concat { axis: 1, .. }));
+        assert!(matches!(
+            graph.op(cumulative).unwrap(),
+            crate::Op::Concat { axis: 1, .. }
+        ));
         let loss = graph.sum_all(cumulative).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         let inputs = HashMap::from([(
@@ -3184,11 +3508,17 @@ mod tests {
             TensorData::new([2, 3], vec![2.0, 3.0, 4.0, 2.0, 0.0, -3.0]).unwrap(),
         )]);
         assert_eq!(
-            CpuBackend.execute(&graph, cumulative, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, cumulative, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![2.0, 6.0, 24.0, 2.0, 0.0, 0.0]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, gradient, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, gradient, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![16.0, 10.0, 6.0, 1.0, -4.0, 0.0]
         );
 
@@ -3215,18 +3545,20 @@ mod tests {
         let input = empty.input_dtype("input", [0], DType::F16);
         let cumulative = empty.cumprod(input, -1).unwrap();
         assert_eq!(empty.dtype(cumulative).unwrap(), DType::F16);
-        assert!(CpuBackend
-            .execute(
-                &empty,
-                cumulative,
-                &HashMap::from([(
-                    "input".into(),
-                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
-                )]),
-            )
-            .unwrap()
-            .to_vec_f64()
-            .is_empty());
+        assert!(
+            CpuBackend
+                .execute(
+                    &empty,
+                    cumulative,
+                    &HashMap::from([(
+                        "input".into(),
+                        TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                    )]),
+                )
+                .unwrap()
+                .to_vec_f64()
+                .is_empty()
+        );
 
         let mut invalid = Graph::new();
         let input = invalid.input("input", [2]);
@@ -3256,7 +3588,10 @@ mod tests {
             let output = typed.cumprod(input, -1).unwrap();
             assert_eq!(typed.shape(output).unwrap(), &Shape::from([2, 2]));
             assert_eq!(typed.dtype(output).unwrap(), dtype);
-            assert!(matches!(typed.op(output).unwrap(), crate::Op::Concat { axis: 1, .. }));
+            assert!(matches!(
+                typed.op(output).unwrap(),
+                crate::Op::Concat { axis: 1, .. }
+            ));
         }
 
         // The descriptor-first plan rejects byte overflow before a Shrink or
@@ -3264,7 +3599,10 @@ mod tests {
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("overflow", [usize::MAX, 2], DType::F64);
         let before_nodes = overflow.node_count();
-        assert!(matches!(overflow.cumprod(input, 0), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            overflow.cumprod(input, 0),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), before_nodes);
     }
 
@@ -3454,7 +3792,10 @@ mod tests {
         assert_eq!(graph.shape(default_sum).unwrap(), &Shape::from([1, 1]));
         assert_eq!(graph.dtype(default_sum).unwrap(), DType::F16);
         let default_reduction = match graph.op(default_sum).unwrap() {
-            crate::Op::Cast { input, dtype: DType::F16 } => *input,
+            crate::Op::Cast {
+                input,
+                dtype: DType::F16,
+            } => *input,
             op => panic!("expected source-default F16 narrowing cast, got {op:?}"),
         };
         assert!(matches!(
@@ -3539,7 +3880,10 @@ mod tests {
             let explicit = graph
                 .sum_with_options(input, None, false, Some(DType::F64))
                 .unwrap();
-            assert_eq!(graph.dtype(sum).unwrap(), ReductionDType::sum_default(dtype).output);
+            assert_eq!(
+                graph.dtype(sum).unwrap(),
+                ReductionDType::sum_default(dtype).output
+            );
             assert_eq!(graph.dtype(product).unwrap(), dtype);
             assert_eq!(graph.dtype(explicit).unwrap(), DType::F64);
         }
@@ -3569,20 +3913,10 @@ mod tests {
         let input = graph.input("input", [3]);
         let default_variance = graph.var(input, None, false, None).unwrap();
         let population_variance = graph
-            .var(
-                input,
-                None,
-                false,
-                Some(VarianceCorrection::new(0)),
-            )
+            .var(input, None, false, Some(VarianceCorrection::new(0)))
             .unwrap();
         let negative_correction = graph
-            .var(
-                input,
-                None,
-                false,
-                Some(VarianceCorrection::new(-1)),
-            )
+            .var(input, None, false, Some(VarianceCorrection::new(-1)))
             .unwrap();
         let standard_deviation = graph
             .std(
@@ -3597,19 +3931,22 @@ mod tests {
         let inputs = HashMap::from([("input".into(), data([3], &[1., 3., 5.]))]);
 
         assert_eq!(
-            CpuBackend.execute(&graph, default_variance, &inputs)
+            CpuBackend
+                .execute(&graph, default_variance, &inputs)
                 .unwrap()
                 .to_vec_f64(),
             vec![4.]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, population_variance, &inputs)
+            CpuBackend
+                .execute(&graph, population_variance, &inputs)
                 .unwrap()
                 .to_vec_f64(),
             vec![(8.0f32 / 3.0) as f64]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, negative_correction, &inputs)
+            CpuBackend
+                .execute(&graph, negative_correction, &inputs)
                 .unwrap()
                 .to_vec_f64(),
             vec![2.]
@@ -3623,13 +3960,15 @@ mod tests {
             vec![(8.0f32 / 3.0).sqrt() as f64]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, default_gradient, &inputs)
+            CpuBackend
+                .execute(&graph, default_gradient, &inputs)
                 .unwrap()
                 .to_vec_f64(),
             vec![-2., 0., 2.]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, gradient, &inputs)
+            CpuBackend
+                .execute(&graph, gradient, &inputs)
                 .unwrap()
                 .to_vec_f64(),
             vec![(-4.0f32 / 3.0) as f64, 0., (4.0f32 / 3.0) as f64]
@@ -3643,11 +3982,16 @@ mod tests {
         assert_eq!(narrow.dtype(f16_variance).unwrap(), DType::F16);
         assert_eq!(narrow.dtype(bf16_variance).unwrap(), DType::BF16);
         assert!(narrow.nodes.iter().any(|node| {
-            matches!(&node.op, crate::Op::Reduce { kind: ReduceKind::Sum, .. })
-                && node.dtype == DType::F32
+            matches!(
+                &node.op,
+                crate::Op::Reduce {
+                    kind: ReduceKind::Sum,
+                    ..
+                }
+            ) && node.dtype == DType::F32
         }));
-        let f16_data = TensorData::from_scalars([2], DType::F16, [Scalar::F(1.5), Scalar::F(2.5)])
-            .unwrap();
+        let f16_data =
+            TensorData::from_scalars([2], DType::F16, [Scalar::F(1.5), Scalar::F(2.5)]).unwrap();
         assert_eq!(
             CpuBackend
                 .execute(
@@ -3673,12 +4017,8 @@ mod tests {
                     variance,
                     &HashMap::from([(
                         "values".into(),
-                        TensorData::from_scalars(
-                            [2],
-                            DType::I32,
-                            [Scalar::I(1), Scalar::I(3)],
-                        )
-                        .unwrap(),
+                        TensorData::from_scalars([2], DType::I32, [Scalar::I(1), Scalar::I(3)],)
+                            .unwrap(),
                     )]),
                 )
                 .unwrap()
@@ -3730,20 +4070,32 @@ mod tests {
         assert_eq!(graph.dtype(mean).unwrap(), DType::F32);
 
         let loss = graph
-            .add(graph.sum_all(variance).unwrap(), graph.sum_all(mean).unwrap())
+            .add(
+                graph.sum_all(variance).unwrap(),
+                graph.sum_all(mean).unwrap(),
+            )
             .unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         let inputs = HashMap::from([("input".into(), data([2, 2], &[1., 3., 5., 7.]))]);
         assert_eq!(
-            CpuBackend.execute(&graph, variance, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, variance, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![1., 1.]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, mean, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, mean, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![2., 6.]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, gradient, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, gradient, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![-0.5, 1.5, -0.5, 1.5]
         );
 
@@ -3765,22 +4117,21 @@ mod tests {
         let mut malformed = Graph::new();
         let input = malformed.input("input", [2, 3]);
         let nodes = malformed.node_count();
-        assert!(malformed
-            .var_mean(input, Some(vec![0, -2]), false, None)
-            .is_err());
+        assert!(
+            malformed
+                .var_mean(input, Some(vec![0, -2]), false, None)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), nodes);
 
         let mut overflow = Graph::new();
         let input = overflow.input("input", [usize::MAX]);
         let nodes = overflow.node_count();
-        assert!(overflow
-            .var_mean(
-                input,
-                None,
-                false,
-                Some(VarianceCorrection::new(-1)),
-            )
-            .is_err());
+        assert!(
+            overflow
+                .var_mean(input, None, false, Some(VarianceCorrection::new(-1)),)
+                .is_err()
+        );
         assert_eq!(overflow.node_count(), nodes);
     }
 
@@ -3796,7 +4147,10 @@ mod tests {
                 Some(VarianceCorrection::new(0)),
             )
             .unwrap();
-        assert_eq!(graph.shape(standard_deviation).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(
+            graph.shape(standard_deviation).unwrap(),
+            &Shape::new([2, 1])
+        );
         assert_eq!(graph.shape(mean).unwrap(), &Shape::new([2, 1]));
         assert_eq!(graph.dtype(standard_deviation).unwrap(), DType::F32);
         assert_eq!(graph.dtype(mean).unwrap(), DType::F32);
@@ -3817,11 +4171,17 @@ mod tests {
             vec![1., 1.]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, mean, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, mean, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![2., 6.]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, gradient, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, gradient, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![0., 1., 0., 1.]
         );
 
@@ -3833,7 +4193,8 @@ mod tests {
 
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("input", [], DType::F16);
-        let (standard_deviation, mean) = scalar.std_mean(input, Some(vec![-1]), false, None).unwrap();
+        let (standard_deviation, mean) =
+            scalar.std_mean(input, Some(vec![-1]), false, None).unwrap();
         assert_eq!(scalar.shape(standard_deviation).unwrap(), &Shape::new([]));
         assert_eq!(scalar.shape(mean).unwrap(), &Shape::new([]));
     }
@@ -3843,22 +4204,21 @@ mod tests {
         let mut malformed = Graph::new();
         let input = malformed.input("input", [2, 3]);
         let nodes = malformed.node_count();
-        assert!(malformed
-            .std_mean(input, Some(vec![0, -2]), false, None)
-            .is_err());
+        assert!(
+            malformed
+                .std_mean(input, Some(vec![0, -2]), false, None)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), nodes);
 
         let mut overflow = Graph::new();
         let input = overflow.input("input", [usize::MAX]);
         let nodes = overflow.node_count();
-        assert!(overflow
-            .std_mean(
-                input,
-                None,
-                false,
-                Some(VarianceCorrection::new(-1)),
-            )
-            .is_err());
+        assert!(
+            overflow
+                .std_mean(input, None, false, Some(VarianceCorrection::new(-1)),)
+                .is_err()
+        );
         assert_eq!(overflow.node_count(), nodes);
     }
 
@@ -3872,8 +4232,13 @@ mod tests {
         let (pair_variance, pair_mean) = graph.var_mean_default(input).unwrap();
         let (pair_standard_deviation, pair_standard_mean) = graph.std_mean_default(input).unwrap();
         for output in [
-            mean, variance, standard_deviation, pair_variance, pair_mean,
-            pair_standard_deviation, pair_standard_mean,
+            mean,
+            variance,
+            standard_deviation,
+            pair_variance,
+            pair_mean,
+            pair_standard_deviation,
+            pair_standard_mean,
         ] {
             assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
             assert_eq!(graph.dtype(output).unwrap(), DType::F32);
@@ -3883,13 +4248,25 @@ mod tests {
         assert_ne!(pair_variance, pair_mean);
         assert_ne!(pair_standard_deviation, pair_standard_mean);
         assert!((0..graph.node_count()).any(|index| matches!(
-            graph.op(NodeId(index)).unwrap(), crate::Op::Unary { op: UnaryOp::Square, .. }
+            graph.op(NodeId(index)).unwrap(),
+            crate::Op::Unary {
+                op: UnaryOp::Square,
+                ..
+            }
         )));
         assert!(matches!(
             graph.op(pair_standard_deviation).unwrap(),
-            crate::Op::Unary { op: UnaryOp::Sqrt, .. }
+            crate::Op::Unary {
+                op: UnaryOp::Sqrt,
+                ..
+            }
         ));
-        let loss = graph.add(graph.sum_all(pair_variance).unwrap(), graph.sum_all(pair_mean).unwrap()).unwrap();
+        let loss = graph
+            .add(
+                graph.sum_all(pair_variance).unwrap(),
+                graph.sum_all(pair_mean).unwrap(),
+            )
+            .unwrap();
         assert!(graph.grad(loss, input).is_ok());
 
         let mut nonfloat = Graph::new();
@@ -3897,8 +4274,12 @@ mod tests {
         let (variance, mean) = nonfloat.var_mean_default(input).unwrap();
         let (standard_deviation, std_mean) = nonfloat.std_mean_default(input).unwrap();
         for output in [
-            nonfloat.mean_default(input).unwrap(), variance, mean,
-            nonfloat.var_default(input).unwrap(), standard_deviation, std_mean,
+            nonfloat.mean_default(input).unwrap(),
+            variance,
+            mean,
+            nonfloat.var_default(input).unwrap(),
+            standard_deviation,
+            std_mean,
             nonfloat.std_default(input).unwrap(),
         ] {
             assert_eq!(nonfloat.shape(output).unwrap(), &Shape::new([]));
@@ -3910,8 +4291,12 @@ mod tests {
         let (variance, mean) = empty.var_mean_default(input).unwrap();
         let (standard_deviation, std_mean) = empty.std_mean_default(input).unwrap();
         for output in [
-            empty.mean_default(input).unwrap(), variance, mean,
-            empty.var_default(input).unwrap(), standard_deviation, std_mean,
+            empty.mean_default(input).unwrap(),
+            variance,
+            mean,
+            empty.var_default(input).unwrap(),
+            standard_deviation,
+            std_mean,
             empty.std_default(input).unwrap(),
         ] {
             assert_eq!(empty.shape(output).unwrap(), &Shape::new([]));
@@ -3953,12 +4338,7 @@ mod tests {
         let input = overflow.input("input", [usize::MAX]);
         let original_nodes = overflow.node_count();
         assert!(matches!(
-            overflow.var(
-                input,
-                None,
-                false,
-                Some(VarianceCorrection::new(-1)),
-            ),
+            overflow.var(input, None, false, Some(VarianceCorrection::new(-1)),),
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(overflow.node_count(), original_nodes);
@@ -4001,7 +4381,8 @@ mod tests {
 
         assert_eq!(graph.shape(normalized).unwrap(), &Shape::new([2, 2]));
         assert_eq!(
-            CpuBackend.execute(&graph, normalized, &inputs)
+            CpuBackend
+                .execute(&graph, normalized, &inputs)
                 .unwrap()
                 .to_vec_f64(),
             vec![
@@ -4012,7 +4393,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, gradient, &inputs)
+            CpuBackend
+                .execute(&graph, gradient, &inputs)
                 .unwrap()
                 .to_vec_f64(),
             vec![
@@ -4028,8 +4410,13 @@ mod tests {
         let normalized = narrow.normalize_l2(input, 0, 1e-12).unwrap();
         assert_eq!(narrow.dtype(normalized).unwrap(), DType::F16);
         assert!(narrow.nodes.iter().any(|node| {
-            matches!(&node.op, crate::Op::Reduce { kind: ReduceKind::Sum, .. })
-                && node.dtype == DType::F32
+            matches!(
+                &node.op,
+                crate::Op::Reduce {
+                    kind: ReduceKind::Sum,
+                    ..
+                }
+            ) && node.dtype == DType::F32
         }));
         assert_eq!(
             CpuBackend
@@ -4038,12 +4425,8 @@ mod tests {
                     normalized,
                     &HashMap::from([(
                         "input".into(),
-                        TensorData::from_scalars(
-                            [2],
-                            DType::F16,
-                            [Scalar::F(3.), Scalar::F(4.)],
-                        )
-                        .unwrap(),
+                        TensorData::from_scalars([2], DType::F16, [Scalar::F(3.), Scalar::F(4.)],)
+                            .unwrap(),
                     )]),
                 )
                 .unwrap()
@@ -4103,7 +4486,13 @@ mod tests {
         let output = graph.normalize(input, 3.0, -1, 1e-12).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
         assert_eq!(graph.dtype(output).unwrap(), DType::F32);
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, crate::Op::Binary { op: crate::BinaryOp::Pow, .. }) && node.dtype == DType::F32));
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Binary {
+                op: crate::BinaryOp::Pow,
+                ..
+            }
+        ) && node.dtype == DType::F32));
         let default = graph.normalize_default(input).unwrap();
         assert_eq!(graph.shape(default).unwrap(), &Shape::new([2, 3]));
 
@@ -4117,11 +4506,19 @@ mod tests {
         let output = zero.normalize(input, -0.0, -1, f64::NAN).unwrap();
         assert_eq!(zero.shape(output).unwrap(), &Shape::new([]));
         assert_eq!(zero.dtype(output).unwrap(), DType::F32);
-        assert!((0..zero.node_count()).all(|index| !matches!(zero.op(NodeId(index)).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Pow, .. })));
+        assert!((0..zero.node_count()).all(|index| !matches!(
+            zero.op(NodeId(index)).unwrap(),
+            crate::Op::Binary {
+                op: crate::BinaryOp::Pow,
+                ..
+            }
+        )));
 
         let mut empty = Graph::new();
         let input = empty.input_dtype("input", [2, 0], DType::F16);
-        let output = empty.normalize(input, f64::INFINITY, -1, f64::NEG_INFINITY).unwrap();
+        let output = empty
+            .normalize(input, f64::INFINITY, -1, f64::NEG_INFINITY)
+            .unwrap();
         assert_eq!(empty.shape(output).unwrap(), &Shape::new([2, 0]));
 
         let mut malformed = Graph::new();
@@ -4133,7 +4530,10 @@ mod tests {
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F32);
         let nodes = overflow.node_count();
-        assert!(matches!(overflow.normalize(input, 2.0, -1, 1e-12), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            overflow.normalize(input, 2.0, -1, 1e-12),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), nodes);
     }
 
@@ -4145,8 +4545,13 @@ mod tests {
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 1]));
         assert_eq!(graph.dtype(output).unwrap(), DType::F16);
         assert!(graph.nodes.iter().any(|node| {
-            matches!(&node.op, crate::Op::Reduce { kind: ReduceKind::Sum, .. })
-                && node.dtype == DType::F32
+            matches!(
+                &node.op,
+                crate::Op::Reduce {
+                    kind: ReduceKind::Sum,
+                    ..
+                }
+            ) && node.dtype == DType::F32
         }));
         let loss = graph.sum_all(output).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
@@ -4160,11 +4565,17 @@ mod tests {
             .unwrap(),
         )]);
         assert_eq!(
-            CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, output, &bindings)
+                .unwrap()
+                .to_vec_f64(),
             vec![4., 8.]
         );
         assert_eq!(
-            CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, gradient, &bindings)
+                .unwrap()
+                .to_vec_f64(),
             vec![0.5; 4]
         );
 
@@ -4174,7 +4585,11 @@ mod tests {
         assert_eq!(all.shape(output).unwrap(), &Shape::new([]));
         assert_eq!(
             CpuBackend
-                .execute(&all, output, &HashMap::from([("input".into(), data([2, 2], &[1., 2., 3., 4.]))]))
+                .execute(
+                    &all,
+                    output,
+                    &HashMap::from([("input".into(), data([2, 2], &[1., 2., 3., 4.]))])
+                )
                 .unwrap()
                 .to_vec_f64(),
             vec![2.5]
@@ -4217,7 +4632,11 @@ mod tests {
         let output = empty.mean_with_axes(x, Some(vec![1]), false).unwrap();
         assert_eq!(empty.shape(output).unwrap(), &Shape::new([2]));
         let values = CpuBackend
-            .execute(&empty, output, &HashMap::from([("input".into(), data([2, 0], &[]))]))
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), data([2, 0], &[]))]),
+            )
             .unwrap()
             .to_vec_f64();
         assert!(values.iter().all(|value| value.is_nan()));
@@ -4225,7 +4644,11 @@ mod tests {
         let mut malformed = Graph::new();
         let x = malformed.input("input", [2, 2]);
         let nodes = malformed.node_count();
-        assert!(malformed.mean_with_axes(x, Some(vec![0, -2]), false).is_err());
+        assert!(
+            malformed
+                .mean_with_axes(x, Some(vec![0, -2]), false)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), nodes);
 
         let mut overflow = Graph::new();
@@ -4239,10 +4662,19 @@ mod tests {
     fn layernorm_reuses_centered_literal_and_preflights_all_stages() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2, 3, 4], DType::F16);
-        let output = graph.layernorm_with_axes(input, vec![-2, -1], 1e-5).unwrap();
+        let output = graph
+            .layernorm_with_axes(input, vec![-2, -1], 1e-5)
+            .unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3, 4]));
         assert_eq!(graph.dtype(output).unwrap(), DType::F16);
-        let crate::Op::Binary { op: crate::BinaryOp::Mul, lhs, .. } = graph.op(output).unwrap() else { unreachable!() };
+        let crate::Op::Binary {
+            op: crate::BinaryOp::Mul,
+            lhs,
+            ..
+        } = graph.op(output).unwrap()
+        else {
+            unreachable!()
+        };
         // The final multiply reuses the same centered tensor that was squared
         // for variance, rather than recomputing source-minus-mean.
         let centered = *lhs;
@@ -4267,13 +4699,20 @@ mod tests {
         let mut malformed = Graph::new();
         let input = malformed.input("input", [2, 2]);
         let nodes = malformed.node_count();
-        assert!(malformed.layernorm_with_axes(input, vec![0, -2], 1e-5).is_err());
+        assert!(
+            malformed
+                .layernorm_with_axes(input, vec![0, -2], 1e-5)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), nodes);
 
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F32);
         let nodes = overflow.node_count();
-        assert!(matches!(overflow.layernorm(input, -1, 1e-5), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            overflow.layernorm(input, -1, 1e-5),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), nodes);
     }
 
@@ -4291,19 +4730,37 @@ mod tests {
             TensorData::from_scalars(
                 [2, 2],
                 DType::F64,
-                [Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(f64::NAN), Scalar::F(3.)],
+                [
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(3.),
+                ],
             )
             .unwrap(),
         )]);
         let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
         assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
         assert!(values.scalar_at(1).as_f64().is_nan());
-        let gradients = CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64();
+        let gradients = CpuBackend
+            .execute(&graph, gradient, &bindings)
+            .unwrap()
+            .to_vec_f64();
         assert_eq!(&gradients[..2], &[0.5, 0.5]);
 
         for dtype in [
-            DType::Bool, DType::I8, DType::I16, DType::I32, DType::I64, DType::U8,
-            DType::U16, DType::U32, DType::U64, DType::F16, DType::BF16, DType::F32,
+            DType::Bool,
+            DType::I8,
+            DType::I16,
+            DType::I32,
+            DType::I64,
+            DType::U8,
+            DType::U16,
+            DType::U32,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
             DType::F64,
         ] {
             let mut typed = Graph::new();
@@ -4316,15 +4773,27 @@ mod tests {
         let output = empty.max_with_axes(x, Some(vec![1]), false).unwrap();
         assert_eq!(empty.shape(output).unwrap(), &Shape::new([2]));
         let values = CpuBackend
-            .execute(&empty, output, &HashMap::from([("input".into(), data([2, 0], &[]))]))
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), data([2, 0], &[]))]),
+            )
             .unwrap()
             .to_vec_f64();
-        assert!(values.iter().all(|value| value.is_infinite() && value.is_sign_negative()));
+        assert!(
+            values
+                .iter()
+                .all(|value| value.is_infinite() && value.is_sign_negative())
+        );
 
         let mut malformed = Graph::new();
         let x = malformed.input("input", [2, 2]);
         let nodes = malformed.node_count();
-        assert!(malformed.max_with_axes(x, Some(vec![0, -2]), false).is_err());
+        assert!(
+            malformed
+                .max_with_axes(x, Some(vec![0, -2]), false)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), nodes);
     }
 
@@ -4342,19 +4811,37 @@ mod tests {
             TensorData::from_scalars(
                 [2, 2],
                 DType::F64,
-                [Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(f64::NAN), Scalar::F(-3.)],
+                [
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(-3.),
+                ],
             )
             .unwrap(),
         )]);
         let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
         assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
         assert!(values.scalar_at(1).as_f64().is_nan());
-        let gradients = CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64();
+        let gradients = CpuBackend
+            .execute(&graph, gradient, &bindings)
+            .unwrap()
+            .to_vec_f64();
         assert_eq!(&gradients[..2], &[0.5, 0.5]);
 
         for dtype in [
-            DType::Bool, DType::I8, DType::I16, DType::I32, DType::I64, DType::U8,
-            DType::U16, DType::U32, DType::U64, DType::F16, DType::BF16, DType::F32,
+            DType::Bool,
+            DType::I8,
+            DType::I16,
+            DType::I32,
+            DType::I64,
+            DType::U8,
+            DType::U16,
+            DType::U32,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
             DType::F64,
         ] {
             let mut typed = Graph::new();
@@ -4367,10 +4854,18 @@ mod tests {
         let output = empty.min_with_axes(x, Some(vec![1]), false).unwrap();
         assert_eq!(empty.shape(output).unwrap(), &Shape::new([2]));
         let values = CpuBackend
-            .execute(&empty, output, &HashMap::from([("input".into(), data([2, 0], &[]))]))
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), data([2, 0], &[]))]),
+            )
             .unwrap()
             .to_vec_f64();
-        assert!(values.iter().all(|value| value.is_infinite() && value.is_sign_positive()));
+        assert!(
+            values
+                .iter()
+                .all(|value| value.is_infinite() && value.is_sign_positive())
+        );
 
         let mut scalar = Graph::new();
         let x = scalar.input("input", []);
@@ -4380,7 +4875,11 @@ mod tests {
         let mut malformed = Graph::new();
         let x = malformed.input("input", [2, 2]);
         let nodes = malformed.node_count();
-        assert!(malformed.min_with_axes(x, Some(vec![0, -2]), false).is_err());
+        assert!(
+            malformed
+                .min_with_axes(x, Some(vec![0, -2]), false)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), nodes);
     }
 
@@ -4394,16 +4893,41 @@ mod tests {
         assert_eq!(graph.shape(minimum).unwrap(), &Shape::new([]));
         assert_eq!(graph.dtype(maximum).unwrap(), DType::F64);
         assert_eq!(graph.dtype(minimum).unwrap(), DType::F64);
-        let crate::Op::Reduce { kind: ReduceKind::Max, input: max_input, .. } = graph.op(maximum).unwrap() else { unreachable!() };
+        let crate::Op::Reduce {
+            kind: ReduceKind::Max,
+            input: max_input,
+            ..
+        } = graph.op(maximum).unwrap()
+        else {
+            unreachable!()
+        };
         assert_eq!(*max_input, input);
         // tinygrad's Min is exactly `(-x).max(...)._inverse()`, not raw Min.
-        let crate::Op::Unary { op: UnaryOp::Neg, input: min_max } = graph.op(minimum).unwrap() else { unreachable!() };
-        let crate::Op::Reduce { kind: ReduceKind::Max, input: min_inverse, .. } = graph.op(*min_max).unwrap() else { unreachable!() };
+        let crate::Op::Unary {
+            op: UnaryOp::Neg,
+            input: min_max,
+        } = graph.op(minimum).unwrap()
+        else {
+            unreachable!()
+        };
+        let crate::Op::Reduce {
+            kind: ReduceKind::Max,
+            input: min_inverse,
+            ..
+        } = graph.op(*min_max).unwrap()
+        else {
+            unreachable!()
+        };
         assert!(matches!(
             graph.op(*min_inverse).unwrap(),
             crate::Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
         ));
-        let loss = graph.add(graph.sum_all(maximum).unwrap(), graph.sum_all(minimum).unwrap()).unwrap();
+        let loss = graph
+            .add(
+                graph.sum_all(maximum).unwrap(),
+                graph.sum_all(minimum).unwrap(),
+            )
+            .unwrap();
         assert!(graph.grad(loss, input).is_ok());
 
         let mut specials = Graph::new();
@@ -4418,12 +4942,29 @@ mod tests {
         )]);
         for output in [maximum, minimum] {
             assert_eq!(
-                CpuBackend.execute(&specials, output, &bindings).unwrap().scalar_at(0).as_f64().to_bits(),
+                CpuBackend
+                    .execute(&specials, output, &bindings)
+                    .unwrap()
+                    .scalar_at(0)
+                    .as_f64()
+                    .to_bits(),
                 (-0.0f64).to_bits(),
             );
         }
-        assert_eq!(CpuBackend.execute(&specials, max_gradient, &bindings).unwrap().to_vec_f64(), vec![0.5, 0.5]);
-        assert_eq!(CpuBackend.execute(&specials, min_gradient, &bindings).unwrap().to_vec_f64(), vec![0.5, 0.5]);
+        assert_eq!(
+            CpuBackend
+                .execute(&specials, max_gradient, &bindings)
+                .unwrap()
+                .to_vec_f64(),
+            vec![0.5, 0.5]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&specials, min_gradient, &bindings)
+                .unwrap()
+                .to_vec_f64(),
+            vec![0.5, 0.5]
+        );
 
         let mut nonfloat = Graph::new();
         let input = nonfloat.input_dtype("input", [], DType::I32);
@@ -4431,7 +4972,13 @@ mod tests {
         let minimum = nonfloat.min_default(input).unwrap();
         assert_eq!(nonfloat.dtype(maximum).unwrap(), DType::I32);
         assert_eq!(nonfloat.dtype(minimum).unwrap(), DType::I32);
-        assert!(matches!(nonfloat.op(minimum).unwrap(), crate::Op::Binary { op: crate::BinaryOp::BitXor, .. }));
+        assert!(matches!(
+            nonfloat.op(minimum).unwrap(),
+            crate::Op::Binary {
+                op: crate::BinaryOp::BitXor,
+                ..
+            }
+        ));
 
         let mut empty = Graph::new();
         let input = empty.input_dtype("input", [0, 2], DType::F16);

@@ -56,7 +56,7 @@ impl<'a> TensorDataReader<'a> {
         self.position
     }
 
-    fn bytes(&self) -> &[u8] {
+    fn source_bytes(&self) -> &[u8] {
         let Storage::U8(bytes) = self.data.storage() else {
             unreachable!("TensorDataReader validates U8 storage at construction")
         };
@@ -64,7 +64,7 @@ impl<'a> TensorDataReader<'a> {
     }
 
     fn seek_position(&self, offset: i128, origin: i128) -> usize {
-        let end = self.bytes().len() as i128;
+        let end = self.source_bytes().len() as i128;
         (origin.saturating_add(offset).clamp(0, end)) as usize
     }
 }
@@ -73,7 +73,7 @@ impl Read for TensorDataReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let position = self.position;
         let count = {
-            let bytes = self.bytes();
+            let bytes = self.source_bytes();
             let count = bytes.len().saturating_sub(position).min(buffer.len());
             buffer[..count].copy_from_slice(&bytes[position..position + count]);
             count
@@ -87,8 +87,12 @@ impl Seek for TensorDataReader<'_> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.position = match position {
             SeekFrom::Start(offset) => self.seek_position(i128::from(offset), 0),
-            SeekFrom::Current(offset) => self.seek_position(i128::from(offset), self.position as i128),
-            SeekFrom::End(offset) => self.seek_position(i128::from(offset), self.bytes().len() as i128),
+            SeekFrom::Current(offset) => {
+                self.seek_position(i128::from(offset), self.position as i128)
+            }
+            SeekFrom::End(offset) => {
+                self.seek_position(i128::from(offset), self.source_bytes().len() as i128)
+            }
         };
         Ok(self.position as u64)
     }
@@ -630,13 +634,17 @@ mod tests {
 
     fn assert_same_scalar(actual: Scalar, expected: Scalar, dtype: DType) {
         match (actual, expected) {
-            (Scalar::Bool(actual), Scalar::Bool(expected)) => assert_eq!(actual, expected, "{dtype:?}"),
+            (Scalar::Bool(actual), Scalar::Bool(expected)) => {
+                assert_eq!(actual, expected, "{dtype:?}")
+            }
             (Scalar::I(actual), Scalar::I(expected)) => assert_eq!(actual, expected, "{dtype:?}"),
             (Scalar::U(actual), Scalar::U(expected)) => assert_eq!(actual, expected, "{dtype:?}"),
             (Scalar::F(actual), Scalar::F(expected)) => {
                 assert_eq!(actual.to_bits(), expected.to_bits(), "{dtype:?}")
             }
-            (actual, expected) => panic!("tolist changed scalar kind for {dtype:?}: {actual:?} != {expected:?}"),
+            (actual, expected) => {
+                panic!("tolist changed scalar kind for {dtype:?}: {actual:?} != {expected:?}")
+            }
         }
     }
 
@@ -767,12 +775,7 @@ mod tests {
         assert_same_scalar(leaf(&second_row[0]), Scalar::I(30), DType::I32);
         assert_same_scalar(leaf(&second_row[1]), Scalar::I(40), DType::I32);
 
-        let data = TensorData::from_scalars(
-            [2, 2, 2],
-            DType::I32,
-            (0..8).map(Scalar::I),
-        )
-        .unwrap();
+        let data = TensorData::from_scalars([2, 2, 2], DType::I32, (0..8).map(Scalar::I)).unwrap();
         let before = data.clone();
         let TensorList::List(outer) = data.tolist() else {
             panic!("rank-three TensorData must become nested lists");
@@ -875,11 +878,8 @@ mod tests {
         for source in [
             TensorData::from_storage([2], Storage::F16(vec![0x8000, 0x7e01])).unwrap(),
             TensorData::from_storage([2], Storage::BF16(vec![0x8000, 0x7fc1])).unwrap(),
-            TensorData::from_storage(
-                [2],
-                Storage::F32(vec![-0.0, f32::from_bits(0x7f80_0001)]),
-            )
-            .unwrap(),
+            TensorData::from_storage([2], Storage::F32(vec![-0.0, f32::from_bits(0x7f80_0001)]))
+                .unwrap(),
             TensorData::from_storage(
                 [2],
                 Storage::F64(vec![-0.0, f64::from_bits(0x7ff0_0000_0000_0001)]),
@@ -887,19 +887,22 @@ mod tests {
             .unwrap(),
         ] {
             let source_before = source.clone();
-            let mut destination = TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap();
+            let mut destination =
+                TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap();
             destination.replace(&source).unwrap();
             assert_same_storage_bits(destination.storage(), source.storage());
             assert_same_storage_bits(source.storage(), source_before.storage());
         }
 
         let scalar_source = TensorData::scalar_with_dtype(Scalar::I(-7), DType::I32);
-        let mut scalar_destination = TensorData::scalar_with_dtype(Scalar::Bool(false), DType::Bool);
+        let mut scalar_destination =
+            TensorData::scalar_with_dtype(Scalar::Bool(false), DType::Bool);
         scalar_destination.replace(&scalar_source).unwrap();
         assert_eq!(scalar_destination.storage(), scalar_source.storage());
 
         let empty_source = TensorData::from_storage([2, 0, 3], Storage::F16(vec![])).unwrap();
-        let mut empty_destination = TensorData::from_storage([2, 0, 3], Storage::U8(vec![])).unwrap();
+        let mut empty_destination =
+            TensorData::from_storage([2, 0, 3], Storage::U8(vec![])).unwrap();
         empty_destination.replace(&empty_source).unwrap();
         assert_eq!(empty_destination.storage(), empty_source.storage());
     }
@@ -931,7 +934,11 @@ mod tests {
             (DType::I64, Scalar::I(i64::MIN), Scalar::I(i64::MIN)),
             (DType::U8, Scalar::U(250), Scalar::U(250)),
             (DType::U16, Scalar::U(60_000), Scalar::U(60_000)),
-            (DType::U32, Scalar::U(4_000_000_000), Scalar::U(4_000_000_000)),
+            (
+                DType::U32,
+                Scalar::U(4_000_000_000),
+                Scalar::U(4_000_000_000),
+            ),
             (DType::U64, Scalar::U(u64::MAX), Scalar::U(u64::MAX)),
             (DType::F16, Scalar::F(-0.0), Scalar::F(-0.0)),
             (DType::BF16, Scalar::F(-0.0), Scalar::F(-0.0)),
@@ -1092,14 +1099,21 @@ mod tests {
     fn same_dtype_float_cast_is_a_raw_storage_identity() {
         let input = TensorData::from_storage(
             [2],
-            Storage::F32(vec![f32::from_bits(0x7f80_0001), f32::from_bits(0x8000_0000)]),
+            Storage::F32(vec![
+                f32::from_bits(0x7f80_0001),
+                f32::from_bits(0x8000_0000),
+            ]),
         )
         .unwrap();
-        let Storage::F32(values) = input.cast(DType::F32).storage() else {
+        let cast = input.cast(DType::F32);
+        let Storage::F32(values) = cast.storage() else {
             panic!("same dtype cast changed F32 storage");
         };
         assert_eq!(
-            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
             vec![0x7f80_0001, 0x8000_0000]
         );
     }
@@ -1143,7 +1157,8 @@ mod tests {
     fn assign_validates_shape_before_dtype_and_keeps_failures_atomic() {
         let mut destination = TensorData::from_storage([2, 3], Storage::F32(vec![1.0; 6])).unwrap();
         let before = destination.clone();
-        let invalid_shape_and_dtype = TensorData::from_storage([4], Storage::I32(vec![1; 4])).unwrap();
+        let invalid_shape_and_dtype =
+            TensorData::from_storage([4], Storage::I32(vec![1; 4])).unwrap();
         assert_eq!(
             destination.assign(&invalid_shape_and_dtype).unwrap_err(),
             Error::ShapeMismatch {
@@ -1154,7 +1169,8 @@ mod tests {
         );
         assert_eq!(destination, before);
 
-        let valid_shape_wrong_dtype = TensorData::from_storage([1, 3], Storage::I32(vec![1; 3])).unwrap();
+        let valid_shape_wrong_dtype =
+            TensorData::from_storage([1, 3], Storage::I32(vec![1; 3])).unwrap();
         assert_eq!(
             destination.assign(&valid_shape_wrong_dtype).unwrap_err(),
             Error::InputDType {
@@ -1172,7 +1188,8 @@ mod tests {
             TensorData::from_storage([1], Storage::F16(vec![0x8000])).unwrap(),
             TensorData::from_storage([1], Storage::BF16(vec![0x7fc1])).unwrap(),
             TensorData::from_storage([1], Storage::F32(vec![f32::from_bits(0x8000_0000)])).unwrap(),
-            TensorData::from_storage([1], Storage::F64(vec![f64::from_bits(0x7ff0_0000_0001)])).unwrap(),
+            TensorData::from_storage([1], Storage::F64(vec![f64::from_bits(0x7ff0_0000_0001)]))
+                .unwrap(),
         ] {
             let source_before = source.clone();
             let mut destination = TensorData::from_storage(
@@ -1204,7 +1221,8 @@ mod tests {
         assert_eq!(scalar_destination.storage(), scalar.storage());
 
         let zero_source = TensorData::from_storage([1, 0, 3], Storage::U8(vec![])).unwrap();
-        let mut zero_destination = TensorData::from_storage([2, 0, 3], Storage::U8(vec![])).unwrap();
+        let mut zero_destination =
+            TensorData::from_storage([2, 0, 3], Storage::U8(vec![])).unwrap();
         zero_destination.assign(&zero_source).unwrap();
         assert_eq!(zero_destination.storage(), &Storage::U8(vec![]));
     }

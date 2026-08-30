@@ -245,10 +245,7 @@ pub(super) fn strict_typed_string_attr(n: &Msg<'_>, wanted: &str) -> Result<Opti
 /// INTS and whose sole payload is the packed integer field. This keeps
 /// adapters with Python-list controls from accepting a scalar INT, STRING,
 /// or TENSOR wire alias.
-pub(super) fn strict_typed_packed_i64_attr(
-    n: &Msg<'_>,
-    wanted: &str,
-) -> Result<Option<Vec<i64>>> {
+pub(super) fn strict_typed_packed_i64_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<Vec<i64>>> {
     let mut out = None;
     for raw in n.bytes(5)? {
         let attribute = Msg::new(raw);

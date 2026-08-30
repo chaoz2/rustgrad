@@ -5,8 +5,7 @@
 //! step checks the captured parameter versions before replacement, so callers
 //! must rebuild/evaluate the next graph cycle after an update.
 
-use crate::nn::{Module, ParameterRestore, StateDict, restore_parameters};
-use crate::nn::{StateDict, next_version};
+use crate::nn::{Module, ParameterRestore, StateDict, next_version, restore_parameters};
 use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
@@ -1085,11 +1084,8 @@ impl Optimizer {
             .ok_or_else(|| invalid("optimizer step counter overflow"))?;
         let mut next = self.clone();
         let mut restores = Vec::with_capacity(next.entries.len());
-        for ((entry, snapshot), next_version) in next
-            .entries
-            .iter_mut()
-            .zip(snapshots)
-            .zip(next_versions)
+        for ((entry, snapshot), next_version) in
+            next.entries.iter_mut().zip(snapshots).zip(next_versions)
         {
             let gradient = &gradients[&entry.name];
             let values = to_f64(&snapshot.data);
@@ -1481,11 +1477,7 @@ fn validate(kind: &OptimizerKind) -> Result<()> {
             }
         }
         OptimizerKind::Lars(c) => {
-            if !c.momentum.is_finite()
-                || c.momentum < 0.
-                || !c.tcoef.is_finite()
-                || c.tcoef < 0.
-            {
+            if !c.momentum.is_finite() || c.momentum < 0. || !c.tcoef.is_finite() || c.tcoef < 0. {
                 Err(invalid("invalid LARS momentum or trust coefficient"))
             } else {
                 Ok(())
@@ -1896,11 +1888,8 @@ mod tests {
         parameter.set_version_for_test(u64::MAX).unwrap();
         let before = parameter.snapshot().unwrap();
         let gradient = gradient(&parameter, vec![2.]);
-        let mut optimizer = Optimizer::sgd(
-            vec![("p".into(), parameter.clone())],
-            SgdConfig::default(),
-        )
-        .unwrap();
+        let mut optimizer =
+            Optimizer::sgd(vec![("p".into(), parameter.clone())], SgdConfig::default()).unwrap();
         assert!(matches!(
             optimizer.step(&BTreeMap::from([("p".into(), gradient)])),
             Err(Error::ParameterVersionOverflow { version: u64::MAX })
@@ -1918,11 +1907,8 @@ mod tests {
         second.set_version_for_test(u64::MAX).unwrap();
         let first_before = first.snapshot().unwrap();
         let second_before = second.snapshot().unwrap();
-        let first_optimizer = Optimizer::sgd(
-            vec![("first".into(), first.clone())],
-            SgdConfig::default(),
-        )
-        .unwrap();
+        let first_optimizer =
+            Optimizer::sgd(vec![("first".into(), first.clone())], SgdConfig::default()).unwrap();
         let second_optimizer = Optimizer::sgd(
             vec![("second".into(), second.clone())],
             SgdConfig::default(),
@@ -1949,14 +1935,16 @@ mod tests {
         let parameter = parameter(&mut graph, vec![1.]);
         let before = parameter.snapshot().unwrap();
         for momentum in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(Optimizer::lars(
-                vec![("p".into(), parameter.clone())],
-                LarsConfig {
-                    momentum,
-                    ..LarsConfig::default()
-                },
-            )
-            .is_err());
+            assert!(
+                Optimizer::lars(
+                    vec![("p".into(), parameter.clone())],
+                    LarsConfig {
+                        momentum,
+                        ..LarsConfig::default()
+                    },
+                )
+                .is_err()
+            );
             assert_eq!(parameter.snapshot().unwrap().data, before.data);
         }
 
@@ -1972,7 +1960,10 @@ mod tests {
         )
         .unwrap();
         optimizer
-            .step(&BTreeMap::from([("p".into(), gradient(&parameter, vec![1.]))]))
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&parameter, vec![1.]),
+            )]))
             .unwrap();
         assert_eq!(values(&parameter), vec![0.9]);
     }
@@ -3145,18 +3136,17 @@ mod tests {
     fn adam_step_counter_overflow_rejects_before_optimizer_or_group_publication() {
         let mut graph = Graph::new();
         let parameter = parameter(&mut graph, vec![1.]);
-        let mut optimizer = Optimizer::adam(
-            vec![("p".into(), parameter.clone())],
-            AdamConfig::default(),
-        )
-        .unwrap();
+        let mut optimizer =
+            Optimizer::adam(vec![("p".into(), parameter.clone())], AdamConfig::default()).unwrap();
         optimizer.step = u64::MAX;
         let gradient = gradient(&parameter, vec![0.5]);
         let parameter_before = values(&parameter);
         let state_before = optimizer.state_dict().unwrap();
-        assert!(optimizer
-            .step(&BTreeMap::from([("p".into(), gradient.clone())]))
-            .is_err());
+        assert!(
+            optimizer
+                .step(&BTreeMap::from([("p".into(), gradient.clone())]))
+                .is_err()
+        );
         assert_eq!(values(&parameter), parameter_before);
         assert_eq!(optimizer.state_dict().unwrap(), state_before);
         optimizer.step = 0;
@@ -3169,20 +3159,21 @@ mod tests {
         let right = parameter(&mut graph, vec![3.]);
         let mut group = OptimizerGroup::new(vec![
             Optimizer::adam(vec![("left".into(), left.clone())], AdamConfig::default()).unwrap(),
-            Optimizer::adam(vec![("right".into(), right.clone())], AdamConfig::default())
-                .unwrap(),
+            Optimizer::adam(vec![("right".into(), right.clone())], AdamConfig::default()).unwrap(),
         ])
         .unwrap();
         group.optimizers[1].step = u64::MAX;
         let left_before = values(&left);
         let right_before = values(&right);
         let state_before = group.state_dict().unwrap();
-        assert!(group
-            .step(&BTreeMap::from([
-                ("left".into(), gradient(&left, vec![0.5])),
-                ("right".into(), gradient(&right, vec![0.25])),
-            ]))
-            .is_err());
+        assert!(
+            group
+                .step(&BTreeMap::from([
+                    ("left".into(), gradient(&left, vec![0.5])),
+                    ("right".into(), gradient(&right, vec![0.25])),
+                ]))
+                .is_err()
+        );
         assert_eq!(values(&left), left_before);
         assert_eq!(values(&right), right_before);
         assert_eq!(group.state_dict().unwrap(), state_before);
@@ -3312,7 +3303,10 @@ mod tests {
         assert!(schedulers.step(&mut optimizers).is_err());
         assert_eq!(optimizers.learning_rates(), rates_before);
         assert_eq!(schedulers.schedulers[0].state_dict().unwrap(), first_before);
-        assert_eq!(schedulers.schedulers[1].state_dict().unwrap(), second_before);
+        assert_eq!(
+            schedulers.schedulers[1].state_dict().unwrap(),
+            second_before
+        );
 
         schedulers.schedulers[1]
             .load_state_dict(&second_initial)

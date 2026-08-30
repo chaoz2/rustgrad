@@ -221,7 +221,11 @@ fn live_get_state_dict_preserves_prefix_order_buffers_and_tied_liveness() {
     assert!(!state.is_empty());
     assert_eq!(
         state.keys().collect::<Vec<_>>(),
-        vec!["root.layers.0.weight", "root.layers.1.weight", "root.running"]
+        vec![
+            "root.layers.0.weight",
+            "root.layers.1.weight",
+            "root.running"
+        ]
     );
     assert_eq!(
         state
@@ -243,25 +247,20 @@ fn live_get_state_dict_preserves_prefix_order_buffers_and_tied_liveness() {
         .replace(TensorData::new([2, 2], vec![3.; 4]).unwrap())
         .unwrap();
     assert_eq!(
-        state
-            .get("root.layers.1.weight")
-            .unwrap()
-            .value()
-            .unwrap(),
+        state.get("root.layers.1.weight").unwrap().value().unwrap(),
         TensorData::new([2, 2], vec![3.; 4]).unwrap()
     );
 
-    let one = OneParameter(Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true));
+    let one = OneParameter(Parameter::new(
+        TensorData::new([1], vec![1.]).unwrap(),
+        true,
+    ));
     assert_eq!(
-        get_state_dict(&one, "root")
-            .keys()
-            .collect::<Vec<_>>(),
+        get_state_dict(&one, "root").keys().collect::<Vec<_>>(),
         vec!["rootvalue"]
     );
     assert_eq!(
-        get_state_dict(&one, "root.")
-            .keys()
-            .collect::<Vec<_>>(),
+        get_state_dict(&one, "root.").keys().collect::<Vec<_>>(),
         vec!["root.value"]
     );
     let first = Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true);
@@ -272,9 +271,7 @@ fn live_get_state_dict_preserves_prefix_order_buffers_and_tied_liveness() {
     sequence.push(OneParameter(first));
     sequence.push(nested);
     assert_eq!(
-        get_state_dict(&sequence, "")
-            .keys()
-            .collect::<Vec<_>>(),
+        get_state_dict(&sequence, "").keys().collect::<Vec<_>>(),
         vec!["0.value", "1.0.value"]
     );
     assert!(get_state_dict(&Stateless, "root.").is_empty());
@@ -291,7 +288,10 @@ fn live_get_state_dict_keeps_duplicate_key_position_and_refactors_get_parameters
         middle: middle.clone(),
     };
     let state = get_state_dict(&duplicate, "");
-    assert_eq!(state.keys().collect::<Vec<_>>(), vec!["first", "duplicate", "middle"]);
+    assert_eq!(
+        state.keys().collect::<Vec<_>>(),
+        vec!["first", "duplicate", "middle"]
+    );
     assert_eq!(state.get("duplicate").unwrap().id(), replacement.id());
     assert_eq!(
         state.values().map(Parameter::id).collect::<Vec<_>>(),
@@ -572,9 +572,11 @@ fn strict_state_load_preflights_every_container_parameter_before_replacement() {
     let mut malformed = linear.state_dict().unwrap().into_tensors();
     malformed.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
     malformed.insert("weight".into(), TensorData::new([1], vec![7.]).unwrap());
-    assert!(linear
-        .load_state_dict(&StateDict::from(malformed), true, CastPolicy::Exact)
-        .is_err());
+    assert!(
+        linear
+            .load_state_dict(&StateDict::from(malformed), true, CastPolicy::Exact)
+            .is_err()
+    );
     let weight_after_failure = linear.weight.snapshot().unwrap();
     let bias_after_failure = bias.snapshot().unwrap();
     assert_eq!(weight_after_failure.data, weight_before.data);
@@ -596,8 +598,14 @@ fn strict_state_load_preflights_every_container_parameter_before_replacement() {
     let bias_after_success = bias.snapshot().unwrap();
     assert_eq!(f32s(&weight_after_success.data), vec![7., 8.]);
     assert_eq!(f32s(&bias_after_success.data), vec![5.]);
-    assert_eq!(weight_after_success.version, weight_before.version.checked_add(1).unwrap());
-    assert_eq!(bias_after_success.version, bias_before.version.checked_add(1).unwrap());
+    assert_eq!(
+        weight_after_success.version,
+        weight_before.version.checked_add(1).unwrap()
+    );
+    assert_eq!(
+        bias_after_success.version,
+        bias_before.version.checked_add(1).unwrap()
+    );
 }
 
 #[test]
@@ -606,10 +614,7 @@ fn state_load_admits_only_the_tinygrad_scalar_singleton_shape_bridge() {
     let vector = OneParameter(vector_parameter.clone());
     let report = vector
         .load_state_dict(
-            &StateDict::from(BTreeMap::from([(
-                "value".into(),
-                TensorData::scalar(-0.0),
-            )])),
+            &StateDict::from(BTreeMap::from([("value".into(), TensorData::scalar(-0.0))])),
             true,
             CastPolicy::Exact,
         )
@@ -617,7 +622,10 @@ fn state_load_admits_only_the_tinygrad_scalar_singleton_shape_bridge() {
     assert!(report.is_clean());
     let vector_snapshot = vector_parameter.snapshot().unwrap();
     assert_eq!(vector_snapshot.shape.dims(), [1]);
-    assert_eq!(f32s(&vector_snapshot.data)[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(
+        f32s(&vector_snapshot.data)[0].to_bits(),
+        (-0.0f32).to_bits()
+    );
     assert_eq!(vector_snapshot.version, 1);
 
     let scalar_parameter = Parameter::new(TensorData::scalar(0.0), true);
@@ -671,7 +679,10 @@ fn parameter_version_overflow_is_preflighted_without_any_publication() {
         Err(Error::ParameterVersionOverflow { version: u64::MAX })
     ));
     assert_eq!(linear.weight.snapshot().unwrap().data, weight_before.data);
-    assert_eq!(linear.weight.snapshot().unwrap().version, weight_before.version);
+    assert_eq!(
+        linear.weight.snapshot().unwrap().version,
+        weight_before.version
+    );
     assert_eq!(bias.snapshot().unwrap().data, bias_before.data);
     assert_eq!(bias.snapshot().unwrap().version, bias_before.version);
 }

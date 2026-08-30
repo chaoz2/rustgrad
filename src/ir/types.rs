@@ -273,15 +273,6 @@ pub enum Op {
         axis: Option<usize>,
         keepdim: bool,
     },
-    /// One selector from an atomically evaluated stable sort pair. Both
-    /// nodes share `pair`; values preserve source dtype and indices are I32.
-    Sort {
-        input: NodeId,
-        axis: usize,
-        descending: bool,
-        pair: u64,
-        output: SortOutput,
-    },
     ReduceGrad {
         input: NodeId,
         upstream: NodeId,
@@ -654,13 +645,6 @@ pub enum PrefixScanOutput {
 }
 
 /// Selects one output from the coupled static sort producer.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum SortOutput {
-    Values,
-    Indices,
-}
-
-/// Selects one output from a coupled stable sort producer.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SortOutput {
     Values,

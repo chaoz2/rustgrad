@@ -131,7 +131,11 @@ impl MovementKernelPlan {
             .op(output)
             .map_err(|_| MovementPlanError::InvalidGeometry)?
         {
-            Op::Pad { input, padding, fill } => {
+            Op::Pad {
+                input,
+                padding,
+                fill,
+            } => {
                 let input = MovementOperand::from_graph(graph, *input)?;
                 MovementKernelKind::Pad {
                     fill_bits: scalar_bits(input.dtype, *fill),
@@ -235,15 +239,29 @@ impl MovementKernelPlan {
                     return Err(MovementPlanError::InvalidGeometry);
                 }
             }
-            MovementKernelKind::Pad { input, padding, fill_bits } => {
-                input.shape.numel().map_err(|_| MovementPlanError::Overflow)?;
+            MovementKernelKind::Pad {
+                input,
+                padding,
+                fill_bits,
+            } => {
+                input
+                    .shape
+                    .numel()
+                    .map_err(|_| MovementPlanError::Overflow)?;
                 if padding.len() != input.shape.rank() || self.dtype != input.dtype {
                     return Err(MovementPlanError::InvalidGeometry);
                 }
-                let expected = input.shape.dims().iter().zip(padding).map(|(dim, (before, after))| {
-                    dim.checked_add(*before).and_then(|x| x.checked_add(*after))
-                        .ok_or(MovementPlanError::Overflow)
-                }).collect::<Result<Vec<_>, _>>()?;
+                let expected = input
+                    .shape
+                    .dims()
+                    .iter()
+                    .zip(padding)
+                    .map(|(dim, (before, after))| {
+                        dim.checked_add(*before)
+                            .and_then(|x| x.checked_add(*after))
+                            .ok_or(MovementPlanError::Overflow)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 if self.output_shape.dims() != expected || !valid_bits(self.dtype, *fill_bits) {
                     return Err(MovementPlanError::InvalidGeometry);
                 }
@@ -383,9 +401,11 @@ impl MovementKernelPlan {
                 )
                 .map_err(|_| MovementExecutionError::InvalidGeometry)
             }
-            MovementKernelKind::Pad { input, padding, fill_bits } => {
-                self.execute_pad(&operands[0], input, padding, *fill_bits)
-            }
+            MovementKernelKind::Pad {
+                input,
+                padding,
+                fill_bits,
+            } => self.execute_pad(&operands[0], input, padding, *fill_bits),
             MovementKernelKind::Concat { inputs, axis } => {
                 self.execute_concat(operands, inputs, *axis)
             }
@@ -411,20 +431,42 @@ impl MovementKernelPlan {
         }
     }
 
-    fn execute_pad(&self, input: &TensorData, desc: &MovementOperand, padding: &[(usize, usize)], fill_bits: u64) -> Result<TensorData, MovementExecutionError> {
+    fn execute_pad(
+        &self,
+        input: &TensorData,
+        desc: &MovementOperand,
+        padding: &[(usize, usize)],
+        fill_bits: u64,
+    ) -> Result<TensorData, MovementExecutionError> {
         let source = dense(&desc.shape)?;
         let output = dense(&self.output_shape)?;
         let fill = scalar_from_bits(self.dtype, fill_bits);
         let mut values = Vec::with_capacity(output.len());
         for linear in 0..output.len() {
-            let coords = output.coords(linear).map_err(|_| MovementExecutionError::InvalidGeometry)?;
-            let inside = coords.iter().zip(padding).zip(desc.shape.dims()).all(|((coord, (before, _)), dim)| *coord >= *before && *coord - *before < *dim);
+            let coords = output
+                .coords(linear)
+                .map_err(|_| MovementExecutionError::InvalidGeometry)?;
+            let inside =
+                coords.iter().zip(padding).zip(desc.shape.dims()).all(
+                    |((coord, (before, _)), dim)| *coord >= *before && *coord - *before < *dim,
+                );
             values.push(if inside {
-                let input_coords = coords.iter().zip(padding).map(|(coord, (before, _))| coord - before).collect::<Vec<_>>();
-                input.scalar_at(source.offset(&input_coords).map_err(|_| MovementExecutionError::InvalidGeometry)?)
-            } else { fill });
+                let input_coords = coords
+                    .iter()
+                    .zip(padding)
+                    .map(|(coord, (before, _))| coord - before)
+                    .collect::<Vec<_>>();
+                input.scalar_at(
+                    source
+                        .offset(&input_coords)
+                        .map_err(|_| MovementExecutionError::InvalidGeometry)?,
+                )
+            } else {
+                fill
+            });
         }
-        TensorData::from_scalars(self.output_shape.clone(), self.dtype, values).map_err(|_| MovementExecutionError::InvalidGeometry)
+        TensorData::from_scalars(self.output_shape.clone(), self.dtype, values)
+            .map_err(|_| MovementExecutionError::InvalidGeometry)
     }
 
     fn execute_concat(
@@ -551,15 +593,38 @@ impl MovementKernelPlan {
 fn scalar_bits(dtype: DType, value: Scalar) -> u64 {
     let data = TensorData::scalar_with_dtype(value, dtype);
     match data.storage() {
-        Storage::Bool(v) => u64::from(v[0]), Storage::I8(v) => v[0] as u8 as u64, Storage::U8(v) => v[0] as u64,
-        Storage::I16(v) => v[0] as u16 as u64, Storage::U16(v) | Storage::F16(v) | Storage::BF16(v) => v[0] as u64,
-        Storage::I32(v) => v[0] as u32 as u64, Storage::U32(v) => v[0] as u64, Storage::I64(v) => v[0] as u64,
-        Storage::U64(v) => v[0], Storage::F32(v) => v[0].to_bits() as u64, Storage::F64(v) => v[0].to_bits(),
+        Storage::Bool(v) => u64::from(v[0]),
+        Storage::I8(v) => v[0] as u8 as u64,
+        Storage::U8(v) => v[0] as u64,
+        Storage::I16(v) => v[0] as u16 as u64,
+        Storage::U16(v) | Storage::F16(v) | Storage::BF16(v) => v[0] as u64,
+        Storage::I32(v) => v[0] as u32 as u64,
+        Storage::U32(v) => v[0] as u64,
+        Storage::I64(v) => v[0] as u64,
+        Storage::U64(v) => v[0],
+        Storage::F32(v) => v[0].to_bits() as u64,
+        Storage::F64(v) => v[0].to_bits(),
     }
 }
-fn valid_bits(dtype: DType, bits: u64) -> bool { dtype.bits() == 64 || bits >> dtype.bits() == 0 }
+fn valid_bits(dtype: DType, bits: u64) -> bool {
+    dtype.bits() == 64 || bits >> dtype.bits() == 0
+}
 fn scalar_from_bits(dtype: DType, bits: u64) -> Scalar {
-    match dtype { DType::Bool => Scalar::Bool(bits != 0), DType::I8 => Scalar::I(bits as u8 as i8 as i64), DType::U8 => Scalar::U(bits as u8 as u64), DType::I16 => Scalar::I(bits as u16 as i16 as i64), DType::U16 => Scalar::U(bits as u16 as u64), DType::I32 => Scalar::I(bits as u32 as i32 as i64), DType::U32 => Scalar::U(bits as u32 as u64), DType::I64 => Scalar::I(bits as i64), DType::U64 => Scalar::U(bits), DType::F16 => Scalar::F(crate::f16_to_f32(bits as u16) as f64), DType::BF16 => Scalar::F(crate::bf16_to_f32(bits as u16) as f64), DType::F32 => Scalar::F(f32::from_bits(bits as u32) as f64), DType::F64 => Scalar::F(f64::from_bits(bits)) }
+    match dtype {
+        DType::Bool => Scalar::Bool(bits != 0),
+        DType::I8 => Scalar::I(bits as u8 as i8 as i64),
+        DType::U8 => Scalar::U(bits as u8 as u64),
+        DType::I16 => Scalar::I(bits as u16 as i16 as i64),
+        DType::U16 => Scalar::U(bits as u16 as u64),
+        DType::I32 => Scalar::I(bits as u32 as i32 as i64),
+        DType::U32 => Scalar::U(bits as u32 as u64),
+        DType::I64 => Scalar::I(bits as i64),
+        DType::U64 => Scalar::U(bits),
+        DType::F16 => Scalar::F(crate::f16_to_f32(bits as u16) as f64),
+        DType::BF16 => Scalar::F(crate::bf16_to_f32(bits as u16) as f64),
+        DType::F32 => Scalar::F(f32::from_bits(bits as u32) as f64),
+        DType::F64 => Scalar::F(f64::from_bits(bits)),
+    }
 }
 
 fn dense(shape: &Shape) -> Result<DenseIndex, MovementExecutionError> {
@@ -1130,7 +1195,12 @@ mod tests {
         let output = graph.pad(input, [(1, 0), (0, 2)], Scalar::F(-0.0)).unwrap();
         let plan = MovementKernelPlan::from_graph(&graph, output).unwrap();
         assert_eq!(plan.output_shape, Shape::from([2, 4]));
-        let MovementKernelKind::Pad { padding, fill_bits, .. } = &plan.kind else { panic!("pad plan") };
+        let MovementKernelKind::Pad {
+            padding, fill_bits, ..
+        } = &plan.kind
+        else {
+            panic!("pad plan")
+        };
         assert_eq!(padding, vec![(1, 0), (0, 2)]);
         assert_eq!(*fill_bits, 0x8000);
         assert!(plan.validate().is_ok());

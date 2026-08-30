@@ -1,4 +1,6 @@
-use super::{shape::normalize_axes, Graph, NodeId, Op, RandomKind, RandomStream, RollDims, RollShifts};
+use super::{
+    Graph, NodeId, Op, RandomKind, RandomStream, RollDims, RollShifts, shape::normalize_axes,
+};
 use crate::random::reserve;
 use crate::{
     DType, Error, ExpandExtent, ReshapeExtent, Result, Scalar, Shape, ShrinkRange, TensorData,
@@ -10,6 +12,21 @@ use std::sync::{Mutex, OnceLock};
 struct StreamRegistry {
     seed: u64,
     counters: BTreeMap<u32, [u32; 2]>,
+}
+
+/// An uncommitted implicit Threefry reservation owned by one graph and gated
+/// by a scalar Bool node. Creating this value never mutates the global stream.
+#[derive(Clone, Debug)]
+pub struct PendingRandomReservation {
+    graph: u64,
+    guard: NodeId,
+    shape: Shape,
+    dtype: DType,
+    device: u32,
+    key: [u32; 2],
+    expected_counter: [u32; 2],
+    words: u64,
+    committed: bool,
 }
 
 #[derive(Clone)]
@@ -67,7 +84,9 @@ fn tinygrad_full_plan(
     // Dense payload construction remains wholly before `constant`, so a
     // malformed descriptor cannot publish a prefix node. The lazy route
     // retains only the already committed scalar storage above.
-    let dense = buffer.then(|| TensorData::full_with_dtype(shape.clone(), value, dtype)).transpose()?;
+    let dense = buffer
+        .then(|| TensorData::full_with_dtype(shape.clone(), value, dtype))
+        .transpose()?;
     Ok(TinygradFullPlan {
         shape,
         dtype,
@@ -84,7 +103,11 @@ struct TinygradLikePlan {
     dtype: DType,
 }
 
-fn tinygrad_like_plan(graph: &Graph, input: NodeId, dtype: Option<DType>) -> Result<TinygradLikePlan> {
+fn tinygrad_like_plan(
+    graph: &Graph,
+    input: NodeId,
+    dtype: Option<DType>,
+) -> Result<TinygradLikePlan> {
     let source = graph.node(input)?;
     let shape = source.shape.clone();
     shape
@@ -231,7 +254,10 @@ fn source_roll_plan(
 fn lower_source_roll(graph: &mut Graph, input: NodeId, plan: &SourceRollPlan) -> Result<NodeId> {
     if plan.flattened {
         let flat = graph.flatten(input, 0, -1)?;
-        debug_assert_eq!(graph.shape(flat).expect("source roll preflighted"), plan.flat_shape.as_ref().expect("flatten plan"));
+        debug_assert_eq!(
+            graph.shape(flat).expect("source roll preflighted"),
+            plan.flat_shape.as_ref().expect("flatten plan")
+        );
         let rolled = graph.roll_axes(flat, &plan.shifts, &plan.axes)?;
         graph.reshape(rolled, plan.output_shape.clone())
     } else {
@@ -269,11 +295,20 @@ pub(crate) fn one_hot_plan(graph: &Graph, input: NodeId, classes: usize) -> Resu
     one_hot_plan_inner(graph, input, classes, true)
 }
 
-pub(crate) fn one_hot_bool_plan(graph: &Graph, input: NodeId, classes: usize) -> Result<OneHotPlan> {
+pub(crate) fn one_hot_bool_plan(
+    graph: &Graph,
+    input: NodeId,
+    classes: usize,
+) -> Result<OneHotPlan> {
     one_hot_plan_inner(graph, input, classes, false)
 }
 
-fn one_hot_plan_inner(graph: &Graph, input: NodeId, classes: usize, numeric: bool) -> Result<OneHotPlan> {
+fn one_hot_plan_inner(
+    graph: &Graph,
+    input: NodeId,
+    classes: usize,
+    numeric: bool,
+) -> Result<OneHotPlan> {
     let source = graph.node(input)?;
     let input_shape = source.shape.clone();
     let input_dtype = source.dtype;
@@ -338,8 +373,13 @@ fn one_hot_plan_inner(graph: &Graph, input: NodeId, classes: usize, numeric: boo
         extent(zero.shape(), zero.dtype())?;
         if output_shape.broadcast_with(one.shape())? != output_shape
             || output_shape.broadcast_with(zero.shape())? != output_shape
-            || one.dtype() != DType::I32 || zero.dtype() != DType::I32 {
-            return Err(Error::InvalidElementwiseDType { op: "one_hot value commitment", actual: DType::I32 });
+            || one.dtype() != DType::I32
+            || zero.dtype() != DType::I32
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "one_hot value commitment",
+                actual: DType::I32,
+            });
         }
         extent(&output_shape, DType::I32)?;
     }
@@ -479,10 +519,17 @@ mod tests {
             op: crate::BinaryOp::Add,
             lhs,
             rhs,
-        } = graph.op(positive).unwrap() else {
+        } = graph.op(positive).unwrap()
+        else {
             panic!("expected cumulative range offset Add");
         };
-        assert!(matches!(graph.op(*lhs).unwrap(), Op::Reduce { kind: crate::ReduceKind::Sum, .. }));
+        assert!(matches!(
+            graph.op(*lhs).unwrap(),
+            Op::Reduce {
+                kind: crate::ReduceKind::Sum,
+                ..
+            }
+        ));
         assert!(matches!(graph.op(*rhs).unwrap(), Op::Constant(data) if data.len() == 1));
 
         let negative = graph.lazy_arange_with_dtype(5, -2, -3, DType::I64).unwrap();
@@ -497,7 +544,9 @@ mod tests {
         assert_eq!(graph.dtype(default_i32).unwrap(), DType::I32);
         assert_eq!(graph.dtype(default_i64).unwrap(), DType::I64);
 
-        let empty = graph.lazy_full_with_dtype([0], Scalar::F(1.0), DType::F64).unwrap();
+        let empty = graph
+            .lazy_full_with_dtype([0], Scalar::F(1.0), DType::F64)
+            .unwrap();
         let empty_range = graph.lazy_arange_with_dtype(0, 0, 1, DType::I32).unwrap();
         assert_eq!(graph.shape(empty).unwrap(), &Shape::from([0]));
         assert_eq!(graph.shape(empty_range).unwrap(), &Shape::from([0]));
@@ -516,13 +565,21 @@ mod tests {
             DType::F32,
             DType::F64,
         ] {
-            let filled = graph.lazy_full_with_dtype([0], Scalar::I(1), dtype).unwrap();
+            let filled = graph
+                .lazy_full_with_dtype([0], Scalar::I(1), dtype)
+                .unwrap();
             assert_eq!(graph.dtype(filled).unwrap(), dtype);
         }
-        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
-            Op::Constant(data) => Some(data.len()),
-            _ => None,
-        }).all(|len| len == 1));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|len| len == 1)
+        );
 
         let mut invalid = Graph::new();
         let before = invalid.node_count();
@@ -546,16 +603,24 @@ mod tests {
     #[test]
     fn full_tinygrad_commits_python_scalars_and_preserves_buffer_boundary() {
         let mut graph = Graph::new();
-        let inferred_bool = graph.full_tinygrad([2], Scalar::Bool(true), None, true).unwrap();
+        let inferred_bool = graph
+            .full_tinygrad([2], Scalar::Bool(true), None, true)
+            .unwrap();
         let inferred_int = graph.full_tinygrad([2], Scalar::I(-7), None, true).unwrap();
-        let inferred_uint = graph.full_tinygrad([1], Scalar::U(u64::MAX), None, true).unwrap();
-        let inferred_float = graph.full_tinygrad([2], Scalar::F(1.5), None, true).unwrap();
+        let inferred_uint = graph
+            .full_tinygrad([1], Scalar::U(u64::MAX), None, true)
+            .unwrap();
+        let inferred_float = graph
+            .full_tinygrad([2], Scalar::F(1.5), None, true)
+            .unwrap();
         assert_eq!(graph.dtype(inferred_bool).unwrap(), DType::Bool);
         assert_eq!(graph.dtype(inferred_int).unwrap(), DType::I32);
         assert_eq!(graph.dtype(inferred_uint).unwrap(), DType::I32);
         assert_eq!(graph.dtype(inferred_float).unwrap(), DType::F32);
-        assert!(matches!(graph.op(inferred_uint).unwrap(), Op::Constant(data)
-            if matches!(data.scalar_at(0), Scalar::I(-1))));
+        assert!(
+            matches!(graph.op(inferred_uint).unwrap(), Op::Constant(data)
+            if matches!(data.scalar_at(0), Scalar::I(-1)))
+        );
 
         for dtype in [
             DType::Bool,
@@ -572,22 +637,38 @@ mod tests {
             DType::F32,
             DType::F64,
         ] {
-            let output = graph.full_tinygrad([0, 3], Scalar::I(-1), Some(dtype), true).unwrap();
+            let output = graph
+                .full_tinygrad([0, 3], Scalar::I(-1), Some(dtype), true)
+                .unwrap();
             assert_eq!(graph.dtype(output).unwrap(), dtype);
             assert!(matches!(graph.op(output).unwrap(), Op::Constant(data) if data.len() == 0));
         }
 
-        let dense = graph.full_tinygrad([2, 3], Scalar::I(9), Some(DType::I16), true).unwrap();
-        let lazy = graph.full_tinygrad([2, 3], Scalar::I(9), Some(DType::I16), false).unwrap();
+        let dense = graph
+            .full_tinygrad([2, 3], Scalar::I(9), Some(DType::I16), true)
+            .unwrap();
+        let lazy = graph
+            .full_tinygrad([2, 3], Scalar::I(9), Some(DType::I16), false)
+            .unwrap();
         assert!(matches!(graph.op(dense).unwrap(), Op::Constant(data) if data.len() == 6));
-        let Op::Expand { input: lazy_scalar, .. } = graph.op(lazy).unwrap() else {
+        let Op::Expand {
+            input: lazy_scalar, ..
+        } = graph.op(lazy).unwrap()
+        else {
             panic!("expected buffer=False scalar Expand");
         };
         assert!(matches!(graph.op(*lazy_scalar).unwrap(), Op::Constant(data) if data.len() == 1));
 
-        let signed_zero = graph.full_tinygrad([1], Scalar::F(-0.0), Some(DType::F32), false).unwrap();
-        let nan = graph.full_tinygrad([1], Scalar::F(f64::NAN), Some(DType::F16), false).unwrap();
-        let Op::Expand { input: signed_zero, .. } = graph.op(signed_zero).unwrap() else {
+        let signed_zero = graph
+            .full_tinygrad([1], Scalar::F(-0.0), Some(DType::F32), false)
+            .unwrap();
+        let nan = graph
+            .full_tinygrad([1], Scalar::F(f64::NAN), Some(DType::F16), false)
+            .unwrap();
+        let Op::Expand {
+            input: signed_zero, ..
+        } = graph.op(signed_zero).unwrap()
+        else {
             panic!("expected scalar signed-zero Expand");
         };
         let Op::Expand { input: nan, .. } = graph.op(nan).unwrap() else {
@@ -598,7 +679,9 @@ mod tests {
         assert!(matches!(graph.op(*nan).unwrap(), Op::Constant(data)
             if data.scalar_at(0).as_f64().is_nan()));
 
-        let scalar = graph.full_tinygrad([], Scalar::F(f64::INFINITY), None, false).unwrap();
+        let scalar = graph
+            .full_tinygrad([], Scalar::F(f64::INFINITY), None, false)
+            .unwrap();
         assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
         assert!(matches!(graph.op(scalar).unwrap(), Op::Constant(data) if data.len() == 1));
 
@@ -638,11 +721,17 @@ mod tests {
         assert_eq!(graph.dtype(inherited_one).unwrap(), DType::BF16);
         assert!(!graph.node(inherited).unwrap().requires_grad);
         assert!(matches!(graph.op(override_dtype).unwrap(), Op::Constant(data) if data.len() == 0));
-        let Op::Expand { input: inherited_scalar, .. } = graph.op(inherited).unwrap() else {
+        let Op::Expand {
+            input: inherited_scalar,
+            ..
+        } = graph.op(inherited).unwrap()
+        else {
             panic!("expected scalar-backed full_like");
         };
-        assert!(matches!(graph.op(*inherited_scalar).unwrap(), Op::Constant(data)
-            if data.len() == 1 && data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits()));
+        assert!(
+            matches!(graph.op(*inherited_scalar).unwrap(), Op::Constant(data)
+            if data.len() == 1 && data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits())
+        );
 
         for dtype in [
             DType::Bool,
@@ -665,7 +754,12 @@ mod tests {
 
         let scalar_receiver = graph.input_dtype("scalar", [], DType::I16);
         let scalar = graph
-            .full_like_tinygrad(scalar_receiver, Scalar::F(f64::NAN), Some(DType::F16), false)
+            .full_like_tinygrad(
+                scalar_receiver,
+                Scalar::F(f64::NAN),
+                Some(DType::F16),
+                false,
+            )
             .unwrap();
         assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
         assert!(matches!(graph.op(scalar).unwrap(), Op::Constant(data)
@@ -678,7 +772,8 @@ mod tests {
             Err(Error::UnknownNode(_))
         ));
         assert_eq!(malformed.node_count(), before);
-        let source_overflow = malformed.input_dtype("source_overflow", [usize::MAX, 2], DType::Bool);
+        let source_overflow =
+            malformed.input_dtype("source_overflow", [usize::MAX, 2], DType::Bool);
         let before = malformed.node_count();
         assert!(matches!(
             malformed.ones_like_tinygrad(source_overflow, Some(DType::Bool), false),
@@ -699,9 +794,13 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input_dtype_requires_grad("x", [2, 0, 3], DType::F32, true);
         let default = graph.const_like(input, Scalar::F(-0.0), None).unwrap();
-        let override_nan = graph.const_like(input, Scalar::F(f64::NAN), Some(DType::F16)).unwrap();
+        let override_nan = graph
+            .const_like(input, Scalar::F(f64::NAN), Some(DType::F16))
+            .unwrap();
         let scalar_input = graph.input_dtype("s", [], DType::I16);
-        let scalar = graph.const_like(scalar_input, Scalar::U(u64::MAX), Some(DType::U64)).unwrap();
+        let scalar = graph
+            .const_like(scalar_input, Scalar::U(u64::MAX), Some(DType::U64))
+            .unwrap();
         assert_eq!(graph.shape(default).unwrap(), &Shape::from([2, 0, 3]));
         assert_eq!(graph.dtype(default).unwrap(), DType::F32);
         assert_eq!(graph.dtype(override_nan).unwrap(), DType::F16);
@@ -797,7 +896,9 @@ mod tests {
     fn uniform_implicit_is_source_f32_rand_mul_cast_add_and_preflighted() {
         Graph::manual_seed(42);
         let mut graph = Graph::new();
-        let output = graph.uniform_implicit([2, 3], -2.0, 5.0, DType::F16).unwrap();
+        let output = graph
+            .uniform_implicit([2, 3], -2.0, 5.0, DType::F16)
+            .unwrap();
         let default = graph.uniform_default([]).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
         assert_eq!(graph.dtype(output).unwrap(), DType::F16);
@@ -806,18 +907,36 @@ mod tests {
 
         // The requested F16 cast sits between source-default-F32 Mul and the
         // final weak-low Add. It must not be replaced with one ranged Random.
-        let Op::Binary { op: crate::BinaryOp::Add, lhs: cast, .. } = graph.op(output).unwrap() else {
+        let Op::Binary {
+            op: crate::BinaryOp::Add,
+            lhs: cast,
+            ..
+        } = graph.op(output).unwrap()
+        else {
             panic!("expected final source low Add");
         };
-        let Op::Cast { input: multiply, dtype: DType::F16 } = graph.op(*cast).unwrap() else {
+        let Op::Cast {
+            input: multiply,
+            dtype: DType::F16,
+        } = graph.op(*cast).unwrap()
+        else {
             panic!("expected requested dtype cast after source Mul");
         };
-        let Op::Binary { op: crate::BinaryOp::Mul, lhs: scale, rhs: random } = graph.op(*multiply).unwrap() else {
+        let Op::Binary {
+            op: crate::BinaryOp::Mul,
+            lhs: scale,
+            rhs: random,
+        } = graph.op(*multiply).unwrap()
+        else {
             panic!("expected scalar-left source scale Mul");
         };
         assert!(matches!(graph.op(*scale).unwrap(), Op::Constant(data)
             if data.shape() == &Shape::new([]) && data.dtype() == DType::F32));
-        let Op::Random { kind: RandomKind::Uniform { low, high }, .. } = graph.op(*random).unwrap() else {
+        let Op::Random {
+            kind: RandomKind::Uniform { low, high },
+            ..
+        } = graph.op(*random).unwrap()
+        else {
             panic!("expected source unit random stream");
         };
         assert_eq!((*low, *high), (0.0, 1.0));
@@ -826,14 +945,24 @@ mod tests {
         // The literal ordered source validation admits NaN bounds because
         // Python's `nan >= high` is false; an integer cast is subsequently
         // lifted by the weak float `low` Add to source-default F32.
-        let nonfinite = graph.uniform_implicit([0], f64::NAN, 1.0, DType::I16).unwrap();
+        let nonfinite = graph
+            .uniform_implicit([0], f64::NAN, 1.0, DType::I16)
+            .unwrap();
         assert_eq!(graph.dtype(nonfinite).unwrap(), DType::F32);
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
-        assert!(malformed.uniform_implicit([2], 1.0, 1.0, DType::F32).is_err());
+        assert!(
+            malformed
+                .uniform_implicit([2], 1.0, 1.0, DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed.uniform_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64).is_err());
+        assert!(
+            malformed
+                .uniform_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -841,7 +970,9 @@ mod tests {
     fn normal_implicit_is_source_randn_mul_add_and_preflighted() {
         Graph::manual_seed(17);
         let mut graph = Graph::new();
-        let output = graph.normal_implicit([2, 3], 4.0, 0.5, DType::BF16).unwrap();
+        let output = graph
+            .normal_implicit([2, 3], 4.0, 0.5, DType::BF16)
+            .unwrap();
         let default = graph.normal_default([]).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
         assert_eq!(graph.dtype(output).unwrap(), DType::BF16);
@@ -850,18 +981,36 @@ mod tests {
 
         // Source applies the requested randn cast before scalar-left std Mul,
         // then applies mean through a second weak-scalar Add.
-        let Op::Binary { op: crate::BinaryOp::Add, lhs: multiply, .. } = graph.op(output).unwrap() else {
+        let Op::Binary {
+            op: crate::BinaryOp::Add,
+            lhs: multiply,
+            ..
+        } = graph.op(output).unwrap()
+        else {
             panic!("expected final source mean Add");
         };
-        let Op::Binary { op: crate::BinaryOp::Mul, lhs: std, rhs: cast } = graph.op(*multiply).unwrap() else {
+        let Op::Binary {
+            op: crate::BinaryOp::Mul,
+            lhs: std,
+            rhs: cast,
+        } = graph.op(*multiply).unwrap()
+        else {
             panic!("expected scalar-left source std Mul");
         };
         assert!(matches!(graph.op(*std).unwrap(), Op::Constant(data)
             if data.shape() == &Shape::new([]) && data.dtype() == DType::BF16));
-        let Op::Cast { input: random, dtype: DType::BF16 } = graph.op(*cast).unwrap() else {
+        let Op::Cast {
+            input: random,
+            dtype: DType::BF16,
+        } = graph.op(*cast).unwrap()
+        else {
             panic!("expected requested randn storage cast");
         };
-        let Op::Random { kind: RandomKind::Normal { mean, std }, .. } = graph.op(*random).unwrap() else {
+        let Op::Random {
+            kind: RandomKind::Normal { mean, std },
+            ..
+        } = graph.op(*random).unwrap()
+        else {
             panic!("expected source standard-normal stream");
         };
         assert_eq!((*mean, *std), (0.0, 1.0));
@@ -869,14 +1018,24 @@ mod tests {
 
         // Source's ordered `std < 0` test admits NaN, and an integer randn
         // cast is lifted by a weak floating mean only at the final Add.
-        let nonfinite = graph.normal_implicit([0], f64::NAN, f64::NAN, DType::I16).unwrap();
+        let nonfinite = graph
+            .normal_implicit([0], f64::NAN, f64::NAN, DType::I16)
+            .unwrap();
         assert_eq!(graph.dtype(nonfinite).unwrap(), DType::F32);
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
-        assert!(malformed.normal_implicit([2], 0.0, -0.5, DType::F32).is_err());
+        assert!(
+            malformed
+                .normal_implicit([2], 0.0, -0.5, DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed.normal_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64).is_err());
+        assert!(
+            malformed
+                .normal_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -895,15 +1054,6 @@ mod tests {
         assert!(matches!(graph.op(uniform).unwrap(), Op::Random {
             kind: RandomKind::Uniform { low, high }, ..
         } if *low == 0.0 && *high == 1.0));
-        let Op::Random { stream: first_uniform, .. } = graph.op(uniform).unwrap() else {
-            panic!("expected source unit random stream");
-        };
-        let Op::Random { stream: second_uniform, .. } = graph.op(uniform_override).unwrap() else {
-            panic!("expected source override random stream");
-        };
-        // Empty receiver shapes reserve zero words, so both uniform nodes keep
-        // the same captured starting counter.
-        assert_eq!(first_uniform.counter, second_uniform.counter);
         assert!(matches!(graph.op(normal).unwrap(), Op::Random {
             kind: RandomKind::Normal { mean, std }, ..
         } if *mean == 0.0 && *std == 1.0));
@@ -926,7 +1076,9 @@ mod tests {
         let integers = graph.input_dtype("integers", [2], DType::I64);
 
         let uniform = graph.rand_like_implicit(receiver, None).unwrap();
-        let uniform_override = graph.rand_like_implicit(receiver, Some(DType::F64)).unwrap();
+        let uniform_override = graph
+            .rand_like_implicit(receiver, Some(DType::F64))
+            .unwrap();
         assert_eq!(graph.shape(uniform).unwrap(), &Shape::from([2, 0, 3]));
         assert_eq!(graph.dtype(uniform).unwrap(), DType::F16);
         assert_eq!(graph.dtype(uniform_override).unwrap(), DType::F64);
@@ -936,24 +1088,53 @@ mod tests {
         } if *low == 0.0 && *high == 1.0));
 
         let normal = graph.randn_like_implicit(integers, None).unwrap();
-        let normal_override = graph.randn_like_implicit(receiver, Some(DType::Bool)).unwrap();
+        let normal_override = graph
+            .randn_like_implicit(receiver, Some(DType::Bool))
+            .unwrap();
         assert_eq!(graph.dtype(normal).unwrap(), DType::I64);
         assert_eq!(graph.dtype(normal_override).unwrap(), DType::Bool);
-        assert!(matches!(graph.op(normal).unwrap(), Op::Cast { dtype: DType::I64, .. }));
-        assert!(matches!(graph.op(normal_override).unwrap(), Op::Cast { dtype: DType::Bool, .. }));
-        let Op::Cast { input: standard, .. } = graph.op(normal).unwrap() else {
+        assert!(matches!(
+            graph.op(normal).unwrap(),
+            Op::Cast {
+                dtype: DType::I64,
+                ..
+            }
+        ));
+        assert!(matches!(
+            graph.op(normal_override).unwrap(),
+            Op::Cast {
+                dtype: DType::Bool,
+                ..
+            }
+        ));
+        let Op::Cast {
+            input: standard, ..
+        } = graph.op(normal).unwrap()
+        else {
             panic!("expected source F32 randn_like cast");
         };
         assert!(matches!(graph.op(*standard).unwrap(), Op::Random {
             kind: RandomKind::Normal { mean, std }, ..
         } if *mean == 0.0 && *std == 1.0));
-        let Op::Random { stream: first_normal, .. } = graph.op(*standard).unwrap() else {
+        let Op::Random {
+            stream: first_normal,
+            ..
+        } = graph.op(*standard).unwrap()
+        else {
             panic!("expected source F32 normal stream");
         };
-        let Op::Cast { input: second_standard, .. } = graph.op(normal_override).unwrap() else {
+        let Op::Cast {
+            input: second_standard,
+            ..
+        } = graph.op(normal_override).unwrap()
+        else {
             panic!("expected source override normal cast");
         };
-        let Op::Random { stream: second_normal, .. } = graph.op(*second_standard).unwrap() else {
+        let Op::Random {
+            stream: second_normal,
+            ..
+        } = graph.op(*second_standard).unwrap()
+        else {
             panic!("expected source override normal stream");
         };
         // Two F32 words per nonempty element are reserved in source order.
@@ -995,18 +1176,34 @@ mod tests {
         let without_replacement = graph.multinomial(matrix, 2, false).unwrap();
         assert_eq!(graph.shape(replacement).unwrap(), &Shape::from([3]));
         assert_eq!(graph.shape(single).unwrap(), &Shape::from([2, 1]));
-        assert_eq!(graph.shape(without_replacement).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(
+            graph.shape(without_replacement).unwrap(),
+            &Shape::from([2, 2])
+        );
         assert_eq!(graph.dtype(replacement).unwrap(), DType::I32);
         assert!(!graph.node(replacement).unwrap().requires_grad);
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Random {
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Random {
             kind: RandomKind::Uniform { low, high }, ..
-        } if *low == 0.0 && *high == 1.0)));
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Unary {
-            op: crate::UnaryOp::Log2, ..
-        })));
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Sort {
-            output: crate::SortOutput::Indices, ..
-        })));
+        } if *low == 0.0 && *high == 1.0))
+        );
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            Op::Unary {
+                op: crate::UnaryOp::Log2,
+                ..
+            }
+        )));
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            Op::Sort {
+                output: crate::SortOutput::Indices,
+                ..
+            }
+        )));
 
         let mut malformed = Graph::new();
         let weights = malformed.input_dtype("weights", [2, 3], DType::F32);
@@ -1026,7 +1223,10 @@ mod tests {
         assert_eq!(malformed.node_count(), before_empty);
         let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F32);
         let overflow_before = malformed.node_count();
-        assert!(matches!(malformed.multinomial(overflow, 1, true), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            malformed.multinomial(overflow, 1, true),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(malformed.node_count(), overflow_before);
     }
 
@@ -1047,11 +1247,22 @@ mod tests {
         assert!(!graph.node(output).unwrap().requires_grad);
         // The root is inherited literally from `uniform`: a weak lower-bound
         // Add over its separately visible unit-random scaling chain.
-        assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: crate::BinaryOp::Add, .. }));
-        assert!((0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
-            Op::Random { kind: RandomKind::Uniform { low, high }, .. } => *low == 0.0 && *high == 1.0,
-            _ => false,
-        }));
+        assert!(matches!(
+            graph.op(output).unwrap(),
+            Op::Binary {
+                op: crate::BinaryOp::Add,
+                ..
+            }
+        ));
+        assert!(
+            (0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
+                Op::Random {
+                    kind: RandomKind::Uniform { low, high },
+                    ..
+                } => *low == 0.0 && *high == 1.0,
+                _ => false,
+            })
+        );
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
@@ -1059,9 +1270,17 @@ mod tests {
         assert_eq!(malformed.node_count(), before);
         // rank-two zero shape has `fan_in + prod(fan_out) == 0`, whose Python
         // `6 / 0` fails before source uniform can reserve a stream.
-        assert!(malformed.glorot_uniform_implicit([0, 0], DType::F32).is_err());
+        assert!(
+            malformed
+                .glorot_uniform_implicit([0, 0], DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed.glorot_uniform_implicit([usize::MAX, 1], DType::F32).is_err());
+        assert!(
+            malformed
+                .glorot_uniform_implicit([usize::MAX, 1], DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -1071,30 +1290,57 @@ mod tests {
         let mut graph = Graph::new();
         // Unlike the old seeded compatibility API, source Kaiming permits a
         // scalar: `prod(shape[1:])` is Python's empty-product identity.
-        let scalar = graph.kaiming_uniform_implicit([], 0.25, DType::F16).unwrap();
+        let scalar = graph
+            .kaiming_uniform_implicit([], 0.25, DType::F16)
+            .unwrap();
         let rank_one_empty = graph.kaiming_uniform_default_a([0], DType::F64).unwrap();
         let default = graph.kaiming_uniform_default([2, 3]).unwrap();
-        let lifted_integer = graph.kaiming_uniform_implicit([1], f64::NAN, DType::I16).unwrap();
+        let lifted_integer = graph
+            .kaiming_uniform_implicit([1], f64::NAN, DType::I16)
+            .unwrap();
         assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
         assert_eq!(graph.shape(rank_one_empty).unwrap(), &Shape::from([0]));
         assert_eq!(graph.dtype(default).unwrap(), DType::F32);
         assert_eq!(graph.dtype(lifted_integer).unwrap(), DType::F32);
         assert!(!graph.node(scalar).unwrap().requires_grad);
-        assert!(matches!(graph.op(scalar).unwrap(), Op::Binary { op: crate::BinaryOp::Add, .. }));
-        assert!((0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
-            Op::Random { kind: RandomKind::Uniform { low, high }, .. } => *low == 0.0 && *high == 1.0,
-            _ => false,
-        }));
+        assert!(matches!(
+            graph.op(scalar).unwrap(),
+            Op::Binary {
+                op: crate::BinaryOp::Add,
+                ..
+            }
+        ));
+        assert!(
+            (0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
+                Op::Random {
+                    kind: RandomKind::Uniform { low, high },
+                    ..
+                } => *low == 0.0 && *high == 1.0,
+                _ => false,
+            })
+        );
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
         // A zero tail fan and a zero bound from infinite `a` both make source
         // uniform reject before it can reserve a captured stream.
-        assert!(malformed.kaiming_uniform_implicit([2, 0], 0.01, DType::F32).is_err());
+        assert!(
+            malformed
+                .kaiming_uniform_implicit([2, 0], 0.01, DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed.kaiming_uniform_implicit([2], f64::INFINITY, DType::F32).is_err());
+        assert!(
+            malformed
+                .kaiming_uniform_implicit([2], f64::INFINITY, DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed.kaiming_uniform_implicit([1, usize::MAX, 2], 0.01, DType::F32).is_err());
+        assert!(
+            malformed
+                .kaiming_uniform_implicit([1, usize::MAX, 2], 0.01, DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -1106,33 +1352,65 @@ mod tests {
         let scalar = graph.kaiming_normal_implicit([], 0.25, DType::F16).unwrap();
         let rank_one_empty = graph.kaiming_normal_default_a([0], DType::F64).unwrap();
         let default = graph.kaiming_normal_default([2, 3]).unwrap();
-        let lifted_integer = graph.kaiming_normal_implicit([1], f64::NAN, DType::I16).unwrap();
+        let lifted_integer = graph
+            .kaiming_normal_implicit([1], f64::NAN, DType::I16)
+            .unwrap();
         // Unlike Uniform, a zero Normal std is valid: infinite `a` still
         // invokes source Normal and therefore its ambient two-word stream.
-        let zero_std = graph.kaiming_normal_implicit([1], f64::INFINITY, DType::F32).unwrap();
+        let zero_std = graph
+            .kaiming_normal_implicit([1], f64::INFINITY, DType::F32)
+            .unwrap();
         assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
         assert_eq!(graph.shape(rank_one_empty).unwrap(), &Shape::from([0]));
         assert_eq!(graph.dtype(default).unwrap(), DType::F32);
         assert_eq!(graph.dtype(lifted_integer).unwrap(), DType::F32);
         assert!(!graph.node(scalar).unwrap().requires_grad);
 
-        let Op::Binary { op: crate::BinaryOp::Add, lhs: multiply, .. } = graph.op(scalar).unwrap() else {
+        let Op::Binary {
+            op: crate::BinaryOp::Add,
+            lhs: multiply,
+            ..
+        } = graph.op(scalar).unwrap()
+        else {
             panic!("expected source mean Add");
         };
-        let Op::Binary { op: crate::BinaryOp::Mul, .. } = graph.op(*multiply).unwrap() else {
+        let Op::Binary {
+            op: crate::BinaryOp::Mul,
+            ..
+        } = graph.op(*multiply).unwrap()
+        else {
             panic!("expected source scalar-left std Mul");
         };
-        assert!((0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
-            Op::Random { kind: RandomKind::Normal { mean, std }, .. } => *mean == 0.0 && *std == 1.0,
-            _ => false,
-        }));
-        assert!(matches!(graph.op(zero_std).unwrap(), Op::Binary { op: crate::BinaryOp::Add, .. }));
+        assert!(
+            (0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
+                Op::Random {
+                    kind: RandomKind::Normal { mean, std },
+                    ..
+                } => *mean == 0.0 && *std == 1.0,
+                _ => false,
+            })
+        );
+        assert!(matches!(
+            graph.op(zero_std).unwrap(),
+            Op::Binary {
+                op: crate::BinaryOp::Add,
+                ..
+            }
+        ));
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
-        assert!(malformed.kaiming_normal_implicit([2, 0], 0.01, DType::F32).is_err());
+        assert!(
+            malformed
+                .kaiming_normal_implicit([2, 0], 0.01, DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed.kaiming_normal_implicit([1, usize::MAX, 2], 0.01, DType::F32).is_err());
+        assert!(
+            malformed
+                .kaiming_normal_implicit([1, usize::MAX, 2], 0.01, DType::F32)
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -1155,12 +1433,26 @@ mod tests {
         // I32 is tinygrad cast's identity, whereas alternate target storage
         // remains a visible cast after the stable source argsort.
         assert!(matches!(graph.op(default).unwrap(), Op::Sort { .. }));
-        assert!(matches!(graph.op(boolean).unwrap(), Op::Cast { dtype: DType::Bool, .. }));
-        assert!((0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
-            Op::Random { kind: RandomKind::Uniform { low, high }, .. } => *low == 0.0 && *high == 1.0,
-            _ => false,
-        }));
-        assert!((0..graph.node_count()).all(|index| !matches!(graph.op(NodeId(index)).unwrap(), Op::RandomPermutation { .. })));
+        assert!(matches!(
+            graph.op(boolean).unwrap(),
+            Op::Cast {
+                dtype: DType::Bool,
+                ..
+            }
+        ));
+        assert!(
+            (0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
+                Op::Random {
+                    kind: RandomKind::Uniform { low, high },
+                    ..
+                } => *low == 0.0 && *high == 1.0,
+                _ => false,
+            })
+        );
+        assert!((0..graph.node_count()).all(|index| !matches!(
+            graph.op(NodeId(index)).unwrap(),
+            Op::RandomPermutation { .. }
+        )));
 
         let mut malformed = Graph::new();
         let before = malformed.node_count();
@@ -1181,33 +1473,96 @@ mod tests {
         assert_eq!(graph.shape(singleton).unwrap(), &Shape::new([1]));
         assert_eq!(graph.dtype(line).unwrap(), DType::BF16);
         assert_eq!(graph.dtype(default).unwrap(), DType::F32);
-        assert!((0..graph.node_count()).any(|n| matches!(graph.op(NodeId(n)).unwrap(), Op::Reduce { kind: crate::ReduceKind::Sum, .. })));
-        assert!(graph.nodes.iter().filter_map(|node| match &node.op { Op::Constant(data)=>Some(data.len()), _=>None }).all(|len| len==1));
+        assert!((0..graph.node_count()).any(|n| matches!(
+            graph.op(NodeId(n)).unwrap(),
+            Op::Reduce {
+                kind: crate::ReduceKind::Sum,
+                ..
+            }
+        )));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|len| len == 1)
+        );
 
-        for dtype in [DType::F32,DType::F16,DType::BF16,DType::F64,DType::I8,DType::U8,DType::I64,DType::U64] {
-            let mut typed=Graph::new(); let output=typed.linspace(0.0,1.0,2,dtype).unwrap(); assert_eq!(typed.dtype(output).unwrap(),dtype);
+        for dtype in [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::F64,
+            DType::I8,
+            DType::U8,
+            DType::I64,
+            DType::U64,
+        ] {
+            let mut typed = Graph::new();
+            let output = typed.linspace(0.0, 1.0, 2, dtype).unwrap();
+            assert_eq!(typed.dtype(output).unwrap(), dtype);
         }
-        let mut invalid=Graph::new(); let before=invalid.node_count();
-        assert!(invalid.linspace(0.0,1.0,-1,DType::F32).is_err());
-        assert!(invalid.linspace(0.0,1.0,2,DType::Bool).is_err()); assert_eq!(invalid.node_count(),before);
-        let mut overflow=Graph::new(); let before=overflow.node_count();
-        assert!(overflow.linspace(0.0,1.0,isize::MAX,DType::F64).is_err()); assert_eq!(overflow.node_count(),before);
+        let mut invalid = Graph::new();
+        let before = invalid.node_count();
+        assert!(invalid.linspace(0.0, 1.0, -1, DType::F32).is_err());
+        assert!(invalid.linspace(0.0, 1.0, 2, DType::Bool).is_err());
+        assert_eq!(invalid.node_count(), before);
+        let mut overflow = Graph::new();
+        let before = overflow.node_count();
+        assert!(overflow.linspace(0.0, 1.0, isize::MAX, DType::F64).is_err());
+        assert_eq!(overflow.node_count(), before);
     }
 
     #[test]
     fn eye_is_lazy_range_equality_and_preflighted() {
-        let mut graph=Graph::new();
-        let square=graph.eye_default(3,None).unwrap();
-        let rectangular=graph.eye(2,Some(4),DType::I16).unwrap();
-        let empty=graph.eye(0,Some(3),DType::F64).unwrap();
-        assert_eq!(graph.shape(square).unwrap(),&Shape::new([3,3]));
-        assert_eq!(graph.dtype(square).unwrap(),DType::F32);
-        assert_eq!(graph.shape(rectangular).unwrap(),&Shape::new([2,4]));
-        assert_eq!(graph.shape(empty).unwrap(),&Shape::new([0,3]));
-        assert!((0..graph.node_count()).any(|n|matches!(graph.op(NodeId(n)).unwrap(),Op::Logical{..})));
-        assert!(graph.nodes.iter().filter_map(|node|match &node.op{Op::Constant(data)=>Some(data.len()),_=>None}).all(|len|len==1));
-        for dtype in [DType::Bool,DType::I8,DType::U8,DType::I16,DType::U16,DType::I32,DType::U32,DType::I64,DType::U64,DType::F16,DType::BF16,DType::F32,DType::F64] { let mut typed=Graph::new();let eye=typed.eye(1,None,dtype).unwrap();assert_eq!(typed.dtype(eye).unwrap(),dtype); }
-        let mut overflow=Graph::new();let before=overflow.node_count();assert!(overflow.eye(usize::MAX,Some(2),DType::F64).is_err());assert_eq!(overflow.node_count(),before);
+        let mut graph = Graph::new();
+        let square = graph.eye_default(3, None).unwrap();
+        let rectangular = graph.eye(2, Some(4), DType::I16).unwrap();
+        let empty = graph.eye(0, Some(3), DType::F64).unwrap();
+        assert_eq!(graph.shape(square).unwrap(), &Shape::new([3, 3]));
+        assert_eq!(graph.dtype(square).unwrap(), DType::F32);
+        assert_eq!(graph.shape(rectangular).unwrap(), &Shape::new([2, 4]));
+        assert_eq!(graph.shape(empty).unwrap(), &Shape::new([0, 3]));
+        assert!(
+            (0..graph.node_count())
+                .any(|n| matches!(graph.op(NodeId(n)).unwrap(), Op::Logical { .. }))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|len| len == 1)
+        );
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let mut typed = Graph::new();
+            let eye = typed.eye(1, None, dtype).unwrap();
+            assert_eq!(typed.dtype(eye).unwrap(), dtype);
+        }
+        let mut overflow = Graph::new();
+        let before = overflow.node_count();
+        assert!(overflow.eye(usize::MAX, Some(2), DType::F64).is_err());
+        assert_eq!(overflow.node_count(), before);
     }
 
     #[test]
@@ -1255,7 +1610,11 @@ mod tests {
                 .iter()
                 .map(|&output| graph.shape(output).unwrap().clone())
                 .collect::<Vec<_>>(),
-            vec![Shape::from([2, 2]), Shape::from([2, 2]), Shape::from([2, 1])]
+            vec![
+                Shape::from([2, 2]),
+                Shape::from([2, 2]),
+                Shape::from([2, 1])
+            ]
         );
         let loss = graph.sum_all(outputs[1]).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
@@ -1282,7 +1641,12 @@ mod tests {
         let output = graph.unfold_tinygrad(input, -1, 2, 2).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 2, 2]));
         assert_eq!(
-            execute(&graph, output, TensorData::new([2, 5], (0..10).map(|x| x as f32).collect()).unwrap()).to_vec_f64(),
+            execute(
+                &graph,
+                output,
+                TensorData::new([2, 5], (0..10).map(|x| x as f32).collect()).unwrap()
+            )
+            .to_vec_f64(),
             vec![0., 1., 2., 3., 5., 6., 7., 8.]
         );
         assert!(graph.grad(graph.sum_all(output).unwrap(), input).is_ok());
@@ -1326,8 +1690,16 @@ mod tests {
         // Therefore source returns three views, not five padded empties.
         let outputs = graph.chunk_default(input, 5).unwrap();
         assert_eq!(outputs.len(), 3);
-        assert!(outputs.iter().all(|&output| graph.shape(output).unwrap() == &Shape::from([1])));
-        assert!(outputs.iter().all(|&output| graph.dtype(output).unwrap() == DType::I16));
+        assert!(
+            outputs
+                .iter()
+                .all(|&output| graph.shape(output).unwrap() == &Shape::from([1]))
+        );
+        assert!(
+            outputs
+                .iter()
+                .all(|&output| graph.dtype(output).unwrap() == DType::I16)
+        );
 
         let scalar = graph.input("scalar", []);
         let before_scalar = graph.node_count();
@@ -1394,13 +1766,15 @@ mod tests {
         let input = empty.input_dtype("x", [2, 0], DType::I8);
         let output = empty.tril(input, 0).unwrap();
         assert_eq!(empty.dtype(output).unwrap(), DType::I8);
-        assert!(execute(
-            &empty,
-            output,
-            TensorData::from_scalars([2, 0], DType::I8, []).unwrap(),
-        )
-        .to_vec_f64()
-        .is_empty());
+        assert!(
+            execute(
+                &empty,
+                output,
+                TensorData::from_scalars([2, 0], DType::I8, []).unwrap(),
+            )
+            .to_vec_f64()
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1430,11 +1804,7 @@ mod tests {
         let diagonal = graph.diagonal(input, 1, 0, 1).unwrap();
         let loss = graph.sum_all(diagonal).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
-        let values = TensorData::new(
-            [3, 4],
-            (1..=12).map(|value| value as f32).collect(),
-        )
-        .unwrap();
+        let values = TensorData::new([3, 4], (1..=12).map(|value| value as f32).collect()).unwrap();
         assert_eq!(graph.shape(default_diagonal).unwrap(), &Shape::from([3]));
         assert_eq!(
             execute(&graph, default_diagonal, values.clone()),
@@ -1446,11 +1816,7 @@ mod tests {
         );
         assert_eq!(
             execute(&graph, gradient, values),
-            TensorData::new(
-                [3, 4],
-                vec![0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.],
-            )
-            .unwrap()
+            TensorData::new([3, 4], vec![0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.],).unwrap()
         );
 
         let mut signed = Graph::new();
@@ -1548,17 +1914,21 @@ mod tests {
         let output = empty.diag(input).unwrap();
         assert_eq!(empty.shape(output).unwrap(), &Shape::from([0, 0]));
         assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
-        assert!(empty
-            .nodes
-            .iter()
-            .all(|node| !matches!(&node.op, Op::Pad { .. })));
-        assert!(execute(
-            &empty,
-            output,
-            TensorData::from_scalars([0], DType::BF16, []).unwrap(),
-        )
-        .to_vec_f64()
-        .is_empty());
+        assert!(
+            empty
+                .nodes
+                .iter()
+                .all(|node| !matches!(&node.op, Op::Pad { .. }))
+        );
+        assert!(
+            execute(
+                &empty,
+                output,
+                TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+            )
+            .to_vec_f64()
+            .is_empty()
+        );
 
         let mut invalid = Graph::new();
         let scalar = invalid.input("scalar", []);
@@ -1580,7 +1950,7 @@ mod tests {
     fn roll_matches_tinygrad_signed_shift_axis_dtype_and_vjp_contracts() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 4]);
-        let rolled = graph.roll(input, -1, -1).unwrap();
+        let rolled = graph.roll_axis(input, -1, -1).unwrap();
         let loss = graph.sum_all(rolled).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         let values = TensorData::new([2, 4], (1..=8).map(|value| value as f32).collect()).unwrap();
@@ -1595,14 +1965,18 @@ mod tests {
 
         let mut integer = Graph::new();
         let input = integer.input_dtype("x", [3], DType::I8);
-        let rolled = integer.roll(input, 7, 0).unwrap();
+        let rolled = integer.roll_axis(input, 7, 0).unwrap();
         assert_eq!(integer.dtype(rolled).unwrap(), DType::I8);
         assert_eq!(
             execute(
                 &integer,
                 rolled,
-                TensorData::from_scalars([3], DType::I8, [Scalar::I(1), Scalar::I(2), Scalar::I(3)])
-                    .unwrap(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::I8,
+                    [Scalar::I(1), Scalar::I(2), Scalar::I(3)]
+                )
+                .unwrap(),
             ),
             TensorData::from_scalars([3], DType::I8, [Scalar::I(3), Scalar::I(1), Scalar::I(2)])
                 .unwrap()
@@ -1610,7 +1984,7 @@ mod tests {
 
         let mut empty = Graph::new();
         let input = empty.input("x", [2, 0]);
-        assert_eq!(empty.roll(input, i64::MIN, -1).unwrap(), input);
+        assert_eq!(empty.roll_axis(input, i64::MIN, -1).unwrap(), input);
     }
 
     #[test]
@@ -1701,17 +2075,17 @@ mod tests {
         let mut graph = Graph::new();
         let scalar = graph.input("scalar", []);
         let before = graph.node_count();
-        assert!(graph.roll(scalar, 1, 0).is_err());
+        assert!(graph.roll_axis(scalar, 1, 0).is_err());
         assert_eq!(graph.node_count(), before);
 
         let input = graph.input("input", [2, 3]);
         let before = graph.node_count();
-        assert!(graph.roll(input, 1, 2).is_err());
+        assert!(graph.roll_axis(input, 1, 2).is_err());
         assert_eq!(graph.node_count(), before);
 
         let overflow = graph.input("overflow", [usize::MAX]);
         let before = graph.node_count();
-        assert!(graph.roll(overflow, 1, 0).is_err());
+        assert!(graph.roll_axis(overflow, 1, 0).is_err());
         assert_eq!(graph.node_count(), before);
     }
 
@@ -1770,8 +2144,18 @@ mod tests {
         assert_eq!(graph.shape(tuple).unwrap(), &Shape::new([2, 3]));
         // The source literal is Repeat followed by Shrink, not the legacy
         // one-axis concat shortcut.
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Expand { .. })));
-        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Shrink { .. })));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Expand { .. }))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Shrink { .. }))
+        );
         assert!(graph.grad(graph.sum_all(tuple).unwrap(), input).is_ok());
 
         let tuple_one = graph
@@ -1811,25 +2195,27 @@ mod tests {
         let mut invalid = Graph::new();
         let input = invalid.input("x", [2, 3]);
         let before = invalid.node_count();
-        assert!(invalid
-            .roll_tinygrad(
-                input,
-                RollShifts::Tuple(vec![1, 2]),
-                RollDims::None,
-            )
-            .is_err());
+        assert!(
+            invalid
+                .roll_tinygrad(input, RollShifts::Tuple(vec![1, 2]), RollDims::None,)
+                .is_err()
+        );
         assert_eq!(invalid.node_count(), before);
-        assert!(invalid
-            .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Tuple(vec![]))
-            .is_err());
+        assert!(
+            invalid
+                .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Tuple(vec![]))
+                .is_err()
+        );
         assert_eq!(invalid.node_count(), before);
 
         let mut overflow = Graph::new();
         let input = overflow.input_dtype("x", [usize::MAX / 2 + 1], DType::U8);
         let before = overflow.node_count();
-        assert!(overflow
-            .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Scalar(0))
-            .is_err());
+        assert!(
+            overflow
+                .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Scalar(0))
+                .is_err()
+        );
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -1849,13 +2235,11 @@ mod tests {
         assert_eq!(graph.flatten(input, -2, -2).unwrap(), input);
         let flattened = graph.flatten(input, -3, -2).unwrap();
         assert_eq!(graph.shape(default_flattened).unwrap(), &Shape::from([24]));
-        assert_eq!(
-            graph.shape(flattened).unwrap(),
-            &Shape::from([6, 4])
-        );
+        assert_eq!(graph.shape(flattened).unwrap(), &Shape::from([6, 4]));
         let loss = graph.sum_all(flattened).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
-        let values = TensorData::new([2, 3, 4], (0..24).map(|value| value as f32).collect()).unwrap();
+        let values =
+            TensorData::new([2, 3, 4], (0..24).map(|value| value as f32).collect()).unwrap();
         assert_eq!(
             execute(&graph, default_flattened, values.clone()),
             TensorData::new([24], (0..24).map(|value| value as f32).collect()).unwrap()
@@ -1897,7 +2281,10 @@ mod tests {
         let mut singleton_graph = Graph::new();
         let singleton = singleton_graph.input("x", [2, 1, 3]);
         let squeezed = singleton_graph.squeeze(singleton, Some(-2)).unwrap();
-        assert_eq!(singleton_graph.shape(squeezed).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(
+            singleton_graph.shape(squeezed).unwrap(),
+            &Shape::from([2, 3])
+        );
         let loss = singleton_graph.sum_all(squeezed).unwrap();
         let gradient = singleton_graph.grad(loss, singleton).unwrap();
         let values = TensorData::new([2, 1, 3], vec![1f32; 6]).unwrap();
@@ -1938,7 +2325,11 @@ mod tests {
         let loss = graph.sum_all(unsqueezed).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         assert_eq!(
-            execute(&graph, gradient, TensorData::new([2, 0, 3], Vec::<f32>::new()).unwrap()),
+            execute(
+                &graph,
+                gradient,
+                TensorData::new([2, 0, 3], Vec::<f32>::new()).unwrap()
+            ),
             TensorData::new([2, 0, 3], Vec::<f32>::new()).unwrap()
         );
     }
@@ -1962,7 +2353,10 @@ mod tests {
     fn permute_signed_matches_tinygrad_identity_scalar_and_vjp() {
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("x", [], DType::F16);
-        assert_eq!(scalar.permute_signed(input, Vec::<isize>::new()).unwrap(), input);
+        assert_eq!(
+            scalar.permute_signed(input, Vec::<isize>::new()).unwrap(),
+            input
+        );
 
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 2, 3]);
@@ -2040,11 +2434,16 @@ mod tests {
         let square_transposed = graph.t_tinygrad(square).unwrap();
         let empty_transposed = graph.t_tinygrad(empty).unwrap();
         assert_eq!(graph.shape(transposed).unwrap(), &Shape::from([3, 2]));
-        assert_eq!(graph.shape(square_transposed).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(
+            graph.shape(square_transposed).unwrap(),
+            &Shape::from([2, 2])
+        );
         assert_eq!(graph.shape(empty_transposed).unwrap(), &Shape::from([3, 0]));
         assert_eq!(graph.dtype(empty_transposed).unwrap(), DType::F16);
-        assert!(matches!(graph.op(transposed).unwrap(), Op::Permute { input, axes }
-            if *input == rectangular && axes == &vec![1, 0]));
+        assert!(
+            matches!(graph.op(transposed).unwrap(), Op::Permute { input, axes }
+            if *input == rectangular && axes == &vec![1, 0])
+        );
         let loss = graph.sum_all(transposed).unwrap();
         let gradient = graph.grad(loss, rectangular).unwrap();
         assert_eq!(
@@ -2062,13 +2461,20 @@ mod tests {
             let before = malformed.node_count();
             assert!(matches!(
                 malformed.t_tinygrad(input),
-                Err(Error::InvalidMovementRank { op: "Tensor.T", expected: 2, .. })
+                Err(Error::InvalidMovementRank {
+                    op: "Tensor.T",
+                    expected: 2,
+                    ..
+                })
             ));
             assert_eq!(malformed.node_count(), before);
         }
         let overflow = malformed.input_dtype("overflow", [usize::MAX, 1], DType::F64);
         let before = malformed.node_count();
-        assert!(matches!(malformed.t_tinygrad(overflow), Err(Error::ShapeOverflow(_))));
+        assert!(matches!(
+            malformed.t_tinygrad(overflow),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -2076,7 +2482,9 @@ mod tests {
     fn reshape_with_extents_matches_tinygrad_infer_copy_identity_and_vjp() {
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("x", [], DType::BF16);
-        let reshaped = scalar.reshape_with_extents(input, [ReshapeExtent::Infer]).unwrap();
+        let reshaped = scalar
+            .reshape_with_extents(input, [ReshapeExtent::Infer])
+            .unwrap();
         assert_eq!(scalar.shape(reshaped).unwrap(), &Shape::from([1]));
 
         let mut graph = Graph::new();
@@ -2097,7 +2505,9 @@ mod tests {
         assert_eq!(graph.shape(viewed).unwrap(), &Shape::from([3, 2]));
         assert_eq!(graph.dtype(viewed).unwrap(), DType::F16);
         assert_eq!(
-            graph.view(input, [ReshapeExtent::Copy, ReshapeExtent::Copy]).unwrap(),
+            graph
+                .view(input, [ReshapeExtent::Copy, ReshapeExtent::Copy])
+                .unwrap(),
             input
         );
         let loss = graph.sum_all(reshaped).unwrap();
@@ -2121,29 +2531,46 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("x", [0, 3]);
         let before = graph.node_count();
-        assert!(graph
-            .reshape_with_extents(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
-            .is_err());
+        assert!(
+            graph
+                .reshape_with_extents(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
+                .is_err()
+        );
         assert_eq!(graph.node_count(), before);
-        assert!(graph
-            .reshape_with_extents(input, [ReshapeExtent::Copy, ReshapeExtent::Copy, ReshapeExtent::Copy])
-            .is_err());
+        assert!(
+            graph
+                .reshape_with_extents(
+                    input,
+                    [
+                        ReshapeExtent::Copy,
+                        ReshapeExtent::Copy,
+                        ReshapeExtent::Copy
+                    ]
+                )
+                .is_err()
+        );
         assert_eq!(graph.node_count(), before);
-        assert!(graph
-            .reshape_with_extents(input, [ReshapeExtent::Infer, ReshapeExtent::Infer])
-            .is_err());
+        assert!(
+            graph
+                .reshape_with_extents(input, [ReshapeExtent::Infer, ReshapeExtent::Infer])
+                .is_err()
+        );
         assert_eq!(graph.node_count(), before);
-        assert!(graph
-            .view(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
-            .is_err());
+        assert!(
+            graph
+                .view(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
+                .is_err()
+        );
         assert_eq!(graph.node_count(), before);
 
         let mut overflow = Graph::new();
         let input = overflow.input("x", [usize::MAX, 2]);
         let before = overflow.node_count();
-        assert!(overflow
-            .reshape_with_extents(input, [ReshapeExtent::Infer])
-            .is_err());
+        assert!(
+            overflow
+                .reshape_with_extents(input, [ReshapeExtent::Infer])
+                .is_err()
+        );
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -2172,7 +2599,9 @@ mod tests {
 
         let mut empty = Graph::new();
         let input = empty.input("x", [1, 0]);
-        let expanded = empty.expand_with_extents(input, [ExpandExtent::Exact(2), ExpandExtent::Copy]).unwrap();
+        let expanded = empty
+            .expand_with_extents(input, [ExpandExtent::Exact(2), ExpandExtent::Copy])
+            .unwrap();
         assert_eq!(empty.shape(expanded).unwrap(), &Shape::from([2, 0]));
     }
 
@@ -2187,9 +2616,11 @@ mod tests {
         let mut overflow = Graph::new();
         let input = overflow.input("x", [usize::MAX, 2]);
         let before = overflow.node_count();
-        assert!(overflow
-            .expand_with_extents(input, [ExpandExtent::Copy, ExpandExtent::Copy])
-            .is_err());
+        assert!(
+            overflow
+                .expand_with_extents(input, [ExpandExtent::Copy, ExpandExtent::Copy])
+                .is_err()
+        );
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -2206,10 +2637,7 @@ mod tests {
         let shrunk = graph
             .shrink_with_ranges(
                 input,
-                [
-                    ShrinkRange::Full,
-                    ShrinkRange::Bounds { start: 1, end: 1 },
-                ],
+                [ShrinkRange::Full, ShrinkRange::Bounds { start: 1, end: 1 }],
             )
             .unwrap();
         assert_eq!(graph.shape(shrunk).unwrap(), &Shape::from([2, 0]));
@@ -2227,22 +2655,30 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 3]);
         let before = graph.node_count();
-        assert!(graph.shrink_with_ranges(input, [ShrinkRange::Full]).is_err());
+        assert!(
+            graph
+                .shrink_with_ranges(input, [ShrinkRange::Full])
+                .is_err()
+        );
         assert_eq!(graph.node_count(), before);
-        assert!(graph
-            .shrink_with_ranges(
-                input,
-                [ShrinkRange::Full, ShrinkRange::Bounds { start: 2, end: 4 }],
-            )
-            .is_err());
+        assert!(
+            graph
+                .shrink_with_ranges(
+                    input,
+                    [ShrinkRange::Full, ShrinkRange::Bounds { start: 2, end: 4 }],
+                )
+                .is_err()
+        );
         assert_eq!(graph.node_count(), before);
 
         let mut overflow = Graph::new();
         let input = overflow.input("x", [usize::MAX, 2]);
         let before = overflow.node_count();
-        assert!(overflow
-            .shrink_with_ranges(input, [ShrinkRange::Full, ShrinkRange::Full])
-            .is_err());
+        assert!(
+            overflow
+                .shrink_with_ranges(input, [ShrinkRange::Full, ShrinkRange::Full])
+                .is_err()
+        );
         assert_eq!(overflow.node_count(), before);
     }
 
@@ -2257,7 +2693,10 @@ mod tests {
         assert_eq!(graph.shape(zero).unwrap(), &Shape::from([0, 2]));
         assert_eq!(graph.shrink_to(input, [None, None]).unwrap(), input);
         let loss = graph.sum_all(output).unwrap();
-        assert_eq!(graph.shape(graph.grad(loss, input).unwrap()).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(
+            graph.shape(graph.grad(loss, input).unwrap()).unwrap(),
+            &Shape::from([2, 3])
+        );
 
         let scalar = graph.input("scalar", []);
         assert_eq!(graph.shrink_to(scalar, []).unwrap(), scalar);
@@ -2269,7 +2708,11 @@ mod tests {
         assert_eq!(malformed.node_count(), before);
         assert!(malformed.shrink_to(input, [Some(3), None]).is_err());
         assert_eq!(malformed.node_count(), before);
-        assert!(malformed.shrink_to(NodeId(usize::MAX), [None, None]).is_err());
+        assert!(
+            malformed
+                .shrink_to(NodeId(usize::MAX), [None, None])
+                .is_err()
+        );
         assert_eq!(malformed.node_count(), before);
         let overflow = malformed.input_dtype(
             "overflow",
@@ -2297,8 +2740,14 @@ mod tests {
         let uniform = graph.split(input, SplitSections::Uniform(2), 1).unwrap();
         assert_eq!(default_uniform.len(), 2);
         assert_eq!(default_explicit.len(), 2);
-        assert_eq!(graph.shape(default_uniform[0]).unwrap(), &Shape::from([1, 5]));
-        assert_eq!(graph.shape(default_explicit[1]).unwrap(), &Shape::from([1, 5]));
+        assert_eq!(
+            graph.shape(default_uniform[0]).unwrap(),
+            &Shape::from([1, 5])
+        );
+        assert_eq!(
+            graph.shape(default_explicit[1]).unwrap(),
+            &Shape::from([1, 5])
+        );
         assert_eq!(explicit.len(), 3);
         assert_eq!(uniform.len(), 3);
         assert_eq!(
@@ -2306,7 +2755,11 @@ mod tests {
                 .iter()
                 .map(|&output| graph.shape(output).unwrap().clone())
                 .collect::<Vec<_>>(),
-            vec![Shape::from([2, 1]), Shape::from([2, 3]), Shape::from([2, 1])]
+            vec![
+                Shape::from([2, 1]),
+                Shape::from([2, 3]),
+                Shape::from([2, 1])
+            ]
         );
         let loss = graph.sum_all(explicit[1]).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
@@ -2366,13 +2819,26 @@ mod tests {
                 .iter()
                 .map(|&output| graph.shape(output).unwrap().clone())
                 .collect::<Vec<_>>(),
-            vec![Shape::from([0]), Shape::from([2]), Shape::from([0]), Shape::from([1])]
+            vec![
+                Shape::from([0]),
+                Shape::from([2]),
+                Shape::from([0]),
+                Shape::from([1])
+            ]
         );
-        assert!(explicit.iter().all(|&output| graph.dtype(output).unwrap() == DType::U16));
+        assert!(
+            explicit
+                .iter()
+                .all(|&output| graph.dtype(output).unwrap() == DType::U16)
+        );
 
         let scalar = graph.input("scalar", []);
         let before_scalar = graph.node_count();
-        assert!(graph.split_default(scalar, SplitSections::Uniform(1)).is_err());
+        assert!(
+            graph
+                .split_default(scalar, SplitSections::Uniform(1))
+                .is_err()
+        );
         assert_eq!(graph.node_count(), before_scalar);
 
         let mut overflow = Graph::new();
@@ -2382,9 +2848,14 @@ mod tests {
             DType::F64,
         );
         let before_overflow = overflow.node_count();
-        assert!(overflow
-            .split_default(overflow_input, SplitSections::Explicit(vec![1, usize::MAX / DType::F64.itemsize()]))
-            .is_err());
+        assert!(
+            overflow
+                .split_default(
+                    overflow_input,
+                    SplitSections::Explicit(vec![1, usize::MAX / DType::F64.itemsize()])
+                )
+                .is_err()
+        );
         assert_eq!(overflow.node_count(), before_overflow);
     }
 
@@ -2394,21 +2865,25 @@ mod tests {
         let input = graph.input("x", [2, 5]);
         let node_count = graph.node_count();
 
-        assert!(graph
-            .split(input, SplitSections::Uniform(0), 1)
-            .is_err());
+        assert!(graph.split(input, SplitSections::Uniform(0), 1).is_err());
         assert_eq!(graph.node_count(), node_count);
-        assert!(graph
-            .split(input, SplitSections::Explicit(vec![2, 2]), 1)
-            .is_err());
+        assert!(
+            graph
+                .split(input, SplitSections::Explicit(vec![2, 2]), 1)
+                .is_err()
+        );
         assert_eq!(graph.node_count(), node_count);
-        assert!(graph
-            .split(input, SplitSections::Explicit(vec![usize::MAX, 1]), 1)
-            .is_err());
+        assert!(
+            graph
+                .split(input, SplitSections::Explicit(vec![usize::MAX, 1]), 1)
+                .is_err()
+        );
         assert_eq!(graph.node_count(), node_count);
-        assert!(graph
-            .split(input, SplitSections::Uniform(1), isize::MIN)
-            .is_err());
+        assert!(
+            graph
+                .split(input, SplitSections::Uniform(1), isize::MIN)
+                .is_err()
+        );
         assert_eq!(graph.node_count(), node_count);
     }
 
@@ -2476,7 +2951,10 @@ mod tests {
         assert_eq!(graph.shape(stacked).unwrap(), &Shape::from([2, 2]));
         let bindings = HashMap::from([
             ("left".into(), TensorData::new([2], vec![0., 0.]).unwrap()),
-            ("right".into(), TensorData::new([3], vec![0., 0., 0.]).unwrap()),
+            (
+                "right".into(),
+                TensorData::new([3], vec![0., 0., 0.]).unwrap(),
+            ),
             ("first".into(), TensorData::new([2], vec![1., 2.]).unwrap()),
             ("second".into(), TensorData::new([2], vec![3., 4.]).unwrap()),
         ]);
@@ -2485,7 +2963,9 @@ mod tests {
             TensorData::new([2, 2], vec![1., 3., 2., 4.]).unwrap()
         );
         assert_eq!(
-            CpuBackend.execute(&graph, default_stacked, &bindings).unwrap(),
+            CpuBackend
+                .execute(&graph, default_stacked, &bindings)
+                .unwrap(),
             TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap()
         );
         assert_eq!(
@@ -2535,6 +3015,14 @@ fn stream_words(shape: &Shape, dtype: DType, multiplier: usize) -> Result<u64> {
     Ok(bytes.div_ceil(4) as u64)
 }
 
+fn checked_counter_end(counter: [u32; 2], words: u64) -> Result<()> {
+    let start = u64::from(counter[0]) | (u64::from(counter[1]) << 32);
+    start.checked_add(words).ok_or(Error::InvalidRandom {
+        reason: "implicit random stream counter overflow",
+    })?;
+    Ok(())
+}
+
 /// Pure descriptor plan shared by the public source `*_like` random helpers.
 ///
 /// It proves the receiver read, selected output, and F32/two-row internal
@@ -2566,7 +3054,12 @@ fn random_like_plan(
     Ok((shape, output_dtype))
 }
 
-fn multinomial_plan(graph: &Graph, input: NodeId, num_samples: isize, replacement: bool) -> Result<MultinomialPlan> {
+fn multinomial_plan(
+    graph: &Graph,
+    input: NodeId,
+    num_samples: isize,
+    replacement: bool,
+) -> Result<MultinomialPlan> {
     let source = graph.node(input)?;
     let rank = source.shape.rank();
     if !(1..=2).contains(&rank) || num_samples <= 0 {
@@ -2615,7 +3108,13 @@ fn multinomial_plan(graph: &Graph, input: NodeId, num_samples: isize, replacemen
         .numel()?
         .checked_mul(DType::F32.itemsize())
         .ok_or_else(|| Error::ShapeOverflow(random_shape.clone()))?;
-    Ok(MultinomialPlan { rank, samples, replacement, weight_shape, output_shape })
+    Ok(MultinomialPlan {
+        rank,
+        samples,
+        replacement,
+        weight_shape,
+        output_shape,
+    })
 }
 
 fn lower_multinomial(
@@ -2624,13 +3123,20 @@ fn lower_multinomial(
     plan: &MultinomialPlan,
     ambient: bool,
 ) -> Result<NodeId> {
-    let weight = if plan.rank == 1 { graph.unsqueeze(input, 0)? } else { input };
+    let weight = if plan.rank == 1 {
+        graph.unsqueeze(input, 0)?
+    } else {
+        input
+    };
     let indices = if plan.replacement || plan.samples == 1 {
         let cumulative = graph.cumsum(weight, 1)?;
         let cdf = graph.to_f32(cumulative)?;
         let last = graph.shrink(
             cdf,
-            vec![(0, plan.weight_shape.dims()[0]), (plan.weight_shape.dims()[1] - 1, plan.weight_shape.dims()[1])],
+            vec![
+                (0, plan.weight_shape.dims()[0]),
+                (plan.weight_shape.dims()[1] - 1, plan.weight_shape.dims()[1]),
+            ],
         )?;
         let cdf = graph.div(cdf, last)?;
         let random_shape = Shape::new([plan.samples, plan.weight_shape.dims()[0], 1]);
@@ -2652,15 +3158,24 @@ fn lower_multinomial(
         let scores = graph.div(log_random, weight)?;
         graph.topk(scores, plan.samples, 1, true, true)?.1
     };
-    let indices = if plan.rank == 1 { graph.squeeze(indices, Some(0))? } else { indices };
+    let indices = if plan.rank == 1 {
+        graph.squeeze(indices, Some(0))?
+    } else {
+        indices
+    };
     graph.to_i32(indices)
 }
 
 fn checked_initializer_tail_fan(shape: &Shape) -> Result<usize> {
-    shape.dims().get(1..).unwrap_or(&[]).iter().try_fold(1usize, |fan, &dimension| {
-        fan.checked_mul(dimension)
-            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
-    })
+    shape
+        .dims()
+        .get(1..)
+        .unwrap_or(&[])
+        .iter()
+        .try_fold(1usize, |fan, &dimension| {
+            fan.checked_mul(dimension)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        })
 }
 
 fn reserve_implicit_stream(device: u32, words: u64) -> RandomStream {
@@ -2734,8 +3249,8 @@ impl StackPlan {
             .rank()
             .checked_add(1)
             .ok_or_else(|| Error::ShapeOverflow(shapes[0].clone()))?;
-        let rank = isize::try_from(output_rank)
-            .map_err(|_| Error::ShapeOverflow(shapes[0].clone()))?;
+        let rank =
+            isize::try_from(output_rank).map_err(|_| Error::ShapeOverflow(shapes[0].clone()))?;
         let axis = if axis < 0 {
             axis.checked_add(rank).ok_or(Error::InvalidAxis {
                 node: inputs[0],
@@ -2782,6 +3297,95 @@ impl StackPlan {
 }
 
 impl Graph {
+    /// Captures, but does not consume, an implicit uniform reservation. The
+    /// caller must commit it through the owning CPU session after `guard`
+    /// validates successfully.
+    pub fn pending_uniform_after_guard(
+        &self,
+        guard: NodeId,
+        shape: impl Into<Shape>,
+        dtype: DType,
+        device: u32,
+    ) -> Result<PendingRandomReservation> {
+        if !matches!(self.op(guard)?, Op::TensorGuard { .. }) {
+            return Err(Error::InvalidRandom {
+                reason: "pending random guard requires a TensorGuard node",
+            });
+        }
+        if !dtype.is_float() {
+            return Err(Error::InvalidRandom {
+                reason: "pending uniform requires a floating point dtype",
+            });
+        }
+        let shape = shape.into();
+        let words = stream_words(&shape, dtype, 1)?;
+        let registry = stream_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expected_counter = *registry.counters.get(&device).unwrap_or(&[0, 0]);
+        checked_counter_end(expected_counter, words)?;
+        Ok(PendingRandomReservation {
+            graph: self.id(),
+            guard,
+            shape,
+            dtype,
+            device,
+            key: [device_key(device), registry.seed as u32],
+            expected_counter,
+            words,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn commit_pending_uniform(
+        &mut self,
+        pending: &mut PendingRandomReservation,
+        guard: NodeId,
+    ) -> Result<NodeId> {
+        if pending.graph != self.id() {
+            return Err(Error::InvalidRandom {
+                reason: "pending random reservation belongs to another graph",
+            });
+        }
+        if pending.committed {
+            return Err(Error::InvalidRandom {
+                reason: "pending random reservation was already committed",
+            });
+        }
+        if pending.guard != guard {
+            return Err(Error::InvalidRandom {
+                reason: "pending random reservation guard does not match",
+            });
+        }
+        let mut registry = stream_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seed = registry.seed as u32;
+        let counter = registry.counters.entry(pending.device).or_insert([0, 0]);
+        if *counter != pending.expected_counter || seed != pending.key[1] {
+            return Err(Error::InvalidRandom {
+                reason: "pending random reservation is stale",
+            });
+        }
+        checked_counter_end(*counter, pending.words)?;
+        let stream = RandomStream {
+            device: pending.device,
+            key: pending.key,
+            counter: reserve(counter, pending.words),
+        };
+        let node = self.random_stream(
+            pending.shape.clone(),
+            pending.dtype,
+            RandomKind::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
+            stream,
+        )?;
+        pending.committed = true;
+        Ok(node)
+    }
+
     pub fn unsqueeze(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
         let dtype = self.dtype(input)?;
@@ -2984,27 +3588,47 @@ impl Graph {
     /// then restores the original axes with the window-size lane trailing.
     /// Resolve all window bounds and the final permutation before the first
     /// Shrink/Stack node so invalid controls are atomic.
-    pub fn unfold(&mut self, input: NodeId, dim: isize, size: usize, step: usize) -> Result<NodeId> {
+    pub fn unfold_unsigned(
+        &mut self,
+        input: NodeId,
+        dim: isize,
+        size: usize,
+        step: usize,
+    ) -> Result<NodeId> {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let dtype = source.dtype;
         if shape.rank() == 0 {
-            return Err(Error::InvalidMovementRank { op: "unfold", expected: 1, actual: 0 });
+            return Err(Error::InvalidMovementRank {
+                op: "unfold",
+                expected: 1,
+                actual: 0,
+            });
         }
         if step == 0 {
-            return Err(Error::InvalidRandom { reason: "unfold step must be positive" });
+            return Err(Error::InvalidRandom {
+                reason: "unfold step must be positive",
+            });
         }
         let axis = normalize_axes(input, shape.rank(), Some(vec![dim]))?[0];
         let extent = shape.dims()[axis];
         if size > extent {
-            return Err(Error::InvalidBounds { axis, start: size, end: size, dim: extent });
+            return Err(Error::InvalidBounds {
+                axis,
+                start: size,
+                end: size,
+                dim: extent,
+            });
         }
         let windows = extent
             .checked_sub(size)
             .and_then(|delta| delta.checked_add(1))
             .map(|span| span.div_ceil(step))
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-        let output_rank = shape.rank().checked_add(1).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let output_rank = shape
+            .rank()
+            .checked_add(1)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         let mut output_dims = shape.dims().to_vec();
         output_dims[axis] = windows;
         output_dims.push(size);
@@ -3017,13 +3641,27 @@ impl Graph {
         let stacked_shape = Shape::new(stacked_dims);
         for candidate in [&shape, &window_shape, &stacked_shape, &output_shape] {
             let candidate_dtype = dtype;
-            candidate.numel()?.checked_mul(candidate_dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(candidate.clone()))?;
+            candidate
+                .numel()?
+                .checked_mul(candidate_dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(candidate.clone()))?;
         }
         let bounds = (0..windows)
             .map(|window| {
-                let start = window.checked_mul(step).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-                let end = start.checked_add(size).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-                if end > extent { return Err(Error::InvalidBounds { axis, start, end, dim: extent }); }
+                let start = window
+                    .checked_mul(step)
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                let end = start
+                    .checked_add(size)
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                if end > extent {
+                    return Err(Error::InvalidBounds {
+                        axis,
+                        start,
+                        end,
+                        dim: extent,
+                    });
+                }
                 let mut bound = shape.dims().iter().map(|&dim| (0, dim)).collect::<Vec<_>>();
                 bound[axis] = (start, end);
                 Ok(bound)
@@ -3033,7 +3671,10 @@ impl Graph {
         let size_lane = axis + 1;
         permutation.remove(size_lane);
         permutation.push(size_lane);
-        let windows = bounds.into_iter().map(|bound| self.shrink(input, bound)).collect::<Result<Vec<_>>>()?;
+        let windows = bounds
+            .into_iter()
+            .map(|bound| self.shrink(input, bound))
+            .collect::<Result<Vec<_>>>()?;
         let stacked = self.stack(windows, axis as isize)?;
         self.permute(stacked, permutation)
     }
@@ -3067,7 +3708,7 @@ impl Graph {
         let step = usize::try_from(step).map_err(|_| Error::InvalidRandom {
             reason: "unfold step does not fit graph extents",
         })?;
-        self.unfold(input, dim, size, step)
+        self.unfold_unsigned(input, dim, size, step)
     }
 
     /// Internal `_one_hot_along_dim` Bool predicate used by tinygrad loss
@@ -3096,8 +3737,14 @@ impl Graph {
             self.cast(classes, plan.comparison_dtype)?
         };
         let output = self.eq(values, classes)?;
-        debug_assert_eq!(self.shape(output).expect("one_hot Bool preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("one_hot Bool preflighted"), DType::Bool);
+        debug_assert_eq!(
+            self.shape(output).expect("one_hot Bool preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("one_hot Bool preflighted"),
+            DType::Bool
+        );
         Ok(output)
     }
 
@@ -3106,13 +3753,24 @@ impl Graph {
         let values = self.reshape(input, plan.value_shape)?;
         let classes = self.lower_lazy_arange(plan.range)?;
         let classes = self.reshape(classes, plan.class_shape)?;
-        let values = if self.dtype(values)? == plan.comparison_dtype { values } else { self.cast(values, plan.comparison_dtype)? };
-        let classes = if self.dtype(classes)? == plan.comparison_dtype { classes } else { self.cast(classes, plan.comparison_dtype)? };
+        let values = if self.dtype(values)? == plan.comparison_dtype {
+            values
+        } else {
+            self.cast(values, plan.comparison_dtype)?
+        };
+        let classes = if self.dtype(classes)? == plan.comparison_dtype {
+            classes
+        } else {
+            self.cast(classes, plan.comparison_dtype)?
+        };
         let equal = self.eq(values, classes)?;
         let one = self.constant(plan.one.expect("numeric one_hot plan has one"));
         let zero = self.constant(plan.zero.expect("numeric one_hot plan has zero"));
         let output = self.select(equal, one, zero)?;
-        debug_assert_eq!(self.shape(output).expect("one_hot preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("one_hot preflighted"),
+            &plan.output_shape
+        );
         debug_assert_eq!(self.dtype(output).expect("one_hot preflighted"), DType::I32);
         Ok(output)
     }
@@ -3445,7 +4103,8 @@ impl Graph {
     }
 
     pub(crate) fn lower_lazy_arange(&mut self, plan: LazyArangePlan) -> Result<NodeId> {
-        let step = self.lazy_full_with_dtype(plan.shape.clone(), plan.step.scalar_at(0), plan.dtype)?;
+        let step =
+            self.lazy_full_with_dtype(plan.shape.clone(), plan.step.scalar_at(0), plan.dtype)?;
         let cumulative = self.cumsum(step, 0)?;
         let offset = self.constant(plan.offset);
         self.add(cumulative, offset)
@@ -3454,12 +4113,7 @@ impl Graph {
     /// Tinygrad’s default integer-range storage policy: I32 when the checked
     /// endpoints fit, otherwise I64. This is distinct from legacy
     /// [`Self::arange`], which deliberately remains I64.
-    pub fn lazy_arange_default_int(
-        &mut self,
-        start: i64,
-        end: i64,
-        step: i64,
-    ) -> Result<NodeId> {
+    pub fn lazy_arange_default_int(&mut self, start: i64, end: i64, step: i64) -> Result<NodeId> {
         self.lower_lazy_arange(lazy_arange_default_int_plan(start, end, step)?)
     }
 
@@ -3469,7 +4123,10 @@ impl Graph {
     // coordinates.
     pub(crate) fn lazy_arange_f32(&mut self, steps: usize) -> Result<NodeId> {
         let shape = Shape::new([steps]);
-        shape.numel()?.checked_mul(DType::F32.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        shape
+            .numel()?
+            .checked_mul(DType::F32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         let step = self.lazy_full_with_dtype(shape, Scalar::F(1.0), DType::F32)?;
         let cumulative = self.cumsum(step, 0)?;
         let offset = self.constant(TensorData::scalar_with_dtype(Scalar::F(-1.0), DType::F32));
@@ -3487,19 +4144,34 @@ impl Graph {
         steps: isize,
         dtype: DType,
     ) -> Result<NodeId> {
-        if steps < 0 { return Err(Error::InvalidLinspace { steps }); }
-        if dtype == DType::Bool { return Err(Error::InvalidRandom { reason: "linspace does not support bool dtype" }); }
+        if steps < 0 {
+            return Err(Error::InvalidLinspace { steps });
+        }
+        if dtype == DType::Bool {
+            return Err(Error::InvalidRandom {
+                reason: "linspace does not support bool dtype",
+            });
+        }
         let steps = usize::try_from(steps).map_err(|_| Error::InvalidLinspace { steps })?;
         let shape = Shape::new([steps]);
-        shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-        if steps == 1 { return self.lazy_full_with_dtype(shape, Scalar::F(start), dtype); }
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if steps == 1 {
+            return self.lazy_full_with_dtype(shape, Scalar::F(start), dtype);
+        }
         // tinygrad always constructs the coordinate range at default F32,
         // then applies its Python scale and start constants before final cast.
         let range = self.lazy_arange_f32(steps)?;
         let scale = Scalar::F((stop - start) / ((steps as isize - 1) as f64));
         let scaled = self.mul_scalar(range, scale)?;
         let shifted = self.add_scalar(scaled, Scalar::F(start))?;
-        if self.dtype(shifted)? == dtype { Ok(shifted) } else { self.cast(shifted, dtype) }
+        if self.dtype(shifted)? == dtype {
+            Ok(shifted)
+        } else {
+            self.cast(shifted, dtype)
+        }
     }
 
     pub fn linspace_default(&mut self, start: f64, stop: f64, steps: isize) -> Result<NodeId> {
@@ -3509,19 +4181,47 @@ impl Graph {
     pub fn eye(&mut self, rows: usize, columns: Option<usize>, dtype: DType) -> Result<NodeId> {
         let columns = columns.unwrap_or(rows);
         let output = Shape::new([rows, columns]);
-        output.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
-        let row_plan = lazy_arange_default_int_plan(0, i64::try_from(rows).map_err(|_| Error::ShapeOverflow(output.clone()))?, 1)?;
-        let column_plan = lazy_arange_default_int_plan(0, i64::try_from(columns).map_err(|_| Error::ShapeOverflow(output.clone()))?, 1)?;
+        output
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
+        let row_plan = lazy_arange_default_int_plan(
+            0,
+            i64::try_from(rows).map_err(|_| Error::ShapeOverflow(output.clone()))?,
+            1,
+        )?;
+        let column_plan = lazy_arange_default_int_plan(
+            0,
+            i64::try_from(columns).map_err(|_| Error::ShapeOverflow(output.clone()))?,
+            1,
+        )?;
         for plan in [&row_plan, &column_plan] {
-            plan.shape.numel()?.checked_mul(plan.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(plan.shape.clone()))?;
+            plan.shape
+                .numel()?
+                .checked_mul(plan.dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(plan.shape.clone()))?;
         }
-        let comparison = if matches!((row_plan.dtype,column_plan.dtype),(DType::I64,DType::U64)|(DType::U64,DType::I64)) { DType::F32 } else { row_plan.dtype.promote(column_plan.dtype) };
-        output.numel()?.checked_mul(comparison.itemsize()).ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
+        let comparison = if matches!(
+            (row_plan.dtype, column_plan.dtype),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
+            DType::F32
+        } else {
+            row_plan.dtype.promote(column_plan.dtype)
+        };
+        output
+            .numel()?
+            .checked_mul(comparison.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
         let rows = self.lower_lazy_arange(row_plan)?;
         let rows = self.unsqueeze(rows, -1)?;
         let columns = self.lower_lazy_arange(column_plan)?;
         let equal = self.eq(rows, columns)?;
-        if dtype == DType::Bool { Ok(equal) } else { self.cast(equal, dtype) }
+        if dtype == DType::Bool {
+            Ok(equal)
+        } else {
+            self.cast(equal, dtype)
+        }
     }
 
     pub fn eye_default(&mut self, rows: usize, columns: Option<usize>) -> Result<NodeId> {
@@ -3594,10 +4294,7 @@ impl Graph {
         }
 
         let row = self.reshape(self.arange(0, rows_i64, 1)?, Shape::new([rows, 1]))?;
-        let column = self.reshape(
-            self.arange(0, columns_i64, 1)?,
-            Shape::new([1, columns]),
-        )?;
+        let column = self.reshape(self.arange(0, columns_i64, 1)?, Shape::new([1, columns]))?;
         let shift = self.full_with_dtype([], Scalar::I(shift), DType::I64)?;
         let outside = self.le(self.add(row, shift)?, column)?;
         let zero = self.zeros_with_dtype(shape, dtype)?;
@@ -3832,7 +4529,7 @@ impl Graph {
     /// This is the one-axis branch of tinygrad's public `roll` helper. Its
     /// signed axis, empty-tensor no-op, and Euclidean shift normalization are
     /// resolved before the two source views or their concat are appended.
-    pub fn roll(&mut self, input: NodeId, shift: i64, axis: isize) -> Result<NodeId> {
+    pub fn roll_axis(&mut self, input: NodeId, shift: i64, axis: isize) -> Result<NodeId> {
         let shape = self.node(input)?.shape.clone();
         shape.numel()?;
         if shape.rank() == 0 {
@@ -3891,12 +4588,7 @@ impl Graph {
     /// doubles each distinct selected axis only once.  All concrete movement
     /// descriptors are planned before the source-literal repeat and shrink
     /// composition can publish a node.
-    pub fn roll_axes(
-        &mut self,
-        input: NodeId,
-        shifts: &[i64],
-        axes: &[isize],
-    ) -> Result<NodeId> {
+    pub fn roll_axes(&mut self, input: NodeId, shifts: &[i64], axes: &[isize]) -> Result<NodeId> {
         if shifts.len() != axes.len() {
             return Err(Error::InvalidRepeat {
                 reason: "roll shifts and axes must have equal lengths",
@@ -4001,10 +4693,10 @@ impl Graph {
         if shift.rem_euclid(elements_i64) == 0 {
             return Ok(input);
         }
-        let end = isize::try_from(shape.rank() - 1)
-            .map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let end =
+            isize::try_from(shape.rank() - 1).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
         let flattened = self.flatten(input, 0, end)?;
-        let rolled = self.roll(flattened, shift, 0)?;
+        let rolled = self.roll_axis(flattened, shift, 0)?;
         self.reshape(rolled, shape)
     }
 
@@ -4032,7 +4724,10 @@ impl Graph {
             .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
         debug_assert_eq!(output_shape, plan.output_shape);
         let output = lower_source_roll(self, input, &plan)?;
-        debug_assert_eq!(self.shape(output).expect("source roll preflighted"), &plan.output_shape);
+        debug_assert_eq!(
+            self.shape(output).expect("source roll preflighted"),
+            &plan.output_shape
+        );
         Ok(output)
     }
 
@@ -4134,8 +4829,14 @@ impl Graph {
             self.cast(scaled, dtype)?
         };
         let output = self.add_scalar(cast, Scalar::F(low))?;
-        debug_assert_eq!(self.shape(output).expect("uniform preflighted"), &output_shape);
-        debug_assert_eq!(self.dtype(output).expect("uniform preflighted"), output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("uniform preflighted"),
+            &output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("uniform preflighted"),
+            output_dtype
+        );
         Ok(output)
     }
 
@@ -4296,8 +4997,14 @@ impl Graph {
         };
         let scaled = self.scalar_mul(Scalar::F(std), standard)?;
         let output = self.add_scalar(scaled, Scalar::F(mean))?;
-        debug_assert_eq!(self.shape(output).expect("normal preflighted"), &output_shape);
-        debug_assert_eq!(self.dtype(output).expect("normal preflighted"), output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("normal preflighted"),
+            &output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("normal preflighted"),
+            output_dtype
+        );
         Ok(output)
     }
 
@@ -4419,7 +5126,9 @@ impl Graph {
         // stages without advancing the process-wide ambient random counter.
         let mut rehearsal = self.clone();
         let rehearsed = lower_multinomial(&mut rehearsal, input, &plan, false)?;
-        if rehearsal.shape(rehearsed)? != &plan.output_shape || rehearsal.dtype(rehearsed)? != DType::I32 {
+        if rehearsal.shape(rehearsed)? != &plan.output_shape
+            || rehearsal.dtype(rehearsed)? != DType::I32
+        {
             return Err(Error::InvalidRandom {
                 reason: "multinomial output descriptor changed during preflight",
             });
@@ -4429,8 +5138,14 @@ impl Graph {
             .checked_mul(DType::I32.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(plan.output_shape.clone()))?;
         let output = lower_multinomial(self, input, &plan, true)?;
-        debug_assert_eq!(self.shape(output).expect("multinomial preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("multinomial preflighted"), DType::I32);
+        debug_assert_eq!(
+            self.shape(output).expect("multinomial preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("multinomial preflighted"),
+            DType::I32
+        );
         Ok(output)
     }
 
@@ -4620,22 +5335,34 @@ impl Graph {
                 reason: "randperm requires an integer dtype",
             });
         }
-        Ok(self.push(Op::RandomPermutation { seed }, Shape::new([count]), dtype))
+        self.random_permutation(
+            Shape::new([count]),
+            dtype,
+            RandomStream {
+                device: 0,
+                key: [0, seed as u32],
+                counter: [0, 0],
+            },
+        )
     }
     pub fn randperm_implicit(&mut self, count: usize, dtype: DType) -> Result<NodeId> {
+        self.randperm_implicit_on_device(count, dtype, 0)
+    }
+
+    pub fn randperm_implicit_on_device(
+        &mut self,
+        count: usize,
+        dtype: DType,
+        device: u32,
+    ) -> Result<NodeId> {
         if !dtype.is_integer() {
             return Err(Error::InvalidRandom {
                 reason: "randperm requires an integer dtype",
             });
         }
-        // `RandomPermutation` predates captured streams. Reserve the same F32
-        // domain as tinygrad's `rand(n).argsort()` and derive its legacy seed
-        // from that immutable reservation until permutation receives typed IR.
-        let stream = reserve_implicit_stream(0, stream_words(&Shape::new([count]), DType::F32, 1)?);
-        let seed = (u64::from(stream.counter[1]) << 32 | u64::from(stream.counter[0]))
-            ^ (u64::from(stream.key[1]) << 1)
-            ^ u64::from(stream.key[0]);
-        self.randperm(count, dtype, seed)
+        let shape = Shape::new([count]);
+        let stream = reserve_implicit_stream(device, stream_words(&shape, DType::F32, 1)?);
+        self.random_permutation(shape, dtype, stream)
     }
 
     /// Source-literal ambient-stream `Tensor.randperm`.
@@ -4685,8 +5412,14 @@ impl Graph {
 
         let random = self.rand_implicit(shape, DType::F32)?;
         let output = lower_source_randperm(self, random, dtype)?;
-        debug_assert_eq!(self.shape(output).expect("randperm preflighted"), &output_shape);
-        debug_assert_eq!(self.dtype(output).expect("randperm preflighted"), output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("randperm preflighted"),
+            &output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("randperm preflighted"),
+            output_dtype
+        );
         Ok(output)
     }
 
@@ -4796,5 +5529,15 @@ impl Graph {
     ) -> Result<NodeId> {
         shape.numel()?;
         Ok(self.push(Op::Random { kind, stream }, shape, dtype))
+    }
+
+    fn random_permutation(
+        &mut self,
+        shape: Shape,
+        dtype: DType,
+        stream: RandomStream,
+    ) -> Result<NodeId> {
+        shape.numel()?;
+        Ok(self.push(Op::RandomPermutation { stream }, shape, dtype))
     }
 }

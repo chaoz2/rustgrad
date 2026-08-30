@@ -59,7 +59,10 @@ pub enum GradcheckError {
     NoTargets,
     DuplicateTarget(NodeId),
     TargetNotInput(NodeId),
-    UnsupportedTargetDType { target: NodeId, dtype: DType },
+    UnsupportedTargetDType {
+        target: NodeId,
+        dtype: DType,
+    },
     MissingBinding(String),
     BindingShape {
         name: String,
@@ -75,8 +78,14 @@ pub enum GradcheckError {
     NonScalarLoss(Shape),
     NonFloatLoss(DType),
     NonFiniteBaseLoss,
-    NonFiniteAnalytic { target: NodeId, coordinate: usize },
-    NonFiniteLoss { target: NodeId, coordinate: usize },
+    NonFiniteAnalytic {
+        target: NodeId,
+        coordinate: usize,
+    },
+    NonFiniteLoss {
+        target: NodeId,
+        coordinate: usize,
+    },
     Graph(Error),
 }
 
@@ -88,14 +97,20 @@ impl fmt::Display for GradcheckError {
             Self::DuplicateTarget(target) => write!(f, "duplicate gradcheck target %{target}"),
             Self::TargetNotInput(target) => write!(f, "gradcheck target %{target} is not an input"),
             Self::UnsupportedTargetDType { target, dtype } => {
-                write!(f, "gradcheck target %{target} has unsupported dtype {dtype:?}")
+                write!(
+                    f,
+                    "gradcheck target %{target} has unsupported dtype {dtype:?}"
+                )
             }
             Self::MissingBinding(name) => write!(f, "gradcheck is missing binding {name:?}"),
             Self::BindingShape {
                 name,
                 expected,
                 actual,
-            } => write!(f, "gradcheck binding {name:?} expected {expected}, got {actual}"),
+            } => write!(
+                f,
+                "gradcheck binding {name:?} expected {expected}, got {actual}"
+            ),
             Self::BindingDType {
                 name,
                 expected,
@@ -105,14 +120,22 @@ impl fmt::Display for GradcheckError {
                 "gradcheck binding {name:?} expected {expected:?}, got {actual:?}"
             ),
             Self::EmptyTarget(target) => write!(f, "gradcheck target %{target} is empty"),
-            Self::NonScalarLoss(shape) => write!(f, "gradcheck requires a scalar loss, got {shape}"),
+            Self::NonScalarLoss(shape) => {
+                write!(f, "gradcheck requires a scalar loss, got {shape}")
+            }
             Self::NonFloatLoss(dtype) => write!(f, "gradcheck loss has non-float dtype {dtype:?}"),
             Self::NonFiniteBaseLoss => write!(f, "gradcheck base loss is non-finite"),
             Self::NonFiniteAnalytic { target, coordinate } => {
-                write!(f, "gradcheck analytic gradient for %{target}[{coordinate}] is non-finite")
+                write!(
+                    f,
+                    "gradcheck analytic gradient for %{target}[{coordinate}] is non-finite"
+                )
             }
             Self::NonFiniteLoss { target, coordinate } => {
-                write!(f, "gradcheck perturbation for %{target}[{coordinate}] has non-finite loss")
+                write!(
+                    f,
+                    "gradcheck perturbation for %{target}[{coordinate}] has non-finite loss"
+                )
             }
             Self::Graph(error) => error.fmt(f),
         }
@@ -253,30 +276,29 @@ pub fn gradcheck_cpu(
         }
 
         let analytic_node = checked_graph.grad(loss, target)?;
-        let analytic = CpuBackend.execute(
-            &checked_graph,
-            analytic_node,
-            &bindings_for_cpu(bindings),
-        )?;
+        let analytic =
+            CpuBackend.execute(&checked_graph, analytic_node, &bindings_for_cpu(bindings))?;
         for coordinate in 0..value.len() {
             let analytic_value = analytic.scalar_at(coordinate).as_f64();
             if !analytic_value.is_finite() {
                 return Err(GradcheckError::NonFiniteAnalytic { target, coordinate });
             }
-            let plus = CpuBackend.execute(
-                &checked_graph,
-                loss,
-                &perturbed_bindings(bindings, &name, value, coordinate, config.epsilon)?,
-            )?
-            .scalar_at(0)
-            .as_f64();
-            let minus = CpuBackend.execute(
-                &checked_graph,
-                loss,
-                &perturbed_bindings(bindings, &name, value, coordinate, -config.epsilon)?,
-            )?
-            .scalar_at(0)
-            .as_f64();
+            let plus = CpuBackend
+                .execute(
+                    &checked_graph,
+                    loss,
+                    &perturbed_bindings(bindings, &name, value, coordinate, config.epsilon)?,
+                )?
+                .scalar_at(0)
+                .as_f64();
+            let minus = CpuBackend
+                .execute(
+                    &checked_graph,
+                    loss,
+                    &perturbed_bindings(bindings, &name, value, coordinate, -config.epsilon)?,
+                )?
+                .scalar_at(0)
+                .as_f64();
             if !plus.is_finite() || !minus.is_finite() {
                 return Err(GradcheckError::NonFiniteLoss { target, coordinate });
             }
@@ -323,8 +345,8 @@ mod tests {
         let original_nodes = graph.node_count();
         let original_bindings = bindings.clone();
 
-        let report = gradcheck_cpu(&graph, loss, &[y, x], &bindings, GradcheckConfig::default())
-            .unwrap();
+        let report =
+            gradcheck_cpu(&graph, loss, &[y, x], &bindings, GradcheckConfig::default()).unwrap();
         assert!(report.passed());
         assert_eq!(report.coordinates_checked, 4);
         assert_eq!(graph.node_count(), original_nodes);
@@ -361,10 +383,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
-        assert!(report
-            .mismatches
-            .iter()
-            .all(|mismatch| mismatch.analytic < mismatch.numerical));
+        assert!(
+            report
+                .mismatches
+                .iter()
+                .all(|mismatch| mismatch.analytic < mismatch.numerical)
+        );
     }
 
     #[test]

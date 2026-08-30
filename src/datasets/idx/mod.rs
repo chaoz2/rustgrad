@@ -176,12 +176,8 @@ mod tests {
                 cols: valid.cols,
             },
             MnistIdx {
-                images: TensorData::from_scalars(
-                    [1, 1, 1, 4],
-                    DType::U8,
-                    [Scalar::U(0); 4],
-                )
-                .unwrap(),
+                images: TensorData::from_scalars([1, 1, 1, 4], DType::U8, [Scalar::U(0); 4])
+                    .unwrap(),
                 labels: valid.labels.clone(),
                 rows: valid.rows,
                 cols: valid.cols,

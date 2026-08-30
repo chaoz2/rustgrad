@@ -25,67 +25,371 @@ fn normalized_model_is_order_independent_and_dot_escapes() {
 
 #[test]
 fn typed_trace_visualization_is_deterministic_and_fail_closed() {
-    let compile = crate::CompileTrace { output: NodeId::from_index(1), steps: vec![
-        crate::TraceStep { node: NodeId::from_index(0), operation: "input".into(), shape: Shape::from([]), dtype: DType::F32 },
-        crate::TraceStep { node: NodeId::from_index(1), operation: "relu".into(), shape: Shape::from([0]), dtype: DType::F16 },
-    ]};
+    let compile = crate::CompileTrace {
+        output: NodeId::from_index(1),
+        steps: vec![
+            crate::TraceStep {
+                node: NodeId::from_index(0),
+                operation: "input".into(),
+                shape: Shape::from([]),
+                dtype: DType::F32,
+            },
+            crate::TraceStep {
+                node: NodeId::from_index(1),
+                operation: "relu".into(),
+                shape: Shape::from([0]),
+                dtype: DType::F16,
+            },
+        ],
+    };
     let dot = crate::compile_trace_viz(&compile).unwrap().to_dot();
-    assert!(dot.contains("sequence=0") && dot.contains("sequence=1") && dot.contains("declared_output=true") && dot.contains("shape=[]") && dot.contains("shape=[0]"));
-    let duplicate = crate::CompileTrace { output: NodeId::from_index(0), steps: vec![compile.steps[0].clone(), compile.steps[0].clone()] };
-    assert!(matches!(crate::compile_trace_viz(&duplicate), Err(VizError::DuplicateNode(_))));
-    let missing = crate::CompileTrace { output: NodeId::from_index(9), steps: compile.steps };
-    assert!(matches!(crate::compile_trace_viz(&missing), Err(VizError::InvalidGraphNode(9))));
+    assert!(
+        dot.contains("sequence=0")
+            && dot.contains("sequence=1")
+            && dot.contains("declared_output=true")
+            && dot.contains("shape=[]")
+            && dot.contains("shape=[0]")
+    );
+    let duplicate = crate::CompileTrace {
+        output: NodeId::from_index(0),
+        steps: vec![compile.steps[0].clone(), compile.steps[0].clone()],
+    };
+    assert!(matches!(
+        crate::compile_trace_viz(&duplicate),
+        Err(VizError::DuplicateNode(_))
+    ));
+    let missing = crate::CompileTrace {
+        output: NodeId::from_index(9),
+        steps: compile.steps,
+    };
+    assert!(matches!(
+        crate::compile_trace_viz(&missing),
+        Err(VizError::InvalidGraphNode(9))
+    ));
 
-    let trace = crate::RealizationTrace { items: vec![
-        crate::ItemTrace { item: 1, dependencies: vec![], backend: crate::ItemBackend::Interpreter, cache_key: 7, materialized_buffer: 9, last_consumer: Some(3), allocation_id: Some(4), physical_slot: Some(5), generation: Some(6), reused_from: None, released_buffers: vec![8], lanes: 4, vector_main: 3, vector_tail: 1, vector_reason: "tail".into() },
-        crate::ItemTrace { item: 2, dependencies: vec![1], backend: crate::ItemBackend::NativeJit, cache_key: 10, materialized_buffer: 11, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: Some(4), released_buffers: vec![], lanes: 1, vector_main: 0, vector_tail: 1, vector_reason: "scalar".into() },
-        crate::ItemTrace { item: 3, dependencies: vec![1], backend: crate::ItemBackend::JitFallback, cache_key: 12, materialized_buffer: 13, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: None, released_buffers: vec![], lanes: 1, vector_main: 1, vector_tail: 0, vector_reason: "fallback".into() },
-    ]};
+    let trace = crate::RealizationTrace {
+        items: vec![
+            crate::ItemTrace {
+                item: 1,
+                dependencies: vec![],
+                backend: crate::ItemBackend::Interpreter,
+                cache_key: 7,
+                materialized_buffer: 9,
+                last_consumer: Some(3),
+                allocation_id: Some(4),
+                physical_slot: Some(5),
+                generation: Some(6),
+                reused_from: None,
+                released_buffers: vec![8],
+                lanes: 4,
+                vector_main: 3,
+                vector_tail: 1,
+                vector_reason: "tail".into(),
+            },
+            crate::ItemTrace {
+                item: 2,
+                dependencies: vec![1],
+                backend: crate::ItemBackend::NativeJit,
+                cache_key: 10,
+                materialized_buffer: 11,
+                last_consumer: None,
+                allocation_id: None,
+                physical_slot: None,
+                generation: None,
+                reused_from: Some(4),
+                released_buffers: vec![],
+                lanes: 1,
+                vector_main: 0,
+                vector_tail: 1,
+                vector_reason: "scalar".into(),
+            },
+            crate::ItemTrace {
+                item: 3,
+                dependencies: vec![1],
+                backend: crate::ItemBackend::JitFallback,
+                cache_key: 12,
+                materialized_buffer: 13,
+                last_consumer: None,
+                allocation_id: None,
+                physical_slot: None,
+                generation: None,
+                reused_from: None,
+                released_buffers: vec![],
+                lanes: 1,
+                vector_main: 1,
+                vector_tail: 0,
+                vector_reason: "fallback".into(),
+            },
+        ],
+    };
     let dot = crate::realization_trace_viz(&trace).unwrap().to_dot();
-    for field in ["backend=interpreter", "backend=native_jit", "backend=jit_fallback", "cache_key=7", "buffer=9", "last_consumer=3", "allocation=4", "slot=5", "generation=6", "reused_from=4", "released=[8]", "vector_tail=1", "vector_reason=tail"] { assert!(dot.contains(field), "{field}"); }
-    let missing_dependency = crate::RealizationTrace { items: vec![crate::ItemTrace { item: 1, dependencies: vec![99], backend: crate::ItemBackend::Interpreter, cache_key: 0, materialized_buffer: 0, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: None, released_buffers: vec![], lanes: 1, vector_main: 1, vector_tail: 0, vector_reason: String::new() }] };
-    assert!(matches!(crate::realization_trace_viz(&missing_dependency), Err(VizError::MissingEndpoint { .. })));
-    assert!(matches!(crate::realization_trace_viz(&crate::RealizationTrace { items: vec![crate::ItemTrace { lanes: 2, vector_main: 2, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
-    assert!(matches!(crate::realization_trace_viz(&crate::RealizationTrace { items: vec![crate::ItemTrace { lanes: usize::MAX, vector_main: usize::MAX, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
+    for field in [
+        "backend=interpreter",
+        "backend=native_jit",
+        "backend=jit_fallback",
+        "cache_key=7",
+        "buffer=9",
+        "last_consumer=3",
+        "allocation=4",
+        "slot=5",
+        "generation=6",
+        "reused_from=4",
+        "released=[8]",
+        "vector_tail=1",
+        "vector_reason=tail",
+    ] {
+        assert!(dot.contains(field), "{field}");
+    }
+    let missing_dependency = crate::RealizationTrace {
+        items: vec![crate::ItemTrace {
+            item: 1,
+            dependencies: vec![99],
+            backend: crate::ItemBackend::Interpreter,
+            cache_key: 0,
+            materialized_buffer: 0,
+            last_consumer: None,
+            allocation_id: None,
+            physical_slot: None,
+            generation: None,
+            reused_from: None,
+            released_buffers: vec![],
+            lanes: 1,
+            vector_main: 1,
+            vector_tail: 0,
+            vector_reason: String::new(),
+        }],
+    };
+    assert!(matches!(
+        crate::realization_trace_viz(&missing_dependency),
+        Err(VizError::MissingEndpoint { .. })
+    ));
+    assert!(matches!(
+        crate::realization_trace_viz(&crate::RealizationTrace {
+            items: vec![crate::ItemTrace {
+                lanes: 2,
+                vector_main: 2,
+                vector_tail: 1,
+                ..trace.items[0].clone()
+            }]
+        }),
+        Err(VizError::InvalidSchedule(_))
+    ));
+    assert!(matches!(
+        crate::realization_trace_viz(&crate::RealizationTrace {
+            items: vec![crate::ItemTrace {
+                lanes: usize::MAX,
+                vector_main: usize::MAX,
+                vector_tail: 1,
+                ..trace.items[0].clone()
+            }]
+        }),
+        Err(VizError::InvalidSchedule(_))
+    ));
 }
 
 #[test]
 fn cuda_trace_visualization_preserves_typed_submission_order() {
     let device = crate::DeviceId::new("cuda:0").unwrap();
     let collective = vec![
-        crate::CudaCollectiveTrace { action_id: 1, operation: "copy", device: device.clone(), range: crate::LogicalRange { start: 0, len: 0 }, cache_key: None },
-        crate::CudaCollectiveTrace { action_id: 2, operation: "add", device, range: crate::LogicalRange { start: 4, len: 8 }, cache_key: Some("cache".into()) },
+        crate::CudaCollectiveTrace {
+            action_id: 1,
+            operation: "copy",
+            device: device.clone(),
+            range: crate::LogicalRange { start: 0, len: 0 },
+            cache_key: None,
+        },
+        crate::CudaCollectiveTrace {
+            action_id: 2,
+            operation: "add",
+            device,
+            range: crate::LogicalRange { start: 4, len: 8 },
+            cache_key: Some("cache".into()),
+        },
     ];
-    let dot = crate::cuda_collective_trace_viz(&collective).unwrap().to_dot();
-    for field in ["operation=copy", "operation=add", "device=cuda:0", "range=0:0", "range=4:8", "cache_key=none", "cache_key=cache", "order:next"] { assert!(dot.contains(field), "{field}"); }
-    assert!(crate::cuda_collective_trace_viz(&[]).unwrap().nodes().is_empty());
-    assert!(matches!(crate::cuda_collective_trace_viz(&[collective[0].clone(), collective[0].clone()]), Err(VizError::DuplicateNode(_))));
-    let stages = vec![crate::ShardedCudaExecutionTrace { stage: 1, action: "run", skipped: false }, crate::ShardedCudaExecutionTrace { stage: 2, action: "skip", skipped: true }];
-    let dot = crate::sharded_cuda_execution_trace_viz(&stages).unwrap().to_dot();
-    assert!(dot.contains("action=run") && dot.contains("skipped=false") && dot.contains("action=skip") && dot.contains("skipped=true"));
-    assert!(crate::sharded_cuda_execution_trace_viz(&[]).unwrap().nodes().is_empty());
-    assert!(matches!(crate::sharded_cuda_execution_trace_viz(&[stages[0].clone(), stages[0].clone()]), Err(VizError::DuplicateNode(_))));
+    let dot = crate::cuda_collective_trace_viz(&collective)
+        .unwrap()
+        .to_dot();
+    for field in [
+        "operation=copy",
+        "operation=add",
+        "device=cuda:0",
+        "range=0:0",
+        "range=4:8",
+        "cache_key=none",
+        "cache_key=cache",
+        "order:next",
+    ] {
+        assert!(dot.contains(field), "{field}");
+    }
+    assert!(
+        crate::cuda_collective_trace_viz(&[])
+            .unwrap()
+            .nodes()
+            .is_empty()
+    );
+    assert!(matches!(
+        crate::cuda_collective_trace_viz(&[collective[0].clone(), collective[0].clone()]),
+        Err(VizError::DuplicateNode(_))
+    ));
+    let stages = vec![
+        crate::ShardedCudaExecutionTrace {
+            stage: 1,
+            action: "run",
+            skipped: false,
+        },
+        crate::ShardedCudaExecutionTrace {
+            stage: 2,
+            action: "skip",
+            skipped: true,
+        },
+    ];
+    let dot = crate::sharded_cuda_execution_trace_viz(&stages)
+        .unwrap()
+        .to_dot();
+    assert!(
+        dot.contains("action=run")
+            && dot.contains("skipped=false")
+            && dot.contains("action=skip")
+            && dot.contains("skipped=true")
+    );
+    assert!(
+        crate::sharded_cuda_execution_trace_viz(&[])
+            .unwrap()
+            .nodes()
+            .is_empty()
+    );
+    assert!(matches!(
+        crate::sharded_cuda_execution_trace_viz(&[stages[0].clone(), stages[0].clone()]),
+        Err(VizError::DuplicateNode(_))
+    ));
 }
 
 #[test]
 fn replay_trace_visualization_preserves_typed_fields_and_duplicates() {
-    let trace = crate::CapturedReplayTrace { items: vec![
-        crate::CapturedItemTrace { invocation: 0, item: 1, backend: crate::ItemBackend::Interpreter, schedule_cache_key: 1, native_cache_key: None, cache_hit: false, lanes: 4, vector_main: 3, vector_tail: 1, packed_weight_bytes: 8, reason: "tail".into() },
-        crate::CapturedItemTrace { invocation: 1, item: 1, backend: crate::ItemBackend::NativeJit, schedule_cache_key: 2, native_cache_key: Some("native".into()), cache_hit: true, lanes: 4, vector_main: 4, vector_tail: 0, packed_weight_bytes: 0, reason: "full".into() },
-        crate::CapturedItemTrace { invocation: 1, item: 2, backend: crate::ItemBackend::JitFallback, schedule_cache_key: 3, native_cache_key: None, cache_hit: false, lanes: 1, vector_main: 0, vector_tail: 1, packed_weight_bytes: 0, reason: "fallback".into() },
-    ]};
+    let trace = crate::CapturedReplayTrace {
+        items: vec![
+            crate::CapturedItemTrace {
+                invocation: 0,
+                item: 1,
+                backend: crate::ItemBackend::Interpreter,
+                schedule_cache_key: 1,
+                native_cache_key: None,
+                cache_hit: false,
+                lanes: 4,
+                vector_main: 3,
+                vector_tail: 1,
+                packed_weight_bytes: 8,
+                reason: "tail".into(),
+            },
+            crate::CapturedItemTrace {
+                invocation: 1,
+                item: 1,
+                backend: crate::ItemBackend::NativeJit,
+                schedule_cache_key: 2,
+                native_cache_key: Some("native".into()),
+                cache_hit: true,
+                lanes: 4,
+                vector_main: 4,
+                vector_tail: 0,
+                packed_weight_bytes: 0,
+                reason: "full".into(),
+            },
+            crate::CapturedItemTrace {
+                invocation: 1,
+                item: 2,
+                backend: crate::ItemBackend::JitFallback,
+                schedule_cache_key: 3,
+                native_cache_key: None,
+                cache_hit: false,
+                lanes: 1,
+                vector_main: 0,
+                vector_tail: 1,
+                packed_weight_bytes: 0,
+                reason: "fallback".into(),
+            },
+        ],
+    };
     let dot = crate::captured_replay_trace_viz(&trace).unwrap().to_dot();
-    for field in ["backend=interpreter", "backend=native_jit", "backend=jit_fallback", "cache_hit=true", "native_cache_key=native", "vector_tail=1", "packed_weight_bytes=8", "order:next"] { assert!(dot.contains(field)); }
-    assert!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace::default()).unwrap().nodes().is_empty());
-    assert!(matches!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace { items: vec![trace.items[0].clone(), trace.items[0].clone()] }), Err(VizError::DuplicateNode(_))));
-    assert!(matches!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace { items: vec![crate::CapturedItemTrace { lanes: 2, vector_main: 2, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
-    let specialization = crate::CapturedSpecializationTrace { source_identity: 1, concrete_identity: 2, bindings: vec![(9, -1), (3, 4)], cache_hit: true };
-    assert!(crate::captured_specialization_trace_viz(&specialization).unwrap().to_dot().contains("bindings=[9:-1,3:4]"));
-    let replay = crate::NativeMixedReplayTrace { identity: 1, artifact_identity: 2, vectorized: true, pure_item_cache_keys: vec![3, 4] };
-    assert!(crate::native_mixed_replay_trace_viz(&replay).unwrap().to_dot().contains("pure_item_cache_keys=[3,4]"));
-    let batch = crate::NativeMixedBatchTrace { identity: 1, batch_identity: 2, vectorized: false, binding_count: 2, binding_schema_keys: vec![5, 6], pure_item_cache_keys: vec![7] };
-    assert!(crate::native_mixed_batch_trace_viz(&batch).unwrap().to_dot().contains("binding_schema_keys=[5,6]"));
-    assert!(matches!(crate::native_mixed_batch_trace_viz(&crate::NativeMixedBatchTrace { binding_count: 1, ..batch }), Err(VizError::InvalidSchedule(_))));
+    for field in [
+        "backend=interpreter",
+        "backend=native_jit",
+        "backend=jit_fallback",
+        "cache_hit=true",
+        "native_cache_key=native",
+        "vector_tail=1",
+        "packed_weight_bytes=8",
+        "order:next",
+    ] {
+        assert!(dot.contains(field));
+    }
+    assert!(
+        crate::captured_replay_trace_viz(&crate::CapturedReplayTrace::default())
+            .unwrap()
+            .nodes()
+            .is_empty()
+    );
+    assert!(matches!(
+        crate::captured_replay_trace_viz(&crate::CapturedReplayTrace {
+            items: vec![trace.items[0].clone(), trace.items[0].clone()]
+        }),
+        Err(VizError::DuplicateNode(_))
+    ));
+    assert!(matches!(
+        crate::captured_replay_trace_viz(&crate::CapturedReplayTrace {
+            items: vec![crate::CapturedItemTrace {
+                lanes: 2,
+                vector_main: 2,
+                vector_tail: 1,
+                ..trace.items[0].clone()
+            }]
+        }),
+        Err(VizError::InvalidSchedule(_))
+    ));
+    let specialization = crate::CapturedSpecializationTrace {
+        source_identity: 1,
+        concrete_identity: 2,
+        bindings: vec![(9, -1), (3, 4)],
+        cache_hit: true,
+    };
+    assert!(
+        crate::captured_specialization_trace_viz(&specialization)
+            .unwrap()
+            .to_dot()
+            .contains("bindings=[9:-1,3:4]")
+    );
+    let replay = crate::NativeMixedReplayTrace {
+        identity: 1,
+        artifact_identity: 2,
+        vectorized: true,
+        pure_item_cache_keys: vec![3, 4],
+    };
+    assert!(
+        crate::native_mixed_replay_trace_viz(&replay)
+            .unwrap()
+            .to_dot()
+            .contains("pure_item_cache_keys=[3,4]")
+    );
+    let batch = crate::NativeMixedBatchTrace {
+        identity: 1,
+        batch_identity: 2,
+        vectorized: false,
+        binding_count: 2,
+        binding_schema_keys: vec![5, 6],
+        pure_item_cache_keys: vec![7],
+    };
+    assert!(
+        crate::native_mixed_batch_trace_viz(&batch)
+            .unwrap()
+            .to_dot()
+            .contains("binding_schema_keys=[5,6]")
+    );
+    assert!(matches!(
+        crate::native_mixed_batch_trace_viz(&crate::NativeMixedBatchTrace {
+            binding_count: 1,
+            ..batch
+        }),
+        Err(VizError::InvalidSchedule(_))
+    ));
 }
 
 #[test]
@@ -139,13 +443,7 @@ fn reduction_derivative_graph_visualization_preserves_axes_and_sum_to_target() {
     let input = graph.input("input", [2, 3, 4]);
     let upstream = graph.input("upstream", [2, 1, 1]);
     let gradient = graph
-        .reduce_grad(
-            input,
-            upstream,
-            crate::ReduceKind::Mean,
-            vec![1, 2],
-            true,
-        )
+        .reduce_grad(input, upstream, crate::ReduceKind::Mean, vec![1, 2], true)
         .unwrap();
     let cotangent = graph.input("cotangent", [2, 3, 4]);
     let vjp = graph
@@ -258,7 +556,16 @@ fn convolution_graph_visualization_preserves_roles_geometry_and_derivatives() {
         .unwrap();
     let cotangent = graph.input("cotangent", [2, 1, 2, 3]);
     let vjp = graph
-        .conv2d_grad_vjp(cotangent, upstream, input, weight, Some(bias), options, 1, 0)
+        .conv2d_grad_vjp(
+            cotangent,
+            upstream,
+            input,
+            weight,
+            Some(bias),
+            options,
+            1,
+            0,
+        )
         .unwrap();
 
     let transpose_input = graph.input("transpose_input", [1, 2, 3, 4]);
@@ -300,12 +607,26 @@ fn convolution_graph_visualization_preserves_roles_geometry_and_derivatives() {
 
     let first = graph_viz(
         &graph,
-        &[forward, gradient, vjp, transpose, transpose_gradient, transpose_vjp],
+        &[
+            forward,
+            gradient,
+            vjp,
+            transpose,
+            transpose_gradient,
+            transpose_vjp,
+        ],
     )
     .unwrap();
     let second = graph_viz(
         &graph,
-        &[forward, gradient, vjp, transpose, transpose_gradient, transpose_vjp],
+        &[
+            forward,
+            gradient,
+            vjp,
+            transpose,
+            transpose_gradient,
+            transpose_vjp,
+        ],
     )
     .unwrap();
     assert_eq!(first, second);
@@ -337,11 +658,8 @@ fn einsum_graph_visualization_preserves_normalized_plan_and_derivative_roles() {
     let rhs = graph.input("rhs", [3, 4]);
     let forward = graph.einsum("ij,jk->ik", &[lhs, rhs]).unwrap();
     let upstream = graph.input("upstream", [2, 4]);
-    let plan = crate::EinsumPlan::parse(
-        "ij,jk->ik",
-        &[Shape::from([2, 3]), Shape::from([3, 4])],
-    )
-    .unwrap();
+    let plan =
+        crate::EinsumPlan::parse("ij,jk->ik", &[Shape::from([2, 3]), Shape::from([3, 4])]).unwrap();
     let gradient = graph
         .einsum_grad(upstream, &[lhs, rhs], plan.clone(), 0)
         .unwrap();

@@ -115,15 +115,26 @@ pub enum TokenizerErrorKind {
     UnsupportedPreset(String),
     MissingMetadata(&'static str),
     MalformedMetadata(GgufMetadataAccessError),
-    MetadataLengthMismatch { tokens: usize, token_types: usize },
-    TokenIdOutOfRange { key: &'static str, value: u64 },
+    MetadataLengthMismatch {
+        tokens: usize,
+        token_types: usize,
+    },
+    TokenIdOutOfRange {
+        key: &'static str,
+        value: u64,
+    },
     ConfiguredTokenIdOutOfRange {
         key: &'static str,
         token_id: u32,
         token_count: usize,
     },
-    InvalidNormalTokenCharacter { token_id: u32, character: char },
-    EmptySpecialToken { token_id: u32 },
+    InvalidNormalTokenCharacter {
+        token_id: u32,
+        character: char,
+    },
+    EmptySpecialToken {
+        token_id: u32,
+    },
     TokenNotFound(Vec<u8>),
     UnknownTokenId(u32),
 }
@@ -476,7 +487,11 @@ fn validate_configured_token_id(
     token_id: u32,
     token_count: usize,
 ) -> Result<(), TokenizerError> {
-    if usize::try_from(token_id).ok().filter(|&id| id < token_count).is_none() {
+    if usize::try_from(token_id)
+        .ok()
+        .filter(|&id| id < token_count)
+        .is_none()
+    {
         return Err(TokenizerError::new(
             TokenizerErrorKind::ConfiguredTokenIdOutOfRange {
                 key,

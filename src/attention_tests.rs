@@ -222,9 +222,24 @@ fn logsumexp_uses_detached_typed_exp2_log2_and_empty_max_identity() {
     let input = graph.input_dtype("x", [2, 2], DType::F64);
     let output = graph.logsumexp(input, Some(vec![-1]), false).unwrap();
     let trace = graph.trace(output).unwrap();
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("detach("))
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("exp2("))
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("log2("))
+    );
     let loss = graph.sum_all(output).unwrap();
     let gradient = graph.grad(loss, input).unwrap();
     let bindings = HashMap::from([(
@@ -268,9 +283,17 @@ fn logsumexp_uses_detached_typed_exp2_log2_and_empty_max_identity() {
     let values = execute(
         &empty_axis,
         output,
-        HashMap::from([("x".into(), TensorData::new([2, 0], Vec::<f32>::new()).unwrap())]),
+        HashMap::from([(
+            "x".into(),
+            TensorData::new([2, 0], Vec::<f32>::new()).unwrap(),
+        )]),
     );
-    assert!(values.to_vec_f64().iter().all(|value| value.is_infinite() && value.is_sign_negative()));
+    assert!(
+        values
+            .to_vec_f64()
+            .iter()
+            .all(|value| value.is_infinite() && value.is_sign_negative())
+    );
 
     let mut malformed = Graph::new();
     let x = malformed.input("x", [2]);
@@ -303,22 +326,26 @@ fn logsumexp_preflights_axes_and_keeps_established_nonfinite_boundaries() {
     let mut graph = Graph::new();
     let values = graph.input("values", [2]);
     let output = graph.logsumexp(values, Some(vec![-1]), false).unwrap();
-    assert!(execute(
-        &graph,
-        output,
-        HashMap::from([("values".into(), data([2], &[f32::NEG_INFINITY; 2]))]),
-    )
-    .scalar_at(0)
-    .as_f64()
-    .is_nan());
-    assert!(execute(
-        &graph,
-        output,
-        HashMap::from([("values".into(), data([2], &[f32::NAN, 0.]))]),
-    )
-    .scalar_at(0)
-    .as_f64()
-    .is_nan());
+    assert!(
+        execute(
+            &graph,
+            output,
+            HashMap::from([("values".into(), data([2], &[f32::NEG_INFINITY; 2]))]),
+        )
+        .scalar_at(0)
+        .as_f64()
+        .is_nan()
+    );
+    assert!(
+        execute(
+            &graph,
+            output,
+            HashMap::from([("values".into(), data([2], &[f32::NAN, 0.]))]),
+        )
+        .scalar_at(0)
+        .as_f64()
+        .is_nan()
+    );
 
     let mut integer_graph = Graph::new();
     let integer = integer_graph.input_dtype("integer", [2], DType::I32);
@@ -336,9 +363,24 @@ fn logsumexp_default_keeps_tinygrad_all_axis_literal_and_atomic_plan() {
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
     assert_eq!(graph.dtype(output).unwrap(), DType::F64);
     let trace = graph.trace(output).unwrap();
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("detach("))
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("exp2("))
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("log2("))
+    );
     let loss = graph.sum_all(output).unwrap();
     assert!(graph.grad(loss, input).is_ok());
 
@@ -631,7 +673,9 @@ fn triangular_masks_preserve_dtype_empty_shapes_and_float_gradients() {
 fn softmax_preflights_requested_dtype_before_stable_lowering() {
     let mut requested_integer = Graph::new();
     let input = requested_integer.input("input", [2]);
-    let output = requested_integer.softmax(input, -1, Some(DType::I32)).unwrap();
+    let output = requested_integer
+        .softmax(input, -1, Some(DType::I32))
+        .unwrap();
     // Tinygrad permits a requested exact dtype, then Exp lifts that storage to
     // F32. It is not a rejection and the final probabilities are F32.
     assert_eq!(requested_integer.dtype(output).unwrap(), DType::F32);
@@ -657,9 +701,24 @@ fn softmax_uses_detached_typed_exp2_sum_reciprocal_and_preflights() {
     let input = graph.input_dtype("x", [2, 2], DType::F64);
     let output = graph.softmax(input, -1, None).unwrap();
     let trace = graph.trace(output).unwrap();
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("reciprocal(")));
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("detach("))
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("exp2("))
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("reciprocal("))
+    );
     let loss = graph.sum_all(output).unwrap();
     let gradient = graph.grad(loss, input).unwrap();
     let bindings = HashMap::from([(
@@ -725,7 +784,12 @@ fn softmin_is_tinygrads_literal_neg_then_typed_softmax() {
         Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
     )));
     let trace = graph.trace(output).unwrap();
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("detach("))
+    );
     assert_eq!(graph.dtype(output).unwrap(), DType::F32);
     assert_close(
         &execute(
@@ -767,9 +831,24 @@ fn log_softmax_uses_detached_typed_exp2_log2_composition_and_preflights() {
     let input = graph.input_dtype("x", [2, 2], DType::F64);
     let output = graph.log_softmax(input, -1, None).unwrap();
     let trace = graph.trace(output).unwrap();
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
-    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("detach("))
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("exp2("))
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("log2("))
+    );
     let loss = graph.sum_all(output).unwrap();
     let gradient = graph.grad(loss, input).unwrap();
     let bindings = HashMap::from([(
@@ -787,7 +866,11 @@ fn log_softmax_uses_detached_typed_exp2_log2_composition_and_preflights() {
         .unwrap(),
     )]);
     let values = execute(&graph, output, bindings.clone());
-    assert_close(&values.to_vec_f64()[..2], &[-std::f64::consts::LN_2; 2], 1e-12);
+    assert_close(
+        &values.to_vec_f64()[..2],
+        &[-std::f64::consts::LN_2; 2],
+        1e-12,
+    );
     assert!(values.scalar_at(2).as_f64().is_nan());
     assert!(values.scalar_at(3).as_f64().is_nan());
     let gradients = execute(&graph, gradient, bindings).to_vec_f64();
@@ -836,11 +919,31 @@ fn softmax_family_default_wrappers_keep_tinygrad_axis_dtype_and_atomic_plans() {
         assert_eq!(graph.dtype(output).unwrap(), DType::F16);
     }
     let softmax_trace = graph.trace(softmax).unwrap();
-    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
-    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
-    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("reciprocal(")));
+    assert!(
+        softmax_trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("detach("))
+    );
+    assert!(
+        softmax_trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("exp2("))
+    );
+    assert!(
+        softmax_trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("reciprocal("))
+    );
     let log_trace = graph.trace(log_softmax).unwrap();
-    assert!(log_trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    assert!(
+        log_trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("log2("))
+    );
     assert!((0..graph.node_count()).any(|index| matches!(
         graph.op(crate::NodeId(index)).unwrap(),
         Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
@@ -1140,13 +1243,7 @@ fn attention_preflights_mask_geometry_before_lowering() {
     let value = valid.input("value", [1, 1, 2, 1]);
     let mask = valid.input_dtype("mask", [1, 2], DType::Bool);
     let output = valid
-        .scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            Some(mask),
-            AttentionOptions::default(),
-        )
+        .scaled_dot_product_attention(query, key, value, Some(mask), AttentionOptions::default())
         .unwrap();
     assert_close(
         &execute(

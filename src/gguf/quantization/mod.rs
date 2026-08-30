@@ -4,9 +4,9 @@ mod data;
 mod row_gather;
 
 use self::blocks::{
-    BlockDecodeError, decode_iq2_s_block, decode_iq3_s_block, decode_iq3_xxs_block, decode_iq4_xs_block,
-    decode_mxfp4_block, decode_q1_0_block, decode_q4_0_block, decode_q4_1_block,
-    decode_q4_k_block, decode_q5_0_block, decode_q5_1_block, decode_q5_k_block,
+    BlockDecodeError, decode_iq2_s_block, decode_iq3_s_block, decode_iq3_xxs_block,
+    decode_iq4_xs_block, decode_mxfp4_block, decode_q1_0_block, decode_q4_0_block,
+    decode_q4_1_block, decode_q4_k_block, decode_q5_0_block, decode_q5_1_block, decode_q5_k_block,
     decode_q6_k_block, decode_q8_0_block,
 };
 use super::{GgmlType, GgufError, GgufErrorKind, GgufTensor};

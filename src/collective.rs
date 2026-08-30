@@ -128,9 +128,7 @@ impl CollectivePlan {
             || self.actions != canonical.actions
             || self.cache_key != canonical.cache_key
         {
-            return Err(err(
-                "collective plan does not match its canonical request",
-            ));
+            return Err(err("collective plan does not match its canonical request"));
         }
         Ok(())
     }
@@ -532,126 +530,126 @@ impl CudaCollectiveGroup {
             let mut trace = Vec::new();
             let mut completed = vec![false; plan.actions.len()];
             for action in &plan.actions {
-            if action
-                .depends_on
-                .iter()
-                .any(|d| *d >= action.id || !completed[*d])
-            {
-                return Err(err("invalid collective action dependency"));
-            }
-            let src = self
-                .devices
-                .iter()
-                .position(|d| d == &action.source)
-                .ok_or_else(|| err("unknown action source"))?;
-            let dst = self
-                .devices
-                .iter()
-                .position(|d| d == &action.destination)
-                .ok_or_else(|| err("unknown action destination"))?;
-            let off = action
-                .range
-                .start
-                .checked_mul(dtype.itemsize())
-                .ok_or_else(|| err("range overflow"))?;
-            let n = action
-                .range
-                .len
-                .checked_mul(dtype.itemsize())
-                .ok_or_else(|| err("range overflow"))?;
-            if n != 0 {
-                let action_error =
-                    |operation: &'static str, error: CudaError| Error::CollectiveAction {
-                        action_id: action.id,
-                        operation,
-                        reason: error.to_string(),
-                    };
-                match action.op {
-                    ActionOp::LocalCopy => {
-                        let destination = inputs[dst]
-                            .view()
-                            .map_err(|e| action_error("local-copy", e))?;
-                        if src == dst {
-                            let original = originals[src]
+                if action
+                    .depends_on
+                    .iter()
+                    .any(|d| *d >= action.id || !completed[*d])
+                {
+                    return Err(err("invalid collective action dependency"));
+                }
+                let src = self
+                    .devices
+                    .iter()
+                    .position(|d| d == &action.source)
+                    .ok_or_else(|| err("unknown action source"))?;
+                let dst = self
+                    .devices
+                    .iter()
+                    .position(|d| d == &action.destination)
+                    .ok_or_else(|| err("unknown action destination"))?;
+                let off = action
+                    .range
+                    .start
+                    .checked_mul(dtype.itemsize())
+                    .ok_or_else(|| err("range overflow"))?;
+                let n = action
+                    .range
+                    .len
+                    .checked_mul(dtype.itemsize())
+                    .ok_or_else(|| err("range overflow"))?;
+                if n != 0 {
+                    let action_error =
+                        |operation: &'static str, error: CudaError| Error::CollectiveAction {
+                            action_id: action.id,
+                            operation,
+                            reason: error.to_string(),
+                        };
+                    match action.op {
+                        ActionOp::LocalCopy => {
+                            let destination = inputs[dst]
                                 .view()
                                 .map_err(|e| action_error("local-copy", e))?;
-                            destination
-                                .copy_from_view(off, &original, off, n)
-                                .map_err(|e| action_error("local-copy", e))?;
-                        } else {
-                            let staged = scratch[dst]
-                                .view()
-                                .map_err(|e| action_error("local-copy", e))?;
-                            destination
-                                .copy_from_view(off, &staged, off, n)
-                                .map_err(|e| action_error("local-copy", e))?;
+                            if src == dst {
+                                let original = originals[src]
+                                    .view()
+                                    .map_err(|e| action_error("local-copy", e))?;
+                                destination
+                                    .copy_from_view(off, &original, off, n)
+                                    .map_err(|e| action_error("local-copy", e))?;
+                            } else {
+                                let staged = scratch[dst]
+                                    .view()
+                                    .map_err(|e| action_error("local-copy", e))?;
+                                destination
+                                    .copy_from_view(off, &staged, off, n)
+                                    .map_err(|e| action_error("local-copy", e))?;
+                            }
+                            trace.push(CudaCollectiveTrace {
+                                action_id: action.id,
+                                operation: "local-copy",
+                                device: self.devices[dst].clone(),
+                                range: action.range,
+                                cache_key: None,
+                            });
                         }
-                        trace.push(CudaCollectiveTrace {
-                            action_id: action.id,
-                            operation: "local-copy",
-                            device: self.devices[dst].clone(),
-                            range: action.range,
-                            cache_key: None,
-                        });
-                    }
-                    ActionOp::Transfer => {
-                        let peers = self.peers.lock().expect("collective peer mutex poisoned");
-                        let peer = peers
-                            .get(&(src, dst))
-                            .expect("required collective peer exists");
-                        let mut t = scratch[dst]
-                            .copy_from_peer_async(
-                                off,
-                                peer,
-                                &originals[src],
-                                off,
-                                n,
+                        ActionOp::Transfer => {
+                            let peers = self.peers.lock().expect("collective peer mutex poisoned");
+                            let peer = peers
+                                .get(&(src, dst))
+                                .expect("required collective peer exists");
+                            let mut t = scratch[dst]
+                                .copy_from_peer_async(
+                                    off,
+                                    peer,
+                                    &originals[src],
+                                    off,
+                                    n,
+                                    &self.streams[dst],
+                                )
+                                .map_err(|e| action_error("peer-copy", e))?;
+                            t.wait().map_err(|e| action_error("peer-copy", e))?;
+                            drop(t);
+                            drop(peers);
+                            trace.push(CudaCollectiveTrace {
+                                action_id: action.id,
+                                operation: "peer-copy",
+                                device: self.devices[dst].clone(),
+                                range: action.range,
+                                cache_key: None,
+                            });
+                        }
+                        ActionOp::ReduceSum => {
+                            let k = self.adds[dst]
+                                .get_or_load(&self.contexts[dst], dtype)
+                                .map_err(|e| Error::CollectiveAction {
+                                    action_id: action.id,
+                                    operation: "add",
+                                    reason: e.to_string(),
+                                })?;
+                            k.launch(
+                                inputs[dst],
+                                action.range.start,
+                                &scratch[dst],
+                                action.range.start,
+                                action.range.len,
                                 &self.streams[dst],
+                                true,
                             )
-                            .map_err(|e| action_error("peer-copy", e))?;
-                        t.wait().map_err(|e| action_error("peer-copy", e))?;
-                        drop(t);
-                        drop(peers);
-                        trace.push(CudaCollectiveTrace {
-                            action_id: action.id,
-                            operation: "peer-copy",
-                            device: self.devices[dst].clone(),
-                            range: action.range,
-                            cache_key: None,
-                        });
-                    }
-                    ActionOp::ReduceSum => {
-                        let k = self.adds[dst]
-                            .get_or_load(&self.contexts[dst], dtype)
                             .map_err(|e| Error::CollectiveAction {
                                 action_id: action.id,
                                 operation: "add",
                                 reason: e.to_string(),
                             })?;
-                        k.launch(
-                            inputs[dst],
-                            action.range.start,
-                            &scratch[dst],
-                            action.range.start,
-                            action.range.len,
-                            &self.streams[dst],
-                            true,
-                        )
-                        .map_err(|e| Error::CollectiveAction {
-                            action_id: action.id,
-                            operation: "add",
-                            reason: e.to_string(),
-                        })?;
-                        trace.push(CudaCollectiveTrace {
-                            action_id: action.id,
-                            operation: "add",
-                            device: self.devices[dst].clone(),
-                            range: action.range,
-                            cache_key: Some(k.rendered().cache_key.clone()),
-                        });
+                            trace.push(CudaCollectiveTrace {
+                                action_id: action.id,
+                                operation: "add",
+                                device: self.devices[dst].clone(),
+                                range: action.range,
+                                cache_key: Some(k.rendered().cache_key.clone()),
+                            });
+                        }
                     }
                 }
-            }
                 completed[action.id] = true;
             }
             Ok(trace)
@@ -1181,14 +1179,16 @@ mod tests {
         // close also fails once, then its Drop retry releases it.
         mock.fail_stream_create_after(1, 2);
         mock.fail_stream_destroy_after(0, 2);
-        assert!(CudaCollectiveGroup::new(
-            group
-                .devices()
-                .iter()
-                .cloned()
-                .zip(primaries.iter().cloned()),
-        )
-        .is_err());
+        assert!(
+            CudaCollectiveGroup::new(
+                group
+                    .devices()
+                    .iter()
+                    .cloned()
+                    .zip(primaries.iter().cloned()),
+            )
+            .is_err()
+        );
         for (rank, input) in inputs.iter().enumerate() {
             assert_eq!(read(&mock, &primaries[rank], input, 8), values[rank]);
             assert_eq!(
@@ -1197,9 +1197,25 @@ mod tests {
             );
         }
         let calls = mock.calls();
-        assert_eq!(calls.iter().filter(|&&call| call == "stream_create").count(), 2);
-        assert_eq!(calls.iter().filter(|&&call| call == "stream_destroy").count(), 2);
-        assert!(calls.iter().all(|&call| call != "peer_enable" && call != "launch"));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|&&call| call == "stream_create")
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|&&call| call == "stream_destroy")
+                .count(),
+            2
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&call| call != "peer_enable" && call != "launch")
+        );
 
         let executor = CudaCollectiveGroup::new(
             group
@@ -1508,8 +1524,14 @@ mod tests {
             );
             assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), left);
             assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), right);
-            assert_eq!(mock.live_allocation_count(primaries[0].owner()), allocations[0]);
-            assert_eq!(mock.live_allocation_count(primaries[1].owner()), allocations[1]);
+            assert_eq!(
+                mock.live_allocation_count(primaries[0].owner()),
+                allocations[0]
+            );
+            assert_eq!(
+                mock.live_allocation_count(primaries[1].owner()),
+                allocations[1]
+            );
             assert_eq!(primaries[0].allocator().deferred_bytes(), 0);
             assert_eq!(primaries[1].allocator().deferred_bytes(), 0);
             assert!(
@@ -1549,8 +1571,14 @@ mod tests {
             allocations
         );
         let calls = mock.calls();
-        assert_eq!(calls.iter().filter(|&&call| call == "peer_enable").count(), 2);
-        assert_eq!(calls.iter().filter(|&&call| call == "peer_disable").count(), 1);
+        assert_eq!(
+            calls.iter().filter(|&&call| call == "peer_enable").count(),
+            2
+        );
+        assert_eq!(
+            calls.iter().filter(|&&call| call == "peer_disable").count(),
+            1
+        );
 
         let values: Vec<Vec<u8>> = (0_i32..3)
             .map(|rank| {
@@ -1569,11 +1597,20 @@ mod tests {
         let refs: Vec<_> = inputs.iter().collect();
         executor.all_reduce_sum(&plan, refs).unwrap();
         for (rank, input) in inputs.iter().enumerate() {
-            assert_eq!(read(&mock, &primaries[rank], input, expected.len()), expected);
+            assert_eq!(
+                read(&mock, &primaries[rank], input, expected.len()),
+                expected
+            );
         }
         let calls = mock.calls();
-        assert_eq!(calls.iter().filter(|&&call| call == "peer_enable").count(), 8);
-        assert_eq!(calls.iter().filter(|&&call| call == "peer_disable").count(), 1);
+        assert_eq!(
+            calls.iter().filter(|&&call| call == "peer_enable").count(),
+            8
+        );
+        assert_eq!(
+            calls.iter().filter(|&&call| call == "peer_disable").count(),
+            1
+        );
         drop((executor, inputs, primaries));
         assert_eq!(
             mock.calls()
@@ -1624,7 +1661,10 @@ mod tests {
             })
         ));
         for (rank, input) in inputs.iter().enumerate() {
-            assert_eq!(read(&mock, &primaries[rank], input, values[rank].len()), values[rank]);
+            assert_eq!(
+                read(&mock, &primaries[rank], input, values[rank].len()),
+                values[rank]
+            );
             assert_eq!(
                 mock.live_allocation_count(primaries[rank].owner()),
                 allocations[rank]
@@ -1641,7 +1681,10 @@ mod tests {
         let refs: Vec<_> = inputs.iter().collect();
         executor.all_reduce_sum(&plan, refs).unwrap();
         for (rank, input) in inputs.iter().enumerate() {
-            assert_eq!(read(&mock, &primaries[rank], input, expected.len()), expected);
+            assert_eq!(
+                read(&mock, &primaries[rank], input, expected.len()),
+                expected
+            );
         }
     }
 

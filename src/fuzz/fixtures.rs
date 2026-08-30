@@ -1,6 +1,6 @@
 use super::{
-    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzTensor,
-    FuzzScatterOp, FuzzUnaryOp,
+    FuzzBinaryOp, FuzzCase, FuzzCompareOp, FuzzLogicalOp, FuzzReduction, FuzzScatterOp, FuzzTensor,
+    FuzzUnaryOp,
 };
 use crate::{DType, Scalar, Storage, TensorData};
 
@@ -259,7 +259,10 @@ pub fn regression_cases() -> Vec<FuzzCase> {
         },
         FuzzCase::Gather {
             // Axis-one duplicate/reorder selection is intentionally obvious.
-            input: tensor(vec![2, 4], Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
+            input: tensor(
+                vec![2, 4],
+                Storage::F32(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+            ),
             index: tensor(vec![2, 3], Storage::I32(vec![3, 1, 1, 0, 2, 2])),
             axis: 1,
         },
@@ -276,7 +279,14 @@ pub fn regression_cases() -> Vec<FuzzCase> {
         FuzzCase::Gather {
             // Raw storage lanes retain signed zero and the NaN payload through
             // select_raw, with no scalar conversion on the Gather payload.
-            input: tensor(vec![3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])),
+            input: tensor(
+                vec![3],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::INFINITY,
+                ]),
+            ),
             index: tensor(vec![3], Storage::I32(vec![1, 0, 2])),
             axis: 0,
         },
@@ -291,7 +301,14 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             axis: 0,
         },
         FuzzCase::Gather {
-            input: tensor(vec![3], Storage::F64(vec![f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0x7ff8_0000_0000_0001), f64::INFINITY])),
+            input: tensor(
+                vec![3],
+                Storage::F64(vec![
+                    f64::from_bits(0x8000_0000_0000_0000),
+                    f64::from_bits(0x7ff8_0000_0000_0001),
+                    f64::INFINITY,
+                ]),
+            ),
             index: tensor(vec![3], Storage::I64(vec![1, 0, 2])),
             axis: 0,
         },
@@ -333,7 +350,14 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             // Replacement preserves payload bits without scalar conversion.
             base: tensor(vec![3], Storage::F32(vec![0.0, 1.0, 2.0])),
             index: tensor(vec![3], Storage::I32(vec![2, 0, 1])),
-            updates: tensor(vec![3], Storage::F32(vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0001), f32::INFINITY])),
+            updates: tensor(
+                vec![3],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_0001),
+                    f32::INFINITY,
+                ]),
+            ),
             axis: 0,
             op: FuzzScatterOp::Replace,
         },
@@ -374,9 +398,15 @@ pub fn regression_cases() -> Vec<FuzzCase> {
         FuzzCase::ConcatMany {
             // F64 remains a raw lane copy path, including its IEEE specials.
             inputs: vec![
-                tensor(vec![1], Storage::F64(vec![f64::from_bits(0x8000_0000_0000_0000)])),
+                tensor(
+                    vec![1],
+                    Storage::F64(vec![f64::from_bits(0x8000_0000_0000_0000)]),
+                ),
                 tensor(vec![0], Storage::F64(vec![])),
-                tensor(vec![1], Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001)])),
+                tensor(
+                    vec![1],
+                    Storage::F64(vec![f64::from_bits(0x7ff8_0000_0000_0001)]),
+                ),
                 tensor(vec![1], Storage::F64(vec![f64::INFINITY])),
             ],
             axis: 0,
@@ -418,7 +448,10 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             // Right-aligned batch broadcasting exercises generalized output
             // geometry without changing the raw Matmul operation.
             lhs: tensor(vec![2, 1, 1, 2], Storage::F64(vec![1.0, 2.0, 3.0, 4.0])),
-            rhs: tensor(vec![3, 2, 1], Storage::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            rhs: tensor(
+                vec![3, 2, 1],
+                Storage::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ),
         },
         FuzzCase::Matmul {
             lhs: tensor(vec![3, 0], Storage::F32(vec![])),

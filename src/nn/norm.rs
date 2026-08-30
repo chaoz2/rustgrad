@@ -2,9 +2,7 @@
 
 use super::{
     Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward, Parameter, ParameterRestore,
-    PendingModeEffects, StateKind, restore_parameters, state::join,
-    Mode, Module, Parameter, ParameterSnapshot, StateKind,
-    parameter::{ParameterRestore, next_version, restore_parameters},
+    ParameterSnapshot, PendingModeEffects, StateKind, parameter::next_version, restore_parameters,
     state::join,
 };
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};

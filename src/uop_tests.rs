@@ -159,8 +159,7 @@ fn add_zero_preserves_floating_signed_zero_and_keeps_integer_identity() {
     let value = UOp::constant(-7, UType::scalar(DType::I32));
     let zero = UOp::constant(0, UType::scalar(DType::I32));
     let add = UOp::binary(Binary::Add, value.clone(), zero);
-    let (rewritten, trace) =
-        uop::rewrite(&add, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    let (rewritten, trace) = uop::rewrite(&add, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
     assert_eq!(trace.rules, vec!["add-zero"]);
     assert_eq!(rewritten, value);
 }

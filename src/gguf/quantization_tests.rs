@@ -1,7 +1,7 @@
 use super::quantization::blocks::{
-    BlockDecodeError, decode_iq2_s_block, decode_iq3_s_block, decode_iq3_xxs_block, decode_iq4_xs_block,
-    decode_mxfp4_block, decode_q1_0_block, decode_q4_1_block, decode_q4_k_block,
-    decode_q5_0_block, decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
+    BlockDecodeError, decode_iq2_s_block, decode_iq3_s_block, decode_iq3_xxs_block,
+    decode_iq4_xs_block, decode_mxfp4_block, decode_q1_0_block, decode_q4_1_block,
+    decode_q4_k_block, decode_q5_0_block, decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
 };
 use crate::{GgmlType, QuantizedError, QuantizedTensorData, Shape};
 
@@ -87,9 +87,9 @@ fn q5_0_decodes_source_order_high_bits_nibble_halves_and_packed_extent() {
     }
 
     let expected = [
-        0.0, -7.5, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, 4.5, -3.0, -2.5, -2.0, -1.5,
-        -1.0, -0.5, -0.5, -1.0, 6.5, -2.0, -2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, 2.0,
-        -6.5, -7.0, -7.5, -8.0,
+        0.0, -7.5, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, 4.5, -3.0, -2.5, -2.0, -1.5, -1.0,
+        -0.5, -0.5, -1.0, 6.5, -2.0, -2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, 2.0, -6.5, -7.0,
+        -7.5, -8.0,
     ];
     assert_eq!(decode_q5_0_block(&block).unwrap(), expected);
 
@@ -123,7 +123,10 @@ fn q5_0_rejects_bad_block_lengths_nonfinite_scale_and_overflow() {
 
     let mut nonfinite = [0u8; 22];
     nonfinite[..2].copy_from_slice(&0x7c00u16.to_le_bytes());
-    assert_eq!(decode_q5_0_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+    assert_eq!(
+        decode_q5_0_block(&nonfinite),
+        Err(BlockDecodeError::NonFinite)
+    );
 
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Q5_0, Shape::from([usize::MAX, 32]), vec![]),
@@ -142,8 +145,8 @@ fn q5_1_decodes_source_order_high_bits_nibble_halves_and_packed_extent() {
     }
 
     let expected = [
-        10.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 14.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5,
-        9.5, 9.0, 16.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0, 4.5, 12.0, 3.5, 3.0, 2.5, 2.0,
+        10.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 14.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 9.5, 9.0,
+        16.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0, 4.5, 12.0, 3.5, 3.0, 2.5, 2.0,
     ];
     assert_eq!(decode_q5_1_block(&block).unwrap(), expected);
 
@@ -202,8 +205,7 @@ fn mxfp4_decodes_two_nibble_halves_signed_zero_and_repeated_blocks() {
         *packed = ((15 - lane as u8) << 4) | lane as u8;
     }
     let lut: [f32; 16] = [
-        0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, -0.0, -1.0, -2.0, -3.0, -4.0, -6.0,
-        -8.0, -12.0,
+        0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, -0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0,
     ];
     let expected = (0..16)
         .map(|code| lut[code])
@@ -236,7 +238,10 @@ fn mxfp4_handles_raw_exponent_boundaries_and_rejects_overflow() {
     let mut overflowing = [0u8; 17];
     overflowing[0] = 255;
     overflowing[1] = 7;
-    assert_eq!(decode_mxfp4_block(&overflowing), Err(BlockDecodeError::NonFinite));
+    assert_eq!(
+        decode_mxfp4_block(&overflowing),
+        Err(BlockDecodeError::NonFinite)
+    );
     assert_eq!(
         decode_mxfp4_block(&[0; 16]),
         Err(BlockDecodeError::Length {
@@ -265,17 +270,15 @@ fn q1_0_decodes_transposed_bits_signed_zero_and_repeated_blocks() {
         *payload = 1 << (byte % 8);
     }
     let expected = (0..8)
-        .flat_map(|bit| {
-            (0..16).map(move |byte| if byte % 8 == bit { 2.0 } else { -2.0 })
-        })
+        .flat_map(|bit| (0..16).map(move |byte| if byte % 8 == bit { 2.0 } else { -2.0 }))
         .collect::<Vec<f32>>();
     let decoded = decode_q1_0_block(&block).unwrap();
     assert_eq!(decoded.as_slice(), expected);
     assert_eq!(
         &decoded[..18],
         &[
-            2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, 2.0, -2.0, -2.0, -2.0,
-            -2.0, -2.0, -2.0, -2.0, -2.0, 2.0,
+            2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, 2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0,
+            -2.0, -2.0, 2.0,
         ]
     );
 
@@ -308,7 +311,10 @@ fn q1_0_handles_scale_signs_and_rejects_invalid_scale_lengths_and_extent() {
     for bits in [0x7c00u16, 0x7e00u16] {
         let mut nonfinite = [0u8; 18];
         nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
-        assert_eq!(decode_q1_0_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+        assert_eq!(
+            decode_q1_0_block(&nonfinite),
+            Err(BlockDecodeError::NonFinite)
+        );
     }
     assert_eq!(
         decode_q1_0_block(&[0; 17]),
@@ -350,8 +356,8 @@ fn iq4_xs_decodes_all_group_scales_and_nibble_halves() {
     }
 
     let lut = [
-        -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
-        53.0, 69.0, 89.0, 113.0,
+        -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
+        69.0, 89.0, 113.0,
     ];
     let expected = raw_scales
         .iter()
@@ -388,7 +394,10 @@ fn iq4_xs_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() 
     zero_scale[2..4].copy_from_slice(&0x0002u16.to_le_bytes());
     zero_scale[4] = 0x00;
     zero_scale[8] = 8;
-    assert_eq!(decode_iq4_xs_block(&zero_scale).unwrap()[0].to_bits(), 0.0f32.to_bits());
+    assert_eq!(
+        decode_iq4_xs_block(&zero_scale).unwrap()[0].to_bits(),
+        0.0f32.to_bits()
+    );
 
     assert_eq!(
         decode_iq4_xs_block(&[0; 135]),
@@ -407,7 +416,10 @@ fn iq4_xs_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() 
     for bits in [0x7c00u16, 0x7e00u16] {
         let mut nonfinite = [0u8; 136];
         nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
-        assert_eq!(decode_iq4_xs_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+        assert_eq!(
+            decode_iq4_xs_block(&nonfinite),
+            Err(BlockDecodeError::NonFinite)
+        );
     }
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Iq4Xs, Shape::from([usize::MAX, 256]), vec![]),
@@ -444,7 +456,11 @@ fn iq3_xxs_decodes_grid_boundaries_scale_words_signs_and_repeated_blocks() {
             let scale = (group as f32 + 0.5) * 0.5;
             (0..4).flat_map(move |sign_field| {
                 let selector = sign_fields[sign_field];
-                let parity = if selector.count_ones() % 2 == 0 { 0 } else { 0x80 };
+                let parity = if selector.count_ones() % 2 == 0 {
+                    0
+                } else {
+                    0x80
+                };
                 let signs = selector | parity;
                 (0..8).map(move |lane| {
                     let grid_selector = selectors[sign_field * 2 + lane / 4];
@@ -492,16 +508,21 @@ fn iq3_xxs_rejects_invalid_fields_lengths_and_packed_extent() {
     for bits in [0x7c00u16, 0x7e00u16] {
         let mut nonfinite = [0u8; 98];
         nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
-        assert_eq!(decode_iq3_xxs_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+        assert_eq!(
+            decode_iq3_xxs_block(&nonfinite),
+            Err(BlockDecodeError::NonFinite)
+        );
     }
     let mut largest_finite = [0u8; 98];
     largest_finite[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
     largest_finite[2..66].fill(255);
     largest_finite[66..98].fill(0xff);
-    assert!(decode_iq3_xxs_block(&largest_finite)
-        .unwrap()
-        .iter()
-        .all(|value| value.is_finite()));
+    assert!(
+        decode_iq3_xxs_block(&largest_finite)
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite())
+    );
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Iq3Xxs, Shape::from([usize::MAX, 256]), vec![]),
         Err(QuantizedError::Overflow)
@@ -593,7 +614,10 @@ fn iq3_s_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() {
     for bits in [0x7c00u16, 0x7e00u16] {
         let mut nonfinite = [0u8; 110];
         nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
-        assert_eq!(decode_iq3_s_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+        assert_eq!(
+            decode_iq3_s_block(&nonfinite),
+            Err(BlockDecodeError::NonFinite)
+        );
     }
     let mut largest_finite = [0u8; 110];
     largest_finite[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
@@ -601,10 +625,12 @@ fn iq3_s_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() {
     largest_finite[66..74].fill(0xff);
     largest_finite[74..106].fill(0xff);
     largest_finite[106..110].fill(0xff);
-    assert!(decode_iq3_s_block(&largest_finite)
-        .unwrap()
-        .iter()
-        .all(|value| value.is_finite()));
+    assert!(
+        decode_iq3_s_block(&largest_finite)
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite())
+    );
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Iq3S, Shape::from([usize::MAX, 256]), vec![]),
         Err(QuantizedError::Overflow)
@@ -632,23 +658,42 @@ fn iq2_s_decodes_selectors_high_plane_scales_signs_and_repeated_blocks() {
         (1022usize, 0x2b2b_2b2b_082b_2b08u64),
         (1023usize, 0x2b2b_2b2b_2b08_2b08u64),
     ];
-    let expected = (0..16).flat_map(|group| (0..2).flat_map(move |segment| {
-        let position = group * 2 + segment;
-        let high = if position < 4 { [0usize, 0, 3, 3][position] } else { position % 4 };
-        let selector = usize::from(lows[position % 4]) | (high << 8);
-        let word = grids.iter().find_map(|&(index, word)| (index == selector).then_some(word)).unwrap();
-        let signs = [0x00u8, 0xff, 0x55, 0xaa][position % 4];
-        (0..8).map(move |lane| {
-            let grid = ((word >> (lane * 8)) & 0xff) as f32;
-            let sign = if (signs >> lane) & 1 == 0 { 1.0 } else { -1.0 };
-            (group as f32 + 0.5) * 0.25 * grid * sign
+    let expected = (0..16)
+        .flat_map(|group| {
+            (0..2).flat_map(move |segment| {
+                let position = group * 2 + segment;
+                let high = if position < 4 {
+                    [0usize, 0, 3, 3][position]
+                } else {
+                    position % 4
+                };
+                let selector = usize::from(lows[position % 4]) | (high << 8);
+                let word = grids
+                    .iter()
+                    .find_map(|&(index, word)| (index == selector).then_some(word))
+                    .unwrap();
+                let signs = [0x00u8, 0xff, 0x55, 0xaa][position % 4];
+                (0..8).map(move |lane| {
+                    let grid = ((word >> (lane * 8)) & 0xff) as f32;
+                    let sign = if (signs >> lane) & 1 == 0 { 1.0 } else { -1.0 };
+                    (group as f32 + 0.5) * 0.25 * grid * sign
+                })
+            })
         })
-    })).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     let decoded = decode_iq2_s_block(&block).unwrap();
     assert_eq!(decoded.as_slice(), expected);
-    let packed = QuantizedTensorData::new(GgmlType::Iq2S, Shape::from([2, 256]), block.into_iter().chain(block).collect()).unwrap();
+    let packed = QuantizedTensorData::new(
+        GgmlType::Iq2S,
+        Shape::from([2, 256]),
+        block.into_iter().chain(block).collect(),
+    )
+    .unwrap();
     assert_eq!(packed.descriptor().bytes, 164);
-    assert_eq!(packed.dequantize_f32().unwrap().values(), expected.repeat(2));
+    assert_eq!(
+        packed.dequantize_f32().unwrap().values(),
+        expected.repeat(2)
+    );
 }
 
 #[test]
@@ -660,15 +705,34 @@ fn iq2_s_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() {
     assert_eq!(decoded[0].to_bits(), (-0.0f32).to_bits());
     assert_eq!(decoded[1].to_bits(), 0.0f32.to_bits());
     for (length, expected) in [(81, 82), (83, 82)] {
-        assert_eq!(decode_iq2_s_block(&vec![0; length]), Err(BlockDecodeError::Length { expected, actual: length }));
+        assert_eq!(
+            decode_iq2_s_block(&vec![0; length]),
+            Err(BlockDecodeError::Length {
+                expected,
+                actual: length
+            })
+        );
     }
     for bits in [0x7c00u16, 0x7e00u16] {
-        let mut nonfinite = [0u8; 82]; nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
-        assert_eq!(decode_iq2_s_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+        let mut nonfinite = [0u8; 82];
+        nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
+        assert_eq!(
+            decode_iq2_s_block(&nonfinite),
+            Err(BlockDecodeError::NonFinite)
+        );
     }
-    let mut largest_finite = [0xffu8; 82]; largest_finite[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
-    assert!(decode_iq2_s_block(&largest_finite).unwrap().iter().all(|value| value.is_finite()));
-    assert_eq!(QuantizedTensorData::new(GgmlType::Iq2S, Shape::from([usize::MAX, 256]), vec![]), Err(QuantizedError::Overflow));
+    let mut largest_finite = [0xffu8; 82];
+    largest_finite[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
+    assert!(
+        decode_iq2_s_block(&largest_finite)
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    assert_eq!(
+        QuantizedTensorData::new(GgmlType::Iq2S, Shape::from([usize::MAX, 256]), vec![]),
+        Err(QuantizedError::Overflow)
+    );
 }
 
 #[test]
@@ -763,10 +827,12 @@ fn q5_k_rejects_bad_blocks_nonfinite_fields_and_packed_extent_overflow() {
     largest_finite[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
     largest_finite[2..4].copy_from_slice(&0x7bffu16.to_le_bytes());
     largest_finite[4..].fill(0xff);
-    assert!(decode_q5_k_block(&largest_finite)
-        .unwrap()
-        .iter()
-        .all(|value| value.is_finite()));
+    assert!(
+        decode_q5_k_block(&largest_finite)
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite())
+    );
 
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Q5K, Shape::from([usize::MAX, 256]), vec![]),

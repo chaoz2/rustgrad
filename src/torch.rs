@@ -1432,7 +1432,8 @@ impl<'a> Pickle<'a> {
             }
             return Ok(Value::Dict(BTreeMap::new()));
         }
-        if module != "torch._utils" || !(name == "_rebuild_tensor" || name == "_rebuild_tensor_v2") {
+        if module != "torch._utils" || !(name == "_rebuild_tensor" || name == "_rebuild_tensor_v2")
+        {
             return Err(err(format!("pickle GLOBAL {module}.{name} is not allowed")));
         }
         let Value::Tuple(v) = args else {

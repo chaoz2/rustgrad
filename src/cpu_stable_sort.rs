@@ -250,12 +250,9 @@ impl BoundCpuStableSortPlan<'_> {
     /// oracle. Both private outputs are descriptor-checked before two
     /// infallible swaps publish them to their caller-owned destinations.
     pub fn execute(self) -> Result<(), CpuStableSortExecutionError> {
-        let (mut sorted_values, mut sorted_indices) = crate::backend::stable_sort_pair(
-            self.input,
-            self.plan.axis,
-            self.plan.descending,
-        )
-        .map_err(CpuStableSortExecutionError::Oracle)?;
+        let (mut sorted_values, mut sorted_indices) =
+            crate::backend::stable_sort_pair(self.input, self.plan.axis, self.plan.descending)
+                .map_err(CpuStableSortExecutionError::Oracle)?;
         if !validate_data(&sorted_values, &self.plan.values)
             || !validate_data(&sorted_indices, &self.plan.indices)
         {
@@ -290,10 +287,7 @@ fn make_descriptor(
 fn validate_data(data: &TensorData, descriptor: &CpuStableSortDescriptor) -> bool {
     data.shape() == &descriptor.shape
         && data.dtype() == descriptor.dtype
-        && data
-            .len()
-            .checked_mul(data.dtype().itemsize())
-            == Some(descriptor.bytes)
+        && data.len().checked_mul(data.dtype().itemsize()) == Some(descriptor.bytes)
 }
 
 const fn dtype_tag(dtype: DType) -> u8 {
@@ -338,12 +332,8 @@ mod tests {
         assert_eq!(first.indices().bytes, 24);
         let input = data([2, 3], &[1., 2., 3., 4., 5., 6.]);
         let output_values = data([2, 3], &[0.; 6]);
-        let output_indices = TensorData::from_scalars(
-            [2, 3],
-            DType::I32,
-            [crate::Scalar::I(0); 6],
-        )
-        .unwrap();
+        let output_indices =
+            TensorData::from_scalars([2, 3], DType::I32, [crate::Scalar::I(0); 6]).unwrap();
         first
             .preflight_bindings(&input, &output_values, &output_indices)
             .unwrap();
@@ -376,12 +366,8 @@ mod tests {
         let input = data([2], &[1., 2.]);
         let correct_values = data([2], &[0., 0.]);
         let wrong_values = data([1], &[0.]);
-        let correct_indices = TensorData::from_scalars(
-            [2],
-            DType::I32,
-            [crate::Scalar::I(0); 2],
-        )
-        .unwrap();
+        let correct_indices =
+            TensorData::from_scalars([2], DType::I32, [crate::Scalar::I(0); 2]).unwrap();
         assert!(matches!(
             plan.preflight_bindings(&input, &wrong_values, &correct_indices),
             Err(CpuStableSortPlanError::ValuesDescriptor)
@@ -390,12 +376,9 @@ mod tests {
             plan.preflight_bindings(&input, &input, &correct_indices),
             Err(CpuStableSortPlanError::AliasedBindings)
         ));
-        let wrong_input = TensorData::from_scalars(
-            [2],
-            DType::I32,
-            [crate::Scalar::I(1), crate::Scalar::I(2)],
-        )
-        .unwrap();
+        let wrong_input =
+            TensorData::from_scalars([2], DType::I32, [crate::Scalar::I(1), crate::Scalar::I(2)])
+                .unwrap();
         assert!(matches!(
             plan.preflight_bindings(&wrong_input, &correct_values, &correct_indices),
             Err(CpuStableSortPlanError::InputDescriptor)
@@ -438,12 +421,8 @@ mod tests {
         let plan = CpuStableSortPlan::from_graph(&graph, source, values, indices).unwrap();
         let input = data([2, 3], &[1., 1., f32::NAN, -0.0, 0.0, -0.0]);
         let mut output_values = data([2, 3], &[-9.; 6]);
-        let mut output_indices = TensorData::from_scalars(
-            [2, 3],
-            DType::I32,
-            [crate::Scalar::I(-1); 6],
-        )
-        .unwrap();
+        let mut output_indices =
+            TensorData::from_scalars([2, 3], DType::I32, [crate::Scalar::I(-1); 6]).unwrap();
         plan.bind(&input, &mut output_values, &mut output_indices)
             .unwrap()
             .execute()
@@ -454,9 +433,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1., 1., 1., -0., -0., -0.]
         );
-        assert_eq!(output_values.scalar_at(3).as_f64().to_bits(), (-0.0f64).to_bits());
-        assert_eq!(output_values.scalar_at(4).as_f64().to_bits(), (-0.0f64).to_bits());
-        assert_eq!(output_values.scalar_at(5).as_f64().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(
+            output_values.scalar_at(3).as_f64().to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            output_values.scalar_at(4).as_f64().to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            output_values.scalar_at(5).as_f64().to_bits(),
+            (-0.0f64).to_bits()
+        );
         assert_eq!(
             (0..output_indices.len())
                 .map(|index| output_indices.scalar_at(index).as_i64())

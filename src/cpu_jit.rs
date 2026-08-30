@@ -1392,23 +1392,48 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
                 ));
             }
         }
-        crate::MovementKernelKind::Pad { input, padding, fill_bits } => {
+        crate::MovementKernelKind::Pad {
+            input,
+            padding,
+            fill_bits,
+        } => {
             let output_len = elements(&plan.output_shape)?;
             if output_len == 0 {
                 lines.push("  /* empty pad domain */".into());
             } else {
-                lines.push(format!("  for (size_t rg_i=0; rg_i<{output_len}u; ++rg_i) {{"));
+                lines.push(format!(
+                    "  for (size_t rg_i=0; rg_i<{output_len}u; ++rg_i) {{"
+                ));
                 let mut guards = Vec::new();
                 let mut offset = Vec::new();
-                for (axis, ((&out_dim, &in_dim), &(before, _))) in plan.output_shape.dims().iter().zip(input.shape.dims()).zip(padding).enumerate() {
-                    let out_stride = plan.output_shape.dims()[axis + 1..].iter().product::<usize>();
+                for (axis, ((&out_dim, &in_dim), &(before, _))) in plan
+                    .output_shape
+                    .dims()
+                    .iter()
+                    .zip(input.shape.dims())
+                    .zip(padding)
+                    .enumerate()
+                {
+                    let out_stride = plan.output_shape.dims()[axis + 1..]
+                        .iter()
+                        .product::<usize>();
                     let in_stride = input.shape.dims()[axis + 1..].iter().product::<usize>();
                     let coord = format!("((rg_i/{out_stride}u)%{out_dim}u)");
                     guards.push(format!("{coord}>={before}u && {coord}-{before}u<{in_dim}u"));
-                    if in_dim != 0 { offset.push(format!("({coord}-{before}u)*{in_stride}u")); }
+                    if in_dim != 0 {
+                        offset.push(format!("({coord}-{before}u)*{in_stride}u"));
+                    }
                 }
-                let guard = if guards.is_empty() { "1".into() } else { guards.join(" && ") };
-                let source = if offset.is_empty() { "0".into() } else { offset.join("+") };
+                let guard = if guards.is_empty() {
+                    "1".into()
+                } else {
+                    guards.join(" && ")
+                };
+                let source = if offset.is_empty() {
+                    "0".into()
+                } else {
+                    offset.join("+")
+                };
                 lines.push(format!("    if ({guard}) (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[{source}]; else (({output_ty}*)buffers[{output_slot}])[rg_i] = {};", ids[&(input.node.index() as u64)], movement_fill_literal(plan.dtype, *fill_bits)));
                 lines.push("  }".into());
             }
@@ -1602,10 +1627,7 @@ fn render_vector_program(
     if lanes == 0
         || program.main_elements % lanes != 0
         || program.tail_elements >= lanes
-        || program
-            .main_elements
-            .checked_add(program.tail_elements)
-            != Some(elements)
+        || program.main_elements.checked_add(program.tail_elements) != Some(elements)
     {
         return Err(JitError::Unsupported(
             "invalid portable lane/tail control".into(),
@@ -2201,7 +2223,9 @@ fn render_reduction(
             } else {
                 "||"
             };
-            lines.push(format!("      rg_acc = (uint8_t)(rg_acc {operator} ({value}));"));
+            lines.push(format!(
+                "      rg_acc = (uint8_t)(rg_acc {operator} ({value}));"
+            ));
         } else if matches!(kind, crate::ReduceKind::Product) {
             lines.push(format!(
                 "      rg_acc = ({acc})(rg_acc * ({acc})({value}));"
@@ -2382,10 +2406,9 @@ fn emit(
                 // Negating exact integer storage must never ask C to negate a
                 // signed minimum. Subtract from zero in the corresponding
                 // unsigned width, then restore the source storage lane.
-                crate::UnaryOp::Neg => wrap_expr(
-                    input_ty,
-                    format!("0-({})({a})", unsigned_ctype(input_ty)?),
-                )?,
+                crate::UnaryOp::Neg => {
+                    wrap_expr(input_ty, format!("0-({})({a})", unsigned_ctype(input_ty)?))?
+                }
                 crate::UnaryOp::Abs if input_ty.is_float() => format!("fabs({a})"),
                 crate::UnaryOp::Abs if input_ty == DType::Bool => a,
                 crate::UnaryOp::Abs
@@ -2466,14 +2489,10 @@ fn emit(
                 crate::UnaryOp::Sign if ty == DType::Bool => {
                     format!("((uint8_t)(({a})!=0))")
                 }
-                crate::UnaryOp::Sign
-                    if matches!(ty.category(), crate::DTypeCategory::Unsigned) =>
-                {
+                crate::UnaryOp::Sign if matches!(ty.category(), crate::DTypeCategory::Unsigned) => {
                     format!("(({a})==0?0:1)")
                 }
-                crate::UnaryOp::Sign
-                    if matches!(ty.category(), crate::DTypeCategory::Signed) =>
-                {
+                crate::UnaryOp::Sign if matches!(ty.category(), crate::DTypeCategory::Signed) => {
                     format!("(({a})<0?-1:(({a})>0?1:0))")
                 }
                 crate::UnaryOp::Sign if ty.is_float() => {
@@ -2819,8 +2838,13 @@ impl Library {
 }
 fn load_library_call(
     path: &Path,
-) -> Result<(Arc<Library>, unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int), JitError>
-{
+) -> Result<
+    (
+        Arc<Library>,
+        unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int,
+    ),
+    JitError,
+> {
     let lib = Arc::new(Library::open(path)?);
     let call = unsafe { lib.symbol(b"rustgrad_kernel\0")? };
     Ok((lib, call))
@@ -2853,8 +2877,7 @@ fn last_error() -> String {
 mod tests {
     use super::*;
     use crate::{
-        Backend, CompareOp, CpuBackend, Graph, Op, Scalar, Shape, Storage, SymbolicExpr,
-        TensorData,
+        Backend, CompareOp, CpuBackend, Graph, Op, Scalar, Shape, Storage, SymbolicExpr, TensorData,
     };
     use std::collections::{BTreeMap, HashMap};
 
@@ -2904,11 +2927,14 @@ mod tests {
             let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
             let topological = uop.topological().unwrap();
             assert!(topological.iter().any(|node| {
-                matches!(node.kind(), UOpKind::Cast) && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
+                matches!(node.kind(), UOpKind::Cast)
+                    && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
             }));
-            assert!(topological.iter().any(|node| {
-                matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne))
-            }));
+            assert!(
+                topological
+                    .iter()
+                    .any(|node| { matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)) })
+            );
 
             // `!=0` is the source truthiness predicate: it keeps fractional
             // nonzero F32 values, NaNs, and infinities true while both zeros
@@ -2937,26 +2963,50 @@ mod tests {
             let input = graph.input_dtype("input", Shape::from([2]), dtype);
             let neg = graph.unary(crate::UnaryOp::Neg, input).unwrap();
             let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
-            assert!(matches!(graph.op(neg).unwrap(), Op::Unary { op: crate::UnaryOp::Neg, .. }));
-            assert!(matches!(graph.op(abs).unwrap(), Op::Unary { op: crate::UnaryOp::Abs, .. }));
+            assert!(matches!(
+                graph.op(neg).unwrap(),
+                Op::Unary {
+                    op: crate::UnaryOp::Neg,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                graph.op(abs).unwrap(),
+                Op::Unary {
+                    op: crate::UnaryOp::Abs,
+                    ..
+                }
+            ));
 
             let neg_uop = crate::lower_graph_elementwise(&graph, neg).unwrap();
             let abs_uop = crate::lower_graph_elementwise(&graph, abs).unwrap();
             let neg_source = CpuJit::render(&neg_uop).unwrap();
             let abs_source = CpuJit::render(&abs_uop).unwrap();
             assert!(neg_source.source.contains(RENDERER_VERSION));
-            assert!(neg_source.source.contains(&format!("0-({unsigned})")), "{dtype:?}");
+            assert!(
+                neg_source.source.contains(&format!("0-({unsigned})")),
+                "{dtype:?}"
+            );
             assert!(neg_source.source.contains(helper), "{dtype:?}");
-            assert!(abs_source.source.contains(&format!("<0 ? 0-({unsigned})")), "{dtype:?}");
+            assert!(
+                abs_source.source.contains(&format!("<0 ? 0-({unsigned})")),
+                "{dtype:?}"
+            );
             assert!(abs_source.source.contains(helper), "{dtype:?}");
             assert!(!abs_source.source.contains("fabs("), "{dtype:?}");
-            assert_eq!(neg_source.cache_key, CpuJit::render(&neg_uop).unwrap().cache_key);
+            assert_eq!(
+                neg_source.cache_key,
+                CpuJit::render(&neg_uop).unwrap().cache_key
+            );
             let neg_vector = CpuJit::render_vectorized(&neg_uop).unwrap();
             let abs_vector = CpuJit::render_vectorized(&abs_uop).unwrap();
             assert!(neg_vector.source.contains("B2 VectorProgram"));
             assert!(abs_vector.source.contains("B2 VectorProgram"));
             assert!(neg_vector.source.contains("rg_i"), "{dtype:?}");
-            assert!(abs_vector.source.contains(&format!("<0 ? 0-({unsigned})")), "{dtype:?}");
+            assert!(
+                abs_vector.source.contains(&format!("<0 ? 0-({unsigned})")),
+                "{dtype:?}"
+            );
         }
 
         for dtype in [DType::U8, DType::U16, DType::U32, DType::U64] {
@@ -2964,12 +3014,18 @@ mod tests {
             let input = graph.input_dtype("input", Shape::from([2]), dtype);
             let neg = graph.unary(crate::UnaryOp::Neg, input).unwrap();
             let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
-            let neg_source = CpuJit::render(&crate::lower_graph_elementwise(&graph, neg).unwrap()).unwrap();
-            let abs_source = CpuJit::render(&crate::lower_graph_elementwise(&graph, abs).unwrap()).unwrap();
+            let neg_source =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, neg).unwrap()).unwrap();
+            let abs_source =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, abs).unwrap()).unwrap();
             assert!(neg_source.source.contains("0-(uint"), "{dtype:?}");
             assert!(!abs_source.source.contains("fabs("), "{dtype:?}");
-            let neg_vector = CpuJit::render_vectorized(&crate::lower_graph_elementwise(&graph, neg).unwrap()).unwrap();
-            let abs_vector = CpuJit::render_vectorized(&crate::lower_graph_elementwise(&graph, abs).unwrap()).unwrap();
+            let neg_vector =
+                CpuJit::render_vectorized(&crate::lower_graph_elementwise(&graph, neg).unwrap())
+                    .unwrap();
+            let abs_vector =
+                CpuJit::render_vectorized(&crate::lower_graph_elementwise(&graph, abs).unwrap())
+                    .unwrap();
             assert!(neg_vector.source.contains("B2 VectorProgram"));
             assert!(abs_vector.source.contains("B2 VectorProgram"));
             assert!(neg_vector.source.contains("0-(uint"), "{dtype:?}");
@@ -2979,22 +3035,44 @@ mod tests {
         let bool_input = bool_graph.input_dtype("input", Shape::from([2]), DType::Bool);
         let bool_neg = bool_graph.unary(crate::UnaryOp::Neg, bool_input).unwrap();
         let bool_abs = bool_graph.unary(crate::UnaryOp::Abs, bool_input).unwrap();
-        let bool_neg_source = CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_neg).unwrap()).unwrap();
-        let bool_abs_source = CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap()).unwrap();
+        let bool_neg_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_neg).unwrap())
+                .unwrap();
+        let bool_abs_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap())
+                .unwrap();
         assert!(bool_neg_source.source.contains("((uint8_t)!("));
         assert!(!bool_abs_source.source.contains("fabs("));
-        assert!(CpuJit::render_vectorized(&crate::lower_graph_elementwise(&bool_graph, bool_neg).unwrap()).unwrap().source.contains("B2 VectorProgram"));
-        assert!(CpuJit::render_vectorized(&crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap()).unwrap().source.contains("B2 VectorProgram"));
+        assert!(
+            CpuJit::render_vectorized(
+                &crate::lower_graph_elementwise(&bool_graph, bool_neg).unwrap()
+            )
+            .unwrap()
+            .source
+            .contains("B2 VectorProgram")
+        );
+        assert!(
+            CpuJit::render_vectorized(
+                &crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap()
+            )
+            .unwrap()
+            .source
+            .contains("B2 VectorProgram")
+        );
         let bool_bindings = HashMap::from([(
             "input".to_string(),
             TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap(),
         )]);
         assert_eq!(
-            CpuBackend.execute(&bool_graph, bool_neg, &bool_bindings).unwrap(),
+            CpuBackend
+                .execute(&bool_graph, bool_neg, &bool_bindings)
+                .unwrap(),
             TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap()
         );
         assert_eq!(
-            CpuBackend.execute(&bool_graph, bool_abs, &bool_bindings).unwrap(),
+            CpuBackend
+                .execute(&bool_graph, bool_abs, &bool_bindings)
+                .unwrap(),
             TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap()
         );
 
@@ -3005,8 +3083,14 @@ mod tests {
             let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
             let neg_uop = crate::lower_graph_elementwise(&graph, neg).unwrap();
             let abs_uop = crate::lower_graph_elementwise(&graph, abs).unwrap();
-            assert!(CpuJit::render(&neg_uop).unwrap().source.contains("-(("), "{dtype:?}");
-            assert!(CpuJit::render(&abs_uop).unwrap().source.contains("fabs("), "{dtype:?}");
+            assert!(
+                CpuJit::render(&neg_uop).unwrap().source.contains("-(("),
+                "{dtype:?}"
+            );
+            assert!(
+                CpuJit::render(&abs_uop).unwrap().source.contains("fabs("),
+                "{dtype:?}"
+            );
             let neg_vector = CpuJit::render_vectorized(&neg_uop).unwrap();
             let abs_vector = CpuJit::render_vectorized(&abs_uop).unwrap();
             if matches!(dtype, DType::F16 | DType::BF16) {
@@ -3021,11 +3105,36 @@ mod tests {
         // Raw U64 lanes stay integer-width: no f64/fabs path is permitted
         // for values above 2^53, and signed minima retain wrapping behavior.
         for (dtype, input, negated, absolute) in [
-            (DType::I8, TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap()),
-            (DType::I16, TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap()),
-            (DType::I32, TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap()),
-            (DType::I64, TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap()),
-            (DType::U64, TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap(), TensorData::from_storage([1], Storage::U64(vec![u64::MAX - (1u64 << 53)])).unwrap(), TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap()),
+            (
+                DType::I8,
+                TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(),
+                TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(),
+                TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(),
+            ),
+            (
+                DType::I16,
+                TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(),
+                TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(),
+                TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(),
+            ),
+            (
+                DType::I32,
+                TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(),
+                TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(),
+                TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(),
+            ),
+            (
+                DType::I64,
+                TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(),
+                TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(),
+                TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(),
+            ),
+            (
+                DType::U64,
+                TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap(),
+                TensorData::from_storage([1], Storage::U64(vec![u64::MAX - (1u64 << 53)])).unwrap(),
+                TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap(),
+            ),
         ] {
             let mut graph = Graph::new();
             let source = graph.input_dtype("input", Shape::from([1]), dtype);
@@ -3033,17 +3142,36 @@ mod tests {
             let abs = graph.unary(crate::UnaryOp::Abs, source).unwrap();
             let bindings = HashMap::from([("input".to_string(), input)]);
             assert_eq!(CpuBackend.execute(&graph, neg, &bindings).unwrap(), negated);
-            assert_eq!(CpuBackend.execute(&graph, abs, &bindings).unwrap(), absolute);
+            assert_eq!(
+                CpuBackend.execute(&graph, abs, &bindings).unwrap(),
+                absolute
+            );
         }
 
         // Maxima take the ordinary exact-width path while minima wrap.  In
         // particular this also proves the scalar renderer never needs an
         // f64 detour to represent I64 arithmetic.
         for (dtype, input, negated) in [
-            (DType::I8, TensorData::from_storage([1], Storage::I8(vec![i8::MAX])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![-i8::MAX])).unwrap()),
-            (DType::I16, TensorData::from_storage([1], Storage::I16(vec![i16::MAX])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![-i16::MAX])).unwrap()),
-            (DType::I32, TensorData::from_storage([1], Storage::I32(vec![i32::MAX])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![-i32::MAX])).unwrap()),
-            (DType::I64, TensorData::from_storage([1], Storage::I64(vec![i64::MAX])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![-i64::MAX])).unwrap()),
+            (
+                DType::I8,
+                TensorData::from_storage([1], Storage::I8(vec![i8::MAX])).unwrap(),
+                TensorData::from_storage([1], Storage::I8(vec![-i8::MAX])).unwrap(),
+            ),
+            (
+                DType::I16,
+                TensorData::from_storage([1], Storage::I16(vec![i16::MAX])).unwrap(),
+                TensorData::from_storage([1], Storage::I16(vec![-i16::MAX])).unwrap(),
+            ),
+            (
+                DType::I32,
+                TensorData::from_storage([1], Storage::I32(vec![i32::MAX])).unwrap(),
+                TensorData::from_storage([1], Storage::I32(vec![-i32::MAX])).unwrap(),
+            ),
+            (
+                DType::I64,
+                TensorData::from_storage([1], Storage::I64(vec![i64::MAX])).unwrap(),
+                TensorData::from_storage([1], Storage::I64(vec![-i64::MAX])).unwrap(),
+            ),
         ] {
             let mut graph = Graph::new();
             let source = graph.input_dtype("input", Shape::from([1]), dtype);
@@ -3055,8 +3183,16 @@ mod tests {
         }
 
         for (dtype, input) in [
-            (DType::F32, TensorData::from_storage([3], Storage::F32(vec![-0.0, f32::NAN, f32::INFINITY])).unwrap()),
-            (DType::F64, TensorData::from_storage([3], Storage::F64(vec![-0.0, f64::NAN, f64::INFINITY])).unwrap()),
+            (
+                DType::F32,
+                TensorData::from_storage([3], Storage::F32(vec![-0.0, f32::NAN, f32::INFINITY]))
+                    .unwrap(),
+            ),
+            (
+                DType::F64,
+                TensorData::from_storage([3], Storage::F64(vec![-0.0, f64::NAN, f64::INFINITY]))
+                    .unwrap(),
+            ),
         ] {
             let mut graph = Graph::new();
             let source = graph.input_dtype("input", Shape::from([3]), dtype);
@@ -3080,7 +3216,10 @@ mod tests {
         let input = graph.input_dtype("input", Shape::from([1]), DType::F32);
         let output = graph.abs(input).unwrap();
         let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
-        assert!(matches!(CpuJit::render(&uop), Err(JitError::Unsupported(_))));
+        assert!(matches!(
+            CpuJit::render(&uop),
+            Err(JitError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -3120,10 +3259,8 @@ mod tests {
             // IsFinite remains its source-literal IsInf/IsNaN/logical-not
             // composition for every input storage dtype.
             let finite = graph.isfinite(input).unwrap();
-            let finite = CpuJit::render(
-                &crate::lower_graph_elementwise(&graph, finite).unwrap(),
-            )
-            .unwrap();
+            let finite =
+                CpuJit::render(&crate::lower_graph_elementwise(&graph, finite).unwrap()).unwrap();
             assert_eq!(finite.abi.buffers.last().unwrap().dtype, DType::Bool);
             assert!(finite.source.contains("||"), "{dtype:?}");
             assert!(finite.source.contains("(uint8_t)!("), "{dtype:?}");
@@ -3134,16 +3271,14 @@ mod tests {
         let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
         let f16_output = narrow.exp2(f16).unwrap();
         let bf16_output = narrow.exp2(bf16).unwrap();
-        let f16_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
-        )
-        .unwrap()
-        .source;
-        let bf16_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
-        )
-        .unwrap()
-        .source;
+        let f16_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_output).unwrap())
+                .unwrap()
+                .source;
+        let bf16_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_output).unwrap())
+                .unwrap()
+                .source;
         assert!(f16_source.contains("rg_f32_to_f16(exp2("));
         assert!(bf16_source.contains("rg_f32_to_bf16(exp2("));
 
@@ -3155,7 +3290,12 @@ mod tests {
         let loss = differentiated.sum_all(output).unwrap();
         let gradient = differentiated.grad(loss, input).unwrap();
         let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
-        assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("exp2("));
+        assert!(
+            CpuJit::render(&gradient_uop)
+                .unwrap()
+                .source
+                .contains("exp2(")
+        );
     }
 
     #[test]
@@ -3197,16 +3337,14 @@ mod tests {
         let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
         let f16_output = narrow.log2(f16).unwrap();
         let bf16_output = narrow.log2(bf16).unwrap();
-        let f16_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
-        )
-        .unwrap()
-        .source;
-        let bf16_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
-        )
-        .unwrap()
-        .source;
+        let f16_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_output).unwrap())
+                .unwrap()
+                .source;
+        let bf16_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_output).unwrap())
+                .unwrap()
+                .source;
         assert!(f16_source.contains("rg_f32_to_f16(log2("));
         assert!(bf16_source.contains("rg_f32_to_bf16(log2("));
 
@@ -3219,15 +3357,30 @@ mod tests {
         let loss = differentiated.sum_all(output).unwrap();
         let gradient = differentiated.grad(loss, input).unwrap();
         let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
-        assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("log2("));
+        assert!(
+            CpuJit::render(&gradient_uop)
+                .unwrap()
+                .source
+                .contains("log2(")
+        );
     }
 
     #[test]
     fn sin_emits_the_cpu_oracle_path_and_keeps_b1_fail_closed() {
         for dtype in [
-            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
-            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
-            DType::BF16, DType::F32, DType::F64,
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([5]), dtype);
@@ -3246,8 +3399,18 @@ mod tests {
         let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
         let f16_out = narrow.sin(f16).unwrap();
         let bf16_out = narrow.sin(bf16).unwrap();
-        assert!(CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_out).unwrap()).unwrap().source.contains("rg_f32_to_f16(sin("));
-        assert!(CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_out).unwrap()).unwrap().source.contains("rg_f32_to_bf16(sin("));
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_out).unwrap())
+                .unwrap()
+                .source
+                .contains("rg_f32_to_f16(sin(")
+        );
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_out).unwrap())
+                .unwrap()
+                .source
+                .contains("rg_f32_to_bf16(sin(")
+        );
 
         // The source VJP is `sin(pi/2 - x) * upstream`, not a raw Cos node.
         let mut differentiated = Graph::new();
@@ -3255,15 +3418,30 @@ mod tests {
         let output = differentiated.sin(input).unwrap();
         let loss = differentiated.sum_all(output).unwrap();
         let gradient = differentiated.grad(loss, input).unwrap();
-        assert!(CpuJit::render(&crate::lower_graph_elementwise(&differentiated, gradient).unwrap()).unwrap().source.contains("sin("));
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&differentiated, gradient).unwrap())
+                .unwrap()
+                .source
+                .contains("sin(")
+        );
     }
 
     #[test]
     fn trunc_emits_float_c11_and_exact_storage_identity_with_vector_fallback() {
         for dtype in [
-            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
-            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
-            DType::BF16, DType::F32, DType::F64,
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([5]), dtype);
@@ -3299,18 +3477,18 @@ mod tests {
         let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
         let f16_output = narrow.trunc(f16).unwrap();
         let bf16_output = narrow.trunc(bf16).unwrap();
-        assert!(CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap()
-        )
-        .unwrap()
-        .source
-        .contains("rg_f32_to_f16(trunc("));
-        assert!(CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap()
-        )
-        .unwrap()
-        .source
-        .contains("rg_f32_to_bf16(trunc("));
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_output).unwrap())
+                .unwrap()
+                .source
+                .contains("rg_f32_to_f16(trunc(")
+        );
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_output).unwrap())
+                .unwrap()
+                .source
+                .contains("rg_f32_to_bf16(trunc(")
+        );
 
         // Floor, Ceil, Round, and float division modes source-literally use
         // Trunc. Their generated graphs must now be admitted without changing
@@ -3325,26 +3503,39 @@ mod tests {
             composed.trunc_div(lhs, rhs).unwrap(),
             composed.floor_div(lhs, rhs).unwrap(),
         ] {
-            assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, output).unwrap())
-                .unwrap()
-                .source
-                .contains("trunc("));
+            assert!(
+                CpuJit::render(&crate::lower_graph_elementwise(&composed, output).unwrap())
+                    .unwrap()
+                    .source
+                    .contains("trunc(")
+            );
         }
 
         // Reverse mode for Trunc is the existing explicit zero graph.
         let output = composed.trunc(lhs).unwrap();
         let loss = composed.sum_all(output).unwrap();
         let gradient = composed.grad(loss, lhs).unwrap();
-        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap())
-            .is_ok());
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap()).is_ok()
+        );
     }
 
     #[test]
     fn isinf_emits_typed_predicate_and_admits_source_boolean_compositions() {
         for dtype in [
-            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
-            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
-            DType::BF16, DType::F32, DType::F64,
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([5]), dtype);
@@ -3380,16 +3571,14 @@ mod tests {
         let bf16 = narrow.input_dtype("bf16", Shape::from([0]), DType::BF16);
         let f16_output = narrow.isinf(f16).unwrap();
         let bf16_output = narrow.isinf(bf16).unwrap();
-        let f16_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
-        )
-        .unwrap()
-        .source;
-        let bf16_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
-        )
-        .unwrap()
-        .source;
+        let f16_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_output).unwrap())
+                .unwrap()
+                .source;
+        let bf16_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_output).unwrap())
+                .unwrap()
+                .source;
         assert!(f16_source.contains("rg_f16_to_f32"));
         assert!(f16_source.contains("(uint8_t)isinf("));
         assert!(bf16_source.contains("rg_bf16_to_f32"));
@@ -3402,23 +3591,29 @@ mod tests {
         let both = composed.isinf_with_signs(input, true, true).unwrap();
         let positive = composed.isinf_with_signs(input, true, false).unwrap();
         let finite = composed.isfinite(input).unwrap();
-        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, both).unwrap())
-            .unwrap()
-            .source
-            .contains("(uint8_t)isinf("));
-        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, positive).unwrap())
-            .unwrap()
-            .source
-            .contains("=="));
-        let finite_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&composed, finite).unwrap(),
-        )
-        .unwrap()
-        .source;
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&composed, both).unwrap())
+                .unwrap()
+                .source
+                .contains("(uint8_t)isinf(")
+        );
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&composed, positive).unwrap())
+                .unwrap()
+                .source
+                .contains("==")
+        );
+        let finite_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&composed, finite).unwrap())
+                .unwrap()
+                .source;
         assert!(finite_source.contains("(uint8_t)isinf("));
         assert!(finite_source.contains("||"));
         assert!(finite_source.contains("(uint8_t)!("));
-        assert!(matches!(composed.grad(both, input), Err(crate::Error::NoGradient(_))));
+        assert!(matches!(
+            composed.grad(both, input),
+            Err(crate::Error::NoGradient(_))
+        ));
     }
 
     #[test]
@@ -3467,16 +3662,14 @@ mod tests {
         let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
         let f16_output = narrow.sign(f16).unwrap();
         let bf16_output = narrow.sign(bf16).unwrap();
-        let f16_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
-        )
-        .unwrap()
-        .source;
-        let bf16_source = CpuJit::render(
-            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
-        )
-        .unwrap()
-        .source;
+        let f16_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_output).unwrap())
+                .unwrap()
+                .source;
+        let bf16_source =
+            CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_output).unwrap())
+                .unwrap()
+                .source;
         assert!(f16_source.contains("rg_f32_to_f16("));
         assert!(bf16_source.contains("rg_f32_to_bf16("));
 
@@ -3485,15 +3678,18 @@ mod tests {
         let mut composed = Graph::new();
         let input = composed.input_dtype("input", Shape::from([1]), DType::F64);
         let absolute = composed.abs(input).unwrap();
-        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, absolute).unwrap())
-            .unwrap()
-            .source
-            .contains("==0.0?0.0:"));
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&composed, absolute).unwrap())
+                .unwrap()
+                .source
+                .contains("==0.0?0.0:")
+        );
         let output = composed.sign(input).unwrap();
         let loss = composed.sum_all(output).unwrap();
         let gradient = composed.grad(loss, input).unwrap();
-        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap())
-            .is_ok());
+        assert!(
+            CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap()).is_ok()
+        );
     }
 
     #[test]
@@ -3545,10 +3741,22 @@ mod tests {
         let vector = CpuJit::render_vectorized(&uop).unwrap();
 
         assert_ne!(scalar.cache_key, vector.cache_key);
-        assert_eq!(vector.cache_key, CpuJit::render_vectorized(&uop).unwrap().cache_key);
-        assert_eq!(native_cache_key("b1", "source"), native_cache_key("b1", "source"));
-        assert_ne!(native_cache_key("b1", "source"), native_cache_key("scalar", "source"));
-        assert_ne!(native_cache_key("b1", "source"), native_cache_key("b1", "source+tail"));
+        assert_eq!(
+            vector.cache_key,
+            CpuJit::render_vectorized(&uop).unwrap().cache_key
+        );
+        assert_eq!(
+            native_cache_key("b1", "source"),
+            native_cache_key("b1", "source")
+        );
+        assert_ne!(
+            native_cache_key("b1", "source"),
+            native_cache_key("scalar", "source")
+        );
+        assert_ne!(
+            native_cache_key("b1", "source"),
+            native_cache_key("b1", "source+tail")
+        );
     }
 
     #[test]
@@ -4036,24 +4244,14 @@ mod tests {
         let numerator = graph.input_dtype("numerator", Shape::from([2]), DType::I64);
         let denominator = graph.input_dtype("denominator", Shape::from([2]), DType::I64);
         let quotient = graph.div(numerator, denominator).unwrap();
-        let kernel = CpuJit::compile(
-            &crate::lower_graph_elementwise(&graph, quotient).unwrap(),
-        )
-        .unwrap();
+        let kernel =
+            CpuJit::compile(&crate::lower_graph_elementwise(&graph, quotient).unwrap()).unwrap();
         let mut numerator = JitBuffer::zeroed(DType::I64, 2, false);
-        for (bytes, value) in numerator
-            .bytes_mut()
-            .chunks_exact_mut(8)
-            .zip([8i64, 9])
-        {
+        for (bytes, value) in numerator.bytes_mut().chunks_exact_mut(8).zip([8i64, 9]) {
             bytes.copy_from_slice(&value.to_ne_bytes());
         }
         let mut denominator = JitBuffer::zeroed(DType::I64, 2, false);
-        for (bytes, value) in denominator
-            .bytes_mut()
-            .chunks_exact_mut(8)
-            .zip([2i64, 0])
-        {
+        for (bytes, value) in denominator.bytes_mut().chunks_exact_mut(8).zip([2i64, 0]) {
             bytes.copy_from_slice(&value.to_ne_bytes());
         }
         let mut output = JitBuffer::zeroed(DType::I64, 2, true);
@@ -4364,7 +4562,10 @@ mod tests {
         assert!(product_scalar.source.contains(RENDERER_VERSION));
         assert!(product_scalar.source.contains("rg_acc = 1;"));
         assert!(product_scalar.source.contains("rg_acc *"));
-        assert_eq!(product_scalar.cache_key, CpuJit::render(&product_uop).unwrap().cache_key);
+        assert_eq!(
+            product_scalar.cache_key,
+            CpuJit::render(&product_uop).unwrap().cache_key
+        );
         assert!(CpuJit::render_vectorized(&product_uop).is_ok());
 
         for (dtype, conversion) in [
@@ -4398,9 +4599,10 @@ mod tests {
         let maximum = extrema
             .reduce(input, crate::ReduceKind::Max, Some(vec![1]), false)
             .unwrap();
-        let extrema_scalar = CpuJit::render(&crate::lower_graph_reduction(&extrema, maximum).unwrap())
-            .unwrap()
-            .source;
+        let extrema_scalar =
+            CpuJit::render(&crate::lower_graph_reduction(&extrema, maximum).unwrap())
+                .unwrap()
+                .source;
         assert!(extrema_scalar.contains("int rg_seen = 0;"));
         assert!(extrema_scalar.contains("if (!rg_seen)"));
         assert!(extrema_scalar.contains("!isnan(rg_acc)"));
@@ -4707,7 +4909,10 @@ mod tests {
             assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
             assert!(vector.source.contains(decode), "{dtype:?}");
             assert!(vector.source.contains(encode), "{dtype:?}");
-            assert_eq!(vector.cache_key, CpuJit::render_vectorized(&uop).unwrap().cache_key);
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
 
             let linear = CpuJit::linearize(&uop).unwrap();
             let spaces = crate::MemorySpacePlan::from_linear(&linear).unwrap();
@@ -4961,9 +5166,16 @@ mod tests {
         assert!(f32_rendered.source.contains(RENDERER_VERSION));
         assert!(f32_rendered.source.contains("float rg_acc=0.0f;"));
         assert!(f32_rendered.source.contains("float rg_product=(float)"));
-        assert!(f32_rendered.source.contains("rg_acc=(float)(rg_acc+rg_product);"));
+        assert!(
+            f32_rendered
+                .source
+                .contains("rg_acc=(float)(rg_acc+rg_product);")
+        );
         assert!(!f32_rendered.source.contains("double rg_acc=0.0;"));
-        assert_eq!(f32_rendered.cache_key, CpuJit::render(&f32_kernel).unwrap().cache_key);
+        assert_eq!(
+            f32_rendered.cache_key,
+            CpuJit::render(&f32_kernel).unwrap().cache_key
+        );
 
         // This adversarial contraction distinguishes per-step F32 storage
         // rounding from a double accumulator narrowed only at the end.
@@ -4974,11 +5186,8 @@ mod tests {
                 &HashMap::from([
                     (
                         "lhs".into(),
-                        TensorData::from_storage(
-                            [1, 3],
-                            Storage::F32(vec![1.0e10, 1.0, -1.0e10]),
-                        )
-                        .unwrap(),
+                        TensorData::from_storage([1, 3], Storage::F32(vec![1.0e10, 1.0, -1.0e10]))
+                            .unwrap(),
                     ),
                     (
                         "rhs".into(),
@@ -4996,10 +5205,8 @@ mod tests {
         let f64_lhs = f64_graph.input_dtype("lhs", Shape::from([3]), DType::F64);
         let f64_rhs = f64_graph.input_dtype("rhs", Shape::from([3]), DType::F64);
         let f64_output = f64_graph.matmul(f64_lhs, f64_rhs).unwrap();
-        let f64_rendered = CpuJit::render(
-            &crate::lower_graph_matmul(&f64_graph, f64_output).unwrap(),
-        )
-        .unwrap();
+        let f64_rendered =
+            CpuJit::render(&crate::lower_graph_matmul(&f64_graph, f64_output).unwrap()).unwrap();
         assert!(f64_rendered.source.contains("double rg_acc=0.0;"));
         assert!(!f64_rendered.source.contains("float rg_product=(float)"));
     }

@@ -220,12 +220,13 @@ fn checked_llama_chat_template_matches_fallback_and_rejects_other_jinja() {
         )
         .unwrap();
         assert_eq!(
-            template.render(
-                &alternate,
-                &[LlamaChatMessage::new(LlamaChatRole::User, "a").unwrap()],
-                true,
-            )
-            .unwrap(),
+            template
+                .render(
+                    &alternate,
+                    &[LlamaChatMessage::new(LlamaChatRole::User, "a").unwrap()],
+                    true,
+                )
+                .unwrap(),
             "<|start_header_id|>user<|end_header_id|>\n\na</s>\
 <|start_header_id|>assistant<|end_header_id|>\n\n"
         );
@@ -243,7 +244,11 @@ fn checked_llama_chat_template_matches_fallback_and_rejects_other_jinja() {
     .unwrap();
     assert_eq!(
         template
-            .render(&qwen, &[LlamaChatMessage::new(LlamaChatRole::User, "a").unwrap()], true)
+            .render(
+                &qwen,
+                &[LlamaChatMessage::new(LlamaChatRole::User, "a").unwrap()],
+                true
+            )
             .unwrap_err(),
         LlamaChatError::UnsupportedPreset(TokenizerPreset::Qwen2)
     );

@@ -935,39 +935,61 @@ pub(crate) fn execute_lowered_elementwise(
 
 fn fused_storage(dtype: DType, values: Vec<FusedValue>) -> Storage {
     match dtype {
-        dtype @ (DType::F8E4M3
-        | DType::F8E5M2
-        | DType::F8E4M3FNUZ
-        | DType::F8E5M2FNUZ) => Storage::Float8(crate::Float8Storage::from_raw(
-            dtype.float8_format().expect("float8 dtype"),
+        dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
+            Storage::Float8(crate::Float8Storage::from_raw(
+                dtype.float8_format().expect("float8 dtype"),
+                values
+                    .into_iter()
+                    .map(|value| match value {
+                        FusedValue::F8(source, bits) if source == dtype => bits,
+                        value => dtype
+                            .float8_format()
+                            .expect("float8 dtype")
+                            .encode(value.scalar().as_f64()),
+                    })
+                    .collect(),
+            ))
+        }
+        DType::F16 => Storage::F16(
             values
                 .into_iter()
                 .map(|value| match value {
-                    FusedValue::F8(source, bits) if source == dtype => bits,
-                    value => dtype
-                        .float8_format()
-                        .expect("float8 dtype")
-                        .encode(value.scalar().as_f64()),
+                    FusedValue::F16(bits) => bits,
+                    value => crate::tensor::f32_to_f16(value.scalar().as_f64() as f32),
                 })
                 .collect(),
-        )),
-        DType::F16 => Storage::F16(values.into_iter().map(|value| match value {
-            FusedValue::F16(bits) => bits,
-            value => crate::tensor::f32_to_f16(value.scalar().as_f64() as f32),
-        }).collect()),
-        DType::BF16 => Storage::BF16(values.into_iter().map(|value| match value {
-            FusedValue::BF16(bits) => bits,
-            value => crate::tensor::f32_to_bf16(value.scalar().as_f64() as f32),
-        }).collect()),
-        DType::F32 => Storage::F32(values.into_iter().map(|value| match value {
-            FusedValue::F32(bits) => f32::from_bits(bits),
-            value => value.scalar().as_f64() as f32,
-        }).collect()),
-        DType::F64 => Storage::F64(values.into_iter().map(|value| match value {
-            FusedValue::F64(bits) => f64::from_bits(bits),
-            value => value.scalar().as_f64(),
-        }).collect()),
-        _ => Storage::from_scalars(dtype, values.into_iter().map(|value| value.into_storage(dtype))),
+        ),
+        DType::BF16 => Storage::BF16(
+            values
+                .into_iter()
+                .map(|value| match value {
+                    FusedValue::BF16(bits) => bits,
+                    value => crate::tensor::f32_to_bf16(value.scalar().as_f64() as f32),
+                })
+                .collect(),
+        ),
+        DType::F32 => Storage::F32(
+            values
+                .into_iter()
+                .map(|value| match value {
+                    FusedValue::F32(bits) => f32::from_bits(bits),
+                    value => value.scalar().as_f64() as f32,
+                })
+                .collect(),
+        ),
+        DType::F64 => Storage::F64(
+            values
+                .into_iter()
+                .map(|value| match value {
+                    FusedValue::F64(bits) => f64::from_bits(bits),
+                    value => value.scalar().as_f64(),
+                })
+                .collect(),
+        ),
+        _ => Storage::from_scalars(
+            dtype,
+            values.into_iter().map(|value| value.into_storage(dtype)),
+        ),
     }
 }
 
@@ -1108,16 +1130,15 @@ enum FusedValue {
 impl FusedValue {
     fn typed(value: Scalar, dtype: DType) -> Self {
         match dtype {
-            dtype @ (DType::F8E4M3
-            | DType::F8E5M2
-            | DType::F8E4M3FNUZ
-            | DType::F8E5M2FNUZ) => Self::F8(
-                dtype,
-                dtype
-                    .float8_format()
-                    .expect("float8 dtype")
-                    .encode(value.as_f64()),
-            ),
+            dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
+                Self::F8(
+                    dtype,
+                    dtype
+                        .float8_format()
+                        .expect("float8 dtype")
+                        .encode(value.as_f64()),
+                )
+            }
             DType::F16 => Self::F16(crate::tensor::f32_to_f16(value.as_f64() as f32)),
             DType::BF16 => Self::BF16(crate::tensor::f32_to_bf16(value.as_f64() as f32)),
             DType::F32 => Self::F32((value.as_f64() as f32).to_bits()),
@@ -1128,12 +1149,9 @@ impl FusedValue {
     fn scalar(self) -> Scalar {
         match self {
             Self::Scalar(value) => value,
-            Self::F8(dtype, bits) => Scalar::F(
-                dtype
-                    .float8_format()
-                    .expect("float8 dtype")
-                    .decode(bits),
-            ),
+            Self::F8(dtype, bits) => {
+                Scalar::F(dtype.float8_format().expect("float8 dtype").decode(bits))
+            }
             Self::F16(bits) => Scalar::F(crate::tensor::f16_to_f32(bits) as f64),
             Self::BF16(bits) => Scalar::F(crate::tensor::bf16_to_f32(bits) as f64),
             Self::F32(bits) => Scalar::F(f32::from_bits(bits) as f64),
@@ -1153,16 +1171,15 @@ impl FusedValue {
             _ => {}
         }
         match dtype {
-            dtype @ (DType::F8E4M3
-            | DType::F8E5M2
-            | DType::F8E4M3FNUZ
-            | DType::F8E5M2FNUZ) => Self::F8(
-                dtype,
-                dtype
-                    .float8_format()
-                    .expect("float8 dtype")
-                    .encode(self.scalar().as_f64()),
-            ),
+            dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
+                Self::F8(
+                    dtype,
+                    dtype
+                        .float8_format()
+                        .expect("float8 dtype")
+                        .encode(self.scalar().as_f64()),
+                )
+            }
             DType::F16 => Self::F16(crate::tensor::f32_to_f16(self.scalar().as_f64() as f32)),
             DType::BF16 => {
                 let source = match self {
@@ -1180,10 +1197,9 @@ impl FusedValue {
     }
     fn from_constant(dtype: DType, bits: u64) -> Self {
         match dtype {
-            dtype @ (DType::F8E4M3
-            | DType::F8E5M2
-            | DType::F8E4M3FNUZ
-            | DType::F8E5M2FNUZ) => Self::F8(dtype, bits as u8),
+            dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
+                Self::F8(dtype, bits as u8)
+            }
             DType::F16 => Self::F16(bits as u16),
             DType::BF16 => Self::BF16(bits as u16),
             DType::F32 => Self::F32(bits as u32),
@@ -1201,9 +1217,7 @@ impl FusedValue {
     }
     fn from_storage(storage: &Storage, index: usize) -> Self {
         match storage {
-            Storage::Float8(values) => {
-                Self::F8(values.format().dtype(), values.as_raw()[index])
-            }
+            Storage::Float8(values) => Self::F8(values.format().dtype(), values.as_raw()[index]),
             Storage::F16(values) => Self::F16(values[index]),
             Storage::BF16(values) => Self::BF16(values[index]),
             Storage::F32(values) => Self::F32(values[index].to_bits()),
@@ -1213,12 +1227,9 @@ impl FusedValue {
     }
     fn into_storage(self, dtype: DType) -> Scalar {
         match (dtype, self) {
-            (target, Self::F8(source, bits)) if target == source => Scalar::F(
-                source
-                    .float8_format()
-                    .expect("float8 dtype")
-                    .decode(bits),
-            ),
+            (target, Self::F8(source, bits)) if target == source => {
+                Scalar::F(source.float8_format().expect("float8 dtype").decode(bits))
+            }
             (DType::F16, Self::F16(bits)) => Scalar::F(crate::tensor::f16_to_f32(bits) as f64),
             (DType::BF16, Self::BF16(bits)) => Scalar::F(crate::tensor::bf16_to_f32(bits) as f64),
             (DType::F32, Self::F32(bits)) => Scalar::F(f32::from_bits(bits) as f64),
@@ -1227,7 +1238,12 @@ impl FusedValue {
         }
     }
 }
-fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan) -> Result<FusedValue> {
+fn eval(
+    n: &UOp,
+    bindings: &KernelBindings,
+    linear: usize,
+    plan: &IterationPlan,
+) -> Result<FusedValue> {
     match n.kind() {
         UOpKind::Const => match n.arg() {
             UArg::Int(v) => Ok(FusedValue::Scalar(Scalar::I(*v))),
@@ -1258,42 +1274,57 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 None => i64::try_from(logical).map_err(|_| Error::InvalidIndex)?,
             };
             Ok(FusedValue::from_storage(
-                bindings
-                .get(buffer)
-                .ok_or(Error::InvalidIndex)?
-                .storage(),
+                bindings.get(buffer).ok_or(Error::InvalidIndex)?.storage(),
                 usize::try_from(offset).map_err(|_| Error::InvalidIndex)?,
             ))
         }
-        UOpKind::Cast => Ok(eval(&n.sources()[0], bindings, linear, plan)?.cast(
+        UOpKind::Cast => Ok(eval(&n.sources()[0], bindings, linear, plan)?
+            .cast(n.ty().ok_or(Error::InvalidIndex)?.scalar)),
+        UOpKind::GraphUnary(op) => Ok(FusedValue::typed(
+            unary(
+                eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
+                n.ty().ok_or(Error::InvalidIndex)?.scalar,
+                *op,
+            )?,
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
         )),
-        UOpKind::GraphUnary(op) => Ok(FusedValue::typed(unary(
-            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
+        UOpKind::GraphBinary(op) => Ok(FusedValue::typed(
+            binary(
+                eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
+                eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
+                n.ty().ok_or(Error::InvalidIndex)?.scalar,
+                *op,
+            )?,
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
-            *op,
-        )?, n.ty().ok_or(Error::InvalidIndex)?.scalar)),
-        UOpKind::GraphBinary(op) => Ok(FusedValue::typed(binary(
-            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
-            eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
-            n.ty().ok_or(Error::InvalidIndex)?.scalar,
-            *op,
-        )?, n.ty().ok_or(Error::InvalidIndex)?.scalar)),
+        )),
         UOpKind::GraphCompare(op) => Ok(FusedValue::Scalar(Scalar::Bool(compare(
             eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
             eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
             *op,
         )))),
         UOpKind::GraphLogical(op) => {
-            let a = eval(&n.sources()[0], bindings, linear, plan)?.scalar().as_bool();
+            let a = eval(&n.sources()[0], bindings, linear, plan)?
+                .scalar()
+                .as_bool();
             Ok(FusedValue::Scalar(Scalar::Bool(match op {
                 LogicalOp::Not => !a,
-                LogicalOp::And => a && eval(&n.sources()[1], bindings, linear, plan)?.scalar().as_bool(),
-                LogicalOp::Or => a || eval(&n.sources()[1], bindings, linear, plan)?.scalar().as_bool(),
+                LogicalOp::And => {
+                    a && eval(&n.sources()[1], bindings, linear, plan)?
+                        .scalar()
+                        .as_bool()
+                }
+                LogicalOp::Or => {
+                    a || eval(&n.sources()[1], bindings, linear, plan)?
+                        .scalar()
+                        .as_bool()
+                }
             })))
         }
         UOpKind::Ternary(crate::uop::Ternary::Where) => {
-            if eval(&n.sources()[0], bindings, linear, plan)?.scalar().as_bool() {
+            if eval(&n.sources()[0], bindings, linear, plan)?
+                .scalar()
+                .as_bool()
+            {
                 eval(&n.sources()[1], bindings, linear, plan)
             } else {
                 eval(&n.sources()[2], bindings, linear, plan)
@@ -1341,7 +1372,8 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                     bindings,
                     reduction.input_linear(linear, reduce_linear)?,
                     &source_plan,
-                )?.scalar();
+                )?
+                .scalar();
                 acc = match kind {
                     crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
                         binary(acc, next, dtype, BinaryOp::Add)?
@@ -1542,8 +1574,20 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
             BinaryOp::Mul => a * b,
             BinaryOp::Div => a / b,
             BinaryOp::Pow => a.powf(b),
-            BinaryOp::Maximum => if a < b { b } else { a },
-            BinaryOp::Minimum => if a > b { b } else { a },
+            BinaryOp::Maximum => {
+                if a < b {
+                    b
+                } else {
+                    a
+                }
+            }
+            BinaryOp::Minimum => {
+                if a > b {
+                    b
+                } else {
+                    a
+                }
+            }
             BinaryOp::FloorDiv => (a / b).floor(),
             BinaryOp::TruncDiv => (a / b).trunc(),
             BinaryOp::Mod => a - (a / b).floor() * b,
@@ -1581,8 +1625,20 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
             BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::TruncDiv => a / b,
             BinaryOp::Mod | BinaryOp::FMod => a % b,
             BinaryOp::Pow => a.wrapping_pow(b as u32),
-            BinaryOp::Maximum => if a < b { b } else { a },
-            BinaryOp::Minimum => if a > b { b } else { a },
+            BinaryOp::Maximum => {
+                if a < b {
+                    b
+                } else {
+                    a
+                }
+            }
+            BinaryOp::Minimum => {
+                if a > b {
+                    b
+                } else {
+                    a
+                }
+            }
             BinaryOp::BitAnd => a & b,
             BinaryOp::BitOr => a | b,
             BinaryOp::BitXor => a ^ b,
@@ -1605,8 +1661,20 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
         BinaryOp::FloorDiv => a.wrapping_div_euclid(b),
         BinaryOp::Mod => a.wrapping_rem_euclid(b),
         BinaryOp::FMod => a.wrapping_rem(b),
-        BinaryOp::Maximum => if a < b { b } else { a },
-        BinaryOp::Minimum => if a > b { b } else { a },
+        BinaryOp::Maximum => {
+            if a < b {
+                b
+            } else {
+                a
+            }
+        }
+        BinaryOp::Minimum => {
+            if a > b {
+                b
+            } else {
+                a
+            }
+        }
         BinaryOp::BitAnd => a & b,
         BinaryOp::BitOr => a | b,
         BinaryOp::BitXor => a ^ b,
@@ -1646,10 +1714,18 @@ fn compare(a: Scalar, b: Scalar, op: CompareOp) -> bool {
         (Scalar::I(a), Scalar::I(b)) => Some(a.cmp(&b)),
         (Scalar::U(a), Scalar::U(b)) => Some(a.cmp(&b)),
         (Scalar::I(a), Scalar::U(b)) => {
-            if a < 0 { Some(Ordering::Less) } else { Some((a as u64).cmp(&b)) }
+            if a < 0 {
+                Some(Ordering::Less)
+            } else {
+                Some((a as u64).cmp(&b))
+            }
         }
         (Scalar::U(a), Scalar::I(b)) => {
-            if b < 0 { Some(Ordering::Greater) } else { Some(a.cmp(&(b as u64))) }
+            if b < 0 {
+                Some(Ordering::Greater)
+            } else {
+                Some(a.cmp(&(b as u64)))
+            }
         }
         (Scalar::Bool(a), Scalar::Bool(b)) => Some(a.cmp(&b)),
         (Scalar::Bool(a), b) => Some((a as u8 as i64).cmp(&b.as_i64())),
@@ -1698,12 +1774,25 @@ mod tests {
     fn scalar_graph_constants_lower_to_typed_uop_payloads_without_buffer_dependencies() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2], DType::Bool);
-        let truth = graph.constant(TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool));
+        let truth = graph.constant(TensorData::scalar_with_dtype(
+            Scalar::Bool(true),
+            DType::Bool,
+        ));
         let output = graph.ne(input, truth).unwrap();
         let uop = lower_graph_elementwise(&graph, output).unwrap();
         let nodes = uop.topological().unwrap();
-        assert!(nodes.iter().any(|node| matches!(node.kind(), UOpKind::Const)
-            && matches!(node.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })));
+        assert!(
+            nodes
+                .iter()
+                .any(|node| matches!(node.kind(), UOpKind::Const)
+                    && matches!(
+                        node.arg(),
+                        UArg::Scalar {
+                            dtype: DType::Bool,
+                            bits: 1
+                        }
+                    ))
+        );
         assert!(!nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
             && matches!(node.arg(), UArg::BufferIndex { buffer, .. } if *buffer == truth.index() as u64)));
 
@@ -1712,20 +1801,37 @@ mod tests {
         let mut payload = Graph::new();
         let input = payload.input_dtype("input", [], DType::F32);
         let nan = payload.constant(
-            TensorData::from_storage(Shape::new([]), Storage::F32(vec![f32::from_bits(0x7f80_0001)])).unwrap(),
+            TensorData::from_storage(
+                Shape::new([]),
+                Storage::F32(vec![f32::from_bits(0x7f80_0001)]),
+            )
+            .unwrap(),
         );
         let output = payload.eq(input, nan).unwrap();
-        let nodes = lower_graph_elementwise(&payload, output).unwrap().topological().unwrap();
-        assert!(nodes.iter().any(|node| matches!(node.arg(), UArg::Scalar { dtype: DType::F32, bits: 0x7f80_0001 })));
+        let nodes = lower_graph_elementwise(&payload, output)
+            .unwrap()
+            .topological()
+            .unwrap();
+        assert!(nodes.iter().any(|node| matches!(
+            node.arg(),
+            UArg::Scalar {
+                dtype: DType::F32,
+                bits: 0x7f80_0001
+            }
+        )));
 
         // A rank-one singleton is not a scalar provenance value: it remains a
         // bound constant buffer and therefore preserves existing scheduling
         // and capture ownership.
         let mut nonscalar = Graph::new();
         let input = nonscalar.input_dtype("input", [2], DType::F32);
-        let constant = nonscalar.constant(TensorData::from_scalars([1], DType::F32, [Scalar::F(1.0)]).unwrap());
+        let constant = nonscalar
+            .constant(TensorData::from_scalars([1], DType::F32, [Scalar::F(1.0)]).unwrap());
         let output = nonscalar.add(input, constant).unwrap();
-        let nodes = lower_graph_elementwise(&nonscalar, output).unwrap().topological().unwrap();
+        let nodes = lower_graph_elementwise(&nonscalar, output)
+            .unwrap()
+            .topological()
+            .unwrap();
         assert!(nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
             && matches!(node.arg(), UArg::BufferIndex { buffer, .. } if *buffer == constant.index() as u64)));
     }
@@ -1831,7 +1937,10 @@ mod tests {
 
     #[test]
     fn generic_compare_preserves_typed_wide_integer_ordering_and_float_boundaries() {
-        let compare_all = |lhs_dtype, lhs_values: Vec<Scalar>, rhs_dtype, rhs_values: Vec<Scalar>| {
+        let compare_all = |lhs_dtype,
+                           lhs_values: Vec<Scalar>,
+                           rhs_dtype,
+                           rhs_values: Vec<Scalar>| {
             for op in [
                 CompareOp::Eq,
                 CompareOp::Ne,
@@ -1847,16 +1956,23 @@ mod tests {
                 let inputs = HashMap::from([
                     (
                         "lhs".into(),
-                        TensorData::from_scalars([lhs_values.len()], lhs_dtype, lhs_values.clone()).unwrap(),
+                        TensorData::from_scalars([lhs_values.len()], lhs_dtype, lhs_values.clone())
+                            .unwrap(),
                     ),
                     (
                         "rhs".into(),
-                        TensorData::from_scalars([rhs_values.len()], rhs_dtype, rhs_values.clone()).unwrap(),
+                        TensorData::from_scalars([rhs_values.len()], rhs_dtype, rhs_values.clone())
+                            .unwrap(),
                     ),
                 ]);
                 assert_eq!(
-                    execute_elementwise(&graph, output, &inputs).unwrap().storage(),
-                    CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                    execute_elementwise(&graph, output, &inputs)
+                        .unwrap()
+                        .storage(),
+                    CpuBackend
+                        .execute(&graph, output, &inputs)
+                        .unwrap()
+                        .storage(),
                     "{op:?} {lhs_dtype:?}/{rhs_dtype:?}",
                 );
             }
@@ -1915,8 +2031,13 @@ mod tests {
                 ),
             ]);
             assert_eq!(
-                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
-                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                execute_elementwise(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
+                CpuBackend
+                    .execute(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
                 "{op:?} float boundaries",
             );
         }
@@ -1965,8 +2086,13 @@ mod tests {
                 ),
             ]);
             assert_eq!(
-                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
-                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                execute_elementwise(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
+                CpuBackend
+                    .execute(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
                 "{label} ordered float selection",
             );
         }
@@ -1983,13 +2109,17 @@ mod tests {
             ),
             (
                 "rhs".into(),
-                TensorData::from_scalars([1], DType::U64, [Scalar::U((1_u64 << 53) + 1)])
-                    .unwrap(),
+                TensorData::from_scalars([1], DType::U64, [Scalar::U((1_u64 << 53) + 1)]).unwrap(),
             ),
         ]);
         assert_eq!(
-            execute_elementwise(&graph, output, &inputs).unwrap().storage(),
-            CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+            execute_elementwise(&graph, output, &inputs)
+                .unwrap()
+                .storage(),
+            CpuBackend
+                .execute(&graph, output, &inputs)
+                .unwrap()
+                .storage(),
         );
     }
 
@@ -2026,8 +2156,13 @@ mod tests {
                 TensorData::from_scalars([values.len()], dtype, values).unwrap(),
             )]);
             assert_eq!(
-                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
-                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                execute_elementwise(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
+                CpuBackend
+                    .execute(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
                 "{dtype:?} {kind:?}",
             );
         }
@@ -2082,17 +2217,21 @@ mod tests {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", Shape::from([1]), DType::F64);
             let cast = graph.cast(input, dtype).unwrap();
-            let scale = graph.constant(
-                TensorData::from_scalars([1], dtype, [Scalar::F(multiplier)]).unwrap(),
-            );
+            let scale = graph
+                .constant(TensorData::from_scalars([1], dtype, [Scalar::F(multiplier)]).unwrap());
             let output = graph.mul(cast, scale).unwrap();
             let inputs = HashMap::from([(
                 "x".into(),
                 TensorData::from_scalars([1], DType::F64, [Scalar::F(value)]).unwrap(),
             )]);
             assert_eq!(
-                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
-                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                execute_elementwise(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
+                CpuBackend
+                    .execute(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
                 "{dtype:?} Cast->Mul storage boundary"
             );
         }
@@ -2103,15 +2242,17 @@ mod tests {
         let input = graph.input_dtype("x", Shape::from([1]), DType::F32);
         let condition = graph.input_dtype("condition", Shape::from([1]), DType::Bool);
         let cast = graph.cast(input, DType::BF16).unwrap();
-        let fallback = graph.constant(
-            TensorData::from_storage(Shape::from([1]), Storage::BF16(vec![0])).unwrap(),
-        );
+        let fallback = graph
+            .constant(TensorData::from_storage(Shape::from([1]), Storage::BF16(vec![0])).unwrap());
         let output = graph.select(condition, cast, fallback).unwrap();
         let inputs = HashMap::from([
             (
                 "x".into(),
-                TensorData::from_storage(Shape::from([1]), Storage::F32(vec![f32::from_bits(0x7f80_0001)]))
-                    .unwrap(),
+                TensorData::from_storage(
+                    Shape::from([1]),
+                    Storage::F32(vec![f32::from_bits(0x7f80_0001)]),
+                )
+                .unwrap(),
             ),
             (
                 "condition".into(),
@@ -2119,13 +2260,20 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            execute_elementwise(&graph, output, &inputs).unwrap().storage(),
-            CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+            execute_elementwise(&graph, output, &inputs)
+                .unwrap()
+                .storage(),
+            CpuBackend
+                .execute(&graph, output, &inputs)
+                .unwrap()
+                .storage(),
             "F32->BF16 signaling-NaN payload through Select"
         );
 
-        for (dtype, value) in [(DType::I64, Scalar::I((1_i64 << 53) + 1)),
-                               (DType::U64, Scalar::U((1_u64 << 53) + 1))] {
+        for (dtype, value) in [
+            (DType::I64, Scalar::I((1_i64 << 53) + 1)),
+            (DType::U64, Scalar::U((1_u64 << 53) + 1)),
+        ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", Shape::from([1]), dtype);
             let cast = graph.cast(input, DType::F32).unwrap();
@@ -2138,8 +2286,13 @@ mod tests {
                 TensorData::from_scalars([1], dtype, [value]).unwrap(),
             )]);
             assert_eq!(
-                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
-                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                execute_elementwise(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
+                CpuBackend
+                    .execute(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
                 "large {dtype:?} to F32 Cast"
             );
         }

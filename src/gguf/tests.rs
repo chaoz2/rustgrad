@@ -191,9 +191,9 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     assert_eq!(
         &q41_two.values()[..32],
         &[
-            0.5, 2.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5, 16.5, 18.5, 20.5, 22.5, 24.5, 26.5,
-            28.5, 30.5, 30.5, 28.5, 26.5, 24.5, 22.5, 20.5, 18.5, 16.5, 14.5, 12.5, 10.5, 8.5,
-            6.5, 4.5, 2.5, 0.5,
+            0.5, 2.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5, 16.5, 18.5, 20.5, 22.5, 24.5, 26.5, 28.5,
+            30.5, 30.5, 28.5, 26.5, 24.5, 22.5, 20.5, 18.5, 16.5, 14.5, 12.5, 10.5, 8.5, 6.5, 4.5,
+            2.5, 0.5,
         ]
     );
     assert_eq!(&q41_two.values()[32..], &q41_two.values()[..32]);
@@ -201,9 +201,9 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     assert_eq!(
         &q5_two.values()[..32],
         &[
-            0.0, -7.5, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, 4.5, -3.0, -2.5, -2.0, -1.5,
-            -1.0, -0.5, -0.5, -1.0, 6.5, -2.0, -2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, 2.0,
-            -6.5, -7.0, -7.5, -8.0,
+            0.0, -7.5, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, 4.5, -3.0, -2.5, -2.0, -1.5, -1.0,
+            -0.5, -0.5, -1.0, 6.5, -2.0, -2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, 2.0, -6.5, -7.0,
+            -7.5, -8.0,
         ]
     );
     assert_eq!(&q5_two.values()[32..], &q5_two.values()[..32]);
@@ -211,8 +211,8 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     assert_eq!(
         &q51_two.values()[..32],
         &[
-            10.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 14.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5,
-            9.5, 9.0, 16.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0, 4.5, 12.0, 3.5, 3.0, 2.5, 2.0,
+            10.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 14.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 9.5,
+            9.0, 16.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0, 4.5, 12.0, 3.5, 3.0, 2.5, 2.0,
         ]
     );
     assert_eq!(&q51_two.values()[32..], &q51_two.values()[..32]);
@@ -256,8 +256,8 @@ fn q5_k_materializes_repeated_gguf_blocks() {
 #[test]
 fn mxfp4_materializes_checked_in_reference_block() {
     let block = [
-        0x7a, 0x29, 0xab, 0x61, 0x10, 0x21, 0x02, 0x4a, 0x15, 0xca, 0x05, 0x01, 0x9b, 0x39,
-        0x0b, 0x0b, 0x1c,
+        0x7a, 0x29, 0xab, 0x61, 0x10, 0x21, 0x02, 0x4a, 0x15, 0xca, 0x05, 0x01, 0x9b, 0x39, 0x0b,
+        0x0b, 0x1c,
     ];
     let bytes = fixture(
         3,
@@ -275,10 +275,10 @@ fn mxfp4_materializes_checked_in_reference_block() {
     assert_eq!(
         materialized.values(),
         &[
-            -0.015625, -0.046875, 0.015625, 0.0, 0.015625, 0.03125, -0.03125, 0.09375,
-            -0.03125, 0.09375, 0.015625, -0.046875, -0.015625, -0.046875, -0.046875, -0.0625,
-            0.03125, -0.03125, 0.125, 0.015625, 0.03125, 0.0, 0.0625, 0.015625, -0.0625, 0.0,
-            0.0, -0.015625, 0.046875, 0.0, 0.0, 0.015625,
+            -0.015625, -0.046875, 0.015625, 0.0, 0.015625, 0.03125, -0.03125, 0.09375, -0.03125,
+            0.09375, 0.015625, -0.046875, -0.015625, -0.046875, -0.046875, -0.0625, 0.03125,
+            -0.03125, 0.125, 0.015625, 0.03125, 0.0, 0.0625, 0.015625, -0.0625, 0.0, 0.0,
+            -0.015625, 0.046875, 0.0, 0.0, 0.015625,
         ]
     );
 }
@@ -304,9 +304,7 @@ fn q1_0_materializes_transposed_bit_plane() {
     );
     let materialized = read_gguf(&bytes).unwrap().materialize_f32("q1").unwrap();
     let expected = (0..8)
-        .flat_map(|bit| {
-            (0..16).map(move |byte| if byte % 8 == bit { 2.0 } else { -2.0 })
-        })
+        .flat_map(|bit| (0..16).map(move |byte| if byte % 8 == bit { 2.0 } else { -2.0 }))
         .collect::<Vec<f32>>();
     assert_eq!(materialized.values(), expected);
 }
@@ -357,7 +355,10 @@ fn iq3_xxs_materializes_raw_type_18_blocks() {
         }],
         32,
     );
-    let materialized = read_gguf(&bytes).unwrap().materialize_f32("iq3xxs").unwrap();
+    let materialized = read_gguf(&bytes)
+        .unwrap()
+        .materialize_f32("iq3xxs")
+        .unwrap();
     assert_eq!(materialized.shape(), &Shape::from([256]));
     assert_eq!(materialized.values().len(), 256);
     assert_eq!(&materialized.values()[..4], &[3.0, 3.0, 3.0, 3.0]);
@@ -389,7 +390,18 @@ fn iq3_s_materializes_raw_type_21_blocks() {
 fn iq2_s_materializes_raw_type_22_blocks() {
     let mut block = [0u8; 82];
     block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
-    let bytes = fixture(3, &[], &[TensorFixture { name: "iq2s", dimensions: &[256], kind: 22, offset: 0, data: &block }], 32);
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "iq2s",
+            dimensions: &[256],
+            kind: 22,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
     let materialized = read_gguf(&bytes).unwrap().materialize_f32("iq2s").unwrap();
     assert_eq!(materialized.shape(), &Shape::from([256]));
     assert_eq!(materialized.values().len(), 256);

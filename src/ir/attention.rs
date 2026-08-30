@@ -1,6 +1,6 @@
 use super::{
-    shape::{normalize_axes, reduction_shape},
     AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape,
+    shape::{normalize_axes, reduction_shape},
 };
 use crate::{DType, Error, ReductionDType, Result, Scalar, Shape, TensorData};
 
@@ -68,7 +68,10 @@ fn logsumexp_plan(
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     };
     let axes = if shape.rank() == 0 {
-        if axes.as_ref().is_some_and(|axes| axes.iter().any(|axis| !matches!(axis, -1 | 0))) {
+        if axes
+            .as_ref()
+            .is_some_and(|axes| axes.iter().any(|axis| !matches!(axis, -1 | 0)))
+        {
             return Err(Error::InvalidAttention {
                 reason: "logsumexp scalar axes must be -1 or 0",
             });
@@ -79,8 +82,16 @@ fn logsumexp_plan(
     };
     let max_shape = reduction_shape(shape, &axes, true);
     let output_shape = reduction_shape(shape, &axes, keepdim);
-    let exp_dtype = if source_dtype.is_float() { source_dtype } else { DType::F32 };
-    let exp_work_dtype = if exp_dtype == DType::F64 { DType::F64 } else { DType::F32 };
+    let exp_dtype = if source_dtype.is_float() {
+        source_dtype
+    } else {
+        DType::F32
+    };
+    let exp_work_dtype = if exp_dtype == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
     let sum_dtypes = ReductionDType::sum_default(exp_dtype);
     let output_dtype = source_dtype.promote(sum_dtypes.output);
     extent(shape, source_dtype)?;
@@ -101,10 +112,8 @@ fn logsumexp_plan(
             reason: "logsumexp intermediate cannot broadcast",
         });
     }
-    let inv_ln2 = TensorData::scalar_with_dtype(
-        Scalar::F(std::f64::consts::LOG2_E),
-        exp_work_dtype,
-    );
+    let inv_ln2 =
+        TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LOG2_E), exp_work_dtype);
     let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), sum_dtypes.output);
     if shape.broadcast_with(inv_ln2.shape())? != *shape
         || exp_work_dtype.promote(inv_ln2.dtype()) != exp_work_dtype
@@ -117,7 +126,7 @@ fn logsumexp_plan(
     }
     let max_identity = (max_shape.numel()? > 0
         && axes.iter().any(|axis| shape.dims()[*axis as usize] == 0))
-        .then(|| max_identity(source_dtype));
+    .then(|| max_identity(source_dtype));
     Ok(LogsumexpPlan {
         axes: axes.into_iter().map(|axis| axis as isize).collect(),
         max_shape,
@@ -163,9 +172,11 @@ fn softmax_plan(
                 .dims()
                 .iter()
                 .enumerate()
-                .map(|(index, &dimension)| {
-                    if index == axis as usize { 1 } else { dimension }
-                })
+                .map(
+                    |(index, &dimension)| {
+                        if index == axis as usize { 1 } else { dimension }
+                    },
+                )
                 .collect::<Vec<_>>(),
         ),
     };
@@ -204,10 +215,8 @@ fn softmax_plan(
             reason: "softmax reciprocal cannot broadcast to exponentials",
         });
     }
-    let inv_ln2 = TensorData::scalar_with_dtype(
-        Scalar::F(std::f64::consts::LOG2_E),
-        exp_work_dtype,
-    );
+    let inv_ln2 =
+        TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LOG2_E), exp_work_dtype);
     if inv_ln2.dtype() != exp_work_dtype
         || shape.broadcast_with(inv_ln2.shape())? != *shape
         || exp_work_dtype.promote(inv_ln2.dtype()) != exp_work_dtype
@@ -331,8 +340,14 @@ impl Graph {
             self.reshape(maximum, plan.output_shape.clone())?
         };
         let output = self.add(logged, maximum)?;
-        debug_assert_eq!(self.shape(output).expect("LogSumExp preflighted"), &plan.output_shape);
-        debug_assert_eq!(self.dtype(output).expect("LogSumExp preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("LogSumExp preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("LogSumExp preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -361,7 +376,10 @@ impl Graph {
         } else {
             input
         };
-        debug_assert_eq!(self.shape(maximum).expect("Softmax max preflighted"), &plan.max_shape);
+        debug_assert_eq!(
+            self.shape(maximum).expect("Softmax max preflighted"),
+            &plan.max_shape
+        );
         let centered = self.sub(input, self.detach(maximum)?)?;
         let requested = if plan.requested_dtype == plan.source_dtype {
             centered
@@ -393,8 +411,14 @@ impl Graph {
         };
         let reciprocal = self.reciprocal(sum)?;
         let output = self.mul(exponentials, reciprocal)?;
-        debug_assert_eq!(self.shape(output).expect("Softmax preflighted"), &plan.shape);
-        debug_assert_eq!(self.dtype(output).expect("Softmax preflighted"), plan.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("Softmax preflighted"),
+            &plan.shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("Softmax preflighted"),
+            plan.output_dtype
+        );
         Ok(output)
     }
 
@@ -480,8 +504,14 @@ impl Graph {
         let ln2 = self.constant(plan.ln2);
         let logged = self.mul(log2, ln2)?;
         let output = self.sub(requested, logged)?;
-        debug_assert_eq!(self.shape(output).expect("LogSoftmax preflighted"), &plan.softmax.shape);
-        debug_assert_eq!(self.dtype(output).expect("LogSoftmax preflighted"), plan.softmax.output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("LogSoftmax preflighted"),
+            &plan.softmax.shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("LogSoftmax preflighted"),
+            plan.softmax.output_dtype
+        );
         Ok(output)
     }
 
@@ -493,7 +523,13 @@ impl Graph {
     /// Narrow, float8, and exact storage inputs are promoted to a supported
     /// floating compute dtype before the composition; ordinary floating inputs
     /// retain their dtype until the existing reduction-promotion rules apply.
-    pub fn normalize(&mut self, input: NodeId, p: f64, axis: isize, eps: f64) -> Result<NodeId> {
+    pub fn normalize_basic(
+        &mut self,
+        input: NodeId,
+        p: f64,
+        axis: isize,
+        eps: f64,
+    ) -> Result<NodeId> {
         let source = self.node(input)?;
         let normalized_axis = normalize_axes(input, source.shape.rank(), Some(vec![axis]))?[0];
         let compute_dtype = if source.dtype.is_float() && !source.dtype.is_float8() {
@@ -542,7 +578,6 @@ impl Graph {
         let denominator = self.maximum(norm, epsilon)?;
         self.div(input, denominator)
     }
-
 
     /// Checked-in tinygrad's `Tensor.log_softmax()` defaults.
     pub fn log_softmax_default(&mut self, input: NodeId) -> Result<NodeId> {
@@ -599,8 +634,8 @@ impl Graph {
     /// negative values exclude diagonals below it, matching tinygrad's
     /// `Tensor.tril`. Leading dimensions are broadcast through the generated
     /// boolean mask.
-    pub fn tril(&mut self, input: NodeId, diagonal: isize) -> Result<NodeId> {
-        self.triangular(input, diagonal, true, "tril")
+    pub fn tril_static(&mut self, input: NodeId, diagonal: isize) -> Result<NodeId> {
+        self.triangular_static(input, diagonal, true, "tril")
     }
 
     /// Returns the upper triangular part of `input` over its final two axes.
@@ -608,11 +643,11 @@ impl Graph {
     /// Positive `diagonal` excludes diagonals below the requested upper
     /// boundary and negative values include lower diagonals, matching
     /// tinygrad's `Tensor.triu`.
-    pub fn triu(&mut self, input: NodeId, diagonal: isize) -> Result<NodeId> {
-        self.triangular(input, diagonal, false, "triu")
+    pub fn triu_static(&mut self, input: NodeId, diagonal: isize) -> Result<NodeId> {
+        self.triangular_static(input, diagonal, false, "triu")
     }
 
-    fn triangular(
+    fn triangular_static(
         &mut self,
         input: NodeId,
         diagonal: isize,

@@ -57,14 +57,8 @@ fn graph_arange_preflights_zero_step_and_keeps_terminal_i64_values() {
 
     let upper = graph.arange(i64::MAX - 1, i64::MAX, 2).unwrap();
     let lower = graph.arange(i64::MIN + 1, i64::MIN, -2).unwrap();
-    assert_eq!(
-        run(&graph, upper).to_vec_f64(),
-        vec![(i64::MAX - 1) as f64]
-    );
-    assert_eq!(
-        run(&graph, lower).to_vec_f64(),
-        vec![(i64::MIN + 1) as f64]
-    );
+    assert_eq!(run(&graph, upper).to_vec_f64(), vec![(i64::MAX - 1) as f64]);
+    assert_eq!(run(&graph, lower).to_vec_f64(), vec![(i64::MIN + 1) as f64]);
 }
 
 #[test]
@@ -404,13 +398,20 @@ fn meshgrid_matches_tinygrad_flattened_input_xy_dtype_and_vjp_contracts() {
     let loss = graph.sum_all(grids[0]).unwrap();
     let gradient = graph.grad(loss, lhs).unwrap();
     let inputs = HashMap::from([
-        ("lhs".into(), TensorData::new([2, 2], vec![0., 1., 2., 3.]).unwrap()),
+        (
+            "lhs".into(),
+            TensorData::new([2, 2], vec![0., 1., 2., 3.]).unwrap(),
+        ),
         (
             "rhs".into(),
             TensorData::from_scalars(
                 [3],
                 DType::I8,
-                [crate::Scalar::I(10), crate::Scalar::I(20), crate::Scalar::I(30)],
+                [
+                    crate::Scalar::I(10),
+                    crate::Scalar::I(20),
+                    crate::Scalar::I(30),
+                ],
             )
             .unwrap(),
         ),
@@ -509,13 +510,23 @@ fn one_hot_uses_a_scalar_backed_default_integer_range_and_preflights_the_full_gr
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 0, 3]));
     assert_eq!(graph.dtype(output).unwrap(), DType::I32);
     assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
-    assert!(graph.nodes.iter().filter_map(|node| match &node.op {
-        Op::Constant(data) => Some(data.len()),
-        _ => None,
-    }).all(|len| len == 1));
-    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Reduce {
-        kind: crate::ReduceKind::Sum, ..
-    })));
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Constant(data) => Some(data.len()),
+                _ => None,
+            })
+            .all(|len| len == 1)
+    );
+    assert!(graph.nodes.iter().any(|node| matches!(
+        &node.op,
+        Op::Reduce {
+            kind: crate::ReduceKind::Sum,
+            ..
+        }
+    )));
 
     let scalar = graph.input_dtype("scalar", [], DType::I32);
     let scalar_output = graph.one_hot(scalar, 2).unwrap();
@@ -531,6 +542,9 @@ fn one_hot_uses_a_scalar_backed_default_integer_range_and_preflights_the_full_gr
     assert_eq!(invalid.node_count(), before);
     let large = invalid.input_dtype("large", [usize::MAX / 2 + 1], DType::I8);
     let before = invalid.node_count();
-    assert!(matches!(invalid.one_hot(large, 3), Err(Error::ShapeOverflow(_))));
+    assert!(matches!(
+        invalid.one_hot(large, 3),
+        Err(Error::ShapeOverflow(_))
+    ));
     assert_eq!(invalid.node_count(), before);
 }

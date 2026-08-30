@@ -7,7 +7,7 @@
 //! class extents and invalid interpolation coordinates faithful without a
 //! backend indexing exception.
 
-use super::{shape::normalize_axes, Graph, NodeId};
+use super::{Graph, NodeId, shape::normalize_axes};
 use crate::{DType, Error, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData};
 
 #[derive(Clone, Debug)]
@@ -46,7 +46,11 @@ pub(crate) fn source_gather_plan(
         if dimension != axis && requested > source {
             return Err(invalid("source gather index extent exceeds data"));
         }
-        bounds.push(if dimension == axis { (0, source) } else { (0, requested) });
+        bounds.push(if dimension == axis {
+            (0, source)
+        } else {
+            (0, requested)
+        });
     }
     let rank = value_shape.rank();
     let mut moved_dims = bounds.iter().map(|(_, end)| *end).collect::<Vec<_>>();
@@ -147,12 +151,7 @@ impl Graph {
     /// than backend indexing errors. The clone rehearsal covers every later
     /// movement, lazy range, Select, and explicit storage-width Sum before a
     /// live constant or node is appended.
-    pub fn gather_tinygrad(
-        &mut self,
-        value: NodeId,
-        dim: isize,
-        index: NodeId,
-    ) -> Result<NodeId> {
+    pub fn gather_tinygrad(&mut self, value: NodeId, dim: isize, index: NodeId) -> Result<NodeId> {
         let value_node = self.node(value)?;
         let index_node = self.node(index)?;
         let axis = normalize_axes(value, value_node.shape.rank(), Some(vec![dim]))?[0];
@@ -172,8 +171,14 @@ impl Graph {
             .checked_mul(output_dtype.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
         let output = lower_source_gather(self, value, index, plan)?;
-        debug_assert_eq!(self.shape(output).expect("source gather preflighted"), &output_shape);
-        debug_assert_eq!(self.dtype(output).expect("source gather preflighted"), output_dtype);
+        debug_assert_eq!(
+            self.shape(output).expect("source gather preflighted"),
+            &output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("source gather preflighted"),
+            output_dtype
+        );
         Ok(output)
     }
 }

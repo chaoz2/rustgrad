@@ -79,7 +79,7 @@ impl Graph {
     /// Samples I32 category indices from floating weights using an explicit,
     /// replayable Threefry stream. Values are validated by TensorGuard before
     /// the composed sampling result is realized.
-    pub fn multinomial(
+    pub fn multinomial_with_stream(
         &mut self,
         input: NodeId,
         samples: usize,
