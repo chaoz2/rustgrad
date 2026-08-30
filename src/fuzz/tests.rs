@@ -1,9 +1,9 @@
 use super::*;
 use crate::uop::Ternary;
 use crate::{
-    Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, LogicalOp, MovementKernelKind,
-    MovementKernelPlan, Op, ReduceKind, Scalar, Shape, Storage, TensorData, UArg, UOpKind, UnaryOp,
-    schedule,
+    Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, Float8Format, Float8Storage,
+    LogicalOp, MovementKernelKind, MovementKernelPlan, Op, ReduceKind, Scalar, Shape, Storage,
+    TensorData, UArg, UOpKind, UnaryOp, schedule,
 };
 use std::{
     fs::{self, File},
@@ -2558,7 +2558,7 @@ fn generated_gather_cases_are_valid_diverse_and_deterministic() {
     }
 
     assert!(found);
-    assert_eq!(dtypes.len(), 13);
+    assert_eq!(dtypes, DType::ALL.into_iter().collect());
     assert!(index_i32 && index_i64);
     assert!(empty && duplicate);
     assert!(axes.contains(&(1, 0)) && axes.iter().any(|(rank, axis)| *rank >= 2 && *axis == 1));
@@ -2761,6 +2761,38 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         ),
         (DType::U64, Storage::U64(vec![0, 1, u64::MAX]), "uint64_t"),
         (
+            DType::F8E4M3,
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E4M3,
+                vec![0x80, 0x7f, 0x7e],
+            )),
+            "uint8_t",
+        ),
+        (
+            DType::F8E5M2,
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E5M2,
+                vec![0x80, 0x7d, 0x7c],
+            )),
+            "uint8_t",
+        ),
+        (
+            DType::F8E4M3FNUZ,
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E4M3FNUZ,
+                vec![0x00, 0x80, 0x7f],
+            )),
+            "uint8_t",
+        ),
+        (
+            DType::F8E5M2FNUZ,
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E5M2FNUZ,
+                vec![0x00, 0x80, 0x7f],
+            )),
+            "uint8_t",
+        ),
+        (
             DType::F16,
             Storage::F16(vec![0x3c00, 0x4000, 0x4200]),
             "uint16_t",
@@ -2773,6 +2805,13 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         (DType::F32, Storage::F32(vec![1.0, 2.0, 3.0]), "float"),
         (DType::F64, Storage::F64(vec![1.0, 2.0, 3.0]), "double"),
     ];
+    assert_eq!(
+        dtype_cases
+            .iter()
+            .map(|(dtype, _, _)| *dtype)
+            .collect::<std::collections::BTreeSet<_>>(),
+        DType::ALL.into_iter().collect(),
+    );
     for (position, (dtype, storage, native_type)) in dtype_cases.into_iter().enumerate() {
         let input = FuzzTensor::from_tensor(&TensorData::from_storage([3], storage).unwrap());
         let index = FuzzTensor::from_tensor(
@@ -2808,7 +2847,11 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
         assert!(scalar.source.contains(native_type));
         assert!(scalar.source.contains("rg_selected < 0"));
-        assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+        let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
+        if dtype.is_float8() {
+            assert!(!scalar.source.contains("rg_f8_decode"), "{dtype:?}");
+            assert!(!vector.source.contains("rg_f8_decode"), "{dtype:?}");
+        }
         let captured =
             CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
@@ -4875,7 +4918,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 110);
+    assert_eq!(cases.len(), 114);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

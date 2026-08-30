@@ -618,6 +618,55 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             index: tensor(vec![3], Storage::I64(vec![2, 0, 1])),
             axis: 0,
         },
+        FuzzCase::Gather {
+            // Movement selection retains raw E4M3 negative-zero, NaN, and
+            // maximum-finite encodings without numeric conversion.
+            input: tensor(
+                vec![3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3,
+                    vec![0x80, 0x7f, 0x7e],
+                )),
+            ),
+            index: tensor(vec![3], Storage::I32(vec![1, 0, 2])),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            // E5M2 keeps its raw negative zero, NaN payload, and infinity.
+            input: tensor(
+                vec![3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E5M2,
+                    vec![0x80, 0x7d, 0x7c],
+                )),
+            ),
+            index: tensor(vec![3], Storage::I64(vec![2, 1, 0])),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            // FNUZ's reserved NaN byte must remain storage, not a decoded
+            // scalar that could canonicalize it on output.
+            input: tensor(
+                vec![3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3FNUZ,
+                    vec![0x00, 0x80, 0x7f],
+                )),
+            ),
+            index: tensor(vec![3], Storage::I32(vec![1, 2, 0])),
+            axis: 0,
+        },
+        FuzzCase::Gather {
+            input: tensor(
+                vec![3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E5M2FNUZ,
+                    vec![0x00, 0x80, 0xff],
+                )),
+            ),
+            index: tensor(vec![3], Storage::I64(vec![2, 0, 1])),
+            axis: 0,
+        },
         FuzzCase::Scatter {
             // Row-major later duplicate updates replace the earlier lane.
             base: tensor(vec![1, 4], Storage::F32(vec![10.0, 20.0, 30.0, 40.0])),
