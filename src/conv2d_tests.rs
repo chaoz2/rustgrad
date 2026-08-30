@@ -628,9 +628,7 @@ fn conv2d_rejects_non_float_gradients_and_runtime_bias_dtype_mismatches() {
     let loss = all_sum(&mut graph, y);
     assert!(matches!(
         graph.grad(loss, x),
-        Err(Error::NonDifferentiableIndexing(
-            "conv2d gradients require floating point tensors"
-        ))
+        Err(Error::NonDifferentiableTarget(node)) if node == loss
     ));
 
     let mut graph = Graph::new();
