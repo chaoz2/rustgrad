@@ -29,23 +29,27 @@ fn uop_spec_and_dag_order_are_deterministic() {
 
 #[test]
 fn typed_operations_make_payload_mismatches_unrepresentable_and_validate_arity() {
-    let source = UOp::constant(1, i64t());
+    let logical_source = UOp::scalar_constant(DType::Bool, 1, UType::scalar(DType::Bool));
     UOp::from_operation(
         Operation::GraphLogical(crate::LogicalOp::Not),
         Some(UType::scalar(DType::Bool)),
-        vec![source.clone()],
+        vec![logical_source.clone()],
     )
     .validate()
     .unwrap();
     UOp::from_operation(
         Operation::GraphLogical(crate::LogicalOp::And),
         Some(UType::scalar(DType::Bool)),
-        vec![source.clone(), source.clone()],
+        vec![logical_source.clone(), logical_source],
     )
     .validate()
     .unwrap();
-    let wrong_arity =
-        UOp::from_operation(Operation::Binary(Binary::Add), Some(i64t()), vec![source]);
+    let arithmetic_source = UOp::constant(1, i64t());
+    let wrong_arity = UOp::from_operation(
+        Operation::Binary(Binary::Add),
+        Some(i64t()),
+        vec![arithmetic_source],
+    );
     assert!(matches!(
         wrong_arity.validate(),
         Err(crate::UOpError::InvalidArity { actual: 1, .. })
