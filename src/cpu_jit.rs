@@ -157,6 +157,12 @@ impl JitBuffer {
         out
     }
     pub fn into_tensor(self, shape: crate::Shape) -> crate::Result<crate::TensorData> {
+        if let Some(format) = self.dtype.float8_format() {
+            return crate::TensorData::from_storage(
+                shape,
+                crate::Storage::Float8(crate::Float8Storage::from_raw(format, self.bytes)),
+            );
+        }
         if matches!(self.dtype, DType::F16 | DType::BF16) {
             let raw: Vec<u16> = self
                 .bytes
@@ -2914,6 +2920,32 @@ mod tests {
         Backend, CompareOp, CpuBackend, Graph, Op, Scalar, Shape, Storage, SymbolicExpr, TensorData,
     };
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn jit_buffer_round_trips_raw_float8_storage() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let format = dtype.float8_format().unwrap();
+            let raw = vec![0x00, 0x80, 0x7f, 0xff];
+            let input = TensorData::from_storage(
+                [2, 2],
+                Storage::Float8(crate::Float8Storage::from_raw(format, raw.clone())),
+            )
+            .unwrap();
+            let output = JitBuffer::from_tensor(&input, true)
+                .into_tensor(Shape::from([2, 2]))
+                .unwrap();
+            let Storage::Float8(output) = output.storage() else {
+                panic!("expected Float8 storage for {dtype:?}");
+            };
+            assert_eq!(output.format(), format);
+            assert_eq!(output.as_raw(), raw, "{dtype:?}");
+        }
+    }
 
     #[test]
     fn computed_affine_copy_renderer_closes_loop_and_kernel() {
