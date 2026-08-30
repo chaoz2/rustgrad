@@ -131,6 +131,12 @@ impl LlamaDecoderSchema {
         kv_heads
             .checked_mul(head_dim)
             .ok_or(LlamaStateError::ProjectionOverflow)?;
+        // Every gated feed-forward projection spans the residual and
+        // intermediate widths. Validate that extent before GGUF tensors can
+        // be materialized for binding.
+        embedding_dim
+            .checked_mul(hidden_dim)
+            .ok_or(LlamaStateError::ProjectionOverflow)?;
         Ok(Self {
             vocab_size,
             embedding_dim,

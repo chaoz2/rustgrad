@@ -233,6 +233,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
                 "movement".into(),
                 match &plan.kind {
                     crate::MovementKernelKind::AffineCopy { .. } => "affine_copy",
+                    crate::MovementKernelKind::Pad { .. } => "pad",
                     crate::MovementKernelKind::Concat { .. } => "concat",
                     crate::MovementKernelKind::Gather { .. } => "gather",
                     crate::MovementKernelKind::Scatter { add, .. } => {

@@ -228,12 +228,12 @@ fn base_model(items: &[ScheduleItem]) -> Result<(Vec<VizNode>, Vec<VizEdge>), Vi
                 binding.abi_index.to_string(),
             ));
         }
-        for (index, output) in item.outputs.iter().enumerate() {
+        for (position, output) in item.outputs.iter().enumerate() {
             edges.push(VizEdge::new(
                 format!("s{}", item.id),
                 format!("b{}", output.id),
                 "materializes",
-                index.to_string(),
+                format!("output:{position}"),
             ));
         }
     }

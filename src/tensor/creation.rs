@@ -84,9 +84,13 @@ impl TensorData {
         let mut value = start;
         while (step > 0 && value < end) || (step < 0 && value > end) {
             values.push(Scalar::I(value));
-            value = value
-                .checked_add(step)
-                .ok_or(Error::InvalidArange { start, end, step })?;
+            // A checked overflow here can only occur after the final valid
+            // i64 value: the mathematical successor lies beyond the domain,
+            // and therefore cannot satisfy the half-open bound.
+            let Some(next) = value.checked_add(step) else {
+                break;
+            };
+            value = next;
         }
         Self::from_scalars([values.len()], DType::I64, values)
     }
@@ -129,6 +133,18 @@ mod tests {
                 end: 4,
                 step: 0
             })
+        );
+        assert_eq!(
+            TensorData::arange(i64::MAX - 1, i64::MAX, 2)
+                .unwrap()
+                .to_vec_f64(),
+            vec![(i64::MAX - 1) as f64]
+        );
+        assert_eq!(
+            TensorData::arange(i64::MIN + 1, i64::MIN, -2)
+                .unwrap()
+                .to_vec_f64(),
+            vec![(i64::MIN + 1) as f64]
         );
     }
 }

@@ -1432,15 +1432,28 @@ impl<'a> Pickle<'a> {
             }
             return Ok(Value::Dict(BTreeMap::new()));
         }
-        if module != "torch._utils" || !(name == "_rebuild_tensor" || name == "_rebuild_tensor_v2")
-        {
+        if module != "torch._utils" || !(name == "_rebuild_tensor" || name == "_rebuild_tensor_v2") {
             return Err(err(format!("pickle GLOBAL {module}.{name} is not allowed")));
         }
         let Value::Tuple(v) = args else {
             return Err(err("tensor rebuild arguments are not a tuple"));
         };
-        if v.len() < 4 {
-            return Err(err("tensor rebuild has too few arguments"));
+        match name.as_str() {
+            "_rebuild_tensor" if v.len() != 4 => {
+                return Err(err("tensor rebuild has unsupported arguments"));
+            }
+            "_rebuild_tensor_v2" if !matches!(v.len(), 5 | 6) => {
+                return Err(err("tensor rebuild v2 has unsupported arguments"));
+            }
+            "_rebuild_tensor_v2" if !matches!(&v[4], Value::Bool) => {
+                return Err(err("tensor rebuild v2 requires a Boolean gradient flag"));
+            }
+            "_rebuild_tensor_v2"
+                if v.len() == 6 && !matches!(&v[5], Value::Dict(_) | Value::None) =>
+            {
+                return Err(err("tensor rebuild v2 has unsupported backward hooks"));
+            }
+            _ => {}
         }
         let Value::Storage(storage) = &v[0] else {
             return Err(err("tensor rebuild does not reference CPU storage"));
@@ -1872,6 +1885,24 @@ mod tests {
                 "{name}"
             );
         }
+
+        let mut pickle = zip_stored_files(&good)
+            .unwrap()
+            .remove("archive/data.pkl")
+            .unwrap();
+        let marker = [b't', 0x89, b't', b'R'];
+        let at = pickle
+            .windows(marker.len())
+            .rposition(|window| window == marker)
+            .unwrap();
+        // A sixth v2 argument is present but is not an inert hook dictionary.
+        // The importer must reject it rather than silently ignoring it.
+        pickle.splice(at + 2..at + 2, [b'K', 0]);
+        let malformed = zip(&[("archive/data.pkl", pickle), ("archive/data/0", raw)]);
+        assert!(matches!(
+            load_torch_state_dict(&malformed),
+            Err(Error::ModelIo { .. })
+        ));
     }
 
     #[test]

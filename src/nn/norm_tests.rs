@@ -5,6 +5,7 @@ use crate::{
     Backend, CpuBackend, DType, Error, Graph, NodeId, Result, Shape, Storage, TensorData,
     infer_module_cpu,
 };
+use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Scalar, Storage, TensorData};
 use std::collections::HashMap;
 
 fn f32s(data: &TensorData) -> Vec<f32> {
@@ -186,6 +187,124 @@ fn pending_mode_effects_reject_duplicate_batchnorm_targets_before_mutation() -> 
     ));
     assert_eq!(norm.state_dict()?, before);
     Ok(())
+}
+
+#[test]
+fn batchnorm3d_is_the_batchnorm_alias_with_rank_three_module_surface() {
+    let mut graph = Graph::new();
+    let norm: BatchNorm3d = BatchNorm3d::new(&mut graph, 2, 1e-5, true, true, 0.1).unwrap();
+    let _: &BatchNorm = &norm;
+
+    let input = graph.input("input", [1, 2, 3]);
+    let output = norm.forward(&mut graph, input, Mode::Eval).unwrap().output;
+    assert_eq!(graph.shape(output).unwrap().dims(), &[1, 2, 3]);
+
+    let state = get_state_dict(&norm, "");
+    let names: Vec<_> = state.keys().collect();
+    assert_eq!(
+        names,
+        [
+            "weight",
+            "bias",
+            "running_mean",
+            "running_var",
+            "num_batches_tracked",
+        ]
+    );
+}
+
+#[test]
+fn batchnorm_stale_statistics_preflight_leaves_other_running_buffers_unchanged() {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1).unwrap();
+    let input = graph.input("x", [2, 1]);
+    let token = norm
+        .forward(&mut graph, input, Mode::Training)
+        .unwrap()
+        .pending
+        .unwrap();
+    let mean_before = norm.running_mean.as_ref().unwrap().snapshot().unwrap();
+    let batch_before = norm.num_batches_tracked.snapshot().unwrap();
+    let var = norm.running_var.as_ref().unwrap();
+    var.replace(var.value().unwrap()).unwrap();
+    assert!(matches!(
+        token.commit_stats(
+            &norm,
+            TensorData::new([1], vec![2.]).unwrap(),
+            TensorData::new([1], vec![3.]).unwrap(),
+        ),
+        Err(Error::BatchNormToken { .. })
+    ));
+    assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().data, mean_before.data);
+    assert_eq!(norm.num_batches_tracked.snapshot().unwrap().data, batch_before.data);
+}
+
+#[test]
+fn batchnorm_counter_and_parameter_version_overflow_preflight_every_statistic() {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1).unwrap();
+    norm.num_batches_tracked
+        .replace(TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64))
+        .unwrap();
+    let input = graph.input("x", [2, 1]);
+    let token = norm
+        .forward(&mut graph, input, Mode::Training)
+        .unwrap()
+        .pending
+        .unwrap();
+    let mean_before = norm.running_mean.as_ref().unwrap().snapshot().unwrap();
+    let var_before = norm.running_var.as_ref().unwrap().snapshot().unwrap();
+    let batches_before = norm.num_batches_tracked.snapshot().unwrap();
+    assert!(matches!(
+        token.commit_stats(
+            &norm,
+            TensorData::new([1], vec![2.]).unwrap(),
+            TensorData::new([1], vec![3.]).unwrap(),
+        ),
+        Err(Error::BatchNormToken {
+            reason: "batch counter overflow"
+        })
+    ));
+    assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().data, mean_before.data);
+    assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().version, mean_before.version);
+    assert_eq!(norm.running_var.as_ref().unwrap().snapshot().unwrap().data, var_before.data);
+    assert_eq!(norm.running_var.as_ref().unwrap().snapshot().unwrap().version, var_before.version);
+    assert_eq!(norm.num_batches_tracked.snapshot().unwrap().data, batches_before.data);
+    assert_eq!(norm.num_batches_tracked.snapshot().unwrap().version, batches_before.version);
+}
+
+#[test]
+fn batchnorm_preflights_configured_channels_before_binding_or_staging_statistics() {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 2, 1e-5, true, true, 0.1).unwrap();
+    let mean_before = norm.running_mean.as_ref().unwrap().snapshot().unwrap();
+    let var_before = norm.running_var.as_ref().unwrap().snapshot().unwrap();
+    let batches_before = norm.num_batches_tracked.snapshot().unwrap();
+    let wrong_channels = graph.input("wrong_channels", [1, 3]);
+    assert!(matches!(
+        norm.forward(&mut graph, wrong_channels, Mode::Eval),
+        Err(Error::InvalidReshape { .. })
+    ));
+    assert!(graph.parameter_bindings().is_empty());
+    assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().data, mean_before.data);
+    assert_eq!(norm.running_var.as_ref().unwrap().snapshot().unwrap().data, var_before.data);
+    assert_eq!(norm.num_batches_tracked.snapshot().unwrap().data, batches_before.data);
+
+    let valid = graph.input("valid", [1, 2]);
+    assert!(norm
+        .forward(&mut graph, valid, Mode::Training)
+        .unwrap()
+        .pending
+        .is_some());
+
+    let mut stateless_graph = Graph::new();
+    let stateless = BatchNorm::new(&mut stateless_graph, 2, 1e-5, false, false, 0.1).unwrap();
+    let stateless_wrong_channels = stateless_graph.input("stateless_wrong_channels", [1, 3]);
+    assert!(matches!(
+        stateless.forward(&mut stateless_graph, stateless_wrong_channels, Mode::Training),
+        Err(Error::InvalidReshape { .. })
+    ));
+    assert!(stateless_graph.parameter_bindings().is_empty());
 }
 
 #[test]
@@ -469,6 +588,38 @@ fn instancenorm_module_forward_preserves_empty_and_preflight_failure_contracts()
     );
     assert_eq!(model.state_dict()?, before);
     Ok(())
+}
+
+#[test]
+fn groupnorm_preflights_grouped_extent_before_lowering() {
+    let mut malformed = Graph::new();
+    let norm = GroupNorm::new(&mut malformed, 1, 2, 1e-5, false).unwrap();
+    let input = malformed.input("input", [1, 2, usize::MAX]);
+    let original_nodes = malformed.node_count();
+    assert!(matches!(
+        norm.forward(&mut malformed, input),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+    assert!(malformed.parameter_bindings().is_empty());
+
+    let mut valid = Graph::new();
+    let norm = GroupNorm::new(&mut valid, 2, 4, 1e-5, false).unwrap();
+    let input = valid.input("input", [1, 4, 1]);
+    let output = norm.forward(&mut valid, input).unwrap();
+    let output = CpuBackend
+        .execute(
+            &valid,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::new([1, 4, 1], vec![1., 3., 10., 14.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    let values = f32s(&output);
+    assert!((values[0] + 1.).abs() < 1e-4 && (values[1] - 1.).abs() < 1e-4);
+    assert!((values[2] + 1.).abs() < 1e-4 && (values[3] - 1.).abs() < 1e-4);
 }
 
 #[test]
@@ -890,4 +1041,58 @@ fn rmsnorm_module_forward_preserves_empty_and_preflight_failure_contracts() -> R
     );
     assert_eq!(model.state_dict()?, before);
     Ok(())
+}
+
+#[test]
+fn layernorm2d_preflights_channels_before_layout_lowering() {
+    let mut malformed = Graph::new();
+    let norm = LayerNorm2d::new(&mut malformed, 2, 1e-5, true).unwrap();
+    let input = malformed.input("input", [1, 3, 1, 1]);
+    let original_nodes = malformed.node_count();
+    assert!(matches!(
+        norm.forward(&mut malformed, input),
+        Err(Error::InvalidReshape { .. })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+    assert!(malformed.parameter_bindings().is_empty());
+
+    let mut valid = Graph::new();
+    let norm = LayerNorm2d::new(&mut valid, 2, 0.0, false).unwrap();
+    let input = valid.input("input", [1, 2, 1, 2]);
+    let output = norm.forward(&mut valid, input).unwrap();
+    let output = execute(
+        &valid,
+        output,
+        &norm,
+        (
+            "input",
+            TensorData::new([1, 2, 1, 2], vec![1., 3., 5., 7.]).unwrap(),
+        ),
+    );
+    assert_eq!(f32s(&output), vec![-1., -1., 1., 1.]);
+}
+
+#[test]
+fn layernorm_constructor_preflights_nonempty_checked_normalized_geometry() {
+    let mut graph = Graph::new();
+    assert!(LayerNorm::new(&mut graph, Shape::new([0]), 1e-5, false).is_err());
+    assert!(LayerNorm::new(
+        &mut graph,
+        Shape::new([usize::MAX, 2]),
+        1e-5,
+        false,
+    )
+    .is_err());
+    assert!(graph.parameter_bindings().is_empty());
+
+    let norm = LayerNorm::new(&mut graph, Shape::new([2]), 1e-5, true).unwrap();
+    assert_eq!(
+        norm.state_dict()
+            .unwrap()
+            .tensors()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["bias", "weight"]
+    );
 }

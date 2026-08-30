@@ -118,19 +118,18 @@ impl CollectivePlan {
         &self.cache_key
     }
 
-    /// Rejects a plan that is not the exact deterministic artifact for its
-    /// request. Executors call this before allocating scratch storage or
-    /// issuing any copy/compute action, so deserialized plans cannot alter a
-    /// collective's ownership, ranges, or dependency ordering.
+    /// Rebuilds the deterministic plan from its request before an executor
+    /// allocates scratch storage or observes an action. Public fields are
+    /// inspectable metadata, not an alternate executable authoring surface.
     pub fn validate(&self) -> Result<()> {
-        let expected = CollectivePlanner::plan(self.request.clone())?;
-        if self.output_lengths != expected.output_lengths
-            || self.chunks != expected.chunks
-            || self.actions != expected.actions
-            || self.cache_key != expected.cache_key
+        let canonical = CollectivePlanner::plan(self.request.clone())?;
+        if self.output_lengths != canonical.output_lengths
+            || self.chunks != canonical.chunks
+            || self.actions != canonical.actions
+            || self.cache_key != canonical.cache_key
         {
             return Err(err(
-                "collective plan does not match its deterministic request artifact",
+                "collective plan does not match its canonical request",
             ));
         }
         Ok(())
@@ -364,10 +363,7 @@ impl CudaCollectiveGroup {
             .map(|(_, context)| context.clone())
             .collect();
         let allocators = contexts.iter().map(PrimaryContext::allocator).collect();
-        let streams = contexts
-            .iter()
-            .map(|context| context.stream().map_err(cuda_err))
-            .collect::<Result<Vec<_>>>()?;
+        let streams = Self::create_streams(&contexts)?;
         Ok(Self {
             devices,
             contexts,
@@ -380,8 +376,31 @@ impl CudaCollectiveGroup {
                 .collect(),
         })
     }
+    fn create_streams(contexts: &[PrimaryContext]) -> Result<Vec<Stream>> {
+        let mut streams = Vec::with_capacity(contexts.len());
+        for context in contexts {
+            match context.stream() {
+                Ok(stream) => streams.push(stream),
+                Err(error) => {
+                    // `Stream::close` preserves retryability when destruction
+                    // fails. Explicitly close earlier streams before unwinding
+                    // so Drop gets one final retry instead of silently losing
+                    // a partially created group resource.
+                    for stream in &streams {
+                        let _ = stream.close();
+                    }
+                    return Err(cuda_err(error));
+                }
+            }
+        }
+        Ok(streams)
+    }
     fn ensure_peers(&self, plan: &CollectivePlan) -> Result<()> {
         let mut peers = self.peers.lock().expect("collective peer mutex poisoned");
+        // Publish newly enabled directional pairs only after the entire plan
+        // has acquired them. On a later enable failure, this temporary map
+        // drops its owned peers and leaves the retry cache unchanged.
+        let mut acquired = std::collections::BTreeMap::new();
         for action in &plan.actions {
             if action.op != ActionOp::Transfer || action.range.len == 0 {
                 continue;
@@ -396,9 +415,8 @@ impl CudaCollectiveGroup {
                 .iter()
                 .position(|d| d == &action.destination)
                 .unwrap();
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                peers.entry((source, destination))
-            {
+            let key = (source, destination);
+            if !peers.contains_key(&key) && !acquired.contains_key(&key) {
                 let peer = self.contexts[source]
                     .peer_access_to(&self.contexts[destination])
                     .map_err(|error| Error::CollectiveAction {
@@ -406,8 +424,18 @@ impl CudaCollectiveGroup {
                         operation: "peer-copy",
                         reason: error.to_string(),
                     })?;
-                entry.insert(peer);
+                acquired.insert(key, peer);
             }
+        }
+        peers.append(&mut acquired);
+        Ok(())
+    }
+    fn synchronize_before_rollback(&self) -> Result<()> {
+        // A failed synchronous launch may still have submitted work. Reclaim
+        // every rank stream before restoring caller-owned outputs, so the
+        // snapshot copy cannot race an earlier collective action.
+        for stream in &self.streams {
+            stream.synchronize().map_err(cuda_err)?;
         }
         Ok(())
     }
@@ -500,9 +528,10 @@ impl CudaCollectiveGroup {
                 .copy_from_view(0, &input, 0, bytes)
                 .map_err(cuda_err)?;
         }
-        let mut trace = Vec::new();
-        let mut completed = vec![false; plan.actions.len()];
-        for action in &plan.actions {
+        let action_result = (|| -> Result<Vec<CudaCollectiveTrace>> {
+            let mut trace = Vec::new();
+            let mut completed = vec![false; plan.actions.len()];
+            for action in &plan.actions {
             if action
                 .depends_on
                 .iter()
@@ -623,9 +652,27 @@ impl CudaCollectiveGroup {
                     }
                 }
             }
-            completed[action.id] = true;
+                completed[action.id] = true;
+            }
+            Ok(trace)
+        })();
+        match action_result {
+            Ok(trace) => Ok(trace),
+            Err(action_error) => {
+                // Every action writes only a caller-owned rank output. Restore
+                // all of them from the pre-action snapshots before exposing the
+                // failed collective, so a retry sees the original contributions.
+                self.synchronize_before_rollback()?;
+                for index in 0..self.devices.len() {
+                    let destination = inputs[index].view().map_err(cuda_err)?;
+                    let original = originals[index].view().map_err(cuda_err)?;
+                    destination
+                        .copy_from_view(0, &original, 0, bytes)
+                        .map_err(cuda_err)?;
+                }
+                Err(action_error)
+            }
         }
-        Ok(trace)
     }
 }
 fn cuda_err(error: CudaError) -> Error {
@@ -637,7 +684,7 @@ impl CollectiveExecutor for InMemoryCollectiveExecutor {
     fn execute(&self, plan: &CollectivePlan, inputs: &[TensorData]) -> Result<Vec<TensorData>> {
         plan.validate()?;
         let r = &plan.request;
-        validate(r)?;
+        plan.validate()?;
         if inputs.len() != r.group.len() {
             return Err(err("input/group count mismatch"));
         }
@@ -911,6 +958,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn public_plan_tampering_rejects_before_in_memory_execution() {
+        let mut plan = CollectivePlanner::plan(CollectiveRequest {
+            group: group(2),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype: DType::I32,
+            input_lengths: vec![2, 2],
+        })
+        .unwrap();
+        assert!(plan.validate().is_ok());
+        let inputs = input(2, 2, DType::I32);
+        let before = inputs
+            .iter()
+            .map(|input| input.storage().clone())
+            .collect::<Vec<_>>();
+        plan.actions[0].range.len = usize::MAX;
+
+        assert!(plan.validate().is_err());
+        assert!(InMemoryCollectiveExecutor.execute(&plan, &inputs).is_err());
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.storage().clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
     fn native_sum(dtype: DType, a: &[u8], b: &[u8]) -> Vec<u8> {
         a.chunks_exact(dtype.itemsize())
             .zip(b.chunks_exact(dtype.itemsize()))
@@ -1046,6 +1123,100 @@ mod tests {
         )
         .unwrap();
         (mock, executor, inputs, plan, primaries)
+    }
+
+    #[test]
+    fn cuda_collective_stream_setup_failure_cleans_and_retries() {
+        use crate::Driver;
+        use crate::cuda::tests::Mock;
+        use std::{num::NonZeroUsize, sync::Arc};
+
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primaries: Vec<_> = (0..3)
+            .map(|_| {
+                driver
+                    .device(crate::DeviceId(0))
+                    .unwrap()
+                    .retain_primary_context()
+                    .unwrap()
+            })
+            .collect();
+        let group = group(3);
+        let plan = CollectivePlanner::plan(CollectiveRequest {
+            group: group.clone(),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype: DType::I32,
+            input_lengths: vec![2; 3],
+        })
+        .unwrap();
+        let inputs: Vec<_> = primaries
+            .iter()
+            .map(|primary| {
+                primary
+                    .allocator()
+                    .allocate(NonZeroUsize::new(8).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let values: Vec<Vec<u8>> = (0_i32..3)
+            .map(|rank| {
+                [rank + 1, rank + 10]
+                    .into_iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect()
+            })
+            .collect();
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let allocations: Vec<_> = primaries
+            .iter()
+            .map(|primary| mock.live_allocation_count(primary.owner()))
+            .collect();
+
+        // The second stream cannot be created. The first stream's explicit
+        // close also fails once, then its Drop retry releases it.
+        mock.fail_stream_create_after(1, 2);
+        mock.fail_stream_destroy_after(0, 2);
+        assert!(CudaCollectiveGroup::new(
+            group
+                .devices()
+                .iter()
+                .cloned()
+                .zip(primaries.iter().cloned()),
+        )
+        .is_err());
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, 8), values[rank]);
+            assert_eq!(
+                mock.live_allocation_count(primaries[rank].owner()),
+                allocations[rank]
+            );
+        }
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&call| call == "stream_create").count(), 2);
+        assert_eq!(calls.iter().filter(|&&call| call == "stream_destroy").count(), 2);
+        assert!(calls.iter().all(|&call| call != "peer_enable" && call != "launch"));
+
+        let executor = CudaCollectiveGroup::new(
+            group
+                .devices()
+                .iter()
+                .cloned()
+                .zip(primaries.iter().cloned()),
+        )
+        .unwrap();
+        let expected = values[1..].iter().fold(values[0].clone(), |sum, next| {
+            native_sum(DType::I32, &sum, next)
+        });
+        let refs: Vec<_> = inputs.iter().collect();
+        executor.all_reduce_sum(&plan, refs).unwrap();
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, 8), expected);
+        }
     }
     fn write(
         mock: &crate::cuda::tests::Mock,
@@ -1323,6 +1494,10 @@ mod tests {
             let expected = native_sum(DType::I32, &left, &right);
             write(&mock, &primaries[0], &inputs[0], &left);
             write(&mock, &primaries[1], &inputs[1], &right);
+            let allocations = [
+                mock.live_allocation_count(primaries[0].owner()),
+                mock.live_allocation_count(primaries[1].owner()),
+            ];
             if is_peer {
                 mock.fail_peer_after(1, 2);
             } else {
@@ -1331,12 +1506,12 @@ mod tests {
             assert!(
                 matches!(executor.all_reduce_sum(&plan, [&inputs[0], &inputs[1]]), Err(Error::CollectiveAction { action_id: actual_id, operation: actual_op, .. }) if actual_id == action_id && actual_op == operation)
             );
-            assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), expected);
+            assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), left);
             assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), right);
+            assert_eq!(mock.live_allocation_count(primaries[0].owner()), allocations[0]);
+            assert_eq!(mock.live_allocation_count(primaries[1].owner()), allocations[1]);
             assert_eq!(primaries[0].allocator().deferred_bytes(), 0);
             assert_eq!(primaries[1].allocator().deferred_bytes(), 0);
-            write(&mock, &primaries[0], &inputs[0], &left);
-            write(&mock, &primaries[1], &inputs[1], &right);
             assert!(
                 executor
                     .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
@@ -1344,6 +1519,129 @@ mod tests {
             );
             assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), expected);
             assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), expected);
+        }
+    }
+
+    #[test]
+    fn cuda_collective_peer_setup_is_transactional_and_retryable() {
+        let (mock, executor, inputs, plan, primaries) = fixture_n(3, DType::I32, 2);
+        let allocations: Vec<_> = primaries
+            .iter()
+            .map(|primary| mock.live_allocation_count(primary.owner()))
+            .collect();
+        // The first directional pair is acquired, then the next enable fails.
+        // The first one must be released rather than retained in the cache.
+        mock.fail_peer_enable_after(1, 2);
+        let refs: Vec<_> = inputs.iter().collect();
+        assert!(matches!(
+            executor.all_reduce_sum(&plan, refs),
+            Err(Error::CollectiveAction {
+                action_id: 3,
+                operation: "peer-copy",
+                ..
+            })
+        ));
+        assert_eq!(
+            primaries
+                .iter()
+                .map(|primary| mock.live_allocation_count(primary.owner()))
+                .collect::<Vec<_>>(),
+            allocations
+        );
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&call| call == "peer_enable").count(), 2);
+        assert_eq!(calls.iter().filter(|&&call| call == "peer_disable").count(), 1);
+
+        let values: Vec<Vec<u8>> = (0_i32..3)
+            .map(|rank| {
+                [rank + 1, rank + 10]
+                    .into_iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect()
+            })
+            .collect();
+        let expected = values[1..].iter().fold(values[0].clone(), |sum, next| {
+            native_sum(DType::I32, &sum, next)
+        });
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let refs: Vec<_> = inputs.iter().collect();
+        executor.all_reduce_sum(&plan, refs).unwrap();
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, expected.len()), expected);
+        }
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&call| call == "peer_enable").count(), 8);
+        assert_eq!(calls.iter().filter(|&&call| call == "peer_disable").count(), 1);
+        drop((executor, inputs, primaries));
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "peer_disable")
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn cuda_collective_later_rank_sync_failure_restores_and_retries() {
+        let (mock, executor, inputs, plan, primaries) = fixture_n(3, DType::I32, 2);
+        let values: Vec<Vec<u8>> = (0_i32..3)
+            .map(|rank| {
+                [rank + 1, rank + 10]
+                    .into_iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect()
+            })
+            .collect();
+        let expected = values[1..].iter().fold(values[0].clone(), |sum, next| {
+            native_sum(DType::I32, &sum, next)
+        });
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let allocations: Vec<_> = primaries
+            .iter()
+            .map(|primary| mock.live_allocation_count(primary.owner()))
+            .collect();
+        let stream_creates = mock
+            .calls()
+            .iter()
+            .filter(|&&call| call == "stream_create")
+            .count();
+        // Rank zero completes two reductions; the third reduction belongs to
+        // rank one and has already submitted its add when synchronization
+        // reports the one-shot failure.
+        mock.fail_stream_sync_after(2, 2);
+        let refs: Vec<_> = inputs.iter().collect();
+        assert!(matches!(
+            executor.all_reduce_sum(&plan, refs),
+            Err(Error::CollectiveAction {
+                action_id: 7,
+                operation: "add",
+                ..
+            })
+        ));
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, values[rank].len()), values[rank]);
+            assert_eq!(
+                mock.live_allocation_count(primaries[rank].owner()),
+                allocations[rank]
+            );
+            assert_eq!(primaries[rank].allocator().deferred_bytes(), 0);
+        }
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "stream_create")
+                .count(),
+            stream_creates
+        );
+        let refs: Vec<_> = inputs.iter().collect();
+        executor.all_reduce_sum(&plan, refs).unwrap();
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, expected.len()), expected);
         }
     }
 
@@ -1460,7 +1758,9 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(read(&mock, &primaries[2], &inputs[2], 8), values[2]);
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, 8), values[rank]);
+        }
         assert_eq!(primaries[0].allocator().deferred_bytes(), 0);
         mock.fail_launch_after(2, 2);
         for (rank, bytes) in values.iter().enumerate() {
@@ -1475,11 +1775,8 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(read(&mock, &primaries[0], &inputs[0], 8), expected);
-        assert_eq!(read(&mock, &primaries[1], &inputs[1], 8), values[1]);
-        assert_eq!(read(&mock, &primaries[2], &inputs[2], 8), values[2]);
-        for (rank, bytes) in values.iter().enumerate() {
-            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, 8), values[rank]);
         }
         let refs: Vec<_> = inputs.iter().collect();
         executor.all_reduce_sum(&plan, refs).unwrap();

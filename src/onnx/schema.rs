@@ -16,18 +16,18 @@ pub(super) fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
             .ok_or_else(|| bad("attribute lacks name"))?
             .to_owned();
         let fields = a.fields()?;
-        let value = if let Some((_, 5, x)) = fields.iter().find(|(i, w, _)| *i == 2 && *w == 5) {
-            x.to_vec()
-        } else if let Some((_, 0, x)) = fields.iter().find(|(i, w, _)| *i == 3 && *w == 0) {
-            x.to_vec()
-        } else if let Some((_, 2, x)) = fields
-            .iter()
-            .find(|(i, w, _)| (*i == 4 || *i == 5 || *i == 8) && *w == 2)
-        {
-            x.to_vec()
-        } else {
+        let mut values = fields.iter().filter(|(id, wire, _)| {
+            (*id == 2 && *wire == 5)
+                || (*id == 3 && *wire == 0)
+                || ((*id == 4 || *id == 5 || *id == 7 || *id == 8) && *wire == 2)
+        });
+        let Some((_, _, value)) = values.next() else {
             return Err(bad("unsupported ONNX attribute form"));
         };
+        if values.next().is_some() {
+            return Err(bad("duplicate ONNX attribute value"));
+        }
+        let value = value.to_vec();
         if out.insert(name, value).is_some() {
             return Err(bad("duplicate ONNX attribute"));
         }
@@ -43,6 +43,255 @@ pub(super) fn scalar_f32(b: &[u8]) -> Result<f32> {
         .try_into()
         .map_err(|_| bad("ONNX float attribute must be f32"))?;
     Ok(f32::from_le_bytes(a))
+}
+
+/// Reads one named ONNX FLOAT attribute without allowing another AttributeProto
+/// value field to masquerade as its fixed-width payload.  Most legacy lowering
+/// sites intentionally operate on the normalized raw attribute bytes; the
+/// parameterized HardSigmoid adapter needs this narrower source-level check.
+pub(super) fn typed_scalar_f32_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<f32>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(_, _, ty)] = types.as_slice() else {
+            return Err(bad("ONNX float attribute must declare FLOAT type"));
+        };
+        let mut at = 0;
+        if var(ty, &mut at)? != 1 || at != ty.len() {
+            return Err(bad("ONNX attribute is not FLOAT"));
+        }
+        let [(id, wire, value)] = values.as_slice() else {
+            return Err(bad("ONNX float attribute must have one FLOAT value"));
+        };
+        if *id != 2 || *wire != 5 {
+            return Err(bad("ONNX attribute is not FLOAT"));
+        }
+        out = Some(scalar_f32(value)?);
+    }
+    Ok(out)
+}
+
+/// Reads one named ONNX INT attribute without allowing a STRING, FLOAT, or
+/// another AttributeProto payload field to be interpreted as a varint.  The
+/// older importer adapters intentionally keep their raw normalized bytes;
+/// CumSum needs this narrow check because its flags use Python truthiness.
+pub(super) fn typed_scalar_i64_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<i64>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        if !types.is_empty() {
+            let [(_, _, ty)] = types.as_slice() else {
+                return Err(bad("ONNX integer attribute must declare one INT type"));
+            };
+            let mut at = 0;
+            if var(ty, &mut at)? != 2 || at != ty.len() {
+                return Err(bad("ONNX attribute is not INT"));
+            }
+        }
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(id, wire, raw_value)] = values.as_slice() else {
+            return Err(bad("ONNX integer attribute must have one INT value"));
+        };
+        if *id != 3 || *wire != 0 {
+            return Err(bad("ONNX attribute is not INT"));
+        }
+        let mut at = 0;
+        let value = var(raw_value, &mut at)?;
+        if at != raw_value.len() {
+            return Err(bad("invalid ONNX integer attribute"));
+        }
+        out = Some(value as i64);
+    }
+    Ok(out)
+}
+
+/// Reads one named ONNX INT attribute whose declared AttributeProto type must
+/// be INT.  Some legacy adapters predate declared-type enforcement; creation
+/// operators such as EyeLike use this narrower form because their dtype and
+/// diagonal controls must not accept an untyped wire alias.
+pub(super) fn strict_typed_scalar_i64_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<i64>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let [(_, _, ty)] = types.as_slice() else {
+            return Err(bad("ONNX integer attribute must declare INT type"));
+        };
+        let mut at = 0;
+        if var(ty, &mut at)? != 2 || at != ty.len() {
+            return Err(bad("ONNX attribute is not INT"));
+        }
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(id, wire, raw_value)] = values.as_slice() else {
+            return Err(bad("ONNX integer attribute must have one INT value"));
+        };
+        if *id != 3 || *wire != 0 {
+            return Err(bad("ONNX attribute is not INT"));
+        }
+        let mut at = 0;
+        let value = var(raw_value, &mut at)?;
+        if at != raw_value.len() {
+            return Err(bad("invalid ONNX integer attribute"));
+        }
+        out = Some(value as i64);
+    }
+    Ok(out)
+}
+
+/// Reads one named ONNX STRING attribute whose declared AttributeProto type
+/// is STRING. This is deliberately narrower than the legacy raw attribute
+/// map: movement adapters must not treat an INT/FLOAT/TENSOR wire payload as
+/// a UTF-8 mode string.
+pub(super) fn strict_typed_string_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<String>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let [(_, _, ty)] = types.as_slice() else {
+            return Err(bad("ONNX string attribute must declare STRING type"));
+        };
+        let mut at = 0;
+        if var(ty, &mut at)? != 3 || at != ty.len() {
+            return Err(bad("ONNX attribute is not STRING"));
+        }
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(id, wire, value)] = values.as_slice() else {
+            return Err(bad("ONNX string attribute must have one STRING value"));
+        };
+        if *id != 4 || *wire != 2 {
+            return Err(bad("ONNX attribute is not STRING"));
+        }
+        out = Some(
+            std::str::from_utf8(value)
+                .map_err(|_| bad("ONNX string attribute is not UTF-8"))?
+                .to_owned(),
+        );
+    }
+    Ok(out)
+}
+
+/// Reads one named ONNX INTS attribute whose declared AttributeProto type is
+/// INTS and whose sole payload is the packed integer field. This keeps
+/// adapters with Python-list controls from accepting a scalar INT, STRING,
+/// or TENSOR wire alias.
+pub(super) fn strict_typed_packed_i64_attr(
+    n: &Msg<'_>,
+    wanted: &str,
+) -> Result<Option<Vec<i64>>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let [(_, _, ty)] = types.as_slice() else {
+            return Err(bad("ONNX integer list attribute must declare INTS type"));
+        };
+        let mut at = 0;
+        if var(ty, &mut at)? != 7 || at != ty.len() {
+            return Err(bad("ONNX attribute is not INTS"));
+        }
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(id, wire, raw_values)] = values.as_slice() else {
+            return Err(bad("ONNX integer list attribute must have one INTS value"));
+        };
+        if *id != 8 || *wire != 2 {
+            return Err(bad("ONNX attribute is not INTS"));
+        }
+        let mut at = 0;
+        let mut values = Vec::new();
+        while at < raw_values.len() {
+            values.push(var(raw_values, &mut at)? as i64);
+        }
+        out = Some(values);
+    }
+    Ok(out)
 }
 pub(super) fn packed_i64(b: &[u8]) -> Result<Vec<i64>> {
     let mut at = 0;
@@ -168,7 +417,10 @@ pub(super) fn onnx_pool_options(
             "MaxPool storage_order other than row-major is unsupported",
         ));
     }
-    if !max && (attrs.contains_key("storage_order") || attrs.contains_key("dilations")) {
+    if max && attrs.contains_key("count_include_pad") {
+        return Err(bad("unsupported MaxPool count_include_pad attribute"));
+    }
+    if !max && attrs.contains_key("storage_order") {
         return Err(bad("unsupported AveragePool attribute"));
     }
     let bool_attr = |name: &str, default: bool| -> Result<bool> {

@@ -67,10 +67,89 @@ impl fmt::Display for SafetensorsFileError {
 
 impl std::error::Error for SafetensorsFileError {}
 
+/// Borrowed safetensors prefix information without tensor-descriptor validation.
+///
+/// `header` is the raw JSON value from the file prefix. It intentionally does
+/// not require a safetensors tensor-map shape: use [`load_safetensors`] when
+/// the tensor descriptors and payload must be validated.
+#[derive(Debug, PartialEq)]
+pub struct SafetensorsMetadata<'a> {
+    /// The original complete safetensors byte slice.
+    pub source: &'a [u8],
+    /// Byte offset at which the data section begins.
+    pub data_start: usize,
+    /// The unvalidated JSON header value.
+    pub header: Value,
+}
+
+/// Owned safetensors prefix information read from a file without tensor validation.
+#[derive(Debug, PartialEq)]
+pub struct OwnedSafetensorsMetadata {
+    /// The complete original safetensors file bytes.
+    pub source: Vec<u8>,
+    /// Byte offset at which the data section begins.
+    pub data_start: usize,
+    /// The unvalidated JSON header value.
+    pub header: Value,
+}
+
 fn ser(reason: impl Into<String>) -> Error {
     Error::Serialization {
         reason: reason.into(),
     }
+}
+
+/// Validates the shared 8-byte safetensors prefix and borrows its JSON bytes.
+fn safetensors_header_prefix(bytes: &[u8]) -> Result<(&[u8], usize)> {
+    if bytes.len() < 8 {
+        return Err(ser("file is shorter than the 8-byte header length"));
+    }
+    let header_len = usize::try_from(u64::from_le_bytes(
+        bytes[..8].try_into().expect("eight bytes"),
+    ))
+    .map_err(|_| ser("header length does not fit usize"))?;
+    let data_start = 8usize
+        .checked_add(header_len)
+        .ok_or_else(|| ser("header length overflows usize"))?;
+    if data_start > bytes.len() {
+        return Err(ser("truncated header"));
+    }
+    Ok((&bytes[8..data_start], data_start))
+}
+
+/// Inspects only the borrowed safetensors prefix and raw JSON header.
+///
+/// This matches tinygrad's metadata inspection boundary: it checks the
+/// length-prefixed header, parses JSON, and deliberately leaves tensor
+/// descriptor, dtype, offset, and payload validation to [`load_safetensors`].
+pub fn inspect_safetensors_metadata(bytes: &[u8]) -> Result<SafetensorsMetadata<'_>> {
+    let (header_bytes, data_start) = safetensors_header_prefix(bytes)?;
+    let header = serde_json::from_slice(header_bytes)
+        .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
+    Ok(SafetensorsMetadata {
+        source: bytes,
+        data_start,
+        header,
+    })
+}
+
+/// Reads and inspects only a safetensors file's prefix and raw JSON header.
+///
+/// The result owns the file bytes so that its header is not self-referential.
+/// It performs no tensor descriptor, dtype, offset, or payload validation.
+pub fn inspect_safetensors_metadata_file(
+    path: impl AsRef<Path>,
+) -> Result<OwnedSafetensorsMetadata> {
+    let source = fs::read(path).map_err(|e| ser(e.to_string()))?;
+    let (data_start, header) = {
+        let metadata = inspect_safetensors_metadata(&source)?;
+        (metadata.data_start, metadata.header)
+    };
+    Ok(OwnedSafetensorsMetadata {
+        source,
+        data_start,
+        header,
+    })
 }
 
 impl TensorData {
@@ -197,97 +276,131 @@ struct Header {
     tensors: BTreeMap<String, Entry>,
 }
 
+struct StateHeader {
+    tensors: BTreeMap<String, Entry>,
+}
+
+fn parse_header_map<'de, A: MapAccess<'de>>(
+    mut map: A,
+    strict_metadata: bool,
+) -> std::result::Result<Header, A::Error> {
+    let mut metadata = Metadata::new();
+    let mut tensors = BTreeMap::new();
+    while let Some((name, value)) = map.next_entry::<String, Value>()? {
+        if name == "__metadata__" {
+            if strict_metadata {
+                let object = value
+                    .as_object()
+                    .ok_or_else(|| de::Error::custom("__metadata__ must be an object"))?;
+                for (k, v) in object {
+                    metadata.insert(
+                        k.clone(),
+                        v.as_str()
+                            .ok_or_else(|| de::Error::custom("metadata values must be strings"))?
+                            .to_owned(),
+                    );
+                }
+            }
+        } else {
+            if name.is_empty() {
+                return Err(de::Error::custom("tensor name must not be empty"));
+            }
+            if tensors.contains_key(&name) {
+                return Err(de::Error::custom("duplicate tensor name"));
+            }
+            let object = value
+                .as_object()
+                .ok_or_else(|| de::Error::custom("tensor entry must be an object"))?;
+            if object.len() != 3
+                || !object.contains_key("dtype")
+                || !object.contains_key("shape")
+                || !object.contains_key("data_offsets")
+            {
+                return Err(de::Error::custom(
+                    "tensor entry must contain only dtype, shape, and data_offsets",
+                ));
+            }
+            let dtype = dtype_from_tag(
+                object["dtype"]
+                    .as_str()
+                    .ok_or_else(|| de::Error::custom("dtype must be a string"))?,
+            )
+            .map_err(de::Error::custom)?;
+            let shape = object["shape"]
+                .as_array()
+                .ok_or_else(|| de::Error::custom("shape must be an array"))?
+                .iter()
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|x| usize::try_from(x).ok())
+                        .ok_or_else(|| de::Error::custom("shape dimensions must be usize integers"))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let offsets = object["data_offsets"]
+                .as_array()
+                .ok_or_else(|| de::Error::custom("data_offsets must be an array"))?;
+            if offsets.len() != 2 {
+                return Err(de::Error::custom("data_offsets must have two values"));
+            }
+            let offset = |v: &Value| {
+                v.as_u64()
+                    .and_then(|x| usize::try_from(x).ok())
+                    .ok_or_else(|| de::Error::custom("offset must be a usize integer"))
+            };
+            tensors.insert(
+                name,
+                Entry {
+                    dtype,
+                    shape,
+                    offsets: [offset(&offsets[0])?, offset(&offsets[1])?],
+                },
+            );
+        }
+    }
+    Ok(Header { metadata, tensors })
+}
+
 impl<'de> Deserialize<'de> for Header {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         struct HeaderVisitor;
         impl<'de> Visitor<'de> for HeaderVisitor {
             type Value = Header;
+
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("a safetensors header object")
             }
+
             fn visit_map<A: MapAccess<'de>>(
                 self,
-                mut map: A,
+                map: A,
             ) -> std::result::Result<Header, A::Error> {
-                let mut metadata = Metadata::new();
-                let mut tensors = BTreeMap::new();
-                while let Some((name, value)) = map.next_entry::<String, Value>()? {
-                    if name == "__metadata__" {
-                        let object = value
-                            .as_object()
-                            .ok_or_else(|| de::Error::custom("__metadata__ must be an object"))?;
-                        for (k, v) in object {
-                            metadata.insert(
-                                k.clone(),
-                                v.as_str()
-                                    .ok_or_else(|| {
-                                        de::Error::custom("metadata values must be strings")
-                                    })?
-                                    .to_owned(),
-                            );
-                        }
-                    } else {
-                        if name.is_empty() {
-                            return Err(de::Error::custom("tensor name must not be empty"));
-                        }
-                        if tensors.contains_key(&name) {
-                            return Err(de::Error::custom("duplicate tensor name"));
-                        }
-                        let object = value
-                            .as_object()
-                            .ok_or_else(|| de::Error::custom("tensor entry must be an object"))?;
-                        if object.len() != 3
-                            || !object.contains_key("dtype")
-                            || !object.contains_key("shape")
-                            || !object.contains_key("data_offsets")
-                        {
-                            return Err(de::Error::custom(
-                                "tensor entry must contain only dtype, shape, and data_offsets",
-                            ));
-                        }
-                        let dtype = dtype_from_tag(
-                            object["dtype"]
-                                .as_str()
-                                .ok_or_else(|| de::Error::custom("dtype must be a string"))?,
-                        )
-                        .map_err(de::Error::custom)?;
-                        let shape = object["shape"]
-                            .as_array()
-                            .ok_or_else(|| de::Error::custom("shape must be an array"))?
-                            .iter()
-                            .map(|v| {
-                                v.as_u64()
-                                    .and_then(|x| usize::try_from(x).ok())
-                                    .ok_or_else(|| {
-                                        de::Error::custom("shape dimensions must be usize integers")
-                                    })
-                            })
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
-                        let offsets = object["data_offsets"]
-                            .as_array()
-                            .ok_or_else(|| de::Error::custom("data_offsets must be an array"))?;
-                        if offsets.len() != 2 {
-                            return Err(de::Error::custom("data_offsets must have two values"));
-                        }
-                        let offset = |v: &Value| {
-                            v.as_u64()
-                                .and_then(|x| usize::try_from(x).ok())
-                                .ok_or_else(|| de::Error::custom("offset must be a usize integer"))
-                        };
-                        tensors.insert(
-                            name,
-                            Entry {
-                                dtype,
-                                shape,
-                                offsets: [offset(&offsets[0])?, offset(&offsets[1])?],
-                            },
-                        );
-                    }
-                }
-                Ok(Header { metadata, tensors })
+                parse_header_map(map, true)
             }
         }
         deserializer.deserialize_map(HeaderVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for StateHeader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct StateHeaderVisitor;
+        impl<'de> Visitor<'de> for StateHeaderVisitor {
+            type Value = StateHeader;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a safetensors header object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<StateHeader, A::Error> {
+                Ok(StateHeader {
+                    tensors: parse_header_map(map, false)?.tensors,
+                })
+            }
+        }
+        deserializer.deserialize_map(StateHeaderVisitor)
     }
 }
 
@@ -334,25 +447,13 @@ fn dtype_tag(dtype: DType) -> std::result::Result<&'static str, String> {
     })
 }
 
-/// Loads an ordered state dictionary and string metadata from an in-memory file.
-pub fn load_safetensors(bytes: &[u8]) -> Result<(StateDict, Metadata)> {
-    if bytes.len() < 8 {
-        return Err(ser("file is shorter than the 8-byte header length"));
-    }
-    let header_len = usize::try_from(u64::from_le_bytes(
-        bytes[..8].try_into().expect("eight bytes"),
-    ))
-    .map_err(|_| ser("header length does not fit usize"))?;
-    let data_start = 8usize
-        .checked_add(header_len)
-        .ok_or_else(|| ser("header length overflows usize"))?;
-    if data_start > bytes.len() {
-        return Err(ser("truncated header"));
-    }
-    let header: Header = serde_json::from_slice(&bytes[8..data_start])
-        .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
+fn load_safetensors_state(
+    bytes: &[u8],
+    data_start: usize,
+    tensors: BTreeMap<String, Entry>,
+) -> Result<StateDict> {
     let data = &bytes[data_start..];
-    let mut entries: Vec<_> = header.tensors.into_iter().collect();
+    let mut entries: Vec<_> = tensors.into_iter().collect();
     entries.sort_by_key(|(_, entry)| entry.offsets[0]);
     let mut expected_offset = 0usize;
     let mut result = StateDict::new();
@@ -381,17 +482,50 @@ pub fn load_safetensors(bytes: &[u8]) -> Result<(StateDict, Metadata)> {
     if expected_offset != data.len() {
         return Err(ser("data section contains unreferenced bytes"));
     }
-    Ok((result, header.metadata))
+    Ok(result)
 }
 
-/// Serializes a deterministic, name-sorted state dictionary.
-pub fn save_safetensors(tensors: &StateDict, metadata: &Metadata) -> Result<Vec<u8>> {
+/// Loads an ordered state dictionary and string metadata from an in-memory file.
+pub fn load_safetensors(bytes: &[u8]) -> Result<(StateDict, Metadata)> {
+    let (header_bytes, data_start) = safetensors_header_prefix(bytes)?;
+    let header: Header = serde_json::from_slice(header_bytes)
+        .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
+    let state = load_safetensors_state(bytes, data_start, header.tensors)?;
+    Ok((state, header.metadata))
+}
+
+/// Loads safetensors tensor entries while deliberately ignoring `__metadata__`.
+///
+/// Tensor descriptors, offsets, payload layout, and dense bytes receive the
+/// same validation as [`load_safetensors`]. Unlike that strict compatibility
+/// loader, this state-only entry point accepts any JSON value for the reserved
+/// metadata field.
+pub fn load_safetensors_state_only(bytes: &[u8]) -> Result<StateDict> {
+    let (header_bytes, data_start) = safetensors_header_prefix(bytes)?;
+    let header: StateHeader = serde_json::from_slice(header_bytes)
+        .map_err(|e| ser(format!("invalid header JSON: {e}")))?;
+    load_safetensors_state(bytes, data_start, header.tensors)
+}
+
+/// Reads a safetensors file and loads its tensor entries while ignoring metadata.
+pub fn load_safetensors_state_only_file(path: impl AsRef<Path>) -> Result<StateDict> {
+    load_safetensors_state_only(&fs::read(path).map_err(|e| ser(e.to_string()))?)
+}
+
+fn checked_raw_metadata(metadata: Option<&Value>) -> Result<Option<Value>> {
+    match metadata {
+        None => Ok(None),
+        Some(Value::Object(object)) if object.is_empty() => Ok(None),
+        Some(Value::Object(_)) => Ok(metadata.cloned()),
+        Some(_) => Err(ser("metadata must be a JSON object")),
+    }
+}
+
+fn serialize_safetensors(tensors: &StateDict, metadata: Option<&Value>) -> Result<Vec<u8>> {
+    let metadata = checked_raw_metadata(metadata)?;
     let mut header = serde_json::Map::new();
-    if !metadata.is_empty() {
-        header.insert(
-            "__metadata__".into(),
-            serde_json::to_value(metadata).map_err(|e| ser(e.to_string()))?,
-        );
+    if let Some(metadata) = metadata {
+        header.insert("__metadata__".into(), metadata);
     }
     let mut payload = Vec::new();
     for (name, tensor) in tensors {
@@ -429,6 +563,23 @@ pub fn save_safetensors(tensors: &StateDict, metadata: &Metadata) -> Result<Vec<
 /// This compatibility convenience maps filesystem and limit failures into the
 /// crate-wide serialization error. Prefer [`load_safetensors_file_with_limits`]
 /// when callers need a typed local-file boundary.
+/// Serializes a deterministic, name-sorted state dictionary and string metadata.
+pub fn save_safetensors(tensors: &StateDict, metadata: &Metadata) -> Result<Vec<u8>> {
+    let metadata = serde_json::to_value(metadata).map_err(|e| ser(e.to_string()))?;
+    serialize_safetensors(tensors, Some(&metadata))
+}
+
+/// Serializes a state dictionary with optional raw JSON object metadata.
+///
+/// Empty metadata and `None` omit `__metadata__`. Non-object metadata is
+/// rejected before tensor or payload serialization begins.
+pub fn save_safetensors_with_json_metadata(
+    tensors: &StateDict,
+    metadata: Option<&Value>,
+) -> Result<Vec<u8>> {
+    serialize_safetensors(tensors, metadata)
+}
+
 pub fn load_safetensors_file(path: impl AsRef<Path>) -> Result<(StateDict, Metadata)> {
     match load_safetensors_file_with_limits(path, SafetensorsReadLimits::default()) {
         Ok(value) => Ok(value),
@@ -483,18 +634,8 @@ pub fn load_safetensors_file_with_limits(
     }
     load_safetensors(&bytes).map_err(SafetensorsFileError::Format)
 }
-/// Atomically replaces `path` after constructing the whole file in memory.
-///
-/// The staged file is created exclusively beside the target, written and
-/// synced before replacement, then cleaned after every failed write or rename.
-/// An existing target is never opened for writing before the final rename.
-pub fn save_safetensors_file(
-    path: impl AsRef<Path>,
-    tensors: &StateDict,
-    metadata: &Metadata,
-) -> Result<()> {
+fn save_safetensors_file_bytes(path: impl AsRef<Path>, bytes: Vec<u8>) -> Result<()> {
     let path = path.as_ref();
-    let bytes = save_safetensors(tensors, metadata)?;
     let file_name = path
         .file_name()
         .and_then(|x| x.to_str())
@@ -536,6 +677,24 @@ pub fn save_safetensors_file(
     })
 }
 
+/// Atomically replaces `path` after constructing the whole file in memory.
+pub fn save_safetensors_file(
+    path: impl AsRef<Path>,
+    tensors: &StateDict,
+    metadata: &Metadata,
+) -> Result<()> {
+    save_safetensors_file_bytes(path, save_safetensors(tensors, metadata)?)
+}
+
+/// Atomically saves a state dictionary with optional raw JSON object metadata.
+pub fn save_safetensors_file_with_json_metadata(
+    path: impl AsRef<Path>,
+    tensors: &StateDict,
+    metadata: Option<&Value>,
+) -> Result<()> {
+    save_safetensors_file_bytes(path, save_safetensors_with_json_metadata(tensors, metadata)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +715,238 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         directory
     }
+    #[test]
+    fn metadata_inspection_borrows_raw_json_without_validating_tensors() {
+        let header = br#"{"__metadata__":{"producer":"tinygrad"},"x":{"dtype":"NOT_A_DTYPE","shape":"unchecked","data_offsets":[9]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[7, 8, 9]);
+        let original = bytes.clone();
+
+        let metadata = inspect_safetensors_metadata(&bytes).unwrap();
+        assert_eq!(metadata.source.as_ptr(), bytes.as_ptr());
+        assert_eq!(metadata.source, original.as_slice());
+        assert_eq!(metadata.data_start, 8 + header.len());
+        assert_eq!(
+            metadata.header,
+            serde_json::json!({
+                "__metadata__": {"producer": "tinygrad"},
+                "x": {"dtype": "NOT_A_DTYPE", "shape": "unchecked", "data_offsets": [9]}
+            })
+        );
+        assert_eq!(bytes, original);
+        assert!(load_safetensors(&bytes).is_err());
+    }
+
+    #[test]
+    fn metadata_inspection_accepts_arbitrary_json_header_shape() {
+        let header = br#"[{"metadata":{"nested":true}},["tensor",0]]"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+
+        let metadata = inspect_safetensors_metadata(&bytes).unwrap();
+        assert_eq!(metadata.data_start, bytes.len());
+        assert_eq!(
+            metadata.header,
+            serde_json::json!([{"metadata": {"nested": true}}, ["tensor", 0]])
+        );
+    }
+
+    #[test]
+    fn metadata_inspection_rejects_invalid_prefixes_and_json() {
+        assert!(inspect_safetensors_metadata(&[0; 7]).is_err());
+
+        let mut truncated = 4u64.to_le_bytes().to_vec();
+        truncated.extend_from_slice(b"{}");
+        assert!(inspect_safetensors_metadata(&truncated).is_err());
+
+        assert!(inspect_safetensors_metadata(&u64::MAX.to_le_bytes()).is_err());
+
+        let mut invalid_json = 1u64.to_le_bytes().to_vec();
+        invalid_json.push(b'{');
+        assert!(inspect_safetensors_metadata(&invalid_json).is_err());
+    }
+
+    #[test]
+    fn state_only_load_ignores_raw_metadata_but_preserves_tensor_lanes() {
+        let header = br#"{"__metadata__":{"nested":[1,true],"number":7},"x":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#;
+        let payload = [0x00, 0x80, 0x55, 0x7e];
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&payload);
+        let original = bytes.clone();
+
+        let state = load_safetensors_state_only(&bytes).unwrap();
+        assert_eq!(state["x"].to_le_bytes().unwrap(), payload);
+        assert!(load_safetensors(&bytes).is_err());
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn state_only_and_strict_loaders_agree_for_string_metadata() {
+        let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![9])))]);
+        let metadata = Metadata::from([("source".into(), "tinygrad".into())]);
+        let bytes = save_safetensors(&tensors, &metadata).unwrap();
+
+        assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
+        assert_eq!(load_safetensors(&bytes).unwrap(), (tensors, metadata));
+    }
+
+    #[test]
+    fn raw_json_metadata_save_round_trips_state_and_preserves_bytes() {
+        let tensors = StateDict::from([(
+            "x".into(),
+            raw([2], Storage::F16(vec![0x8000, 0x7e55])),
+        )]);
+        let metadata = serde_json::json!({
+            "nested": {"flags": [true, null], "count": 7},
+            "number": 1.5
+        });
+        let original_tensors = tensors.clone();
+        let original_metadata = metadata.clone();
+
+        let bytes = save_safetensors_with_json_metadata(&tensors, Some(&metadata)).unwrap();
+        assert_eq!(
+            inspect_safetensors_metadata(&bytes).unwrap().header["__metadata__"],
+            metadata
+        );
+        assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
+        assert!(load_safetensors(&bytes).is_err());
+        assert_eq!(bytes, save_safetensors_with_json_metadata(&tensors, Some(&metadata)).unwrap());
+        assert_eq!(tensors, original_tensors);
+        assert_eq!(metadata, original_metadata);
+
+        let empty = serde_json::json!({});
+        let absent = save_safetensors_with_json_metadata(&tensors, None).unwrap();
+        assert_eq!(
+            absent,
+            save_safetensors_with_json_metadata(&tensors, Some(&empty)).unwrap()
+        );
+        assert!(inspect_safetensors_metadata(&absent)
+            .unwrap()
+            .header
+            .get("__metadata__")
+            .is_none());
+    }
+
+    #[test]
+    fn raw_json_metadata_save_matches_legacy_strings_and_fails_before_tensors() {
+        let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![9])))]);
+        let metadata = Metadata::from([("source".into(), "tinygrad".into())]);
+        let raw_metadata = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(
+            save_safetensors(&tensors, &metadata).unwrap(),
+            save_safetensors_with_json_metadata(&tensors, Some(&raw_metadata)).unwrap()
+        );
+
+        let invalid_tensors = StateDict::from([("".into(), raw([], Storage::U8(vec![1])))]);
+        let non_object = serde_json::json!(false);
+        assert!(matches!(
+            save_safetensors_with_json_metadata(&invalid_tensors, Some(&non_object)),
+            Err(Error::Serialization { reason }) if reason == "metadata must be a JSON object"
+        ));
+        assert!(save_safetensors_with_json_metadata(&invalid_tensors, None).is_err());
+        assert_eq!(invalid_tensors[""].to_le_bytes().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn raw_json_metadata_file_save_is_atomic_wrapper() {
+        let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![4])))]);
+        let metadata = serde_json::json!({"nested": [1, true]});
+        let directory = std::env::temp_dir().join(format!("rustgrad-safe-json-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.safetensors");
+
+        save_safetensors_file_with_json_metadata(&path, &tensors, Some(&metadata)).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            inspect_safetensors_metadata(&bytes).unwrap().header["__metadata__"],
+            metadata
+        );
+        assert_eq!(load_safetensors_state_only(&bytes).unwrap(), tensors);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn state_only_file_and_owned_metadata_inspection_preserve_file_boundaries() {
+        let tensors = StateDict::from([("x".into(), raw([1], Storage::U8(vec![4])))]);
+        let metadata = serde_json::json!({"nested": [1, true], "number": 3});
+        let directory = std::env::temp_dir().join(format!("rustgrad-safe-load-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let valid = directory.join("valid.safetensors");
+        save_safetensors_file_with_json_metadata(&valid, &tensors, Some(&metadata)).unwrap();
+        let original = fs::read(&valid).unwrap();
+
+        let inspection = inspect_safetensors_metadata_file(&valid).unwrap();
+        assert_eq!(inspection.source, original);
+        assert_eq!(inspection.data_start, 8 + u64::from_le_bytes(original[..8].try_into().unwrap()) as usize);
+        assert_eq!(inspection.header["__metadata__"], metadata);
+        assert_eq!(load_safetensors_state_only_file(&valid).unwrap(), tensors);
+        assert!(load_safetensors(&inspection.source).is_err());
+
+        let array_header = br#"["raw",{"header":true}]"#;
+        let array = directory.join("array.safetensors");
+        let mut array_bytes = (array_header.len() as u64).to_le_bytes().to_vec();
+        array_bytes.extend_from_slice(array_header);
+        fs::write(&array, &array_bytes).unwrap();
+        assert_eq!(
+            inspect_safetensors_metadata_file(&array).unwrap().header,
+            serde_json::json!(["raw", {"header": true}])
+        );
+        assert!(load_safetensors_state_only_file(&array).is_err());
+
+        let truncated = directory.join("truncated.safetensors");
+        fs::write(&truncated, 4u64.to_le_bytes()).unwrap();
+        assert!(inspect_safetensors_metadata_file(&truncated).is_err());
+        assert!(load_safetensors_state_only_file(&truncated).is_err());
+
+        let invalid_json = directory.join("invalid-json.safetensors");
+        let mut invalid_json_bytes = 1u64.to_le_bytes().to_vec();
+        invalid_json_bytes.push(b'{');
+        fs::write(&invalid_json, invalid_json_bytes).unwrap();
+        assert!(inspect_safetensors_metadata_file(&invalid_json).is_err());
+        assert!(load_safetensors_state_only_file(&invalid_json).is_err());
+
+        let missing = directory.join("missing.safetensors");
+        assert!(inspect_safetensors_metadata_file(&missing).is_err());
+        assert!(load_safetensors_state_only_file(&missing).is_err());
+        fs::remove_file(valid).unwrap();
+        fs::remove_file(array).unwrap();
+        fs::remove_file(truncated).unwrap();
+        fs::remove_file(invalid_json).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn state_only_loader_rejects_non_object_headers_and_bad_tensor_layouts() {
+        let top_level_array = br#"[]"#;
+        let mut non_object = (top_level_array.len() as u64).to_le_bytes().to_vec();
+        non_object.extend_from_slice(top_level_array);
+        assert!(load_safetensors_state_only(&non_object).is_err());
+        assert!(load_safetensors(&non_object).is_err());
+
+        let bad_descriptor = br#"{"x":{"dtype":"NOPE","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut descriptor = (bad_descriptor.len() as u64).to_le_bytes().to_vec();
+        descriptor.extend_from_slice(bad_descriptor);
+        descriptor.push(0);
+        assert!(load_safetensors_state_only(&descriptor).is_err());
+        assert!(load_safetensors(&descriptor).is_err());
+
+        let bad_offsets = br#"{"x":{"dtype":"U8","shape":[2],"data_offsets":[0,1]}}"#;
+        let mut offsets = (bad_offsets.len() as u64).to_le_bytes().to_vec();
+        offsets.extend_from_slice(bad_offsets);
+        offsets.push(0);
+        assert!(load_safetensors_state_only(&offsets).is_err());
+        assert!(load_safetensors(&offsets).is_err());
+
+        let valid_header = br#"{"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut truncated_payload = (valid_header.len() as u64).to_le_bytes().to_vec();
+        truncated_payload.extend_from_slice(valid_header);
+        assert!(load_safetensors_state_only(&truncated_payload).is_err());
+        assert!(load_safetensors(&truncated_payload).is_err());
+    }
+
     #[test]
     fn portable_bytes_round_trip_all_dtypes() {
         let values = vec![

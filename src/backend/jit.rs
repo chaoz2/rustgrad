@@ -313,7 +313,7 @@ impl CpuJitBackend {
             .position(|x| x.id == item.primary_output().id)
             .ok_or_else(|| JitBackendError::Binding("native output missing".into()))?;
         let output_elements = item
-            .output
+            .primary_output()
             .shape
             .numel()
             .map_err(|e| JitBackendError::Binding(e.to_string()))?;
@@ -365,7 +365,7 @@ impl CpuJitBackend {
             }
             Op::Sort { .. } => {
                 return Err(JitBackendError::Unsupported(
-                    "static sort pairs are CPU-oracle only".into(),
+                    "stable sort pairs are CPU-oracle only".into(),
                 ));
             }
             Op::Reduce { .. } => crate::lower_graph_reduction(graph, output),

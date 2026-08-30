@@ -85,6 +85,31 @@ fn einsum_forward_fixtures() {
 }
 
 #[test]
+fn matmul_preflights_output_extent_before_publication() {
+    let mut oversized = Graph::new();
+    let lhs = oversized.input("lhs", [usize::MAX, 2]);
+    let rhs = oversized.input("rhs", [2, 2]);
+    let original_nodes = oversized.node_count();
+    assert!(matches!(
+        oversized.matmul(lhs, rhs),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(oversized.node_count(), original_nodes);
+
+    let mut valid = Graph::new();
+    let lhs = valid.constant(data([2, 3], &[1, 2, 3, 4, 5, 6]));
+    let rhs = valid.constant(data([3, 2], &[7, 8, 9, 10, 11, 12]));
+    let output = valid.matmul(lhs, rhs).unwrap();
+    assert_eq!(
+        CpuBackend
+            .execute(&valid, output, &HashMap::new())
+            .unwrap()
+            .to_vec_f64(),
+        vec![58., 64., 139., 154.]
+    );
+}
+
+#[test]
 fn einsum_preserves_promoted_exact_storage_and_empty_domains() {
     let mut graph = Graph::new();
     let lhs = graph.constant(

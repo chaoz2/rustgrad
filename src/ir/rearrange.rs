@@ -1,4 +1,4 @@
-use crate::{Error, Graph, NodeId, Result, Shape};
+use crate::{DType, Error, Graph, NodeId, Result, Shape};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The static section specification accepted by [`Graph::split`].
@@ -123,6 +123,103 @@ impl StaticSplitPlan {
                 Ok(bounds)
             })
             .collect()
+    }
+}
+
+/// One literal tinygrad `repeat` axis expansion.
+#[derive(Clone, Debug)]
+struct RepeatStage {
+    axis: usize,
+    unsqueezed: Shape,
+    expanded: Shape,
+    collapsed: Shape,
+}
+
+/// Fully describes `Tensor.repeat` before its first movement node exists.
+///
+/// tinygrad left-aligns the source and repeat ranks, then performs a
+/// reshape/expand/reshape triple for every non-unit repeat.  Keeping every
+/// descriptor here makes a later zero repeat unable to hide an earlier
+/// overflowing expanded extent.
+#[derive(Clone, Debug)]
+struct RepeatPlan {
+    base: Shape,
+    stages: Vec<RepeatStage>,
+    output: Shape,
+}
+
+impl RepeatPlan {
+    fn build(source: &Shape, dtype: DType, repeats: &[isize]) -> Result<Self> {
+        if repeats.is_empty() {
+            return Err(Error::InvalidRepeat {
+                reason: "at least one repetition is required",
+            });
+        }
+        let repeats = repeats
+            .iter()
+            .map(|repeat| {
+                usize::try_from(*repeat).map_err(|_| Error::InvalidRepeat {
+                    reason: "repetitions must be non-negative",
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rank = source.rank().max(repeats.len());
+        let mut base = vec![1; rank - source.rank()];
+        base.extend_from_slice(source.dims());
+        let base = Shape::new(base);
+        let mut normalized_repeats = vec![1; rank - repeats.len()];
+        normalized_repeats.extend_from_slice(&repeats);
+
+        let extent = |shape: &Shape| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                .map(|_| ())
+        };
+        // Source and left-aligned base are both concrete views which must be
+        // valid before any reshape can be published.
+        extent(source)?;
+        extent(&base)?;
+
+        let mut current = base.clone();
+        let mut stages = Vec::new();
+        for (axis, &repeat) in normalized_repeats.iter().enumerate() {
+            if repeat == 1 {
+                continue;
+            }
+            let mut unsqueezed = current.dims().to_vec();
+            unsqueezed.insert(axis, 1);
+            let unsqueezed = Shape::new(unsqueezed);
+            let mut expanded = unsqueezed.dims().to_vec();
+            expanded[axis] = repeat;
+            let expanded = Shape::new(expanded);
+            let mut collapsed = expanded.dims().to_vec();
+            collapsed[axis] = current.dims()[axis]
+                .checked_mul(repeat)
+                .ok_or_else(|| Error::ShapeOverflow(current.clone()))?;
+            collapsed.remove(axis + 1);
+            let collapsed = Shape::new(collapsed);
+
+            extent(&unsqueezed)?;
+            extent(&expanded)?;
+            extent(&collapsed)?;
+            current = collapsed.clone();
+            stages.push(RepeatStage {
+                axis,
+                unsqueezed,
+                expanded,
+                collapsed,
+            });
+        }
+        // `current` is the literal final shape, including short/equal/long
+        // rank alignment and zero repeats.
+        extent(&current)?;
+        Ok(Self {
+            base,
+            stages,
+            output: current,
+        })
     }
 }
 
@@ -318,7 +415,9 @@ impl Graph {
         sizes: &BTreeMap<String, usize>,
     ) -> Result<NodeId> {
         let parsed = RearrangePattern::parse(pattern)?;
-        let source_shape = self.node(input)?.shape.clone();
+        let source = self.node(input)?;
+        let source_shape = source.shape.clone();
+        let source_dtype = source.dtype;
         let (left, right) = expand_ellipsis(&parsed, source_shape.rank())?;
         let mut supplied = sizes.clone();
         let mut names = BTreeSet::new();
@@ -394,7 +493,6 @@ impl Graph {
         }
         let intermediate_shape =
             Shape::new(elementary.iter().map(|name| dims[name]).collect::<Vec<_>>());
-        let mut node = self.reshape(input, intermediate_shape)?;
         let order = right_names
             .iter()
             .map(|name| {
@@ -404,7 +502,6 @@ impl Graph {
                     .ok_or_else(|| rearrange_err(pattern, "axis mismatch"))
             })
             .collect::<Result<Vec<_>>>()?;
-        node = self.permute(node, order)?;
         let output_shape = Shape::new(
             right
                 .iter()
@@ -416,56 +513,45 @@ impl Graph {
                 })
                 .collect::<Result<Vec<_>>>()?,
         );
+        let permuted_shape = Shape::new(
+            order
+                .iter()
+                .map(|&axis| intermediate_shape.dims()[axis])
+                .collect::<Vec<_>>(),
+        );
+        let extent = |shape: &Shape| {
+            shape
+                .numel()?
+                .checked_mul(source_dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                .map(|_| ())
+        };
+        // Tinygrad's literal is unflatten → permute → flatten. Validate every
+        // concrete view descriptor before the first reshape so malformed
+        // factors and late merged-byte overflow cannot publish a prefix.
+        extent(&source_shape)?;
+        extent(&intermediate_shape)?;
+        extent(&permuted_shape)?;
+        extent(&output_shape)?;
+        let node = self.reshape(input, intermediate_shape)?;
+        let node = self.permute(node, order)?;
         self.reshape(node, output_shape)
     }
 
     /// NumPy/tinygrad repeat: left-aligns ranks, inserts broadcast axes, then
     /// reshapes.  Zero repetitions are legal and preserve dense dtype.
     pub fn repeat(&mut self, input: NodeId, repeats: &[isize]) -> Result<NodeId> {
-        if repeats.is_empty() {
-            return Err(Error::InvalidRepeat {
-                reason: "at least one repetition is required",
-            });
+        let source = self.node(input)?;
+        let plan = RepeatPlan::build(&source.shape, source.dtype, repeats)?;
+
+        let mut node = self.reshape(input, plan.base)?;
+        for stage in plan.stages {
+            debug_assert!(stage.axis < self.shape(node)?.rank());
+            node = self.reshape(node, stage.unsqueezed)?;
+            node = self.expand(node, stage.expanded)?;
+            node = self.reshape(node, stage.collapsed)?;
         }
-        let repeats = repeats
-            .iter()
-            .map(|repeat| {
-                usize::try_from(*repeat).map_err(|_| Error::InvalidRepeat {
-                    reason: "repetitions must be non-negative",
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let source = self.node(input)?.shape.clone();
-        let rank = source.rank().max(repeats.len());
-        let mut base = vec![1; rank - source.rank()];
-        base.extend_from_slice(source.dims());
-        let mut normalized_repeats = vec![1; rank - repeats.len()];
-        normalized_repeats.extend_from_slice(&repeats);
-        let mut node = self.reshape(input, Shape::new(base.clone()))?;
-        let mut final_shape = Vec::with_capacity(rank);
-        for (axis, (&extent, &repeat)) in base.iter().zip(&normalized_repeats).enumerate() {
-            if repeat != 1 {
-                let mut shape = self.shape(node)?.dims().to_vec();
-                shape.insert(axis, 1);
-                node = self.reshape(node, Shape::new(shape))?;
-                let mut expanded = self.shape(node)?.dims().to_vec();
-                expanded[axis] = repeat;
-                node = self.expand(node, Shape::new(expanded))?;
-                let mut collapsed = self.shape(node)?.dims().to_vec();
-                let merged = repeat
-                    .checked_mul(extent)
-                    .ok_or_else(|| Error::ShapeOverflow(source.clone()))?;
-                collapsed[axis] = merged;
-                collapsed.remove(axis + 1);
-                node = self.reshape(node, Shape::new(collapsed))?;
-            }
-            final_shape.push(
-                repeat
-                    .checked_mul(extent)
-                    .ok_or_else(|| Error::ShapeOverflow(source.clone()))?,
-            );
-        }
-        debug_assert_eq!(self.shape(node)?.dims(), final_shape);
+        debug_assert_eq!(self.shape(node)?, &plan.output);
         Ok(node)
     }
 
@@ -485,29 +571,56 @@ impl Graph {
         let repeats = usize::try_from(repeats).map_err(|_| Error::InvalidRepeat {
             reason: "repetitions must be non-negative",
         })?;
-        let mut node = input;
-        let mut shape = self.node(input)?.shape.clone();
-        let axis = match axis {
-            Some(axis) => resolve_axis(axis, shape.rank())?,
+        let source_node = self.node(input)?;
+        let source = source_node.shape.clone();
+        let dtype = source_node.dtype;
+        let (shape, axis, flatten) = match axis {
+            Some(axis) => {
+                source.numel()?;
+                let rank = source.rank();
+                (source, resolve_axis(axis, rank)?, false)
+            }
             None => {
-                node = self.reshape(input, Shape::new(vec![shape.numel()?]))?;
-                shape = self.shape(node)?.clone();
-                0
+                let flat = source.numel()?;
+                (Shape::new(vec![flat]), 0, true)
             }
         };
         let extent = shape.dims()[axis];
+        let output_extent = extent
+            .checked_mul(repeats)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let mut output = shape.dims().to_vec();
+        output[axis] = output_extent;
+        let output_shape = Shape::new(output.clone());
         let mut inserted = shape.dims().to_vec();
         inserted.insert(axis + 1, 1);
-        node = self.reshape(node, Shape::new(inserted))?;
-        let mut expanded = self.shape(node)?.dims().to_vec();
+        let inserted_shape = Shape::new(inserted);
+        let mut expanded = inserted_shape.dims().to_vec();
         expanded[axis + 1] = repeats;
-        node = self.expand(node, Shape::new(expanded))?;
-        let mut output = self.shape(node)?.dims().to_vec();
-        output[axis] = extent
-            .checked_mul(repeats)
-            .ok_or(Error::ShapeOverflow(shape))?;
-        output.remove(axis + 1);
-        self.reshape(node, Shape::new(output))
+        let expanded_shape = Shape::new(expanded);
+        let extent = |candidate: &Shape| {
+            candidate
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(candidate.clone()))
+                .map(|_| ())
+        };
+        // Validate the source, optional flatten view, inserted singleton,
+        // Expand result, and final collapse before publishing any movement.
+        extent(&source)?;
+        extent(&shape)?;
+        extent(&inserted_shape)?;
+        extent(&expanded_shape)?;
+        extent(&output_shape)?;
+
+        let mut node = if flatten {
+            self.reshape(input, shape.clone())?
+        } else {
+            input
+        };
+        node = self.reshape(node, inserted_shape)?;
+        node = self.expand(node, expanded_shape)?;
+        self.reshape(node, output_shape)
     }
 }
 
@@ -656,4 +769,64 @@ fn resolve_graph_axis(input: NodeId, axis: isize, rank: usize) -> Result<usize> 
             axis: usize::try_from(axis).unwrap_or(usize::MAX),
             rank,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DType, Error};
+
+    #[test]
+    fn rearrange_matches_concrete_tinygrad_terms_and_preflights_every_view() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype_requires_grad("x", [2, 1, 6], DType::F32, true);
+        let mut sizes = BTreeMap::new();
+        sizes.insert("h".into(), 2);
+        let output = graph
+            .rearrange(input, "b 1 (h w) -> w b h", &sizes)
+            .unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([3, 2, 2]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        assert!(graph.grad(graph.sum_all(output).unwrap(), input).is_ok());
+
+        let ellipsis = graph.input_dtype("ellipsis", [2, 0, 3], DType::I16);
+        let ellipsis_output = graph
+            .rearrange(ellipsis, "b ... c -> ... b c", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(graph.shape(ellipsis_output).unwrap(), &Shape::new([0, 2, 3]));
+        assert_eq!(graph.dtype(ellipsis_output).unwrap(), DType::I16);
+
+        let mut malformed = Graph::new();
+        let source = malformed.input_dtype("source", [2, 6], DType::F64);
+        let before = malformed.node_count();
+        assert!(malformed
+            .rearrange(source, "b (h w) -> h b w", &BTreeMap::new())
+            .is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed
+            .rearrange(source, "b b -> b", &BTreeMap::new())
+            .is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed
+            .rearrange(source, "b c -> (b c)", &{
+                let mut unused = BTreeMap::new();
+                unused.insert("unused".into(), 1);
+                unused
+            })
+            .is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(matches!(
+            malformed.rearrange(NodeId::from_index(usize::MAX), "b c -> c b", &BTreeMap::new()),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+
+        let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+        let overflow_before = malformed.node_count();
+        assert!(matches!(
+            malformed.rearrange(overflow, "b c -> (b c)", &BTreeMap::new()),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), overflow_before);
+    }
 }

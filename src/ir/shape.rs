@@ -178,7 +178,9 @@ pub(crate) fn conv_transpose2d_shape(
         weight: weight.clone(),
         reason: "invalid transpose output shape",
     })?;
-    Ok(Shape::new([input.dims()[0], oc, h, w]))
+    let output = Shape::new([input.dims()[0], oc, h, w]);
+    output.numel()?;
+    Ok(output)
 }
 pub(crate) fn conv2d_shape(input: &Shape, weight: &Shape, options: Conv2dOptions) -> Result<Shape> {
     if input.rank() != 4 || weight.rank() != 4 {
@@ -234,7 +236,7 @@ pub(crate) fn conv2d_shape(input: &Shape, weight: &Shape, options: Conv2dOptions
         }
         Ok((padded - extent) / stride + 1)
     };
-    Ok(Shape::from([
+    let output = Shape::from([
         i[0],
         w[0],
         spatial(
@@ -253,7 +255,9 @@ pub(crate) fn conv2d_shape(input: &Shape, weight: &Shape, options: Conv2dOptions
             options.stride[1],
             options.dilation[1],
         )?,
-    ]))
+    ]);
+    output.numel()?;
+    Ok(output)
 }
 
 /// Returns normalized `(start, stop, step, output_length)` with the same
@@ -350,7 +354,7 @@ pub(crate) fn normalize_axes(
     let mut axes = axes.unwrap_or_else(|| (0..rank).map(|x| x as isize).collect());
     for axis in &mut axes {
         if *axis < 0 {
-            *axis += rank as isize;
+            *axis = (*axis).checked_add(rank as isize).unwrap_or(isize::MIN);
         }
     }
     if axes.iter().any(|axis| *axis < 0 || *axis >= rank as isize) {

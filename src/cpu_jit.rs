@@ -12,13 +12,27 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 #[path = "cpu_jit_random.rs"]
 mod random;
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v14";
+// Bump whenever the scalar expression surface changes: mixed captures include
+// this identity before they can reuse a native-renderer admission decision.
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v19";
 pub const ABI_VERSION: u32 = 2;
+const C11_COMPILER_COMMAND: &str = "cc";
+const C11_COMPILER_FLAGS: &[&str] = &[
+    "-std=c11",
+    "-O2",
+    "-ffp-contract=off",
+    "-fPIC",
+    "-shared",
+    "-Werror",
+];
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum JitError {
@@ -392,8 +406,24 @@ pub struct JitKernel {
 impl JitKernel {
     fn load(r: &RenderedC) -> Result<Self, JitError> {
         let path = compile_cached(r)?;
-        let lib = Arc::new(Library::open(&path)?);
-        let call = unsafe { lib.symbol(b"rustgrad_kernel\0")? };
+        let (lib, call) = match load_library_call(&path) {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                // A durable cache entry is untrusted until the loader and its
+                // exact stable entry symbol accept it. Evict a damaged entry
+                // before rebuilding so a truncated or stale artifact cannot
+                // poison every later compile for this source identity.
+                evict_cached_library(&path)?;
+                let rebuilt = compile_cached(r)?;
+                match load_library_call(&rebuilt) {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        let _ = evict_cached_library(&rebuilt);
+                        return Err(error);
+                    }
+                }
+            }
+        };
         Ok(Self {
             abi: r.abi.clone(),
             _library: lib,
@@ -438,7 +468,7 @@ impl JitKernel {
                 KernelPointerAbi::Quantized(_) => unreachable!("validated dense ABI"),
             })
             .collect();
-        self.invoke(&mut ptrs, symbols)
+        self.invoke_transactional(buffers, &mut ptrs, symbols)
     }
 
     pub(crate) fn call_with_quantized(
@@ -484,7 +514,33 @@ impl JitKernel {
                 }
             })
             .collect::<Vec<_>>();
-        self.invoke(&mut ptrs, symbols)
+        self.invoke_transactional(buffers, &mut ptrs, symbols)
+    }
+
+    /// Native kernels may detect a domain failure after earlier loop iterations
+    /// have stored results. Keep every ABI-declared mutable buffer private to
+    /// the call until native completion succeeds, including intentional
+    /// in-place input/output buffers.
+    fn invoke_transactional(
+        &self,
+        buffers: &mut [JitBuffer],
+        ptrs: &mut [*mut c_void],
+        symbols: &[i64],
+    ) -> Result<(), JitError> {
+        let backups = buffers
+            .iter()
+            .zip(&self.abi.buffers)
+            .enumerate()
+            .filter(|(_, (_, abi))| abi.mutable)
+            .map(|(index, (buffer, _))| (index, buffer.bytes.clone()))
+            .collect::<Vec<_>>();
+        let result = self.invoke(ptrs, symbols);
+        if result.is_err() {
+            for (index, bytes) in backups {
+                buffers[index].bytes.copy_from_slice(&bytes);
+            }
+        }
+        result
     }
 
     fn invoke(&self, ptrs: &mut [*mut c_void], symbols: &[i64]) -> Result<(), JitError> {
@@ -719,10 +775,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     ];
     if let Some(rendered) = render_reduction(store, &abi, &ids, out, &mut lines)? {
         let source = rendered;
-        let cache_key = key(&(RENDERER_VERSION.to_owned()
-            + std::env::consts::ARCH
-            + std::env::consts::OS
-            + &source));
+        let cache_key = native_cache_key("", &source);
         return Ok(RenderedC {
             source,
             source_map: BTreeMap::new(),
@@ -770,10 +823,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &source));
+    let cache_key = native_cache_key("", &source);
     Ok(RenderedC {
         source,
         source_map: map,
@@ -1041,19 +1091,27 @@ fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> 
         "    size_t rg_batch=rg_q;".into(),
         format!("    size_t rg_lbatch={lhs_batch};"),
         format!("    size_t rg_rbatch={rhs_batch};"),
-        "    double rg_acc=0.0;".into(),
-        format!("    for (size_t rg_k=0; rg_k<{}u; ++rg_k) rg_acc += (double)rg_lhs[{lhs_offset}] * (double)rg_rhs[{rhs_offset}];", plan.k),
-        format!("    rg_out[rg_i]=({storage})rg_acc;"),
-        "  }".into(),
-        "  return 0;".into(),
-        "}".into(),
     ]);
+    if plan.dtype == DType::F32 {
+        // The CPU oracle commits both the product and running sum through
+        // binary_scalar at F32 storage width on every contraction step.
+        // Keep the C temporaries explicit so a compiler cannot retain a wider
+        // accumulator across the loop.
+        lines.extend([
+            "    float rg_acc=0.0f;".into(),
+            format!("    for (size_t rg_k=0; rg_k<{}u; ++rg_k) {{ float rg_product=(float)(rg_lhs[{lhs_offset}]*rg_rhs[{rhs_offset}]); rg_acc=(float)(rg_acc+rg_product); }}", plan.k),
+            "    rg_out[rg_i]=rg_acc;".into(),
+        ]);
+    } else {
+        lines.extend([
+            "    double rg_acc=0.0;".into(),
+            format!("    for (size_t rg_k=0; rg_k<{}u; ++rg_k) rg_acc += rg_lhs[{lhs_offset}] * rg_rhs[{rhs_offset}];", plan.k),
+            "    rg_out[rg_i]=rg_acc;".into(),
+        ]);
+    }
+    lines.extend(["  }".into(), "  return 0;".into(), "}".into()]);
     let source = lines.join("\n") + "\n";
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &plan.cache_key.to_string()
-        + &source));
+    let cache_key = native_cache_key(&plan.cache_key.to_string(), &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
@@ -1150,11 +1208,7 @@ fn render_quantized_matmul(plan: &crate::QuantizedMatmulPlan) -> Result<Rendered
         ),
     ]
     .concat();
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &plan.cache_key.to_string()
-        + &source));
+    let cache_key = native_cache_key(&plan.cache_key.to_string(), &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
@@ -1232,11 +1286,7 @@ fn render_quantized_row_gather(
         ),
     ]
     .concat();
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &plan.cache_key.to_string()
-        + &source));
+    let cache_key = native_cache_key(&plan.cache_key.to_string(), &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
@@ -1250,6 +1300,7 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
     let homogeneous_data = match &plan.kind {
         crate::MovementKernelKind::AffineCopy { input, .. } => input.dtype == plan.dtype,
+        crate::MovementKernelKind::Pad { input, .. } => input.dtype == plan.dtype,
         crate::MovementKernelKind::Concat { inputs, .. } => {
             inputs.iter().all(|operand| operand.dtype == plan.dtype)
         }
@@ -1339,6 +1390,26 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
                     "    (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[rg_offset];",
                     ids[&(input.node.index() as u64)]
                 ));
+            }
+        }
+        crate::MovementKernelKind::Pad { input, padding, fill_bits } => {
+            let output_len = elements(&plan.output_shape)?;
+            if output_len == 0 {
+                lines.push("  /* empty pad domain */".into());
+            } else {
+                lines.push(format!("  for (size_t rg_i=0; rg_i<{output_len}u; ++rg_i) {{"));
+                let mut guards = Vec::new();
+                let mut offset = Vec::new();
+                for (axis, ((&out_dim, &in_dim), &(before, _))) in plan.output_shape.dims().iter().zip(input.shape.dims()).zip(padding).enumerate() {
+                    let out_stride = plan.output_shape.dims()[axis + 1..].iter().product::<usize>();
+                    let in_stride = input.shape.dims()[axis + 1..].iter().product::<usize>();
+                    let coord = format!("((rg_i/{out_stride}u)%{out_dim}u)");
+                    guards.push(format!("{coord}>={before}u && {coord}-{before}u<{in_dim}u"));
+                    if in_dim != 0 { offset.push(format!("({coord}-{before}u)*{in_stride}u")); }
+                }
+                let guard = if guards.is_empty() { "1".into() } else { guards.join(" && ") };
+                let source = if offset.is_empty() { "0".into() } else { offset.join("+") };
+                lines.push(format!("    if ({guard}) (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[{source}]; else (({output_ty}*)buffers[{output_slot}])[rg_i] = {};", ids[&(input.node.index() as u64)], movement_fill_literal(plan.dtype, *fill_bits)));
                 lines.push("  }".into());
             }
         }
@@ -1434,14 +1505,22 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
     lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
-    let cache_key =
-        key(&(RENDERER_VERSION.to_owned() + "-movement-" + &plan.cache_key.to_string() + &source));
+    let cache_key = native_cache_key(&format!("movement-{}", plan.cache_key), &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
         abi,
         cache_key,
     })
+}
+
+fn movement_fill_literal(dtype: DType, bits: u64) -> String {
+    match dtype {
+        // Movement kernels write narrow storage directly and intentionally do
+        // not widen the fill through a floating arithmetic expression.
+        DType::F16 | DType::BF16 => format!("((uint16_t)0x{:04x}u)", bits as u16),
+        _ => literal_expr(dtype, bits),
+    }
 }
 
 fn index_expression(
@@ -1520,7 +1599,14 @@ fn render_vector_program(
         .b1_eligibility()
         .map_err(|e| JitError::Unsupported(e.to_string()))?;
     let lanes = usize::from(program.lanes);
-    if lanes == 0 || program.main_elements > elements || program.main_elements % lanes != 0 {
+    if lanes == 0
+        || program.main_elements % lanes != 0
+        || program.tail_elements >= lanes
+        || program
+            .main_elements
+            .checked_add(program.tail_elements)
+            != Some(elements)
+    {
         return Err(JitError::Unsupported(
             "invalid portable lane/tail control".into(),
         ));
@@ -1557,8 +1643,7 @@ fn render_vector_program(
     lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
-    let cache_key =
-        key(&(RENDERER_VERSION.to_owned() + "-b1-" + &program.cache_key.to_string() + &source));
+    let cache_key = native_cache_key(&format!("b1-{}", program.cache_key), &source);
     Ok(RenderedC {
         source,
         source_map: program
@@ -1832,8 +1917,17 @@ fn emit_vector_insts(
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty.is_float() => {
                         format!("-{}[l]", a)
                     }
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
+                        format!("!{}[l]", a)
+                    }
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Abs) if ty.is_float() => {
                         format!("fabs({}[l])", a)
+                    }
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs)
+                        if ty == DType::Bool
+                            || matches!(ty.category(), crate::DTypeCategory::Unsigned) =>
+                    {
+                        format!("{}[l]", a)
                     }
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) => {
                         wrap_expr(ty, format!("0-({}){}[l]", unsigned_ctype(ty)?, a))?
@@ -1938,15 +2032,19 @@ fn emit_vector_insts(
                 let a = input(0)?;
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable cast type".into()))?;
+                let value = if ty == DType::Bool {
+                    format!("((uint8_t)(({}[l])!=0))", a)
+                } else {
+                    format!("(({}){}[l])", ctype(ty), a)
+                };
                 lines.push(format!(
-                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=({}){}[l];",
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
                     ctype(ty),
                     d,
                     usize::from(program.lanes),
                     active,
                     d,
-                    ctype(ty),
-                    a
+                    value
                 ));
             }
             crate::VectorInstKind::Store { buffer } => {
@@ -2033,16 +2131,12 @@ fn render_reduction(
         kind,
         crate::ReduceKind::Sum
             | crate::ReduceKind::Mean
+            | crate::ReduceKind::Product
             | crate::ReduceKind::Max
             | crate::ReduceKind::Min
     ) {
         return Err(JitError::Unsupported(
             "native C reduction kind is not implemented".into(),
-        ));
-    }
-    if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) && !out.dtype.is_float() {
-        return Err(JitError::Unsupported(
-            "native extrema reduction currently requires floating point".into(),
         ));
     }
     let value_node = update
@@ -2060,14 +2154,21 @@ fn render_reduction(
         "  for (size_t rg_out = 0; rg_out < {out_len}u; ++rg_out) {{"
     ));
     let acc = accumulator_type(out.dtype);
-    let initial = if matches!(kind, crate::ReduceKind::Max) {
+    let initial = if matches!(kind, crate::ReduceKind::Max) && out.dtype.is_float() {
         "-INFINITY"
-    } else if matches!(kind, crate::ReduceKind::Min) {
+    } else if matches!(kind, crate::ReduceKind::Min) && out.dtype.is_float() {
         "INFINITY"
+    } else if matches!(kind, crate::ReduceKind::Product) {
+        "1"
     } else {
         "0"
     };
     lines.push(format!("    {acc} rg_acc = {initial};"));
+    if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) {
+        // CpuBackend accepts the first stored lane unconditionally. This is
+        // observable for a leading NaN and for equal signed-zero lanes.
+        lines.push("    int rg_seen = 0;".into());
+    }
     if reduce_len != 0 {
         lines.push(format!(
             "    for (size_t rg_r = 0; rg_r < {reduce_len}u; ++rg_r) {{"
@@ -2078,16 +2179,33 @@ fn render_reduction(
         ));
         let mut map = BTreeMap::new();
         let value = emit(value_node, ids, &mut map, lines)?;
-        if matches!(kind, crate::ReduceKind::Max) {
+        if matches!(kind, crate::ReduceKind::Max) && out.dtype.is_float() {
             lines.push(format!(
-                "      if (!isnan(({acc})({value})) && ({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
+                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
+            ));
+        } else if matches!(kind, crate::ReduceKind::Min) && out.dtype.is_float() {
+            lines.push(format!(
+                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
+            ));
+        } else if matches!(kind, crate::ReduceKind::Max) {
+            lines.push(format!(
+                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
             ));
         } else if matches!(kind, crate::ReduceKind::Min) {
             lines.push(format!(
-                "      if (!isnan(({acc})({value})) && ({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
+                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
             ));
         } else if out.dtype == DType::Bool {
-            lines.push(format!("      rg_acc = (uint8_t)(rg_acc || ({value}));"));
+            let operator = if matches!(kind, crate::ReduceKind::Product) {
+                "&&"
+            } else {
+                "||"
+            };
+            lines.push(format!("      rg_acc = (uint8_t)(rg_acc {operator} ({value}));"));
+        } else if matches!(kind, crate::ReduceKind::Product) {
+            lines.push(format!(
+                "      rg_acc = ({acc})(rg_acc * ({acc})({value}));"
+            ));
         } else {
             lines.push(format!(
                 "      rg_acc = ({acc})(rg_acc + ({acc})({value}));"
@@ -2244,60 +2362,122 @@ fn emit(
                 ))
             }
         }
-        UOpKind::Cast => Ok(format!("(({})({}))", expr_ctype(ty), s(0)?)),
+        UOpKind::Cast => Ok(cast_expression(ty, s(0)?)),
         UOpKind::GraphUnary(op) => {
+            let input_ty = n
+                .sources()
+                .first()
+                .and_then(|source| source.ty())
+                .ok_or_else(|| JitError::Unsupported("untyped unary input".into()))?
+                .scalar;
             let a = s(0)?;
             let x = match op {
-                crate::UnaryOp::Neg if ty == DType::Bool => format!("!({a})"),
-                crate::UnaryOp::Neg if !ty.is_float() => {
-                    let unsigned = unsigned_ctype(ty)?;
-                    return wrap_expr(ty, format!("(({unsigned})0)-(({unsigned})({a}))"));
+                crate::UnaryOp::Neg if input_ty.is_float() => format!("-({a})"),
+                // Raw GraphUnary Bool negation is storage-level logical-not.
+                // Public Graph::neg deliberately uses its own source-literal
+                // logical_not composition and does not depend on this arm.
+                crate::UnaryOp::Neg if input_ty == DType::Bool => {
+                    format!("((uint8_t)!({a}))")
                 }
-                crate::UnaryOp::Neg => format!("-({a})"),
-                crate::UnaryOp::Abs => format!("fabs({a})"),
+                // Negating exact integer storage must never ask C to negate a
+                // signed minimum. Subtract from zero in the corresponding
+                // unsigned width, then restore the source storage lane.
+                crate::UnaryOp::Neg => wrap_expr(
+                    input_ty,
+                    format!("0-({})({a})", unsigned_ctype(input_ty)?),
+                )?,
+                crate::UnaryOp::Abs if input_ty.is_float() => format!("fabs({a})"),
+                crate::UnaryOp::Abs if input_ty == DType::Bool => a,
+                crate::UnaryOp::Abs
+                    if matches!(input_ty.category(), crate::DTypeCategory::Unsigned) =>
+                {
+                    a
+                }
+                // Match B2's exact-width signed formula: test the signed
+                // lane, do any negation in unsigned storage, and wrap it back
+                // so every signed minimum follows wrapping_abs rather than an
+                // f64/fabs conversion or signed-overflow UB.
+                crate::UnaryOp::Abs
+                    if matches!(input_ty.category(), crate::DTypeCategory::Signed) =>
+                {
+                    let unsigned = unsigned_ctype(input_ty)?;
+                    wrap_expr(
+                        input_ty,
+                        format!("({a})<0 ? 0-({unsigned})({a}) : ({unsigned})({a})"),
+                    )?
+                }
+                // CPU/generic evaluate arithmetic after widening a typed
+                // storage lane to f64. Keep that working-value contract for
+                // the direct multiply instead of letting C evaluate two
+                // float operands before the typed output store.
+                crate::UnaryOp::Square if ty.is_float() => {
+                    format!("((double)({a}))*((double)({a}))")
+                }
                 crate::UnaryOp::Square => format!("({a})*({a})"),
                 crate::UnaryOp::Relu => format!("(({a})>0?({a}):0)"),
                 crate::UnaryOp::Sqrt => format!("sqrt({a})"),
                 crate::UnaryOp::Rsqrt => format!("(1.0/sqrt({a}))"),
                 crate::UnaryOp::Exp => format!("exp({a})"),
-                // Keep the C operation in double precision, matching the
-                // CPU oracle's Scalar::F evaluation before TensorData applies
-                // the destination storage quantization.
-                crate::UnaryOp::Exp2 if matches!(ty, DType::F32 | DType::F64) => {
-                    format!("exp2({a})")
+                // The CPU and generic evaluators both promote a storage lane
+                // to f64 before evaluating Exp2, then quantize only at the
+                // result boundary.  C11's `exp2` has that same double input
+                // contract; the existing narrow-float store helpers below
+                // perform the F16/BF16 rounding.  Keep raw exact-dtype Exp2
+                // fail-closed by admitting only the floating UOp contract.
+                crate::UnaryOp::Exp2 if ty.is_float() => format!("exp2({a})"),
+                // As for Exp2, the CPU and generic evaluators perform Log2
+                // after widening the stored lane to f64. C11 `log2` keeps
+                // that double evaluation, while the established stores below
+                // make the F16/BF16/F32 result rounding explicit. The public
+                // non-float path has this floating result contract, matching
+                // CPU/generic's scalar-to-f64 evaluation.
+                crate::UnaryOp::Log2 if ty.is_float() => format!("log2({a})"),
+                // CPU and generic evaluate Sin on the widened f64 scalar.
+                // C11 `sin` preserves that operation boundary; narrow floats
+                // are quantized solely by the established storage stores.
+                crate::UnaryOp::Sin if ty.is_float() => format!("sin({a})"),
+                crate::UnaryOp::Tan if ty.is_float() => format!("tan({a})"),
+                crate::UnaryOp::Cos if ty.is_float() => format!("cos({a})"),
+                crate::UnaryOp::Log if ty.is_float() => format!("log({a})"),
+                // CPU/generic evaluate floating Trunc after widening the
+                // storage lane to f64, then narrow only at the output store.
+                // C11's `trunc` has the same double contract and preserves
+                // signed zero, NaN, and infinities. Exact Bool/integer Trunc
+                // is an identity in the shared evaluator; calling C `trunc`
+                // there would introduce a lossy double round-trip for wide
+                // integers, so preserve the source storage lane directly.
+                crate::UnaryOp::Trunc if ty.is_float() => format!("trunc({a})"),
+                crate::UnaryOp::Trunc => a,
+                // The raw IsInf public helper has Bool output. C11's
+                // type-generic predicate precisely recognizes both floating
+                // infinities and excludes NaN/finite/signed-zero lanes. Do
+                // not pass exact Bool/integer storage through it: source and
+                // CPU/generic semantics make those lanes deterministically
+                // false without a lossy wide-integer conversion.
+                crate::UnaryOp::IsInf if ty == DType::Bool && input_ty.is_float() => {
+                    format!("((uint8_t)isinf({a}))")
                 }
-                // Keep the C operation in double precision, matching the
-                // CPU oracle's Scalar::F evaluation before TensorData applies
-                // the destination storage quantization.
-                crate::UnaryOp::Sin if matches!(ty, DType::F32 | DType::F64) => {
-                    format!("sin({a})")
+                crate::UnaryOp::IsInf if ty == DType::Bool => "((uint8_t)0)".into(),
+                // tinygrad Sign is `ne(0).where(lt(0).where(-1, 1), 0)`.
+                // Keep its ordered comparisons: NaN is nonzero but unordered
+                // and therefore +1, while either signed zero takes the
+                // canonical positive zero branch. Integer branches avoid
+                // arithmetic so signed minima never overflow.
+                crate::UnaryOp::Sign if ty == DType::Bool => {
+                    format!("((uint8_t)(({a})!=0))")
                 }
-                // Keep the C operation in double precision, matching the
-                // CPU oracle's Scalar::F evaluation before TensorData applies
-                // the destination storage quantization.
-                crate::UnaryOp::Tan if matches!(ty, DType::F32 | DType::F64) => {
-                    format!("tan({a})")
+                crate::UnaryOp::Sign
+                    if matches!(ty.category(), crate::DTypeCategory::Unsigned) =>
+                {
+                    format!("(({a})==0?0:1)")
                 }
-                // Keep the C operation in double precision, matching the
-                // CPU oracle's Scalar::F evaluation before TensorData applies
-                // the destination storage quantization.
-                crate::UnaryOp::Cos if matches!(ty, DType::F32 | DType::F64) => {
-                    format!("cos({a})")
+                crate::UnaryOp::Sign
+                    if matches!(ty.category(), crate::DTypeCategory::Signed) =>
+                {
+                    format!("(({a})<0?-1:(({a})>0?1:0))")
                 }
-                // Keep the C operation in double precision, matching the
-                // CPU oracle's Scalar::F evaluation before TensorData applies
-                // the destination storage quantization.
-                crate::UnaryOp::Log if matches!(ty, DType::F32 | DType::F64) => {
-                    format!("log({a})")
-                }
-                crate::UnaryOp::Trunc if matches!(ty, DType::F32 | DType::F64) => {
-                    format!("trunc({a})")
-                }
-                // Keep the C operation in double precision, matching the
-                // CPU oracle's Scalar::F evaluation before TensorData applies
-                // the destination storage quantization.
-                crate::UnaryOp::Log2 if matches!(ty, DType::F32 | DType::F64) => {
-                    format!("log2({a})")
+                crate::UnaryOp::Sign if ty.is_float() => {
+                    format!("(({a})==0.0?0.0:(({a})<0.0?-1.0:1.0))")
                 }
                 crate::UnaryOp::Reciprocal => format!("(1.0/({a}))"),
                 _ => return Err(JitError::Unsupported(format!("unary {op:?}"))),
@@ -2341,11 +2521,35 @@ fn emit(
                 crate::BinaryOp::BitAnd => "&",
                 crate::BinaryOp::BitOr => "|",
                 crate::BinaryOp::BitXor => "^",
-                crate::BinaryOp::Maximum => return Ok(format!("(({a})>({b})?({a}):({b}))")),
-                crate::BinaryOp::Minimum => return Ok(format!("(({a})<({b})?({a}):({b}))")),
+                crate::BinaryOp::Maximum => return Ok(format!("(({a})<({b})?({b}):({a}))")),
+                crate::BinaryOp::Minimum => return Ok(format!("(({a})>({b})?({b}):({a}))")),
                 _ => return Err(JitError::Unsupported(format!("binary {op:?}"))),
             };
-            Ok(format!("(({a}) {x} ({b}))"))
+            if ty.is_float() {
+                // A typed Cast rounds its source value before this operation,
+                // but CPU/generic then evaluate the ALU at f64 and narrow
+                // only at this result's storage boundary.
+                Ok(format!("(((double)({a})) {x} ((double)({b})))"))
+            } else {
+                Ok(format!("(({a}) {x} ({b}))"))
+            }
+        }
+        UOpKind::GraphLogical(op) => {
+            if ty != DType::Bool {
+                return Err(JitError::Unsupported("logical output is not Bool".into()));
+            }
+            let a = s(0)?;
+            match op {
+                crate::LogicalOp::Not => Ok(format!("((uint8_t)!({a}))")),
+                crate::LogicalOp::And => {
+                    let b = s(1)?;
+                    Ok(format!("((uint8_t)(({a}) && ({b})))"))
+                }
+                crate::LogicalOp::Or => {
+                    let b = s(1)?;
+                    Ok(format!("((uint8_t)(({a}) || ({b})))"))
+                }
+            }
         }
         UOpKind::GraphCompare(op) => {
             let (a, b) = (s(0)?, s(1)?);
@@ -2477,6 +2681,17 @@ fn expr_ctype(d: DType) -> &'static str {
         _ => ctype(d),
     }
 }
+/// A fused narrow CAST has a typed storage boundary. C `float` alone is not
+/// that boundary, so explicitly encode then decode F16/BF16 before a later
+/// expression consumes the value. The helpers use raw payload-aware encoding.
+fn cast_expression(dtype: DType, value: String) -> String {
+    match dtype {
+        DType::Bool => format!("((uint8_t)(({value})!=0))"),
+        DType::F16 => format!("rg_f16_to_f32(rg_f32_to_f16((float)({value})))"),
+        DType::BF16 => format!("rg_bf16_to_f32(rg_f32_to_bf16((float)({value})))"),
+        _ => format!("(({})({value}))", expr_ctype(dtype)),
+    }
+}
 fn key(s: &str) -> String {
     let mut h = 0xcbf29ce484222325u64;
     for b in s.bytes() {
@@ -2485,10 +2700,22 @@ fn key(s: &str) -> String {
     }
     format!("{h:016x}")
 }
+/// Stable identity for one durable C11 shared-library artifact. The compiler
+/// command and every fixed flag are part of the key rather than an unstated
+/// property of the temporary cache directory.
+fn native_cache_key(discriminator: &str, source: &str) -> String {
+    let flags = C11_COMPILER_FLAGS.join("\u{1f}");
+    key(&format!(
+        "{RENDERER_VERSION}\u{1f}{ABI_VERSION}\u{1f}{C11_COMPILER_COMMAND}\u{1f}{flags}\u{1f}{}\u{1f}{}\u{1f}{discriminator}\u{1f}{source}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+    ))
+}
 fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("rustgrad-cpu-jit-v1")
 }
 static COMPILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static COMPILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
     let _guard = COMPILE_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -2505,40 +2732,69 @@ fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
             "so"
         }
     ));
-    if lib.exists() {
-        return Ok(lib);
+    match fs::symlink_metadata(&lib) {
+        Ok(metadata) if metadata.file_type().is_file() => return Ok(lib),
+        Ok(_) => {
+            return Err(JitError::Io(format!(
+                "CPU JIT cache entry is not a regular file: {}",
+                lib.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(JitError::Io(error.to_string())),
     }
-    let c = d.join(format!("{}.c", r.cache_key));
-    fs::write(&c, &r.source).map_err(|e| JitError::Io(e.to_string()))?;
-    let tmp = d.join(format!("{}.tmp", r.cache_key));
-    let out = Command::new("cc")
-        .args([
-            "-std=c11",
-            "-O2",
-            "-ffp-contract=off",
-            "-fPIC",
-            "-shared",
-            "-Werror",
-            "-o",
-        ])
-        .arg(&tmp)
-        .arg(&c)
-        .output()
-        .map_err(|e| JitError::Compiler {
-            status: None,
-            stderr: e.to_string(),
-        })?;
-    if !out.status.success() {
-        return Err(JitError::Compiler {
-            status: out.status.code(),
-            stderr: String::from_utf8_lossy(&out.stderr)
-                .chars()
-                .take(8192)
-                .collect(),
-        });
+    let sequence = COMPILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stem = format!(".{}-{}-{sequence}", r.cache_key, std::process::id());
+    let source = d.join(format!("{stem}.c"));
+    let temp = d.join(format!("{stem}.tmp"));
+    let result = (|| {
+        fs::write(&source, &r.source).map_err(|e| JitError::Io(e.to_string()))?;
+        let out = Command::new(C11_COMPILER_COMMAND)
+            .args(C11_COMPILER_FLAGS)
+            .arg("-o")
+            .arg(&temp)
+            .arg(&source)
+            .output()
+            .map_err(|e| JitError::Compiler {
+                status: None,
+                stderr: e.to_string(),
+            })?;
+        if !out.status.success() {
+            return Err(JitError::Compiler {
+                status: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(8192)
+                    .collect(),
+            });
+        }
+        fs::File::open(&temp)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| JitError::Io(e.to_string()))?;
+        match fs::rename(&temp, &lib) {
+            Ok(()) => Ok(lib),
+            Err(error) => match fs::symlink_metadata(&lib) {
+                // Another process may have compiled this exact
+                // content-addressed key while this temporary artifact was
+                // being built. Its completed regular file is a valid hit.
+                Ok(metadata) if metadata.file_type().is_file() => Ok(lib),
+                _ => Err(JitError::Io(error.to_string())),
+            },
+        }
+    })();
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&temp);
+    result
+}
+fn evict_cached_library(path: &Path) -> Result<(), JitError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| JitError::Io(error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Err(JitError::Io(format!(
+            "CPU JIT cache entry is not a regular file: {}",
+            path.display()
+        )));
     }
-    fs::rename(&tmp, &lib).map_err(|e| JitError::Io(e.to_string()))?;
-    Ok(lib)
+    fs::remove_file(path).map_err(|error| JitError::Io(error.to_string()))
 }
 struct Library(*mut c_void);
 unsafe impl Send for Library {}
@@ -2560,6 +2816,14 @@ impl Library {
         }
         Ok(unsafe { std::mem::transmute_copy(&p) })
     }
+}
+fn load_library_call(
+    path: &Path,
+) -> Result<(Arc<Library>, unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int), JitError>
+{
+    let lib = Arc::new(Library::open(path)?);
+    let call = unsafe { lib.symbol(b"rustgrad_kernel\0")? };
+    Ok((lib, call))
 }
 impl Drop for Library {
     fn drop(&mut self) {
@@ -2588,8 +2852,650 @@ fn last_error() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, Graph, Scalar, Shape, SymbolicExpr, TensorData};
+    use crate::{
+        Backend, CompareOp, CpuBackend, Graph, Op, Scalar, Shape, Storage, SymbolicExpr,
+        TensorData,
+    };
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn extrema_render_as_ordered_selects_not_host_intrinsics() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", Shape::from([1]), DType::F32);
+        let rhs = graph.input_dtype("rhs", Shape::from([1]), DType::F32);
+        let maximum = graph.maximum(lhs, rhs).unwrap();
+        let minimum = graph.minimum(lhs, rhs).unwrap();
+        let maximum = CpuJit::render(&crate::lower_graph_elementwise(&graph, maximum).unwrap())
+            .unwrap()
+            .source;
+        let minimum = CpuJit::render(&crate::lower_graph_elementwise(&graph, minimum).unwrap())
+            .unwrap()
+            .source;
+        assert!(maximum.contains("?"));
+        assert!(maximum.contains("<"));
+        assert!(minimum.contains("?"));
+        assert!(minimum.contains(">"));
+        assert!(!maximum.contains("fmax"));
+        assert!(!minimum.contains("fmin"));
+    }
+
+    #[test]
+    fn public_logical_not_keeps_cast_then_ne_and_renders_bool_truthiness() {
+        for dtype in [DType::F32, DType::I32] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([4]), dtype);
+            let output = graph.logical_not(input).unwrap();
+            let Op::Compare {
+                op: CompareOp::Ne,
+                lhs,
+                ..
+            } = graph.op(output).unwrap()
+            else {
+                panic!("logical_not must retain its source Ne root");
+            };
+            assert!(matches!(
+                graph.op(*lhs).unwrap(),
+                Op::Cast {
+                    input: cast_input,
+                    dtype: DType::Bool,
+                } if *cast_input == input
+            ));
+
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let topological = uop.topological().unwrap();
+            assert!(topological.iter().any(|node| {
+                matches!(node.kind(), UOpKind::Cast) && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
+            }));
+            assert!(topological.iter().any(|node| {
+                matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne))
+            }));
+
+            // `!=0` is the source truthiness predicate: it keeps fractional
+            // nonzero F32 values, NaNs, and infinities true while both zeros
+            // are false, unlike a numeric C cast to uint8_t.
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains("!=0"), "{dtype:?}");
+            assert!(scalar.source.contains("uint8_t"), "{dtype:?}");
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert!(vector.source.contains("!=0"), "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v19");
+
+        let signed = [
+            (DType::I8, "uint8_t", "rg_i8"),
+            (DType::I16, "uint16_t", "rg_i16"),
+            (DType::I32, "uint32_t", "rg_i32"),
+            (DType::I64, "uint64_t", "rg_i64"),
+        ];
+        for (dtype, unsigned, helper) in signed {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([2]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, input).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
+            assert!(matches!(graph.op(neg).unwrap(), Op::Unary { op: crate::UnaryOp::Neg, .. }));
+            assert!(matches!(graph.op(abs).unwrap(), Op::Unary { op: crate::UnaryOp::Abs, .. }));
+
+            let neg_uop = crate::lower_graph_elementwise(&graph, neg).unwrap();
+            let abs_uop = crate::lower_graph_elementwise(&graph, abs).unwrap();
+            let neg_source = CpuJit::render(&neg_uop).unwrap();
+            let abs_source = CpuJit::render(&abs_uop).unwrap();
+            assert!(neg_source.source.contains(RENDERER_VERSION));
+            assert!(neg_source.source.contains(&format!("0-({unsigned})")), "{dtype:?}");
+            assert!(neg_source.source.contains(helper), "{dtype:?}");
+            assert!(abs_source.source.contains(&format!("<0 ? 0-({unsigned})")), "{dtype:?}");
+            assert!(abs_source.source.contains(helper), "{dtype:?}");
+            assert!(!abs_source.source.contains("fabs("), "{dtype:?}");
+            assert_eq!(neg_source.cache_key, CpuJit::render(&neg_uop).unwrap().cache_key);
+            let neg_vector = CpuJit::render_vectorized(&neg_uop).unwrap();
+            let abs_vector = CpuJit::render_vectorized(&abs_uop).unwrap();
+            assert!(neg_vector.source.contains("B2 VectorProgram"));
+            assert!(abs_vector.source.contains("B2 VectorProgram"));
+            assert!(neg_vector.source.contains("rg_i"), "{dtype:?}");
+            assert!(abs_vector.source.contains(&format!("<0 ? 0-({unsigned})")), "{dtype:?}");
+        }
+
+        for dtype in [DType::U8, DType::U16, DType::U32, DType::U64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([2]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, input).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
+            let neg_source = CpuJit::render(&crate::lower_graph_elementwise(&graph, neg).unwrap()).unwrap();
+            let abs_source = CpuJit::render(&crate::lower_graph_elementwise(&graph, abs).unwrap()).unwrap();
+            assert!(neg_source.source.contains("0-(uint"), "{dtype:?}");
+            assert!(!abs_source.source.contains("fabs("), "{dtype:?}");
+            let neg_vector = CpuJit::render_vectorized(&crate::lower_graph_elementwise(&graph, neg).unwrap()).unwrap();
+            let abs_vector = CpuJit::render_vectorized(&crate::lower_graph_elementwise(&graph, abs).unwrap()).unwrap();
+            assert!(neg_vector.source.contains("B2 VectorProgram"));
+            assert!(abs_vector.source.contains("B2 VectorProgram"));
+            assert!(neg_vector.source.contains("0-(uint"), "{dtype:?}");
+        }
+
+        let mut bool_graph = Graph::new();
+        let bool_input = bool_graph.input_dtype("input", Shape::from([2]), DType::Bool);
+        let bool_neg = bool_graph.unary(crate::UnaryOp::Neg, bool_input).unwrap();
+        let bool_abs = bool_graph.unary(crate::UnaryOp::Abs, bool_input).unwrap();
+        let bool_neg_source = CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_neg).unwrap()).unwrap();
+        let bool_abs_source = CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap()).unwrap();
+        assert!(bool_neg_source.source.contains("((uint8_t)!("));
+        assert!(!bool_abs_source.source.contains("fabs("));
+        assert!(CpuJit::render_vectorized(&crate::lower_graph_elementwise(&bool_graph, bool_neg).unwrap()).unwrap().source.contains("B2 VectorProgram"));
+        assert!(CpuJit::render_vectorized(&crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap()).unwrap().source.contains("B2 VectorProgram"));
+        let bool_bindings = HashMap::from([(
+            "input".to_string(),
+            TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend.execute(&bool_graph, bool_neg, &bool_bindings).unwrap(),
+            TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap()
+        );
+        assert_eq!(
+            CpuBackend.execute(&bool_graph, bool_abs, &bool_bindings).unwrap(),
+            TensorData::from_storage([2], Storage::Bool(vec![true, false])).unwrap()
+        );
+
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([2]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, input).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, input).unwrap();
+            let neg_uop = crate::lower_graph_elementwise(&graph, neg).unwrap();
+            let abs_uop = crate::lower_graph_elementwise(&graph, abs).unwrap();
+            assert!(CpuJit::render(&neg_uop).unwrap().source.contains("-(("), "{dtype:?}");
+            assert!(CpuJit::render(&abs_uop).unwrap().source.contains("fabs("), "{dtype:?}");
+            let neg_vector = CpuJit::render_vectorized(&neg_uop).unwrap();
+            let abs_vector = CpuJit::render_vectorized(&abs_uop).unwrap();
+            if matches!(dtype, DType::F16 | DType::BF16) {
+                assert!(!neg_vector.source.contains("B2 VectorProgram"));
+                assert!(!abs_vector.source.contains("B2 VectorProgram"));
+            } else {
+                assert!(neg_vector.source.contains("B2 VectorProgram"));
+                assert!(abs_vector.source.contains("B2 VectorProgram"));
+            }
+        }
+
+        // Raw U64 lanes stay integer-width: no f64/fabs path is permitted
+        // for values above 2^53, and signed minima retain wrapping behavior.
+        for (dtype, input, negated, absolute) in [
+            (DType::I8, TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![i8::MIN])).unwrap()),
+            (DType::I16, TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![i16::MIN])).unwrap()),
+            (DType::I32, TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![i32::MIN])).unwrap()),
+            (DType::I64, TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![i64::MIN])).unwrap()),
+            (DType::U64, TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap(), TensorData::from_storage([1], Storage::U64(vec![u64::MAX - (1u64 << 53)])).unwrap(), TensorData::from_storage([1], Storage::U64(vec![(1u64 << 53) + 1])).unwrap()),
+        ] {
+            let mut graph = Graph::new();
+            let source = graph.input_dtype("input", Shape::from([1]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, source).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, source).unwrap();
+            let bindings = HashMap::from([("input".to_string(), input)]);
+            assert_eq!(CpuBackend.execute(&graph, neg, &bindings).unwrap(), negated);
+            assert_eq!(CpuBackend.execute(&graph, abs, &bindings).unwrap(), absolute);
+        }
+
+        // Maxima take the ordinary exact-width path while minima wrap.  In
+        // particular this also proves the scalar renderer never needs an
+        // f64 detour to represent I64 arithmetic.
+        for (dtype, input, negated) in [
+            (DType::I8, TensorData::from_storage([1], Storage::I8(vec![i8::MAX])).unwrap(), TensorData::from_storage([1], Storage::I8(vec![-i8::MAX])).unwrap()),
+            (DType::I16, TensorData::from_storage([1], Storage::I16(vec![i16::MAX])).unwrap(), TensorData::from_storage([1], Storage::I16(vec![-i16::MAX])).unwrap()),
+            (DType::I32, TensorData::from_storage([1], Storage::I32(vec![i32::MAX])).unwrap(), TensorData::from_storage([1], Storage::I32(vec![-i32::MAX])).unwrap()),
+            (DType::I64, TensorData::from_storage([1], Storage::I64(vec![i64::MAX])).unwrap(), TensorData::from_storage([1], Storage::I64(vec![-i64::MAX])).unwrap()),
+        ] {
+            let mut graph = Graph::new();
+            let source = graph.input_dtype("input", Shape::from([1]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, source).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, source).unwrap();
+            let bindings = HashMap::from([("input".to_string(), input.clone())]);
+            assert_eq!(CpuBackend.execute(&graph, neg, &bindings).unwrap(), negated);
+            assert_eq!(CpuBackend.execute(&graph, abs, &bindings).unwrap(), input);
+        }
+
+        for (dtype, input) in [
+            (DType::F32, TensorData::from_storage([3], Storage::F32(vec![-0.0, f32::NAN, f32::INFINITY])).unwrap()),
+            (DType::F64, TensorData::from_storage([3], Storage::F64(vec![-0.0, f64::NAN, f64::INFINITY])).unwrap()),
+        ] {
+            let mut graph = Graph::new();
+            let source = graph.input_dtype("input", Shape::from([3]), dtype);
+            let neg = graph.unary(crate::UnaryOp::Neg, source).unwrap();
+            let abs = graph.unary(crate::UnaryOp::Abs, source).unwrap();
+            let bindings = HashMap::from([("input".to_string(), input)]);
+            let negated = CpuBackend.execute(&graph, neg, &bindings).unwrap();
+            let absolute = CpuBackend.execute(&graph, abs, &bindings).unwrap();
+            assert!(negated.scalar_at(0).as_f64().is_sign_positive());
+            assert!(absolute.scalar_at(0).as_f64().is_sign_positive());
+            assert!(negated.scalar_at(1).as_f64().is_nan());
+            assert!(absolute.scalar_at(1).as_f64().is_nan());
+            assert!(negated.scalar_at(2).as_f64().is_infinite());
+            assert!(absolute.scalar_at(2).as_f64().is_infinite());
+        }
+    }
+
+    #[test]
+    fn public_abs_sign_composition_is_fail_closed_without_a_jit_sign_contract() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([1]), DType::F32);
+        let output = graph.abs(input).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        assert!(matches!(CpuJit::render(&uop), Err(JitError::Unsupported(_))));
+    }
+
+    #[test]
+    fn exp2_emits_the_cpu_oracle_double_path_and_preserves_vector_fallback() {
+        // Public Exp2 lifts exact storage to F32 and preserves each float
+        // storage dtype. The scalar renderer evaluates the same f64 Exp2 as
+        // CpuBackend/Kernel, then its existing stores perform narrow rounding.
+        for dtype in [
+            DType::Bool,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.exp2(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains("exp2("), "{dtype:?}");
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // B1 deliberately admits only Neg/Abs unary operations. An Exp2
+            // vector request must therefore use the legacy per-lane emitter,
+            // which shares the scalar expression and remains deterministic.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains("exp2("), "{dtype:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+
+            // IsFinite remains its source-literal IsInf/IsNaN/logical-not
+            // composition for every input storage dtype.
+            let finite = graph.isfinite(input).unwrap();
+            let finite = CpuJit::render(
+                &crate::lower_graph_elementwise(&graph, finite).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(finite.abi.buffers.last().unwrap().dtype, DType::Bool);
+            assert!(finite.source.contains("||"), "{dtype:?}");
+            assert!(finite.source.contains("(uint8_t)!("), "{dtype:?}");
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_output = narrow.exp2(f16).unwrap();
+        let bf16_output = narrow.exp2(bf16).unwrap();
+        let f16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        let bf16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(f16_source.contains("rg_f32_to_f16(exp2("));
+        assert!(bf16_source.contains("rg_f32_to_bf16(exp2("));
+
+        // Exp2 VJPs retain an Exp2 node and typed ln(2) multiplication. The
+        // JIT renderer must accept that generated forward subexpression too.
+        let mut differentiated = Graph::new();
+        let input = differentiated.input_dtype("input", Shape::from([1]), DType::F64);
+        let output = differentiated.exp2(input).unwrap();
+        let loss = differentiated.sum_all(output).unwrap();
+        let gradient = differentiated.grad(loss, input).unwrap();
+        let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
+        assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("exp2("));
+    }
+
+    #[test]
+    fn log2_emits_the_cpu_oracle_double_path_and_preserves_vector_fallback() {
+        // Public Log2 has the same storage lattice as Exp2: exact inputs have
+        // an F32 result contract, floating storage is retained, and the
+        // result boundary alone narrows F16/BF16 lanes.
+        for dtype in [
+            DType::Bool,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.log2(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains("log2("), "{dtype:?}");
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // The deliberately narrow B1 ABI does not admit Log2. A vector
+            // request must keep using the deterministic per-lane renderer.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains("log2("), "{dtype:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_output = narrow.log2(f16).unwrap();
+        let bf16_output = narrow.log2(bf16).unwrap();
+        let f16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        let bf16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(f16_source.contains("rg_f32_to_f16(log2("));
+        assert!(bf16_source.contains("rg_f32_to_bf16(log2("));
+
+        // Log2 VJPs carry a source-width ln(2) denominator. Rendering the
+        // gradient validates that the Log2 source remains admitted alongside
+        // the typed multiply/divide nodes created by autograd.
+        let mut differentiated = Graph::new();
+        let input = differentiated.input_dtype("input", Shape::from([1]), DType::F64);
+        let output = differentiated.log2(input).unwrap();
+        let loss = differentiated.sum_all(output).unwrap();
+        let gradient = differentiated.grad(loss, input).unwrap();
+        let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
+        assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("log2("));
+    }
+
+    #[test]
+    fn sin_emits_the_cpu_oracle_path_and_keeps_b1_fail_closed() {
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+            DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.sin(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains("sin("), "{dtype:?}");
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains("sin("), "{dtype:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_out = narrow.sin(f16).unwrap();
+        let bf16_out = narrow.sin(bf16).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_out).unwrap()).unwrap().source.contains("rg_f32_to_f16(sin("));
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_out).unwrap()).unwrap().source.contains("rg_f32_to_bf16(sin("));
+
+        // The source VJP is `sin(pi/2 - x) * upstream`, not a raw Cos node.
+        let mut differentiated = Graph::new();
+        let input = differentiated.input_dtype("input", Shape::from([1]), DType::F64);
+        let output = differentiated.sin(input).unwrap();
+        let loss = differentiated.sum_all(output).unwrap();
+        let gradient = differentiated.grad(loss, input).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&differentiated, gradient).unwrap()).unwrap().source.contains("sin("));
+    }
+
+    #[test]
+    fn trunc_emits_float_c11_and_exact_storage_identity_with_vector_fallback() {
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+            DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.trunc(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            if dtype.is_float() {
+                // C11 `trunc(double)` is the CPU/generic widened operation,
+                // including signed zero, finite fractions, NaN, and infinity.
+                assert!(scalar.source.contains("trunc("), "{dtype:?}");
+            } else {
+                // Bool/integer Trunc is storage-exact identity: do not route
+                // exact I64/U64 lanes through a lossy floating expression.
+                assert!(!scalar.source.contains("trunc("), "{dtype:?}");
+            }
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // B1 intentionally remains limited to Neg/Abs. Trunc therefore
+            // takes the deterministic scalar-expression-per-lane fallback.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            if dtype.is_float() {
+                assert!(vector.source.contains("trunc("), "{dtype:?}");
+            }
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_output = narrow.trunc(f16).unwrap();
+        let bf16_output = narrow.trunc(bf16).unwrap();
+        assert!(CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap()
+        )
+        .unwrap()
+        .source
+        .contains("rg_f32_to_f16(trunc("));
+        assert!(CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap()
+        )
+        .unwrap()
+        .source
+        .contains("rg_f32_to_bf16(trunc("));
+
+        // Floor, Ceil, Round, and float division modes source-literally use
+        // Trunc. Their generated graphs must now be admitted without changing
+        // any raw non-float division contract.
+        let mut composed = Graph::new();
+        let lhs = composed.input_dtype("lhs", Shape::from([1]), DType::F64);
+        let rhs = composed.input_dtype("rhs", Shape::from([1]), DType::F64);
+        for output in [
+            composed.floor(lhs).unwrap(),
+            composed.ceil(lhs).unwrap(),
+            composed.round(lhs).unwrap(),
+            composed.trunc_div(lhs, rhs).unwrap(),
+            composed.floor_div(lhs, rhs).unwrap(),
+        ] {
+            assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, output).unwrap())
+                .unwrap()
+                .source
+                .contains("trunc("));
+        }
+
+        // Reverse mode for Trunc is the existing explicit zero graph.
+        let output = composed.trunc(lhs).unwrap();
+        let loss = composed.sum_all(output).unwrap();
+        let gradient = composed.grad(loss, lhs).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn isinf_emits_typed_predicate_and_admits_source_boolean_compositions() {
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+            DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.isinf(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert_eq!(scalar.abi.buffers.last().unwrap().dtype, DType::Bool);
+            if dtype.is_float() {
+                // C11 isinf recognizes both infinities while excluding finite
+                // values, either signed zero, and NaN.
+                assert!(scalar.source.contains("(uint8_t)isinf("), "{dtype:?}");
+            } else {
+                // Exact non-float lanes never take a floating conversion.
+                assert!(!scalar.source.contains("isinf("), "{dtype:?}");
+            }
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // B1 remains deliberately limited to Neg/Abs; IsInf follows the
+            // deterministic scalar-expression-per-lane vector fallback.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            if dtype.is_float() {
+                assert!(vector.source.contains("(uint8_t)isinf("), "{dtype:?}");
+            }
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([0]), DType::BF16);
+        let f16_output = narrow.isinf(f16).unwrap();
+        let bf16_output = narrow.isinf(bf16).unwrap();
+        let f16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        let bf16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(f16_source.contains("rg_f16_to_f32"));
+        assert!(f16_source.contains("(uint8_t)isinf("));
+        assert!(bf16_source.contains("rg_bf16_to_f32"));
+        assert!(bf16_source.contains("(uint8_t)isinf("));
+
+        // Default both-sign IsInf and source-literal IsFinite must retain the
+        // raw predicate, typed Bool logical-or/not, and no gradient route.
+        let mut composed = Graph::new();
+        let input = composed.input_dtype("input", Shape::from([1]), DType::F64);
+        let both = composed.isinf_with_signs(input, true, true).unwrap();
+        let positive = composed.isinf_with_signs(input, true, false).unwrap();
+        let finite = composed.isfinite(input).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, both).unwrap())
+            .unwrap()
+            .source
+            .contains("(uint8_t)isinf("));
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, positive).unwrap())
+            .unwrap()
+            .source
+            .contains("=="));
+        let finite_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&composed, finite).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(finite_source.contains("(uint8_t)isinf("));
+        assert!(finite_source.contains("||"));
+        assert!(finite_source.contains("(uint8_t)!("));
+        assert!(matches!(composed.grad(both, input), Err(crate::Error::NoGradient(_))));
+    }
+
+    #[test]
+    fn sign_emits_tinygrad_ordered_branches_and_keeps_b1_fail_closed() {
+        for (dtype, branch) in [
+            (DType::Bool, "!=0"),
+            (DType::I8, "<0?-1:(("),
+            (DType::I16, "<0?-1:(("),
+            (DType::I32, "<0?-1:(("),
+            (DType::I64, "<0?-1:(("),
+            (DType::U8, "==0?0:1"),
+            (DType::U16, "==0?0:1"),
+            (DType::U32, "==0?0:1"),
+            (DType::U64, "==0?0:1"),
+            (DType::F16, "==0.0?0.0:"),
+            (DType::BF16, "==0.0?0.0:"),
+            (DType::F32, "==0.0?0.0:"),
+            (DType::F64, "==0.0?0.0:"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.sign(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains(branch), "{dtype:?}");
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+            if dtype.is_float() {
+                assert!(scalar.source.contains("<0.0?-1.0:1.0"), "{dtype:?}");
+            }
+
+            // The B1 vector ABI deliberately only admits Neg/Abs unary
+            // instructions. Sign uses the deterministic scalar expression
+            // per lane instead of silently extending that narrower contract.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains(branch), "{dtype:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_output = narrow.sign(f16).unwrap();
+        let bf16_output = narrow.sign(bf16).unwrap();
+        let f16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        let bf16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(f16_source.contains("rg_f32_to_f16("));
+        assert!(bf16_source.contains("rg_f32_to_bf16("));
+
+        // Public Abs is source-literally `x * sign(x)`, and Sign's VJP is an
+        // explicit zero. Both generated graphs must now remain JIT-admitted.
+        let mut composed = Graph::new();
+        let input = composed.input_dtype("input", Shape::from([1]), DType::F64);
+        let absolute = composed.abs(input).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, absolute).unwrap())
+            .unwrap()
+            .source
+            .contains("==0.0?0.0:"));
+        let output = composed.sign(input).unwrap();
+        let loss = composed.sum_all(output).unwrap();
+        let gradient = composed.grad(loss, input).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap())
+            .is_ok());
+    }
+
     #[test]
     fn source_is_deterministic_and_native_call_works() {
         let mut g = Graph::new();
@@ -2620,10 +3526,50 @@ mod tests {
             JitBuffer::zeroed(DType::F32, 3, false),
             JitBuffer::zeroed(DType::F32, 3, true),
         ];
+        malformed[2].bytes_mut().fill(0x7a);
+        let output_before = malformed[2].bytes().to_vec();
         assert!(matches!(
             k.call(&mut malformed, &[]),
             Err(JitError::InvalidBuffer(_))
         ));
+        assert_eq!(malformed[2].bytes(), output_before);
+    }
+
+    #[test]
+    fn durable_native_key_distinguishes_vector_policy_and_is_deterministic() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([5]), DType::F32);
+        let output = graph.square(input).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let scalar = CpuJit::render(&uop).unwrap();
+        let vector = CpuJit::render_vectorized(&uop).unwrap();
+
+        assert_ne!(scalar.cache_key, vector.cache_key);
+        assert_eq!(vector.cache_key, CpuJit::render_vectorized(&uop).unwrap().cache_key);
+        assert_eq!(native_cache_key("b1", "source"), native_cache_key("b1", "source"));
+        assert_ne!(native_cache_key("b1", "source"), native_cache_key("scalar", "source"));
+        assert_ne!(native_cache_key("b1", "source"), native_cache_key("b1", "source+tail"));
+    }
+
+    #[test]
+    fn corrupt_durable_library_is_evicted_and_rebuilt_once() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([1]));
+        let output = graph.neg(input).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let mut rendered = CpuJit::render(&uop).unwrap();
+        // Keep this fixture isolated from normal JIT cache keys while using
+        // the real temporary directory and publication path.
+        rendered.cache_key = format!("{}-corruption-retry", rendered.cache_key);
+        let path = compile_cached(&rendered).unwrap();
+        std::fs::write(&path, b"not a shared library").unwrap();
+
+        let kernel = JitKernel::load(&rendered).unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), b"not a shared library");
+        assert_eq!(compile_cached(&rendered).unwrap(), path);
+
+        drop(kernel);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -3085,6 +4031,48 @@ mod tests {
     }
 
     #[test]
+    fn native_domain_failure_restores_the_mutable_output_buffer() {
+        let mut graph = Graph::new();
+        let numerator = graph.input_dtype("numerator", Shape::from([2]), DType::I64);
+        let denominator = graph.input_dtype("denominator", Shape::from([2]), DType::I64);
+        let quotient = graph.div(numerator, denominator).unwrap();
+        let kernel = CpuJit::compile(
+            &crate::lower_graph_elementwise(&graph, quotient).unwrap(),
+        )
+        .unwrap();
+        let mut numerator = JitBuffer::zeroed(DType::I64, 2, false);
+        for (bytes, value) in numerator
+            .bytes_mut()
+            .chunks_exact_mut(8)
+            .zip([8i64, 9])
+        {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+        }
+        let mut denominator = JitBuffer::zeroed(DType::I64, 2, false);
+        for (bytes, value) in denominator
+            .bytes_mut()
+            .chunks_exact_mut(8)
+            .zip([2i64, 0])
+        {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+        }
+        let mut output = JitBuffer::zeroed(DType::I64, 2, true);
+        let sentinel = [0x5au8; 16];
+        output.bytes_mut().copy_from_slice(&sentinel);
+        let numerator_before = numerator.bytes().to_vec();
+        let denominator_before = denominator.bytes().to_vec();
+
+        let mut buffers = [numerator, denominator, output];
+        assert_eq!(
+            kernel.call(&mut buffers, &[]),
+            Err(JitError::DivisionByZero { index: 1 })
+        );
+        assert_eq!(buffers[0].bytes(), numerator_before);
+        assert_eq!(buffers[1].bytes(), denominator_before);
+        assert_eq!(buffers[2].bytes(), sentinel);
+    }
+
+    #[test]
     fn narrow_float_raw_storage_executes_natively() {
         let mut g = Graph::new();
         let a = g.input_dtype("a", Shape::from([1]), DType::F16);
@@ -3172,6 +4160,30 @@ mod tests {
                 .map(|raw| u16::from_ne_bytes(raw.try_into().unwrap()))
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "vectorized={vectorized}");
+        }
+    }
+
+    #[test]
+    fn typed_narrow_casts_use_a_storage_roundtrip_before_fused_alu() {
+        for (dtype, marker) in [
+            (DType::F16, "rg_f16_to_f32(rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32(rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([4]), DType::F32);
+            let cast = graph.cast(input, dtype).unwrap();
+            let output = graph.mul(cast, cast).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains(marker), "{dtype:?}");
+            assert!(scalar.source.contains(RENDERER_VERSION));
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // B1 explicitly rejects tagged narrow Casts and uses the scalar
+            // per-lane source instead of a raw-u16 deferred conversion.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert!(vector.source.contains(marker), "{dtype:?}");
         }
     }
 
@@ -3341,6 +4353,76 @@ mod tests {
     }
 
     #[test]
+    fn reduction_renderer_product_bool_and_extrema_preserve_typed_contracts() {
+        let mut numeric = Graph::new();
+        let input = numeric.input_dtype("input", Shape::from([2, 3]), DType::F32);
+        let product = numeric
+            .reduce(input, crate::ReduceKind::Product, Some(vec![1]), false)
+            .unwrap();
+        let product_uop = crate::lower_graph_reduction(&numeric, product).unwrap();
+        let product_scalar = CpuJit::render(&product_uop).unwrap();
+        assert!(product_scalar.source.contains(RENDERER_VERSION));
+        assert!(product_scalar.source.contains("rg_acc = 1;"));
+        assert!(product_scalar.source.contains("rg_acc *"));
+        assert_eq!(product_scalar.cache_key, CpuJit::render(&product_uop).unwrap().cache_key);
+        assert!(CpuJit::render_vectorized(&product_uop).is_ok());
+
+        for (dtype, conversion) in [
+            (DType::F16, "rg_f32_to_f16"),
+            (DType::BF16, "rg_f32_to_bf16"),
+        ] {
+            let mut narrow = Graph::new();
+            let input = narrow.input_dtype("input", Shape::from([1, 2]), dtype);
+            let product = narrow
+                .reduce(input, crate::ReduceKind::Product, Some(vec![1]), false)
+                .unwrap();
+            let source = CpuJit::render(&crate::lower_graph_reduction(&narrow, product).unwrap())
+                .unwrap()
+                .source;
+            assert!(source.contains(conversion), "{dtype:?}");
+        }
+
+        let mut boolean = Graph::new();
+        let input = boolean.input_dtype("input", Shape::from([2, 2]), DType::Bool);
+        let product = boolean
+            .reduce(input, crate::ReduceKind::Product, Some(vec![1]), true)
+            .unwrap();
+        let bool_uop = crate::lower_graph_reduction(&boolean, product).unwrap();
+        let bool_scalar = CpuJit::render(&bool_uop).unwrap();
+        assert!(bool_scalar.source.contains("uint8_t rg_acc = 1;"));
+        assert!(bool_scalar.source.contains("rg_acc &&"));
+        assert!(CpuJit::render_vectorized(&bool_uop).is_ok());
+
+        let mut extrema = Graph::new();
+        let input = extrema.input_dtype("input", Shape::from([1, 3]), DType::F32);
+        let maximum = extrema
+            .reduce(input, crate::ReduceKind::Max, Some(vec![1]), false)
+            .unwrap();
+        let extrema_scalar = CpuJit::render(&crate::lower_graph_reduction(&extrema, maximum).unwrap())
+            .unwrap()
+            .source;
+        assert!(extrema_scalar.contains("int rg_seen = 0;"));
+        assert!(extrema_scalar.contains("if (!rg_seen)"));
+        assert!(extrema_scalar.contains("!isnan(rg_acc)"));
+
+        for (dtype, kind, comparison) in [
+            (DType::Bool, crate::ReduceKind::Max, "> rg_acc"),
+            (DType::I64, crate::ReduceKind::Min, "< rg_acc"),
+            (DType::U64, crate::ReduceKind::Max, "> rg_acc"),
+        ] {
+            let mut integral = Graph::new();
+            let input = integral.input_dtype("input", Shape::from([1, 3]), dtype);
+            let output = integral.reduce(input, kind, Some(vec![1]), false).unwrap();
+            let uop = crate::lower_graph_reduction(&integral, output).unwrap();
+            let rendered = CpuJit::render(&uop).unwrap();
+            assert!(rendered.source.contains("int rg_seen = 0;"), "{dtype:?}");
+            assert!(rendered.source.contains(comparison), "{dtype:?}");
+            assert!(!rendered.source.contains("isnan((uint64_t)"), "{dtype:?}");
+            assert!(CpuJit::render_vectorized(&uop).is_ok(), "{dtype:?}");
+        }
+    }
+
+    #[test]
     fn symbolic_specialization_validates_and_executes_two_bindings() {
         let expr = SymbolicExpr::variable("n", 0, 4).unwrap();
         let var = expr.variables().into_iter().next().unwrap();
@@ -3421,6 +4503,21 @@ mod tests {
             );
             assert!(vector_source.source.contains("rg_base"));
             assert!(vector_source.source.contains("VectorProgram key"));
+            if len == 5 {
+                let mut malformed = program.clone();
+                malformed.tail_elements = 2;
+                let ids = vector_source
+                    .abi
+                    .buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, buffer)| (buffer.id, index))
+                    .collect::<BTreeMap<_, _>>();
+                assert!(matches!(
+                    render_vector_program(&malformed, &vector_source.abi, &ids, len),
+                    Err(JitError::Unsupported(_))
+                ));
+            }
             let vector = CpuJit::compile_vectorized(&uop).unwrap();
             let scalar = CpuJit::compile(&uop).unwrap();
             let input = TensorData::from_scalars(
@@ -3469,7 +4566,40 @@ mod tests {
     }
 
     #[test]
-    fn portable_b2_exact_and_narrow_float_vectors_execute() {
+    fn portable_vector_tail_domain_failure_restores_output() {
+        let mut graph = Graph::new();
+        let numerator = graph.input_dtype("numerator", Shape::from([5]), DType::I32);
+        let denominator = graph.input_dtype("denominator", Shape::from([5]), DType::I32);
+        let quotient = graph.div(numerator, denominator).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, quotient).unwrap();
+        let rendered = CpuJit::render_vectorized(&uop).unwrap();
+        assert!(rendered.source.contains("VectorProgram key"));
+        let kernel = CpuJit::compile_vectorized(&uop).unwrap();
+        let mut numerator = JitBuffer::zeroed(DType::I32, 5, false);
+        let mut denominator = JitBuffer::zeroed(DType::I32, 5, false);
+        for ((numerator, denominator), divisor) in numerator
+            .bytes_mut()
+            .chunks_exact_mut(4)
+            .zip(denominator.bytes_mut().chunks_exact_mut(4))
+            .zip([1i32, 1, 1, 1, 0])
+        {
+            numerator.copy_from_slice(&8i32.to_ne_bytes());
+            denominator.copy_from_slice(&divisor.to_ne_bytes());
+        }
+        let mut output = JitBuffer::zeroed(DType::I32, 5, true);
+        output.bytes_mut().fill(0x3c);
+        let before = output.bytes().to_vec();
+        let mut buffers = [numerator, denominator, output];
+
+        assert_eq!(
+            kernel.call(&mut buffers, &[]),
+            Err(JitError::DivisionByZero { index: 4 })
+        );
+        assert_eq!(buffers[2].bytes(), before);
+    }
+
+    #[test]
+    fn portable_b2_exact_vectors_execute() {
         for dtype in [
             DType::Bool,
             DType::I8,
@@ -3480,8 +4610,6 @@ mod tests {
             DType::U16,
             DType::U32,
             DType::U64,
-            DType::F16,
-            DType::BF16,
         ] {
             for len in [0usize, 1, 3, 4, 5, 8, 17] {
                 let mut graph = Graph::new();
@@ -3551,6 +4679,60 @@ mod tests {
                 );
                 assert_eq!(native.storage(), expected.storage(), "{dtype:?} len={len}");
             }
+        }
+    }
+
+    #[test]
+    fn narrow_select_and_cast_vector_requests_use_legacy_per_lane_rendering() {
+        for (dtype, decode, encode) in [
+            (DType::F16, "rg_f16_to_f32", "rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32", "rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let condition = graph.input_dtype("condition", Shape::from([5]), DType::Bool);
+            let on_true = graph.input_dtype("on_true", Shape::from([5]), dtype);
+            let on_false = graph.input_dtype("on_false", Shape::from([5]), dtype);
+            // Keep a live Select branch and both widening/narrowing Casts so
+            // raw F16/BF16 signed-zero, NaN/infinity, and fractional lanes
+            // must traverse the source-correct conversion helpers.
+            let selected = graph.select(condition, on_true, on_false).unwrap();
+            let widened = graph.cast(selected, DType::F32).unwrap();
+            let output = graph.cast(widened, dtype).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains(decode), "{dtype:?}");
+            assert!(scalar.source.contains(encode), "{dtype:?}");
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert!(vector.source.contains(decode), "{dtype:?}");
+            assert!(vector.source.contains(encode), "{dtype:?}");
+            assert_eq!(vector.cache_key, CpuJit::render_vectorized(&uop).unwrap().cache_key);
+
+            let linear = CpuJit::linearize(&uop).unwrap();
+            let spaces = crate::MemorySpacePlan::from_linear(&linear).unwrap();
+            let program = crate::VectorProgram::from_linear(&linear, &spaces).unwrap();
+            assert!(matches!(
+                program.b1_eligibility(),
+                Err(crate::VectorIrError::Unsupported(reason))
+                    if reason == "portable narrow vector ABI needs tagged float lanes"
+            ));
+        }
+
+        for dtype in [DType::F32, DType::I32] {
+            let mut graph = Graph::new();
+            let condition = graph.input_dtype("condition", Shape::from([5]), DType::Bool);
+            let on_true = graph.input_dtype("on_true", Shape::from([5]), dtype);
+            let on_false = graph.input_dtype("on_false", Shape::from([5]), dtype);
+            let output = graph.select(condition, on_true, on_false).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            assert!(
+                CpuJit::render_vectorized(&uop)
+                    .unwrap()
+                    .source
+                    .contains("B2 VectorProgram"),
+                "{dtype:?} Select remains B2-eligible"
+            );
         }
     }
 
@@ -3766,5 +4948,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(native.storage(), expected.storage());
+    }
+
+    #[test]
+    fn raw_matmul_uses_dtype_width_accumulators_and_renderer_v16() {
+        let mut f32_graph = Graph::new();
+        let f32_lhs = f32_graph.input_dtype("lhs", Shape::from([1, 3]), DType::F32);
+        let f32_rhs = f32_graph.input_dtype("rhs", Shape::from([3, 1]), DType::F32);
+        let f32_output = f32_graph.matmul(f32_lhs, f32_rhs).unwrap();
+        let f32_kernel = crate::lower_graph_matmul(&f32_graph, f32_output).unwrap();
+        let f32_rendered = CpuJit::render(&f32_kernel).unwrap();
+        assert!(f32_rendered.source.contains(RENDERER_VERSION));
+        assert!(f32_rendered.source.contains("float rg_acc=0.0f;"));
+        assert!(f32_rendered.source.contains("float rg_product=(float)"));
+        assert!(f32_rendered.source.contains("rg_acc=(float)(rg_acc+rg_product);"));
+        assert!(!f32_rendered.source.contains("double rg_acc=0.0;"));
+        assert_eq!(f32_rendered.cache_key, CpuJit::render(&f32_kernel).unwrap().cache_key);
+
+        // This adversarial contraction distinguishes per-step F32 storage
+        // rounding from a double accumulator narrowed only at the end.
+        let oracle = CpuBackend
+            .execute(
+                &f32_graph,
+                f32_output,
+                &HashMap::from([
+                    (
+                        "lhs".into(),
+                        TensorData::from_storage(
+                            [1, 3],
+                            Storage::F32(vec![1.0e10, 1.0, -1.0e10]),
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        "rhs".into(),
+                        TensorData::from_storage([3, 1], Storage::F32(vec![1.0; 3])).unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        let Scalar::F(value) = oracle.scalar_at(0) else {
+            panic!("F32 matmul must retain F32 scalar storage")
+        };
+        assert_eq!((value as f32).to_bits(), 0.0f32.to_bits());
+
+        let mut f64_graph = Graph::new();
+        let f64_lhs = f64_graph.input_dtype("lhs", Shape::from([3]), DType::F64);
+        let f64_rhs = f64_graph.input_dtype("rhs", Shape::from([3]), DType::F64);
+        let f64_output = f64_graph.matmul(f64_lhs, f64_rhs).unwrap();
+        let f64_rendered = CpuJit::render(
+            &crate::lower_graph_matmul(&f64_graph, f64_output).unwrap(),
+        )
+        .unwrap();
+        assert!(f64_rendered.source.contains("double rg_acc=0.0;"));
+        assert!(!f64_rendered.source.contains("float rg_product=(float)"));
     }
 }

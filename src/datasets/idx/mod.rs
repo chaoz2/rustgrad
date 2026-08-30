@@ -26,8 +26,49 @@ pub struct MnistIdx {
 }
 
 impl MnistIdx {
+    /// Verifies that this public feature/label pair retains the exact MNIST
+    /// storage contract produced by [`parse_mnist_idx`].
+    ///
+    /// The parser permits any IDX row/column geometry, so
+    /// this validates against the pair's declared `rows` and `cols` rather
+    /// than imposing a separate 28×28 policy. Public tensors remain
+    /// inspectable, but derived consumers must not normalize a mismatched
+    /// sample axis or invalid label inventory.
+    pub fn validate(&self) -> Result<()> {
+        if self.images.dtype() != DType::U8 {
+            return Err(bad("MNIST images must have dtype U8"));
+        }
+        if self.labels.dtype() != DType::U8 {
+            return Err(bad("MNIST labels must have dtype U8"));
+        }
+        let image_shape = self.images.shape().dims();
+        if image_shape.len() != 4 || image_shape[1..] != [1, self.rows, self.cols] {
+            return Err(bad(format!(
+                "MNIST images must have shape [N, 1, {}, {}], got {:?}",
+                self.rows, self.cols, image_shape
+            )));
+        }
+        let count = image_shape[0];
+        if self.labels.shape().dims() != [count] {
+            return Err(bad(format!(
+                "MNIST label shape must be [{count}], got {:?}",
+                self.labels.shape().dims()
+            )));
+        }
+        if let Some((index, label)) = (0..self.labels.len())
+            .map(|index| (index, self.labels.scalar_at(index).as_u64()))
+            .find(|(_, label)| *label > 9)
+        {
+            return Err(bad(format!(
+                "MNIST label {label} at record {index} is outside 0..=9"
+            )));
+        }
+        Ok(())
+    }
+
     /// Converts byte pixels to F32 in the inclusive range `0..=1`.
     pub fn normalized_f32(&self) -> Result<TensorData> {
+        self.validate()?;
         TensorData::from_scalars(
             self.images.shape().clone(),
             DType::F32,
@@ -67,7 +108,7 @@ pub fn parse_mnist_idx(images: &[u8], labels: &[u8]) -> Result<MnistIdx> {
     {
         return Err(bad("IDX payload length mismatch"));
     }
-    Ok(MnistIdx {
+    let dataset = MnistIdx {
         images: TensorData::from_le_bytes(
             Shape::new([count, 1, rows, cols]),
             DType::U8,
@@ -76,7 +117,9 @@ pub fn parse_mnist_idx(images: &[u8], labels: &[u8]) -> Result<MnistIdx> {
         labels: TensorData::from_le_bytes([count], DType::U8, &labels[8..])?,
         rows,
         cols,
-    })
+    };
+    dataset.validate()?;
+    Ok(dataset)
 }
 
 #[cfg(test)]
@@ -104,6 +147,67 @@ mod tests {
 
         assert!(parse_mnist_idx(&images[..16], &labels).is_err());
         images.push(0);
+        assert!(parse_mnist_idx(&images, &labels).is_err());
+    }
+
+    #[test]
+    fn public_mnist_pair_validation_rejects_misaligned_or_invalid_tensors_without_derivation() {
+        let mut images = Vec::new();
+        images.extend_from_slice(&2051u32.to_be_bytes());
+        images.extend_from_slice(&1u32.to_be_bytes());
+        images.extend_from_slice(&2u32.to_be_bytes());
+        images.extend_from_slice(&2u32.to_be_bytes());
+        images.extend_from_slice(&[0, 1, 2, 3]);
+        let mut labels = Vec::new();
+        labels.extend_from_slice(&2049u32.to_be_bytes());
+        labels.extend_from_slice(&1u32.to_be_bytes());
+        labels.push(9);
+        let valid = parse_mnist_idx(&images, &labels).unwrap();
+        let before = valid.clone();
+        assert!(valid.validate().is_ok());
+        assert_eq!(valid, before);
+
+        let malformed = [
+            MnistIdx {
+                images: valid.images.clone(),
+                labels: TensorData::from_scalars([2], DType::U8, [Scalar::U(1), Scalar::U(2)])
+                    .unwrap(),
+                rows: valid.rows,
+                cols: valid.cols,
+            },
+            MnistIdx {
+                images: TensorData::from_scalars(
+                    [1, 1, 1, 4],
+                    DType::U8,
+                    [Scalar::U(0); 4],
+                )
+                .unwrap(),
+                labels: valid.labels.clone(),
+                rows: valid.rows,
+                cols: valid.cols,
+            },
+            MnistIdx {
+                images: valid.images.clone().cast(DType::F32),
+                labels: valid.labels.clone(),
+                rows: valid.rows,
+                cols: valid.cols,
+            },
+            MnistIdx {
+                images: valid.images.clone(),
+                labels: TensorData::from_scalars([1], DType::U8, [Scalar::U(10)]).unwrap(),
+                rows: valid.rows,
+                cols: valid.cols,
+            },
+        ];
+        for dataset in malformed {
+            let before = dataset.clone();
+            assert!(dataset.validate().is_err());
+            assert!(dataset.normalized_f32().is_err());
+            assert_eq!(dataset, before);
+        }
+
+        labels.pop();
+        labels.push(10);
         assert!(parse_mnist_idx(&images, &labels).is_err());
     }
 }

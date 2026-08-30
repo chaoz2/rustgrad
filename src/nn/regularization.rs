@@ -28,12 +28,17 @@ pub struct Dropout {
     pub seed: u64,
 }
 impl Dropout {
-    pub fn new(probability: f64, training: bool, seed: u64) -> Result<Self> {
+    fn validate_probability(probability: f64) -> Result<()> {
         if !(0.0..=1.0).contains(&probability) {
             return Err(Error::UnsupportedDropout {
                 probability_bits: probability.to_bits(),
             });
         }
+        Ok(())
+    }
+
+    pub fn new(probability: f64, training: bool, seed: u64) -> Result<Self> {
+        Self::validate_probability(probability)?;
         Ok(Self {
             probability,
             training,
@@ -41,6 +46,7 @@ impl Dropout {
         })
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::validate_probability(self.probability)?;
         if !self.training || self.probability == 0.0 {
             return Ok(input);
         }

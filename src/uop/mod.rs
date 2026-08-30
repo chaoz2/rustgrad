@@ -1418,6 +1418,21 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
             },
         },
         RewriteRule {
+            name: "add-zero-untyped-int",
+            priority: 2,
+            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
+                UPat::any().named("x"),
+                UPat::op(UOpKind::Const).arg(UArg::Int(0)),
+            ]),
+            // Do not turn a floating `-0.0 + 0` into `-0.0`: only the exact
+            // non-float domain has this untyped literal identity.
+            apply: |c, n| {
+                n.ty()
+                    .filter(|ty| !ty.scalar.is_float())
+                    .and_then(|_| c.get("x").cloned())
+            },
+        },
+        RewriteRule {
             name: "cast-same",
             priority: 2,
             pattern: UPat::op(UOpKind::Cast).sources(vec![UPat::any().named("x")]),
@@ -1427,7 +1442,10 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
             name: "where-same",
             priority: 3,
             pattern: UPat::op(UOpKind::Ternary(Ternary::Where)).sources(vec![
-                UPat::any(),
+                // A nonconstant condition can have observable failure or
+                // binding behavior even when both arms are the same value.
+                // Keep only the dependency-free, total constant condition.
+                UPat::op(UOpKind::Const),
                 UPat::any().named("x"),
                 UPat::any().named("x"),
             ]),
@@ -1521,7 +1539,11 @@ fn typed_positive_zero(node: &UOp, ty: Option<UType>) -> bool {
 
 /// Lowers a scalar-expression pilot from the high-level graph. It is
 /// inspectable metadata only; execution remains with the CPU backend.
-fn raw_literal_bits(data: &crate::TensorData) -> Result<u64, UOpError> {
+/// Returns the exact storage payload of a graph-owned scalar constant.  This
+/// is shared by scalar metadata lowering and fused elementwise lowering so a
+/// constant never loses its F16/BF16/float NaN or signed-zero bits at either
+/// boundary.
+pub(crate) fn raw_literal_bits(data: &crate::TensorData) -> Result<u64, UOpError> {
     if data.len() != 1 {
         return Err(UOpError::InvalidArgument);
     }
@@ -1581,6 +1603,33 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                 };
                 UOp::unary(u, lower(graph, *input, memo)?)
             }
+            crate::Op::Binary { op, lhs, rhs }
+                if matches!(*op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) =>
+            {
+                // tinygrad extrema are ordered selects, rather than host max/min
+                // intrinsics: MAX is lhs < rhs ? rhs : lhs, while MIN is its
+                // inverse predicate.  Keep this lowering in Compare/Where form
+                // so scalar UOp renderers cannot reintroduce platform extrema
+                // behavior for NaNs or signed-zero ties.
+                let lhs = lower(graph, *lhs, memo)?;
+                let rhs = lower(graph, *rhs, memo)?;
+                let condition = UOp::new(
+                    UOpKind::GraphCompare(crate::CompareOp::Lt),
+                    Some(UType::scalar(DType::Bool)),
+                    if *op == crate::BinaryOp::Maximum {
+                        vec![lhs.clone(), rhs.clone()]
+                    } else {
+                        vec![rhs.clone(), lhs.clone()]
+                    },
+                    UArg::None,
+                );
+                UOp::new(
+                    UOpKind::Ternary(Ternary::Where),
+                    Some(ty),
+                    vec![condition, rhs, lhs],
+                    UArg::None,
+                )
+            }
             crate::Op::Binary { op, lhs, rhs } => {
                 let b = match op {
                     crate::BinaryOp::Add => Binary::Add,
@@ -1588,8 +1637,6 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                     crate::BinaryOp::Mul => Binary::Mul,
                     crate::BinaryOp::FloorDiv => Binary::FloorDiv,
                     crate::BinaryOp::Mod => Binary::Mod,
-                    crate::BinaryOp::Maximum => Binary::Max,
-                    crate::BinaryOp::Minimum => Binary::Min,
                     _ => return Err(UOpError::InvalidArgument),
                 };
                 UOp::binary(b, lower(graph, *lhs, memo)?, lower(graph, *rhs, memo)?)

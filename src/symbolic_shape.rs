@@ -102,7 +102,8 @@ impl SymbolicShape {
         if let Some(extra) = bindings.keys().find(|v| !used.contains(*v)) {
             return Err(SymbolicError::ExtraBinding(extra.clone()));
         }
-        self.0
+        let shape = self
+            .0
             .iter()
             .map(|d| {
                 // An axis need not mention every shape variable.  Preserve the
@@ -117,7 +118,15 @@ impl SymbolicShape {
                 d.bind(&axis_bindings)
             })
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map(Shape::new)
+            .map(Shape::new)?;
+        // Binding is the last symbolic boundary before graph construction.
+        // A concrete Shape can hold dimensions whose product is invalid, so
+        // reject that extent here instead of letting input_symbolic append an
+        // unusable graph leaf.
+        shape
+            .numel()
+            .map_err(|_| SymbolicError::Overflow { op: "shape extent" })?;
+        Ok(shape)
     }
     pub fn broadcast_with(&self, other: &Self) -> std::result::Result<Self, SymbolicError> {
         let rank = self.rank().max(other.rank());

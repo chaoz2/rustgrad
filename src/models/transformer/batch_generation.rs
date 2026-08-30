@@ -129,6 +129,7 @@ impl<'a> LlamaBatchGenerator<'a> {
                 });
             }
         }
+        self.model.validate_batch_token_ids(prompts)?;
         let batch = prompts.len();
         let vocab = self.model.config().schema().vocab_size();
         validate_sampling(sampling, max_new_tokens, batch, vocab)?;

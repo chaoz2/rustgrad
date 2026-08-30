@@ -707,15 +707,7 @@ impl LlamaModel {
         if tokens.is_empty() {
             return Err(LlamaModelError::EmptyTokens);
         }
-        let schema = self.config.schema;
-        for &token in tokens {
-            if usize::try_from(token).map_or(true, |token| token >= schema.vocab_size) {
-                return Err(LlamaModelError::TokenOutOfRange {
-                    token,
-                    vocab_size: schema.vocab_size,
-                });
-            }
-        }
+        self.validate_token_ids(tokens)?;
         let past_len = validate_cache(&self.config, past)?;
         let total_len = past_len
             .checked_add(tokens.len())
@@ -802,6 +794,39 @@ impl LlamaModel {
             quantized_embedding,
             packed_logits_input,
         })
+    }
+
+    /// Rejects any token outside this model's GGUF-derived vocabulary before
+    /// a caller can stage cache or native execution work.
+    pub(super) fn validate_token_ids(&self, tokens: &[u32]) -> Result<(), LlamaModelError> {
+        let vocab_size = self.config.schema.vocab_size;
+        for &token in tokens {
+            if usize::try_from(token).map_or(true, |token| token >= vocab_size) {
+                return Err(LlamaModelError::TokenOutOfRange { token, vocab_size });
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies the same vocabulary proof to every independently-addressed
+    /// batch row, preserving the existing row-specific diagnostic.
+    pub(super) fn validate_batch_token_ids(
+        &self,
+        rows: &[Vec<u32>],
+    ) -> Result<(), LlamaModelError> {
+        let vocab_size = self.config.schema.vocab_size;
+        for (row, tokens) in rows.iter().enumerate() {
+            for &token in tokens {
+                if usize::try_from(token).map_or(true, |token| token >= vocab_size) {
+                    return Err(LlamaModelError::BatchTokenOutOfRange {
+                        row,
+                        token,
+                        vocab_size,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 

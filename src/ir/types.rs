@@ -131,6 +131,42 @@ pub struct AttentionOptions {
     pub dropout_seed: Option<u64>,
 }
 
+/// Concrete Python-style shift argument accepted by public tinygrad
+/// `Tensor.roll`: one integer or an ordered tuple of integers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RollShifts {
+    Scalar(i64),
+    Tuple(Vec<i64>),
+}
+
+impl RollShifts {
+    pub(crate) fn into_vec(self) -> Vec<i64> {
+        match self {
+            Self::Scalar(shift) => vec![shift],
+            Self::Tuple(shifts) => shifts,
+        }
+    }
+}
+
+/// Concrete Python-style dimension argument accepted by public tinygrad
+/// `Tensor.roll`, including its flattening `dims=None` default.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RollDims {
+    None,
+    Scalar(isize),
+    Tuple(Vec<isize>),
+}
+
+impl RollDims {
+    pub(crate) fn into_option_vec(self) -> Option<Vec<isize>> {
+        match self {
+            Self::None => None,
+            Self::Scalar(axis) => Some(vec![axis]),
+            Self::Tuple(axes) => Some(axes),
+        }
+    }
+}
+
 impl Default for AttentionOptions {
     fn default() -> Self {
         Self {
@@ -236,6 +272,15 @@ pub enum Op {
         max: bool,
         axis: Option<usize>,
         keepdim: bool,
+    },
+    /// One selector from an atomically evaluated stable sort pair. Both
+    /// nodes share `pair`; values preserve source dtype and indices are I32.
+    Sort {
+        input: NodeId,
+        axis: usize,
+        descending: bool,
+        pair: u64,
+        output: SortOutput,
     },
     ReduceGrad {
         input: NodeId,
@@ -522,6 +567,61 @@ pub struct Slice {
     pub stop: Option<isize>,
     pub step: isize,
 }
+
+/// Source-defined forms for [`Graph::split`](super::Graph::split).
+///
+/// `Uniform` uses a maximum section size and gives the final nonempty output
+/// the remaining tail. `Explicit` preserves every ordered section, including
+/// zero-sized sections when their checked total covers a zero-sized axis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SplitSections {
+    Uniform(usize),
+    Explicit(Vec<usize>),
+}
+
+/// A concrete or inferred extent for [`Graph::unflatten`](super::Graph::unflatten).
+///
+/// `Infer` is the sole source-compatible negative reshape form: exactly one
+/// extent may be inferred from the replaced input axis. Arbitrary negative
+/// dimensions are intentionally not representable.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum UnflattenExtent {
+    Exact(usize),
+    Infer,
+}
+
+/// A concrete, copied, or inferred extent for [`Graph::reshape_with_extents`](super::Graph::reshape_with_extents).
+///
+/// This is the Rust representation of tinygrad's public reshape forms:
+/// concrete extents, one `-1` inference, and `None` copying the source extent
+/// at the same position.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReshapeExtent {
+    Exact(usize),
+    Infer,
+    Copy,
+}
+
+/// A concrete or copied extent for [`Graph::expand_with_extents`](super::Graph::expand_with_extents).
+///
+/// `Copy` represents tinygrad's public `-1`/`None` expand sentinel after
+/// right-aligning the requested shape with the input shape.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ExpandExtent {
+    Exact(usize),
+    Copy,
+}
+
+/// One axis of [`Graph::shrink_with_ranges`](super::Graph::shrink_with_ranges).
+///
+/// `Full` is tinygrad's public `None` axis marker; `Bounds` is its concrete
+/// nonnegative half-open `(start, end)` form.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ShrinkRange {
+    Full,
+    Bounds { start: usize, end: usize },
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReduceKind {
     Sum,
@@ -558,6 +658,69 @@ pub enum PrefixScanOutput {
 pub enum SortOutput {
     Values,
     Indices,
+}
+
+/// Selects one output from a coupled stable sort producer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SortOutput {
+    Values,
+    Indices,
+}
+
+/// The explicit accumulator and final-storage dtypes for a reduction.
+///
+/// The default Sum pair mirrors tinygrad's checked-in `sum_acc_dtype` rule.
+/// Narrow floating inputs accumulate in F32 and narrow only at the final
+/// result; other supported dtypes retain their source-defined accumulation
+/// width. Product defaults to its input dtype for both stages.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ReductionDType {
+    pub accumulator: DType,
+    pub output: DType,
+}
+
+/// Signed Bessel-style correction used by [`Graph::var`](super::Graph::var)
+/// and [`Graph::std`](super::Graph::std).
+///
+/// This is the concrete host representation of tinygrad's `sint` correction
+/// argument. The denominator is always formed as `max(n - correction, 0)`;
+/// negative corrections are therefore intentionally valid.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VarianceCorrection(i64);
+
+impl VarianceCorrection {
+    /// The tinygrad default: sample variance / standard deviation.
+    pub const UNBIASED: Self = Self(1);
+
+    pub const fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> i64 {
+        self.0
+    }
+}
+
+impl ReductionDType {
+    pub const fn new(accumulator: DType, output: DType) -> Self {
+        Self {
+            accumulator,
+            output,
+        }
+    }
+
+    pub const fn sum_default(input: DType) -> Self {
+        let accumulator = input.sum_accumulator_dtype();
+        let output = match input {
+            DType::F16 | DType::BF16 => input,
+            _ => accumulator,
+        };
+        Self::new(accumulator, output)
+    }
+
+    pub const fn product_default(input: DType) -> Self {
+        Self::new(input, input)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -964,6 +1127,19 @@ impl Op {
             } => format!(
                 "arg{}(%{input}, axis={axis:?}, keepdim={keepdim})",
                 if *max { "max" } else { "min" }
+            ),
+            Self::Sort {
+                input,
+                axis,
+                descending,
+                output,
+                ..
+            } => format!(
+                "{}(%{input}, axis={axis}, descending={descending})",
+                match output {
+                    SortOutput::Values => "sort",
+                    SortOutput::Indices => "argsort",
+                }
             ),
             Self::ReduceGrad {
                 input,

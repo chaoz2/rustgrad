@@ -106,6 +106,8 @@ pub enum MemoryPlanError {
     InvalidSchedule(String),
     Overflow,
     DuplicateBuffer(u64),
+    InvalidOutputProjection(u64),
+    UnsupportedMultiOutput(u64),
     MissingProducer(u64),
     UseBeforeProduce {
         buffer: u64,
@@ -119,6 +121,10 @@ pub enum MemoryPlanError {
     },
     ConsumerMismatch {
         producer: u64,
+    },
+    InvalidAlignment {
+        buffer: u64,
+        alignment: usize,
     },
     AliasEscape(u64),
 }
@@ -243,6 +249,19 @@ impl MemoryPlan {
             if bytes != desc.bytes {
                 return Err(MemoryPlanError::Overflow);
             }
+            // `from_temporaries` is a public compatibility boundary and can
+            // receive descriptors that did not pass through a schedule codec.
+            // Keep its host-allocation ABI at least as strict as the memory
+            // space contract before constructing any reusable requests.
+            if desc.alignment == 0
+                || !desc.alignment.is_power_of_two()
+                || (bytes != 0 && bytes % desc.alignment != 0)
+            {
+                return Err(MemoryPlanError::InvalidAlignment {
+                    buffer: desc.id,
+                    alignment: desc.alignment,
+                });
+            }
             requests.push((
                 producer_position,
                 AllocationRequest {
@@ -337,6 +356,28 @@ impl MemoryPlan {
             peak_bytes: peak.1,
         })
     }
+}
+
+/// Checks the complete declared producer inventory before any allocator state
+/// or request vector can be made visible. Multi-output ownership is modeled
+/// here, but deliberately rejected until executors can publish every member
+/// atomically.
+fn validate_output_inventory(items: &[ScheduleItem]) -> Result<(), MemoryPlanError> {
+    let mut owners = BTreeSet::new();
+    for item in items {
+        if item.primary_output() != &item.output {
+            return Err(MemoryPlanError::InvalidOutputProjection(item.id));
+        }
+        for output in item.outputs.iter() {
+            if !owners.insert(output.id) {
+                return Err(MemoryPlanError::DuplicateBuffer(output.id));
+            }
+        }
+    }
+    if let Some(item) = items.iter().find(|item| !item.outputs.is_single()) {
+        return Err(MemoryPlanError::UnsupportedMultiOutput(item.id));
+    }
+    Ok(())
 }
 
 fn request_last_position(
@@ -490,5 +531,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(10, 1), (11, 2)]
         );
+    }
+
+    #[test]
+    fn invalid_temporary_alignment_rejects_before_reuse_planning() {
+        for alignment in [0, 3, 16] {
+            let (_, mut schedule, _, _) = shared_schedule();
+            let buffer = schedule.items[0].output.id;
+            schedule.items[0].output.alignment = alignment;
+            let output = schedule.items[0].output.clone();
+            schedule.items[0].outputs = crate::ScheduledOutputs::single(output);
+            let temporaries = vec![schedule.items[0].output.clone()];
+            assert!(matches!(
+                MemoryPlan::from_temporaries(&schedule.items, &temporaries, true),
+                Err(MemoryPlanError::InvalidAlignment {
+                    buffer: actual_buffer,
+                    alignment: actual_alignment,
+                }) if actual_buffer == buffer && actual_alignment == alignment
+            ));
+        }
     }
 }

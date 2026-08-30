@@ -1,6 +1,6 @@
 use crate::{
-    Backend, BinaryOp, CpuBackend, DType, Graph, NodeId, ReduceKind, Scalar, Shape, Storage,
-    TensorData,
+    Backend, BinaryOp, CompareOp, CpuBackend, DType, Graph, NodeId, ReduceKind, Scalar, Shape,
+    Storage, TensorData, UnaryOp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -20,10 +20,45 @@ pub enum FuzzBinaryOp {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum FuzzUnaryOp {
+    Neg,
+    Abs,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzCompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzLogicalOp {
+    And,
+    Or,
+}
+
+/// Closed raw movement scatter modes with a complete portable fuzz path.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzScatterOp {
+    Replace,
+    Add,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FuzzReduction {
     Sum,
     Mean,
     Product,
+    Max,
+    Min,
 }
 
 /// Portable little-endian tensor bytes used by generated cases and failures.
@@ -181,9 +216,52 @@ pub enum FuzzCase {
         rhs: FuzzTensor,
         axis: usize,
     },
+    /// Additive arbitrary-arity raw `Graph::concat` coverage. The legacy
+    /// two-input `concat` tag remains unchanged for persisted artifacts.
+    ConcatMany {
+        inputs: Vec<FuzzTensor>,
+        axis: usize,
+    },
     Matmul {
         lhs: FuzzTensor,
         rhs: FuzzTensor,
+    },
+    Unary {
+        op: FuzzUnaryOp,
+        input: FuzzTensor,
+    },
+    Compare {
+        op: FuzzCompareOp,
+        lhs: FuzzTensor,
+        rhs: FuzzTensor,
+    },
+    Logical {
+        op: FuzzLogicalOp,
+        lhs: FuzzTensor,
+        rhs: FuzzTensor,
+    },
+    LogicalNot {
+        input: FuzzTensor,
+    },
+    TensorT {
+        input: FuzzTensor,
+    },
+    Pad {
+        input: FuzzTensor,
+        padding: Vec<(usize, usize)>,
+        fill: FuzzTensor,
+    },
+    Gather {
+        input: FuzzTensor,
+        index: FuzzTensor,
+        axis: usize,
+    },
+    Scatter {
+        base: FuzzTensor,
+        index: FuzzTensor,
+        updates: FuzzTensor,
+        axis: usize,
+        op: FuzzScatterOp,
     },
 }
 
@@ -203,7 +281,20 @@ impl FuzzCase {
         match self {
             Self::Binary { lhs, rhs, .. }
             | Self::Concat { lhs, rhs, .. }
-            | Self::Matmul { lhs, rhs } => vec![lhs, rhs],
+            | Self::Matmul { lhs, rhs }
+            | Self::Compare { lhs, rhs, .. }
+            | Self::Logical { lhs, rhs, .. }
+            | Self::Gather {
+                input: lhs,
+                index: rhs,
+                ..
+            } => vec![lhs, rhs],
+            Self::Scatter {
+                base,
+                index,
+                updates,
+                ..
+            } => vec![base, index, updates],
             Self::Select {
                 condition,
                 on_true,
@@ -211,7 +302,14 @@ impl FuzzCase {
             } => vec![condition, on_true, on_false],
             Self::Cast { input, .. }
             | Self::AffineView { input, .. }
-            | Self::Reduction { input, .. } => vec![input],
+            | Self::Reduction { input, .. }
+            | Self::Unary { input, .. }
+            | Self::LogicalNot { input }
+            | Self::TensorT { input } => vec![input],
+            // Raw Graph::pad stores its fill in the movement plan, not as a
+            // caller-owned graph buffer. `build` validates it explicitly.
+            Self::Pad { input, .. } => vec![input],
+            Self::ConcatMany { inputs, .. } => inputs.iter().collect(),
         }
     }
 
@@ -294,6 +392,8 @@ impl FuzzCase {
                             FuzzReduction::Sum => ReduceKind::Sum,
                             FuzzReduction::Mean => ReduceKind::Mean,
                             FuzzReduction::Product => ReduceKind::Product,
+                            FuzzReduction::Max => ReduceKind::Max,
+                            FuzzReduction::Min => ReduceKind::Min,
                         },
                         Some(vec![*axis as isize]),
                         *keepdim,
@@ -307,10 +407,178 @@ impl FuzzCase {
                     .concat([lhs, rhs], *axis)
                     .map_err(|error| error.to_string())?
             }
+            Self::ConcatMany { inputs, axis } => {
+                if inputs.len() < 2 {
+                    return Err("raw fuzz concat_many requires at least two inputs".into());
+                }
+                let first = &inputs[0];
+                if first.shape.is_empty()
+                    || *axis >= first.shape.len()
+                    || inputs.iter().any(|input| {
+                        input.dtype != first.dtype
+                            || input.shape.len() != first.shape.len()
+                            || input.shape.iter().enumerate().any(|(dimension, extent)| {
+                                dimension != *axis && *extent != first.shape[dimension]
+                            })
+                    })
+                {
+                    return Err("invalid homogeneous raw fuzz concat_many geometry".into());
+                }
+                let ids = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(position, input)| bind(&mut graph, &format!("input{position}"), input))
+                    .collect::<Result<Vec<_>, _>>()?;
+                graph.concat(ids, *axis).map_err(|error| error.to_string())?
+            }
             Self::Matmul { lhs, rhs } => {
                 let lhs = bind(&mut graph, "lhs", lhs)?;
                 let rhs = bind(&mut graph, "rhs", rhs)?;
                 graph.matmul(lhs, rhs).map_err(|error| error.to_string())?
+            }
+            Self::Unary { op, input } => {
+                let input = bind(&mut graph, "input", input)?;
+                match op {
+                    FuzzUnaryOp::Neg => graph.neg(input),
+                    // `Graph::abs` is the source-level sign/mul composition.
+                    // This portable fuzz family instead exercises the existing
+                    // direct GraphUnary Abs path shared by captured/native
+                    // replay, just as Neg does for its numeric inputs.
+                    FuzzUnaryOp::Abs => graph.unary(UnaryOp::Abs, input),
+                }
+                .map_err(|error| error.to_string())?
+            }
+            Self::Compare { op, lhs, rhs } => {
+                let lhs = bind(&mut graph, "lhs", lhs)?;
+                let rhs = bind(&mut graph, "rhs", rhs)?;
+                graph
+                    .compare(
+                        match op {
+                            FuzzCompareOp::Eq => CompareOp::Eq,
+                            FuzzCompareOp::Ne => CompareOp::Ne,
+                            FuzzCompareOp::Lt => CompareOp::Lt,
+                            FuzzCompareOp::Le => CompareOp::Le,
+                            FuzzCompareOp::Gt => CompareOp::Gt,
+                            FuzzCompareOp::Ge => CompareOp::Ge,
+                        },
+                        lhs,
+                        rhs,
+                    )
+                    .map_err(|error| error.to_string())?
+            }
+            Self::Logical { op, lhs, rhs } => {
+                let lhs = bind(&mut graph, "lhs", lhs)?;
+                let rhs = bind(&mut graph, "rhs", rhs)?;
+                match op {
+                    FuzzLogicalOp::And => graph.logical_and(lhs, rhs),
+                    FuzzLogicalOp::Or => graph.logical_or(lhs, rhs),
+                }
+                .map_err(|error| error.to_string())?
+            }
+            Self::LogicalNot { input } => {
+                let input = bind(&mut graph, "input", input)?;
+                graph.logical_not(input).map_err(|error| error.to_string())?
+            }
+            Self::TensorT { input } => {
+                let input = bind(&mut graph, "input", input)?;
+                graph.t_tinygrad(input).map_err(|error| error.to_string())?
+            }
+            Self::Pad {
+                input,
+                padding,
+                fill,
+            } => {
+                fill.validate()?;
+                if !fill.shape.is_empty() || fill.dtype != input.dtype {
+                    return Err("pad fill must be a rank-zero tensor with the input dtype".into());
+                }
+                let fill = fill.to_tensor()?.scalar_at(0);
+                let input = bind(&mut graph, "input", input)?;
+                graph
+                    .pad(input, padding.clone(), fill)
+                    .map_err(|error| error.to_string())?
+            }
+            Self::Gather { input, index, axis } => {
+                if !matches!(index.dtype, DType::I32 | DType::I64) {
+                    return Err("raw fuzz gather index dtype must be I32 or I64".into());
+                }
+                if input.shape.is_empty()
+                    || index.shape.len() != input.shape.len()
+                    || *axis >= input.shape.len()
+                    || input
+                        .shape
+                        .iter()
+                        .zip(&index.shape)
+                        .enumerate()
+                        .any(|(dimension, (input, index))| dimension != *axis && index > input)
+                {
+                    return Err("invalid raw fuzz gather geometry".into());
+                }
+                let extent = input.shape[*axis];
+                let index_value = index.to_tensor()?;
+                if (0..index_value.len()).any(|position| match index_value.scalar_at(position) {
+                    Scalar::I(value) => usize::try_from(value).map_or(true, |value| value >= extent),
+                    _ => true,
+                }) {
+                    return Err("raw fuzz gather index is negative or out of range".into());
+                }
+                let input = bind(&mut graph, "input", input)?;
+                let index = bind(&mut graph, "index", index)?;
+                graph
+                    .gather(input, index, *axis)
+                    .map_err(|error| error.to_string())?
+            }
+            Self::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                op,
+            } => {
+                if !matches!(index.dtype, DType::I32 | DType::I64) {
+                    return Err("raw fuzz scatter index dtype must be I32 or I64".into());
+                }
+                if updates.dtype != base.dtype
+                {
+                    return Err("raw fuzz scatter requires homogeneous portable data dtypes".into());
+                }
+                if *op == FuzzScatterOp::Add && !matches!(base.dtype, DType::F32 | DType::F64) {
+                    return Err("raw fuzz scatter_add is portable for F32/F64 only".into());
+                }
+                if base.shape.is_empty()
+                    || index.shape.len() != base.shape.len()
+                    || updates.shape.len() != index.shape.len()
+                    || *axis >= base.shape.len()
+                    || base
+                        .shape
+                        .iter()
+                        .zip(&index.shape)
+                        .enumerate()
+                        .any(|(dimension, (base, index))| dimension != *axis && index > base)
+                    || updates
+                        .shape
+                        .iter()
+                        .zip(&index.shape)
+                        .any(|(update, index)| update < index)
+                {
+                    return Err("invalid raw fuzz scatter geometry".into());
+                }
+                let extent = base.shape[*axis];
+                let index_value = index.to_tensor()?;
+                if (0..index_value.len()).any(|position| match index_value.scalar_at(position) {
+                    Scalar::I(value) => usize::try_from(value).map_or(true, |value| value >= extent),
+                    _ => true,
+                }) {
+                    return Err("raw fuzz scatter index is negative or out of range".into());
+                }
+                let base = bind(&mut graph, "base", base)?;
+                let index = bind(&mut graph, "index", index)?;
+                let updates = bind(&mut graph, "updates", updates)?;
+                match op {
+                    FuzzScatterOp::Replace => graph.scatter(base, index, updates, *axis),
+                    FuzzScatterOp::Add => graph.scatter_add(base, index, updates, *axis),
+                }
+                .map_err(|error| error.to_string())?
             }
         };
         let oracle = ordered.clone().into_iter().collect();

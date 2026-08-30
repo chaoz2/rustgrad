@@ -233,6 +233,8 @@ pub fn realize_with_options(
     inputs: &HashMap<String, TensorData>,
     options: RealizationOptions,
 ) -> Result<Realized, RealizationError> {
+    // Preflight the complete output inventory before the planner can lease a
+    // slot or the JIT can populate a process-local compile cache.
     schedule
         .validate()
         .map_err(|error| RealizationError::Schedule(error.to_string()))?;

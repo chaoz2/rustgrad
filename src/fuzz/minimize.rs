@@ -47,9 +47,64 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
             rhs: rhs.zeroed(),
             axis: *axis,
         },
+        FuzzCase::ConcatMany { inputs, axis } => FuzzCase::ConcatMany {
+            inputs: inputs.iter().map(|input| input.zeroed()).collect(),
+            axis: *axis,
+        },
         FuzzCase::Matmul { lhs, rhs } => FuzzCase::Matmul {
             lhs: lhs.zeroed(),
             rhs: rhs.zeroed(),
+        },
+        FuzzCase::Unary { op, input } => FuzzCase::Unary {
+            op: *op,
+            input: input.zeroed(),
+        },
+        FuzzCase::Compare { op, lhs, rhs } => FuzzCase::Compare {
+            op: *op,
+            lhs: lhs.zeroed(),
+            rhs: rhs.zeroed(),
+        },
+        FuzzCase::Logical { op, lhs, rhs } => FuzzCase::Logical {
+            op: *op,
+            lhs: lhs.zeroed(),
+            rhs: rhs.zeroed(),
+        },
+        FuzzCase::LogicalNot { input } => FuzzCase::LogicalNot {
+            input: input.zeroed(),
+        },
+        FuzzCase::TensorT { input } => FuzzCase::TensorT {
+            input: input.zeroed(),
+        },
+        FuzzCase::Pad {
+            input,
+            padding,
+            fill,
+        } => FuzzCase::Pad {
+            input: input.zeroed(),
+            padding: padding.clone(),
+            fill: fill.zeroed(),
+        },
+        FuzzCase::Gather { input, index, axis } => FuzzCase::Gather {
+            input: input.zeroed(),
+            // Zero is in range whenever a generated index lane exists; an
+            // axis of length zero necessarily has an empty index tensor.
+            index: index.zeroed(),
+            axis: *axis,
+        },
+        FuzzCase::Scatter {
+            base,
+            index,
+            updates,
+            axis,
+            op,
+        } => FuzzCase::Scatter {
+            base: base.zeroed(),
+            // Zero remains in range whenever an index lane exists; an empty
+            // scatter axis necessarily carries an empty index domain.
+            index: index.zeroed(),
+            updates: updates.zeroed(),
+            axis: *axis,
+            op: *op,
         },
     }
 }
@@ -74,6 +129,45 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
             input: input.scalar_prefix()?,
             to: *to,
         }),
+        FuzzCase::Unary { op, input } => Some(FuzzCase::Unary {
+            op: *op,
+            input: input.scalar_prefix()?,
+        }),
+        FuzzCase::Compare { op, lhs, rhs } => Some(FuzzCase::Compare {
+            op: *op,
+            lhs: lhs.scalar_prefix()?,
+            rhs: rhs.scalar_prefix()?,
+        }),
+        FuzzCase::Logical { op, lhs, rhs } => Some(FuzzCase::Logical {
+            op: *op,
+            lhs: lhs.scalar_prefix()?,
+            rhs: rhs.scalar_prefix()?,
+        }),
+        FuzzCase::LogicalNot { input } => Some(FuzzCase::LogicalNot {
+            input: input.scalar_prefix()?,
+        }),
+        // Tensor.T admits rank two only, so scalarization would stop being a
+        // valid source program and is deliberately omitted.
+        FuzzCase::TensorT { .. } => None,
+        // Raw Concat owns a rank/axis contract, including its input arity.
+        FuzzCase::Concat { .. } | FuzzCase::ConcatMany { .. } => None,
+        // Pad can remain scalar only when its rank-zero padding contract is
+        // already valid. Higher-rank padding cannot follow scalarization.
+        FuzzCase::Pad {
+            input,
+            padding,
+            fill,
+        } if input.shape.is_empty() && padding.is_empty() => Some(FuzzCase::Pad {
+            input: input.scalar_prefix()?,
+            padding: vec![],
+            fill: fill.scalar_prefix()?,
+        }),
+        FuzzCase::Pad { .. } => None,
+        // Rank and axis are part of Gather's static admission, so reducing it
+        // to scalars would turn a valid case into a different program.
+        FuzzCase::Gather { .. } => None,
+        // Scatter similarly owns rank, axis, and index geometry.
+        FuzzCase::Scatter { .. } => None,
         _ => None,
     }
 }

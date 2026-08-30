@@ -16,10 +16,18 @@ impl Embedding {
         padding_idx: Option<usize>,
         seed: u64,
     ) -> Result<Self> {
+        if vocab == 0 || embedding_dim == 0 {
+            return Err(Error::InvalidRandom {
+                reason: "embedding vocabulary and dimension must be nonzero",
+            });
+        }
         if padding_idx.is_some_and(|i| i >= vocab) {
             return Err(Error::InvalidIndex);
         }
-        let bound = (6.0f32 / (vocab + embedding_dim) as f32).sqrt();
+        let fan_sum = vocab
+            .checked_add(embedding_dim)
+            .ok_or_else(|| Error::ShapeOverflow(Shape::new([vocab, embedding_dim])))?;
+        let bound = (6.0f32 / fan_sum as f32).sqrt();
         Ok(Self {
             weight: Parameter::new(
                 uniform(Shape::new([vocab, embedding_dim]), -bound, bound, seed)?,

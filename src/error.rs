@@ -63,6 +63,9 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
+    InvalidTensorIo {
+        reason: &'static str,
+    },
     ShapeOverflow(Shape),
     InvalidIndex,
     UnknownNode(NodeId),
@@ -101,6 +104,20 @@ pub enum Error {
     BitcastItemsize {
         from: DType,
         to: DType,
+    },
+    InvalidDTypeFinfo {
+        dtype: DType,
+    },
+    InvalidTinygradDTypeName {
+        name: String,
+    },
+    InvalidTensorLen {
+        node: NodeId,
+    },
+    TensorBoolNotDefined,
+    BitcastItemsizeMismatch {
+        input: DType,
+        output: DType,
     },
     DivisionByZero {
         op: &'static str,
@@ -202,6 +219,7 @@ pub enum Error {
     UnsupportedDropout {
         probability_bits: u64,
     },
+    UnsupportedTopKUnsorted,
     InvalidConv2d {
         input: Shape,
         weight: Shape,
@@ -257,6 +275,8 @@ pub enum Error {
         dim: usize,
     },
     NonDifferentiableIndexing(&'static str),
+    /// `TensorData::item` requires exactly one stored element, regardless of rank.
+    NonScalarItem(Shape),
     NonScalarLoss(Shape),
     /// A reverse-mode target must be a floating, gradient-tracked graph value.
     NonDifferentiableTarget(NodeId),
@@ -275,6 +295,11 @@ pub enum Error {
     ParameterVersionConflict {
         expected: u64,
         actual: u64,
+    },
+    /// A mutation cannot advance a parameter version without reusing a stale
+    /// graph/gradient identity.
+    ParameterVersionOverflow {
+        version: u64,
     },
     BatchNormToken {
         reason: &'static str,
@@ -324,6 +349,7 @@ impl fmt::Display for Error {
             } => {
                 write!(f, "shape {shape} needs {expected} values, got {actual}")
             }
+            Self::InvalidTensorIo { reason } => write!(f, "invalid TensorData IO: {reason}"),
             Self::UnsupportedDType { dtype } => {
                 write!(f, "unsupported CUDA collective add dtype {dtype:?}")
             }
@@ -371,6 +397,20 @@ impl fmt::Display for Error {
             Self::BitcastItemsize { from, to } => {
                 write!(f, "cannot bitcast {from:?} to {to:?}: item sizes differ")
             }
+            Self::InvalidDTypeFinfo { dtype } => {
+                write!(f, "{dtype:?} is not a floating point type")
+            }
+            Self::InvalidTinygradDTypeName { name } => {
+                write!(f, "unsupported tinygrad dtype name {name:?}")
+            }
+            Self::InvalidTensorLen { .. } => write!(f, "len() of a 0-d tensor"),
+            Self::TensorBoolNotDefined => write!(f, "__bool__ on Tensor is not defined"),
+            Self::BitcastItemsizeMismatch { input, output } => write!(
+                f,
+                "cannot bitcast {input:?} ({}) to {output:?} ({})",
+                input.itemsize(),
+                output.itemsize()
+            ),
             Self::DivisionByZero { op } => write!(f, "{op} by zero"),
             Self::InvalidShiftCount { count, bits } => {
                 write!(f, "shift count {count} is invalid for {bits}-bit values")
@@ -435,6 +475,9 @@ impl fmt::Display for Error {
                 "scaled dot-product attention dropout_p={} requires RustGrad's random subsystem",
                 f64::from_bits(*probability_bits)
             ),
+            Self::UnsupportedTopKUnsorted => {
+                write!(f, "topk with sorted=false is not supported")
+            }
             Self::InvalidConv2d {
                 input,
                 weight,
@@ -490,6 +533,9 @@ impl fmt::Display for Error {
                 f,
                 "{op} is deliberately nondifferentiable in the current graph"
             ),
+            Self::NonScalarItem(shape) => {
+                write!(f, "item requires exactly one element, got {shape}")
+            }
             Self::NonScalarLoss(shape) => {
                 write!(f, "backward requires a one-element loss, got {shape}")
             }
@@ -513,6 +559,9 @@ impl fmt::Display for Error {
                 f,
                 "parameter version conflict: expected {expected}, found {actual}"
             ),
+            Self::ParameterVersionOverflow { version } => {
+                write!(f, "parameter version overflow at {version}")
+            }
             Self::BatchNormToken { reason } => {
                 write!(f, "BatchNorm statistics token error: {reason}")
             }

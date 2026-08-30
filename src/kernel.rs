@@ -453,7 +453,15 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
             load(graph, id, out, range, None)?
         } else {
             match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-                Op::Input { .. } | Op::Constant(_) => load(graph, id, out, range, None)?,
+                Op::Input { .. } => load(graph, id, out, range, None)?,
+                // A rank-0 graph constant is dependency-free once its typed
+                // storage payload is present in the UOp. Keep all non-scalar
+                // constants as buffer loads: their allocation, scheduling,
+                // capture, and replay ownership remains unchanged.
+                Op::Constant(data) if data.shape().rank() == 0 => {
+                    UOp::scalar_constant(data.dtype(), crate::uop::raw_literal_bits(data)?, ty)
+                }
+                Op::Constant(_) => load(graph, id, out, range, None)?,
                 Op::Random { .. } => return Err(UOpError::InvalidArgument),
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
@@ -922,7 +930,45 @@ pub(crate) fn execute_lowered_elementwise(
     for linear in 0..len {
         values.push(eval_store_value(store, bindings, linear, &plan)?);
     }
-    TensorData::from_scalars(output_shape, output_dtype, values)
+    TensorData::from_storage(output_shape, fused_storage(output_dtype, values))
+}
+
+fn fused_storage(dtype: DType, values: Vec<FusedValue>) -> Storage {
+    match dtype {
+        dtype @ (DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ) => Storage::Float8(crate::Float8Storage::from_raw(
+            dtype.float8_format().expect("float8 dtype"),
+            values
+                .into_iter()
+                .map(|value| match value {
+                    FusedValue::F8(source, bits) if source == dtype => bits,
+                    value => dtype
+                        .float8_format()
+                        .expect("float8 dtype")
+                        .encode(value.scalar().as_f64()),
+                })
+                .collect(),
+        )),
+        DType::F16 => Storage::F16(values.into_iter().map(|value| match value {
+            FusedValue::F16(bits) => bits,
+            value => crate::tensor::f32_to_f16(value.scalar().as_f64() as f32),
+        }).collect()),
+        DType::BF16 => Storage::BF16(values.into_iter().map(|value| match value {
+            FusedValue::BF16(bits) => bits,
+            value => crate::tensor::f32_to_bf16(value.scalar().as_f64() as f32),
+        }).collect()),
+        DType::F32 => Storage::F32(values.into_iter().map(|value| match value {
+            FusedValue::F32(bits) => f32::from_bits(bits),
+            value => value.scalar().as_f64() as f32,
+        }).collect()),
+        DType::F64 => Storage::F64(values.into_iter().map(|value| match value {
+            FusedValue::F64(bits) => f64::from_bits(bits),
+            value => value.scalar().as_f64(),
+        }).collect()),
+        _ => Storage::from_scalars(dtype, values.into_iter().map(|value| value.into_storage(dtype))),
+    }
 }
 
 fn direct_f32_to_bf16(
@@ -1040,34 +1086,152 @@ fn eval_store_value(
     bindings: &KernelBindings,
     linear: usize,
     plan: &IterationPlan,
-) -> Result<Scalar> {
+) -> Result<FusedValue> {
     if !matches!(store.kind(), UOpKind::Store) || store.sources().len() != 2 {
         return Err(Error::InvalidIndex);
     }
     eval(&store.sources()[1], bindings, linear, plan)
 }
-fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan) -> Result<Scalar> {
+/// A fused lane retains exact floating storage only until an operation needs
+/// its numeric value. This is deliberately private to the interpreter: UOps
+/// and TensorData already carry typed raw constants/storage, while Scalar is
+/// the public numeric conversion boundary.
+#[derive(Clone, Copy, Debug)]
+enum FusedValue {
+    Scalar(Scalar),
+    F8(DType, u8),
+    F16(u16),
+    BF16(u16),
+    F32(u32),
+    F64(u64),
+}
+impl FusedValue {
+    fn typed(value: Scalar, dtype: DType) -> Self {
+        match dtype {
+            dtype @ (DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ) => Self::F8(
+                dtype,
+                dtype
+                    .float8_format()
+                    .expect("float8 dtype")
+                    .encode(value.as_f64()),
+            ),
+            DType::F16 => Self::F16(crate::tensor::f32_to_f16(value.as_f64() as f32)),
+            DType::BF16 => Self::BF16(crate::tensor::f32_to_bf16(value.as_f64() as f32)),
+            DType::F32 => Self::F32((value.as_f64() as f32).to_bits()),
+            DType::F64 => Self::F64(value.as_f64().to_bits()),
+            _ => Self::Scalar(cast_scalar(value, dtype)),
+        }
+    }
+    fn scalar(self) -> Scalar {
+        match self {
+            Self::Scalar(value) => value,
+            Self::F8(dtype, bits) => Scalar::F(
+                dtype
+                    .float8_format()
+                    .expect("float8 dtype")
+                    .decode(bits),
+            ),
+            Self::F16(bits) => Scalar::F(crate::tensor::f16_to_f32(bits) as f64),
+            Self::BF16(bits) => Scalar::F(crate::tensor::bf16_to_f32(bits) as f64),
+            Self::F32(bits) => Scalar::F(f32::from_bits(bits) as f64),
+            Self::F64(bits) => Scalar::F(f64::from_bits(bits)),
+        }
+    }
+    fn cast(self, dtype: DType) -> Self {
+        // A same-width floating CAST is still an explicit source operation,
+        // but its logical storage value is unchanged. Keep the raw encoding
+        // rather than widening an F32 signaling NaN through Scalar::F.
+        match (self, dtype) {
+            (value @ Self::F8(source, _), target) if source == target => return value,
+            (value @ Self::F16(_), DType::F16)
+            | (value @ Self::BF16(_), DType::BF16)
+            | (value @ Self::F32(_), DType::F32)
+            | (value @ Self::F64(_), DType::F64) => return value,
+            _ => {}
+        }
+        match dtype {
+            dtype @ (DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ) => Self::F8(
+                dtype,
+                dtype
+                    .float8_format()
+                    .expect("float8 dtype")
+                    .encode(self.scalar().as_f64()),
+            ),
+            DType::F16 => Self::F16(crate::tensor::f32_to_f16(self.scalar().as_f64() as f32)),
+            DType::BF16 => {
+                let source = match self {
+                    // Do not route F32 through Scalar::F(f64): tinygrad's
+                    // BF16 CAST sees the original F32 payload bits.
+                    Self::F32(bits) => f32::from_bits(bits),
+                    value => value.scalar().as_f64() as f32,
+                };
+                Self::BF16(crate::tensor::f32_to_bf16(source))
+            }
+            DType::F32 => Self::F32((self.scalar().as_f64() as f32).to_bits()),
+            DType::F64 => Self::F64(self.scalar().as_f64().to_bits()),
+            _ => Self::Scalar(cast_scalar(self.scalar(), dtype)),
+        }
+    }
+    fn from_constant(dtype: DType, bits: u64) -> Self {
+        match dtype {
+            dtype @ (DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ) => Self::F8(dtype, bits as u8),
+            DType::F16 => Self::F16(bits as u16),
+            DType::BF16 => Self::BF16(bits as u16),
+            DType::F32 => Self::F32(bits as u32),
+            DType::F64 => Self::F64(bits),
+            DType::Bool => Self::Scalar(Scalar::Bool(bits != 0)),
+            DType::I8 => Self::Scalar(Scalar::I(bits as i8 as i64)),
+            DType::U8 => Self::Scalar(Scalar::U(bits as u8 as u64)),
+            DType::I16 => Self::Scalar(Scalar::I(bits as i16 as i64)),
+            DType::U16 => Self::Scalar(Scalar::U(bits as u16 as u64)),
+            DType::I32 => Self::Scalar(Scalar::I(bits as i32 as i64)),
+            DType::U32 => Self::Scalar(Scalar::U(bits as u32 as u64)),
+            DType::I64 => Self::Scalar(Scalar::I(bits as i64)),
+            DType::U64 => Self::Scalar(Scalar::U(bits)),
+        }
+    }
+    fn from_storage(storage: &Storage, index: usize) -> Self {
+        match storage {
+            Storage::Float8(values) => {
+                Self::F8(values.format().dtype(), values.as_raw()[index])
+            }
+            Storage::F16(values) => Self::F16(values[index]),
+            Storage::BF16(values) => Self::BF16(values[index]),
+            Storage::F32(values) => Self::F32(values[index].to_bits()),
+            Storage::F64(values) => Self::F64(values[index].to_bits()),
+            _ => Self::Scalar(storage.scalar(index)),
+        }
+    }
+    fn into_storage(self, dtype: DType) -> Scalar {
+        match (dtype, self) {
+            (target, Self::F8(source, bits)) if target == source => Scalar::F(
+                source
+                    .float8_format()
+                    .expect("float8 dtype")
+                    .decode(bits),
+            ),
+            (DType::F16, Self::F16(bits)) => Scalar::F(crate::tensor::f16_to_f32(bits) as f64),
+            (DType::BF16, Self::BF16(bits)) => Scalar::F(crate::tensor::bf16_to_f32(bits) as f64),
+            (DType::F32, Self::F32(bits)) => Scalar::F(f32::from_bits(bits) as f64),
+            (DType::F64, Self::F64(bits)) => Scalar::F(f64::from_bits(bits)),
+            (_, value) => value.scalar(),
+        }
+    }
+}
+fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan) -> Result<FusedValue> {
     match n.kind() {
         UOpKind::Const => match n.arg() {
-            UArg::Int(v) => Ok(Scalar::I(*v)),
-            UArg::Scalar { dtype, bits } => Ok(match dtype {
-                DType::Bool => Scalar::Bool(*bits != 0),
-                DType::I8 => Scalar::I(*bits as i8 as i64),
-                DType::U8 => Scalar::U(*bits as u8 as u64),
-                DType::I16 => Scalar::I(*bits as i16 as i64),
-                DType::U16 => Scalar::U(*bits as u16 as u64),
-                DType::I32 => Scalar::I(*bits as i32 as i64),
-                DType::U32 => Scalar::U(*bits as u32 as u64),
-                DType::I64 => Scalar::I(*bits as i64),
-                DType::U64 => Scalar::U(*bits),
-                DType::F16 => Scalar::F(crate::tensor::f16_to_f32(*bits as u16) as f64),
-                DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
-                DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
-                DType::F64 => Scalar::F(f64::from_bits(*bits)),
-                DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
-                    return Err(Error::InvalidIndex);
-                }
-            }),
+            UArg::Int(v) => Ok(FusedValue::Scalar(Scalar::I(*v))),
+            UArg::Scalar { dtype, bits } => Ok(FusedValue::from_constant(*dtype, *bits)),
             _ => Err(Error::InvalidIndex),
         },
         UOpKind::Load => {
@@ -1093,43 +1257,43 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                     .map_err(|_| Error::InvalidIndex)?,
                 None => i64::try_from(logical).map_err(|_| Error::InvalidIndex)?,
             };
-            bindings
+            Ok(FusedValue::from_storage(
+                bindings
                 .get(buffer)
                 .ok_or(Error::InvalidIndex)?
-                .storage()
-                .scalar(usize::try_from(offset).map_err(|_| Error::InvalidIndex)?)
-                .pipe(Ok)
+                .storage(),
+                usize::try_from(offset).map_err(|_| Error::InvalidIndex)?,
+            ))
         }
-        UOpKind::Cast => Ok(cast_scalar(
-            eval(&n.sources()[0], bindings, linear, plan)?,
+        UOpKind::Cast => Ok(eval(&n.sources()[0], bindings, linear, plan)?.cast(
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
         )),
-        UOpKind::GraphUnary(op) => unary(
-            eval(&n.sources()[0], bindings, linear, plan)?,
+        UOpKind::GraphUnary(op) => Ok(FusedValue::typed(unary(
+            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
             *op,
-        ),
-        UOpKind::GraphBinary(op) => binary(
-            eval(&n.sources()[0], bindings, linear, plan)?,
-            eval(&n.sources()[1], bindings, linear, plan)?,
+        )?, n.ty().ok_or(Error::InvalidIndex)?.scalar)),
+        UOpKind::GraphBinary(op) => Ok(FusedValue::typed(binary(
+            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
+            eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
             *op,
-        ),
-        UOpKind::GraphCompare(op) => Ok(Scalar::Bool(compare(
-            eval(&n.sources()[0], bindings, linear, plan)?,
-            eval(&n.sources()[1], bindings, linear, plan)?,
+        )?, n.ty().ok_or(Error::InvalidIndex)?.scalar)),
+        UOpKind::GraphCompare(op) => Ok(FusedValue::Scalar(Scalar::Bool(compare(
+            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
+            eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
             *op,
-        ))),
+        )))),
         UOpKind::GraphLogical(op) => {
-            let a = eval(&n.sources()[0], bindings, linear, plan)?.as_bool();
-            Ok(Scalar::Bool(match op {
+            let a = eval(&n.sources()[0], bindings, linear, plan)?.scalar().as_bool();
+            Ok(FusedValue::Scalar(Scalar::Bool(match op {
                 LogicalOp::Not => !a,
-                LogicalOp::And => a && eval(&n.sources()[1], bindings, linear, plan)?.as_bool(),
-                LogicalOp::Or => a || eval(&n.sources()[1], bindings, linear, plan)?.as_bool(),
-            }))
+                LogicalOp::And => a && eval(&n.sources()[1], bindings, linear, plan)?.scalar().as_bool(),
+                LogicalOp::Or => a || eval(&n.sources()[1], bindings, linear, plan)?.scalar().as_bool(),
+            })))
         }
         UOpKind::Ternary(crate::uop::Ternary::Where) => {
-            if eval(&n.sources()[0], bindings, linear, plan)?.as_bool() {
+            if eval(&n.sources()[0], bindings, linear, plan)?.scalar().as_bool() {
                 eval(&n.sources()[1], bindings, linear, plan)
             } else {
                 eval(&n.sources()[2], bindings, linear, plan)
@@ -1170,29 +1334,30 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 crate::ReduceKind::Any => Scalar::Bool(false),
                 crate::ReduceKind::All => Scalar::Bool(true),
             };
+            let mut extrema_seen = false;
             for reduce_linear in 0..reduction_len {
                 let next = eval(
                     value,
                     bindings,
                     reduction.input_linear(linear, reduce_linear)?,
                     &source_plan,
-                )?;
+                )?.scalar();
                 acc = match kind {
                     crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
                         binary(acc, next, dtype, BinaryOp::Add)?
                     }
                     crate::ReduceKind::Product => binary(acc, next, dtype, BinaryOp::Mul)?,
-                    crate::ReduceKind::Max
-                        if !next.as_f64().is_nan() && next.as_f64() > acc.as_f64() =>
-                    {
-                        next
+                    crate::ReduceKind::Max | crate::ReduceKind::Min => {
+                        let replace = !extrema_seen
+                            || reduction_extrema_is_better(
+                                dtype,
+                                matches!(kind, crate::ReduceKind::Max),
+                                next,
+                                acc,
+                            );
+                        extrema_seen = true;
+                        if replace { next } else { acc }
                     }
-                    crate::ReduceKind::Min
-                        if !next.as_f64().is_nan() && next.as_f64() < acc.as_f64() =>
-                    {
-                        next
-                    }
-                    crate::ReduceKind::Max | crate::ReduceKind::Min => acc,
                     crate::ReduceKind::Any => Scalar::Bool(acc.as_bool() || next.as_bool()),
                     crate::ReduceKind::All => Scalar::Bool(acc.as_bool() && next.as_bool()),
                 };
@@ -1204,17 +1369,33 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                     acc.as_f64() / reduction_len as f64
                 });
             }
-            Ok(acc)
+            Ok(FusedValue::typed(acc, dtype))
         }
         _ => Err(Error::InvalidIndex),
     }
 }
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
+
+/// Match the CPU oracle's stored-lane extrema ordering. A leading NaN and
+/// equal signed-zero lanes keep their first payload, while I64/U64 lanes are
+/// compared without a lossy floating projection.
+fn reduction_extrema_is_better(dtype: DType, max: bool, candidate: Scalar, best: Scalar) -> bool {
+    use std::cmp::Ordering;
+
+    let ordering = if dtype.is_float() {
+        candidate.as_f64().partial_cmp(&best.as_f64())
+    } else if matches!(dtype.category(), crate::DTypeCategory::Unsigned) {
+        Some(candidate.as_u64().cmp(&best.as_u64()))
+    } else if dtype == DType::Bool {
+        Some(candidate.as_bool().cmp(&best.as_bool()))
+    } else {
+        Some(candidate.as_i64().cmp(&best.as_i64()))
+    };
+    if max {
+        ordering == Some(Ordering::Greater)
+    } else {
+        ordering == Some(Ordering::Less)
     }
 }
-impl<T> Pipe for T {}
 fn cast_scalar(x: Scalar, dtype: DType) -> Scalar {
     match dtype {
         DType::Bool => Scalar::Bool(x.as_bool()),
@@ -1318,7 +1499,15 @@ fn unary(x: Scalar, dtype: DType, op: UnaryOp) -> Result<Scalar> {
         UnaryOp::Ceil => Scalar::F(v.ceil()),
         UnaryOp::Trunc => Scalar::F(v.trunc()),
         UnaryOp::Round => Scalar::F(v.round_ties_even()),
-        UnaryOp::Sign => Scalar::F(if v.is_nan() { f64::NAN } else { v.signum() }),
+        // Match tinygrad's comparison composition: NaN is nonzero but not
+        // ordered below zero, and both signed zeroes select canonical +0.
+        UnaryOp::Sign => Scalar::F(if v == 0.0 {
+            0.0
+        } else if v < 0.0 {
+            -1.0
+        } else {
+            1.0
+        }),
         UnaryOp::Step => Scalar::F(f64::from(v > 0.)),
         UnaryOp::IsNan => Scalar::Bool(v.is_nan()),
         UnaryOp::IsInf => Scalar::Bool(v.is_infinite()),
@@ -1353,8 +1542,8 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
             BinaryOp::Mul => a * b,
             BinaryOp::Div => a / b,
             BinaryOp::Pow => a.powf(b),
-            BinaryOp::Maximum => a.max(b),
-            BinaryOp::Minimum => a.min(b),
+            BinaryOp::Maximum => if a < b { b } else { a },
+            BinaryOp::Minimum => if a > b { b } else { a },
             BinaryOp::FloorDiv => (a / b).floor(),
             BinaryOp::TruncDiv => (a / b).trunc(),
             BinaryOp::Mod => a - (a / b).floor() * b,
@@ -1392,8 +1581,8 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
             BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::TruncDiv => a / b,
             BinaryOp::Mod | BinaryOp::FMod => a % b,
             BinaryOp::Pow => a.wrapping_pow(b as u32),
-            BinaryOp::Maximum => a.max(b),
-            BinaryOp::Minimum => a.min(b),
+            BinaryOp::Maximum => if a < b { b } else { a },
+            BinaryOp::Minimum => if a > b { b } else { a },
             BinaryOp::BitAnd => a & b,
             BinaryOp::BitOr => a | b,
             BinaryOp::BitXor => a ^ b,
@@ -1416,8 +1605,8 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
         BinaryOp::FloorDiv => a.wrapping_div_euclid(b),
         BinaryOp::Mod => a.wrapping_rem_euclid(b),
         BinaryOp::FMod => a.wrapping_rem(b),
-        BinaryOp::Maximum => a.max(b),
-        BinaryOp::Minimum => a.min(b),
+        BinaryOp::Maximum => if a < b { b } else { a },
+        BinaryOp::Minimum => if a > b { b } else { a },
         BinaryOp::BitAnd => a & b,
         BinaryOp::BitOr => a | b,
         BinaryOp::BitXor => a ^ b,
@@ -1445,14 +1634,34 @@ fn erf(value: f64) -> f64 {
 }
 
 fn compare(a: Scalar, b: Scalar, op: CompareOp) -> bool {
-    let (a, b) = (a.as_f64(), b.as_f64());
+    use std::cmp::Ordering;
+
+    // Compare the evaluated Scalar variants, not a lossy floating projection.
+    // GraphCompare carries both sources through the UOp, so same-width I64/U64
+    // lanes above 2^53 remain distinguishable while mixed scalar kinds retain
+    // the CPU evaluator's existing signed/unsigned ordering contract.
+    let ordering = match (a, b) {
+        (Scalar::F(a), b) => a.partial_cmp(&b.as_f64()),
+        (a, Scalar::F(b)) => a.as_f64().partial_cmp(&b),
+        (Scalar::I(a), Scalar::I(b)) => Some(a.cmp(&b)),
+        (Scalar::U(a), Scalar::U(b)) => Some(a.cmp(&b)),
+        (Scalar::I(a), Scalar::U(b)) => {
+            if a < 0 { Some(Ordering::Less) } else { Some((a as u64).cmp(&b)) }
+        }
+        (Scalar::U(a), Scalar::I(b)) => {
+            if b < 0 { Some(Ordering::Greater) } else { Some(a.cmp(&(b as u64))) }
+        }
+        (Scalar::Bool(a), Scalar::Bool(b)) => Some(a.cmp(&b)),
+        (Scalar::Bool(a), b) => Some((a as u8 as i64).cmp(&b.as_i64())),
+        (a, Scalar::Bool(b)) => Some(a.as_i64().cmp(&(b as u8 as i64))),
+    };
     match op {
-        CompareOp::Eq => a == b,
-        CompareOp::Ne => a != b,
-        CompareOp::Lt => a < b,
-        CompareOp::Le => a <= b,
-        CompareOp::Gt => a > b,
-        CompareOp::Ge => a >= b,
+        CompareOp::Eq => ordering == Some(Ordering::Equal),
+        CompareOp::Ne => ordering != Some(Ordering::Equal),
+        CompareOp::Lt => ordering == Some(Ordering::Less),
+        CompareOp::Le => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+        CompareOp::Gt => ordering == Some(Ordering::Greater),
+        CompareOp::Ge => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
     }
 }
 
@@ -1460,6 +1669,66 @@ fn compare(a: Scalar, b: Scalar, op: CompareOp) -> bool {
 mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, Shape, SymbolicExpr};
+
+    #[test]
+    fn reciprocal_promotes_nonfloats_before_homogeneous_graph_unary_lowering() {
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let output = graph.reciprocal(input).unwrap();
+
+            // Public reciprocal explicitly promotes its nonfloat input to
+            // F32, so the raw GraphUnary has matching operand/result types.
+            let uop = lower_graph_elementwise(&graph, output).unwrap();
+            uop.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_graph_constants_lower_to_typed_uop_payloads_without_buffer_dependencies() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::Bool);
+        let truth = graph.constant(TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool));
+        let output = graph.ne(input, truth).unwrap();
+        let uop = lower_graph_elementwise(&graph, output).unwrap();
+        let nodes = uop.topological().unwrap();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), UOpKind::Const)
+            && matches!(node.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })));
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
+            && matches!(node.arg(), UArg::BufferIndex { buffer, .. } if *buffer == truth.index() as u64)));
+
+        // Exact scalar payloads are carried through the UOp rather than host
+        // floating conversion, including an F32 NaN bit pattern.
+        let mut payload = Graph::new();
+        let input = payload.input_dtype("input", [], DType::F32);
+        let nan = payload.constant(
+            TensorData::from_storage(Shape::new([]), Storage::F32(vec![f32::from_bits(0x7f80_0001)])).unwrap(),
+        );
+        let output = payload.eq(input, nan).unwrap();
+        let nodes = lower_graph_elementwise(&payload, output).unwrap().topological().unwrap();
+        assert!(nodes.iter().any(|node| matches!(node.arg(), UArg::Scalar { dtype: DType::F32, bits: 0x7f80_0001 })));
+
+        // A rank-one singleton is not a scalar provenance value: it remains a
+        // bound constant buffer and therefore preserves existing scheduling
+        // and capture ownership.
+        let mut nonscalar = Graph::new();
+        let input = nonscalar.input_dtype("input", [2], DType::F32);
+        let constant = nonscalar.constant(TensorData::from_scalars([1], DType::F32, [Scalar::F(1.0)]).unwrap());
+        let output = nonscalar.add(input, constant).unwrap();
+        let nodes = lower_graph_elementwise(&nonscalar, output).unwrap().topological().unwrap();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), UOpKind::Index)
+            && matches!(node.arg(), UArg::BufferIndex { buffer, .. } if *buffer == constant.index() as u64)));
+    }
 
     #[test]
     fn iteration_plan_covers_scalar_zero_and_broadcast_offsets() {
@@ -1561,6 +1830,210 @@ mod tests {
     }
 
     #[test]
+    fn generic_compare_preserves_typed_wide_integer_ordering_and_float_boundaries() {
+        let compare_all = |lhs_dtype, lhs_values: Vec<Scalar>, rhs_dtype, rhs_values: Vec<Scalar>| {
+            for op in [
+                CompareOp::Eq,
+                CompareOp::Ne,
+                CompareOp::Lt,
+                CompareOp::Le,
+                CompareOp::Gt,
+                CompareOp::Ge,
+            ] {
+                let mut graph = Graph::new();
+                let lhs = graph.input_dtype("lhs", [lhs_values.len()], lhs_dtype);
+                let rhs = graph.input_dtype("rhs", [rhs_values.len()], rhs_dtype);
+                let output = graph.compare(op, lhs, rhs).unwrap();
+                let inputs = HashMap::from([
+                    (
+                        "lhs".into(),
+                        TensorData::from_scalars([lhs_values.len()], lhs_dtype, lhs_values.clone()).unwrap(),
+                    ),
+                    (
+                        "rhs".into(),
+                        TensorData::from_scalars([rhs_values.len()], rhs_dtype, rhs_values.clone()).unwrap(),
+                    ),
+                ]);
+                assert_eq!(
+                    execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                    CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                    "{op:?} {lhs_dtype:?}/{rhs_dtype:?}",
+                );
+            }
+        };
+
+        let two_to_53 = 1_u64 << 53;
+        compare_all(
+            DType::U64,
+            vec![Scalar::U(two_to_53), Scalar::U(u64::MAX)],
+            DType::U64,
+            vec![Scalar::U(two_to_53 + 1), Scalar::U(0)],
+        );
+        compare_all(
+            DType::I64,
+            vec![Scalar::I(-((1_i64) << 53)), Scalar::I(i64::MIN)],
+            DType::I64,
+            vec![Scalar::I(-((1_i64 << 53) + 1)), Scalar::I(i64::MAX)],
+        );
+        // GraphCompare itself has no promotion node, so actual mixed Scalar
+        // kinds must retain the CPU evaluator's signed/unsigned ordering.
+        compare_all(
+            DType::I64,
+            vec![Scalar::I(-1), Scalar::I((1_i64) << 53)],
+            DType::U64,
+            vec![Scalar::U(0), Scalar::U((1_u64 << 53) + 1)],
+        );
+        compare_all(
+            DType::Bool,
+            vec![Scalar::Bool(false), Scalar::Bool(true)],
+            DType::Bool,
+            vec![Scalar::Bool(true), Scalar::Bool(false)],
+        );
+
+        // Partial float order keeps NaN unordered, treats +/-0 as equal, and
+        // retains ordinary infinity ordering across every CompareOp.
+        for op in [
+            CompareOp::Eq,
+            CompareOp::Ne,
+            CompareOp::Lt,
+            CompareOp::Le,
+            CompareOp::Gt,
+            CompareOp::Ge,
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [3], DType::F64);
+            let rhs = graph.input_dtype("rhs", [3], DType::F64);
+            let output = graph.compare(op, lhs, rhs).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::new([3], vec![f64::NAN, -0.0, f64::INFINITY]).unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::new([3], vec![1.0, 0.0, f64::INFINITY]).unwrap(),
+                ),
+            ]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "{op:?} float boundaries",
+            );
+        }
+    }
+
+    #[test]
+    fn generic_extrema_match_cpu_ordered_selection_and_source_bridge() {
+        for (op, label) in [
+            (BinaryOp::Maximum, "maximum"),
+            (BinaryOp::Minimum, "minimum"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [5], DType::F64);
+            let rhs = graph.input_dtype("rhs", [5], DType::F64);
+            let output = graph.binary(op, lhs, rhs).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [5],
+                        DType::F64,
+                        [
+                            Scalar::F(f64::NAN),
+                            Scalar::F(-0.0),
+                            Scalar::F(5.0),
+                            Scalar::F(f64::NEG_INFINITY),
+                            Scalar::F(f64::INFINITY),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [5],
+                        DType::F64,
+                        [
+                            Scalar::F(2.0),
+                            Scalar::F(0.0),
+                            Scalar::F(f64::NAN),
+                            Scalar::F(f64::INFINITY),
+                            Scalar::F(f64::INFINITY),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "{label} ordered float selection",
+            );
+        }
+
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [1], DType::I64);
+        let rhs = graph.input_dtype("rhs", [1], DType::U64);
+        let output = graph.maximum(lhs, rhs).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        let inputs = HashMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(1_i64 << 53)]).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_scalars([1], DType::U64, [Scalar::U((1_u64 << 53) + 1)])
+                    .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+            CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+        );
+    }
+
+    #[test]
+    fn captured_reductions_match_cpu_extrema_lane_order_for_floats_and_wide_integers() {
+        let cases = [
+            (
+                DType::F32,
+                crate::ReduceKind::Max,
+                vec![Scalar::F(f32::NAN as f64), Scalar::F(f32::INFINITY as f64)],
+            ),
+            (
+                DType::F32,
+                crate::ReduceKind::Min,
+                vec![Scalar::F(-0.0), Scalar::F(0.0)],
+            ),
+            (
+                DType::U64,
+                crate::ReduceKind::Max,
+                vec![Scalar::U((1_u64 << 53) + 1), Scalar::U(1_u64 << 53)],
+            ),
+            (
+                DType::I64,
+                crate::ReduceKind::Min,
+                vec![Scalar::I(-((1_i64 << 53) + 1)), Scalar::I(-(1_i64 << 53))],
+            ),
+        ];
+        for (dtype, kind, values) in cases {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [values.len()], dtype);
+            let output = graph.reduce(input, kind, Some(vec![0]), false).unwrap();
+            let inputs = HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([values.len()], dtype, values).unwrap(),
+            )]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "{dtype:?} {kind:?}",
+            );
+        }
+    }
+
+    #[test]
     fn lowered_float_to_narrow_integer_casts_match_cpu_at_special_values() {
         let values = [
             Scalar::F(f32::NEG_INFINITY as f64),
@@ -1595,6 +2068,79 @@ mod tests {
                     .unwrap()
                     .storage(),
                 "lowered {dtype:?} cast diverged from the CPU backend"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_cast_values_keep_typed_storage_through_mul_and_select() {
+        for (dtype, value, multiplier) in [
+            (DType::F16, 1.0003, 1000.0),
+            (DType::BF16, 1.003, 100.0),
+            (DType::F32, 1.00000006, 100_000_000.0),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", Shape::from([1]), DType::F64);
+            let cast = graph.cast(input, dtype).unwrap();
+            let scale = graph.constant(
+                TensorData::from_scalars([1], dtype, [Scalar::F(multiplier)]).unwrap(),
+            );
+            let output = graph.mul(cast, scale).unwrap();
+            let inputs = HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([1], DType::F64, [Scalar::F(value)]).unwrap(),
+            )]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "{dtype:?} Cast->Mul storage boundary"
+            );
+        }
+
+        // Select must retain the selected tagged value; otherwise this
+        // payload-sensitive F32->BF16 Cast would regress after fusion.
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", Shape::from([1]), DType::F32);
+        let condition = graph.input_dtype("condition", Shape::from([1]), DType::Bool);
+        let cast = graph.cast(input, DType::BF16).unwrap();
+        let fallback = graph.constant(
+            TensorData::from_storage(Shape::from([1]), Storage::BF16(vec![0])).unwrap(),
+        );
+        let output = graph.select(condition, cast, fallback).unwrap();
+        let inputs = HashMap::from([
+            (
+                "x".into(),
+                TensorData::from_storage(Shape::from([1]), Storage::F32(vec![f32::from_bits(0x7f80_0001)]))
+                    .unwrap(),
+            ),
+            (
+                "condition".into(),
+                TensorData::from_scalars([1], DType::Bool, [Scalar::Bool(true)]).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+            CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+            "F32->BF16 signaling-NaN payload through Select"
+        );
+
+        for (dtype, value) in [(DType::I64, Scalar::I((1_i64 << 53) + 1)),
+                               (DType::U64, Scalar::U((1_u64 << 53) + 1))] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", Shape::from([1]), dtype);
+            let cast = graph.cast(input, DType::F32).unwrap();
+            let scale = graph.constant(
+                TensorData::from_scalars([1], DType::F32, [Scalar::F(1.00000006)]).unwrap(),
+            );
+            let output = graph.mul(cast, scale).unwrap();
+            let inputs = HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([1], dtype, [value]).unwrap(),
+            )]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "large {dtype:?} to F32 Cast"
             );
         }
     }

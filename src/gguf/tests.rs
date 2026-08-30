@@ -103,14 +103,27 @@ fn assert_kind(bytes: &[u8], expected: GgufErrorKind) {
 #[test]
 fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     // tinygrad/llm/gguf.py: Q4_0 is f16 d then 16 low/high-nibble bytes;
+    // Q4_1 adds a little-endian f16 minimum and uses q * d + m;
     // Q8_0 is f16 d then 32 signed bytes.
     let mut q4 = vec![0x00, 0x3c]; // d = 1
     q4.extend((0..16).map(|i| (15 - i) << 4 | i));
+    let mut q41 = vec![0x00, 0x40, 0x00, 0x38]; // d = 2, m = 0.5
+    q41.extend((0..16).map(|i| (15 - i) << 4 | i));
+    let mut q5 = vec![0x00, 0x38, 0x01, 0x02, 0x04, 0x08]; // d = 0.5, high bits
+    q5.extend((0..16).map(|i| (15 - i) << 4 | i));
+    let mut q51 = vec![0x00, 0x38, 0x00, 0x40, 0x01, 0x02, 0x04, 0x08]; // d = 0.5, m = 2
+    q51.extend((0..16).map(|i| (15 - i) << 4 | i));
     let mut q8 = vec![0x00, 0x38]; // d = 0.5
     q8.extend([0x80, 0xff, 0, 1, 127]);
     q8.resize(34, 0);
     let mut q4_two = q4.clone();
     q4_two.extend_from_slice(&q4);
+    let mut q41_two = q41.clone();
+    q41_two.extend_from_slice(&q41);
+    let mut q5_two = q5.clone();
+    q5_two.extend_from_slice(&q5);
+    let mut q51_two = q51.clone();
+    q51_two.extend_from_slice(&q51);
     let bytes = fixture(
         3,
         &[metadata_u32("general.alignment", 32)],
@@ -136,6 +149,27 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
                 offset: 96,
                 data: &q4_two,
             },
+            TensorFixture {
+                name: "q41-two",
+                dimensions: &[64],
+                kind: 3,
+                offset: 160,
+                data: &q41_two,
+            },
+            TensorFixture {
+                name: "q5-two",
+                dimensions: &[64],
+                kind: 6,
+                offset: 224,
+                data: &q5_two,
+            },
+            TensorFixture {
+                name: "q51-two",
+                dimensions: &[64],
+                kind: 7,
+                offset: 288,
+                data: &q51_two,
+            },
         ],
         32,
     );
@@ -153,6 +187,213 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     let q4_two = file.materialize_f32("q4-two").unwrap();
     assert_eq!(&q4_two.values()[..32], q4.values());
     assert_eq!(&q4_two.values()[32..], q4.values());
+    let q41_two = file.materialize_f32("q41-two").unwrap();
+    assert_eq!(
+        &q41_two.values()[..32],
+        &[
+            0.5, 2.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5, 16.5, 18.5, 20.5, 22.5, 24.5, 26.5,
+            28.5, 30.5, 30.5, 28.5, 26.5, 24.5, 22.5, 20.5, 18.5, 16.5, 14.5, 12.5, 10.5, 8.5,
+            6.5, 4.5, 2.5, 0.5,
+        ]
+    );
+    assert_eq!(&q41_two.values()[32..], &q41_two.values()[..32]);
+    let q5_two = file.materialize_f32("q5-two").unwrap();
+    assert_eq!(
+        &q5_two.values()[..32],
+        &[
+            0.0, -7.5, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, 4.5, -3.0, -2.5, -2.0, -1.5,
+            -1.0, -0.5, -0.5, -1.0, 6.5, -2.0, -2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, 2.0,
+            -6.5, -7.0, -7.5, -8.0,
+        ]
+    );
+    assert_eq!(&q5_two.values()[32..], &q5_two.values()[..32]);
+    let q51_two = file.materialize_f32("q51-two").unwrap();
+    assert_eq!(
+        &q51_two.values()[..32],
+        &[
+            10.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 14.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5,
+            9.5, 9.0, 16.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5, 5.0, 4.5, 12.0, 3.5, 3.0, 2.5, 2.0,
+        ]
+    );
+    assert_eq!(&q51_two.values()[32..], &q51_two.values()[..32]);
+}
+
+#[test]
+fn q5_k_materializes_repeated_gguf_blocks() {
+    let mut block = [0u8; 176];
+    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    block[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+    block[4..16].copy_from_slice(&[
+        0x41, 0x82, 0xc3, 0x04, 0x45, 0x86, 0xc7, 0x08, 0xa9, 0xb8, 0xc7, 0xd6,
+    ]);
+    for (lane, high_bits) in block[16..48].iter_mut().enumerate() {
+        *high_bits = 1 << (lane % 8);
+    }
+    block[48..80].fill(0x10);
+    block[80..112].fill(0x32);
+    block[112..144].fill(0x54);
+    block[144..176].fill(0x76);
+    let mut packed = block.to_vec();
+    packed.extend_from_slice(&block);
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "q5k",
+            dimensions: &[512],
+            kind: 13,
+            offset: 0,
+            data: &packed,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("q5k").unwrap();
+    assert_eq!(materialized.shape(), &Shape::from([512]));
+    assert_eq!(materialized.values().len(), 512);
+    assert_eq!(&materialized.values()[..256], &materialized.values()[256..]);
+}
+
+#[test]
+fn mxfp4_materializes_checked_in_reference_block() {
+    let block = [
+        0x7a, 0x29, 0xab, 0x61, 0x10, 0x21, 0x02, 0x4a, 0x15, 0xca, 0x05, 0x01, 0x9b, 0x39,
+        0x0b, 0x0b, 0x1c,
+    ];
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "mxfp4",
+            dimensions: &[32],
+            kind: 39,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("mxfp4").unwrap();
+    assert_eq!(
+        materialized.values(),
+        &[
+            -0.015625, -0.046875, 0.015625, 0.0, 0.015625, 0.03125, -0.03125, 0.09375,
+            -0.03125, 0.09375, 0.015625, -0.046875, -0.015625, -0.046875, -0.046875, -0.0625,
+            0.03125, -0.03125, 0.125, 0.015625, 0.03125, 0.0, 0.0625, 0.015625, -0.0625, 0.0,
+            0.0, -0.015625, 0.046875, 0.0, 0.0, 0.015625,
+        ]
+    );
+}
+
+#[test]
+fn q1_0_materializes_transposed_bit_plane() {
+    let mut block = [0u8; 18];
+    block[..2].copy_from_slice(&0x4000u16.to_le_bytes());
+    for (byte, payload) in block[2..].iter_mut().enumerate() {
+        *payload = 1 << (byte % 8);
+    }
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "q1",
+            dimensions: &[128],
+            kind: 41,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("q1").unwrap();
+    let expected = (0..8)
+        .flat_map(|bit| {
+            (0..16).map(move |byte| if byte % 8 == bit { 2.0 } else { -2.0 })
+        })
+        .collect::<Vec<f32>>();
+    assert_eq!(materialized.values(), expected);
+}
+
+#[test]
+fn iq4_xs_materializes_raw_type_23_blocks() {
+    let mut block = [0u8; 136];
+    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    block[2..4].copy_from_slice(&0x0000u16.to_le_bytes());
+    block[4..8].fill(0x21);
+    for group in 0..8 {
+        block[8 + group * 16..8 + (group + 1) * 16].fill(0x98);
+    }
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "iq4xs",
+            dimensions: &[256],
+            kind: 23,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("iq4xs").unwrap();
+    assert_eq!(materialized.shape(), &Shape::from([256]));
+    assert_eq!(materialized.values().len(), 256);
+    assert_eq!(&materialized.values()[..16], &[-31.0; 16]);
+    assert_eq!(&materialized.values()[16..32], &[-403.0; 16]);
+}
+
+#[test]
+fn iq3_xxs_materializes_raw_type_18_blocks() {
+    let mut block = [0u8; 98];
+    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    block[2..66].fill(0);
+    block[66..70].copy_from_slice(&(1u32 << 28).to_le_bytes());
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "iq3xxs",
+            dimensions: &[256],
+            kind: 18,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("iq3xxs").unwrap();
+    assert_eq!(materialized.shape(), &Shape::from([256]));
+    assert_eq!(materialized.values().len(), 256);
+    assert_eq!(&materialized.values()[..4], &[3.0, 3.0, 3.0, 3.0]);
+}
+
+#[test]
+fn iq3_s_materializes_raw_type_21_blocks() {
+    let mut block = [0u8; 110];
+    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "iq3s",
+            dimensions: &[256],
+            kind: 21,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("iq3s").unwrap();
+    assert_eq!(materialized.shape(), &Shape::from([256]));
+    assert_eq!(materialized.values().len(), 256);
+    assert_eq!(&materialized.values()[..4], &[1.0, 1.0, 1.0, 1.0]);
+}
+
+#[test]
+fn iq2_s_materializes_raw_type_22_blocks() {
+    let mut block = [0u8; 82];
+    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    let bytes = fixture(3, &[], &[TensorFixture { name: "iq2s", dimensions: &[256], kind: 22, offset: 0, data: &block }], 32);
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("iq2s").unwrap();
+    assert_eq!(materialized.shape(), &Shape::from([256]));
+    assert_eq!(materialized.values().len(), 256);
+    assert_eq!(&materialized.values()[..4], &[1.0, 1.0, 1.0, 1.0]);
 }
 
 #[test]
@@ -653,6 +894,27 @@ fn malformed_headers_metadata_and_tensor_tables_fail_structurally() {
     assert_kind(
         &nonzero_header_padding,
         GgufErrorKind::InvalidPadding { section: "header" },
+    );
+
+    let mut nonzero_leading_tensor_padding = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "x",
+            dimensions: &[1],
+            kind: 0,
+            offset: 32,
+            data: &data,
+        }],
+        32,
+    );
+    let leading_data_offset = read_gguf(&nonzero_leading_tensor_padding)
+        .unwrap()
+        .data_offset();
+    nonzero_leading_tensor_padding[leading_data_offset] = 1;
+    assert_kind(
+        &nonzero_leading_tensor_padding,
+        GgufErrorKind::InvalidPadding { section: "tensor" },
     );
 
     let mut nonzero_trailing_padding = base.clone();

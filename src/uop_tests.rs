@@ -123,6 +123,98 @@ fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
 }
 
 #[test]
+fn add_zero_preserves_floating_signed_zero_and_keeps_integer_identity() {
+    let float_types = [DType::F16, DType::BF16, DType::F32, DType::F64];
+    for dtype in float_types {
+        let ty = UType::scalar(dtype);
+        // `UArg::Int(0)` is deliberately used here: it is the only literal
+        // shape matched by add-zero, and is valid with a floating UType.
+        let negative_zero = UOp::scalar_constant(
+            dtype,
+            match dtype {
+                DType::F16 => 0x8000,
+                DType::BF16 => 0x8000,
+                DType::F32 => 0x8000_0000,
+                DType::F64 => 0x8000_0000_0000_0000,
+                _ => unreachable!(),
+            },
+            ty,
+        );
+        let positive_zero = UOp::constant(0, ty);
+        let add = UOp::binary(Binary::Add, negative_zero.clone(), positive_zero);
+        let (rewritten, trace) =
+            uop::rewrite(&add, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+        // The unfurled node is retained, so its CPU evaluation keeps IEEE
+        // `-0 + +0 == +0` behavior rather than exposing the input's -0 bits.
+        assert_eq!(trace.rules, Vec::<&str>::new());
+        assert_eq!(rewritten, add);
+
+        let reverse = UOp::binary(Binary::Add, UOp::constant(0, ty), negative_zero);
+        let (rewritten, trace) =
+            uop::rewrite(&reverse, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+        assert_eq!(trace.rules, Vec::<&str>::new());
+        assert_eq!(rewritten, reverse);
+    }
+
+    let value = UOp::constant(-7, UType::scalar(DType::I32));
+    let zero = UOp::constant(0, UType::scalar(DType::I32));
+    let add = UOp::binary(Binary::Add, value.clone(), zero);
+    let (rewritten, trace) =
+        uop::rewrite(&add, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(trace.rules, vec!["add-zero"]);
+    assert_eq!(rewritten, value);
+}
+
+#[test]
+fn where_same_keeps_fallible_condition_but_folds_constant_condition() {
+    let i32t = UType::scalar(DType::I32);
+    let boolt = UType::scalar(DType::Bool);
+    let one = UOp::constant(1, i32t);
+    let zero = UOp::constant(0, i32t);
+    let div = UOp::new(
+        UOpKind::GraphBinary(crate::BinaryOp::Div),
+        Some(i32t),
+        vec![one.clone(), zero],
+        UArg::None,
+    );
+    let condition = UOp::new(
+        UOpKind::GraphCompare(crate::CompareOp::Eq),
+        Some(boolt),
+        vec![div.clone(), one],
+        UArg::None,
+    );
+    let guarded = UOp::new(
+        UOpKind::Ternary(Ternary::Where),
+        Some(i32t),
+        vec![condition.clone(), div.clone(), div.clone()],
+        UArg::None,
+    );
+    guarded.validate().unwrap();
+    let (rewritten, trace) =
+        uop::rewrite(&guarded, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    // Evaluation visits Where's condition first; retaining this dependency
+    // preserves the division-by-zero status rather than exposing either arm.
+    assert_eq!(trace.rules, Vec::<&str>::new());
+    assert_eq!(rewritten, guarded);
+    assert!(rewritten.topological().unwrap().contains(&condition));
+
+    let nan = UOp::scalar_constant(DType::F32, 0x7fc0_1234, UType::scalar(DType::F32));
+    let constant_condition = UOp::constant(0, boolt);
+    let safe = UOp::new(
+        UOpKind::Ternary(Ternary::Where),
+        Some(UType::scalar(DType::F32)),
+        vec![constant_condition, nan.clone(), nan.clone()],
+        UArg::None,
+    );
+    safe.validate().unwrap();
+    let (rewritten, trace) =
+        uop::rewrite(&safe, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(trace.rules, vec!["where-same"]);
+    // Returning the original branch preserves exact dtype and NaN payload.
+    assert_eq!(rewritten, nan);
+}
+
+#[test]
 fn uop_graph_scalar_pilot_is_inspectable() {
     let mut graph = Graph::new();
     let x = graph.input("x", Shape::new([]));

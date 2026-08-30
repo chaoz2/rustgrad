@@ -28,7 +28,8 @@ pub use embedding::Embedding;
 pub use linear::Linear;
 pub use log_softmax::LogSoftmax;
 pub use norm::{
-    BatchNorm, BatchNorm2d, BatchNormOutput, GroupNorm, InstanceNorm, LayerNorm, LayerNorm2d,
+    BatchNorm, BatchNorm2d, BatchNorm3d, BatchNormOutput, GroupNorm, InstanceNorm, LayerNorm,
+    LayerNorm2d,
     PendingBatchNormStats, RMSNorm,
 };
 pub use output::Argmax;
@@ -45,9 +46,10 @@ pub use softmax::Softmax;
 pub use state::{
     CastPolicy, LoadReport, Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward,
     PendingModeEffects, RealizedBatchNormStats, StateDict, StateKind, StrictStateLoadLimits,
+    LiveStateDict, get_parameters, get_state_dict,
 };
 
-pub(crate) use parameter::{ParameterRestore, restore_parameters};
+pub(crate) use parameter::{ParameterRestore, next_version, restore_parameters};
 
 #[cfg(test)]
 mod conv_tests;

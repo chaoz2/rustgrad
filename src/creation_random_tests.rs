@@ -46,6 +46,28 @@ fn creation_helpers_cover_scalar_empty_ranges_and_dtypes() {
 }
 
 #[test]
+fn graph_arange_preflights_zero_step_and_keeps_terminal_i64_values() {
+    let mut graph = Graph::new();
+    let original_nodes = graph.node_count();
+    assert!(matches!(
+        graph.arange(0, 4, 0),
+        Err(Error::InvalidArange { .. })
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+
+    let upper = graph.arange(i64::MAX - 1, i64::MAX, 2).unwrap();
+    let lower = graph.arange(i64::MIN + 1, i64::MIN, -2).unwrap();
+    assert_eq!(
+        run(&graph, upper).to_vec_f64(),
+        vec![(i64::MAX - 1) as f64]
+    );
+    assert_eq!(
+        run(&graph, lower).to_vec_f64(),
+        vec![(i64::MIN + 1) as f64]
+    );
+}
+
+#[test]
 fn seeded_random_nodes_replay_exactly_and_are_typed() {
     for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
         let mut graph = Graph::new();
@@ -205,6 +227,60 @@ fn implicit_streams_reserve_packed_words_reset_and_isolate_devices() {
 }
 
 #[test]
+fn invalid_implicit_randperm_does_not_reserve_or_append() {
+    Graph::manual_seed(411);
+    let mut graph = Graph::new();
+    let original_nodes = graph.node_count();
+    assert!(matches!(
+        graph.randperm_implicit(8, DType::F32),
+        Err(Error::InvalidRandom { .. })
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+
+    let first = graph.rand_implicit([1], DType::F32).unwrap();
+    assert_eq!(stream(&graph, first).counter, [0, 0]);
+    Graph::manual_seed(411);
+    let mut replay = Graph::new();
+    let expected = replay.rand_implicit([1], DType::F32).unwrap();
+    assert_eq!(stream(&graph, first), stream(&replay, expected));
+    assert_eq!(run(&graph, first), run(&replay, expected));
+}
+
+#[test]
+fn initializer_fan_overflow_rejects_before_random_node_construction() {
+    let mut graph = Graph::new();
+    let original_nodes = graph.node_count();
+
+    assert!(matches!(
+        graph.glorot_uniform([usize::MAX, 1], DType::F32, 9),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+    assert!(matches!(
+        graph.kaiming_uniform([1, usize::MAX, 2], 0.01, DType::F32, 9),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+    assert!(matches!(
+        graph.kaiming_normal([1, usize::MAX, 2], 0.01, DType::F32, 9),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+
+    let glorot = graph.glorot_uniform([2, 3], DType::F32, 9).unwrap();
+    let uniform = graph
+        .uniform(
+            [2, 3],
+            -(6.0_f64 / 5.0).sqrt(),
+            (6.0_f64 / 5.0).sqrt(),
+            DType::F32,
+            9,
+        )
+        .unwrap();
+    assert_eq!(run(&graph, glorot), run(&graph, uniform));
+}
+
+#[test]
 fn randint_uses_float_uniform_scaling_then_storage_cast() {
     let mut graph = Graph::new();
     let uniform = graph.uniform([16], -3.0, 5.0, DType::F32, 23).unwrap();
@@ -313,4 +389,148 @@ fn rank_stack_one_hot_and_meshgrid_compose_through_existing_ops() {
     let grids = graph.meshgrid(vec![gx, gy], "xy").unwrap();
     assert_eq!(graph.shape(grids[0]).unwrap(), &Shape::new([3, 2]));
     assert!(graph.trace(stacked).unwrap().to_string().contains("concat"));
+}
+
+#[test]
+fn meshgrid_matches_tinygrad_flattened_input_xy_dtype_and_vjp_contracts() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2, 2]);
+    let rhs = graph.input_dtype("rhs", [3], DType::I8);
+    let grids = graph.meshgrid(vec![lhs, rhs], "xy").unwrap();
+    assert_eq!(graph.shape(grids[0]).unwrap(), &Shape::new([3, 4]));
+    assert_eq!(graph.shape(grids[1]).unwrap(), &Shape::new([3, 4]));
+    assert_eq!(graph.dtype(grids[0]).unwrap(), DType::F32);
+    assert_eq!(graph.dtype(grids[1]).unwrap(), DType::I8);
+    let loss = graph.sum_all(grids[0]).unwrap();
+    let gradient = graph.grad(loss, lhs).unwrap();
+    let inputs = HashMap::from([
+        ("lhs".into(), TensorData::new([2, 2], vec![0., 1., 2., 3.]).unwrap()),
+        (
+            "rhs".into(),
+            TensorData::from_scalars(
+                [3],
+                DType::I8,
+                [crate::Scalar::I(10), crate::Scalar::I(20), crate::Scalar::I(30)],
+            )
+            .unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, grids[0], &inputs)
+            .unwrap()
+            .to_vec_f64(),
+        vec![0., 1., 2., 3., 0., 1., 2., 3., 0., 1., 2., 3.]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, grids[1], &inputs)
+            .unwrap()
+            .to_vec_f64(),
+        vec![10., 10., 10., 10., 20., 20., 20., 20., 30., 30., 30., 30.]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, gradient, &inputs)
+            .unwrap()
+            .to_vec_f64(),
+        vec![3.; 4]
+    );
+
+    let mut singleton = Graph::new();
+    let input = singleton.input_dtype("input", [2, 2], DType::BF16);
+    assert_eq!(singleton.meshgrid(vec![input], "ij").unwrap(), vec![input]);
+
+    let mut empty = Graph::new();
+    let lhs = empty.input("lhs", [0]);
+    let rhs = empty.input("rhs", [2]);
+    let grids = empty.meshgrid(vec![lhs, rhs], "ij").unwrap();
+    assert_eq!(empty.shape(grids[0]).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.shape(grids[1]).unwrap(), &Shape::new([0, 2]));
+}
+
+#[test]
+fn meshgrid_preflights_every_descriptor_before_graph_growth() {
+    let mut empty = Graph::new();
+    let nodes = empty.node_count();
+    assert!(empty.meshgrid(Vec::new(), "ij").is_err());
+    assert_eq!(empty.node_count(), nodes);
+
+    let mut overflow = Graph::new();
+    let large = overflow.input("large", [usize::MAX, 2]);
+    let small = overflow.input("small", [1]);
+    let nodes = overflow.node_count();
+    assert!(overflow.meshgrid(vec![large, small], "ij").is_err());
+    assert_eq!(overflow.node_count(), nodes);
+}
+
+#[test]
+fn meshgrid_default_is_source_ij_identity_and_inherits_atomic_preflight() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2], DType::F16);
+    let y = graph.input_dtype("y", [3], DType::I16);
+    let grids = graph.meshgrid_default(vec![x, y]).unwrap();
+    assert_eq!(graph.shape(grids[0]).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.shape(grids[1]).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.dtype(grids[0]).unwrap(), DType::F16);
+    assert_eq!(graph.dtype(grids[1]).unwrap(), DType::I16);
+
+    let scalar = graph.input_dtype("scalar", [], DType::BF16);
+    assert_eq!(graph.meshgrid_default(vec![scalar]).unwrap(), vec![scalar]);
+
+    let mut invalid = Graph::new();
+    let before = invalid.node_count();
+    assert!(invalid.meshgrid_default(Vec::new()).is_err());
+    assert_eq!(invalid.node_count(), before);
+}
+
+#[test]
+fn one_hot_preflights_unrepresentable_class_counts_before_creating_nodes() {
+    if usize::BITS < i64::BITS {
+        return;
+    }
+    let mut graph = Graph::new();
+    let indices = graph.input_dtype("indices", [1], DType::I32);
+    let node_count = graph.node_count();
+    assert!(matches!(
+        graph.one_hot(indices, usize::MAX),
+        Err(Error::InvalidRandom {
+            reason: "one_hot class count exceeds the supported i64 range",
+        })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
+fn one_hot_uses_a_scalar_backed_default_integer_range_and_preflights_the_full_graph() {
+    let mut graph = Graph::new();
+    let indices = graph.input_dtype("indices", [2, 0], DType::I16);
+    let output = graph.one_hot(indices, 3).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 0, 3]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::I32);
+    assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+    assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+        Op::Constant(data) => Some(data.len()),
+        _ => None,
+    }).all(|len| len == 1));
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Reduce {
+        kind: crate::ReduceKind::Sum, ..
+    })));
+
+    let scalar = graph.input_dtype("scalar", [], DType::I32);
+    let scalar_output = graph.one_hot(scalar, 2).unwrap();
+    assert_eq!(graph.shape(scalar_output).unwrap(), &Shape::new([2]));
+    let empty = graph.input_dtype("empty", [0], DType::U8);
+    let empty_output = graph.one_hot(empty, 0).unwrap();
+    assert_eq!(graph.shape(empty_output).unwrap(), &Shape::new([0, 0]));
+
+    let mut invalid = Graph::new();
+    let float = invalid.input("float", [1]);
+    let before = invalid.node_count();
+    assert!(invalid.one_hot(float, 1).is_err());
+    assert_eq!(invalid.node_count(), before);
+    let large = invalid.input_dtype("large", [usize::MAX / 2 + 1], DType::I8);
+    let before = invalid.node_count();
+    assert!(matches!(invalid.one_hot(large, 3), Err(Error::ShapeOverflow(_))));
+    assert_eq!(invalid.node_count(), before);
 }

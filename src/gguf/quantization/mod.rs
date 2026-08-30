@@ -4,7 +4,10 @@ mod data;
 mod row_gather;
 
 use self::blocks::{
-    BlockDecodeError, decode_q4_0_block, decode_q4_k_block, decode_q6_k_block, decode_q8_0_block,
+    BlockDecodeError, decode_iq2_s_block, decode_iq3_s_block, decode_iq3_xxs_block, decode_iq4_xs_block,
+    decode_mxfp4_block, decode_q1_0_block, decode_q4_0_block, decode_q4_1_block,
+    decode_q4_k_block, decode_q5_0_block, decode_q5_1_block, decode_q5_k_block,
+    decode_q6_k_block, decode_q8_0_block,
 };
 use super::{GgmlType, GgufError, GgufErrorKind, GgufTensor};
 use crate::TensorData;
@@ -20,12 +23,52 @@ pub(super) fn materialize_f32(tensor: &GgufTensor, bytes: &[u8]) -> Result<Tenso
             values.extend(decode_q4_0_block(block)?);
             Ok(())
         }),
+        GgmlType::Q4_1 => decode_blocks(bytes, 20, &mut values, |block, values| {
+            values.extend(decode_q4_1_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Q5_0 => decode_blocks(bytes, 22, &mut values, |block, values| {
+            values.extend(decode_q5_0_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Q5_1 => decode_blocks(bytes, 24, &mut values, |block, values| {
+            values.extend(decode_q5_1_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Mxfp4 => decode_blocks(bytes, 17, &mut values, |block, values| {
+            values.extend(decode_mxfp4_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Q1_0 => decode_blocks(bytes, 18, &mut values, |block, values| {
+            values.extend(decode_q1_0_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Iq4Xs => decode_blocks(bytes, 136, &mut values, |block, values| {
+            values.extend(decode_iq4_xs_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Iq3Xxs => decode_blocks(bytes, 98, &mut values, |block, values| {
+            values.extend(decode_iq3_xxs_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Iq3S => decode_blocks(bytes, 110, &mut values, |block, values| {
+            values.extend(decode_iq3_s_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Iq2S => decode_blocks(bytes, 82, &mut values, |block, values| {
+            values.extend(decode_iq2_s_block(block)?);
+            Ok(())
+        }),
         GgmlType::Q8_0 => decode_blocks(bytes, 34, &mut values, |block, values| {
             values.extend(decode_q8_0_block(block)?);
             Ok(())
         }),
         GgmlType::Q4K => decode_blocks(bytes, 144, &mut values, |block, values| {
             values.extend(decode_q4_k_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Q5K => decode_blocks(bytes, 176, &mut values, |block, values| {
+            values.extend(decode_q5_k_block(block)?);
             Ok(())
         }),
         GgmlType::Q6K => decode_blocks(bytes, 210, &mut values, |block, values| {

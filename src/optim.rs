@@ -6,6 +6,7 @@
 //! must rebuild/evaluate the next graph cycle after an update.
 
 use crate::nn::{Module, ParameterRestore, StateDict, restore_parameters};
+use crate::nn::{StateDict, next_version};
 use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
@@ -378,6 +379,12 @@ impl LrSchedulerState {
         self.epoch
     }
 }
+fn next_scheduler_epoch(state: &LrSchedulerState) -> Result<u64> {
+    state
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| invalid("scheduler epoch overflow"))
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlateauMode {
     Min,
@@ -467,7 +474,7 @@ impl LearningRateScheduler {
         })
     }
     pub fn cosine_annealing(optimizer: &Optimizer, t_max: u64, eta_min: f64) -> Result<Self> {
-        if t_max == 0 || !eta_min.is_finite() {
+        if t_max == 0 || !eta_min.is_finite() || eta_min < 0. {
             return Err(invalid("invalid CosineAnnealingLR configuration"));
         }
         Ok(Self::CosineAnnealing {
@@ -529,6 +536,7 @@ impl LearningRateScheduler {
                 milestones,
                 gamma,
             } => {
+                let next_epoch = next_scheduler_epoch(state)?;
                 if milestones.contains(&state.epoch) {
                     optimizer.set_learning_rates(
                         optimizer
@@ -554,6 +562,7 @@ impl LearningRateScheduler {
                 if !value.is_finite() {
                     return Err(invalid("invalid ReduceLROnPlateau metric"));
                 }
+                let next_epoch = next_scheduler_epoch(state)?;
                 let boundary = match threshold_mode {
                     ThresholdMode::Relative => {
                         *best
@@ -582,17 +591,21 @@ impl LearningRateScheduler {
                     *best = value;
                     *bad_epochs = 0;
                 } else {
-                    *bad_epochs += 1;
-                }
-                if *bad_epochs > *patience {
-                    optimizer.set_learning_rates(
-                        optimizer
-                            .learning_rates
-                            .iter()
-                            .map(|lr| lr * *factor)
-                            .collect(),
-                    )?;
-                    *bad_epochs = 0;
+                    let next_bad_epochs = bad_epochs
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("scheduler bad-epoch counter overflow"))?;
+                    if next_bad_epochs > *patience {
+                        optimizer.set_learning_rates(
+                            optimizer
+                                .learning_rates
+                                .iter()
+                                .map(|lr| lr * *factor)
+                                .collect(),
+                        )?;
+                        *bad_epochs = 0;
+                    } else {
+                        *bad_epochs = next_bad_epochs;
+                    }
                 }
                 state.epoch = next_epoch;
             }
@@ -602,6 +615,7 @@ impl LearningRateScheduler {
                 eta_min,
                 eta_max,
             } => {
+                let next_epoch = next_scheduler_epoch(state)?;
                 let ratio = state.epoch as f64 / *t_max as f64;
                 optimizer.set_learning_rates(
                     eta_max
@@ -624,6 +638,7 @@ impl LearningRateScheduler {
                 total_steps,
                 pct_start,
             } => {
+                let next_epoch = next_scheduler_epoch(state)?;
                 let split = *total_steps as f64 * *pct_start;
                 let epoch = state.epoch as f64;
                 let lr = if epoch < split {
@@ -822,6 +837,9 @@ impl LrSchedulerGroup {
         // Scheduler steps alter only scheduler state and child learning rates,
         // so cloned candidates provide all-or-nothing group validation without
         // acquiring parameter locks or touching parameter versions.
+        // Scheduler updates only mutate host-side rate/state fields. Evaluate
+        // the complete ordered fan-out on clones so a late child rejection
+        // cannot publish an earlier child's rate or epoch advance.
         let mut next_schedulers = self.schedulers.clone();
         let mut next_optimizers = optimizers.optimizers.clone();
         for (scheduler, optimizer) in next_schedulers.iter_mut().zip(&mut next_optimizers) {
@@ -992,8 +1010,16 @@ impl Optimizer {
             if gradient.version != entry.version || snapshot.version != entry.version {
                 return Err(invalid("stale gradient parameter version"));
             }
+            next_version(snapshot.version)?;
         }
+        self.next_step()?;
         Ok(())
+    }
+
+    fn next_step(&self) -> Result<u64> {
+        self.step
+            .checked_add(1)
+            .ok_or_else(|| invalid("optimizer step overflow"))
     }
     fn allocate_slots(&mut self) -> Result<()> {
         for (group, slot) in self.slots.iter_mut().enumerate() {
@@ -1045,6 +1071,13 @@ impl Optimizer {
                 return Err(invalid("stale gradient parameter version"));
             }
         }
+        // Version identities must be advanceable before slots or any parameter
+        // are changed. This prevents a wrapped update from making a stale
+        // gradient or previously bound graph leaf appear current.
+        let next_versions = snapshots
+            .iter()
+            .map(|snapshot| next_version(snapshot.version))
+            .collect::<Result<Vec<_>>>()?;
         let mut positions = vec![0usize; self.groups.len()];
         let next_step = self
             .step
@@ -1052,7 +1085,12 @@ impl Optimizer {
             .ok_or_else(|| invalid("optimizer step counter overflow"))?;
         let mut next = self.clone();
         let mut restores = Vec::with_capacity(next.entries.len());
-        for (entry, snapshot) in next.entries.iter_mut().zip(snapshots) {
+        for ((entry, snapshot), next_version) in next
+            .entries
+            .iter_mut()
+            .zip(snapshots)
+            .zip(next_versions)
+        {
             let gradient = &gradients[&entry.name];
             let values = to_f64(&snapshot.data);
             let grad = to_f64(&gradient.data);
@@ -1443,7 +1481,11 @@ fn validate(kind: &OptimizerKind) -> Result<()> {
             }
         }
         OptimizerKind::Lars(c) => {
-            if c.momentum < 0. || !c.tcoef.is_finite() || c.tcoef < 0. {
+            if !c.momentum.is_finite()
+                || c.momentum < 0.
+                || !c.tcoef.is_finite()
+                || c.tcoef < 0.
+            {
                 Err(invalid("invalid LARS momentum or trust coefficient"))
             } else {
                 Ok(())
@@ -1846,6 +1888,95 @@ mod tests {
         nesterov.step(&gradients).unwrap();
         assert!((values(&parameter)[0] - 0.23).abs() < 1e-6);
     }
+
+    #[test]
+    fn parameter_version_overflow_rejects_optimizer_step_before_slot_or_parameter_commit() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        parameter.set_version_for_test(u64::MAX).unwrap();
+        let before = parameter.snapshot().unwrap();
+        let gradient = gradient(&parameter, vec![2.]);
+        let mut optimizer = Optimizer::sgd(
+            vec![("p".into(), parameter.clone())],
+            SgdConfig::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            optimizer.step(&BTreeMap::from([("p".into(), gradient)])),
+            Err(Error::ParameterVersionOverflow { version: u64::MAX })
+        ));
+        assert_eq!(parameter.snapshot().unwrap().data, before.data);
+        assert_eq!(parameter.snapshot().unwrap().version, before.version);
+        assert_eq!(optimizer.step_count(), 0);
+    }
+
+    #[test]
+    fn optimizer_group_preflights_late_parameter_version_overflow() {
+        let mut graph = Graph::new();
+        let first = parameter(&mut graph, vec![1.]);
+        let second = parameter(&mut graph, vec![2.]);
+        second.set_version_for_test(u64::MAX).unwrap();
+        let first_before = first.snapshot().unwrap();
+        let second_before = second.snapshot().unwrap();
+        let first_optimizer = Optimizer::sgd(
+            vec![("first".into(), first.clone())],
+            SgdConfig::default(),
+        )
+        .unwrap();
+        let second_optimizer = Optimizer::sgd(
+            vec![("second".into(), second.clone())],
+            SgdConfig::default(),
+        )
+        .unwrap();
+        let mut group = OptimizerGroup::new(vec![first_optimizer, second_optimizer]).unwrap();
+        let gradients = BTreeMap::from([
+            ("first".into(), gradient(&first, vec![1.])),
+            ("second".into(), gradient(&second, vec![1.])),
+        ]);
+        assert!(matches!(
+            group.step(&gradients),
+            Err(Error::ParameterVersionOverflow { version: u64::MAX })
+        ));
+        assert_eq!(first.snapshot().unwrap().data, first_before.data);
+        assert_eq!(first.snapshot().unwrap().version, first_before.version);
+        assert_eq!(second.snapshot().unwrap().data, second_before.data);
+        assert_eq!(second.snapshot().unwrap().version, second_before.version);
+    }
+
+    #[test]
+    fn lars_rejects_nonfinite_momentum_before_constructing_state() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        let before = parameter.snapshot().unwrap();
+        for momentum in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(Optimizer::lars(
+                vec![("p".into(), parameter.clone())],
+                LarsConfig {
+                    momentum,
+                    ..LarsConfig::default()
+                },
+            )
+            .is_err());
+            assert_eq!(parameter.snapshot().unwrap().data, before.data);
+        }
+
+        let mut optimizer = Optimizer::lars(
+            vec![("p".into(), parameter.clone())],
+            LarsConfig {
+                lr: 0.1,
+                momentum: 0.,
+                weight_decay: 0.,
+                tcoef: 0.,
+                ..LarsConfig::default()
+            },
+        )
+        .unwrap();
+        optimizer
+            .step(&BTreeMap::from([("p".into(), gradient(&parameter, vec![1.]))]))
+            .unwrap();
+        assert_eq!(values(&parameter), vec![0.9]);
+    }
+
     #[test]
     fn adam_and_adamw_match_one_step_oracle_and_reject_stale_gradients() {
         let mut graph = Graph::new();
@@ -3011,6 +3142,62 @@ mod tests {
     }
 
     #[test]
+    fn adam_step_counter_overflow_rejects_before_optimizer_or_group_publication() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::adam(
+            vec![("p".into(), parameter.clone())],
+            AdamConfig::default(),
+        )
+        .unwrap();
+        optimizer.step = u64::MAX;
+        let gradient = gradient(&parameter, vec![0.5]);
+        let parameter_before = values(&parameter);
+        let state_before = optimizer.state_dict().unwrap();
+        assert!(optimizer
+            .step(&BTreeMap::from([("p".into(), gradient.clone())]))
+            .is_err());
+        assert_eq!(values(&parameter), parameter_before);
+        assert_eq!(optimizer.state_dict().unwrap(), state_before);
+        optimizer.step = 0;
+        optimizer
+            .step(&BTreeMap::from([("p".into(), gradient)]))
+            .unwrap();
+        assert_eq!(optimizer.step_count(), 1);
+
+        let left = parameter(&mut graph, vec![2.]);
+        let right = parameter(&mut graph, vec![3.]);
+        let mut group = OptimizerGroup::new(vec![
+            Optimizer::adam(vec![("left".into(), left.clone())], AdamConfig::default()).unwrap(),
+            Optimizer::adam(vec![("right".into(), right.clone())], AdamConfig::default())
+                .unwrap(),
+        ])
+        .unwrap();
+        group.optimizers[1].step = u64::MAX;
+        let left_before = values(&left);
+        let right_before = values(&right);
+        let state_before = group.state_dict().unwrap();
+        assert!(group
+            .step(&BTreeMap::from([
+                ("left".into(), gradient(&left, vec![0.5])),
+                ("right".into(), gradient(&right, vec![0.25])),
+            ]))
+            .is_err());
+        assert_eq!(values(&left), left_before);
+        assert_eq!(values(&right), right_before);
+        assert_eq!(group.state_dict().unwrap(), state_before);
+        group.optimizers[1].step = 0;
+        group
+            .step(&BTreeMap::from([
+                ("left".into(), gradient(&left, vec![0.5])),
+                ("right".into(), gradient(&right, vec![0.25])),
+            ]))
+            .unwrap();
+        assert_eq!(group[0].step_count(), 1);
+        assert_eq!(group[1].step_count(), 1);
+    }
+
+    #[test]
     fn host_schedulers_match_static_formulas_and_group_order() {
         let mut graph = Graph::new();
         let p = parameter(&mut graph, vec![1.]);
@@ -3071,6 +3258,127 @@ mod tests {
         scheduler_group.step(&mut group).unwrap();
         assert_eq!(group[0].learning_rates(), &[0.05]);
         assert_eq!(group[1].learning_rates(), &[0.025]);
+    }
+
+    #[test]
+    fn cosine_scheduler_preflights_rate_floor_and_keeps_tinygrad_endpoints() {
+        let mut graph = Graph::new();
+        let p = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::sgd(
+            vec![("p".into(), p)],
+            SgdConfig {
+                lr: 0.4,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let before = optimizer.state_dict().unwrap();
+        assert!(LearningRateScheduler::cosine_annealing(&optimizer, 2, -0.1).is_err());
+        assert_eq!(optimizer.state_dict().unwrap(), before);
+
+        let mut cosine = LearningRateScheduler::cosine_annealing(&optimizer, 2, 0.1).unwrap();
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.4).abs() < 1e-12);
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.25).abs() < 1e-12);
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.1).abs() < 1e-12);
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn scheduler_group_rejects_late_child_without_rate_or_epoch_publication() {
+        let mut graph = Graph::new();
+        let left = parameter(&mut graph, vec![1.]);
+        let right = parameter(&mut graph, vec![1.]);
+        let mut optimizers = skip_list_group(left, right);
+        let mut schedulers = LrSchedulerGroup::new(vec![
+            LearningRateScheduler::multi_step(vec![0], 0.5).unwrap(),
+            LearningRateScheduler::multi_step(vec![0], 0.25).unwrap(),
+        ]);
+        let second_initial = schedulers.schedulers[1].state_dict().unwrap();
+        let mut second_overflow = second_initial.clone();
+        second_overflow.insert(
+            "scheduler.epoch",
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64),
+        );
+        schedulers.schedulers[1]
+            .load_state_dict(&second_overflow)
+            .unwrap();
+        let rates_before = optimizers.learning_rates();
+        let first_before = schedulers.schedulers[0].state_dict().unwrap();
+        let second_before = schedulers.schedulers[1].state_dict().unwrap();
+        assert!(schedulers.step(&mut optimizers).is_err());
+        assert_eq!(optimizers.learning_rates(), rates_before);
+        assert_eq!(schedulers.schedulers[0].state_dict().unwrap(), first_before);
+        assert_eq!(schedulers.schedulers[1].state_dict().unwrap(), second_before);
+
+        schedulers.schedulers[1]
+            .load_state_dict(&second_initial)
+            .unwrap();
+        schedulers.step(&mut optimizers).unwrap();
+        assert_eq!(optimizers.learning_rates(), vec![vec![0.05], vec![0.025]]);
+        assert_eq!(schedulers.schedulers[0].epoch(), 1);
+        assert_eq!(schedulers.schedulers[1].epoch(), 1);
+    }
+
+    #[test]
+    fn scheduler_counter_overflow_preflights_rate_and_state_publication() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::sgd(
+            vec![("p".into(), parameter)],
+            SgdConfig {
+                lr: 1.,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let mut multi_step = LearningRateScheduler::multi_step(vec![0], 0.5).unwrap();
+        let initial_multi_step = multi_step.state_dict().unwrap();
+        let mut overflow_epoch = initial_multi_step.clone();
+        overflow_epoch.insert(
+            "scheduler.epoch",
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64),
+        );
+        multi_step.load_state_dict(&overflow_epoch).unwrap();
+        let optimizer_before = optimizer.state_dict().unwrap();
+        let scheduler_before = multi_step.state_dict().unwrap();
+        assert!(multi_step.step(&mut optimizer).is_err());
+        assert_eq!(optimizer.state_dict().unwrap(), optimizer_before);
+        assert_eq!(multi_step.state_dict().unwrap(), scheduler_before);
+        multi_step.load_state_dict(&initial_multi_step).unwrap();
+        multi_step.step(&mut optimizer).unwrap();
+        assert_eq!(optimizer.learning_rates(), &[0.5]);
+
+        let mut plateau = LearningRateScheduler::reduce_on_plateau(
+            PlateauMode::Min,
+            0.5,
+            u64::MAX,
+            0.,
+            ThresholdMode::Relative,
+        )
+        .unwrap();
+        let initial_plateau = plateau.state_dict().unwrap();
+        let mut overflow_bad_epochs = initial_plateau.clone();
+        overflow_bad_epochs.insert(
+            "scheduler.best",
+            TensorData::scalar_with_dtype(Scalar::F(0.), DType::F64),
+        );
+        overflow_bad_epochs.insert(
+            "scheduler.bad_epochs",
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64),
+        );
+        plateau.load_state_dict(&overflow_bad_epochs).unwrap();
+        let optimizer_before = optimizer.state_dict().unwrap();
+        let scheduler_before = plateau.state_dict().unwrap();
+        assert!(plateau.step_metric(&mut optimizer, Some(1.)).is_err());
+        assert_eq!(optimizer.state_dict().unwrap(), optimizer_before);
+        assert_eq!(plateau.state_dict().unwrap(), scheduler_before);
+        plateau.load_state_dict(&initial_plateau).unwrap();
+        plateau.step_metric(&mut optimizer, Some(1.)).unwrap();
+        assert_eq!(plateau.epoch(), 1);
     }
 
     #[test]

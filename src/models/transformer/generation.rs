@@ -109,6 +109,7 @@ impl<'a> LlamaGenerator<'a> {
                 maximum: self.model.config().max_context(),
             });
         }
+        self.model.validate_token_ids(prompt_ids)?;
         let vocab = self.model.config().schema().vocab_size;
         validate_sampling(sampling, max_new_tokens, vocab)?;
         if max_new_tokens == 0 {

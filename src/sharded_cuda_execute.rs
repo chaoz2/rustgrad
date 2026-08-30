@@ -264,6 +264,117 @@ impl ShardedCudaPlanComposition {
             substitutions,
         })
     }
+    fn checked_substitutions(&self) -> Result<BTreeMap<(usize, u64), u64>, Error> {
+        self.plan.validate()?;
+        let composition_error = |kind| Error::ShardedCudaComposition { kind };
+        let mut aliases = BTreeMap::new();
+        let mut destinations = BTreeSet::new();
+        for substitution in &self.substitutions {
+            let key = (substitution.rank, substitution.local_buffer);
+            if aliases.insert(key, substitution.transfer_buffer).is_some() {
+                return Err(composition_error(
+                    CompositionError::DuplicateLocalSubstitution {
+                        rank: substitution.rank,
+                        buffer: substitution.local_buffer,
+                    },
+                ));
+            }
+            if !destinations.insert((substitution.rank, substitution.transfer_buffer)) {
+                return Err(composition_error(
+                    CompositionError::DuplicateTransferDestination {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    },
+                ));
+            }
+            let source = self
+                .plan
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer.rank == substitution.rank
+                        && buffer.buffer == substitution.transfer_buffer
+                })
+                .ok_or_else(|| {
+                    composition_error(CompositionError::MissingTransferDestination {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    })
+                })?;
+            let Some(producer) = source.producer else {
+                return Err(composition_error(CompositionError::MissingProducer {
+                    rank: substitution.rank,
+                    buffer: substitution.transfer_buffer,
+                }));
+            };
+            if !matches!(source.role, ExecutableBufferRole::Output)
+                || !matches!(
+                    self.plan.logical.stages.get(producer),
+                    Some(CudaPlanStage::Transfer { .. })
+                )
+            {
+                return Err(composition_error(
+                    CompositionError::DestinationNotProducedByTransfer {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    },
+                ));
+            }
+            let owner = self
+                .plan
+                .owners
+                .get(substitution.rank)
+                .ok_or_else(|| {
+                    composition_error(CompositionError::MissingLocalExternal {
+                        rank: substitution.rank,
+                        buffer: substitution.local_buffer,
+                    })
+                })?;
+            if source.owner_identity != owner.identity() {
+                return Err(composition_error(CompositionError::DescriptorMismatch {
+                    rank: substitution.rank,
+                    local_buffer: substitution.local_buffer,
+                    transfer_buffer: substitution.transfer_buffer,
+                    field: CompositionField::Owner,
+                }));
+            }
+            let producer_id = match &self.plan.logical.stages[producer] {
+                CudaPlanStage::Transfer { id, .. } => *id,
+                _ => unreachable!(),
+            };
+            let mut consumers = 0;
+            for stage in &self.plan.logical.stages {
+                if let CudaPlanStage::Local {
+                    id,
+                    owner_identity,
+                    inputs,
+                    dependencies,
+                    ..
+                } = stage
+                    && *owner_identity == owner.identity()
+                    && inputs.contains(&substitution.local_buffer)
+                {
+                    consumers += 1;
+                    if !dependencies.contains(&producer_id) {
+                        return Err(composition_error(CompositionError::UseBeforeProduce {
+                            stage: *id,
+                            producer: producer_id,
+                        }));
+                    }
+                }
+            }
+            if consumers == 0 {
+                return Err(composition_error(CompositionError::MissingLocalExternal {
+                    rank: substitution.rank,
+                    buffer: substitution.local_buffer,
+                }));
+            }
+        }
+        if aliases.is_empty() {
+            return Err(err("composition requires at least one explicit substitution"));
+        }
+        Ok(aliases)
+    }
 }
 fn validate_composition_dependencies(stages: &[CudaPlanStage]) -> Result<(), Error> {
     let ids: BTreeSet<_> = stages
@@ -523,11 +634,7 @@ impl ShardedCudaExecutionEnvironment {
         &mut self,
         composition: &ShardedCudaPlanComposition,
     ) -> Result<ShardedCudaExecutionResult, Error> {
-        let substitutions = composition
-            .substitutions
-            .iter()
-            .map(|entry| ((entry.rank, entry.local_buffer), entry.transfer_buffer))
-            .collect();
+        let substitutions = composition.checked_substitutions()?;
         self.execute_with_substitutions(&composition.plan, &substitutions, None)
     }
     pub fn execute_transaction(
@@ -569,6 +676,9 @@ impl ShardedCudaExecutionEnvironment {
             ));
         }
         plan.validate()?;
+        if self.caches.len() != plan.owners.len() {
+            return Err(err("primary PTX cache bindings do not match plan owners"));
+        }
         if let Some(allocators) = &self.allocators
             && (allocators.len() != plan.owners.len()
                 || allocators
@@ -1076,6 +1186,23 @@ mod tests {
             ]),
             1,
         );
+        environment.caches.clear();
+        let before = mock.calls().len();
+        let Err(cache_error) = environment.execute(&plan) else {
+            panic!("cache-owner mismatch unexpectedly executed")
+        };
+        assert!(
+            cache_error
+                .to_string()
+                .contains("primary PTX cache bindings do not match plan owners")
+        );
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "cache-owner mismatch is rejected before Driver work"
+        );
+        assert_eq!(environment.external.len(), 2);
+        environment.caches.push(ConcurrentPtxCache::new());
         {
             let CudaPlanStage::Local { diagnostic, .. } = &mut plan.logical.stages[0] else {
                 unreachable!();
@@ -2136,7 +2263,7 @@ mod tests {
         if let CudaPlanStage::Transfer { dependencies, .. } = &mut transfer.logical.stages[0] {
             dependencies.clear();
         }
-        let composition = ShardedCudaPlanComposition::compose(
+        let mut composition = ShardedCudaPlanComposition::compose(
             &transfer,
             &local,
             (0..2)
@@ -2199,6 +2326,120 @@ mod tests {
             BTreeMap::new(),
             pools.clone(),
         );
+        let calls_before_tamper = mock.calls().len();
+        composition
+            .substitutions
+            .push(composition.substitutions[0].clone());
+        assert!(matches!(
+            environment.execute_composed(&composition),
+            Err(Error::ShardedCudaComposition {
+                kind: CompositionError::DuplicateLocalSubstitution { .. }
+            })
+        ));
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_tamper,
+            "public composed substitutions reject before Driver work"
+        );
+        assert_eq!(environment.external.len(), 4);
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 48)
+        );
+        let external_bytes = environment
+            .external
+            .iter()
+            .map(|(key, lease)| {
+                let (_, bytes, _, _) = lease.execution_metadata().unwrap();
+                let mut contents = vec![0; bytes];
+                lease.view().unwrap().copy_to(0, &mut contents).unwrap();
+                (*key, contents)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let assert_external_bytes = |environment: &ShardedCudaExecutionEnvironment, message| {
+            assert_eq!(
+                environment
+                    .external
+                    .iter()
+                    .map(|(key, lease)| {
+                        let (_, bytes, _, _) = lease.execution_metadata().unwrap();
+                        let mut contents = vec![0; bytes];
+                        lease.view().unwrap().copy_to(0, &mut contents).unwrap();
+                        (*key, contents)
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                external_bytes,
+                "{message}"
+            );
+        };
+        let duplicate_buffer = composition
+            .plan
+            .buffers
+            .iter()
+            .find(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+            .unwrap()
+            .clone();
+        composition.plan.buffers.push(duplicate_buffer);
+        let calls_before_duplicate_buffer = mock.calls().len();
+        let Err(duplicate_buffer_error) = environment.execute_composed(&composition) else {
+            panic!("duplicate canonical buffer unexpectedly executed")
+        };
+        assert!(
+            duplicate_buffer_error
+                .to_string()
+                .contains("duplicate canonical executable buffer identity")
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_duplicate_buffer,
+            "duplicate buffer is rejected before Driver work"
+        );
+        assert_eq!(environment.external.len(), 4);
+        assert_external_bytes(
+            &environment,
+            "duplicate buffer rejection preserves caller-owned external bytes",
+        );
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 48)
+        );
+        composition.plan.buffers.pop();
+        let output_buffer = composition
+            .plan
+            .buffers
+            .iter()
+            .position(|buffer| matches!(buffer.role, ExecutableBufferRole::Output))
+            .unwrap();
+        let original_output_rank = composition.plan.buffers[output_buffer].rank;
+        composition.plan.buffers[output_buffer].rank = owners.len();
+        let calls_before_bad_rank = mock.calls().len();
+        let Err(bad_rank_error) = environment.execute_composed(&composition) else {
+            panic!("out-of-range canonical buffer rank unexpectedly executed")
+        };
+        assert!(
+            bad_rank_error
+                .to_string()
+                .contains("canonical buffer rank exceeds retained owners")
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_bad_rank,
+            "out-of-range buffer rank is rejected before Driver work"
+        );
+        assert_eq!(environment.external.len(), 4);
+        assert_external_bytes(
+            &environment,
+            "out-of-range buffer rank preserves caller-owned external bytes",
+        );
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 48)
+        );
+        composition.plan.buffers[output_buffer].rank = original_output_rank;
+        composition.substitutions.pop();
         let result = environment.execute_composed(&composition).unwrap();
         assert_eq!(
             result
@@ -2229,6 +2470,7 @@ mod tests {
                 .iter()
                 .all(|pool| pool.stats().logical_leased_bytes == 112)
         );
+        assert_external_bytes(&environment, "successful composition preserves external bytes");
         drop(result);
         assert!(
             pools
@@ -2245,6 +2487,7 @@ mod tests {
             4,
             "transfer failure restores true externals"
         );
+        assert_external_bytes(&environment, "transfer failure preserves external bytes");
         assert!(pools.iter().all(|pool| {
             let stats = pool.stats();
             stats.logical_leased_bytes == 48 && stats.peak_in_use_bytes >= 112
@@ -2261,6 +2504,7 @@ mod tests {
             4,
             "local failure restores true externals"
         );
+        assert_external_bytes(&environment, "local failure preserves external bytes");
         assert!(
             pools
                 .iter()
@@ -3791,7 +4035,7 @@ mod tests {
                 context: owner.clone(),
             })
             .collect::<Vec<_>>();
-        let plan = executable_redistribution_plan(&source, &destination, &bindings).unwrap();
+        let mut plan = executable_redistribution_plan(&source, &destination, &bindings).unwrap();
         plan.validate().unwrap();
         let CudaPlanStage::Transfer { routes, .. } = &plan.logical.stages[0] else {
             panic!("expected typed transfer stage")
@@ -3837,6 +4081,41 @@ mod tests {
             external.insert((rank, source.nodes()[rank].index() as u64), lease);
         }
         let mut environment = ShardedCudaExecutionEnvironment::new(external, 2);
+        let omitted = match &mut plan.logical.stages[0] {
+            CudaPlanStage::Transfer { routes, .. } => routes.pop().unwrap(),
+            _ => unreachable!(),
+        };
+        let before_omitted_route = mock.calls().len();
+        let Err(omitted_route_error) = environment.execute(&plan) else {
+            panic!("incomplete transfer routes unexpectedly executed")
+        };
+        assert!(
+            omitted_route_error
+                .to_string()
+                .contains("transfer routes do not exactly cover output buffer")
+        );
+        assert_eq!(
+            mock.calls().len(),
+            before_omitted_route,
+            "incomplete transfer routes reject before Driver work"
+        );
+        assert_eq!(environment.external.len(), 2);
+        for rank in 0..2 {
+            let mut actual = vec![0; source_bytes[rank].len()];
+            environment
+                .external
+                .get(&(rank, source.nodes()[rank].index() as u64))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut actual)
+                .unwrap();
+            assert_eq!(actual, source_bytes[rank]);
+        }
+        let CudaPlanStage::Transfer { routes, .. } = &mut plan.logical.stages[0] else {
+            unreachable!();
+        };
+        routes.push(omitted);
         mock.fail_dtod_after(0, 2);
         let Err(failed) = environment.execute(&plan) else {
             panic!("injected DtoD failure unexpectedly succeeded")

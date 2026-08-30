@@ -185,6 +185,9 @@ impl HostSlotPool {
             .map_err(|_| HostBufferError::OwnerMismatch)?;
         let mut seen = std::collections::BTreeSet::new();
         for write in &writes {
+            if !Arc::ptr_eq(&self.inner, &write.inner) {
+                return Err(HostBufferError::OwnerMismatch);
+            }
             if !seen.insert(write.slot) {
                 return Err(HostBufferError::OutstandingBorrow { slot: write.slot });
             }
@@ -215,6 +218,7 @@ impl HostSlotPool {
 /// An owned, descriptor-checked value for one pool transaction. This remains
 /// crate-private so callers cannot manufacture a slot/generation capability.
 pub(crate) struct HostBufferWrite {
+    inner: Arc<Mutex<PoolState>>,
     slot: u64,
     generation: u64,
     descriptor: HostBufferDesc,
@@ -258,6 +262,7 @@ impl HostBufferLease {
             return Err(HostBufferError::IncompatibleDescriptor);
         }
         Ok(HostBufferWrite {
+            inner: self.inner.clone(),
             slot: self.slot,
             generation: self.generation,
             descriptor: self.descriptor.clone(),
@@ -592,5 +597,37 @@ mod tests {
         let stats = pool.stats().unwrap();
         assert_eq!(stats.physical_slots, 2);
         assert_eq!(stats.leased_slots, 2);
+    }
+
+    #[test]
+    fn transaction_rejects_cross_pool_staged_write_before_publication() {
+        let first_pool = HostSlotPool::new();
+        let second_pool = HostSlotPool::new();
+        let first = first_pool.lease(Some(7), desc(7, [2])).unwrap();
+        let second = second_pool.lease(Some(7), desc(7, [2])).unwrap();
+        second
+            .write(TensorData::new([2], vec![1.0, 2.0]).unwrap())
+            .unwrap();
+
+        let foreign = first
+            .staged_write(TensorData::new([2], vec![9.0, 9.0]).unwrap())
+            .unwrap();
+        assert_eq!(
+            second_pool.commit(vec![foreign]),
+            Err(HostBufferError::OwnerMismatch)
+        );
+        assert_eq!(
+            second.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![1.0, 2.0]
+        );
+
+        let local = second
+            .staged_write(TensorData::new([2], vec![8.0, 8.0]).unwrap())
+            .unwrap();
+        second_pool.commit(vec![local]).unwrap();
+        assert_eq!(
+            second.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![8.0, 8.0]
+        );
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Backend, CpuBackend, DType, Graph, NodeId, Scalar, Storage, TensorData};
+use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Op, Scalar, Storage, TensorData};
 
 fn f32s(data: &TensorData) -> Vec<f32> {
     match data.storage() {
@@ -102,6 +102,80 @@ fn explicit_mode_dropout_is_eval_identity_and_deterministic_training_composition
 }
 
 #[test]
+fn rms_norm_uses_tinygrad_f32_statistics_and_preflights_empty_geometry() {
+    let mut graph = Graph::new();
+    let norm = RMSNorm::new(&mut graph, 2, f32::NAN, false).unwrap();
+    let input = graph.input_dtype("f64", [1, 2], DType::F64);
+    let output = norm.forward(&mut graph, input).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert!(matches!(
+        &graph.node(output).unwrap().op,
+        Op::Cast {
+            dtype: DType::F64,
+            ..
+        }
+    ));
+
+    let affine = RMSNorm::new(&mut graph, 2, 1e-6, true).unwrap();
+    let integer = graph.input_dtype("integer", [1, 2], DType::I16);
+    let affine_output = affine.forward(&mut graph, integer).unwrap();
+    assert_eq!(graph.dtype(affine_output).unwrap(), DType::F32);
+    assert_eq!(graph.parameter_bindings().len(), 1);
+
+    let mut empty_graph = Graph::new();
+    let zero_dim = RMSNorm::new(&mut empty_graph, 0, f32::INFINITY, false).unwrap();
+    let empty = empty_graph.input_dtype("empty", [3, 0], DType::F16);
+    let before = empty_graph.node_count();
+    assert_eq!(zero_dim.forward(&mut empty_graph, empty).unwrap(), empty);
+    assert_eq!(empty_graph.node_count(), before);
+
+    let wrong = empty_graph.input("wrong", [3, 1]);
+    let before = empty_graph.node_count();
+    assert!(zero_dim.forward(&mut empty_graph, wrong).is_err());
+    assert_eq!(empty_graph.node_count(), before);
+    assert!(empty_graph.parameter_bindings().is_empty());
+}
+
+#[test]
+fn dropout_revalidates_public_probability_before_graph_work() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2]);
+    let before = graph.node_count();
+    let mut dropout = Dropout::new(0.5, true, 42).unwrap();
+
+    dropout.probability = f64::NAN;
+    assert!(matches!(
+        dropout.forward(&mut graph, input),
+        Err(Error::UnsupportedDropout { .. })
+    ));
+    assert_eq!(graph.node_count(), before);
+
+    dropout.probability = 1.5;
+    assert!(matches!(
+        dropout.forward(&mut graph, input),
+        Err(Error::UnsupportedDropout { .. })
+    ));
+    assert_eq!(graph.node_count(), before);
+
+    dropout.probability = 0.5;
+    assert!(dropout.forward(&mut graph, input).is_ok());
+    assert!(graph.node_count() > before);
+}
+
+#[test]
+fn embedding_preflights_geometry_and_index_dtype_before_binding_weight() {
+    let mut graph = Graph::new();
+    assert!(Embedding::new(&mut graph, 0, 2, None, 1).is_err());
+    assert!(Embedding::new(&mut graph, 2, 0, None, 1).is_err());
+    assert!(Embedding::new(&mut graph, usize::MAX, 1, None, 1).is_err());
+
+    let embedding = Embedding::new(&mut graph, 3, 2, None, 2).unwrap();
+    let float_index = graph.input("float_index", [2]);
+    assert!(embedding.forward(&mut graph, float_index).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+}
+
+#[test]
 fn convolution_and_pooling_modules_are_stateful_only_at_parameters() {
     let mut graph = Graph::new();
     let conv = Conv2d::new(
@@ -198,4 +272,135 @@ fn convolution_and_pooling_modules_are_stateful_only_at_parameters() {
         1
     );
     assert!(pool.state_dict().unwrap().tensors().is_empty());
+}
+
+#[test]
+fn conv2d_constructor_rejects_zero_execution_geometry() {
+    let mut graph = Graph::new();
+    assert!(Conv2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::Conv2dOptions {
+            stride: [0, 1],
+            ..crate::Conv2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .is_err());
+    assert!(Conv2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::Conv2dOptions {
+            dilation: [1, 0],
+            ..crate::Conv2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let layer = Conv2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::Conv2dOptions::default(),
+        true,
+        2,
+    )
+    .unwrap();
+    assert_eq!(layer.weight.shape().unwrap().dims(), &[4, 2, 3, 2]);
+}
+
+#[test]
+fn transpose_conv2d_preflights_geometry_and_input_before_parameter_binding() {
+    let mut graph = Graph::new();
+    assert!(ConvTranspose2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::ConvTranspose2dOptions {
+            stride: [0, 1],
+            ..crate::ConvTranspose2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .is_err());
+    assert!(ConvTranspose2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::ConvTranspose2dOptions {
+            stride: [1, 1],
+            output_padding: [1, 0],
+            ..crate::ConvTranspose2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .is_err());
+
+    let layer = ConvTranspose2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::ConvTranspose2dOptions {
+            groups: 2,
+            stride: [2, 1],
+            output_padding: [1, 0],
+            ..crate::ConvTranspose2dOptions::default()
+        },
+        true,
+        2,
+    )
+    .unwrap();
+    assert_eq!(layer.weight.shape().unwrap().dims(), &[2, 2, 3, 2]);
+    let wrong_rank = graph.input("wrong_rank", [1, 2, 2]);
+    assert!(layer.forward(&mut graph, wrong_rank).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let wrong_channels = graph.input("wrong_channels", [1, 1, 2, 2]);
+    assert!(layer.forward(&mut graph, wrong_channels).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let input = graph.input("x", [1, 2, 2, 2]);
+    let output = layer.forward(&mut graph, input).unwrap();
+    assert_eq!(graph.shape(output).unwrap().dims(), &[1, 4, 6, 3]);
+}
+
+#[test]
+fn transpose_conv1d_preflights_input_before_parameter_binding() {
+    let mut graph = Graph::new();
+    let layer = ConvTranspose1d::new(
+        &mut graph,
+        2,
+        4,
+        3,
+        crate::ConvTranspose1dOptions {
+            groups: 2,
+            stride: 2,
+            output_padding: 1,
+            ..crate::ConvTranspose1dOptions::default()
+        },
+        true,
+        3,
+    )
+    .unwrap();
+    assert_eq!(layer.weight.shape().unwrap().dims(), &[2, 2, 3]);
+    let wrong_rank = graph.input("wrong_rank", [1, 2]);
+    assert!(layer.forward(&mut graph, wrong_rank).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let wrong_channels = graph.input("wrong_channels", [1, 1, 3]);
+    assert!(layer.forward(&mut graph, wrong_channels).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let input = graph.input("x", [1, 2, 3]);
+    let output = layer.forward(&mut graph, input).unwrap();
+    assert_eq!(graph.shape(output).unwrap().dims(), &[1, 4, 8]);
 }

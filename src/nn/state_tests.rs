@@ -76,6 +76,13 @@ impl Module for OneParameter {
     }
 }
 
+struct ScalarParameter(Parameter);
+impl Module for ScalarParameter {
+    fn visit(&self, prefix: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        v(join(prefix, "value"), &self.0, StateKind::Parameter)
+    }
+}
+
 #[test]
 fn parameter_binding_is_graph_local_versioned_and_captures_values() {
     let parameter = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
@@ -179,6 +186,220 @@ impl Module for Tied {
         v(join(p, "running"), &self.running, StateKind::Buffer)
     }
 }
+
+struct Stateless;
+impl Module for Stateless {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
+struct DuplicateNames {
+    first: Parameter,
+    replacement: Parameter,
+    middle: Parameter,
+}
+impl Module for DuplicateNames {
+    fn visit(&self, _: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        v("first".into(), &self.first, StateKind::Parameter);
+        v("duplicate".into(), &self.first, StateKind::Parameter);
+        v("middle".into(), &self.middle, StateKind::Buffer);
+        v("duplicate".into(), &self.replacement, StateKind::Parameter);
+    }
+}
+
+#[test]
+fn live_get_state_dict_preserves_prefix_order_buffers_and_tied_liveness() {
+    let mut graph = Graph::new();
+    let left = Linear::new(&mut graph, 2, 2, false, 1).unwrap();
+    let running = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), false);
+    let tied = Tied {
+        right: left.weight.clone(),
+        left,
+        running: running.clone(),
+    };
+    let state = get_state_dict(&tied, "root.");
+    assert_eq!(state.len(), 3);
+    assert!(!state.is_empty());
+    assert_eq!(
+        state.keys().collect::<Vec<_>>(),
+        vec!["root.layers.0.weight", "root.layers.1.weight", "root.running"]
+    );
+    assert_eq!(
+        state
+            .entries()
+            .map(|(name, parameter)| (name, parameter.id()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("root.layers.0.weight", tied.left.weight.id()),
+            ("root.layers.1.weight", tied.right.id()),
+            ("root.running", running.id()),
+        ]
+    );
+    assert_eq!(
+        state.get("root.layers.0.weight").unwrap().id(),
+        state.get("root.layers.1.weight").unwrap().id()
+    );
+    tied.left
+        .weight
+        .replace(TensorData::new([2, 2], vec![3.; 4]).unwrap())
+        .unwrap();
+    assert_eq!(
+        state
+            .get("root.layers.1.weight")
+            .unwrap()
+            .value()
+            .unwrap(),
+        TensorData::new([2, 2], vec![3.; 4]).unwrap()
+    );
+
+    let one = OneParameter(Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true));
+    assert_eq!(
+        get_state_dict(&one, "root")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["rootvalue"]
+    );
+    assert_eq!(
+        get_state_dict(&one, "root.")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["root.value"]
+    );
+    let first = Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true);
+    let second = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let mut nested = Sequential::default();
+    nested.push(OneParameter(second));
+    let mut sequence = Sequential::default();
+    sequence.push(OneParameter(first));
+    sequence.push(nested);
+    assert_eq!(
+        get_state_dict(&sequence, "")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["0.value", "1.0.value"]
+    );
+    assert!(get_state_dict(&Stateless, "root.").is_empty());
+}
+
+#[test]
+fn live_get_state_dict_keeps_duplicate_key_position_and_refactors_get_parameters() {
+    let first = Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true);
+    let replacement = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let middle = Parameter::new(TensorData::new([1], vec![3.]).unwrap(), false);
+    let duplicate = DuplicateNames {
+        first: first.clone(),
+        replacement: replacement.clone(),
+        middle: middle.clone(),
+    };
+    let state = get_state_dict(&duplicate, "");
+    assert_eq!(state.keys().collect::<Vec<_>>(), vec!["first", "duplicate", "middle"]);
+    assert_eq!(state.get("duplicate").unwrap().id(), replacement.id());
+    assert_eq!(
+        state.values().map(Parameter::id).collect::<Vec<_>>(),
+        vec![first.id(), replacement.id(), middle.id()]
+    );
+    assert_eq!(
+        state
+            .clone()
+            .into_entries()
+            .into_iter()
+            .map(|(name, parameter)| (name, parameter.id()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("first".into(), first.id()),
+            ("duplicate".into(), replacement.id()),
+            ("middle".into(), middle.id()),
+        ]
+    );
+    assert_eq!(
+        get_parameters(&duplicate)
+            .iter()
+            .map(Parameter::id)
+            .collect::<Vec<_>>(),
+        state.values().map(Parameter::id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn live_get_state_dict_never_snapshots_locks_or_mutates_handles() {
+    let parameter = Parameter::new(TensorData::new([1], vec![4.]).unwrap(), true);
+    let module = OneParameter(parameter.clone());
+    let version = parameter.version().unwrap();
+    let value = parameter.value().unwrap();
+    let state = get_state_dict(&module, "");
+    assert_eq!(state.get("value").unwrap().id(), parameter.id());
+    assert_eq!(parameter.version().unwrap(), version);
+    assert_eq!(parameter.value().unwrap(), value);
+
+    parameter.poison_for_test();
+    let poisoned = get_state_dict(&module, "");
+    assert_eq!(poisoned.len(), 1);
+    assert_eq!(poisoned.get("value").unwrap().id(), parameter.id());
+    assert!(matches!(
+        parameter.snapshot(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+}
+
+#[test]
+fn get_parameters_preserves_declared_order_buffers_and_tied_handles() {
+    let mut graph = Graph::new();
+    let left = Linear::new(&mut graph, 2, 2, false, 1).unwrap();
+    let running = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), false);
+    let tied = Tied {
+        right: left.weight.clone(),
+        left,
+        running: running.clone(),
+    };
+    let handles = get_parameters(&tied);
+    assert_eq!(handles.len(), 3);
+    assert_eq!(handles[0].id(), tied.left.weight.id());
+    assert_eq!(handles[1].id(), tied.right.id());
+    assert_eq!(handles[2].id(), running.id());
+    assert_eq!(handles[0].id(), handles[1].id());
+    assert!(!handles[2].is_trainable());
+
+    let first = Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true);
+    let second = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let third = Parameter::new(TensorData::new([1], vec![3.]).unwrap(), true);
+    let mut nested = Sequential::default();
+    nested.push(OneParameter(second.clone()));
+    nested.push(OneParameter(third.clone()));
+    let mut sequence = Sequential::default();
+    sequence.push(OneParameter(first.clone()));
+    sequence.push(nested);
+    assert_eq!(
+        get_parameters(&sequence)
+            .iter()
+            .map(Parameter::id)
+            .collect::<Vec<_>>(),
+        vec![first.id(), second.id(), third.id()]
+    );
+
+    assert!(get_parameters(&Stateless).is_empty());
+}
+
+#[test]
+fn get_parameters_clones_handles_without_snapshotting_locking_or_mutation() {
+    let parameter = Parameter::new(TensorData::new([1], vec![4.]).unwrap(), true);
+    let module = OneParameter(parameter.clone());
+    let version = parameter.version().unwrap();
+    let value = parameter.value().unwrap();
+    let handles = get_parameters(&module);
+    assert_eq!(handles.len(), 1);
+    assert_eq!(handles[0].id(), parameter.id());
+    assert_eq!(parameter.version().unwrap(), version);
+    assert_eq!(parameter.value().unwrap(), value);
+
+    parameter.poison_for_test();
+    let poisoned_handles = get_parameters(&module);
+    assert_eq!(poisoned_handles.len(), 1);
+    assert_eq!(poisoned_handles[0].id(), parameter.id());
+    assert!(matches!(
+        parameter.snapshot(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+}
+
 #[test]
 fn state_is_deterministic_shared_and_safetensors_portable() {
     let mut graph = Graph::new();
@@ -338,6 +559,121 @@ fn strict_loading_lock_failure_leaves_other_parameters_unchanged() {
         Err(Error::ParameterLockPoisoned { .. })
     ));
     assert_eq!(first.value().unwrap(), first_before);
+}
+
+#[test]
+fn strict_state_load_preflights_every_container_parameter_before_replacement() {
+    let mut graph = Graph::new();
+    let linear = Linear::new(&mut graph, 2, 1, true, 7).unwrap();
+    let weight_before = linear.weight.snapshot().unwrap();
+    let bias = linear.bias.as_ref().unwrap();
+    let bias_before = bias.snapshot().unwrap();
+
+    let mut malformed = linear.state_dict().unwrap().into_tensors();
+    malformed.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
+    malformed.insert("weight".into(), TensorData::new([1], vec![7.]).unwrap());
+    assert!(linear
+        .load_state_dict(&StateDict::from(malformed), true, CastPolicy::Exact)
+        .is_err());
+    let weight_after_failure = linear.weight.snapshot().unwrap();
+    let bias_after_failure = bias.snapshot().unwrap();
+    assert_eq!(weight_after_failure.data, weight_before.data);
+    assert_eq!(weight_after_failure.version, weight_before.version);
+    assert_eq!(bias_after_failure.data, bias_before.data);
+    assert_eq!(bias_after_failure.version, bias_before.version);
+
+    let mut valid = linear.state_dict().unwrap().into_tensors();
+    valid.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
+    valid.insert(
+        "weight".into(),
+        TensorData::new([1, 2], vec![7., 8.]).unwrap(),
+    );
+    let report = linear
+        .load_state_dict(&StateDict::from(valid), true, CastPolicy::Exact)
+        .unwrap();
+    assert!(report.is_clean());
+    let weight_after_success = linear.weight.snapshot().unwrap();
+    let bias_after_success = bias.snapshot().unwrap();
+    assert_eq!(f32s(&weight_after_success.data), vec![7., 8.]);
+    assert_eq!(f32s(&bias_after_success.data), vec![5.]);
+    assert_eq!(weight_after_success.version, weight_before.version.checked_add(1).unwrap());
+    assert_eq!(bias_after_success.version, bias_before.version.checked_add(1).unwrap());
+}
+
+#[test]
+fn state_load_admits_only_the_tinygrad_scalar_singleton_shape_bridge() {
+    let vector_parameter = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), true);
+    let vector = OneParameter(vector_parameter.clone());
+    let report = vector
+        .load_state_dict(
+            &StateDict::from(BTreeMap::from([(
+                "value".into(),
+                TensorData::scalar(-0.0),
+            )])),
+            true,
+            CastPolicy::Exact,
+        )
+        .unwrap();
+    assert!(report.is_clean());
+    let vector_snapshot = vector_parameter.snapshot().unwrap();
+    assert_eq!(vector_snapshot.shape.dims(), [1]);
+    assert_eq!(f32s(&vector_snapshot.data)[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(vector_snapshot.version, 1);
+
+    let scalar_parameter = Parameter::new(TensorData::scalar(0.0), true);
+    let scalar = ScalarParameter(scalar_parameter.clone());
+    let report = scalar
+        .load_state_dict(
+            &StateDict::from(BTreeMap::from([(
+                "value".into(),
+                TensorData::new([1], vec![3.5]).unwrap(),
+            )])),
+            true,
+            CastPolicy::Exact,
+        )
+        .unwrap();
+    assert!(report.is_clean());
+    let scalar_snapshot = scalar_parameter.snapshot().unwrap();
+    assert!(scalar_snapshot.shape.dims().is_empty());
+    assert_eq!(f32s(&scalar_snapshot.data), vec![3.5]);
+    assert_eq!(scalar_snapshot.version, 1);
+}
+
+#[test]
+fn parameter_version_overflow_is_preflighted_without_any_publication() {
+    let parameter = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let tied = parameter.clone();
+    parameter.set_version_for_test(u64::MAX).unwrap();
+    let before = parameter.snapshot().unwrap();
+    assert!(matches!(
+        parameter.replace(TensorData::new([1], vec![3.]).unwrap()),
+        Err(Error::ParameterVersionOverflow { version: u64::MAX })
+    ));
+    assert_eq!(parameter.snapshot().unwrap().data, before.data);
+    assert_eq!(parameter.snapshot().unwrap().version, before.version);
+    assert_eq!(tied.snapshot().unwrap().data, before.data);
+    assert_eq!(tied.snapshot().unwrap().version, before.version);
+
+    let mut graph = Graph::new();
+    let linear = Linear::new(&mut graph, 2, 1, true, 7).unwrap();
+    let bias = linear.bias.as_ref().unwrap();
+    linear.weight.set_version_for_test(u64::MAX).unwrap();
+    let weight_before = linear.weight.snapshot().unwrap();
+    let bias_before = bias.snapshot().unwrap();
+    let mut state = linear.state_dict().unwrap().into_tensors();
+    state.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
+    state.insert(
+        "weight".into(),
+        TensorData::new([1, 2], vec![7., 8.]).unwrap(),
+    );
+    assert!(matches!(
+        linear.load_state_dict(&StateDict::from(state), true, CastPolicy::Exact),
+        Err(Error::ParameterVersionOverflow { version: u64::MAX })
+    ));
+    assert_eq!(linear.weight.snapshot().unwrap().data, weight_before.data);
+    assert_eq!(linear.weight.snapshot().unwrap().version, weight_before.version);
+    assert_eq!(bias.snapshot().unwrap().data, bias_before.data);
+    assert_eq!(bias.snapshot().unwrap().version, bias_before.version);
 }
 
 #[test]

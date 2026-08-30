@@ -24,7 +24,72 @@ fn normalized_model_is_order_independent_and_dot_escapes() {
 }
 
 #[test]
-fn malformed_models_and_unsupported_graph_ops_fail_closed() {
+fn typed_trace_visualization_is_deterministic_and_fail_closed() {
+    let compile = crate::CompileTrace { output: NodeId::from_index(1), steps: vec![
+        crate::TraceStep { node: NodeId::from_index(0), operation: "input".into(), shape: Shape::from([]), dtype: DType::F32 },
+        crate::TraceStep { node: NodeId::from_index(1), operation: "relu".into(), shape: Shape::from([0]), dtype: DType::F16 },
+    ]};
+    let dot = crate::compile_trace_viz(&compile).unwrap().to_dot();
+    assert!(dot.contains("sequence=0") && dot.contains("sequence=1") && dot.contains("declared_output=true") && dot.contains("shape=[]") && dot.contains("shape=[0]"));
+    let duplicate = crate::CompileTrace { output: NodeId::from_index(0), steps: vec![compile.steps[0].clone(), compile.steps[0].clone()] };
+    assert!(matches!(crate::compile_trace_viz(&duplicate), Err(VizError::DuplicateNode(_))));
+    let missing = crate::CompileTrace { output: NodeId::from_index(9), steps: compile.steps };
+    assert!(matches!(crate::compile_trace_viz(&missing), Err(VizError::InvalidGraphNode(9))));
+
+    let trace = crate::RealizationTrace { items: vec![
+        crate::ItemTrace { item: 1, dependencies: vec![], backend: crate::ItemBackend::Interpreter, cache_key: 7, materialized_buffer: 9, last_consumer: Some(3), allocation_id: Some(4), physical_slot: Some(5), generation: Some(6), reused_from: None, released_buffers: vec![8], lanes: 4, vector_main: 3, vector_tail: 1, vector_reason: "tail".into() },
+        crate::ItemTrace { item: 2, dependencies: vec![1], backend: crate::ItemBackend::NativeJit, cache_key: 10, materialized_buffer: 11, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: Some(4), released_buffers: vec![], lanes: 1, vector_main: 0, vector_tail: 1, vector_reason: "scalar".into() },
+        crate::ItemTrace { item: 3, dependencies: vec![1], backend: crate::ItemBackend::JitFallback, cache_key: 12, materialized_buffer: 13, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: None, released_buffers: vec![], lanes: 1, vector_main: 1, vector_tail: 0, vector_reason: "fallback".into() },
+    ]};
+    let dot = crate::realization_trace_viz(&trace).unwrap().to_dot();
+    for field in ["backend=interpreter", "backend=native_jit", "backend=jit_fallback", "cache_key=7", "buffer=9", "last_consumer=3", "allocation=4", "slot=5", "generation=6", "reused_from=4", "released=[8]", "vector_tail=1", "vector_reason=tail"] { assert!(dot.contains(field), "{field}"); }
+    let missing_dependency = crate::RealizationTrace { items: vec![crate::ItemTrace { item: 1, dependencies: vec![99], backend: crate::ItemBackend::Interpreter, cache_key: 0, materialized_buffer: 0, last_consumer: None, allocation_id: None, physical_slot: None, generation: None, reused_from: None, released_buffers: vec![], lanes: 1, vector_main: 1, vector_tail: 0, vector_reason: String::new() }] };
+    assert!(matches!(crate::realization_trace_viz(&missing_dependency), Err(VizError::MissingEndpoint { .. })));
+    assert!(matches!(crate::realization_trace_viz(&crate::RealizationTrace { items: vec![crate::ItemTrace { lanes: 2, vector_main: 2, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
+    assert!(matches!(crate::realization_trace_viz(&crate::RealizationTrace { items: vec![crate::ItemTrace { lanes: usize::MAX, vector_main: usize::MAX, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
+}
+
+#[test]
+fn cuda_trace_visualization_preserves_typed_submission_order() {
+    let device = crate::DeviceId::new("cuda:0").unwrap();
+    let collective = vec![
+        crate::CudaCollectiveTrace { action_id: 1, operation: "copy", device: device.clone(), range: crate::LogicalRange { start: 0, len: 0 }, cache_key: None },
+        crate::CudaCollectiveTrace { action_id: 2, operation: "add", device, range: crate::LogicalRange { start: 4, len: 8 }, cache_key: Some("cache".into()) },
+    ];
+    let dot = crate::cuda_collective_trace_viz(&collective).unwrap().to_dot();
+    for field in ["operation=copy", "operation=add", "device=cuda:0", "range=0:0", "range=4:8", "cache_key=none", "cache_key=cache", "order:next"] { assert!(dot.contains(field), "{field}"); }
+    assert!(crate::cuda_collective_trace_viz(&[]).unwrap().nodes().is_empty());
+    assert!(matches!(crate::cuda_collective_trace_viz(&[collective[0].clone(), collective[0].clone()]), Err(VizError::DuplicateNode(_))));
+    let stages = vec![crate::ShardedCudaExecutionTrace { stage: 1, action: "run", skipped: false }, crate::ShardedCudaExecutionTrace { stage: 2, action: "skip", skipped: true }];
+    let dot = crate::sharded_cuda_execution_trace_viz(&stages).unwrap().to_dot();
+    assert!(dot.contains("action=run") && dot.contains("skipped=false") && dot.contains("action=skip") && dot.contains("skipped=true"));
+    assert!(crate::sharded_cuda_execution_trace_viz(&[]).unwrap().nodes().is_empty());
+    assert!(matches!(crate::sharded_cuda_execution_trace_viz(&[stages[0].clone(), stages[0].clone()]), Err(VizError::DuplicateNode(_))));
+}
+
+#[test]
+fn replay_trace_visualization_preserves_typed_fields_and_duplicates() {
+    let trace = crate::CapturedReplayTrace { items: vec![
+        crate::CapturedItemTrace { invocation: 0, item: 1, backend: crate::ItemBackend::Interpreter, schedule_cache_key: 1, native_cache_key: None, cache_hit: false, lanes: 4, vector_main: 3, vector_tail: 1, packed_weight_bytes: 8, reason: "tail".into() },
+        crate::CapturedItemTrace { invocation: 1, item: 1, backend: crate::ItemBackend::NativeJit, schedule_cache_key: 2, native_cache_key: Some("native".into()), cache_hit: true, lanes: 4, vector_main: 4, vector_tail: 0, packed_weight_bytes: 0, reason: "full".into() },
+        crate::CapturedItemTrace { invocation: 1, item: 2, backend: crate::ItemBackend::JitFallback, schedule_cache_key: 3, native_cache_key: None, cache_hit: false, lanes: 1, vector_main: 0, vector_tail: 1, packed_weight_bytes: 0, reason: "fallback".into() },
+    ]};
+    let dot = crate::captured_replay_trace_viz(&trace).unwrap().to_dot();
+    for field in ["backend=interpreter", "backend=native_jit", "backend=jit_fallback", "cache_hit=true", "native_cache_key=native", "vector_tail=1", "packed_weight_bytes=8", "order:next"] { assert!(dot.contains(field)); }
+    assert!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace::default()).unwrap().nodes().is_empty());
+    assert!(matches!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace { items: vec![trace.items[0].clone(), trace.items[0].clone()] }), Err(VizError::DuplicateNode(_))));
+    assert!(matches!(crate::captured_replay_trace_viz(&crate::CapturedReplayTrace { items: vec![crate::CapturedItemTrace { lanes: 2, vector_main: 2, vector_tail: 1, ..trace.items[0].clone() }] }), Err(VizError::InvalidSchedule(_))));
+    let specialization = crate::CapturedSpecializationTrace { source_identity: 1, concrete_identity: 2, bindings: vec![(9, -1), (3, 4)], cache_hit: true };
+    assert!(crate::captured_specialization_trace_viz(&specialization).unwrap().to_dot().contains("bindings=[9:-1,3:4]"));
+    let replay = crate::NativeMixedReplayTrace { identity: 1, artifact_identity: 2, vectorized: true, pure_item_cache_keys: vec![3, 4] };
+    assert!(crate::native_mixed_replay_trace_viz(&replay).unwrap().to_dot().contains("pure_item_cache_keys=[3,4]"));
+    let batch = crate::NativeMixedBatchTrace { identity: 1, batch_identity: 2, vectorized: false, binding_count: 2, binding_schema_keys: vec![5, 6], pure_item_cache_keys: vec![7] };
+    assert!(crate::native_mixed_batch_trace_viz(&batch).unwrap().to_dot().contains("binding_schema_keys=[5,6]"));
+    assert!(matches!(crate::native_mixed_batch_trace_viz(&crate::NativeMixedBatchTrace { binding_count: 1, ..batch }), Err(VizError::InvalidSchedule(_))));
+}
+
+#[test]
+fn malformed_models_and_invalid_graph_nodes_fail_closed() {
     assert!(matches!(
         VizGraph::try_new(
             "x",
@@ -33,17 +98,383 @@ fn malformed_models_and_unsupported_graph_ops_fail_closed() {
         ),
         Err(VizError::MissingEndpoint { .. })
     ));
-    let mut graph = Graph::new();
-    let input = graph.input("x", [2]);
-    let padded = graph.pad(input, [(1, 1)], crate::Scalar::F(0.0)).unwrap();
-    assert!(matches!(
-        graph_viz(&graph, &[padded]),
-        Err(VizError::UnsupportedGraphOp(_))
-    ));
+    let graph = Graph::new();
     assert!(matches!(
         graph_viz(&graph, &[NodeId::from_index(99)]),
         Err(VizError::InvalidGraphNode(99))
     ));
+}
+
+#[test]
+fn static_index_graph_visualization_preserves_normalized_output_geometry() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [3, 4]);
+    let indexed = graph
+        .static_index(
+            input,
+            &[
+                crate::ir::indexing::StaticIndex::Slice {
+                    start: Some(-3),
+                    stop: None,
+                    step: 2,
+                },
+                crate::ir::indexing::StaticIndex::Advanced {
+                    shape: Shape::from([2]),
+                    values: vec![1, 1],
+                },
+            ],
+        )
+        .unwrap();
+    let first = graph_viz(&graph, &[indexed]).unwrap();
+    assert_eq!(first, graph_viz(&graph, &[indexed]).unwrap());
+    let dot = first.to_dot();
+    assert!(dot.contains("static_index\\nkind=graph_op"));
+    assert!(dot.contains("index_shape=[2,2]"));
+    assert!(dot.contains("data:0:input"));
+}
+
+#[test]
+fn reduction_derivative_graph_visualization_preserves_axes_and_sum_to_target() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2, 3, 4]);
+    let upstream = graph.input("upstream", [2, 1, 1]);
+    let gradient = graph
+        .reduce_grad(
+            input,
+            upstream,
+            crate::ReduceKind::Mean,
+            vec![1, 2],
+            true,
+        )
+        .unwrap();
+    let cotangent = graph.input("cotangent", [2, 3, 4]);
+    let vjp = graph
+        .reduce_grad_vjp(
+            cotangent,
+            input,
+            upstream,
+            crate::ReduceKind::Mean,
+            vec![1, 2],
+            true,
+            1,
+        )
+        .unwrap();
+    let compact_upstream = graph.input("compact_upstream", [2]);
+    let compact_gradient = graph
+        .reduce_grad(
+            input,
+            compact_upstream,
+            crate::ReduceKind::Sum,
+            vec![1, 2],
+            false,
+        )
+        .unwrap();
+    let scalar = graph.input("scalar", []);
+    let scalar_sum = graph.sum_to(scalar, Shape::from([])).unwrap();
+    let broadcast = graph.input("broadcast", [2, 3, 4]);
+    let summed = graph.sum_to(broadcast, Shape::from([1, 3, 1])).unwrap();
+
+    let first = graph_viz(
+        &graph,
+        &[gradient, vjp, compact_gradient, scalar_sum, summed],
+    )
+    .unwrap();
+    let second = graph_viz(
+        &graph,
+        &[gradient, vjp, compact_gradient, scalar_sum, summed],
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let dot = first.to_dot();
+    assert!(dot.contains("reduce_grad\\nkind=graph_op"));
+    assert!(dot.contains("reduce_grad_vjp\\nkind=graph_op"));
+    assert!(dot.contains("reduction=mean"));
+    assert!(dot.contains("axes=[1,2]"));
+    assert!(dot.contains("keepdim=true"));
+    assert!(dot.contains("keepdim=false"));
+    assert!(dot.contains("wrt=1"));
+    assert!(dot.contains("data:0:input"));
+    assert!(dot.contains("data:1:upstream"));
+    assert!(dot.contains("data:0:cotangent"));
+    assert!(dot.contains("sum_to\\nkind=graph_op"));
+    assert!(dot.contains("target_shape=[]"));
+    assert!(dot.contains("target_shape=[1,3,1]"));
+    assert!(dot.contains("shape=[2,3,4]"));
+}
+
+#[test]
+fn matmul_grad_graph_visualization_preserves_batched_vector_and_vjp_roles() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2, 1, 3, 4]);
+    let rhs = graph.input("rhs", [1, 5, 4, 6]);
+    let upstream = graph.input("upstream", [2, 5, 3, 6]);
+    let gradient = graph.matmul_grad(upstream, lhs, rhs, true).unwrap();
+    let cotangent = graph.input("cotangent", [2, 1, 3, 4]);
+    let vjp = graph
+        .matmul_grad_vjp(cotangent, upstream, lhs, rhs, true, 2)
+        .unwrap();
+
+    let vector = graph.input("vector", [4]);
+    let matrix = graph.input("matrix", [2, 4, 3]);
+    let vector_upstream = graph.input("vector_upstream", [2, 3]);
+    let vector_gradient = graph
+        .matmul_grad(vector_upstream, vector, matrix, false)
+        .unwrap();
+
+    let first = graph_viz(&graph, &[gradient, vjp, vector_gradient]).unwrap();
+    let second = graph_viz(&graph, &[gradient, vjp, vector_gradient]).unwrap();
+    assert_eq!(first, second);
+    let dot = first.to_dot();
+    assert!(dot.contains("matmul_grad\\nkind=graph_op"));
+    assert!(dot.contains("matmul_grad_vjp\\nkind=graph_op"));
+    assert!(dot.contains("target=lhs"));
+    assert!(dot.contains("target=rhs"));
+    assert!(dot.contains("wrt=2"));
+    assert!(dot.contains("data:0:upstream"));
+    assert!(dot.contains("data:1:lhs"));
+    assert!(dot.contains("data:2:rhs"));
+    assert!(dot.contains("data:0:cotangent"));
+    assert!(dot.contains("shape=[2,1,3,4]"));
+    assert!(dot.contains("shape=[1,5,4,6]"));
+    assert!(dot.contains("shape=[2,4,3]"));
+}
+
+#[test]
+fn convolution_graph_visualization_preserves_roles_geometry_and_derivatives() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [1, 2, 5, 6]);
+    let weight = graph.input("weight", [2, 1, 2, 3]);
+    let bias = graph.input("bias", [2]);
+    let options = crate::Conv2dOptions {
+        groups: 2,
+        stride: [2, 1],
+        dilation: [1, 2],
+        padding: [1, 0, 2, 1],
+    };
+    let forward = graph.conv2d(input, weight, Some(bias), options).unwrap();
+    let upstream = graph.input("upstream", [1, 2, 3, 5]);
+    let gradient = graph
+        .conv2d_grad(upstream, input, weight, Some(bias), options, 1)
+        .unwrap();
+    let cotangent = graph.input("cotangent", [2, 1, 2, 3]);
+    let vjp = graph
+        .conv2d_grad_vjp(cotangent, upstream, input, weight, Some(bias), options, 1, 0)
+        .unwrap();
+
+    let transpose_input = graph.input("transpose_input", [1, 2, 3, 4]);
+    let transpose_weight = graph.input("transpose_weight", [2, 1, 2, 3]);
+    let transpose_options = crate::ConvTranspose2dOptions {
+        groups: 2,
+        stride: [2, 2],
+        dilation: [1, 2],
+        padding: [1, 0, 2, 1],
+        output_padding: [1, 1],
+    };
+    let transpose = graph
+        .conv_transpose2d(transpose_input, transpose_weight, None, transpose_options)
+        .unwrap();
+    let transpose_upstream = graph.input("transpose_upstream", [1, 2, 6, 9]);
+    let transpose_gradient = graph
+        .conv_transpose2d_grad(
+            transpose_upstream,
+            transpose_input,
+            transpose_weight,
+            None,
+            transpose_options,
+            0,
+        )
+        .unwrap();
+    let transpose_cotangent = graph.input("transpose_cotangent", [1, 2, 3, 4]);
+    let transpose_vjp = graph
+        .conv_transpose2d_grad_vjp(
+            transpose_cotangent,
+            transpose_upstream,
+            transpose_input,
+            transpose_weight,
+            None,
+            transpose_options,
+            0,
+            1,
+        )
+        .unwrap();
+
+    let first = graph_viz(
+        &graph,
+        &[forward, gradient, vjp, transpose, transpose_gradient, transpose_vjp],
+    )
+    .unwrap();
+    let second = graph_viz(
+        &graph,
+        &[forward, gradient, vjp, transpose, transpose_gradient, transpose_vjp],
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let dot = first.to_dot();
+    assert!(dot.contains("conv2d\\nkind=graph_op"));
+    assert!(dot.contains("conv_transpose2d\\nkind=graph_op"));
+    assert!(dot.contains("groups=2"));
+    assert!(dot.contains("stride=[2,1]"));
+    assert!(dot.contains("dilation=[1,2]"));
+    assert!(dot.contains("padding=[1,0,2,1]"));
+    assert!(dot.contains("output_padding=[1,1]"));
+    assert!(dot.contains("target=1"));
+    assert!(dot.contains("wrt=0"));
+    assert!(dot.contains("target=0"));
+    assert!(dot.contains("wrt=1"));
+    assert!(dot.contains("data:0:input"));
+    assert!(dot.contains("data:1:weight"));
+    assert!(dot.contains("data:2:bias"));
+    assert!(dot.contains("data:0:upstream"));
+    assert!(dot.contains("data:0:cotangent"));
+    assert!(dot.contains("shape=[1,2,3,5]"));
+    assert!(dot.contains("shape=[1,2,6,9]"));
+}
+
+#[test]
+fn einsum_graph_visualization_preserves_normalized_plan_and_derivative_roles() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2, 3]);
+    let rhs = graph.input("rhs", [3, 4]);
+    let forward = graph.einsum("ij,jk->ik", &[lhs, rhs]).unwrap();
+    let upstream = graph.input("upstream", [2, 4]);
+    let plan = crate::EinsumPlan::parse(
+        "ij,jk->ik",
+        &[Shape::from([2, 3]), Shape::from([3, 4])],
+    )
+    .unwrap();
+    let gradient = graph
+        .einsum_grad(upstream, &[lhs, rhs], plan.clone(), 0)
+        .unwrap();
+    let cotangent = graph.input("cotangent", [2, 3]);
+    let vjp = graph
+        .einsum_grad_vjp(cotangent, upstream, &[lhs, rhs], plan, 0, 1)
+        .unwrap();
+
+    let first = graph_viz(&graph, &[forward, gradient, vjp]).unwrap();
+    let second = graph_viz(&graph, &[forward, gradient, vjp]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=lhs\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=rhs\\nnode=1\\nshape=[3,4]\"];\n  \"g2\" [label=\"einsum\\nkind=graph_op\\ncontracted_labels=[j]\\ndtype=f32\\nnode=2\\noperand_labels=[[i,j],[j,k]]\\noutput_labels=[i,k]\\nplan_key=operands=[[i,j],[j,k]];extents=[i:2,j:3,k:4];output=[i,k];contracted=[j]\\nshape=[2,4]\"];\n  \"g3\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=upstream\\nnode=3\\nshape=[2,4]\"];\n  \"g4\" [label=\"einsum_grad\\nkind=graph_op\\ncontracted_labels=[j]\\ndtype=f32\\nnode=4\\noperand_labels=[[i,j],[j,k]]\\noutput_labels=[i,k]\\nplan_key=operands=[[i,j],[j,k]];extents=[i:2,j:3,k:4];output=[i,k];contracted=[j]\\nshape=[2,3]\\ntarget_operand=0\"];\n  \"g5\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=cotangent\\nnode=5\\nshape=[2,3]\"];\n  \"g6\" [label=\"einsum_grad_vjp\\nkind=graph_op\\ncontracted_labels=[j]\\ndtype=f32\\nnode=6\\noperand_labels=[[i,j],[j,k]]\\noutput_labels=[i,k]\\nplan_key=operands=[[i,j],[j,k]];extents=[i:2,j:3,k:4];output=[i,k];contracted=[j]\\nshape=[3,4]\\ntarget_operand=0\\nwrt=1\"];\n  \"g0\" -> \"g2\" [label=\"data:0:operand_0\"];\n  \"g0\" -> \"g4\" [label=\"data:1:operand_0\"];\n  \"g0\" -> \"g6\" [label=\"data:2:operand_0\"];\n  \"g1\" -> \"g2\" [label=\"data:1:operand_1\"];\n  \"g1\" -> \"g4\" [label=\"data:2:operand_1\"];\n  \"g1\" -> \"g6\" [label=\"data:3:operand_1\"];\n  \"g3\" -> \"g4\" [label=\"data:0:upstream\"];\n  \"g3\" -> \"g6\" [label=\"data:1:upstream\"];\n  \"g5\" -> \"g6\" [label=\"data:0:cotangent\"];\n}\n"
+    );
+
+    let ellipsis_lhs = graph.input("ellipsis_lhs", [2, 3, 4]);
+    let ellipsis_rhs = graph.input("ellipsis_rhs", [4]);
+    let ellipsis = graph
+        .einsum("...i,i->...", &[ellipsis_lhs, ellipsis_rhs])
+        .unwrap();
+    let diagonal = graph.input("diagonal", [3, 3]);
+    let trace = graph.einsum("ii->", &[diagonal]).unwrap();
+    let metadata = format!(
+        "{}{}",
+        graph_viz(&graph, &[ellipsis]).unwrap().to_dot(),
+        graph_viz(&graph, &[trace]).unwrap().to_dot(),
+    );
+    assert!(metadata.contains("...0"));
+    assert!(metadata.contains("operand_labels=[[i,i]]"));
+}
+
+#[test]
+fn scatter_positions_graph_visualization_preserves_static_map_geometry() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2]);
+    // A zero step makes both input coordinates target the same destination.
+    // The graph-level map preserves that duplicate geometry verbatim.
+    let placed = graph
+        .scatter_positions(input, Shape::from([1]), vec![0], vec![0])
+        .unwrap();
+    let cotangent = graph.input("cotangent", [1]);
+    let read = graph
+        .scatter_positions_vjp(cotangent, Shape::from([2]), vec![0], vec![0])
+        .unwrap();
+    let first = graph_viz(&graph, &[placed, read]).unwrap();
+    let second = graph_viz(&graph, &[placed, read]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2]\"];\n  \"g1\" [label=\"scatter_positions\\nkind=graph_op\\ndtype=f32\\nmode=place\\nnode=1\\nshape=[1]\\nstarts=[0]\\nsteps=[0]\\ntarget_shape=[1]\"];\n  \"g2\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=cotangent\\nnode=2\\nshape=[1]\"];\n  \"g3\" [label=\"scatter_positions_vjp\\nkind=graph_op\\ndtype=f32\\ninput_shape=[2]\\nmode=read_static_map\\nnode=3\\nshape=[2]\\nstarts=[0]\\nsteps=[0]\"];\n  \"g0\" -> \"g1\" [label=\"data:0:input\"];\n  \"g2\" -> \"g3\" [label=\"data:0:cotangent\"];\n}\n"
+    );
+
+    let empty = graph.input("empty", [0, 2]);
+    let empty_map = graph
+        .scatter_positions(empty, Shape::from([0, 4]), vec![0, 3], vec![1, -1])
+        .unwrap();
+    let empty_dot = graph_viz(&graph, &[empty_map]).unwrap().to_dot();
+    assert!(empty_dot.contains("target_shape=[0,4]"));
+    assert!(empty_dot.contains("starts=[0,3]"));
+    assert!(empty_dot.contains("steps=[1,-1]"));
+}
+
+#[test]
+fn masked_select_graph_visualization_preserves_fixed_and_dynamic_contracts() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 3]);
+    let mask = graph.input_dtype("mask", [1, 3], DType::Bool);
+    let selected = graph
+        .masked_select(input, mask, 4, crate::Scalar::F(-0.0))
+        .unwrap();
+    let first = graph_viz(&graph, &[selected]).unwrap();
+    let second = graph_viz(&graph, &[selected]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=bool\\nname=mask\\nnode=1\\nshape=[1,3]\"];\n  \"g2\" [label=\"masked_select\\nkind=graph_op\\ndtype=f32\\ndynamic_counterpart=runtime_rank1\\nfill=f:0x8000000000000000\\nnode=2\\nresult_policy=fixed_size_pad_truncate\\nshape=[4]\\nsize=4\"];\n  \"g0\" -> \"g2\" [label=\"data:0:input\"];\n  \"g1\" -> \"g2\" [label=\"data:1:mask\"];\n}\n"
+    );
+
+    let empty = graph
+        .masked_select(input, mask, 0, crate::Scalar::I(7))
+        .unwrap();
+    let empty_dot = graph_viz(&graph, &[empty]).unwrap().to_dot();
+    assert!(empty_dot.contains("fill=i:7"));
+    assert!(empty_dot.contains("result_policy=fixed_size_pad_truncate"));
+    assert!(empty_dot.contains("shape=[0]"));
+}
+
+#[test]
+fn arg_reduce_graph_visualization_preserves_normalized_axes_and_index_contract() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 3]);
+    let reduced = graph.argmin(input, Some(-1), true).unwrap();
+    let first = graph_viz(&graph, &[reduced]).unwrap();
+    let second = graph_viz(&graph, &[reduced]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"arg_reduce\\nkind=graph_op\\naxes=[1]\\ndtype=i32\\nkeepdim=true\\nnode=1\\nreduction=argmin\\nshape=[2,1]\"];\n  \"g0\" -> \"g1\" [label=\"data:0:input\"];\n}\n"
+    );
+
+    let scalar = graph.input("scalar", []);
+    let global = graph.argmax(scalar, None, false).unwrap();
+    let global_dot = graph_viz(&graph, &[global]).unwrap().to_dot();
+    assert!(global_dot.contains("axes=all"));
+    assert!(global_dot.contains("dtype=i32"));
+    assert!(global_dot.contains("shape=[]"));
+}
+
+#[test]
+fn pad_graph_visualization_preserves_geometry_fill_and_dependency() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 0]);
+    let padded = graph
+        .pad(input, [(1, 0), (0, 2)], crate::Scalar::F(-0.0))
+        .unwrap();
+    let first = graph_viz(&graph, &[padded]).unwrap();
+    let second = graph_viz(&graph, &[padded]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.to_dot(),
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,0]\"];\n  \"g1\" [label=\"pad\\nkind=graph_op\\ndtype=f32\\nfill=f:0x8000000000000000\\nnode=1\\npadding=[1:0,0:2]\\nshape=[3,2]\"];\n  \"g0\" -> \"g1\" [label=\"data:0:input\"];\n}\n"
+    );
+
+    // Signed public padding lowers crop first, then the raw Pad geometry;
+    // both movements remain inspectable without extending Pad's unsigned IR.
+    let signed = graph
+        .pad_signed(input, [(-1, 2), (0, 0)], crate::Scalar::I(0))
+        .unwrap();
+    let signed_dot = graph_viz(&graph, &[signed]).unwrap().to_dot();
+    assert!(signed_dot.contains("shrink"));
+    assert!(signed_dot.contains("bounds=[1:2,0:0]"));
+    assert!(signed_dot.contains("padding=[0:2,0:0]"));
 }
 
 #[test]
@@ -56,7 +487,7 @@ fn fused_graph_snapshot_has_typed_edges_shape_and_dtype() {
     let dot = graph_viz(&graph, &[output]).unwrap().to_dot();
     assert_eq!(
         dot,
-        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=y\\nnode=1\\nshape=[2,3]\"];\n  \"g2\" [label=\"binary\\nkind=graph_op\\ndtype=f32\\nnode=2\\noperator=add\\nshape=[2,3]\"];\n  \"g3\" [label=\"unary\\nkind=graph_op\\ndtype=f32\\nnode=3\\noperator=relu\\nshape=[2,3]\"];\n  \"g0\" -> \"g2\" [label=\"data:0:lhs\"];\n  \"g1\" -> \"g2\" [label=\"data:1:rhs\"];\n  \"g2\" -> \"g3\" [label=\"data:0:input\"];\n}\n"
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=y\\nnode=1\\nshape=[2,3]\"];\n  \"g2\" [label=\"binary\\nkind=graph_op\\ndtype=f32\\nnode=2\\noperator=add\\nshape=[2,3]\"];\n  \"g3\" [label=\"constant\\nkind=graph_op\\ndtype=f32\\nelements=1\\nnode=3\\nshape=[]\"];\n  \"g4\" [label=\"compare\\nkind=graph_op\\ndtype=bool\\nnode=4\\noperator=lt\\nshape=[2,3]\"];\n  \"g5\" [label=\"select\\nkind=graph_op\\ndtype=f32\\nnode=5\\nshape=[2,3]\"];\n  \"g0\" -> \"g2\" [label=\"data:0:lhs\"];\n  \"g1\" -> \"g2\" [label=\"data:1:rhs\"];\n  \"g2\" -> \"g4\" [label=\"data:1:rhs\"];\n  \"g2\" -> \"g5\" [label=\"data:1:true\"];\n  \"g3\" -> \"g4\" [label=\"data:0:lhs\"];\n  \"g3\" -> \"g5\" [label=\"data:2:false\"];\n  \"g4\" -> \"g5\" [label=\"data:0:condition\"];\n}\n"
     );
 }
 

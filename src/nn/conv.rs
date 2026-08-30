@@ -70,6 +70,8 @@ impl Conv2d {
             || out_channels == 0
             || kernel_size.contains(&0)
             || options.groups == 0
+            || options.stride.contains(&0)
+            || options.dilation.contains(&0)
             || in_channels % options.groups != 0
             || out_channels % options.groups != 0
         {
@@ -191,8 +193,12 @@ impl ConvTranspose2d {
             || out_channels == 0
             || kernel_size.contains(&0)
             || options.groups == 0
+            || options.stride.contains(&0)
+            || options.dilation.contains(&0)
             || in_channels % options.groups != 0
             || out_channels % options.groups != 0
+            || options.output_padding[0] >= options.stride[0]
+            || options.output_padding[1] >= options.stride[1]
         {
             return Err(Error::InvalidConv2d {
                 input: Shape::new([0; 4]),
@@ -361,9 +367,10 @@ impl ConvTranspose1d {
         })
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
-        if graph.shape(input)?.rank() != 3 || graph.shape(input)?.dims()[1] != self.in_channels {
+        let shape = graph.shape(input)?.clone();
+        if shape.rank() != 3 || shape.dims()[1] != self.in_channels {
             return Err(Error::InvalidConv2d {
-                input: graph.shape(input)?.clone(),
+                input: shape,
                 weight: self.weight.shape()?,
                 reason: "ConvTranspose1d input must be NCL with the configured channels",
             });

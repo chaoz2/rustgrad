@@ -1,6 +1,7 @@
 use super::{
-    LLAMA_SIMPLE_CHAT_TEMPLATE, LlamaBatchGenerator, LlamaBatchNativeGenerator, LlamaBatchSampling,
-    LlamaChatMessage, LlamaChatRole, LlamaChatTemplate, LlamaGenerator, LlamaNativeError,
+    LLAMA_SIMPLE_CHAT_TEMPLATE, LlamaBatchGenerationError, LlamaBatchGenerator,
+    LlamaBatchNativeGenerator, LlamaBatchSampling, LlamaChatMessage, LlamaChatRole,
+    LlamaChatTemplate, LlamaGenerationError, LlamaGenerator, LlamaModelError, LlamaNativeError,
     LlamaNativeGenerationError, LlamaNativeGenerator, LlamaNativeStageKind, LlamaSampling,
     generation::select_last,
     model_tests::{VOCAB, make_model, serialized_model_with_template},
@@ -163,4 +164,66 @@ fn staged_native_generation_failure_rolls_back_single_and_batch_caches() {
         ))
     ));
     assert_eq!(batch.cache_lengths(), before);
+}
+
+#[test]
+fn zero_token_generation_preflights_prompt_vocabulary_before_cache_work() {
+    let (model, tokenizer, _) = make_model(8);
+    let invalid = VOCAB as u32;
+
+    let mut direct = LlamaGenerator::new(&model, &tokenizer);
+    assert_eq!(
+        direct.generate_ids(&[invalid], 0, LlamaSampling::Greedy),
+        Err(LlamaGenerationError::Model(LlamaModelError::TokenOutOfRange {
+            token: invalid,
+            vocab_size: VOCAB,
+        }))
+    );
+    assert_eq!(direct.cache_len(), 0);
+
+    let mut batch = LlamaBatchGenerator::new(&model, &tokenizer, 2).unwrap();
+    assert_eq!(
+        batch.generate_ids(
+            &[vec![3], vec![invalid]],
+            0,
+            LlamaBatchSampling::Greedy,
+        ),
+        Err(LlamaBatchGenerationError::Model(
+            LlamaModelError::BatchTokenOutOfRange {
+                row: 1,
+                token: invalid,
+                vocab_size: VOCAB,
+            }
+        ))
+    );
+    assert_eq!(batch.cache_lengths(), &[0, 0]);
+
+    let mut native = LlamaNativeGenerator::new(&model, &tokenizer);
+    assert!(matches!(
+        native.generate_ids(&[invalid], 0, LlamaSampling::Greedy),
+        Err(LlamaNativeGenerationError::Generation(
+            LlamaGenerationError::Model(LlamaModelError::TokenOutOfRange {
+                token,
+                vocab_size: VOCAB,
+            })
+        )) if token == invalid
+    ));
+    assert_eq!(native.cache_len(), 0);
+
+    let mut native_batch = LlamaBatchNativeGenerator::new(&model, &tokenizer, 2).unwrap();
+    assert!(matches!(
+        native_batch.generate_ids(
+            &[vec![3], vec![invalid]],
+            0,
+            LlamaBatchSampling::Greedy,
+        ),
+        Err(LlamaNativeGenerationError::Batch(
+            LlamaBatchGenerationError::Model(LlamaModelError::BatchTokenOutOfRange {
+                row: 1,
+                token,
+                vocab_size: VOCAB,
+            })
+        )) if token == invalid
+    ));
+    assert_eq!(native_batch.cache_lengths(), &[0, 0]);
 }

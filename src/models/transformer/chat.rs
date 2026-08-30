@@ -107,7 +107,14 @@ impl LlamaChatTemplate {
         messages: &[LlamaChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String, LlamaChatError> {
-        if tokenizer.preset() != TokenizerPreset::Llama3 {
+        // tinygrad's fallback takes this same default-header branch for all
+        // three Llama BPE pre-tokenizer labels. The other presets select
+        // distinct role/end-turn grammars that this closed formatter does not
+        // represent.
+        if !matches!(
+            tokenizer.preset(),
+            TokenizerPreset::Llama3 | TokenizerPreset::LlamaV3 | TokenizerPreset::LlamaBpe
+        ) {
             return Err(LlamaChatError::UnsupportedPreset(tokenizer.preset()));
         }
         let bos = tokenizer

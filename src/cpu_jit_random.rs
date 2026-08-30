@@ -6,7 +6,7 @@
 
 use super::{
     ABI_VERSION, BufferAbi, DType, JitError, KernelAbi, KernelPointerAbi, RENDERER_VERSION,
-    RenderedC, key,
+    RenderedC, native_cache_key,
 };
 use crate::{RandomKind, random::plan::RandomKernelPlan};
 use std::collections::BTreeMap;
@@ -63,10 +63,7 @@ pub(super) fn render(plan: &RandomKernelPlan) -> Result<RenderedC, JitError> {
         unit = unit,
         store = store,
     );
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &source));
+    let cache_key = native_cache_key("random", &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::new(),

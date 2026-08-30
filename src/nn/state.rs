@@ -12,6 +12,10 @@ use std::{
     io::Read,
     path::Path,
 };
+use super::{Parameter, ParameterRestore, ParameterSnapshot, restore_parameters};
+use super::parameter::next_version;
+use crate::{Error, Graph, Result, TensorData};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub enum StateKind {
     Parameter,
@@ -245,6 +249,60 @@ impl From<StateDict> for BTreeMap<String, TensorData> {
     }
 }
 
+/// Ordered live parameter handles collected from an explicit module traversal.
+///
+/// Entries retain declaration order. Repeated names replace their prior value
+/// in place, while tied handles under different names remain distinct entries.
+#[derive(Clone, Debug, Default)]
+pub struct LiveStateDict {
+    entries: Vec<(String, Parameter)>,
+}
+impl LiveStateDict {
+    pub fn get(&self, name: &str) -> Option<&Parameter> {
+        self.entries
+            .iter()
+            .find_map(|(entry_name, parameter)| (entry_name == name).then_some(parameter))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = (&str, &Parameter)> {
+        self.entries
+            .iter()
+            .map(|(name, parameter)| (name.as_str(), parameter))
+    }
+
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.entries.iter().map(|(name, _)| name.as_str())
+    }
+
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &Parameter> {
+        self.entries.iter().map(|(_, parameter)| parameter)
+    }
+
+    pub fn into_entries(self) -> Vec<(String, Parameter)> {
+        self.entries
+    }
+
+    fn insert(&mut self, name: String, parameter: Parameter) {
+        if let Some((_, existing)) = self
+            .entries
+            .iter_mut()
+            .find(|(entry_name, _)| entry_name.as_str() == name.as_str())
+        {
+            *existing = parameter;
+        } else {
+            self.entries.push((name, parameter));
+        }
+    }
+}
+
 /// Rust-native explicit state traversal. Implementors call `visit` for fields,
 /// nested modules, vectors, and options in their declared deterministic order.
 pub trait Module {
@@ -349,15 +407,27 @@ pub trait Module {
         }
         let mut report = LoadReport::default();
         let mut restores = Vec::new();
+        let mut loaded_keys = Vec::new();
         for (name, (parameter, snapshot)) in &entries {
             let Some(value) = state.tensors.get(name) else {
                 report.missing_keys.push(name.clone());
                 continue;
             };
-            if value.shape() != &snapshot.shape {
-                report.shape_mismatches.push(name.clone());
-                continue;
-            }
+            // tinygrad's loader admits only this one shape relaxation: a
+            // scalar and a rank-one singleton carry the same single storage
+            // lane, so it reshapes the incoming value to the parameter shape
+            // before replacement.  Keep it in this preflight phase and clone
+            // raw storage so narrow payloads, NaNs, and signed zero survive.
+            let value = if value.shape() != &snapshot.shape {
+                if singleton_scalar_rank_one_pair(value, &snapshot) {
+                    TensorData::from_storage(snapshot.shape.clone(), value.storage().clone())?
+                } else {
+                    report.shape_mismatches.push(name.clone());
+                    continue;
+                }
+            } else {
+                value.clone()
+            };
             let value = if value.dtype() != snapshot.dtype {
                 if cast == CastPolicy::Allow {
                     value.cast(snapshot.dtype)
@@ -366,15 +436,15 @@ pub trait Module {
                     continue;
                 }
             } else {
-                value.clone()
+                value
             };
             restores.push(ParameterRestore {
                 parameter: parameter.clone(),
                 data: value,
                 expected_version: snapshot.version,
-                restored_version: snapshot.version.wrapping_add(1),
+                restored_version: next_version(snapshot.version)?,
             });
-            report.loaded_keys.push(name.clone());
+            loaded_keys.push(name.clone());
         }
         report.unexpected_keys = state
             .tensors
@@ -397,6 +467,7 @@ pub trait Module {
         // one of them, so even a racing version change cannot leave a strict
         // or non-strict load partially visible.
         restore_parameters(restores)?;
+        report.loaded_keys = loaded_keys;
         Ok(report)
     }
 
@@ -495,6 +566,43 @@ fn read_safetensors_file_bounded(path: &Path, limits: StrictStateLoadLimits) -> 
     })?;
     check_safetensors_len(bytes.len(), limits)?;
     Ok(bytes)
+}
+
+/// Returns live parameter handles in tinygrad's explicit state-dict traversal order.
+///
+/// This is exactly the values of [`get_state_dict`] at zero prefix.
+pub fn get_parameters(module: &dyn Module) -> Vec<Parameter> {
+    get_state_dict(module, "")
+        .into_entries()
+        .into_iter()
+        .map(|(_, parameter)| parameter)
+        .collect()
+}
+
+/// Collects live module handles with tinygrad's raw prefix and dict semantics.
+///
+/// The prefix is concatenated directly onto each name emitted by a zero-prefix
+/// visit. Collection clones handles only: it does not snapshot, lock, sort, or
+/// deduplicate them.
+pub fn get_state_dict(module: &dyn Module, prefix: &str) -> LiveStateDict {
+    let mut state = LiveStateDict::default();
+    module.visit("", &mut |name, parameter, _| {
+        state.insert(format!("{prefix}{name}"), parameter.clone());
+    });
+    state
+}
+
+/// The only load-time shape adaptation accepted by tinygrad state loading.
+/// Both descriptors have exactly one element, so rebuilding the descriptor
+/// from cloned storage is a checked descriptor change rather than a broadcast
+/// or a value conversion.
+fn singleton_scalar_rank_one_pair(value: &TensorData, snapshot: &ParameterSnapshot) -> bool {
+    (value.shape().rank() == 0
+        && snapshot.shape.rank() == 1
+        && snapshot.shape.dims() == [1])
+        || (value.shape().rank() == 1
+            && value.shape().dims() == [1]
+            && snapshot.shape.rank() == 0)
 }
 
 pub(super) fn join(prefix: &str, name: &str) -> String {

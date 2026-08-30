@@ -100,16 +100,37 @@ impl ShardLayout {
         dtype: DType,
         distribution: ShardDistribution,
     ) -> Result<Self> {
-        global_shape.numel()?;
-        if let ShardDistribution::Axis { axis, ranges } = &distribution {
-            if *axis >= global_shape.rank() || ranges.len() != group.len() {
+        let cache_key = canonical_layout_key(&group, &global_shape, dtype, &distribution);
+        let layout = Self {
+            group,
+            global_shape,
+            dtype,
+            distribution,
+            cache_key,
+        };
+        layout.validate()?;
+        Ok(layout)
+    }
+
+    /// Revalidates a layout that may have crossed a serde or public artifact boundary.
+    /// This is pure: callers can reject malformed ownership/range metadata before creating
+    /// local views, consuming caller shards, or entering a device executor.
+    pub fn validate(&self) -> Result<()> {
+        if self.group.devices().is_empty()
+            || self.group.devices().iter().collect::<BTreeSet<_>>().len() != self.group.len()
+        {
+            return Err(shard_error("shard layout requires distinct nonempty device owners"));
+        }
+        self.global_shape.numel()?;
+        if let ShardDistribution::Axis { axis, ranges } = &self.distribution {
+            if *axis >= self.global_shape.rank() || ranges.len() != self.group.len() {
                 return Err(shard_error("invalid axis-sharded layout"));
             }
             let mut cursor = 0;
             for range in ranges {
                 if range.start != cursor
                     || range.end < range.start
-                    || range.end > global_shape.dims()[*axis]
+                    || range.end > self.global_shape.dims()[*axis]
                 {
                     return Err(shard_error(
                         "shard ranges must exactly cover the global axis in device order",
@@ -117,27 +138,21 @@ impl ShardLayout {
                 }
                 cursor = range.end;
             }
-            if cursor != global_shape.dims()[*axis] {
+            if cursor != self.global_shape.dims()[*axis] {
                 return Err(shard_error("shard ranges do not cover global axis"));
             }
         }
-        let cache_key = format!(
-            "shard:v1:{}:{dtype:?}:{:?}:{distribution:?}",
-            group
-                .devices()
-                .iter()
-                .map(DeviceId::as_str)
-                .collect::<Vec<_>>()
-                .join(","),
-            global_shape.dims()
-        );
-        Ok(Self {
-            group,
-            global_shape,
-            dtype,
-            distribution,
-            cache_key,
-        })
+        if self.cache_key
+            != canonical_layout_key(
+                &self.group,
+                &self.global_shape,
+                self.dtype,
+                &self.distribution,
+            )
+        {
+            return Err(shard_error("shard layout cache identity is noncanonical"));
+        }
+        Ok(())
     }
     pub fn group(&self) -> &DeviceGroup {
         &self.group
@@ -155,6 +170,7 @@ impl ShardLayout {
         &self.cache_key
     }
     pub fn local_shape(&self, index: usize) -> Result<Shape> {
+        self.validate()?;
         if index >= self.group.len() {
             return Err(shard_error("device index is outside layout group"));
         }
@@ -382,6 +398,7 @@ pub struct ShardedTensorData {
 }
 impl ShardedTensorData {
     pub fn new(layout: ShardLayout, shards: Vec<DeviceShard>) -> Result<Self> {
+        layout.validate()?;
         if shards.len() != layout.group.len() {
             return Err(shard_error("shard count does not match device group"));
         }
@@ -436,6 +453,7 @@ impl ShardedTensorData {
         &self.shards
     }
     pub fn gather(&self) -> Result<TensorData> {
+        self.layout.validate()?;
         let global_len = self.layout.global_shape.numel()?;
         let mut per_global = vec![None; global_len];
         for (i, _shard) in self.shards.iter().enumerate() {
@@ -482,6 +500,7 @@ pub enum MovementDecision {
 }
 impl ShardLayout {
     pub fn movement(&self, transform: LayoutTransform) -> Result<MovementDecision> {
+        self.validate()?;
         let ShardDistribution::Axis { axis, .. } = &self.distribution else {
             return Ok(MovementDecision::Local(self.clone()));
         };
@@ -674,6 +693,7 @@ fn permuted_shape(shape: &Shape, axes: &[usize]) -> Shape {
     Shape::from(axes.iter().map(|&a| shape.dims()[a]).collect::<Vec<_>>())
 }
 pub(crate) fn local_global_indices(layout: &ShardLayout, device: usize) -> Result<Vec<usize>> {
+    layout.validate()?;
     let local = layout.local_shape(device)?;
     let len = local.numel()?;
     match layout.distribution() {
@@ -695,6 +715,23 @@ pub(crate) fn local_global_indices(layout: &ShardLayout, device: usize) -> Resul
                 .collect())
         }
     }
+}
+fn canonical_layout_key(
+    group: &DeviceGroup,
+    global_shape: &Shape,
+    dtype: DType,
+    distribution: &ShardDistribution,
+) -> String {
+    format!(
+        "shard:v1:{}:{dtype:?}:{:?}:{distribution:?}",
+        group
+            .devices()
+            .iter()
+            .map(DeviceId::as_str)
+            .collect::<Vec<_>>()
+            .join(","),
+        global_shape.dims()
+    )
 }
 fn strides(shape: &Shape) -> Result<Vec<usize>> {
     let mut out = vec![1usize; shape.rank()];
@@ -856,6 +893,32 @@ mod tests {
                 .gather()
                 .unwrap(),
             matrix
+        );
+    }
+    #[test]
+    fn shard_assembly_revalidates_deserialized_layout_identity_before_consuming_shards() {
+        let layout = ShardLayout::axis_sharded(group(2), [4], DType::I32, 0).unwrap();
+        let layout: ShardLayout = serde_json::from_value(serde_json::to_value(layout).unwrap())
+            .unwrap();
+        assert!(layout.validate().is_ok());
+
+        let mut reversed_range = layout.clone();
+        let ShardDistribution::Axis { ranges, .. } = &mut reversed_range.distribution else {
+            unreachable!();
+        };
+        ranges[0] = ShardRange { start: 2, end: 0 };
+        assert!(reversed_range.validate().is_err());
+        assert!(
+            ShardedTensorData::new(reversed_range, vec![]).is_err(),
+            "malformed ranges fail before shard inventory indexing"
+        );
+
+        let mut stale_identity = layout;
+        stale_identity.cache_key.push_str(":tampered");
+        assert!(stale_identity.validate().is_err());
+        assert!(
+            ShardedTensorData::new(stale_identity, vec![]).is_err(),
+            "noncanonical layouts fail before shard inventory consumption"
         );
     }
     #[test]

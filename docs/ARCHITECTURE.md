@@ -193,9 +193,9 @@ validated model. Model construction sorts node IDs, fields, and edges before a
 dependency-free DOT renderer escapes labels, so construction order cannot leak
 into snapshots. Graph-local node IDs and portable buffer, item, artifact, and
 cache identities remain explicit; pointer identities, compiled modules, runtime
-handles, profiling samples, and `Debug` text are not inputs. Unsupported Graph
-operation families fail with a typed visualization error instead of being
-silently flattened.
+handles, profiling samples, and `Debug` text are not inputs. Every current
+typed Graph Op family is normalized; future unsupported operation families fail
+with a typed visualization error instead of being silently flattened.
 
 `ir::indexing` is the pure static-indexing boundary: it normalizes immutable
 integer/slice/newaxis/ellipsis and constant advanced-index specifications into
@@ -534,6 +534,8 @@ device-scoped pipeline cache across equivalent logical batches. Preparation or
 launch failures leave the host transaction uncommitted and may retry through
 the same retained semantic path. This remains retained-semantic-mock evidence;
 no ignored live test currently exercises `replay_metal`.
+RGSM validator. Device execution, runtime rebinding, compiler-failure
+injection, and mutation autograd remain fail-closed.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained
@@ -1368,9 +1370,12 @@ This CPU path is serial and inference-only; quantized backward, additional
 formats, tiled decoding, and device execution remain separate work.
 
 Source and libraries are content-addressed below the OS temporary directory.
-The key includes renderer/ABI version, host target, fixed compiler flags, and
-the rendered UOp source. A process-local mutex and atomic rename prevent
-duplicate publication; compiler diagnostics are bounded.
+The key includes renderer/ABI version, host target, the literal `cc` command,
+every fixed compiler flag, a renderer-path discriminator, and the rendered UOp
+source. Unique same-directory temporary files, a process-local mutex, and
+atomic rename prevent duplicate publication; loader rejection evicts one corrupt
+regular-file entry and rebuilds it once, while compiler diagnostics remain
+bounded.
 
 ## File and null runtime boundary
 
@@ -1386,6 +1391,10 @@ little-endian `TensorData` bytes, then exclusively creates and syncs only its
 own same-directory staging file before final rename; failed staging is cleaned
 without opening an existing target for writing.
 or introduce mmap, lazy, device, or native-endian storage.
+The owned descriptor deliberately preserves OS handle identity rather than
+canonicalizing paths, while each nonempty read/write rechecks that an
+externally truncated backing file still covers its fixed logical extent before
+it can extend or partially read that file.
 `runtime::null::NullRuntime` validates logical allocation/copy requests and
 records deterministic planning traces, but intentionally has no values or
 semantic execution. These concrete modules establish runtime-resource evidence

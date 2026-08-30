@@ -11,7 +11,7 @@ mod storage;
 pub(crate) mod artifact;
 mod creation;
 
-pub use data::TensorData;
+pub use data::{TensorData, TensorDataReader, TensorList};
 pub use dtype::{DType, DTypeCategory};
 pub use float8::{Float8Format, Float8Storage};
 pub use literal::LiteralScalar;
@@ -19,4 +19,4 @@ pub use scalar::Scalar;
 pub use shape::Shape;
 pub use storage::Storage;
 
-pub(crate) use scalar::{bf16_to_f32, f16_to_f32, f32_to_bf16};
+pub(crate) use scalar::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};

@@ -3,6 +3,9 @@
 use super::{
     Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward, Parameter, ParameterRestore,
     PendingModeEffects, StateKind, restore_parameters, state::join,
+    Mode, Module, Parameter, ParameterSnapshot, StateKind,
+    parameter::{ParameterRestore, next_version, restore_parameters},
+    state::join,
 };
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::sync::{
@@ -159,6 +162,7 @@ pub struct BatchNorm {
     pub running_mean: Option<Parameter>,
     pub running_var: Option<Parameter>,
     pub num_batches_tracked: Parameter,
+    channels: usize,
     pub eps: f32,
     /// `NaN` selects tinygrad's cumulative-update extension; finite values are momentum.
     pub momentum: f32,
@@ -166,6 +170,8 @@ pub struct BatchNorm {
     identity: Arc<()>,
 }
 pub type BatchNorm2d = BatchNorm;
+/// Tinygrad aliases `BatchNorm3d` to the rank-two-or-greater `BatchNorm` module.
+pub type BatchNorm3d = BatchNorm;
 impl BatchNorm {
     pub fn new(
         _graph: &mut Graph,
@@ -214,6 +220,7 @@ impl BatchNorm {
                 TensorData::scalar_with_dtype(Scalar::U(0), DType::U64),
                 false,
             ),
+            channels,
             eps,
             momentum,
             track_running_stats,
@@ -225,10 +232,10 @@ impl BatchNorm {
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId, mode: Mode) -> Result<BatchNormOutput> {
         let shape = graph.shape(input)?.clone();
-        if shape.rank() < 2 {
+        if shape.rank() < 2 || shape.dims()[1] != self.channels {
             return Err(Error::InvalidReshape {
                 from: shape,
-                to: Shape::new([0, 0]),
+                to: Shape::new([0, self.channels]),
             });
         }
         let channels = shape.dims()[1];
@@ -444,14 +451,12 @@ impl GroupNorm {
             .iter()
             .try_fold(1usize, |a, &x| a.checked_mul(x))
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-        let grouped = graph.reshape(
-            input,
-            Shape::new([
-                n,
-                self.num_groups,
-                self.num_channels / self.num_groups * rest,
-            ]),
-        )?;
+        let per_group = (self.num_channels / self.num_groups)
+            .checked_mul(rest)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let grouped_shape = Shape::new([n, self.num_groups, per_group]);
+        grouped_shape.numel()?;
+        let grouped = graph.reshape(input, grouped_shape)?;
         let mean = graph.reduce(grouped, crate::ReduceKind::Mean, Some(vec![-1]), true)?;
         let centered = graph.sub(grouped, mean)?;
         let squared = graph.square(centered)?;
@@ -551,11 +556,13 @@ impl LayerNorm {
     }
 
     fn new_impl(shape: Shape, eps: f32, affine: bool) -> Result<Self> {
-        if shape.rank() == 0 || !eps.is_finite() || eps < 0.0 {
+        let shape = shape;
+        if shape.rank() == 0 || shape.dims().contains(&0) || !eps.is_finite() || eps < 0.0 {
             return Err(Error::InvalidRandom {
                 reason: "invalid LayerNorm shape or epsilon",
             });
         };
+        shape.numel()?;
         Ok(Self {
             weight: affine.then(|| {
                 Parameter::new(TensorData::ones(shape.clone()).expect("valid shape"), true)
@@ -655,6 +662,12 @@ impl LayerNorm2d {
                 to: Shape::new([0; 4]),
             });
         }
+        if s.dims()[1] != self.inner.normalized_shape.dims()[0] {
+            return Err(Error::InvalidReshape {
+                from: s,
+                to: self.inner.normalized_shape.clone(),
+            });
+        }
         let nhwc = graph.permute(input, vec![0, 2, 3, 1])?;
         let out = self.inner.forward(graph, nhwc)?;
         graph.permute(out, vec![0, 3, 1, 2])
@@ -676,6 +689,18 @@ pub struct RMSNorm {
     dim: usize,
     eps: f32,
 }
+
+/// Fully validates tinygrad's RMSNorm descriptor before a graph node or
+/// parameter binding is published.  The public layer always computes its
+/// statistic in F32, then casts the normalized value back to the input dtype
+/// before applying its optional F32 weight.
+struct RMSNormPlan {
+    input: NodeId,
+    input_dtype: DType,
+    input_is_empty: bool,
+    weight: Option<ParameterSnapshot>,
+}
+
 impl RMSNorm {
     /// Creates graph-independent host parameters for static module workflows.
     pub fn new_static(dim: usize, eps: f32, affine: bool) -> Result<Self> {
@@ -700,32 +725,85 @@ impl RMSNorm {
             eps,
         })
     }
-    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
-        if graph.shape(input)?.dims().last().copied() != Some(self.dim) {
+
+    fn plan(&self, graph: &Graph, input: NodeId) -> Result<RMSNormPlan> {
+        let input_shape = graph.shape(input)?.clone();
+        let input_dtype = graph.dtype(input)?;
+        if input_shape.dims().last().copied() != Some(self.dim) {
             return Err(Error::InvalidReshape {
-                from: graph.shape(input)?.clone(),
+                from: input_shape,
                 to: Shape::new([self.dim]),
             });
         }
-        let original = graph.dtype(input)?;
-        let x = if original == DType::F16 || original == DType::BF16 {
-            graph.cast(input, DType::F32)?
-        } else {
-            input
-        };
+        let input_is_empty = input_shape.numel()? == 0;
+        input_shape
+            .numel()?
+            .checked_mul(input_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        input_shape
+            .numel()?
+            .checked_mul(DType::F32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        let mut statistic_dims = input_shape.dims().to_vec();
+        *statistic_dims
+            .last_mut()
+            .expect("RMSNorm rank was checked above") = 1;
+        let statistic_shape = Shape::new(statistic_dims);
+        statistic_shape
+            .numel()?
+            .checked_mul(DType::F32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(statistic_shape.clone()))?;
+        let weight = self.weight.as_ref().map(Parameter::snapshot).transpose()?;
+        if let Some(weight) = &weight {
+            let expected = Shape::new([self.dim]);
+            if weight.shape != expected || weight.dtype != DType::F32 {
+                return Err(Error::ParameterValueMismatch {
+                    expected_shape: expected,
+                    actual_shape: weight.shape.clone(),
+                    expected_dtype: DType::F32,
+                    actual_dtype: weight.dtype,
+                });
+            }
+            if input_shape.broadcast_with(&weight.shape)? != input_shape {
+                return Err(Error::BroadcastMismatch {
+                    lhs: input_shape.clone(),
+                    rhs: weight.shape.clone(),
+                });
+            }
+            input_shape
+                .numel()?
+                .checked_mul(input_dtype.promote(weight.dtype).itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        }
+        Ok(RMSNormPlan {
+            input,
+            input_dtype,
+            input_is_empty,
+            weight,
+        })
+    }
+
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        let plan = self.plan(graph, input)?;
+        if plan.input_is_empty {
+            return match plan.weight {
+                Some(weight) => {
+                    let weight = graph.bind_parameter(weight)?;
+                    graph.mul(plan.input, weight)
+                }
+                None => Ok(plan.input),
+            };
+        }
+        let x = graph.cast(plan.input, DType::F32)?;
         let squared = graph.square(x)?;
         let mean = graph.reduce(squared, crate::ReduceKind::Mean, Some(vec![-1]), true)?;
         let eps = graph.constant(TensorData::scalar(self.eps));
         let mean = graph.add(mean, eps)?;
         let scale = graph.rsqrt(mean)?;
         let out = graph.mul(x, scale)?;
-        let out = if x != input {
-            graph.cast(out, original)?
-        } else {
-            out
-        };
-        if let Some(weight) = &self.weight {
-            let weight = weight.bind(graph)?;
+        let out = graph.cast(out, plan.input_dtype)?;
+        if let Some(weight) = plan.weight {
+            let weight = graph.bind_parameter(weight)?;
             graph.mul(out, weight)
         } else {
             Ok(out)

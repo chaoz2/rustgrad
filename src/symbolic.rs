@@ -14,6 +14,17 @@ use std::{
 
 static NEXT_VARIABLE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Reserves one non-sentinel symbolic identity without allowing the global
+/// allocator to wrap back to a value that can already identify a live or
+/// deserialized variable.
+fn reserve_variable_id(counter: &AtomicU64) -> Result<u64, SymbolicError> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            (id != 0 && id != u64::MAX).then_some(id + 1)
+        })
+        .map_err(|_| SymbolicError::IdentityExhausted)
+}
+
 /// A variable's identity is deliberately independent from its display name.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SymbolicVar {
@@ -28,7 +39,7 @@ impl SymbolicVar {
             return Err(SymbolicError::InvalidBounds { min, max });
         }
         Ok(Self {
-            id: NEXT_VARIABLE_ID.fetch_add(1, Ordering::Relaxed),
+            id: reserve_variable_id(&NEXT_VARIABLE_ID)?,
             name: name.into(),
             min,
             max,
@@ -71,10 +82,8 @@ impl Bounds {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SymbolicError {
-    InvalidBounds {
-        min: i64,
-        max: i64,
-    },
+    InvalidBounds { min: i64, max: i64 },
+    IdentityExhausted,
     DivisionByZero,
     Overflow {
         op: &'static str,
@@ -96,6 +105,7 @@ impl fmt::Display for SymbolicError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBounds { min, max } => write!(f, "invalid symbolic bounds [{min}, {max}]"),
+            Self::IdentityExhausted => write!(f, "symbolic variable identity space exhausted"),
             Self::DivisionByZero => write!(f, "symbolic floor division or modulo by zero"),
             Self::Overflow { op } => write!(f, "symbolic {op} overflows i64"),
             Self::MissingBinding(v) => write!(f, "missing binding for {}#{}", v.name, v.id),
@@ -831,6 +841,31 @@ fn simplify_logic(
 }
 fn boolv(x: i64) -> bool {
     x != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbolic_identity_reservation_never_wraps_or_reuses_a_sentinel() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(reserve_variable_id(&counter), Ok(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            reserve_variable_id(&counter),
+            Err(SymbolicError::IdentityExhausted)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn symbolic_artifact_loader_rejects_identity_sentinels() {
+        assert!(matches!(
+            SymbolicVar::from_artifact(u64::MAX, "x".into(), 0, 1),
+            Err(SymbolicError::InvalidBounds { .. })
+        ));
+    }
 }
 fn bool_possibilities(bounds: Bounds) -> Vec<bool> {
     let mut values = Vec::new();

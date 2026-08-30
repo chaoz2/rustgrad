@@ -1661,6 +1661,11 @@ pub(crate) fn specialize_capture(
             "tensor guard symbolic specialization is unsupported".into(),
         ));
     }
+    if capture.items.iter().any(|item| !item.outputs.is_single()) {
+        return Err(ReplayError::Unsupported(
+            "multi-output symbolic specialization is unavailable".into(),
+        ));
+    }
     let schema = capture
         .symbolic
         .as_ref()

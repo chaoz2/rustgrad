@@ -9,6 +9,15 @@ use std::{
 
 const LHS_SHARED_ID: u32 = 1;
 const RHS_SHARED_ID: u32 = 2;
+const CANONICAL_TILES: &[(u32, u32, u32)] = &[
+    (8, 8, 8),
+    (8, 16, 8),
+    (16, 8, 8),
+    (16, 16, 8),
+    (8, 8, 16),
+    (8, 16, 16),
+    (16, 8, 16),
+];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MatmulTargetCaps {
@@ -262,17 +271,14 @@ impl TiledMatmulPlan {
             return Ok(Vec::new());
         }
         let mut candidates = Vec::new();
-        for (block_m, block_n, block_k) in [
-            (8, 8, 8),
-            (8, 16, 8),
-            (16, 8, 8),
-            (16, 16, 8),
-            (8, 8, 16),
-            (8, 16, 16),
-            (16, 8, 16),
-        ] {
-            if let Ok(candidate) = Self::candidate(matmul, target, block_m, block_n, block_k) {
-                candidates.push(candidate);
+        for &(block_m, block_n, block_k) in CANONICAL_TILES {
+            match Self::candidate(matmul, target, block_m, block_n, block_k) {
+                Ok(candidate) => candidates.push(candidate),
+                // Candidate-local hardware pressure is an expected scalar
+                // fallback. Arithmetic or contract failures must not silently
+                // produce a partial ordered candidate set/cache identity.
+                Err(TiledMatmulError::ResourceLimit) => {}
+                Err(error) => return Err(error),
             }
         }
         candidates.sort_by_key(|candidate| {
@@ -301,6 +307,7 @@ impl TiledMatmulPlan {
             || self.block_m == 0
             || self.block_n == 0
             || self.block_k == 0
+            || !CANONICAL_TILES.contains(&(self.block_m, self.block_n, self.block_k))
             || self.register_tile != [1, 1]
             || self.vector_width != 1
             || self.workgroup != [self.block_n, self.block_m, 1]
@@ -716,5 +723,44 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn candidate_enumeration_propagates_cost_overflow_without_partial_plan() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [4_000_000, 4_000_000], DType::F32);
+        let rhs = graph.input_dtype("rhs", [4_000_000, 4_000_000], DType::F32);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let base = MatmulKernelPlan::from_graph(&graph, output).unwrap();
+        assert_eq!(
+            TiledMatmulPlan::enumerate(&base, &MatmulTargetCaps::conservative_ptx(80).unwrap()),
+            Err(TiledMatmulError::Overflow)
+        );
+    }
+
+    #[test]
+    fn validation_rejects_off_policy_candidate_before_artifact_identity() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [8, 8], DType::F32);
+        let rhs = graph.input_dtype("rhs", [8, 8], DType::F32);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let base = MatmulKernelPlan::from_graph(&graph, output).unwrap();
+        let target = MatmulTargetCaps::conservative_ptx(80).unwrap();
+        let off_policy = TiledMatmulPlan::candidate(&base, &target, 1, 1, 1).unwrap();
+        assert!(matches!(
+            off_policy.validate(&base),
+            Err(TiledMatmulError::InvalidPlan)
+        ));
+        let kernel = crate::UOp::new(
+            crate::UOpKind::Matmul,
+            Some(crate::UType::scalar(DType::F32)),
+            vec![],
+            crate::UArg::TiledMatmul(Box::new(TiledMatmulPayload {
+                matmul: base,
+                tile: off_policy,
+            })),
+        );
+        assert!(kernel.validate().is_err());
+        assert!(crate::uop::artifact::encode(&kernel).is_err());
     }
 }

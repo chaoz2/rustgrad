@@ -1,5 +1,6 @@
 use crate::{
-    AttentionOptions, Backend, CpuBackend, DType, Error, Graph, ReduceKind, Shape, TensorData,
+    AttentionOptions, Backend, CpuBackend, DType, Error, Graph, Op, ReduceKind, Scalar, Shape,
+    TensorData, UnaryOp,
 };
 use std::collections::HashMap;
 
@@ -213,6 +214,151 @@ fn logsumexp_empty_domain_validates_axes_before_graph_mutation() {
     let trace = graph.trace(output).unwrap().to_string();
     assert!(trace.contains("constant"));
     assert!(!trace.contains("Max(%"));
+}
+
+#[test]
+fn logsumexp_uses_detached_typed_exp2_log2_and_empty_max_identity() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 2], DType::F64);
+    let output = graph.logsumexp(input, Some(vec![-1]), false).unwrap();
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [2, 2],
+            DType::F64,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::NAN),
+                Scalar::F(f64::INFINITY),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = execute(&graph, output, bindings.clone());
+    assert_close(&values.to_vec_f64()[..1], &[std::f64::consts::LN_2], 1e-12);
+    assert!(values.scalar_at(1).as_f64().is_nan());
+    let gradients = execute(&graph, gradient, bindings).to_vec_f64();
+    assert_eq!(&gradients[..2], &[0.5, 0.5]);
+    assert!(gradients[2].is_nan() && gradients[3].is_nan());
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut typed = Graph::new();
+        let x = typed.input_dtype("x", [], dtype);
+        let output = typed.logsumexp(x, Some(vec![-1]), false).unwrap();
+        assert_eq!(typed.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(typed.dtype(output).unwrap(), dtype);
+    }
+    for dtype in [DType::Bool, DType::I8, DType::I64, DType::U8, DType::U64] {
+        let mut promoted = Graph::new();
+        let x = promoted.input_dtype("x", [], dtype);
+        let output = promoted.logsumexp(x, None, false).unwrap();
+        assert_eq!(promoted.dtype(output).unwrap(), DType::F32);
+    }
+    let mut empty_axis = Graph::new();
+    let x = empty_axis.input_dtype("x", [2, 0], DType::F32);
+    let output = empty_axis.logsumexp(x, Some(vec![1]), false).unwrap();
+    assert_eq!(empty_axis.shape(output).unwrap(), &Shape::new([2]));
+    let values = execute(
+        &empty_axis,
+        output,
+        HashMap::from([("x".into(), TensorData::new([2, 0], Vec::<f32>::new()).unwrap())]),
+    );
+    assert!(values.to_vec_f64().iter().all(|value| value.is_infinite() && value.is_sign_negative()));
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.logsumexp(x, Some(vec![1]), false).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
+fn logsumexp_preflights_axes_and_keeps_established_nonfinite_boundaries() {
+    let mut malformed = Graph::new();
+    let input = malformed.input("input", [2, 0]);
+    let original_nodes = malformed.node_count();
+    assert!(matches!(
+        malformed.logsumexp(input, Some(vec![-1, 1]), false),
+        Err(Error::InvalidReductionAxes { .. })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+    assert!(matches!(
+        malformed.logsumexp(input, Some(vec![isize::MIN]), false),
+        Err(Error::InvalidReductionAxes { .. })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+    assert!(matches!(
+        malformed.logsumexp(input, Some(vec![-1]), false),
+        Err(Error::EmptyReduction { op: "max", .. })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+
+    let mut graph = Graph::new();
+    let values = graph.input("values", [2]);
+    let output = graph.logsumexp(values, Some(vec![-1]), false).unwrap();
+    assert!(execute(
+        &graph,
+        output,
+        HashMap::from([("values".into(), data([2], &[f32::NEG_INFINITY; 2]))]),
+    )
+    .scalar_at(0)
+    .as_f64()
+    .is_nan());
+    assert!(execute(
+        &graph,
+        output,
+        HashMap::from([("values".into(), data([2], &[f32::NAN, 0.]))]),
+    )
+    .scalar_at(0)
+    .as_f64()
+    .is_nan());
+
+    let mut integer_graph = Graph::new();
+    let integer = integer_graph.input_dtype("integer", [2], DType::I32);
+    let output = integer_graph
+        .logsumexp(integer, Some(vec![-1]), false)
+        .unwrap();
+    assert_eq!(integer_graph.dtype(output).unwrap(), DType::F32);
+}
+
+#[test]
+fn logsumexp_default_keeps_tinygrad_all_axis_literal_and_atomic_plan() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F64);
+    let output = graph.logsumexp_default(input).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    let loss = graph.sum_all(output).unwrap();
+    assert!(graph.grad(loss, input).is_ok());
+
+    let mut nonfloat = Graph::new();
+    let input = nonfloat.input_dtype("x", [], DType::I32);
+    let output = nonfloat.logsumexp_default(input).unwrap();
+    assert_eq!(nonfloat.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 2], DType::F16);
+    let output = empty.logsumexp_default(input).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F32);
+    let nodes = overflow.node_count();
+    assert!(overflow.logsumexp_default(input).is_err());
+    assert_eq!(overflow.node_count(), nodes);
 }
 
 #[test]
@@ -482,6 +628,262 @@ fn triangular_masks_preserve_dtype_empty_shapes_and_float_gradients() {
 }
 
 #[test]
+fn softmax_preflights_requested_dtype_before_stable_lowering() {
+    let mut requested_integer = Graph::new();
+    let input = requested_integer.input("input", [2]);
+    let output = requested_integer.softmax(input, -1, Some(DType::I32)).unwrap();
+    // Tinygrad permits a requested exact dtype, then Exp lifts that storage to
+    // F32. It is not a rejection and the final probabilities are F32.
+    assert_eq!(requested_integer.dtype(output).unwrap(), DType::F32);
+
+    let mut valid = Graph::new();
+    let input = valid.input("input", [2]);
+    let output = valid.softmax(input, -1, Some(DType::F32)).unwrap();
+    assert_close(
+        &execute(
+            &valid,
+            output,
+            HashMap::from([("input".into(), data([2], &[0., 1.]))]),
+        )
+        .to_vec_f64(),
+        &[0.26894, 0.73106],
+        2e-3,
+    );
+}
+
+#[test]
+fn softmax_uses_detached_typed_exp2_sum_reciprocal_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 2], DType::F64);
+    let output = graph.softmax(input, -1, None).unwrap();
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("reciprocal(")));
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [2, 2],
+            DType::F64,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::NAN),
+                Scalar::F(f64::INFINITY),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = execute(&graph, output, bindings.clone());
+    assert_eq!(values.scalar_at(0).as_f64(), 0.5);
+    assert_eq!(values.scalar_at(1).as_f64(), 0.5);
+    assert!(values.scalar_at(2).as_f64().is_nan());
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    let gradients = execute(&graph, gradient, bindings).to_vec_f64();
+    assert_eq!(&gradients[..2], &[0., 0.]);
+    assert!(gradients[2].is_nan() && gradients[3].is_nan());
+
+    for (input_dtype, requested, expected) in [
+        (DType::F16, None, DType::F16),
+        (DType::BF16, None, DType::BF16),
+        (DType::F32, None, DType::F32),
+        (DType::F64, None, DType::F64),
+        (DType::I64, None, DType::F32),
+        (DType::U64, None, DType::F32),
+        (DType::F16, Some(DType::F64), DType::F64),
+        (DType::F32, Some(DType::I32), DType::F32),
+    ] {
+        let mut typed = Graph::new();
+        let x = typed.input_dtype("x", [], input_dtype);
+        let output = typed.softmax(x, -1, requested).unwrap();
+        assert_eq!(typed.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(typed.dtype(output).unwrap(), expected);
+    }
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [2, 0], DType::F16);
+    let nodes = empty.node_count();
+    let output = empty.softmax(x, -1, None).unwrap();
+    assert_eq!(output, x);
+    assert_eq!(empty.node_count(), nodes);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.softmax(x, 1, None).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
+fn softmin_is_tinygrads_literal_neg_then_typed_softmax() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [1, 3], DType::F16);
+    let output = graph.softmin(input, -1, Some(DType::F32)).unwrap();
+    assert!((0..graph.node_count()).any(|index| matches!(
+        graph.op(crate::NodeId(index)).unwrap(),
+        Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
+    )));
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert_close(
+        &execute(
+            &graph,
+            output,
+            HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars(
+                    [1, 3],
+                    DType::F16,
+                    [Scalar::F(1.0), Scalar::F(2.0), Scalar::F(3.0)],
+                )
+                .unwrap(),
+            )]),
+        )
+        .to_vec_f64(),
+        &[0.66524, 0.24473, 0.09003],
+        2e-3,
+    );
+
+    // The preflight is before Neg: invalid softmax controls cannot publish
+    // the otherwise-valid source-literal prefix.
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.softmin(x, 1, None).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0], DType::F16);
+    let output = empty.softmin(x, -1, None).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+}
+
+#[test]
+fn log_softmax_uses_detached_typed_exp2_log2_composition_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 2], DType::F64);
+    let output = graph.log_softmax(input, -1, None).unwrap();
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [2, 2],
+            DType::F64,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::NAN),
+                Scalar::F(f64::INFINITY),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = execute(&graph, output, bindings.clone());
+    assert_close(&values.to_vec_f64()[..2], &[-std::f64::consts::LN_2; 2], 1e-12);
+    assert!(values.scalar_at(2).as_f64().is_nan());
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    let gradients = execute(&graph, gradient, bindings).to_vec_f64();
+    assert_eq!(&gradients[..2], &[0., 0.]);
+    assert!(gradients[2].is_nan() && gradients[3].is_nan());
+
+    for (input_dtype, requested, expected) in [
+        (DType::F16, None, DType::F16),
+        (DType::BF16, None, DType::BF16),
+        (DType::F32, None, DType::F32),
+        (DType::F64, None, DType::F64),
+        (DType::I64, None, DType::F32),
+        (DType::U64, None, DType::F32),
+        (DType::F16, Some(DType::F64), DType::F64),
+        (DType::F32, Some(DType::I32), DType::F32),
+    ] {
+        let mut typed = Graph::new();
+        let x = typed.input_dtype("x", [], input_dtype);
+        let output = typed.log_softmax(x, -1, requested).unwrap();
+        assert_eq!(typed.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(typed.dtype(output).unwrap(), expected);
+    }
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [2, 0], DType::F16);
+    let nodes = empty.node_count();
+    let output = empty.log_softmax(x, -1, None).unwrap();
+    assert_eq!(output, x);
+    assert_eq!(empty.node_count(), nodes);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.log_softmax(x, 1, None).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
+fn softmax_family_default_wrappers_keep_tinygrad_axis_dtype_and_atomic_plans() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F16);
+    let softmax = graph.softmax_default(input).unwrap();
+    let log_softmax = graph.log_softmax_default(input).unwrap();
+    let softmin = graph.softmin_default(input).unwrap();
+    for output in [softmax, log_softmax, softmin] {
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+    }
+    let softmax_trace = graph.trace(softmax).unwrap();
+    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("reciprocal(")));
+    let log_trace = graph.trace(log_softmax).unwrap();
+    assert!(log_trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    assert!((0..graph.node_count()).any(|index| matches!(
+        graph.op(crate::NodeId(index)).unwrap(),
+        Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
+    )));
+
+    let loss = graph.sum_all(softmax).unwrap();
+    assert!(graph.grad(loss, input).is_ok());
+
+    let mut nonfloat = Graph::new();
+    let input = nonfloat.input_dtype("x", [], DType::I32);
+    for output in [
+        nonfloat.softmax_default(input).unwrap(),
+        nonfloat.log_softmax_default(input).unwrap(),
+        nonfloat.softmin_default(input).unwrap(),
+    ] {
+        assert_eq!(nonfloat.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 2], DType::BF16);
+    assert_eq!(empty.softmax_default(input).unwrap(), input);
+    assert_eq!(empty.log_softmax_default(input).unwrap(), input);
+    let softmin = empty.softmin_default(input).unwrap();
+    assert_eq!(empty.shape(softmin).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(softmin).unwrap(), DType::BF16);
+
+    for name in ["softmax", "log_softmax", "softmin"] {
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        let result = match name {
+            "softmax" => overflow.softmax_default(input),
+            "log_softmax" => overflow.log_softmax_default(input),
+            "softmin" => overflow.softmin_default(input),
+            _ => unreachable!(),
+        };
+        assert!(result.is_err());
+        assert_eq!(overflow.node_count(), nodes);
+    }
+}
+
+#[test]
 fn attention_causal_boolean_and_additive_masks_match_fixtures() {
     let mut graph = Graph::new();
     let q = graph.input("q", [1, 1, 2, 2]);
@@ -707,6 +1109,67 @@ fn attention_rejects_invalid_contracts_and_nonzero_dropout() {
                 }
             )
             .is_err()
+    );
+}
+
+#[test]
+fn attention_preflights_mask_geometry_before_lowering() {
+    let mut malformed = Graph::new();
+    let query = malformed.input("query", [1, 1, 2, 1]);
+    let key = malformed.input("key", [1, 1, 2, 1]);
+    let value = malformed.input("value", [1, 1, 2, 1]);
+    let mask = malformed.input_dtype("mask", [3], DType::Bool);
+    let original_nodes = malformed.node_count();
+    assert_eq!(
+        malformed.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            Some(mask),
+            AttentionOptions::default(),
+        ),
+        Err(Error::InvalidAttention {
+            reason: "attn_mask must broadcast to attention scores"
+        })
+    );
+    assert_eq!(malformed.node_count(), original_nodes);
+
+    let mut valid = Graph::new();
+    let query = valid.input("query", [1, 1, 1, 1]);
+    let key = valid.input("key", [1, 1, 2, 1]);
+    let value = valid.input("value", [1, 1, 2, 1]);
+    let mask = valid.input_dtype("mask", [1, 2], DType::Bool);
+    let output = valid
+        .scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            Some(mask),
+            AttentionOptions::default(),
+        )
+        .unwrap();
+    assert_close(
+        &execute(
+            &valid,
+            output,
+            HashMap::from([
+                ("query".into(), data([1, 1, 1, 1], &[1.])),
+                ("key".into(), data([1, 1, 2, 1], &[1., 0.])),
+                ("value".into(), data([1, 1, 2, 1], &[3., 7.])),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [1, 2],
+                        DType::Bool,
+                        [crate::Scalar::Bool(true), crate::Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .to_vec_f64(),
+        &[3.],
+        2e-3,
     );
 }
 
