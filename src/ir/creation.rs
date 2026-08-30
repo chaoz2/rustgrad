@@ -4356,8 +4356,28 @@ impl Graph {
         };
         checked_bytes(&shape)?;
         let rank = shape.rank();
-        let dim1 = normalize_axes(input, rank, Some(vec![dim1]))?[0];
-        let dim2 = normalize_axes(input, rank, Some(vec![dim2]))?[0];
+        let normalize_axis = |axis: isize| -> Result<usize> {
+            let rank_isize = isize::try_from(rank).map_err(|_| Error::InvalidAxis {
+                node: input,
+                axis: usize::try_from(axis).unwrap_or(usize::MAX),
+                rank,
+            })?;
+            let normalized = if axis < 0 {
+                axis.checked_add(rank_isize)
+            } else {
+                Some(axis)
+            };
+            normalized
+                .and_then(|axis| usize::try_from(axis).ok())
+                .filter(|axis| *axis < rank)
+                .ok_or(Error::InvalidAxis {
+                    node: input,
+                    axis: usize::try_from(axis).unwrap_or(usize::MAX),
+                    rank,
+                })
+        };
+        let dim1 = normalize_axis(dim1)?;
+        let dim2 = normalize_axis(dim2)?;
         if dim1 == dim2 {
             return Err(Error::InvalidDiagonal {
                 reason: "diagonal axes must be distinct",
