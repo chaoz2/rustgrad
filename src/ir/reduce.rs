@@ -3955,7 +3955,7 @@ mod tests {
         assert!((0..graph.node_count()).any(|index| matches!(
             graph.op(NodeId(index)).unwrap(),
             crate::Op::Binary {
-                op: BinaryOp::Mul,
+                op: crate::BinaryOp::Mul,
                 lhs,
                 rhs,
             } if lhs == rhs
