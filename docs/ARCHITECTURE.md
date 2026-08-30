@@ -1101,6 +1101,12 @@ their semantic policies differ. Artifact encoding alone projects operations to
 a private wire opcode and payload; the existing numeric tags and version gates
 are unchanged and cannot leak back into the DAG.
 
+Validation also binds address semantics to the defining operation:
+`DefineGlobal`, `DefineLocal`, and `DefineRegister` require the matching embedded
+`AddressValue` memory space. `LinearKernel::from_uop` validates the complete
+source DAG before deriving instruction order, so a structurally sortable but
+semantically invalid address graph cannot enter late linearization.
+
 This is an intentional pre-1.0 Rust source migration. `UOp::from_operation`
 is the typed constructor and `UOp::operation()` exposes the borrowed enum.
 There is no legacy opcode/argument constructor or projection that could

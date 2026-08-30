@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:b7e7cba783f6274f",
+  "source_fingerprint": "fnv1a64:8c6ee90d87060d95",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -297,7 +297,7 @@
       "subject": "Universal IR for ALU, memory, ranges and control",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "The immutable typed UOp DAG covers constants/vconsts, definitions, special/range/if delimiters, selected ALU/cast/vector/index/load/store/barrier/sink families, plus separate validated serial, scalar-tiled, and tensor-core Matmul payloads reusing normalized `MatmulKernelPlan`. `UOpNode` stores one directly declared typed `Operation` whose variants own their payloads; this is the sole in-memory operation taxonomy, so mismatched kind/argument states are unrepresentable. Validation, rewriting, schedules, interpreters, renderers, and visualization match that enum directly at their distinct exhaustive semantic boundaries. Only the private artifact codec maps operations to stable numeric wire tags and payload records; RGUA bytes and version gates remain unchanged. Versioned node-table artifacts preserve and validate complete tile/capability/resource/barrier/fragment metadata. Its portable B2 VectorProgram intentionally rejects every F16/BF16/Float8 register producer/consumer, including untyped Load/Store/Select/Cast boundaries, so the CPU renderer falls back to its scalar-per-lane half decode/encode or Float8 comparison-decode/raw-Select path; tagged half/Float8 vector ABIs remain unimplemented. Full tinygrad op vocabulary and broader kernel lowering remain."
+        "Acceptance requirement": "The immutable typed UOp DAG covers constants/vconsts, definitions, special/range/if delimiters, selected ALU/cast/vector/index/load/store/barrier/sink families, plus separate validated serial, scalar-tiled, and tensor-core Matmul payloads reusing normalized `MatmulKernelPlan`. `UOpNode` stores one directly declared typed `Operation` whose variants own their payloads; this is the sole in-memory operation taxonomy, so mismatched kind/argument states are unrepresentable. Validation, rewriting, schedules, interpreters, renderers, and visualization match that enum directly at their distinct exhaustive semantic boundaries. `DefineGlobal`, `DefineLocal`, and `DefineRegister` reject an embedded `AddressValue` with a different memory space, and `LinearKernel::from_uop` validates the complete source DAG before deriving instruction order. Only the private artifact codec maps operations to stable numeric wire tags and payload records; RGUA bytes and version gates remain unchanged. Versioned node-table artifacts preserve and validate complete tile/capability/resource/barrier/fragment metadata. Its portable B2 VectorProgram intentionally rejects every F16/BF16/Float8 register producer/consumer, including untyped Load/Store/Select/Cast boundaries, so the CPU renderer falls back to its scalar-per-lane half decode/encode or Float8 comparison-decode/raw-Select path; tagged half/Float8 vector ABIs remain unimplemented. Full tinygrad op vocabulary and broader kernel lowering remain."
       }
     },
     {

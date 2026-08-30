@@ -729,6 +729,15 @@ fn validate_operation_arity(n: &UOp) -> Result<(), UOpError> {
 fn same(n: &UOp) -> bool {
     n.sources().iter().all(|s| s.ty() == n.ty())
 }
+fn graph_unary_type_is_valid(
+    op: crate::UnaryOp,
+    input: Option<UType>,
+    output: Option<UType>,
+) -> bool {
+    input.zip(output).is_some_and(|(input, output)| {
+        input.lanes == output.lanes && crate::ir::unary_dtype(op, input.scalar) == output.scalar
+    })
+}
 fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Result<(), UOpError> {
     validate_operation_arity(n)?;
     match n.operation() {
@@ -742,11 +751,13 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidDType);
             }
         },
-        Operation::DefineVar(_)
-        | Operation::DefineGlobal(_)
-        | Operation::DefineLocal(_)
-        | Operation::DefineRegister(_)
-        | Operation::Special(_) => {}
+        Operation::DefineVar(_) | Operation::Special(_) => {}
+        Operation::DefineGlobal(value) if value.space == AddressSpace::Global => {}
+        Operation::DefineLocal(value) if value.space == AddressSpace::Local => {}
+        Operation::DefineRegister(value) if value.space == AddressSpace::Register => {}
+        Operation::DefineGlobal(_) | Operation::DefineLocal(_) | Operation::DefineRegister(_) => {
+            return Err(UOpError::InvalidArgument);
+        }
         Operation::Range(axis) => {
             if !n.sources()[0].ty().is_some_and(|t| t.scalar.is_integer()) {
                 return Err(UOpError::InvalidDType);
@@ -780,19 +791,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
         }
         Operation::GraphUnary(op) => {
-            let valid = if matches!(
-                op,
-                crate::UnaryOp::IsNan | crate::UnaryOp::IsInf | crate::UnaryOp::IsFinite
-            ) {
-                matches!(
-                    (n.ty(), n.sources()[0].ty()),
-                    (Some(output), Some(input))
-                        if output.scalar == DType::Bool && output.lanes == input.lanes
-                )
-            } else {
-                same(n)
-            };
-            if !valid {
+            if !graph_unary_type_is_valid(*op, n.sources()[0].ty(), n.ty()) {
                 return Err(UOpError::InvalidDType);
             }
         }

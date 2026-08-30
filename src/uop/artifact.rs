@@ -2,7 +2,7 @@
 use super::{
     AddressSpace, AddressValue, AffineView, Binary, IndexValue, LiteralValue, MatmulValue,
     MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue, TensorGuardValue, UOp,
-    UType, Unary, VariableValue, ViewMap,
+    UType, Unary, VariableValue, ViewMap, graph_unary_type_is_valid,
 };
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
@@ -879,14 +879,9 @@ fn validate_fields(
                         matches!(index.operation(), Operation::Index(_)) && index.ty() == value.ty()
                     })
         }
-        WireOpcode::GraphUnary(op) => sources
-            .first()
-            .and_then(|source| source.ty())
-            .zip(ty)
-            .is_some_and(|(source, output)| {
-                source.lanes == output.lanes
-                    && crate::ir::unary_dtype(*op, source.scalar) == output.scalar
-            }),
+        WireOpcode::GraphUnary(op) => {
+            graph_unary_type_is_valid(*op, sources.first().and_then(|source| source.ty()), ty)
+        }
         WireOpcode::Unary(_) => sources.first().is_some_and(|x| x.ty() == ty),
         WireOpcode::GraphBinary(_) => ty.is_some() && sources.iter().all(|x| x.ty().is_some()),
         WireOpcode::GraphCompare(_) => {
