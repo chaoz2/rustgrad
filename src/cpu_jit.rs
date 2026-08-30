@@ -727,14 +727,22 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     // result needs no Float8 store. Fail closed for every other Float8 ALU
     // graph until its result-encoding boundary is implemented, rather than
     // silently treating raw payload bytes as numeric lanes.
-    let has_float8 = nodes.iter().any(|node| {
-        node.ty().is_some_and(|ty| ty.scalar.is_float8())
+    let has_float8_alu = nodes.iter().any(|node| {
+        matches!(
+            node.kind(),
+            UOpKind::GraphUnary(_)
+                | UOpKind::GraphBinary(_)
+                | UOpKind::GraphCompare(_)
+                | UOpKind::GraphLogical(_)
+                | UOpKind::Cast
+                | UOpKind::Ternary(_)
+        ) && (node.ty().is_some_and(|ty| ty.scalar.is_float8())
             || node
                 .sources()
                 .iter()
-                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()))
+                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8())))
     });
-    if has_float8 {
+    if has_float8_alu {
         if out.dtype != DType::Bool {
             return Err(JitError::Unsupported(
                 "native Float8 elementwise output encoding is not implemented".into(),
@@ -746,12 +754,16 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                 .sources()
                 .iter()
                 .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
-            if node_float8 && !matches!(node.kind(), UOpKind::Load | UOpKind::Const) {
+            if node_float8
+                && !matches!(node.kind(), UOpKind::Index | UOpKind::Load | UOpKind::Const)
+            {
                 return Err(JitError::Unsupported(
                     "native Float8 elementwise supports decoded loads/constants only".into(),
                 ));
             }
-            if consumes_float8 {
+            if consumes_float8
+                && !matches!(node.kind(), UOpKind::Index | UOpKind::Load | UOpKind::Store)
+            {
                 if !matches!(node.kind(), UOpKind::GraphCompare(_)) {
                     return Err(JitError::Unsupported(
                         "native Float8 elementwise supports comparisons only".into(),
@@ -2758,6 +2770,20 @@ fn emit(
         }
         UOpKind::GraphCompare(op) => {
             let (a, b) = (s(0)?, s(1)?);
+            let float8 = n
+                .sources()
+                .iter()
+                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
+            if float8 {
+                return Ok(match op {
+                    crate::CompareOp::Eq => format!("(({a}) == ({b}))"),
+                    crate::CompareOp::Ne => format!("(({a}) != ({b}))"),
+                    crate::CompareOp::Lt => format!("(({a}) < ({b}))"),
+                    crate::CompareOp::Le => format!("(!(({b}) < ({a})))"),
+                    crate::CompareOp::Gt => format!("(({b}) < ({a}))"),
+                    crate::CompareOp::Ge => format!("(!(({a}) < ({b})))"),
+                });
+            }
             let x = match op {
                 crate::CompareOp::Eq => "==",
                 crate::CompareOp::Ne => "!=",

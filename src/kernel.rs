@@ -1310,11 +1310,19 @@ fn eval(
             )?,
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
         )),
-        UOpKind::GraphCompare(op) => Ok(FusedValue::Scalar(Scalar::Bool(compare(
-            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
-            eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
-            *op,
-        )))),
+        UOpKind::GraphCompare(op) => {
+            let lhs = eval(&n.sources()[0], bindings, linear, plan)?.scalar();
+            let rhs = eval(&n.sources()[1], bindings, linear, plan)?.scalar();
+            let float8 = n
+                .sources()
+                .iter()
+                .any(|source| source.ty().is_some_and(|ty| ty.scalar.is_float8()));
+            Ok(FusedValue::Scalar(Scalar::Bool(if float8 {
+                compare_float8(lhs.as_f64(), rhs.as_f64(), *op)
+            } else {
+                compare(lhs, rhs, *op)
+            })))
+        }
         UOpKind::GraphLogical(op) => {
             let a = eval(&n.sources()[0], bindings, linear, plan)?
                 .scalar()
@@ -1754,6 +1762,20 @@ fn compare(a: Scalar, b: Scalar, op: CompareOp) -> bool {
         CompareOp::Le => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
         CompareOp::Gt => ordering == Some(Ordering::Greater),
         CompareOp::Ge => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
+    }
+}
+
+fn compare_float8(a: f64, b: f64, op: CompareOp) -> bool {
+    // Float8 follows the public tinygrad comparison construction. Inclusive
+    // comparisons are logical-not shells around the opposite strict compare,
+    // so an unordered (NaN) lane is true for Le/Ge.
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        CompareOp::Lt => a < b,
+        CompareOp::Le => !(b < a),
+        CompareOp::Gt => b < a,
+        CompareOp::Ge => !(a < b),
     }
 }
 
