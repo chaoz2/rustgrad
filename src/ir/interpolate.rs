@@ -333,8 +333,9 @@ mod tests {
                 })
                 .all(|len| len == 1)
         );
+        let loss = graph.sum_all(output).expect("interpolation output reduces");
         let gradient = graph
-            .grad(output, input)
+            .grad(loss, input)
             .expect("source gather and lerp compose");
         assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 3, 4]));
     }

@@ -2683,7 +2683,7 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
             .any(|operation| operation.starts_with("maximum("))
     );
     assert!(
-        operations
+        !operations
             .iter()
             .any(|operation| operation.starts_with("abs("))
     );

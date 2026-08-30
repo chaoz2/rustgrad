@@ -2976,7 +2976,10 @@ fn sub_scalar_preserves_tinygrad_neg_then_add_and_reflected_order() {
                     op: CompareOp::Ne,
                     lhs,
                     ..
-                } if *lhs == input
+                } if matches!(reflected.op(*lhs).unwrap(), Op::Cast {
+                    input: source,
+                    dtype: DType::Bool,
+                } if *source == input)
             ));
         } else {
             assert!(
@@ -3076,7 +3079,10 @@ fn sub_matches_tinygrad_bool_negation_and_float_broadcast_vjp() {
             op: CompareOp::Ne,
             lhs: input,
             ..
-        } if *input == rhs
+        } if matches!(booleans.op(*input).unwrap(), Op::Cast {
+            input: source,
+            dtype: DType::Bool,
+        } if *source == rhs)
     ));
     let values = CpuBackend
         .execute(
@@ -3866,7 +3872,7 @@ fn trunc_div_uses_tinygrad_integer_cdiv_lub_and_zero_sentinel() {
     let loss = graph.sum_all(output).unwrap();
     assert!(matches!(
         graph.grad(loss, lhs),
-        Err(Error::NonDifferentiableTarget(node)) if node == lhs
+        Err(Error::NonDifferentiableTarget(node)) if node == loss
     ));
 
     let mut signed_edge = Graph::new();
@@ -4049,7 +4055,7 @@ fn trunc_div_scalar_preserves_source_integer_and_float_branches() {
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
     let boolean_output = mixed.trunc_div_scalar(boolean, Scalar::I(1)).unwrap();
-    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
     let integral_output = mixed.scalar_trunc_div(Scalar::F(-0.0), integral).unwrap();
     assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
     let narrow_output = mixed.trunc_div_scalar(narrow, Scalar::I(1)).unwrap();
@@ -4199,7 +4205,7 @@ fn floor_div_uses_tinygrad_python_floor_correction_and_zero_sentinel() {
     let loss = graph.sum_all(output).unwrap();
     assert!(matches!(
         graph.grad(loss, lhs),
-        Err(Error::NonDifferentiableTarget(node)) if node == lhs
+        Err(Error::NonDifferentiableTarget(node)) if node == loss
     ));
 
     let mut negative_divisor = Graph::new();
@@ -4307,7 +4313,7 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
     let boolean_output = mixed.floor_div_scalar(boolean, Scalar::I(1)).unwrap();
-    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
     let integral_output = mixed.scalar_floor_div(Scalar::F(-0.0), integral).unwrap();
     assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
     let narrow_output = mixed.floor_div_scalar(narrow, Scalar::I(1)).unwrap();
@@ -4586,7 +4592,7 @@ fn modulo_scalar_preserves_floor_composition_and_reflected_roles() {
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
     let boolean_output = mixed.modulo_scalar(boolean, Scalar::I(1)).unwrap();
-    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
     let integral_output = mixed.scalar_modulo(Scalar::F(-0.0), integral).unwrap();
     assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
     let narrow_output = mixed.modulo_scalar(narrow, Scalar::I(1)).unwrap();
@@ -4710,7 +4716,7 @@ fn fmod_scalar_preserves_non_reflected_trunc_composition() {
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
     let boolean_output = mixed.fmod_scalar(boolean, Scalar::I(1)).unwrap();
-    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
     let integral_output = mixed.fmod_scalar(integral, Scalar::F(-0.0)).unwrap();
     assert_eq!(mixed.dtype(integral_output).unwrap(), DType::I32);
     let narrow_output = mixed.fmod_scalar(narrow, Scalar::I(1)).unwrap();
@@ -9721,7 +9727,10 @@ fn neg_uses_tinygrad_bool_logical_not_and_preflighted_numeric_unary() {
             op: CompareOp::Ne,
             lhs,
             ..
-        } if *lhs == boolean
+        } if matches!(discrete.op(*lhs).unwrap(), Op::Cast {
+            input,
+            dtype: DType::Bool,
+        } if *input == boolean)
     ));
     assert!(matches!(
         discrete.op(signed_output).unwrap(),

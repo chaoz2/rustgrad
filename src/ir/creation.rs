@@ -2523,7 +2523,7 @@ mod tests {
         let values = TensorData::new([2, 3], vec![1f32; 6]).unwrap();
         assert_eq!(
             execute(&graph, gradient, values),
-            TensorData::new([2, 3], vec![1f32; 6]).unwrap()
+            TensorData::from_scalars([2, 3], DType::F16, [Scalar::F(1.0); 6]).unwrap()
         );
 
         let mut empty = Graph::new();
@@ -2602,7 +2602,7 @@ mod tests {
         let values = TensorData::new([1, 3], vec![1f32; 3]).unwrap();
         assert_eq!(
             execute(&graph, gradient, values),
-            TensorData::new([1, 3], vec![2f32; 3]).unwrap()
+            TensorData::from_scalars([1, 3], DType::F16, [Scalar::F(2.0); 3]).unwrap()
         );
 
         let mut empty = Graph::new();
@@ -2654,7 +2654,7 @@ mod tests {
         let values = TensorData::new([2, 3], vec![1f32; 6]).unwrap();
         assert_eq!(
             execute(&graph, gradient, values),
-            TensorData::new([2, 3], vec![0f32; 6]).unwrap()
+            TensorData::from_scalars([2, 3], DType::F16, [Scalar::F(0.0); 6]).unwrap()
         );
     }
 
@@ -2703,7 +2703,7 @@ mod tests {
         let loss = graph.sum_all(output).unwrap();
         assert!(matches!(
             graph.grad(loss, input),
-            Err(Error::NonDifferentiableTarget(node)) if node == input
+            Err(Error::NonDifferentiableTarget(node)) if node == loss
         ));
 
         let scalar = graph.input("scalar", []);

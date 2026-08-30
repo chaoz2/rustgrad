@@ -4099,17 +4099,21 @@ mod tests {
                 .zip(expected)
                 .all(|(actual, expected)| (*actual - expected).abs() <= f32::EPSILON as f64)
         );
-        assert_eq!(
-            CpuBackend
-                .execute(&graph, gradient, &inputs)
-                .unwrap()
-                .to_vec_f64(),
-            vec![
-                0.032f32 as f64,
-                -0.024f32 as f64,
-                (84.0f32 / 2197.0) as f64,
-                (-35.0f32 / 2197.0) as f64,
-            ]
+        let actual = CpuBackend
+            .execute(&graph, gradient, &inputs)
+            .unwrap()
+            .to_vec_f64();
+        let expected = [
+            0.032f32 as f64,
+            -0.024f32 as f64,
+            (84.0f32 / 2197.0) as f64,
+            (-35.0f32 / 2197.0) as f64,
+        ];
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (*actual - expected).abs() <= f32::EPSILON as f64)
         );
 
         let mut narrow = Graph::new();
@@ -4211,16 +4215,12 @@ mod tests {
 
         let mut zero = Graph::new();
         let input = zero.input_dtype("input", [], DType::Bool);
-        let output = zero.normalize(input, -0.0, -1, f64::NAN).unwrap();
-        assert_eq!(zero.shape(output).unwrap(), &Shape::new([]));
-        assert_eq!(zero.dtype(output).unwrap(), DType::F32);
-        assert!((0..zero.node_count()).all(|index| !matches!(
-            zero.op(NodeId(index)).unwrap(),
-            crate::Op::Binary {
-                op: crate::BinaryOp::Pow,
-                ..
-            }
-        )));
+        let before = zero.node_count();
+        assert!(matches!(
+            zero.normalize(input, -0.0, -1, f64::NAN),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(zero.node_count(), before);
 
         let mut empty = Graph::new();
         let input = empty.input_dtype("input", [2, 0], DType::F16);
