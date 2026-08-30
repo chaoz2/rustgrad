@@ -918,6 +918,7 @@ mod tests {
 
     #[test]
     fn uniform_implicit_is_source_f32_rand_mul_cast_add_and_preflighted() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(42);
         let mut graph = Graph::new();
         let output = graph
@@ -992,6 +993,7 @@ mod tests {
 
     #[test]
     fn scaled_uniform_implicit_is_source_uniform_then_weak_scale() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(43);
         let mut graph = Graph::new();
         let output = graph.scaled_uniform_implicit([2, 3], DType::F16).unwrap();
@@ -1093,6 +1095,7 @@ mod tests {
 
     #[test]
     fn normal_implicit_is_source_randn_mul_add_and_preflighted() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(17);
         let mut graph = Graph::new();
         let output = graph
@@ -1166,6 +1169,7 @@ mod tests {
 
     #[test]
     fn rand_and_randn_defaults_delegate_to_the_source_f32_streams() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(19);
         let mut graph = Graph::new();
         let uniform = graph.rand_default([2, 3]).unwrap();
@@ -1195,6 +1199,7 @@ mod tests {
 
     #[test]
     fn implicit_rand_like_helpers_follow_receiver_descriptors_and_preflight() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(31);
         let mut graph = Graph::new();
         let receiver = graph.input_dtype_requires_grad("receiver", [2, 0, 3], DType::F16, true);
@@ -1292,6 +1297,7 @@ mod tests {
 
     #[test]
     fn multinomial_is_source_literal_and_stream_atomic() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(37);
         let mut graph = Graph::new();
         let vector = graph.input_dtype_requires_grad("vector", [4], DType::F32, true);
@@ -1357,6 +1363,7 @@ mod tests {
 
     #[test]
     fn glorot_uniform_implicit_preflights_fan_then_uses_source_uniform() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(23);
         let mut graph = Graph::new();
         let output = graph.glorot_uniform_implicit([2, 3], DType::F16).unwrap();
@@ -1411,6 +1418,7 @@ mod tests {
 
     #[test]
     fn kaiming_uniform_implicit_uses_empty_tail_identity_before_uniform() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(29);
         let mut graph = Graph::new();
         // Unlike the old seeded compatibility API, source Kaiming permits a
@@ -1471,6 +1479,7 @@ mod tests {
 
     #[test]
     fn kaiming_normal_implicit_preflights_fan_then_uses_source_normal() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(31);
         let mut graph = Graph::new();
         // Kaiming's tail product is empty for scalar and rank-one shapes.
@@ -1541,6 +1550,7 @@ mod tests {
 
     #[test]
     fn randperm_tinygrad_is_random_argsort_then_source_cast() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(37);
         let mut graph = Graph::new();
         let default = graph.randperm_tinygrad_default(3).unwrap();
@@ -4084,6 +4094,19 @@ impl Graph {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         registry.seed = seed;
         registry.counters.clear();
+    }
+
+    /// Serializes unit tests that reset or inspect the process-global implicit
+    /// random stream. Production reservations remain independently locked;
+    /// this guard only prevents parallel tests from resetting one another's
+    /// counters between `manual_seed` and the reservations under inspection.
+    #[cfg(test)]
+    pub(crate) fn lock_implicit_random_tests() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
     pub fn full(&mut self, shape: impl Into<Shape>, value: f32) -> Result<NodeId> {
         Ok(self.constant(TensorData::full(shape, value)?))

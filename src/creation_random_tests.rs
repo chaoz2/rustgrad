@@ -111,6 +111,7 @@ fn normal_and_randint_have_deterministic_sane_static_contracts() {
 
 #[test]
 fn like_global_seed_randperm_and_initializers_are_replayable() {
+    let _stream_guard = Graph::lock_implicit_random_tests();
     let mut graph = Graph::new();
     let source = graph.input_dtype("x", [2, 3], DType::F16);
     let ones = graph.ones_like(source, None).unwrap();
@@ -198,6 +199,7 @@ fn like_creation_helpers_preserve_metadata_and_const_values() {
 
 #[test]
 fn implicit_streams_reserve_packed_words_reset_and_isolate_devices() {
+    let _stream_guard = Graph::lock_implicit_random_tests();
     Graph::manual_seed(1337);
     let mut graph = Graph::new();
     let first = graph.rand_implicit([1], DType::F16).unwrap();
@@ -222,6 +224,7 @@ fn implicit_streams_reserve_packed_words_reset_and_isolate_devices() {
 
 #[test]
 fn invalid_implicit_randperm_does_not_reserve_or_append() {
+    let _stream_guard = Graph::lock_implicit_random_tests();
     Graph::manual_seed(411);
     let mut graph = Graph::new();
     let original_nodes = graph.node_count();
@@ -289,6 +292,7 @@ fn randint_uses_float_uniform_scaling_then_storage_cast() {
 
 #[test]
 fn randperm_uses_captured_threefry_reservations_and_random_ordering() {
+    let _stream_guard = Graph::lock_implicit_random_tests();
     Graph::manual_seed(1337);
     let mut graph = Graph::new();
     let first = graph.randperm_implicit(20, DType::I32).unwrap();

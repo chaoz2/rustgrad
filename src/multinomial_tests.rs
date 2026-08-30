@@ -108,6 +108,7 @@ fn multinomial_preflights_shape_count_and_dtype_without_graph_mutation() {
 
 #[test]
 fn session_multinomial_implicit_rolls_back_invalid_weights_before_stream_reservation() {
+    let _stream_guard = Graph::lock_implicit_random_tests();
     Graph::manual_seed(91);
     let mut session = CpuSession::new();
     let invalid = session.tensor([2], [f32::NAN, 1.0]).unwrap();

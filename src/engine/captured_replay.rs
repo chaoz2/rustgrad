@@ -1150,6 +1150,7 @@ mod tests {
 
     #[test]
     fn captured_threefry_random_is_graph_free_and_native_f32_f64_matches_oracle() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         for dtype in [DType::F32, DType::F64] {
             let mut graph = Graph::new();
             let output = graph.rand([5], dtype, 0x1234_5678).unwrap();
@@ -1216,6 +1217,7 @@ mod tests {
 
     #[test]
     fn captured_threefry_native_full_distribution_surface_matches_cpu() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
         enum Distribution {
             Uniform(f64, f64),
             Normal(f64, f64),
