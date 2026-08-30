@@ -67,10 +67,14 @@ fn diag_rejects_non_vectors_before_graph_mutation() {
     let scalar = graph.input("scalar", []);
     let matrix = graph.input("matrix", [2, 2]);
     let before = graph.node_count();
-    for input in [scalar, matrix] {
+    for (input, actual) in [(scalar, 0), (matrix, 2)] {
         assert!(matches!(
             graph.diag(input),
-            Err(Error::InvalidDiagonal { .. })
+            Err(Error::InvalidMovementRank {
+                op: "diag",
+                expected: 1,
+                actual: rank,
+            }) if rank == actual
         ));
     }
     assert_eq!(graph.node_count(), before);
