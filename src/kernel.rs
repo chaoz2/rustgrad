@@ -1766,6 +1766,8 @@ fn compare(a: Scalar, b: Scalar, op: CompareOp) -> bool {
 }
 
 fn compare_float8(a: f64, b: f64, op: CompareOp) -> bool {
+    use std::cmp::Ordering;
+
     // Float8 follows the public tinygrad comparison construction. Inclusive
     // comparisons are logical-not shells around the opposite strict compare,
     // so an unordered (NaN) lane is true for Le/Ge.
@@ -1773,9 +1775,9 @@ fn compare_float8(a: f64, b: f64, op: CompareOp) -> bool {
         CompareOp::Eq => a == b,
         CompareOp::Ne => a != b,
         CompareOp::Lt => a < b,
-        CompareOp::Le => !(b < a),
+        CompareOp::Le => b.partial_cmp(&a) != Some(Ordering::Less),
         CompareOp::Gt => b < a,
-        CompareOp::Ge => !(a < b),
+        CompareOp::Ge => a.partial_cmp(&b) != Some(Ordering::Less),
     }
 }
 
