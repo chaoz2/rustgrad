@@ -5402,13 +5402,10 @@ mod tests {
     }
 
     #[test]
-    fn float8_c5_rejects_outside_cpu_oracle_table() {
-        let cases: [(&str, Float8C2Build); 3] = [
+    fn float8_c5_rejects_unsupported_cpu_oracle_ops() {
+        let cases: [(&str, Float8C2Build); 2] = [
             ("exp", |graph, x| graph.exp(x)),
             ("argmax", |graph, x| graph.argmax(x, Some(0), false)),
-            ("pad", |graph, x| {
-                graph.pad(x, [(0, 0), (0, 0)], Scalar::F(0.0))
-            }),
         ];
         for (name, build) in cases {
             let mut graph = Graph::new();
