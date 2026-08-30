@@ -714,7 +714,12 @@ impl ReductionDType {
     pub const fn sum_default(input: DType) -> Self {
         let accumulator = input.sum_accumulator_dtype();
         let output = match input {
-            DType::F16 | DType::BF16 => input,
+            DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ
+            | DType::F16
+            | DType::BF16 => input,
             _ => accumulator,
         };
         Self::new(accumulator, output)

@@ -42,6 +42,28 @@ pub enum DTypeCategory {
 }
 
 impl DType {
+    /// tinygrad's concrete OCP float8 inventory tuple.
+    pub const FP8_OCP: [Self; 2] = [Self::F8E4M3, Self::F8E5M2];
+    /// tinygrad's concrete FNUZ float8 inventory tuple.
+    pub const FP8_FNUZ: [Self; 2] = [Self::F8E4M3FNUZ, Self::F8E5M2FNUZ];
+    /// tinygrad's concrete float8 inventory: OCP entries then FNUZ entries.
+    pub const FP8S: [Self; 4] = [
+        Self::F8E4M3,
+        Self::F8E5M2,
+        Self::F8E4M3FNUZ,
+        Self::F8E5M2FNUZ,
+    ];
+    /// tinygrad's concrete floating-point inventory tuple.
+    pub const FLOATS: [Self; 8] = [
+        Self::F8E4M3,
+        Self::F8E5M2,
+        Self::F8E4M3FNUZ,
+        Self::F8E5M2FNUZ,
+        Self::F16,
+        Self::BF16,
+        Self::F32,
+        Self::F64,
+    ];
     /// tinygrad's concrete `(uint8, int8)` inventory tuple.
     pub const INT8S: [Self; 2] = [Self::U8, Self::I8];
     /// tinygrad's concrete `(uint16, int16)` inventory tuple.
@@ -64,6 +86,26 @@ impl DType {
         Self::I16,
         Self::I32,
         Self::I64,
+    ];
+    /// tinygrad's concrete dtype inventory: floats, integers, then Bool.
+    pub const ALL: [Self; 17] = [
+        Self::F8E4M3,
+        Self::F8E5M2,
+        Self::F8E4M3FNUZ,
+        Self::F8E5M2FNUZ,
+        Self::F16,
+        Self::BF16,
+        Self::F32,
+        Self::F64,
+        Self::U8,
+        Self::U16,
+        Self::U32,
+        Self::U64,
+        Self::I8,
+        Self::I16,
+        Self::I32,
+        Self::I64,
+        Self::Bool,
     ];
 
     pub const fn category(self) -> DTypeCategory {
@@ -118,7 +160,8 @@ impl DType {
             Self::U32 => 6,
             Self::I64 => 7,
             Self::U64 => 8,
-            Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3FNUZ | Self::F8E5M2FNUZ => 9,
+            Self::F8E4M3 | Self::F8E4M3FNUZ => 10,
+            Self::F8E5M2 | Self::F8E5M2FNUZ => 11,
             Self::F16 => 12,
             Self::BF16 => 13,
             Self::F32 => 14,
@@ -286,6 +329,8 @@ impl DType {
     /// Returns the IEEE exponent and mantissa widths for a supported float dtype.
     pub const fn finfo(self) -> Result<(u8, u8)> {
         match self {
+            Self::F8E4M3 | Self::F8E4M3FNUZ => Ok((4, 3)),
+            Self::F8E5M2 | Self::F8E5M2FNUZ => Ok((5, 2)),
             Self::F16 => Ok((5, 10)),
             Self::BF16 => Ok((8, 7)),
             Self::F32 => Ok((8, 23)),
@@ -409,9 +454,26 @@ impl DType {
             return true;
         }
         match target {
-            F64 => matches!(self, F32 | F16 | BF16 | U32 | U16 | U8 | I32 | I16 | I8),
-            F32 => matches!(self, F16 | BF16 | U16 | U8 | I16 | I8),
-            F16 => matches!(self, U8 | I8),
+            F64 => matches!(
+                self,
+                F32 | F16
+                    | BF16
+                    | F8E4M3
+                    | F8E5M2
+                    | F8E4M3FNUZ
+                    | F8E5M2FNUZ
+                    | U32
+                    | U16
+                    | U8
+                    | I32
+                    | I16
+                    | I8
+            ),
+            F32 => matches!(
+                self,
+                F16 | BF16 | F8E4M3 | F8E5M2 | F8E4M3FNUZ | F8E5M2FNUZ | U16 | U8 | I16 | I8
+            ),
+            F16 => matches!(self, F8E4M3 | F8E5M2 | F8E4M3FNUZ | F8E5M2FNUZ | U8 | I8),
             U64 => matches!(self, U32 | U16 | U8),
             U32 => matches!(self, U16 | U8),
             U16 => matches!(self, U8),
@@ -455,6 +517,10 @@ impl DType {
             "uint32" | "uint" => Ok(Self::U32),
             "int64" | "long" => Ok(Self::I64),
             "uint64" | "ulong" => Ok(Self::U64),
+            "fp8e4m3" => Ok(Self::F8E4M3),
+            "fp8e5m2" => Ok(Self::F8E5M2),
+            "fp8e4m3fnuz" => Ok(Self::F8E4M3FNUZ),
+            "fp8e5m2fnuz" => Ok(Self::F8E5M2FNUZ),
             "float16" | "half" => Ok(Self::F16),
             "bfloat16" => Ok(Self::BF16),
             "float32" | "float" => Ok(Self::F32),
@@ -477,17 +543,20 @@ impl DType {
             Self::U32 => "uint",
             Self::I64 => "long",
             Self::U64 => "ulong",
+            Self::F8E4M3 => "fp8e4m3",
+            Self::F8E5M2 => "fp8e5m2",
+            Self::F8E4M3FNUZ => "fp8e4m3fnuz",
+            Self::F8E5M2FNUZ => "fp8e5m2fnuz",
             Self::F16 => "half",
             Self::BF16 => "bfloat16",
             Self::F32 => "float",
             Self::F64 => "double",
-            Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3FNUZ | Self::F8E5M2FNUZ => self.stable_name(),
         }
     }
 
     /// A compact, deterministic promotion lattice for supported scalar dtypes.
-    /// It follows tinygrad's widening intent; fp8/weak/pointer dtypes are not
-    /// implemented yet.
+    /// It follows tinygrad's concrete widening intent; weak, pointer, image,
+    /// and custom dtypes are outside this enum.
     pub fn promote(self, other: Self) -> Self {
         use DType::*;
         if self == other {
@@ -630,6 +699,26 @@ mod tests {
             (DType::U32, 6, 32, 4, "unsigned int", Some('I'), "uint"),
             (DType::I64, 7, 64, 8, "long", Some('q'), "long"),
             (DType::U64, 8, 64, 8, "unsigned long", Some('Q'), "ulong"),
+            (DType::F8E4M3, 10, 8, 1, "float8_e4m3", None, "fp8e4m3"),
+            (DType::F8E5M2, 11, 8, 1, "float8_e5m2", None, "fp8e5m2"),
+            (
+                DType::F8E4M3FNUZ,
+                10,
+                8,
+                1,
+                "float8_e4m3fnuz",
+                None,
+                "fp8e4m3fnuz",
+            ),
+            (
+                DType::F8E5M2FNUZ,
+                11,
+                8,
+                1,
+                "float8_e5m2fnuz",
+                None,
+                "fp8e5m2fnuz",
+            ),
             (DType::F16, 12, 16, 2, "half", Some('e'), "half"),
             (DType::BF16, 13, 16, 2, "__bf16", None, "bfloat16"),
             (DType::F32, 14, 32, 4, "float", Some('f'), "float"),
@@ -651,10 +740,40 @@ mod tests {
             DType::BF16.tinygrad_source_name(),
             DType::BF16.canonical_tinygrad_name()
         );
+        assert_ne!(
+            DType::F8E4M3.tinygrad_source_name(),
+            DType::F8E4M3.canonical_tinygrad_name()
+        );
     }
 
     #[test]
-    fn tinygrad_integer_inventory_and_aliases_cover_only_concrete_integers() {
+    fn tinygrad_concrete_dtype_inventories_match_source_order() {
+        assert_eq!(DType::FP8_OCP, [DType::F8E4M3, DType::F8E5M2]);
+        assert_eq!(DType::FP8_FNUZ, [DType::F8E4M3FNUZ, DType::F8E5M2FNUZ]);
+        assert_eq!(
+            DType::FP8S,
+            [
+                DType::F8E4M3,
+                DType::F8E5M2,
+                DType::F8E4M3FNUZ,
+                DType::F8E5M2FNUZ,
+            ]
+        );
+        assert_eq!(&DType::FP8S[..2], DType::FP8_OCP.as_slice());
+        assert_eq!(&DType::FP8S[2..], DType::FP8_FNUZ.as_slice());
+        assert_eq!(
+            DType::FLOATS,
+            [
+                DType::F8E4M3,
+                DType::F8E5M2,
+                DType::F8E4M3FNUZ,
+                DType::F8E5M2FNUZ,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ]
+        );
         assert_eq!(DType::INT8S, [DType::U8, DType::I8]);
         assert_eq!(DType::INT16S, [DType::U16, DType::I16]);
         assert_eq!(DType::INT32S, [DType::U32, DType::I32]);
@@ -682,22 +801,11 @@ mod tests {
         );
         assert_eq!(&DType::INTS[..4], DType::UINTS.as_slice());
         assert_eq!(&DType::INTS[4..], DType::SINTS.as_slice());
+        assert_eq!(&DType::ALL[..8], DType::FLOATS.as_slice());
+        assert_eq!(&DType::ALL[8..16], DType::INTS.as_slice());
+        assert_eq!(DType::ALL[16], DType::Bool);
 
-        for dtype in [
-            DType::Bool,
-            DType::I8,
-            DType::U8,
-            DType::I16,
-            DType::U16,
-            DType::I32,
-            DType::U32,
-            DType::I64,
-            DType::U64,
-            DType::F16,
-            DType::BF16,
-            DType::F32,
-            DType::F64,
-        ] {
+        for dtype in DType::ALL {
             assert_eq!(dtype.bitsize(), dtype.bits(), "{dtype:?}");
             assert_eq!(dtype.is_int(), dtype.is_integer(), "{dtype:?}");
             assert_eq!(
@@ -707,9 +815,10 @@ mod tests {
             );
         }
         assert!(!DType::INTS.contains(&DType::Bool));
-        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        for dtype in DType::FLOATS {
             assert!(!DType::INTS.contains(&dtype));
             assert!(!dtype.is_int());
+            assert!(dtype.is_float());
         }
     }
 
@@ -717,7 +826,7 @@ mod tests {
     fn dtype_category_bounds_and_finfo_cover_every_local_dtype() {
         let signed = [DType::I8, DType::I16, DType::I32, DType::I64];
         let unsigned = [DType::U8, DType::U16, DType::U32, DType::U64];
-        let floats = [DType::F16, DType::BF16, DType::F32, DType::F64];
+        let floats = DType::FLOATS;
         for dtype in signed {
             assert!(dtype.is_signed_integer());
             assert!(!dtype.is_unsigned());
@@ -745,6 +854,10 @@ mod tests {
             assert!(dtype.max().as_f64().is_infinite());
             assert!(dtype.max().as_f64().is_sign_positive());
         }
+        assert_eq!(DType::F8E4M3.finfo(), Ok((4, 3)));
+        assert_eq!(DType::F8E5M2.finfo(), Ok((5, 2)));
+        assert_eq!(DType::F8E4M3FNUZ.finfo(), Ok((4, 3)));
+        assert_eq!(DType::F8E5M2FNUZ.finfo(), Ok((5, 2)));
         assert_eq!(DType::F16.finfo(), Ok((5, 10)));
         assert_eq!(DType::BF16.finfo(), Ok((8, 7)));
         assert_eq!(DType::F32.finfo(), Ok((8, 23)));
@@ -892,6 +1005,23 @@ mod tests {
         }
         assert_eq!(DType::I64.least_upper_float(), DType::F32);
         assert_eq!(DType::U64.least_upper_float(), DType::F32);
+        for source in DType::FP8S {
+            assert_eq!(source.least_upper_float(), source);
+            for target in DType::FP8S {
+                assert_eq!(source.can_losslessly_cast_to(target), source == target);
+            }
+            for target in [DType::F16, DType::F32, DType::F64] {
+                assert!(
+                    source.can_losslessly_cast_to(target),
+                    "{source:?} -> {target:?}"
+                );
+            }
+            assert!(!source.can_losslessly_cast_to(DType::BF16));
+        }
+        for target in DType::FP8S {
+            assert!(DType::Bool.can_losslessly_cast_to(target));
+            assert!(!DType::F16.can_losslessly_cast_to(target));
+        }
     }
 
     #[test]
@@ -906,6 +1036,10 @@ mod tests {
             (DType::U32, DType::U32, DType::U32),
             (DType::I64, DType::I64, DType::I64),
             (DType::U64, DType::U64, DType::U64),
+            (DType::F8E4M3, DType::F32, DType::F8E4M3),
+            (DType::F8E5M2, DType::F32, DType::F8E5M2),
+            (DType::F8E4M3FNUZ, DType::F32, DType::F8E4M3FNUZ),
+            (DType::F8E5M2FNUZ, DType::F32, DType::F8E5M2FNUZ),
             (DType::F16, DType::F32, DType::F16),
             (DType::BF16, DType::F32, DType::BF16),
             (DType::F32, DType::F32, DType::F32),
@@ -1090,14 +1224,33 @@ mod tests {
             (DType::U32, &["uint32", "uint"][..]),
             (DType::I64, &["int64", "long"][..]),
             (DType::U64, &["uint64", "ulong"][..]),
+            (DType::F8E4M3, &["fp8e4m3"][..]),
+            (DType::F8E5M2, &["fp8e5m2"][..]),
+            (DType::F8E4M3FNUZ, &["fp8e4m3fnuz"][..]),
+            (DType::F8E5M2FNUZ, &["fp8e5m2fnuz"][..]),
             (DType::F16, &["float16", "half"][..]),
             (DType::BF16, &["bfloat16"][..]),
             (DType::F32, &["float32", "float"][..]),
             (DType::F64, &["float64", "double"][..]),
         ];
         let canonical = [
-            "bool", "char", "uchar", "short", "ushort", "int", "uint", "long", "ulong", "half",
-            "bfloat16", "float", "double",
+            "bool",
+            "char",
+            "uchar",
+            "short",
+            "ushort",
+            "int",
+            "uint",
+            "long",
+            "ulong",
+            "fp8e4m3",
+            "fp8e5m2",
+            "fp8e4m3fnuz",
+            "fp8e5m2fnuz",
+            "half",
+            "bfloat16",
+            "float",
+            "double",
         ];
 
         for ((dtype, names), canonical) in aliases.into_iter().zip(canonical) {
@@ -1124,7 +1277,6 @@ mod tests {
             "weakint",
             "weakfloat",
             "void",
-            "fp8e4m3",
             "float8_e5m2",
             "ptr",
             "pointer",
@@ -1162,6 +1314,20 @@ mod tests {
             (DType::U32, "dtypes.uint", &["uint32", "uint"][..], "U32"),
             (DType::I64, "dtypes.long", &["int64", "long"][..], "I64"),
             (DType::U64, "dtypes.ulong", &["uint64", "ulong"][..], "U64"),
+            (DType::F8E4M3, "dtypes.fp8e4m3", &["fp8e4m3"][..], "F8E4M3"),
+            (DType::F8E5M2, "dtypes.fp8e5m2", &["fp8e5m2"][..], "F8E5M2"),
+            (
+                DType::F8E4M3FNUZ,
+                "dtypes.fp8e4m3fnuz",
+                &["fp8e4m3fnuz"][..],
+                "F8E4M3FNUZ",
+            ),
+            (
+                DType::F8E5M2FNUZ,
+                "dtypes.fp8e5m2fnuz",
+                &["fp8e5m2fnuz"][..],
+                "F8E5M2FNUZ",
+            ),
             (DType::F16, "dtypes.half", &["float16", "half"][..], "F16"),
             (DType::BF16, "dtypes.bfloat16", &["bfloat16"][..], "BF16"),
             (DType::F32, "dtypes.float", &["float32", "float"][..], "F32"),
@@ -1182,7 +1348,14 @@ mod tests {
             }
         }
 
-        for rejected in [" float", "float ", "weakint", "void", "fp8e4m3", "custom"] {
+        for rejected in [
+            " float",
+            "float ",
+            "weakint",
+            "void",
+            "float8_e4m3",
+            "custom",
+        ] {
             let error = rejected.parse::<DType>().unwrap_err();
             assert!(matches!(
                 &error,
