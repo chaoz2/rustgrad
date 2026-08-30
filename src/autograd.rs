@@ -520,7 +520,8 @@ impl Graph {
                 | Op::Constant(_)
                 | Op::Random { .. }
                 | Op::RandomPermutation { .. }
-                | Op::Detach { .. } => {}
+                | Op::Detach { .. }
+                | Op::Bitcast { .. } => {}
                 Op::Cast { input, .. } => {
                     // A floating cast has an identity local derivative, but
                     // its cotangent belongs to the source storage dtype. This

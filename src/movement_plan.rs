@@ -46,6 +46,9 @@ pub enum MovementKernelKind {
         axis: usize,
         add: bool,
     },
+    /// Dense raw-byte reinterpretation. Input and output may use different
+    /// element widths, but their total byte extents are identical.
+    Bitcast { input: MovementOperand },
 }
 
 /// Fully validated materializing movement geometry and ordered pointer ABI.
@@ -167,6 +170,9 @@ impl MovementKernelPlan {
                 updates: MovementOperand::from_graph(graph, *updates)?,
                 axis: *axis,
                 add: *add,
+            },
+            Op::Bitcast { input, .. } => MovementKernelKind::Bitcast {
+                input: MovementOperand::from_graph(graph, *input)?,
             },
             _ => return Err(MovementPlanError::NotMovement),
         };
@@ -330,6 +336,41 @@ impl MovementKernelPlan {
                     return Err(MovementPlanError::UnsupportedDType);
                 }
             }
+            MovementKernelKind::Bitcast { input } => {
+                let input_itemsize = input.dtype.itemsize();
+                let output_itemsize = self.dtype.itemsize();
+                let mut expected_dims = input.shape.dims().to_vec();
+                if input_itemsize != output_itemsize {
+                    let last = expected_dims
+                        .last_mut()
+                        .ok_or(MovementPlanError::InvalidGeometry)?;
+                    let final_bytes = last
+                        .checked_mul(input_itemsize)
+                        .ok_or(MovementPlanError::Overflow)?;
+                    if final_bytes % output_itemsize != 0 {
+                        return Err(MovementPlanError::InvalidGeometry);
+                    }
+                    *last = final_bytes / output_itemsize;
+                }
+                let input_bytes = input
+                    .shape
+                    .numel()
+                    .map_err(|_| MovementPlanError::Overflow)?
+                    .checked_mul(input_itemsize)
+                    .ok_or(MovementPlanError::Overflow)?;
+                let output_bytes = self
+                    .output_shape
+                    .numel()
+                    .map_err(|_| MovementPlanError::Overflow)?
+                    .checked_mul(output_itemsize)
+                    .ok_or(MovementPlanError::Overflow)?;
+                if input_bytes != output_bytes
+                    || input.dtype == self.dtype
+                    || self.output_shape.dims() != expected_dims
+                {
+                    return Err(MovementPlanError::InvalidGeometry);
+                }
+            }
         }
         if self
             .input_operands()
@@ -353,6 +394,7 @@ impl MovementKernelPlan {
                 updates,
                 ..
             } => vec![base, index, updates],
+            MovementKernelKind::Bitcast { input } => vec![input],
         }
     }
 
@@ -428,6 +470,9 @@ impl MovementKernelPlan {
                 *axis,
                 *add,
             ),
+            MovementKernelKind::Bitcast { .. } => operands[0]
+                .bitcast_with_shape(self.output_shape.clone(), self.dtype)
+                .map_err(|_| MovementExecutionError::InvalidGeometry),
         }
     }
 
@@ -1213,5 +1258,38 @@ mod tests {
         assert_eq!(padding.as_slice(), [(1, 0), (0, 2)]);
         assert_eq!(*fill_bits, 0x8000);
         assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn bitcast_plan_reinterprets_exact_bytes_and_validates_descriptors() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 4], DType::U8);
+        let output = graph.bitcast(input, DType::U32).unwrap();
+        let plan = MovementKernelPlan::from_graph(&graph, output).unwrap();
+        assert_eq!(plan.output_shape, Shape::from([2, 1]));
+        assert_eq!(plan.dtype, DType::U32);
+        assert!(matches!(
+            &plan.kind,
+            MovementKernelKind::Bitcast { input: operand }
+                if operand.node == input
+                    && operand.shape == Shape::from([2, 4])
+                    && operand.dtype == DType::U8
+        ));
+        let source =
+            TensorData::from_storage([2, 4], Storage::U8(vec![1, 2, 3, 4, 5, 6, 7, 8])).unwrap();
+        let result = plan.execute(&[source]).unwrap();
+        assert_eq!(result.shape(), &Shape::from([2, 1]));
+        assert_eq!(
+            result.storage(),
+            &Storage::U32(vec![0x0403_0201, 0x0807_0605])
+        );
+
+        let mut malformed = plan.clone();
+        malformed.output_shape = Shape::from([1, 2]);
+        malformed.cache_key = malformed.expected_cache_key();
+        assert_eq!(
+            malformed.validate(),
+            Err(MovementPlanError::InvalidGeometry)
+        );
     }
 }

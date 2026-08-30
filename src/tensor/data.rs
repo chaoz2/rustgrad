@@ -276,6 +276,35 @@ impl TensorData {
         Self::from_le_bytes(self.shape.clone(), dtype, &self.to_le_bytes()?)
     }
 
+    /// Internal raw-byte reinterpretation used by the typed Graph bitcast
+    /// materialization contract. The source and destination must describe the
+    /// same total byte extent. Bool storage is canonicalized from nonzero raw
+    /// bytes because Rust's owned Bool lanes cannot retain noncanonical bytes.
+    pub(crate) fn bitcast_with_shape(&self, shape: Shape, dtype: DType) -> Result<Self> {
+        let source_bytes = self
+            .len()
+            .checked_mul(self.dtype().itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(self.shape.clone()))?;
+        let output_bytes = shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if source_bytes != output_bytes {
+            return Err(Error::InvalidBitcast {
+                from: self.dtype(),
+                to: dtype,
+                shape,
+            });
+        }
+        let mut bytes = self.to_le_bytes()?;
+        if dtype == DType::Bool {
+            bytes
+                .iter_mut()
+                .for_each(|byte| *byte = u8::from(*byte != 0));
+        }
+        Self::from_le_bytes(shape, dtype, &bytes)
+    }
+
     pub fn to_vec_f64(&self) -> Vec<f64> {
         (0..self.len())
             .map(|i| self.scalar_at(i).as_f64())

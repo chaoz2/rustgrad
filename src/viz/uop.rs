@@ -243,6 +243,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
                             "scatter"
                         }
                     }
+                    crate::MovementKernelKind::Bitcast { .. } => "bitcast",
                 }
                 .into(),
             );

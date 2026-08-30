@@ -212,6 +212,12 @@ pub enum Op {
         input: NodeId,
         dtype: DType,
     },
+    /// Raw storage reinterpretation. Differing item sizes rescale the final
+    /// axis while preserving the tensor's total byte extent.
+    Bitcast {
+        input: NodeId,
+        dtype: DType,
+    },
     /// Value-preserving boundary which deliberately stops reverse-mode edges.
     Detach {
         input: NodeId,
@@ -906,6 +912,7 @@ impl Op {
             | Self::Random { .. }
             | Self::RandomPermutation { .. } => vec![],
             Self::Cast { input, .. }
+            | Self::Bitcast { input, .. }
             | Self::Detach { input }
             | Self::TensorGuard { input, .. }
             | Self::Unary { input, .. }
@@ -1036,6 +1043,7 @@ impl Op {
     pub(crate) fn backward_inputs(&self) -> Vec<NodeId> {
         match self {
             Self::Detach { .. }
+            | Self::Bitcast { .. }
             | Self::Input { .. }
             | Self::Constant(_)
             | Self::Random { .. }
@@ -1073,6 +1081,7 @@ impl Op {
                 stream.device, stream.key, stream.counter
             ),
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
+            Self::Bitcast { input, dtype } => format!("bitcast(%{input}, {dtype:?})"),
             Self::Detach { input } => format!("detach(%{input})"),
             Self::TensorGuard { input, axis } => {
                 format!("tensor_guard(%{input}, axis={axis})")

@@ -1599,6 +1599,15 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                 UOp::scalar_constant(data.dtype(), raw_literal_bits(data)?, ty)
             }
             crate::Op::Cast { input, .. } => UOp::cast(lower(graph, *input, memo)?, ty),
+            crate::Op::Bitcast { input, .. } => {
+                let source = lower(graph, *input, memo)?;
+                if source.ty().map(|source_ty| source_ty.scalar.itemsize())
+                    != Some(ty.scalar.itemsize())
+                {
+                    return Err(UOpError::InvalidArgument);
+                }
+                UOp::new(UOpKind::Bitcast, Some(ty), vec![source], UArg::None)
+            }
             crate::Op::Unary { op, input } => {
                 let u = match op {
                     crate::UnaryOp::Neg => Unary::Neg,

@@ -979,6 +979,7 @@ fn collect_lowered_view_nodes(
             views.insert(node);
         }
         Op::Cast { input, .. }
+        | Op::Bitcast { input, .. }
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. } => collect_lowered_view_nodes(graph, *input, views)?,
@@ -1074,6 +1075,10 @@ fn derive_shape(
             memo,
             guards,
         )?,
+        // Shape-changing bitcasts depend on the concrete final-axis byte
+        // extent. Keep that static descriptor instead of inventing a symbolic
+        // relation that the guarded replay ABI cannot encode yet.
+        Op::Bitcast { .. } => concrete()?,
         Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => broadcast_shapes(
             &derive_shape(
                 graph,

@@ -1716,6 +1716,10 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
             w.usize(*axis)?;
             w.bool(*add)?;
         }
+        MovementKernelKind::Bitcast { input } => {
+            w.u8(5)?;
+            write_operand(w, input)?;
+        }
     }
     w.u64(plan.output.index() as u64)?;
     write_shape(w, &plan.output_shape)?;
@@ -1764,6 +1768,9 @@ fn read_movement(r: &mut Reader<'_>) -> Result<MovementKernelPlan, ArtifactError
             updates: read_operand(r)?,
             axis: r.usize()?,
             add: r.bool()?,
+        },
+        5 => MovementKernelKind::Bitcast {
+            input: read_operand(r)?,
         },
         _ => return Err(ArtifactError::Format("movement kind")),
     };
@@ -2595,6 +2602,25 @@ mod tests {
                 ..
             } if padding.as_slice() == [(1, 0), (0, 2)]
         ));
+
+        let mut bitcast_graph = crate::Graph::new();
+        let input = bitcast_graph.input_dtype("input", [2, 8], DType::U8);
+        let output = bitcast_graph.bitcast(input, DType::U32).unwrap();
+        let root = crate::lower_graph_movement(&bitcast_graph, output).unwrap();
+        let bytes = encode(&root).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(encode(&decoded).unwrap(), bytes);
+        assert_eq!(decoded, root);
+        let UArg::Movement(plan) = root.arg() else {
+            panic!("movement payload missing");
+        };
+        assert!(matches!(
+            &plan.kind,
+            MovementKernelKind::Bitcast { input: operand }
+                if operand.node == input && operand.dtype == DType::U8
+        ));
+        assert_eq!(plan.output_shape, Shape::from([2, 2]));
+        assert_eq!(plan.dtype, DType::U32);
     }
 
     #[test]

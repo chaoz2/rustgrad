@@ -1,8 +1,9 @@
 //! Exact host codecs for tinygrad's four float8 storage formats.
 //!
-//! This is a raw-storage prerequisite, not a `TensorData` dtype or a graph
-//! execution promise. In particular, no backend silently treats these bytes as
-//! `U8`; callers must select a [`Float8Format`] explicitly.
+//! This codec does not imply float8 arithmetic support. Raw graph Bitcast may
+//! move these bytes through an explicitly typed `DType`, but no arithmetic
+//! backend silently treats float8 storage as `U8`; callers must select a
+//! [`Float8Format`] explicitly.
 
 /// The float8 families defined by checked-in tinygrad `dtype.py`.
 #[derive(

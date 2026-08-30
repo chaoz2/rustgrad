@@ -192,6 +192,9 @@ impl Backend for CpuBackend {
                     random_permutation(node.shape.clone(), node.dtype, *stream)?
                 }
                 Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
+                Op::Bitcast { input, dtype } => {
+                    values[input.index()].bitcast_with_shape(node.shape.clone(), *dtype)?
+                }
                 Op::Detach { input } => values[input.index()].clone(),
                 Op::TensorGuard { input, axis } => {
                     tensor_guard_distribution(&values[input.index()], *axis)?
@@ -524,6 +527,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
             | Op::Constant(_)
             | Op::Detach { .. }
             | Op::Cast { .. }
+            | Op::Bitcast { .. }
             | Op::Unary {
                 op: UnaryOp::Neg
                     | UnaryOp::Abs

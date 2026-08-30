@@ -5061,6 +5061,7 @@ impl Graph {
             | Op::Constant(_)
             | Op::Random { .. }
             | Op::RandomPermutation { .. }
+            | Op::Bitcast { .. }
             | Op::Sort { .. } => false,
             Op::Cast { input, .. }
             | Op::TensorGuard { input, .. }

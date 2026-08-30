@@ -1037,6 +1037,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Constant(_) => "constant",
         Op::Random { .. } => "random",
         Op::RandomPermutation { .. } => "random_permutation",
+        Op::Bitcast { .. } => "bitcast",
         Op::Detach { .. } => "detach",
         _ => "unsupported",
     })
@@ -1048,6 +1049,7 @@ fn op_inputs(op: &Op) -> Vec<NodeId> {
             vec![]
         }
         Op::Cast { input, .. }
+        | Op::Bitcast { input, .. }
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }

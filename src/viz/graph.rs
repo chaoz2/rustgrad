@@ -196,6 +196,7 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
             vec![]
         }
         Op::Cast { input, .. }
+        | Op::Bitcast { input, .. }
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }
@@ -356,6 +357,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::Random { .. } => "random",
         Op::RandomPermutation { .. } => "random_permutation",
         Op::Cast { .. } => "cast",
+        Op::Bitcast { .. } => "bitcast",
         Op::Detach { .. } => "detach",
         Op::Unary { .. } => "unary",
         Op::Binary { .. } => "binary",
@@ -426,6 +428,7 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("key", format!("{:?}", stream.key))
             .field("counter", format!("{:?}", stream.counter)),
         Op::Cast { dtype, .. } => node.field("to", dtype_name(*dtype)),
+        Op::Bitcast { dtype, .. } => node.field("to", dtype_name(*dtype)),
         Op::Unary { op, .. } => node.field("operator", op.name()),
         Op::Binary { op, .. } => node.field("operator", op.name()),
         Op::Compare { op, .. } => node.field("operator", op.name()),

@@ -811,6 +811,19 @@ fn fused_graph_snapshot_has_typed_edges_shape_and_dtype() {
 }
 
 #[test]
+fn bitcast_graph_snapshot_retains_raw_dtype_and_shape_change() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 8], DType::U8);
+    let output = graph.bitcast(input, DType::U32).unwrap();
+    let dot = graph_viz(&graph, &[output]).unwrap().to_dot();
+    assert!(dot.contains("bitcast\\nkind=graph_op"));
+    assert!(dot.contains("dtype=u32"));
+    assert!(dot.contains("shape=[2,2]"));
+    assert!(dot.contains("to=u32"));
+    assert!(dot.contains("\"g0\" -> \"g1\" [label=\"data:0:input\"]"));
+}
+
+#[test]
 fn uop_snapshot_preserves_shared_subgraph_and_typed_metadata() {
     let shared = UOp::constant(7, UType::scalar(DType::I32));
     let root = UOp::binary(Binary::Add, shared.clone(), shared);

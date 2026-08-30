@@ -105,6 +105,11 @@ pub enum Error {
         from: DType,
         to: DType,
     },
+    InvalidBitcast {
+        from: DType,
+        to: DType,
+        shape: Shape,
+    },
     InvalidDTypeFinfo {
         dtype: DType,
     },
@@ -397,6 +402,10 @@ impl fmt::Display for Error {
             Self::BitcastItemsize { from, to } => {
                 write!(f, "cannot bitcast {from:?} to {to:?}: item sizes differ")
             }
+            Self::InvalidBitcast { from, to, shape } => write!(
+                f,
+                "cannot bitcast {shape} from {from:?} to {to:?}: unsupported final-axis byte extent"
+            ),
             Self::InvalidDTypeFinfo { dtype } => {
                 write!(f, "{dtype:?} is not a floating point type")
             }

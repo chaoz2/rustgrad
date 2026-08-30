@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Backend, CpuBackend, DType, Error, Scalar, Shape, TensorData};
+use crate::{Backend, CpuBackend, DType, Error, Scalar, Shape, Storage, TensorData};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -12140,4 +12140,163 @@ fn tinygrad_usum_and_uprod_preserve_source_lub_and_are_atomic() {
         Err(Error::ShapeOverflow(_))
     ));
     assert_eq!(overflow.node_count(), before);
+}
+
+#[test]
+fn tinygrad_bitcast_preserves_raw_storage_and_rescales_only_the_final_axis() {
+    let mut graph = Graph::new();
+    let float = graph.input_dtype_requires_grad("float", [4], DType::F32, true);
+    let bits = graph.bitcast(float, DType::U32).unwrap();
+    assert_eq!(graph.shape(bits).unwrap(), &Shape::new([4]));
+    assert_eq!(graph.dtype(bits).unwrap(), DType::U32);
+    assert!(!graph.requires_grad(bits).unwrap());
+    assert!(
+        matches!(graph.op(bits).unwrap(), Op::Bitcast { input, dtype: DType::U32 } if *input == float)
+    );
+    let values = TensorData::from_storage(
+        [4],
+        Storage::F32(vec![
+            f32::from_bits(0x8000_0000),
+            f32::from_bits(0x7fc0_0123),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ]),
+    )
+    .unwrap();
+    let result = CpuBackend
+        .execute(&graph, bits, &HashMap::from([("float".into(), values)]))
+        .unwrap();
+    assert_eq!(
+        result.storage(),
+        &Storage::U32(vec![0x8000_0000, 0x7fc0_0123, 0x7f80_0000, 0xff80_0000,])
+    );
+
+    let mut widening = Graph::new();
+    let bytes = widening.input_dtype("bytes", [2, 8], DType::U8);
+    let words = widening.bitcast(bytes, DType::U32).unwrap();
+    assert_eq!(widening.shape(words).unwrap(), &Shape::new([2, 2]));
+    let source = TensorData::from_storage([2, 8], Storage::U8((1..=16).collect())).unwrap();
+    let result = CpuBackend
+        .execute(&widening, words, &HashMap::from([("bytes".into(), source)]))
+        .unwrap();
+    assert_eq!(
+        result.storage(),
+        &Storage::U32(vec![0x0403_0201, 0x0807_0605, 0x0c0b_0a09, 0x100f_0e0d])
+    );
+    let scheduled = crate::schedule(&widening, words).unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let crate::UArg::Movement(plan) = scheduled.items[0].kernel.arg() else {
+        panic!("bitcast must schedule as a materializing movement kernel")
+    };
+    assert!(matches!(
+        &plan.kind,
+        crate::MovementKernelKind::Bitcast { .. }
+    ));
+    let captured = crate::CapturedSchedule::capture(&widening, &scheduled, &[words]).unwrap();
+    let bytes = captured.to_bytes().unwrap();
+    assert_eq!(
+        crate::CapturedSchedule::from_bytes(&bytes)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        bytes
+    );
+
+    let mut narrowing = Graph::new();
+    let halves = narrowing.input_dtype("halves", [1, 2], DType::U16);
+    let bytes = narrowing.bitcast(halves, DType::U8).unwrap();
+    assert_eq!(narrowing.shape(bytes).unwrap(), &Shape::new([1, 4]));
+    let source = TensorData::from_storage([1, 2], Storage::U16(vec![0x0201, 0x0403])).unwrap();
+    let result = CpuBackend
+        .execute(
+            &narrowing,
+            bytes,
+            &HashMap::from([("halves".into(), source)]),
+        )
+        .unwrap();
+    assert_eq!(result.storage(), &Storage::U8(vec![1, 2, 3, 4]));
+
+    let mut booleans = Graph::new();
+    let raw = booleans.input_dtype("raw", [4], DType::U8);
+    let truth = booleans.bitcast(raw, DType::Bool).unwrap();
+    let source = TensorData::from_storage([4], Storage::U8(vec![0, 2, 255, 1])).unwrap();
+    let result = CpuBackend
+        .execute(&booleans, truth, &HashMap::from([("raw".into(), source)]))
+        .unwrap();
+    assert_eq!(
+        result.storage(),
+        &Storage::Bool(vec![false, true, true, true])
+    );
+
+    let mut float8 = Graph::new();
+    let raw = float8.input_dtype("raw", [4], DType::U8);
+    let narrow = float8.bitcast(raw, DType::F8E4M3).unwrap();
+    let source = TensorData::from_storage([4], Storage::U8(vec![0x00, 0x80, 0x7f, 0xff])).unwrap();
+    let result = CpuBackend
+        .execute(&float8, narrow, &HashMap::from([("raw".into(), source)]))
+        .unwrap();
+    let Storage::Float8(values) = result.storage() else {
+        panic!("float8 bitcast must retain float8 storage")
+    };
+    assert_eq!(values.as_raw(), [0x00, 0x80, 0x7f, 0xff]);
+    assert_eq!(values.format().dtype(), DType::F8E4M3);
+}
+
+#[test]
+fn tinygrad_bitcast_covers_concrete_dtype_shapes_and_is_atomic() {
+    for source_dtype in DType::ALL {
+        for target_dtype in DType::ALL {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2, 8], source_dtype);
+            let before = graph.node_count();
+            let output = graph.bitcast(input, target_dtype).unwrap();
+            if source_dtype == target_dtype {
+                assert_eq!(output, input);
+                assert_eq!(graph.node_count(), before);
+            } else {
+                assert_eq!(
+                    graph.shape(output).unwrap(),
+                    &Shape::new([2, 8 * source_dtype.itemsize() / target_dtype.itemsize()])
+                );
+                assert_eq!(graph.dtype(output).unwrap(), target_dtype);
+                assert!(
+                    matches!(graph.op(output).unwrap(), Op::Bitcast { input: source, dtype }
+                    if *source == input && *dtype == target_dtype)
+                );
+            }
+        }
+    }
+
+    let mut graph = Graph::new();
+    let scalar = graph.input_dtype("scalar", [], DType::F32);
+    assert_eq!(graph.bitcast(scalar, DType::F32).unwrap(), scalar);
+    let empty = graph.input_dtype("empty", [3, 0], DType::F16);
+    let empty_bits = graph.bitcast(empty, DType::U8).unwrap();
+    assert_eq!(graph.shape(empty_bits).unwrap(), &Shape::new([3, 0]));
+
+    let before = graph.node_count();
+    assert!(matches!(
+        graph.bitcast(NodeId::from_index(usize::MAX), DType::U8),
+        Err(Error::UnknownNode(_))
+    ));
+    assert!(matches!(
+        graph.bitcast(scalar, DType::U8),
+        Err(Error::InvalidBitcast { .. })
+    ));
+    let odd = graph.input_dtype("odd", [3], DType::U8);
+    let odd_before = graph.node_count();
+    assert!(matches!(
+        graph.bitcast(odd, DType::U16),
+        Err(Error::InvalidBitcast { .. })
+    ));
+    assert_eq!(graph.node_count(), odd_before);
+
+    let overflow = graph.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let overflow_before = graph.node_count();
+    assert!(matches!(
+        graph.bitcast(overflow, DType::U64),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(graph.node_count(), overflow_before);
+    assert!(graph.node_count() >= before);
 }

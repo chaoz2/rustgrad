@@ -1308,6 +1308,7 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
         crate::MovementKernelKind::Scatter { base, updates, .. } => {
             base.dtype == plan.dtype && updates.dtype == plan.dtype
         }
+        crate::MovementKernelKind::Bitcast { .. } => true,
     };
     if !homogeneous_data {
         return Err(JitError::Unsupported(
@@ -1525,6 +1526,24 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
                 ids[&(updates.node.index() as u64)]
             ));
                 lines.push("  }".into());
+            }
+        }
+        crate::MovementKernelKind::Bitcast { input } => {
+            let output_bytes = elements(&plan.output_shape)?
+                .checked_mul(plan.dtype.itemsize())
+                .ok_or_else(|| JitError::Unsupported("bitcast byte overflow".into()))?;
+            if output_bytes == 0 {
+                lines.push("  /* empty bitcast domain */".into());
+            } else if plan.dtype == DType::Bool {
+                lines.push(format!(
+                    "  for (size_t rg_i=0; rg_i<{output_bytes}u; ++rg_i) ((uint8_t*)buffers[{output_slot}])[rg_i] = ((const uint8_t*)buffers[{}])[rg_i] != 0;",
+                    ids[&(input.node.index() as u64)]
+                ));
+            } else {
+                lines.push(format!(
+                    "  memcpy(buffers[{output_slot}], buffers[{}], {output_bytes}u);",
+                    ids[&(input.node.index() as u64)]
+                ));
             }
         }
     }
@@ -2900,6 +2919,44 @@ mod tests {
             rendered
                 .source
                 .ends_with("  return failure[1] ? (int)failure[1] : 0;\n}\n")
+        );
+    }
+
+    #[test]
+    fn bitcast_renderer_copies_raw_bytes_and_normalizes_bool_storage() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 8], DType::U8);
+        let output = graph.bitcast(input, DType::U32).unwrap();
+        let plan = crate::MovementKernelPlan::from_graph(&graph, output).unwrap();
+        let rendered = render_movement(&plan).unwrap();
+        assert!(
+            rendered
+                .source
+                .contains("memcpy(buffers[1], buffers[0], 16u);")
+        );
+        assert!(!rendered.source.contains("!= 0"));
+        assert_eq!(rendered.abi.buffers[0].dtype, DType::U8);
+        assert_eq!(rendered.abi.buffers[0].elements, 16);
+        assert_eq!(rendered.abi.buffers[1].dtype, DType::U32);
+        assert_eq!(rendered.abi.buffers[1].elements, 4);
+
+        let mut bool_graph = Graph::new();
+        let input = bool_graph.input_dtype("input", [4], DType::U8);
+        let output = bool_graph.bitcast(input, DType::Bool).unwrap();
+        let plan = crate::MovementKernelPlan::from_graph(&bool_graph, output).unwrap();
+        let rendered = render_movement(&plan).unwrap();
+        assert!(rendered.source.contains("[rg_i] != 0;"));
+        assert!(!rendered.source.contains("memcpy("));
+
+        let mut empty_graph = Graph::new();
+        let input = empty_graph.input_dtype("input", [3, 0], DType::F16);
+        let output = empty_graph.bitcast(input, DType::U8).unwrap();
+        let plan = crate::MovementKernelPlan::from_graph(&empty_graph, output).unwrap();
+        assert!(
+            render_movement(&plan)
+                .unwrap()
+                .source
+                .contains("empty bitcast domain")
         );
     }
 

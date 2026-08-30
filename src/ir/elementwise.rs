@@ -8621,6 +8621,60 @@ impl Graph {
         Ok(self.push(Op::Cast { input, dtype }, shape, dtype))
     }
 
+    /// Reinterprets concrete storage bytes using tinygrad's public
+    /// `Tensor.bitcast` shape rule. When item sizes differ, only the final
+    /// axis is rescaled; the total byte extent is preserved exactly.
+    pub fn bitcast(&mut self, input: NodeId, dtype: DType) -> Result<NodeId> {
+        let (input_shape, input_dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        if input_dtype == dtype {
+            return Ok(input);
+        }
+
+        let input_itemsize = input_dtype.itemsize();
+        let output_itemsize = dtype.itemsize();
+        let mut output_dims = input_shape.dims().to_vec();
+        if input_itemsize != output_itemsize {
+            let Some(last) = output_dims.last_mut() else {
+                return Err(Error::InvalidBitcast {
+                    from: input_dtype,
+                    to: dtype,
+                    shape: input_shape,
+                });
+            };
+            let final_bytes = last
+                .checked_mul(input_itemsize)
+                .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+            if final_bytes % output_itemsize != 0 {
+                return Err(Error::InvalidBitcast {
+                    from: input_dtype,
+                    to: dtype,
+                    shape: input_shape,
+                });
+            }
+            *last = final_bytes / output_itemsize;
+        }
+        let output_shape = Shape::new(output_dims);
+        let input_bytes = input_shape
+            .numel()?
+            .checked_mul(input_itemsize)
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        let output_bytes = output_shape
+            .numel()?
+            .checked_mul(output_itemsize)
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        if input_bytes != output_bytes {
+            return Err(Error::InvalidBitcast {
+                from: input_dtype,
+                to: dtype,
+                shape: input_shape,
+            });
+        }
+        Ok(self.push(Op::Bitcast { input, dtype }, output_shape, dtype))
+    }
+
     /// Read-only tinygrad `Tensor.is_floating_point()`.
     pub fn is_floating_point(&self, input: NodeId) -> Result<bool> {
         Ok(self.node(input)?.dtype.is_float())

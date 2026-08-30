@@ -479,6 +479,10 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 Op::Cast { input, .. } => {
                     UOp::cast(lower(graph, *input, out, range, memo, materialized)?, ty)
                 }
+                // Graph bitcasts are materializing raw-byte movement roots.
+                // A nested instance must have been scheduled already rather
+                // than silently lowered as a numeric scalar cast.
+                Op::Bitcast { .. } => return Err(UOpError::InvalidArgument),
                 // Detach is an autograd boundary, not a runtime value
                 // transformation. Native lowering keeps the same typed value
                 // while Graph reverse-mode traversal owns the gradient stop.

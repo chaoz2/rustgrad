@@ -987,6 +987,7 @@ fn supported(op: &Op) -> bool {
             | Op::Constant(_)
             | Op::Random { .. }
             | Op::Cast { .. }
+            | Op::Bitcast { .. }
             | Op::Detach { .. }
             | Op::Unary { .. }
             | Op::Binary { .. }
@@ -1069,6 +1070,7 @@ pub fn schedule_with_external_materializations(
         }
         let children: Vec<NodeId> = match graph.op(node).map_err(ScheduleError::Graph)? {
             Op::Cast { input, .. }
+            | Op::Bitcast { input, .. }
             | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
@@ -1163,6 +1165,7 @@ fn schedule_many_with_external(
         };
         match g.op(id).map_err(ScheduleError::Graph)? {
             Op::Cast { input, .. }
+            | Op::Bitcast { input, .. }
             | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
@@ -1327,6 +1330,7 @@ fn schedule_many_with_external(
                             | Op::Sort { .. }
                             | Op::Matmul { .. }
                             | Op::Conv2d { .. }
+                            | Op::Bitcast { .. }
                             | Op::Pad { .. }
                             | Op::Concat { .. }
                             | Op::Gather { .. }
@@ -1378,6 +1382,7 @@ fn schedule_many_with_external(
             }
             Op::Random { .. } => {}
             Op::Cast { input, .. }
+            | Op::Bitcast { input, .. }
             | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
@@ -1492,63 +1497,65 @@ fn schedule_many_with_external(
         let paired_output = sort_siblings(node)?
             .map(|sibling| buffer(graph, sibling, false))
             .transpose()?;
-        let kernel = if boundary.is_none() {
-            match graph.op(node).map_err(ScheduleError::Graph)? {
-                Op::Random { .. } => {
-                    crate::kernel::lower_graph_random(graph, node).map_err(ScheduleError::UOp)?
-                }
-                Op::Matmul { .. } => {
-                    crate::kernel::lower_graph_matmul(graph, node).map_err(ScheduleError::UOp)?
-                }
-                Op::Conv2d { .. } => crate::kernel::lower_graph_static_conv2d(graph, node)
-                    .map_err(ScheduleError::UOp)?,
-                Op::Pad { .. } | Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
-                    crate::kernel::lower_graph_movement(graph, node).map_err(ScheduleError::UOp)?
-                }
-                Op::Shrink { .. }
-                | Op::Reshape { .. }
-                | Op::Permute { .. }
-                | Op::Expand { .. }
-                | Op::Stride { .. }
-                    if crate::rangeify::computed_view(graph, node).is_ok() =>
-                {
-                    crate::kernel::lower_graph_computed_affine_view(graph, node)
-                        .map_err(ScheduleError::UOp)?
-                }
-                Op::Reduce { .. } => crate::kernel::lower_graph_reduction_with_materialized(
-                    graph,
-                    node,
-                    &materialized,
-                )
-                .map_err(ScheduleError::UOp)?,
-                Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, node)
-                    .map_err(ScheduleError::UOp)?,
-                Op::TensorGuard { .. } => crate::kernel::lower_graph_tensor_guard(graph, node)
-                    .map_err(ScheduleError::UOp)?,
-                Op::Sort {
-                    output: crate::SortOutput::Values,
-                    ..
-                } => {
-                    let indices = paired_output.as_ref().ok_or_else(|| {
-                        ScheduleError::Binding("sort indices output is absent".into())
-                    })?;
-                    crate::kernel::lower_graph_sort_pair(
+        let kernel =
+            if boundary.is_none() {
+                match graph.op(node).map_err(ScheduleError::Graph)? {
+                    Op::Random { .. } => crate::kernel::lower_graph_random(graph, node)
+                        .map_err(ScheduleError::UOp)?,
+                    Op::Matmul { .. } => crate::kernel::lower_graph_matmul(graph, node)
+                        .map_err(ScheduleError::UOp)?,
+                    Op::Conv2d { .. } => crate::kernel::lower_graph_static_conv2d(graph, node)
+                        .map_err(ScheduleError::UOp)?,
+                    Op::Bitcast { .. }
+                    | Op::Pad { .. }
+                    | Op::Concat { .. }
+                    | Op::Gather { .. }
+                    | Op::Scatter { .. } => crate::kernel::lower_graph_movement(graph, node)
+                        .map_err(ScheduleError::UOp)?,
+                    Op::Shrink { .. }
+                    | Op::Reshape { .. }
+                    | Op::Permute { .. }
+                    | Op::Expand { .. }
+                    | Op::Stride { .. }
+                        if crate::rangeify::computed_view(graph, node).is_ok() =>
+                    {
+                        crate::kernel::lower_graph_computed_affine_view(graph, node)
+                            .map_err(ScheduleError::UOp)?
+                    }
+                    Op::Reduce { .. } => crate::kernel::lower_graph_reduction_with_materialized(
                         graph,
                         node,
-                        NodeId::from_index(indices.id as usize),
+                        &materialized,
                     )
-                    .map_err(ScheduleError::UOp)?
+                    .map_err(ScheduleError::UOp)?,
+                    Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, node)
+                        .map_err(ScheduleError::UOp)?,
+                    Op::TensorGuard { .. } => crate::kernel::lower_graph_tensor_guard(graph, node)
+                        .map_err(ScheduleError::UOp)?,
+                    Op::Sort {
+                        output: crate::SortOutput::Values,
+                        ..
+                    } => {
+                        let indices = paired_output.as_ref().ok_or_else(|| {
+                            ScheduleError::Binding("sort indices output is absent".into())
+                        })?;
+                        crate::kernel::lower_graph_sort_pair(
+                            graph,
+                            node,
+                            NodeId::from_index(indices.id as usize),
+                        )
+                        .map_err(ScheduleError::UOp)?
+                    }
+                    _ => crate::kernel::lower_graph_elementwise_with_materialized(
+                        graph,
+                        node,
+                        &materialized,
+                    )
+                    .map_err(ScheduleError::UOp)?,
                 }
-                _ => crate::kernel::lower_graph_elementwise_with_materialized(
-                    graph,
-                    node,
-                    &materialized,
-                )
-                .map_err(ScheduleError::UOp)?,
-            }
-        } else {
-            UOp::sink(vec![])
-        };
+            } else {
+                UOp::sink(vec![])
+            };
         for value in kernel.topological().map_err(ScheduleError::UOp)? {
             if let crate::UArg::ViewBufferIndex { buffer, view, .. } = value.arg()
                 && let Some(desc) = inputs.iter_mut().find(|desc| desc.id == *buffer)
@@ -1642,7 +1649,9 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             Op::Input { .. } | Op::Constant(_) => {
                 leaves.insert(id.index());
             }
-            Op::Cast { input, .. } | Op::Unary { input, .. } => walk(g, *input, leaves, boundary)?,
+            Op::Cast { input, .. } | Op::Bitcast { input, .. } | Op::Unary { input, .. } => {
+                walk(g, *input, leaves, boundary)?
+            }
             Op::Shrink { input, .. }
             | Op::Reshape { input, .. }
             | Op::Permute { input, .. }
