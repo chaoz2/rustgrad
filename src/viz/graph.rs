@@ -197,6 +197,8 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
         }
         Op::Cast { input, .. }
         | Op::Bitcast { input, .. }
+        | Op::Contiguous { input }
+        | Op::ContiguousBackward { input }
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }
@@ -358,6 +360,8 @@ fn op_class(op: &Op) -> &'static str {
         Op::RandomPermutation { .. } => "random_permutation",
         Op::Cast { .. } => "cast",
         Op::Bitcast { .. } => "bitcast",
+        Op::Contiguous { .. } => "contiguous",
+        Op::ContiguousBackward { .. } => "contiguous_backward",
         Op::Detach { .. } => "detach",
         Op::Unary { .. } => "unary",
         Op::Binary { .. } => "binary",
@@ -643,7 +647,11 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
         } => conv_transpose2d_geometry(node, *options)
             .field("target", target.to_string())
             .field("wrt", wrt.to_string()),
-        Op::Detach { .. } | Op::Select { .. } | Op::Matmul { .. } => node,
+        Op::Contiguous { .. }
+        | Op::ContiguousBackward { .. }
+        | Op::Detach { .. }
+        | Op::Select { .. }
+        | Op::Matmul { .. } => node,
     })
 }
 

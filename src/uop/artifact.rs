@@ -1720,6 +1720,10 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
             w.u8(5)?;
             write_operand(w, input)?;
         }
+        MovementKernelKind::Contiguous { input } => {
+            w.u8(6)?;
+            write_operand(w, input)?;
+        }
     }
     w.u64(plan.output.index() as u64)?;
     write_shape(w, &plan.output_shape)?;
@@ -1770,6 +1774,9 @@ fn read_movement(r: &mut Reader<'_>) -> Result<MovementKernelPlan, ArtifactError
             add: r.bool()?,
         },
         5 => MovementKernelKind::Bitcast {
+            input: read_operand(r)?,
+        },
+        6 => MovementKernelKind::Contiguous {
             input: read_operand(r)?,
         },
         _ => return Err(ArtifactError::Format("movement kind")),

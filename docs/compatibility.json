@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:cdc67f92deadfb94",
+  "source_fingerprint": "fnv1a64:a6200d93f211dfff",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -261,7 +261,7 @@
       "subject": "Reshape, permute, expand, shrink, stride and contiguous views",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Materialized reshape/permute/expand, signed `unsqueeze`/`squeeze`/`flatten`, compositional `stack`, checked shrink, signed stride, and reverse-mode movement mappings exist. `ScatterPositionsVjp` closes second-order static shrink/pad/stride movement adjoints; true views and remaining movement ops remain."
+        "Acceptance requirement": "Materialized reshape/permute/expand, signed `unsqueeze`/`squeeze`/`flatten`, compositional `stack`, checked shrink, signed stride, and reverse-mode movement mappings exist. Source-facing `Graph::contiguous` validates the full typed byte extent and elides only concrete Input/Constant/existing-Contiguous buffer identities plus their Reshape aliases; every other value emits a first-class non-fusible raw-byte owned-copy boundary. `Graph::contiguous_backward` is a forward identity whose VJP applies that contiguous contract to its incoming cotangent. CPU execution, producer-aware schedule dependencies, typed `MovementKernelPlan`, captured artifact round trips, native CPU memcpy/empty-domain rendering, all concrete dtypes including raw Float8 lanes, scalar/zero geometry, visualization, autograd distinction, and atomic malformed/overflow admission have focused acceptance. `ScatterPositionsVjp` closes second-order static shrink/pad/stride movement adjoints. Device-residency-aware identity elision and accelerator copy lowering remain boundaries."
       }
     },
     {
@@ -342,7 +342,7 @@
       "subject": "Fusion, range lowering and indexing",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Source-backed static shrink, contiguous reshape, permutation, expansion, and signed-stride chains lower through canonical `AffineView`/`ViewBufferIndex` across schedule, interpreter, native CPU replay, PTX, OpenCL, Metal, and WebGPU. Computed-value, unsupported signed reshape compositions, and non-affine chains remain explicit lowering boundaries."
+        "Acceptance requirement": "Source-backed static shrink, contiguous reshape, permutation, expansion, and signed-stride chains lower through canonical `AffineView`/`ViewBufferIndex` across schedule, interpreter, native CPU replay, PTX, OpenCL, Metal, and WebGPU. Computed affine views and every computed direct operand of a materializing movement kernel become explicit owned producer items with typed dependency edges; `Graph::contiguous` is a non-fusible Movement root. Unsupported signed reshape compositions, non-affine chains, and accelerator contiguous-copy lowering remain explicit boundaries."
       }
     },
     {
@@ -789,10 +789,19 @@
     {
       "section": "Public elementwise helper audit",
       "subject_header": "tinygrad helper(s)",
-      "subject": "`alu/ufix/contiguous/contiguous_backward/threefry`",
+      "subject": "`contiguous/contiguous_backward`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "`contiguous/contiguous_backward`"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`alu/ufix/threefry`",
       "status": "not_started",
       "fields": {
-        "RustGrad Graph method(s)": "no direct public Graph equivalent (dispatcher/materialization/random infrastructure, not claimed numeric wrapper parity)"
+        "RustGrad Graph method(s)": "no direct public Graph equivalent (dispatcher/random infrastructure, not claimed numeric wrapper parity)"
       }
     }
   ]

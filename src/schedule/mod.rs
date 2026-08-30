@@ -988,6 +988,8 @@ fn supported(op: &Op) -> bool {
             | Op::Random { .. }
             | Op::Cast { .. }
             | Op::Bitcast { .. }
+            | Op::Contiguous { .. }
+            | Op::ContiguousBackward { .. }
             | Op::Detach { .. }
             | Op::Unary { .. }
             | Op::Binary { .. }
@@ -1071,6 +1073,8 @@ pub fn schedule_with_external_materializations(
         let children: Vec<NodeId> = match graph.op(node).map_err(ScheduleError::Graph)? {
             Op::Cast { input, .. }
             | Op::Bitcast { input, .. }
+            | Op::Contiguous { input }
+            | Op::ContiguousBackward { input }
             | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
@@ -1166,6 +1170,8 @@ fn schedule_many_with_external(
         match g.op(id).map_err(ScheduleError::Graph)? {
             Op::Cast { input, .. }
             | Op::Bitcast { input, .. }
+            | Op::Contiguous { input }
+            | Op::ContiguousBackward { input }
             | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
@@ -1284,6 +1290,35 @@ fn schedule_many_with_external(
             )
         })
         .collect::<BTreeSet<_>>();
+    // Materializing movement kernels consume dense direct operands. Any
+    // computed operand, including a source-backed view, therefore becomes its
+    // own producer item instead of being silently replaced by its leaves.
+    let movement_operands = needed
+        .iter()
+        .flat_map(|index| {
+            let id = NodeId::from_index(*index);
+            match graph.op(id) {
+                Ok(
+                    Op::Bitcast { input, .. } | Op::Contiguous { input } | Op::Pad { input, .. },
+                ) => vec![input.index()],
+                Ok(Op::Concat { inputs, .. }) => inputs.iter().map(|input| input.index()).collect(),
+                Ok(Op::Gather { input, index, .. }) => vec![input.index(), index.index()],
+                Ok(Op::Scatter {
+                    base,
+                    index,
+                    updates,
+                    ..
+                }) => vec![base.index(), index.index(), updates.index()],
+                _ => vec![],
+            }
+        })
+        .filter(|index| {
+            !matches!(
+                graph.op(NodeId::from_index(*index)),
+                Ok(Op::Input { .. } | Op::Constant(_))
+            )
+        })
+        .collect::<BTreeSet<_>>();
     // A computed affine view is materialized as its own dense movement item.
     // Its producer must consequently be a schedule root even when the view is
     // its only consumer, so the copy has an owned input ABI.
@@ -1319,6 +1354,7 @@ fn schedule_many_with_external(
                 )
                 && (requested.contains(index)
                     || matmul_operands.contains(index)
+                    || movement_operands.contains(index)
                     || computed_view_sources.contains(index)
                     || (consumers[*index] > 1
                         && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_))))
@@ -1331,6 +1367,7 @@ fn schedule_many_with_external(
                             | Op::Matmul { .. }
                             | Op::Conv2d { .. }
                             | Op::Bitcast { .. }
+                            | Op::Contiguous { .. }
                             | Op::Pad { .. }
                             | Op::Concat { .. }
                             | Op::Gather { .. }
@@ -1383,6 +1420,8 @@ fn schedule_many_with_external(
             Op::Random { .. } => {}
             Op::Cast { input, .. }
             | Op::Bitcast { input, .. }
+            | Op::Contiguous { input }
+            | Op::ContiguousBackward { input }
             | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
@@ -1507,6 +1546,7 @@ fn schedule_many_with_external(
                     Op::Conv2d { .. } => crate::kernel::lower_graph_static_conv2d(graph, node)
                         .map_err(ScheduleError::UOp)?,
                     Op::Bitcast { .. }
+                    | Op::Contiguous { .. }
                     | Op::Pad { .. }
                     | Op::Concat { .. }
                     | Op::Gather { .. }
@@ -1649,9 +1689,11 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             Op::Input { .. } | Op::Constant(_) => {
                 leaves.insert(id.index());
             }
-            Op::Cast { input, .. } | Op::Bitcast { input, .. } | Op::Unary { input, .. } => {
-                walk(g, *input, leaves, boundary)?
-            }
+            Op::Cast { input, .. }
+            | Op::Bitcast { input, .. }
+            | Op::Contiguous { input }
+            | Op::ContiguousBackward { input }
+            | Op::Unary { input, .. } => walk(g, *input, leaves, boundary)?,
             Op::Shrink { input, .. }
             | Op::Reshape { input, .. }
             | Op::Permute { input, .. }

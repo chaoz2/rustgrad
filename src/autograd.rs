@@ -522,6 +522,13 @@ impl Graph {
                 | Op::RandomPermutation { .. }
                 | Op::Detach { .. }
                 | Op::Bitcast { .. } => {}
+                Op::Contiguous { input } => {
+                    self.accumulate(&mut grads, input, upstream)?;
+                }
+                Op::ContiguousBackward { input } => {
+                    let local = self.contiguous(upstream)?;
+                    self.accumulate(&mut grads, input, local)?;
+                }
                 Op::Cast { input, .. } => {
                     // A floating cast has an identity local derivative, but
                     // its cotangent belongs to the source storage dtype. This

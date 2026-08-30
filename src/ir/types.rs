@@ -218,6 +218,16 @@ pub enum Op {
         input: NodeId,
         dtype: DType,
     },
+    /// An explicit owned-storage materialization boundary. The value, shape,
+    /// and dtype are unchanged, but schedulers must not fuse the copy away.
+    Contiguous {
+        input: NodeId,
+    },
+    /// Forward identity whose reverse rule materializes its incoming
+    /// cotangent through [`Op::Contiguous`].
+    ContiguousBackward {
+        input: NodeId,
+    },
     /// Value-preserving boundary which deliberately stops reverse-mode edges.
     Detach {
         input: NodeId,
@@ -913,6 +923,8 @@ impl Op {
             | Self::RandomPermutation { .. } => vec![],
             Self::Cast { input, .. }
             | Self::Bitcast { input, .. }
+            | Self::Contiguous { input }
+            | Self::ContiguousBackward { input }
             | Self::Detach { input }
             | Self::TensorGuard { input, .. }
             | Self::Unary { input, .. }
@@ -1082,6 +1094,10 @@ impl Op {
             ),
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
             Self::Bitcast { input, dtype } => format!("bitcast(%{input}, {dtype:?})"),
+            Self::Contiguous { input } => format!("contiguous(%{input})"),
+            Self::ContiguousBackward { input } => {
+                format!("contiguous_backward(%{input})")
+            }
             Self::Detach { input } => format!("detach(%{input})"),
             Self::TensorGuard { input, axis } => {
                 format!("tensor_guard(%{input}, axis={axis})")

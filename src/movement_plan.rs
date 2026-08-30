@@ -49,6 +49,8 @@ pub enum MovementKernelKind {
     /// Dense raw-byte reinterpretation. Input and output may use different
     /// element widths, but their total byte extents are identical.
     Bitcast { input: MovementOperand },
+    /// Explicit dense owned copy with an unchanged descriptor.
+    Contiguous { input: MovementOperand },
 }
 
 /// Fully validated materializing movement geometry and ordered pointer ABI.
@@ -172,6 +174,9 @@ impl MovementKernelPlan {
                 add: *add,
             },
             Op::Bitcast { input, .. } => MovementKernelKind::Bitcast {
+                input: MovementOperand::from_graph(graph, *input)?,
+            },
+            Op::Contiguous { input } => MovementKernelKind::Contiguous {
                 input: MovementOperand::from_graph(graph, *input)?,
             },
             _ => return Err(MovementPlanError::NotMovement),
@@ -371,6 +376,17 @@ impl MovementKernelPlan {
                     return Err(MovementPlanError::InvalidGeometry);
                 }
             }
+            MovementKernelKind::Contiguous { input } => {
+                if input.shape != self.output_shape || input.dtype != self.dtype {
+                    return Err(MovementPlanError::InvalidGeometry);
+                }
+                input
+                    .shape
+                    .numel()
+                    .map_err(|_| MovementPlanError::Overflow)?
+                    .checked_mul(input.dtype.itemsize())
+                    .ok_or(MovementPlanError::Overflow)?;
+            }
         }
         if self
             .input_operands()
@@ -395,6 +411,7 @@ impl MovementKernelPlan {
                 ..
             } => vec![base, index, updates],
             MovementKernelKind::Bitcast { input } => vec![input],
+            MovementKernelKind::Contiguous { input } => vec![input],
         }
     }
 
@@ -473,6 +490,7 @@ impl MovementKernelPlan {
             MovementKernelKind::Bitcast { .. } => operands[0]
                 .bitcast_with_shape(self.output_shape.clone(), self.dtype)
                 .map_err(|_| MovementExecutionError::InvalidGeometry),
+            MovementKernelKind::Contiguous { .. } => Ok(operands[0].clone()),
         }
     }
 

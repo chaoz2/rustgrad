@@ -824,6 +824,22 @@ fn bitcast_graph_snapshot_retains_raw_dtype_and_shape_change() {
 }
 
 #[test]
+fn contiguous_graph_snapshot_distinguishes_forward_and_backward_boundaries() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 2], DType::F32);
+    let computed = graph.cast(input, DType::F32).unwrap();
+    let contiguous = graph.contiguous(computed).unwrap();
+    let backward = graph.contiguous_backward(contiguous).unwrap();
+    let dot = graph_viz(&graph, &[backward]).unwrap().to_dot();
+    assert!(dot.contains("contiguous\\nkind=graph_op"));
+    assert!(dot.contains("contiguous_backward\\nkind=graph_op"));
+    assert!(dot.contains("dtype=f32"));
+    assert!(dot.contains("shape=[2,2]"));
+    assert!(dot.contains("\"g1\" -> \"g2\" [label=\"data:0:input\"]"));
+    assert!(dot.contains("\"g2\" -> \"g3\" [label=\"data:0:input\"]"));
+}
+
+#[test]
 fn uop_snapshot_preserves_shared_subgraph_and_typed_metadata() {
     let shared = UOp::constant(7, UType::scalar(DType::I32));
     let root = UOp::binary(Binary::Add, shared.clone(), shared);

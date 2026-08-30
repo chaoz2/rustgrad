@@ -1608,6 +1608,8 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                 }
                 UOp::new(UOpKind::Bitcast, Some(ty), vec![source], UArg::None)
             }
+            crate::Op::Contiguous { .. } => return Err(UOpError::InvalidArgument),
+            crate::Op::ContiguousBackward { input } => lower(graph, *input, memo)?,
             crate::Op::Unary { op, input } => {
                 let u = match op {
                     crate::UnaryOp::Neg => Unary::Neg,

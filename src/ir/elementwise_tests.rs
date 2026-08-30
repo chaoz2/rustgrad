@@ -1,5 +1,8 @@
 use super::*;
-use crate::{Backend, CpuBackend, DType, Error, Scalar, Shape, Storage, TensorData};
+use crate::{
+    Backend, CpuBackend, DType, Error, Float8Format, Float8Storage, Scalar, Shape, Storage,
+    TensorData,
+};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -12299,4 +12302,175 @@ fn tinygrad_bitcast_covers_concrete_dtype_shapes_and_is_atomic() {
     ));
     assert_eq!(graph.node_count(), overflow_before);
     assert!(graph.node_count() >= before);
+}
+
+#[test]
+fn tinygrad_contiguous_materializes_exact_values_and_preserves_buffer_identities() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype_requires_grad("input", [2, 3], DType::F32, true);
+    let before = graph.node_count();
+    assert_eq!(graph.contiguous(input).unwrap(), input);
+    assert_eq!(graph.node_count(), before);
+
+    let reshaped = graph.reshape(input, [1, 2, 3]).unwrap();
+    let before = graph.node_count();
+    assert_eq!(graph.contiguous(reshaped).unwrap(), reshaped);
+    assert_eq!(graph.node_count(), before);
+
+    let transposed = graph.permute(input, [1, 0]).unwrap();
+    let contiguous = graph.contiguous(transposed).unwrap();
+    assert_eq!(graph.shape(contiguous).unwrap(), &Shape::new([3, 2]));
+    assert_eq!(graph.dtype(contiguous).unwrap(), DType::F32);
+    assert!(graph.requires_grad(contiguous).unwrap());
+    assert!(
+        matches!(graph.op(contiguous).unwrap(), Op::Contiguous { input: source } if *source == transposed)
+    );
+    let before = graph.node_count();
+    assert_eq!(graph.contiguous(contiguous).unwrap(), contiguous);
+    assert_eq!(graph.node_count(), before);
+
+    let data = TensorData::from_storage(
+        [2, 3],
+        Storage::F32(vec![
+            f32::from_bits(0x8000_0000),
+            f32::from_bits(0x7fc0_0123),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            5.0,
+            6.0,
+        ]),
+    )
+    .unwrap();
+    let result = CpuBackend
+        .execute(&graph, contiguous, &HashMap::from([("input".into(), data)]))
+        .unwrap();
+    let Storage::F32(result) = result.storage() else {
+        panic!("contiguous output storage")
+    };
+    assert_eq!(
+        result
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [
+            0x8000_0000,
+            0xff80_0000,
+            0x7fc0_0123,
+            0x40a0_0000,
+            0x7f80_0000,
+            0x40c0_0000
+        ]
+    );
+
+    let scheduled = crate::schedule(&graph, contiguous).unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    let crate::UArg::Movement(plan) = scheduled.items.last().unwrap().kernel.arg() else {
+        panic!("contiguous must schedule as a movement copy")
+    };
+    assert!(matches!(
+        &plan.kind,
+        crate::MovementKernelKind::Contiguous { input: operand }
+            if operand.node == transposed && operand.shape == Shape::new([3, 2])
+    ));
+    let captured = crate::CapturedSchedule::capture(&graph, &scheduled, &[contiguous]).unwrap();
+    let encoded = captured.to_bytes().unwrap();
+    assert_eq!(
+        crate::CapturedSchedule::from_bytes(&encoded)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        encoded
+    );
+
+    let mut float8 = Graph::new();
+    let input = float8.input_dtype("input", [4], DType::F8E4M3);
+    let detached = float8.detach(input).unwrap();
+    let contiguous = float8.contiguous(detached).unwrap();
+    let data = TensorData::from_storage(
+        [4],
+        Storage::Float8(Float8Storage::from_raw(
+            Float8Format::E4M3,
+            vec![0x00, 0x80, 0x7f, 0xff],
+        )),
+    )
+    .unwrap();
+    let result = CpuBackend
+        .execute(
+            &float8,
+            contiguous,
+            &HashMap::from([("input".into(), data)]),
+        )
+        .unwrap();
+    let Storage::Float8(result) = result.storage() else {
+        panic!("contiguous float8 storage")
+    };
+    assert_eq!(result.as_raw(), [0x00, 0x80, 0x7f, 0xff]);
+}
+
+#[test]
+fn tinygrad_contiguous_backward_has_distinct_reverse_rule_and_atomic_admission() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype_requires_grad("input", [2], DType::F32, true);
+    let squared = graph.square(input).unwrap();
+    let boundary = graph.contiguous_backward(squared).unwrap();
+    assert!(
+        matches!(graph.op(boundary).unwrap(), Op::ContiguousBackward { input: source } if *source == squared)
+    );
+    assert_eq!(graph.shape(boundary).unwrap(), &Shape::new([2]));
+    assert!(graph.requires_grad(boundary).unwrap());
+
+    let seed_input = graph.input_dtype_requires_grad("seed", [2], DType::F32, false);
+    let seed = graph.neg(seed_input).unwrap();
+    let before = graph.node_count();
+    let gradient = graph.grad_with(boundary, input, Some(seed), true).unwrap();
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2]));
+    assert!(
+        graph.nodes[before..]
+            .iter()
+            .any(|node| matches!(node.op, Op::Contiguous { input: source } if source == seed))
+    );
+
+    let mut ordinary = Graph::new();
+    let input = ordinary.input_dtype_requires_grad("input", [2], DType::F32, true);
+    let squared = ordinary.square(input).unwrap();
+    let contiguous = ordinary.contiguous(squared).unwrap();
+    let seed = ordinary.input_dtype_requires_grad("seed", [2], DType::F32, false);
+    let before = ordinary.node_count();
+    ordinary
+        .grad_with(contiguous, input, Some(seed), true)
+        .unwrap();
+    assert!(
+        !ordinary.nodes[before..]
+            .iter()
+            .any(|node| matches!(node.op, Op::Contiguous { .. }))
+    );
+
+    for dtype in DType::ALL {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 0, 3], dtype);
+        let computed = graph.cast(input, dtype).unwrap();
+        let output = graph.contiguous(computed).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 0, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+    }
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.contiguous(NodeId::from_index(usize::MAX)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.contiguous(overflow),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    assert!(matches!(
+        malformed.contiguous_backward(overflow),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
 }

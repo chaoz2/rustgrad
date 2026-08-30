@@ -370,9 +370,11 @@ impl CpuJitBackend {
             }
             Op::Reduce { .. } => crate::lower_graph_reduction(graph, output),
             Op::Matmul { .. } => crate::lower_graph_matmul(graph, output),
-            Op::Bitcast { .. } | Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
-                crate::lower_graph_movement(graph, output)
-            }
+            Op::Bitcast { .. }
+            | Op::Contiguous { .. }
+            | Op::Concat { .. }
+            | Op::Gather { .. }
+            | Op::Scatter { .. } => crate::lower_graph_movement(graph, output),
             _ => crate::lower_graph_elementwise(graph, output),
         }
         .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;

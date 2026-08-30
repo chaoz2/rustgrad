@@ -1309,6 +1309,7 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
             base.dtype == plan.dtype && updates.dtype == plan.dtype
         }
         crate::MovementKernelKind::Bitcast { .. } => true,
+        crate::MovementKernelKind::Contiguous { input } => input.dtype == plan.dtype,
     };
     if !homogeneous_data {
         return Err(JitError::Unsupported(
@@ -1539,6 +1540,19 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
                     "  for (size_t rg_i=0; rg_i<{output_bytes}u; ++rg_i) ((uint8_t*)buffers[{output_slot}])[rg_i] = ((const uint8_t*)buffers[{}])[rg_i] != 0;",
                     ids[&(input.node.index() as u64)]
                 ));
+            } else {
+                lines.push(format!(
+                    "  memcpy(buffers[{output_slot}], buffers[{}], {output_bytes}u);",
+                    ids[&(input.node.index() as u64)]
+                ));
+            }
+        }
+        crate::MovementKernelKind::Contiguous { input } => {
+            let output_bytes = elements(&plan.output_shape)?
+                .checked_mul(plan.dtype.itemsize())
+                .ok_or_else(|| JitError::Unsupported("contiguous byte overflow".into()))?;
+            if output_bytes == 0 {
+                lines.push("  /* empty contiguous domain */".into());
             } else {
                 lines.push(format!(
                     "  memcpy(buffers[{output_slot}], buffers[{}], {output_bytes}u);",
@@ -2957,6 +2971,40 @@ mod tests {
                 .unwrap()
                 .source
                 .contains("empty bitcast domain")
+        );
+    }
+
+    #[test]
+    fn contiguous_renderer_emits_owned_raw_copy_and_empty_noop() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let computed = graph.cast(input, DType::F32).unwrap();
+        let output = graph.contiguous(computed).unwrap();
+        let plan = crate::MovementKernelPlan::from_graph(&graph, output).unwrap();
+        let rendered = render_movement(&plan).unwrap();
+        assert!(matches!(
+            &plan.kind,
+            crate::MovementKernelKind::Contiguous { input: operand }
+                if operand.node == computed && operand.dtype == DType::F32
+        ));
+        assert!(
+            rendered
+                .source
+                .contains("memcpy(buffers[1], buffers[0], 16u);")
+        );
+        assert_eq!(rendered.abi.buffers[0].dtype, DType::F32);
+        assert_eq!(rendered.abi.buffers[1].dtype, DType::F32);
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [3, 0], DType::BF16);
+        let computed = empty.cast(input, DType::BF16).unwrap();
+        let output = empty.contiguous(computed).unwrap();
+        let plan = crate::MovementKernelPlan::from_graph(&empty, output).unwrap();
+        assert!(
+            render_movement(&plan)
+                .unwrap()
+                .source
+                .contains("empty contiguous domain")
         );
     }
 

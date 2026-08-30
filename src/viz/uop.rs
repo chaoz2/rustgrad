@@ -244,6 +244,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
                         }
                     }
                     crate::MovementKernelKind::Bitcast { .. } => "bitcast",
+                    crate::MovementKernelKind::Contiguous { .. } => "contiguous",
                 }
                 .into(),
             );

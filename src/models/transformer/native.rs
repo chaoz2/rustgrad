@@ -1024,6 +1024,8 @@ fn movement_name(op: &Op) -> Option<&'static str> {
         // boundary without asking the arithmetic scheduler to lower autograd
         // metadata.
         Op::Detach { .. } => "detach",
+        Op::Contiguous { .. } => "contiguous",
+        Op::ContiguousBackward { .. } => "contiguous_backward",
         Op::Reshape { .. } => "reshape",
         Op::Permute { .. } => "permute",
         Op::Expand { .. } => "expand",
@@ -1038,6 +1040,8 @@ fn op_name(op: &Op) -> &'static str {
         Op::Random { .. } => "random",
         Op::RandomPermutation { .. } => "random_permutation",
         Op::Bitcast { .. } => "bitcast",
+        Op::Contiguous { .. } => "contiguous",
+        Op::ContiguousBackward { .. } => "contiguous_backward",
         Op::Detach { .. } => "detach",
         _ => "unsupported",
     })
@@ -1050,6 +1054,8 @@ fn op_inputs(op: &Op) -> Vec<NodeId> {
         }
         Op::Cast { input, .. }
         | Op::Bitcast { input, .. }
+        | Op::Contiguous { input }
+        | Op::ContiguousBackward { input }
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }
@@ -1093,7 +1099,10 @@ fn execute_movement(
                 .ok_or(LlamaNativeError::MissingStageValue(input.index()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if matches!(op, Op::Detach { .. }) {
+    if matches!(
+        op,
+        Op::Detach { .. } | Op::Contiguous { .. } | Op::ContiguousBackward { .. }
+    ) {
         return Ok(inputs[0].clone());
     }
     let mut mini = Graph::new();

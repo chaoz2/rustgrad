@@ -5064,6 +5064,8 @@ impl Graph {
             | Op::Bitcast { .. }
             | Op::Sort { .. } => false,
             Op::Cast { input, .. }
+            | Op::Contiguous { input }
+            | Op::ContiguousBackward { input }
             | Op::TensorGuard { input, .. }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }

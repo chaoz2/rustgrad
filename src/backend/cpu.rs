@@ -195,6 +195,9 @@ impl Backend for CpuBackend {
                 Op::Bitcast { input, dtype } => {
                     values[input.index()].bitcast_with_shape(node.shape.clone(), *dtype)?
                 }
+                Op::Contiguous { input } | Op::ContiguousBackward { input } => {
+                    values[input.index()].clone()
+                }
                 Op::Detach { input } => values[input.index()].clone(),
                 Op::TensorGuard { input, axis } => {
                     tensor_guard_distribution(&values[input.index()], *axis)?
@@ -526,6 +529,8 @@ fn float8_cpu_capability(op: &Op) -> bool {
         Op::Input { .. }
             | Op::Constant(_)
             | Op::Detach { .. }
+            | Op::Contiguous { .. }
+            | Op::ContiguousBackward { .. }
             | Op::Cast { .. }
             | Op::Bitcast { .. }
             | Op::Unary {

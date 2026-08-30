@@ -980,6 +980,8 @@ fn collect_lowered_view_nodes(
         }
         Op::Cast { input, .. }
         | Op::Bitcast { input, .. }
+        | Op::Contiguous { input }
+        | Op::ContiguousBackward { input }
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. } => collect_lowered_view_nodes(graph, *input, views)?,
@@ -1066,7 +1068,11 @@ fn derive_shape(
         Op::Input { .. } | Op::Constant(_) => {
             seeds.get(&node).cloned().map_or_else(concrete, Ok)?
         }
-        Op::Cast { input, .. } | Op::Detach { input } | Op::Unary { input, .. } => derive_shape(
+        Op::Cast { input, .. }
+        | Op::Contiguous { input }
+        | Op::ContiguousBackward { input }
+        | Op::Detach { input }
+        | Op::Unary { input, .. } => derive_shape(
             graph,
             *input,
             seeds,

@@ -8675,6 +8675,45 @@ impl Graph {
         Ok(self.push(Op::Bitcast { input, dtype }, output_shape, dtype))
     }
 
+    /// Materializes `input` into fresh contiguous owned storage unless its
+    /// current graph value already has source-style buffer identity.
+    pub fn contiguous(&mut self, input: NodeId) -> Result<NodeId> {
+        fn has_buffer_identity(graph: &Graph, input: NodeId) -> Result<bool> {
+            Ok(match graph.op(input)? {
+                Op::Input { .. } | Op::Constant(_) | Op::Contiguous { .. } => true,
+                Op::Reshape { input, .. } => has_buffer_identity(graph, *input)?,
+                _ => false,
+            })
+        }
+
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if has_buffer_identity(self, input)? {
+            return Ok(input);
+        }
+        Ok(self.push(Op::Contiguous { input }, shape, dtype))
+    }
+
+    /// Preserves `input` in the forward graph and inserts a contiguous copy of
+    /// the incoming cotangent when reverse mode traverses this boundary.
+    pub fn contiguous_backward(&mut self, input: NodeId) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        Ok(self.push(Op::ContiguousBackward { input }, shape, dtype))
+    }
+
     /// Read-only tinygrad `Tensor.is_floating_point()`.
     pub fn is_floating_point(&self, input: NodeId) -> Result<bool> {
         Ok(self.node(input)?.dtype.is_float())
