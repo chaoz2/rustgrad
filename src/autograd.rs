@@ -443,8 +443,8 @@ impl Graph {
                         }
                         UnaryOp::Reciprocal => {
                             let square = self.mul(node, node)?;
-                            let quotient = self.div(upstream, square)?;
-                            self.neg(quotient)?
+                            let local = self.mul(upstream, square)?;
+                            self.neg(local)?
                         }
                         UnaryOp::Square => {
                             let two = self.constant(TensorData::scalar(2.0f32));
@@ -1652,6 +1652,40 @@ mod tests {
             let numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
             assert!((analytic.values()[index] - numerical).abs() < 2e-3);
         }
+    }
+
+    #[test]
+    fn reciprocal_vjp_multiplies_by_the_squared_result() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [3]);
+        let reciprocal = graph.reciprocal(input).unwrap();
+        let loss = graph.sum_all(reciprocal).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+
+        let Op::Unary {
+            op: UnaryOp::Neg,
+            input: local,
+        } = graph.op(gradient).unwrap()
+        else {
+            panic!("reciprocal gradient must end in Neg");
+        };
+        assert!(matches!(
+            graph.op(*local).unwrap(),
+            Op::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    gradient,
+                    &HashMap::from([("x".into(), data([3], &[0.5, 1.0, 2.0]))]),
+                )
+                .unwrap(),
+            data([3], &[-4.0, -1.0, -0.25]),
+        );
     }
 
     #[test]

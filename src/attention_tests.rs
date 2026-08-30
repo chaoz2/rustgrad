@@ -317,11 +317,12 @@ fn logsumexp_preflights_axes_and_keeps_established_nonfinite_boundaries() {
         Err(Error::InvalidReductionAxes { .. })
     ));
     assert_eq!(malformed.node_count(), original_nodes);
-    assert!(matches!(
-        malformed.logsumexp(input, Some(vec![-1]), false),
-        Err(Error::EmptyReduction { op: "max", .. })
-    ));
-    assert_eq!(malformed.node_count(), original_nodes);
+    // tinygrad's public Max supplies dtype.min for a populated output whose
+    // reduction domain is empty. The remaining Exp/Sum/Log composition then
+    // yields the source LogSumExp identity instead of surfacing raw Reduce's
+    // EmptyReduction error.
+    let empty = malformed.logsumexp(input, Some(vec![-1]), false).unwrap();
+    assert_eq!(malformed.shape(empty).unwrap(), &Shape::new([2]));
 
     let mut graph = Graph::new();
     let values = graph.input("values", [2]);
