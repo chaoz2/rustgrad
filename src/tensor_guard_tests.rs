@@ -1,3 +1,4 @@
+use crate::ir::PendingRandomReservation;
 use crate::{Backend, CpuBackend, CpuSession, DType, Error, Graph, Scalar, TensorData};
 use std::collections::HashMap;
 
@@ -9,7 +10,7 @@ fn commit_pending_with_shared_stream_retry(
     session: &mut CpuSession,
     guard: &crate::Tensor,
     shape: impl Into<crate::Shape> + Clone,
-) -> (crate::Tensor, crate::PendingRandomReservation) {
+) -> (crate::Tensor, PendingRandomReservation) {
     for _ in 0..64 {
         let mut pending = session
             .pending_uniform_after_guard(guard, shape.clone(), DType::F32)
