@@ -3019,7 +3019,7 @@ fn generated_scatter_cases_are_valid_diverse_and_deterministic() {
     }
 
     assert!(found);
-    assert_eq!(replace_dtypes.len(), 13);
+    assert_eq!(replace_dtypes, DType::ALL.into_iter().collect());
     assert!(add_f32 && add_f64);
     assert!(index_i32 && index_i64 && zero_axis && empty && duplicate);
     assert!(axes.contains(&(1, 0)) && axes.iter().any(|(rank, axis)| *rank >= 2 && *axis == 1));
@@ -3250,6 +3250,147 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
             .unwrap()
         ),
     );
+
+    // Replacement is a raw storage operation for every concrete dtype. The
+    // duplicate destination deliberately proves deterministic last-write-wins
+    // ordering, while the Float8 cases use noncanonical/special raw bytes that
+    // would be observably changed by a decode/encode round trip.
+    for dtype in DType::ALL {
+        let (base, updates) = if let Some(format) = dtype.float8_format() {
+            (
+                FuzzTensor::from_tensor(
+                    &TensorData::from_storage(
+                        [4],
+                        Storage::Float8(Float8Storage::from_raw(
+                            format,
+                            vec![0x00, 0x80, 0x7f, 0x7e],
+                        )),
+                    )
+                    .unwrap(),
+                ),
+                FuzzTensor::from_tensor(
+                    &TensorData::from_storage(
+                        [3],
+                        Storage::Float8(Float8Storage::from_raw(format, vec![0x01, 0x80, 0xff])),
+                    )
+                    .unwrap(),
+                ),
+            )
+        } else {
+            let values = match dtype {
+                DType::Bool => vec![
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                    Scalar::Bool(true),
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                ],
+                DType::U8 | DType::U16 | DType::U32 | DType::U64 => {
+                    (0..7).map(|value| Scalar::U(value as u64)).collect()
+                }
+                DType::I8 | DType::I16 | DType::I32 | DType::I64 => {
+                    (-3_i64..4).map(Scalar::I).collect()
+                }
+                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => vec![
+                    Scalar::F(-0.0),
+                    Scalar::F(1.0),
+                    Scalar::F(f64::INFINITY),
+                    Scalar::F(-1.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NEG_INFINITY),
+                ],
+                _ => unreachable!("Float8 handled above"),
+            };
+            (
+                FuzzTensor::from_tensor(
+                    &TensorData::from_scalars([4], dtype, values[..4].iter().copied()).unwrap(),
+                ),
+                FuzzTensor::from_tensor(
+                    &TensorData::from_scalars([3], dtype, values[4..].iter().copied()).unwrap(),
+                ),
+            )
+        };
+        let index = FuzzTensor::from_tensor(
+            &TensorData::from_storage([3], Storage::I32(vec![2, 1, 2])).unwrap(),
+        );
+        let case = FuzzCase::Scatter {
+            base: base.clone(),
+            index: index.clone(),
+            updates: updates.clone(),
+            axis: 0,
+            op: FuzzScatterOp::Replace,
+        };
+        let built = case.build().unwrap();
+        assert_eq!(built.graph.dtype(built.output).unwrap(), dtype);
+        let plan = MovementKernelPlan::from_graph(&built.graph, built.output).unwrap();
+        assert_eq!(plan.dtype, dtype);
+        assert!(matches!(
+            &plan.kind,
+            MovementKernelKind::Scatter {
+                axis: 0,
+                add: false,
+                ..
+            }
+        ));
+        let selected = plan
+            .execute(&[
+                base.to_tensor().unwrap(),
+                index.to_tensor().unwrap(),
+                updates.to_tensor().unwrap(),
+            ])
+            .unwrap();
+        let output = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        let width = dtype.itemsize();
+        let mut expected = base.bytes.clone();
+        for (destination, source) in [(2, 0), (1, 1), (2, 2)] {
+            expected[destination * width..(destination + 1) * width]
+                .copy_from_slice(&updates.bytes[source * width..(source + 1) * width]);
+        }
+        assert_eq!(
+            FuzzTensor::from_tensor(&selected).bytes,
+            expected,
+            "{dtype:?}"
+        );
+        assert_eq!(
+            FuzzTensor::from_tensor(&output).bytes,
+            expected,
+            "{dtype:?}"
+        );
+
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        assert!(matches!(
+            scheduled.items[0].kernel.arg(),
+            UArg::Movement(plan)
+                if plan.dtype == dtype
+                    && matches!(&plan.kind, MovementKernelKind::Scatter { add: false, .. })
+        ));
+        let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+        let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
+        assert!(scalar.source.contains("memcpy("), "{dtype:?}");
+        assert!(scalar.source.contains("] = ((const"), "{dtype:?}");
+        if dtype.is_float8() {
+            assert!(scalar.source.contains("uint8_t"), "{dtype:?}");
+            assert!(vector.source.contains("uint8_t"), "{dtype:?}");
+            assert!(!scalar.source.contains("rg_f8_decode"), "{dtype:?}");
+            assert!(!vector.source.contains("rg_f8_decode"), "{dtype:?}");
+        }
+        let captured =
+            CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes,
+            "{dtype:?}",
+        );
+    }
 
     let bad_add = FuzzCase::Scatter {
         base: FuzzTensor::from_tensor(
@@ -4918,7 +5059,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 114);
+    assert_eq!(cases.len(), 118);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(

@@ -706,6 +706,85 @@ pub fn regression_cases() -> Vec<FuzzCase> {
             axis: 0,
             op: FuzzScatterOp::Replace,
         },
+        FuzzCase::Scatter {
+            // Duplicate replacement retains the final raw E4M3 byte.
+            base: tensor(
+                vec![4],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3,
+                    vec![0x00, 0x80, 0x7f, 0x7e],
+                )),
+            ),
+            index: tensor(vec![3], Storage::I32(vec![2, 1, 2])),
+            updates: tensor(
+                vec![3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3,
+                    vec![0x01, 0x80, 0xff],
+                )),
+            ),
+            axis: 0,
+            op: FuzzScatterOp::Replace,
+        },
+        FuzzCase::Scatter {
+            base: tensor(
+                vec![4],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E5M2,
+                    vec![0x00, 0x80, 0x7d, 0x7c],
+                )),
+            ),
+            index: tensor(vec![3], Storage::I64(vec![2, 1, 2])),
+            updates: tensor(
+                vec![3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E5M2,
+                    vec![0x01, 0x80, 0xfd],
+                )),
+            ),
+            axis: 0,
+            op: FuzzScatterOp::Replace,
+        },
+        FuzzCase::Scatter {
+            // FNUZ's reserved NaN byte is copied as storage, never committed
+            // through a Scalar conversion.
+            base: tensor(
+                vec![4],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3FNUZ,
+                    vec![0x00, 0x80, 0x7f, 0xff],
+                )),
+            ),
+            index: tensor(vec![3], Storage::I32(vec![2, 1, 2])),
+            updates: tensor(
+                vec![3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3FNUZ,
+                    vec![0x01, 0x80, 0xfe],
+                )),
+            ),
+            axis: 0,
+            op: FuzzScatterOp::Replace,
+        },
+        FuzzCase::Scatter {
+            base: tensor(
+                vec![4],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E5M2FNUZ,
+                    vec![0x00, 0x80, 0x7f, 0xff],
+                )),
+            ),
+            index: tensor(vec![3], Storage::I64(vec![2, 1, 2])),
+            updates: tensor(
+                vec![3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E5M2FNUZ,
+                    vec![0x01, 0x80, 0xfe],
+                )),
+            ),
+            axis: 0,
+            op: FuzzScatterOp::Replace,
+        },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),
             rhs: tensor(vec![2, 3], Storage::I32(vec![0; 6])),

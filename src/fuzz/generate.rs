@@ -604,21 +604,9 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             let dtype = if op == FuzzScatterOp::Add {
                 [DType::F32, DType::F64][rng.pick(2)]
             } else {
-                [
-                    DType::Bool,
-                    DType::I8,
-                    DType::U8,
-                    DType::I16,
-                    DType::U16,
-                    DType::I32,
-                    DType::U32,
-                    DType::I64,
-                    DType::U64,
-                    DType::F16,
-                    DType::BF16,
-                    DType::F32,
-                    DType::F64,
-                ][rng.pick(13)]
+                // Replacement is raw homogeneous storage movement, including
+                // every tagged Float8 format. Only Add is arithmetic-limited.
+                DType::ALL[rng.pick(DType::ALL.len())]
             };
             let base_shape = (0..rank)
                 .map(|_| [0, 1, 2, 3][rng.pick(4)])
