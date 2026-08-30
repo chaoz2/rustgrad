@@ -1558,8 +1558,8 @@ fn split_plan(
                 // empty section, including when the requested size is zero.
                 vec![0]
             } else if size == 0 {
-                return Err(Error::InvalidRandom {
-                    reason: "uniform split size must be positive",
+                return Err(Error::InvalidSplit {
+                    reason: "split size must be positive for a non-empty axis",
                 });
             } else {
                 (0..axis_len)
@@ -1575,11 +1575,8 @@ fn split_plan(
                     .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
             })?;
             if total != axis_len {
-                return Err(Error::InvalidBounds {
-                    axis,
-                    start: total,
-                    end: total,
-                    dim: axis_len,
+                return Err(Error::InvalidSplit {
+                    reason: "section sizes must sum exactly to the selected axis",
                 });
             }
             lengths
@@ -3512,7 +3509,11 @@ impl Graph {
     ///
     /// This accepts both source section forms and is equivalent to
     /// `split(input, sections, 0)`.
-    pub fn split_default(&mut self, input: NodeId, sections: SplitSections) -> Result<Vec<NodeId>> {
+    pub fn split_default(
+        &mut self,
+        input: NodeId,
+        sections: impl Into<SplitSections>,
+    ) -> Result<Vec<NodeId>> {
         self.split(input, sections, 0)
     }
 
@@ -3521,10 +3522,10 @@ impl Graph {
     pub fn split(
         &mut self,
         input: NodeId,
-        sections: SplitSections,
+        sections: impl Into<SplitSections>,
         axis: isize,
     ) -> Result<Vec<NodeId>> {
-        let plan = split_plan(self, input, sections, axis)?;
+        let plan = split_plan(self, input, sections.into(), axis)?;
         plan.bounds
             .into_iter()
             .map(|bounds| self.shrink(input, bounds))

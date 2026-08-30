@@ -70,9 +70,13 @@ fn chunk_matches_tinygrad_partial_and_zero_axis_contracts() {
         );
     }
 
-    // `Tensor([].reshape(0)).split(0)` is an empty tuple in tinygrad.
+    // tinygrad's `range(0, max(1, 0), max(1, 0))` produces one empty view.
     let split_empty = zero_graph.split(empty, 0usize, 0).unwrap();
-    assert!(split_empty.is_empty());
+    assert_eq!(split_empty.len(), 1);
+    assert_eq!(
+        zero_graph.shape(split_empty[0]).unwrap(),
+        &Shape::from([0, 2])
+    );
 }
 
 #[test]

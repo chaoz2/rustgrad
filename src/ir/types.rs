@@ -570,6 +570,24 @@ pub enum SplitSections {
     Explicit(Vec<usize>),
 }
 
+impl From<usize> for SplitSections {
+    fn from(size: usize) -> Self {
+        Self::Uniform(size)
+    }
+}
+
+impl From<Vec<usize>> for SplitSections {
+    fn from(sections: Vec<usize>) -> Self {
+        Self::Explicit(sections)
+    }
+}
+
+impl From<&[usize]> for SplitSections {
+    fn from(sections: &[usize]) -> Self {
+        Self::Explicit(sections.to_vec())
+    }
+}
+
 /// A concrete or inferred extent for [`Graph::unflatten`](super::Graph::unflatten).
 ///
 /// `Infer` is the sole source-compatible negative reshape form: exactly one
