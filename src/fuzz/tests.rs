@@ -102,7 +102,7 @@ fn generated_reduction_cases_cover_portable_kinds_and_geometry() {
     let mut dropdim = false;
 
     for seed in [0, 0x1234, 0xfeed_cafe] {
-        for index in 0..512 {
+        for index in 0..2048 {
             let case = generate_case(seed, index);
             assert_eq!(case, generate_case(seed, index));
             case.validate().unwrap();
@@ -150,7 +150,7 @@ fn generated_reduction_cases_cover_portable_kinds_and_geometry() {
         ])
     );
     assert_eq!(ranks, std::collections::BTreeSet::from([1, 2, 3]));
-    assert_eq!(dtypes.len(), 13);
+    assert_eq!(dtypes, DType::ALL.into_iter().collect());
     assert!(nonzero_axis && zero_domain && scalar_output && keepdim && dropdim);
 }
 
@@ -540,21 +540,6 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
 
 #[test]
 fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_paths() {
-    let dtypes = [
-        DType::Bool,
-        DType::I8,
-        DType::U8,
-        DType::I16,
-        DType::U16,
-        DType::I32,
-        DType::U32,
-        DType::I64,
-        DType::U64,
-        DType::F16,
-        DType::BF16,
-        DType::F32,
-        DType::F64,
-    ];
     let reductions = [
         (FuzzReduction::Sum, ReduceKind::Sum),
         (FuzzReduction::Mean, ReduceKind::Mean),
@@ -563,15 +548,19 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
         (FuzzReduction::Min, ReduceKind::Min),
     ];
 
-    for dtype in dtypes {
+    for dtype in DType::ALL {
         let values = (0..6).map(|index| match dtype {
             DType::Bool => Scalar::Bool(index % 2 != 0),
             DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U((index % 3) as u64),
             DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I((index % 3) as i64 - 1),
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
-                Scalar::F((index % 3) as f64 - 1.0)
-            }
-            _ => unreachable!("float8 reduction fuzz is not generated"),
+            DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ
+            | DType::F16
+            | DType::BF16
+            | DType::F32
+            | DType::F64 => Scalar::F((index % 3) as f64 - 1.0),
         });
         let input =
             FuzzTensor::from_tensor(&TensorData::from_scalars([2, 3], dtype, values).unwrap());
@@ -628,14 +617,21 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
                     .iter()
                     .any(|node| matches!(node.kind(), UOpKind::ReduceFinalize))
             );
-            assert!(
-                CpuJit::render(&scheduled.items[0].kernel).is_ok(),
-                "{dtype:?} {reduction:?}"
-            );
-            assert!(
-                CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok(),
-                "{dtype:?} {reduction:?}"
-            );
+            let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+            let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
+            if dtype.is_float8() {
+                assert!(
+                    scalar.source.matches("rg_f8_decode(").count() > 1
+                        && scalar.source.matches("rg_f8_encode(").count() > 1,
+                    "{dtype:?} {reduction:?}"
+                );
+                assert!(
+                    vector.source.matches("rg_f8_decode(").count() > 1
+                        && vector.source.matches("rg_f8_encode(").count() > 1
+                        && !vector.source.contains("B2 VectorProgram"),
+                    "{dtype:?} {reduction:?}"
+                );
+            }
             let captured =
                 CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
             let bytes = captured.to_bytes().unwrap();

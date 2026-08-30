@@ -100,11 +100,17 @@ fn reduction_tensor(
                 Scalar::U(value)
             }
             DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I((raw % 3) as i64 - 1),
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+            DType::F8E4M3
+            | DType::F8E5M2
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2FNUZ
+            | DType::F16
+            | DType::BF16
+            | DType::F32
+            | DType::F64 => {
                 let value = (raw % 3) as i64 - 1;
                 Scalar::F(value as f64)
             }
-            _ => unreachable!("float8 reduction fuzz is not generated"),
         }
     });
     FuzzTensor::from_tensor(
@@ -308,21 +314,7 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                     FuzzReduction::Min,
                 ][rng.pick(5)]
             };
-            let dtype = [
-                DType::Bool,
-                DType::I8,
-                DType::U8,
-                DType::I16,
-                DType::U16,
-                DType::I32,
-                DType::U32,
-                DType::I64,
-                DType::U64,
-                DType::F16,
-                DType::BF16,
-                DType::F32,
-                DType::F64,
-            ][rng.pick(13)];
+            let dtype = DType::ALL[rng.pick(DType::ALL.len())];
             FuzzCase::Reduction {
                 input: reduction_tensor(&mut rng, shape, dtype, reduction),
                 reduction,
