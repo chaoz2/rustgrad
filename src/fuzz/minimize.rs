@@ -75,6 +75,10 @@ fn zero_values(case: &FuzzCase) -> FuzzCase {
         FuzzCase::TensorT { input } => FuzzCase::TensorT {
             input: input.zeroed(),
         },
+        FuzzCase::Permute { input, axes } => FuzzCase::Permute {
+            input: input.zeroed(),
+            axes: axes.clone(),
+        },
         FuzzCase::Pad {
             input,
             padding,
@@ -149,6 +153,9 @@ fn scalarize(case: &FuzzCase) -> Option<FuzzCase> {
         // Tensor.T admits rank two only, so scalarization would stop being a
         // valid source program and is deliberately omitted.
         FuzzCase::TensorT { .. } => None,
+        // Rank and axis order define the Permute program. Scalarization would
+        // invalidate every non-scalar permutation and is therefore omitted.
+        FuzzCase::Permute { .. } => None,
         // Raw Concat owns a rank/axis contract, including its input arity.
         FuzzCase::Concat { .. } | FuzzCase::ConcatMany { .. } => None,
         // Pad can remain scalar only when its rank-zero padding contract is

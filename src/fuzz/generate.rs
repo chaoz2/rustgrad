@@ -126,7 +126,7 @@ fn gather_index(
 /// Deterministically generates the `index`th valid bounded case for `seed`.
 pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
     let mut rng = SplitMix64(seed ^ index.wrapping_mul(0xd6e8_feb8_6659_fd93));
-    match rng.pick(15) {
+    match rng.pick(16) {
         0 => {
             let shape = static_shape(&mut rng);
             let dtype = [
@@ -549,6 +549,38 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 updates: tensor(&mut rng, updates_shape, dtype),
                 axis,
                 op,
+            }
+        }
+        14 => {
+            // Raw Permute includes source identity and rank-zero passthrough
+            // programs as well as ordinary affine views. Captured replay owns
+            // passthrough Inputs directly rather than fabricating a kernel.
+            let rank = rng.pick(4);
+            let shape = (0..rank)
+                .map(|_| [0, 1, 2, 3][rng.pick(4)])
+                .collect::<Vec<_>>();
+            let dtype = [
+                DType::Bool,
+                DType::I8,
+                DType::U8,
+                DType::I16,
+                DType::U16,
+                DType::I32,
+                DType::U32,
+                DType::I64,
+                DType::U64,
+                DType::F16,
+                DType::BF16,
+                DType::F32,
+                DType::F64,
+            ][rng.pick(13)];
+            let mut axes = (0..rank).collect::<Vec<_>>();
+            for position in (1..rank).rev() {
+                axes.swap(position, rng.pick(position + 1));
+            }
+            FuzzCase::Permute {
+                input: tensor(&mut rng, shape, dtype),
+                axes,
             }
         }
         _ => {

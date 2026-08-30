@@ -246,6 +246,11 @@ pub enum FuzzCase {
     TensorT {
         input: FuzzTensor,
     },
+    /// Raw `Graph::permute`, including rank-zero and identity passthroughs.
+    Permute {
+        input: FuzzTensor,
+        axes: Vec<usize>,
+    },
     Pad {
         input: FuzzTensor,
         padding: Vec<(usize, usize)>,
@@ -305,7 +310,8 @@ impl FuzzCase {
             | Self::Reduction { input, .. }
             | Self::Unary { input, .. }
             | Self::LogicalNot { input }
-            | Self::TensorT { input } => vec![input],
+            | Self::TensorT { input }
+            | Self::Permute { input, .. } => vec![input],
             // Raw Graph::pad stores its fill in the movement plan, not as a
             // caller-owned graph buffer. `build` validates it explicitly.
             Self::Pad { input, .. } => vec![input],
@@ -486,6 +492,12 @@ impl FuzzCase {
             Self::TensorT { input } => {
                 let input = bind(&mut graph, "input", input)?;
                 graph.t_tinygrad(input).map_err(|error| error.to_string())?
+            }
+            Self::Permute { input, axes } => {
+                let input = bind(&mut graph, "input", input)?;
+                graph
+                    .permute(input, axes.clone())
+                    .map_err(|error| error.to_string())?
             }
             Self::Pad {
                 input,

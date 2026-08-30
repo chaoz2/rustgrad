@@ -201,6 +201,26 @@ pub fn regression_cases() -> Vec<FuzzCase> {
         FuzzCase::TensorT {
             input: tensor(vec![0, 3], Storage::F16(vec![])),
         },
+        FuzzCase::Permute {
+            input: tensor(vec![], Storage::Bool(vec![true])),
+            axes: vec![],
+        },
+        FuzzCase::Permute {
+            input: tensor(vec![2, 2], Storage::I64(vec![1, 2, 3, 4])),
+            axes: vec![0, 1],
+        },
+        FuzzCase::Permute {
+            // [2, 1, 3] -> [3, 2, 1] makes source-order addressing visible.
+            input: tensor(
+                vec![2, 1, 3],
+                Storage::F32(vec![-0.0, 1.0, f32::INFINITY, 3.0, 4.0, f32::NAN]),
+            ),
+            axes: vec![2, 0, 1],
+        },
+        FuzzCase::Permute {
+            input: tensor(vec![0, 2, 3], Storage::F16(vec![])),
+            axes: vec![2, 0, 1],
+        },
         FuzzCase::Pad {
             // [2, 2] becomes [3, 4], retaining row-major placement and the
             // raw negative-zero fill at every padded lane.

@@ -1105,6 +1105,40 @@ fn generated_tensor_t_cases_are_valid_diverse_and_deterministic() {
 }
 
 #[test]
+fn generated_permute_cases_cover_passthrough_and_affine_geometry() {
+    let mut found = false;
+    let mut scalar = false;
+    let mut identity = false;
+    let mut non_identity = false;
+    let mut zero = false;
+
+    for seed in [0, 0x1234, 0xfeed_cafe] {
+        for index in 0..1024 {
+            let case = generate_case(seed, index);
+            assert_eq!(case, generate_case(seed, index));
+            case.validate().unwrap();
+            let FuzzCase::Permute { input, axes } = case else {
+                continue;
+            };
+            found = true;
+            assert_eq!(axes.len(), input.shape.len());
+            assert_eq!(
+                axes.iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                (0..axes.len()).collect()
+            );
+            scalar |= input.shape.is_empty();
+            identity |= axes.iter().copied().eq(0..axes.len());
+            non_identity |= !axes.iter().copied().eq(0..axes.len());
+            zero |= input.shape.contains(&0);
+        }
+    }
+
+    assert!(found && scalar && identity && non_identity && zero);
+}
+
+#[test]
 fn generated_select_cases_cover_homogeneous_dtypes_and_broadcasts() {
     let mut dtypes = std::collections::BTreeSet::new();
     let mut scalar_condition = false;
@@ -3119,6 +3153,145 @@ fn tensor_t_cases_round_trip_minimize_and_capture_as_affine_permute() {
     assert!(malformed.validate().is_err());
 }
 
+#[test]
+fn general_permute_captures_identity_and_affine_views_for_all_dtypes() {
+    let dtypes = [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+    for (position, dtype) in dtypes.into_iter().enumerate() {
+        let axes = if position % 2 == 0 {
+            vec![0, 1]
+        } else {
+            vec![1, 0]
+        };
+        let case = FuzzCase::Permute {
+            input: FuzzTensor::from_tensor(&TensorData::zeros_with_dtype([2, 3], dtype).unwrap()),
+            axes: axes.clone(),
+        };
+        let built = case.build().unwrap();
+        let expected_shape = if axes == [0, 1] { [2, 3] } else { [3, 2] };
+        assert_eq!(
+            built.graph.shape(built.output).unwrap().dims(),
+            &expected_shape
+        );
+        let scheduled = schedule(&built.graph, built.output).unwrap();
+        if axes == [0, 1] {
+            assert!(matches!(
+                built.graph.op(built.output).unwrap(),
+                Op::Input { .. }
+            ));
+            assert!(scheduled.items.is_empty());
+        } else {
+            assert!(matches!(
+                built.graph.op(built.output).unwrap(),
+                Op::Permute { axes, .. } if axes == &vec![1, 0]
+            ));
+            assert_eq!(scheduled.items.len(), 1);
+            let nodes = scheduled.items[0].kernel.topological().unwrap();
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| matches!(node.arg(), UArg::ViewBufferIndex { .. }))
+            );
+            assert!(CpuJit::render(&scheduled.items[0].kernel).is_ok());
+            assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+        }
+        let capture = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+        let oracle = CpuBackend
+            .execute(&built.graph, built.output, &built.oracle)
+            .unwrap();
+        let replay = crate::CapturedReplayExecutor::default()
+            .replay(
+                &decoded,
+                &built.ordered,
+                crate::CapturedReplayOptions {
+                    backend: crate::CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.outputs[0].storage(), oracle.storage());
+        assert_eq!(replay.trace.items.is_empty(), axes == [0, 1]);
+    }
+
+    let scalar = FuzzCase::Permute {
+        input: FuzzTensor::from_tensor(&TensorData::scalar_with_dtype(Scalar::I(7), DType::I32)),
+        axes: vec![],
+    };
+    let scalar_built = scalar.build().unwrap();
+    assert!(
+        schedule(&scalar_built.graph, scalar_built.output)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+
+    let artifact_case = FuzzCase::Permute {
+        input: FuzzTensor::from_tensor(
+            &TensorData::from_storage(
+                [2, 1, 3],
+                Storage::F32(vec![-0.0, 1.0, f32::INFINITY, 3.0, 4.0, f32::NAN]),
+            )
+            .unwrap(),
+        ),
+        axes: vec![2, 0, 1],
+    };
+    let value = serde_json::to_value(&artifact_case).unwrap();
+    assert_eq!(value["kind"], "permute");
+    assert_eq!(
+        serde_json::from_value::<FuzzCase>(value).unwrap(),
+        artifact_case
+    );
+    let artifact = FuzzFailureArtifact::new(
+        17,
+        29,
+        artifact_case.clone(),
+        FuzzPath::NativeVector,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::Error {
+            class: "expected".into(),
+            detail: "synthetic permute expectation".into(),
+        },
+        FuzzOutcome::Error {
+            class: "actual".into(),
+            detail: "synthetic permute mismatch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        FuzzFailureArtifact::from_bytes(&artifact.to_bytes().unwrap()).unwrap(),
+        artifact
+    );
+    let zeroed = minimize_case(&artifact_case, |candidate| {
+        matches!(candidate, FuzzCase::Permute { input, axes }
+            if input.shape == vec![2, 1, 3]
+                && input.bytes == vec![0; 24]
+                && axes == &vec![2, 0, 1])
+    });
+    assert!(matches!(zeroed, FuzzCase::Permute { ref input, ref axes }
+        if input.bytes == vec![0; 24] && axes == &vec![2, 0, 1]));
+
+    let malformed = FuzzCase::Permute {
+        input: FuzzTensor::from_tensor(&TensorData::zeros_with_dtype([2, 3], DType::F32).unwrap()),
+        axes: vec![0, 0],
+    };
+    assert!(malformed.validate().is_err());
+}
+
 fn tensor_t_input(case: &FuzzCase) -> FuzzTensor {
     match case {
         FuzzCase::TensorT { input } => input.clone(),
@@ -4113,7 +4286,7 @@ fn regression_native_cases_remain_explicit_and_portable() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 60);
+    assert_eq!(cases.len(), 64);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(
