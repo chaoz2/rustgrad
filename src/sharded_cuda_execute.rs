@@ -367,12 +367,15 @@ impl ShardedCudaPlanComposition {
             }
         }
         if aliases.is_empty()
-            && self
-                .plan
-                .logical
-                .stages
-                .iter()
-                .any(|stage| matches!(stage, CudaPlanStage::Transfer { .. }))
+            && self.plan.logical.stages.iter().any(|stage| {
+                matches!(stage, CudaPlanStage::Transfer { routes, .. }
+                if routes.iter().any(|route| {
+                    route.source_rank != route.destination_rank
+                        || route.source_device != route.destination_device
+                        || route.source_buffer != route.destination_buffer
+                        || route.source_element_offset != route.destination_element_offset
+                }))
+            })
         {
             return Err(err(
                 "composition requires at least one explicit substitution",
