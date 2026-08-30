@@ -318,10 +318,13 @@ impl PtxRenderer {
             return Err(PtxError::Unsupported("linked F32 Exp NVVM contract".into()));
         }
         let exact_f32_exp = (|| {
-            let [store] = kernel.sources() else {
+            let [store, end_range] = kernel.sources() else {
                 return false;
             };
-            if !matches!(kernel.kind(), UOpKind::Sink) || !matches!(store.kind(), UOpKind::Store) {
+            if !matches!(kernel.kind(), UOpKind::Sink)
+                || !matches!(store.kind(), UOpKind::Store)
+                || !matches!(end_range.kind(), UOpKind::EndRange)
+            {
                 return false;
             }
             let [output_index, exp] = store.sources() else {
