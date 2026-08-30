@@ -3428,7 +3428,7 @@ impl Graph {
 
     /// Reverses each distinct signed axis through the existing checked stride
     /// view. An empty axis list is the same no-op as tinygrad's `flip(())`.
-    pub fn flip(&mut self, input: NodeId, axes: impl Into<Vec<isize>>) -> Result<NodeId> {
+    pub fn flip(&mut self, input: NodeId, axes: impl AsRef<[isize]>) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
         let dtype = self.dtype(input)?;
         shape
@@ -3441,8 +3441,9 @@ impl Graph {
             rank: usize::MAX,
         })?;
         let mut normalized = axes
-            .into()
-            .into_iter()
+            .as_ref()
+            .iter()
+            .copied()
             .map(|axis| {
                 let axis = if axis < 0 {
                     axis.checked_add(rank).ok_or(Error::InvalidAxis {
