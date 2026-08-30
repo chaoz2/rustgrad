@@ -201,15 +201,13 @@ fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
         let mut values = BTreeMap::from([("x".into(), input)]);
         let mut constants = BTreeMap::new();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before_nodes);
         assert_eq!(values["x"], input);
         assert!(!values.contains_key("out"));
@@ -276,15 +274,13 @@ fn gelu_uses_closed_typed_modes_and_preflights() {
         let input = graph.input("x", [2]);
         let mut values = BTreeMap::from([("x".into(), input)]);
         let before = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(graph.node_count(), before);
         assert!(!values.contains_key("out"));
     }
@@ -304,15 +300,13 @@ fn gelu_uses_closed_typed_modes_and_preflights() {
     let input = overflow.input("x", [usize::MAX, 2]);
     let mut values = BTreeMap::from([("x".into(), input)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&gelu(&[])),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&gelu(&[])),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -360,15 +354,13 @@ fn bias_gelu_matches_tinygrad_add_then_closed_gelu_and_preflights() {
         let bias = graph.input("bias", [2]);
         let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
         let before = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(graph.node_count(), before);
         assert!(!values.contains_key("out"));
     }
@@ -379,15 +371,13 @@ fn bias_gelu_matches_tinygrad_add_then_closed_gelu_and_preflights() {
     let bias = overflow.input_dtype("bias", [], DType::I8);
     let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&bias_gelu(&[])),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&bias_gelu(&[])),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -444,15 +434,13 @@ fn optional_has_element_matches_tinygrad_absent_empty_and_present_contract() {
         let mut values = BTreeMap::from([("x".into(), x), ("y".into(), y)]);
         let before_values = values.clone();
         let before = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(graph.node_count(), before);
         assert_eq!(values, before_values);
     }
@@ -460,15 +448,13 @@ fn optional_has_element_matches_tinygrad_absent_empty_and_present_contract() {
     let x = overflow.input_dtype("x", [usize::MAX], DType::F64);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&optional(&["x"])),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&optional(&["x"])),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -528,15 +514,13 @@ fn optional_get_element_matches_tinygrad_identity_and_empty_fallback() {
         let mut values = BTreeMap::from([("x".into(), x), ("y".into(), y)]);
         let before_values = values.clone();
         let before = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(graph.node_count(), before);
         assert_eq!(values, before_values);
     }
@@ -544,15 +528,13 @@ fn optional_get_element_matches_tinygrad_identity_and_empty_fallback() {
     let x = overflow.input_dtype("x", [usize::MAX], DType::F64);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&optional(&["x"])),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&optional(&["x"])),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -618,15 +600,13 @@ fn fast_gelu_uses_optional_live_bias_then_tanh_gelu_and_preflights() {
         let bias = malformed.input("bias", [3]);
         let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
         let before = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before);
         assert!(!values.contains_key("out"));
     }
@@ -635,15 +615,13 @@ fn fast_gelu_uses_optional_live_bias_then_tanh_gelu_and_preflights() {
     let x = overflow.input("x", [usize::MAX, 2]);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&fast_gelu(&["x"])),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&fast_gelu(&["x"])),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -678,15 +656,13 @@ fn elu_uses_strict_source_branches_and_preflights() {
         let x = malformed.input("x", [1]);
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before);
         assert!(!values.contains_key("out"));
     }
@@ -736,15 +712,13 @@ fn selu_uses_closed_typed_attributes_and_empty_promotion() {
         let x = malformed.input("x", [1]);
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before);
         assert!(!values.contains_key("out"));
     }
@@ -780,15 +754,13 @@ fn swish_uses_typed_exp2_reciprocal_path_and_preflights() {
         let x = malformed.input("x", [1]);
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before);
         assert!(!values.contains_key("out"));
     }
@@ -798,15 +770,13 @@ fn swish_uses_typed_exp2_reciprocal_path_and_preflights() {
     let x = overflow.input_dtype("x", [usize::MAX], DType::I8);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&swish(&[])),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&swish(&[])),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -863,15 +833,13 @@ fn mod_uses_typed_fmod_selector_and_constant_zero_preflight() {
         TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap(),
     )]);
     let before = graph.node_count();
-    assert!(
-        lower(
-            &mut graph,
-            Msg::new(&modu(&[])),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut graph,
+        Msg::new(&modu(&[])),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert_eq!(graph.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -937,15 +905,13 @@ fn softplus_uses_source_width_stable_logaddexp_and_preflights() {
     let mut invalid = node("Softplus", &["x"], "out");
     field(&mut invalid, 5, &float_attr("beta", 1.0));
     let before = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 
@@ -953,15 +919,13 @@ fn softplus_uses_source_width_stable_logaddexp_and_preflights() {
     let x = overflow.input("x", [usize::MAX, 2]);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Softplus", &["x"], "out")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Softplus", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -1000,15 +964,13 @@ fn softsign_uses_literal_sign_reciprocal_composition_and_preflights() {
     let mut invalid = node("Softsign", &["x"], "out");
     field(&mut invalid, 5, &float_attr("alpha", 1.0));
     let before = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -1052,15 +1014,13 @@ fn celu_uses_source_ordered_extrema_and_typed_alpha() {
     let mut invalid = node("Celu", &["x"], "out");
     field(&mut invalid, 5, &int_attr("alpha", 1));
     let before = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 
@@ -1068,15 +1028,13 @@ fn celu_uses_source_ordered_extrema_and_typed_alpha() {
     let x = overflow.input("x", [usize::MAX, 2]);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Celu", &["x"], "out")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Celu", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -1106,15 +1064,13 @@ fn dropout_preflights_static_identity_controls_without_nodes() {
     let training = TensorData::from_scalars([1], DType::Bool, [Scalar::Bool(false)]).unwrap();
     let mut constants = BTreeMap::from([("training".into(), training)]);
     let before = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&node("Dropout", &["x", "", "training"], "out")),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Dropout", &["x", "", "training"], "out")),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -1146,15 +1102,13 @@ fn layer_normalization_uses_f32_statistics_and_single_output_contract() {
     let mut invalid = node("LayerNormalization", &["x", "scale"], "out");
     field(&mut invalid, 5, &typed_int_attr("stash_type", 2));
     let before = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -1179,15 +1133,13 @@ fn mean_variance_normalization_recomputes_typed_statistics_and_preflights_axes()
     let mut invalid = node("MeanVarianceNormalization", &["x"], "out");
     field(&mut invalid, 5, &typed_int_attr("axis", 0));
     let before = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -1221,15 +1173,13 @@ fn lp_normalization_uses_source_p_branches_and_preflights() {
     let mut invalid = node("LpNormalization", &["x"], "out");
     field(&mut invalid, 5, &float_attr("p", 1.0));
     let before = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 
@@ -1241,15 +1191,13 @@ fn lp_normalization_uses_source_p_branches_and_preflights() {
     let x = overflow.input_dtype("x", [usize::MAX / 4 + 1], DType::F16);
     let before_nodes = overflow.node_count();
     let mut values = BTreeMap::from([("x".into(), x)]);
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("LpNormalization", &["x"], "out")),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("LpNormalization", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before_nodes);
     assert_eq!(values["x"], x);
     assert!(!values.contains_key("out"));
@@ -1282,15 +1230,13 @@ fn rms_normalization_uses_live_scale_f32_statistics_and_preflights() {
         let scale = malformed.input("scale", [2]);
         let before = malformed.node_count();
         let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale)]);
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before);
         assert!(!values.contains_key("out"));
     }
@@ -1299,15 +1245,13 @@ fn rms_normalization_uses_live_scale_f32_statistics_and_preflights() {
     let scale = overflow.input("scale", [1]);
     let before = overflow.node_count();
     let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale)]);
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("RMSNormalization", &["x", "scale"], "out")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("RMSNormalization", &["x", "scale"], "out")),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -1339,15 +1283,13 @@ fn einsum_forwards_the_full_static_graph_grammar_after_preflight() {
     let mut invalid = node("Einsum", &["x"], "out");
     field(&mut invalid, 5, &int_attr("equation", 1));
     let before = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
@@ -1462,15 +1404,13 @@ fn topk_publishes_the_checked_stable_pair_only_after_full_preflight() {
         let x = malformed.input("x", [2, 3]);
         let mut malformed_values = BTreeMap::from([("x".into(), x)]);
         let before = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&encoded),
-                &mut malformed_values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&encoded),
+            &mut malformed_values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before);
         assert_eq!(malformed_values["x"], x);
         assert!(!malformed_values.contains_key("only_one"));
@@ -1510,11 +1450,9 @@ fn split_preflights_every_source_section_before_atomic_multi_output_publication(
             .collect::<Vec<_>>(),
         vec![vec![2, 2], vec![2, 2], vec![2, 1]]
     );
-    assert!(
-        [values["a"], values["b"], values["c"]]
-            .into_iter()
-            .all(|output| graph.dtype(output).unwrap() == DType::BF16)
-    );
+    assert!([values["a"], values["b"], values["c"]]
+        .into_iter()
+        .all(|output| graph.dtype(output).unwrap() == DType::BF16));
 
     // An explicit I32 section initializer preserves zero-width views and
     // output order even on an otherwise nonempty source axis.
@@ -1604,15 +1542,13 @@ fn split_preflights_every_source_section_before_atomic_multi_output_publication(
         let x = malformed.input("x", [2, 3]);
         let mut malformed_values = BTreeMap::from([("x".into(), x)]);
         let before = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&encoded),
-                &mut malformed_values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&encoded),
+            &mut malformed_values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before);
         assert_eq!(malformed_values["x"], x);
         assert!(!malformed_values.contains_key("a"));
@@ -1959,12 +1895,11 @@ fn strict_native_static_mlp_reuses_cache_and_fails_closed() {
     assert_eq!(cold.output(), warm.output());
     assert_eq!(cold.native_trace(), warm.native_trace());
     assert_eq!(scalar_len, executor.compile_cache_len(false));
-    assert!(
-        cold.replay_trace()
-            .items
-            .iter()
-            .all(|item| item.backend == ItemBackend::NativeJit)
-    );
+    assert!(cold
+        .replay_trace()
+        .items
+        .iter()
+        .all(|item| item.backend == ItemBackend::NativeJit));
 
     let vector = model.run_native_static(&input, &executor, true).unwrap();
     assert_eq!(vector.output(), &cpu["y"]);
@@ -2008,11 +1943,9 @@ fn strict_native_static_mlp_reuses_cache_and_fails_closed() {
     unsupported_bytes[relu..relu + 4].copy_from_slice(b"Tanh");
     let unsupported = import_onnx(&unsupported_bytes).unwrap();
     let unsupported_executor = CapturedReplayExecutor::default();
-    assert!(
-        unsupported
-            .run_native_static(&input, &unsupported_executor, false)
-            .is_err()
-    );
+    assert!(unsupported
+        .run_native_static(&input, &unsupported_executor, false)
+        .is_err());
     assert_eq!(unsupported_executor.compile_cache_len(false), 0);
 
     let multi = import_onnx(&multi_input_mlp()).unwrap();
@@ -2027,20 +1960,16 @@ fn strict_native_static_mlp_reuses_cache_and_fails_closed() {
             TensorData::new([1, 2], vec![0.0f32, 0.0]).unwrap(),
         ),
     ]);
-    assert!(
-        multi
-            .run_native_static(&multi_inputs, &multi_executor, false)
-            .is_err()
-    );
+    assert!(multi
+        .run_native_static(&multi_inputs, &multi_executor, false)
+        .is_err());
     assert_eq!(multi_executor.compile_cache_len(false), 0);
 
     let multi_output = import_onnx(&multi_output_mlp()).unwrap();
     let multi_output_executor = CapturedReplayExecutor::default();
-    assert!(
-        multi_output
-            .run_native_static(&input, &multi_output_executor, false)
-            .is_err()
-    );
+    assert!(multi_output
+        .run_native_static(&input, &multi_output_executor, false)
+        .is_err());
     assert_eq!(multi_output_executor.compile_cache_len(false), 0);
 }
 
@@ -2076,23 +2005,20 @@ fn strict_native_many_replays_selected_static_f32_outputs_in_name_order() {
             .collect::<Vec<_>>(),
         ["a", "y"]
     );
-    assert!(
-        cold.replay_trace()
-            .items
-            .iter()
-            .all(|item| item.backend == ItemBackend::NativeJit)
-    );
+    assert!(cold
+        .replay_trace()
+        .items
+        .iter()
+        .all(|item| item.backend == ItemBackend::NativeJit));
     let before = executor.compile_cache_len(false);
-    assert!(
-        model
-            .run_native_static_many(
-                &input,
-                &BTreeSet::from(["missing".into()]),
-                &executor,
-                false
-            )
-            .is_err()
-    );
+    assert!(model
+        .run_native_static_many(
+            &input,
+            &BTreeSet::from(["missing".into()]),
+            &executor,
+            false
+        )
+        .is_err());
     assert_eq!(before, executor.compile_cache_len(false));
 }
 #[test]
@@ -2225,15 +2151,13 @@ fn flatten_matches_tinygrad_two_dimensional_shape_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = leading_zero.node_count();
-    assert!(
-        lower(
-            &mut leading_zero,
-            Msg::new(&node("Flatten", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut leading_zero,
+        Msg::new(&node("Flatten", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(leading_zero.node_count(), before_nodes);
@@ -2310,15 +2234,13 @@ fn unsqueeze_supports_sorted_signed_axes_and_preflights_them_together() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&node("Unsqueeze", &["x", "axes"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Unsqueeze", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -2380,7 +2302,7 @@ fn squeeze_sorts_signed_axes_and_preflights_the_full_sequence() {
         &mut constants,
     )
     .unwrap();
-    assert_eq!(duplicate.shape(values["out"]).unwrap().dims(), &[]);
+    assert!(duplicate.shape(values["out"]).unwrap().dims().is_empty());
 
     let mut empty_axes = Graph::new();
     let x = empty_axes.input("x", [1, 2]);
@@ -2410,15 +2332,13 @@ fn squeeze_sorts_signed_axes_and_preflights_the_full_sequence() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&node("Squeeze", &["x", "axes"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Squeeze", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -2517,15 +2437,13 @@ fn reshape_matches_tinygrad_allowzero_and_static_inference() {
         if shape == [0, -1] {
             field(&mut encoded, 5, &typed_int_attr("allowzero", 1));
         }
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&encoded),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&encoded),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -2850,15 +2768,13 @@ fn slice_preflights_negative_steps_defaults_and_failures() {
         } else {
             &["x", "starts", "ends", "missing"]
         };
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&node("Slice", inputs, "out")),
-                &mut values,
-                &mut controls,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&node("Slice", inputs, "out")),
+            &mut values,
+            &mut controls,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(controls, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -2923,30 +2839,22 @@ fn log_softmax_uses_detached_exp2_log2_composition_and_preflights() {
     )
     .unwrap();
     let trace = graph.trace(values["out"]).unwrap();
-    assert!(
-        trace
-            .steps
-            .iter()
-            .any(|step| step.operation.starts_with("detach("))
-    );
-    assert!(
-        trace
-            .steps
-            .iter()
-            .any(|step| step.operation.starts_with("exp2("))
-    );
-    assert!(
-        trace
-            .steps
-            .iter()
-            .any(|step| step.operation.starts_with("log2("))
-    );
-    assert!(
-        !trace
-            .steps
-            .iter()
-            .any(|step| step.operation.starts_with("log("))
-    );
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| step.operation.starts_with("detach(")));
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| step.operation.starts_with("log2(")));
+    assert!(!trace
+        .steps
+        .iter()
+        .any(|step| step.operation.starts_with("log(")));
     let output = CpuBackend
         .execute(
             &graph,
@@ -3048,15 +2956,13 @@ fn log_softmax_uses_detached_exp2_log2_composition_and_preflights() {
         let x = malformed.input("x", [1, 2]);
         let before_nodes = malformed.node_count();
         let mut malformed_values = BTreeMap::from([("x".into(), x)]);
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut malformed_values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut malformed_values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before_nodes);
         assert_eq!(malformed_values["x"], x);
         assert!(!malformed_values.contains_key("out"));
@@ -3066,15 +2972,13 @@ fn log_softmax_uses_detached_exp2_log2_composition_and_preflights() {
     let x = overflow.input("x", [usize::MAX, 2]);
     let before_nodes = overflow.node_count();
     let mut overflow_values = BTreeMap::from([("x".into(), x)]);
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&log_softmax(&[])),
-            &mut overflow_values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&log_softmax(&[])),
+        &mut overflow_values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before_nodes);
     assert_eq!(overflow_values["x"], x);
     assert!(!overflow_values.contains_key("out"));
@@ -3101,24 +3005,18 @@ fn softmax_uses_detached_exp2_reciprocal_composition_and_preflights() {
     )
     .unwrap();
     let trace = graph.trace(values["out"]).unwrap();
-    assert!(
-        trace
-            .steps
-            .iter()
-            .any(|step| step.operation.starts_with("detach("))
-    );
-    assert!(
-        trace
-            .steps
-            .iter()
-            .any(|step| step.operation.starts_with("exp2("))
-    );
-    assert!(
-        trace
-            .steps
-            .iter()
-            .any(|step| step.operation.starts_with("reciprocal("))
-    );
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| step.operation.starts_with("detach(")));
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| step.operation.starts_with("reciprocal(")));
     let output = CpuBackend
         .execute(
             &graph,
@@ -3202,15 +3100,13 @@ fn softmax_uses_detached_exp2_reciprocal_composition_and_preflights() {
         let x = malformed.input("x", [1, 2]);
         let before_nodes = malformed.node_count();
         let mut malformed_values = BTreeMap::from([("x".into(), x)]);
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut malformed_values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut malformed_values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before_nodes);
         assert_eq!(malformed_values["x"], x);
         assert!(!malformed_values.contains_key("out"));
@@ -3220,15 +3116,13 @@ fn softmax_uses_detached_exp2_reciprocal_composition_and_preflights() {
     let x = overflow.input("x", [usize::MAX, 2]);
     let before_nodes = overflow.node_count();
     let mut overflow_values = BTreeMap::from([("x".into(), x)]);
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&softmax(&[])),
-            &mut overflow_values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&softmax(&[])),
+        &mut overflow_values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before_nodes);
     assert_eq!(overflow_values["x"], x);
     assert!(!overflow_values.contains_key("out"));
@@ -3358,15 +3252,13 @@ fn gemm_preflights_optional_bias_before_constructing_transposes_or_matmul() {
     let before_nodes = g.node_count();
 
     for inputs in [["a", "b", "missing"], ["a", "b", "bad_c"]] {
-        assert!(
-            lower(
-                &mut g,
-                Msg::new(&node("Gemm", &inputs, "out")),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut g,
+            Msg::new(&node("Gemm", &inputs, "out")),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(g.node_count(), before_nodes);
@@ -3885,15 +3777,13 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -3906,15 +3796,13 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("GlobalMaxPool", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -3927,15 +3815,13 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before_values = values.clone();
     let before_nodes = byte_overflow.node_count();
-    assert!(
-        lower(
-            &mut byte_overflow,
-            Msg::new(&node("GlobalMaxPool", &["x"], "out")),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut byte_overflow,
+        Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(byte_overflow.node_count(), before_nodes);
 }
@@ -4000,15 +3886,13 @@ fn global_average_pool_uses_tinygrad_mean_accumulator_for_every_rank() {
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before_values = values.clone();
         let before_nodes = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(graph.node_count(), before_nodes);
     }
@@ -4018,15 +3902,13 @@ fn global_average_pool_uses_tinygrad_mean_accumulator_for_every_rank() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before_values = values.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("GlobalAveragePool", &["x"], "out")),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("GlobalAveragePool", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(overflow.node_count(), before_nodes);
 }
@@ -4215,15 +4097,13 @@ fn cumsum_matches_tinygrad_static_axis_flags_and_scheduled_pad_boundary() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&cumsum_node(&attrs)),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&cumsum_node(&attrs)),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(graph.node_count(), before_nodes);
@@ -4265,15 +4145,13 @@ fn cumsum_matches_tinygrad_static_axis_flags_and_scheduled_pad_boundary() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&cumsum_node(&[])),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&cumsum_node(&[])),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(graph.node_count(), before_nodes);
@@ -4313,15 +4191,13 @@ fn cumsum_matches_tinygrad_static_axis_flags_and_scheduled_pad_boundary() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&cumsum_node(&[])),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&cumsum_node(&[])),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -4333,7 +4209,7 @@ fn trilu_matches_tinygrad_masks_and_saturates_extreme_diagonals() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2, 3]);
     let upper = lower_trilu(&mut graph, x, None, &[]);
-    let lower = lower_trilu(
+    let lower_output = lower_trilu(
         &mut graph,
         x,
         Some(TensorData::from_scalars([], DType::I32, [Scalar::I(0)]).unwrap()),
@@ -4352,7 +4228,7 @@ fn trilu_matches_tinygrad_masks_and_saturates_extreme_diagonals() {
     );
     assert_eq!(
         CpuBackend
-            .execute(&graph, lower, &bindings)
+            .execute(&graph, lower_output, &bindings)
             .unwrap()
             .values(),
         &[1., 0., 0., 4., 5., 0.]
@@ -4498,15 +4374,13 @@ fn trilu_matches_tinygrad_masks_and_saturates_extreme_diagonals() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&trilu_node(Some("k"), &[])),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&trilu_node(Some("k"), &[])),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(graph.node_count(), before_nodes);
@@ -4537,15 +4411,13 @@ fn trilu_matches_tinygrad_masks_and_saturates_extreme_diagonals() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     let mut constants = BTreeMap::new();
     let before_nodes = rank.node_count();
-    assert!(
-        lower(
-            &mut rank,
-            Msg::new(&trilu_node(None, &[])),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut rank,
+        Msg::new(&trilu_node(None, &[])),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(rank.node_count(), before_nodes);
 
     let mut overflow = Graph::new();
@@ -4555,15 +4427,13 @@ fn trilu_matches_tinygrad_masks_and_saturates_extreme_diagonals() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&trilu_node(None, &[])),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&trilu_node(None, &[])),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -4613,16 +4483,12 @@ fn one_hot_matches_tinygrad_live_values_axis_and_negative_index_contract() {
     assert_eq!(output.dtype(), DType::F32);
     assert!(output.values()[2].is_nan()); // -1 adjusts once to class 2.
     assert!(output.values()[10].is_nan()); // class 1 of the final input.
-    assert!(
-        output.values()[3..6]
-            .iter()
-            .all(|value| value.to_bits() == (-0.0f32).to_bits())
-    );
-    assert!(
-        output.values()[6..9]
-            .iter()
-            .all(|value| value.to_bits() == (-0.0f32).to_bits())
-    );
+    assert!(output.values()[3..6]
+        .iter()
+        .all(|value| value.to_bits() == (-0.0f32).to_bits()));
+    assert!(output.values()[6..9]
+        .iter()
+        .all(|value| value.to_bits() == (-0.0f32).to_bits()));
 
     // Both permitted empty-depth source forms create a zero class axis.
     for depth in [-1, 0] {
@@ -4749,15 +4615,13 @@ fn one_hot_matches_tinygrad_live_values_axis_and_negative_index_contract() {
         let before_values = bindings.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut bindings,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut bindings,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(bindings, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -4881,15 +4745,13 @@ fn eye_like_matches_tinygrad_rank_two_padding_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -4899,15 +4761,13 @@ fn eye_like_matches_tinygrad_rank_two_padding_and_preflights() {
         let x = malformed.input("x", shape);
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&eye_like(&[])),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&eye_like(&[])),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(malformed.node_count(), before_nodes);
         assert_eq!(values["x"], x);
         assert!(!values.contains_key("out"));
@@ -4915,15 +4775,13 @@ fn eye_like_matches_tinygrad_rank_two_padding_and_preflights() {
     let mut missing = Graph::new();
     let mut values = BTreeMap::new();
     let before_nodes = missing.node_count();
-    assert!(
-        lower(
-            &mut missing,
-            Msg::new(&node("EyeLike", &["missing"], "out")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut missing,
+        Msg::new(&node("EyeLike", &["missing"], "out")),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(missing.node_count(), before_nodes);
 
     let mut overflow = Graph::new();
@@ -4931,15 +4789,13 @@ fn eye_like_matches_tinygrad_rank_two_padding_and_preflights() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before_values = values.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&eye_like(&[])),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&eye_like(&[])),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(overflow.node_count(), before_nodes);
 
@@ -4951,15 +4807,13 @@ fn eye_like_matches_tinygrad_rank_two_padding_and_preflights() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before_values = values.clone();
     let before_nodes = narrow_input_overflow.node_count();
-    assert!(
-        lower(
-            &mut narrow_input_overflow,
-            Msg::new(&eye_like(&[typed_int_attr("dtype", 9)])),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut narrow_input_overflow,
+        Msg::new(&eye_like(&[typed_int_attr("dtype", 9)])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(narrow_input_overflow.node_count(), before_nodes);
 }
@@ -5107,15 +4961,13 @@ fn space_to_depth_matches_tinygrad_hblock_wblock_channel_order_and_preflights() 
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -5132,15 +4984,13 @@ fn space_to_depth_matches_tinygrad_hblock_wblock_channel_order_and_preflights() 
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before_values = values.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
-                &mut values,
-                &mut BTreeMap::new(),
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(malformed.node_count(), before_nodes);
     }
@@ -5148,15 +4998,13 @@ fn space_to_depth_matches_tinygrad_hblock_wblock_channel_order_and_preflights() 
     let mut missing = Graph::new();
     let mut values = BTreeMap::new();
     let before_nodes = missing.node_count();
-    assert!(
-        lower(
-            &mut missing,
-            Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut missing,
+        Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(missing.node_count(), before_nodes);
 
     // Product and byte limits are both checked before the first reshape.
@@ -5169,15 +5017,13 @@ fn space_to_depth_matches_tinygrad_hblock_wblock_channel_order_and_preflights() 
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before_values = values.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
-                &mut values,
-                &mut BTreeMap::new(),
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(malformed.node_count(), before_nodes);
     }
@@ -5343,15 +5189,13 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -5370,15 +5214,13 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before_values = values.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&depth_to_space(&[block_two.clone()])),
-                &mut values,
-                &mut BTreeMap::new(),
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&depth_to_space(&[block_two.clone()])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(malformed.node_count(), before_nodes);
     }
@@ -5386,15 +5228,13 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
     let mut missing = Graph::new();
     let mut values = BTreeMap::new();
     let before_nodes = missing.node_count();
-    assert!(
-        lower(
-            &mut missing,
-            Msg::new(&depth_to_space(&[block_two.clone()])),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut missing,
+        Msg::new(&depth_to_space(&[block_two.clone()])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(missing.node_count(), before_nodes);
 
     for (shape, blocksize) in [
@@ -5407,15 +5247,13 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before_values = values.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&depth_to_space(&[typed_int_attr("blocksize", blocksize)])),
-                &mut values,
-                &mut BTreeMap::new(),
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&depth_to_space(&[typed_int_attr("blocksize", blocksize)])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(malformed.node_count(), before_nodes);
     }
@@ -5601,15 +5439,13 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -5627,15 +5463,13 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&center_crop_pad(&[typed_ints_attr("axes", &[1])])),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&center_crop_pad(&[typed_ints_attr("axes", &[1])])),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -5643,15 +5477,13 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
 
     let mut missing = Graph::new();
     let mut values = BTreeMap::new();
-    assert!(
-        lower(
-            &mut missing,
-            Msg::new(&center_crop_pad(&[])),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut missing,
+        Msg::new(&center_crop_pad(&[])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert!(!values.contains_key("out"));
 
     for (input_shape, target) in [
@@ -5665,15 +5497,13 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&center_crop_pad(&[])),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&center_crop_pad(&[])),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -5741,9 +5571,7 @@ fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(
         output.values(),
-        &[
-            0., 1., 0., 1., 0., 0., 1., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0.,
-        ]
+        &[0., 1., 0., 1., 0., 0., 1., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0.,]
     );
     // ArgReduce remains deliberately outside generic scheduling, so this
     // importer cannot create native/JIT work or a cache entry.
@@ -5828,15 +5656,13 @@ fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
         let before_values = bindings.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut bindings,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut bindings,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(bindings, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -5845,15 +5671,13 @@ fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
     let x = scalar.input("x", []);
     let mut bindings = BTreeMap::from([("x".into(), x)]);
     let before = scalar.node_count();
-    assert!(
-        lower(
-            &mut scalar,
-            Msg::new(&hardmax(&[])),
-            &mut bindings,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut scalar,
+        Msg::new(&hardmax(&[])),
+        &mut bindings,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(scalar.node_count(), before);
 
     // Input/output and all planned intermediate byte extents are checked
@@ -5862,15 +5686,13 @@ fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
     let x = overflow.input("x", [usize::MAX, 2]);
     let mut bindings = BTreeMap::from([("x".into(), x)]);
     let before = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&hardmax(&[])),
-            &mut bindings,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&hardmax(&[])),
+        &mut bindings,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(overflow.node_count(), before);
     assert_eq!(bindings["x"], x);
     assert!(!bindings.contains_key("out"));
@@ -6073,15 +5895,13 @@ fn argmax_matches_tinygrad_last_ties_nan_sentinels_and_preflight() {
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before_values = values.clone();
         let before_nodes = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(graph.node_count(), before_nodes);
     }
@@ -6090,15 +5910,13 @@ fn argmax_matches_tinygrad_last_ties_nan_sentinels_and_preflight() {
     let x = scalar.input("x", []);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before_nodes = scalar.node_count();
-    assert!(
-        lower(
-            &mut scalar,
-            Msg::new(&argmax(&[])),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut scalar,
+        Msg::new(&argmax(&[])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(scalar.node_count(), before_nodes);
     assert!(!values.contains_key("out"));
 }
@@ -6325,15 +6143,13 @@ fn argmin_matches_tinygrad_negated_argmax_and_preflight() {
         let mut values = BTreeMap::from([("x".into(), x)]);
         let before_values = values.clone();
         let before_nodes = graph.node_count();
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&invalid),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&invalid),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(graph.node_count(), before_nodes);
     }
@@ -6352,15 +6168,13 @@ fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
     let x = g.input("x", [1, 2]);
     let p = g.input("p", [1]);
     let mut values = BTreeMap::from([("x".into(), x), ("p".into(), p)]);
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&node("BatchNormalization", &["x", "p", "p", "p", "p"], "y")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut g,
+        Msg::new(&node("BatchNormalization", &["x", "p", "p", "p", "p"], "y")),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     lower(
         &mut g,
         Msg::new(&node("GlobalAveragePool", &["x"], "z")),
@@ -6426,15 +6240,13 @@ fn batch_norm_uses_typed_inference_attributes_and_source_ordering_plan() {
         let before_nodes = graph.node_count();
         let mut encoded = node("BatchNormalization", &["x", "p", "p", "p", "p"], "out");
         field(&mut encoded, 5, &attr);
-        assert!(
-            lower(
-                &mut graph,
-                Msg::new(&encoded),
-                &mut values,
-                &mut BTreeMap::new()
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut graph,
+            Msg::new(&encoded),
+            &mut values,
+            &mut BTreeMap::new()
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(graph.node_count(), before_nodes);
     }
@@ -6518,15 +6330,13 @@ fn average_pool_accepts_dilation_and_preflights_storage_order() {
     let mut malformed = node("AveragePool", &["x"], "out");
     field(&mut malformed, 5, &ints_attr("kernel_shape", &[2, 2]));
     field(&mut malformed, 5, &int_attr("storage_order", 1));
-    assert!(
-        lower(
-            &mut invalid,
-            Msg::new(&malformed),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut invalid,
+        Msg::new(&malformed),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(invalid.node_count(), before_nodes);
 }
@@ -6536,15 +6346,13 @@ fn pools_reject_missing_bad_and_indices_contracts() {
     let mut g = Graph::new();
     let x = g.input("x", [1, 1, 2, 2]);
     let mut values = BTreeMap::from([("x".into(), x)]);
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&node("MaxPool", &["x"], "a")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut g,
+        Msg::new(&node("MaxPool", &["x"], "a")),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     let mut bad = node("AveragePool", &["x"], "b");
     field(&mut bad, 5, &ints_attr("kernel_shape", &[2, 2]));
     field(&mut bad, 5, &int_attr("storage_order", 1));
@@ -6552,15 +6360,13 @@ fn pools_reject_missing_bad_and_indices_contracts() {
     let mut indexed = node("MaxPool", &["x"], "c");
     text(&mut indexed, 2, "indices");
     field(&mut indexed, 5, &ints_attr("kernel_shape", &[2, 2]));
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&indexed),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut g,
+        Msg::new(&indexed),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
 }
 
 #[test]
@@ -6574,15 +6380,13 @@ fn max_pool_rejects_average_only_padding_control_before_publication() {
     let mut invalid = node("MaxPool", &["x"], "out");
     field(&mut invalid, 5, &ints_attr("kernel_shape", &[2, 2]));
     field(&mut invalid, 5, &int_attr("count_include_pad", 1));
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&invalid),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut g,
+        Msg::new(&invalid),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(g.node_count(), before_nodes);
 
@@ -6710,15 +6514,13 @@ fn pow_restores_integer_base_dtype_before_publication() {
     let mut values = BTreeMap::from([("base".into(), base), ("exponent".into(), exponent)]);
     let before_values = values.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&node("Pow", &["base", "exponent"], "out")),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Pow", &["base", "exponent"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -6765,15 +6567,13 @@ fn div_rejects_fmod_attribute_before_publication() {
     let before_nodes = invalid.node_count();
     let mut node = node("Div", &["lhs", "rhs"], "out");
     field(&mut node, 5, &int_attr("fmod", 1));
-    assert!(
-        lower(
-            &mut invalid,
-            Msg::new(&node),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut invalid,
+        Msg::new(&node),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(invalid.node_count(), before_nodes);
 }
@@ -6852,15 +6652,13 @@ fn leaky_relu_keeps_fractional_alpha_for_integer_input() {
     let before_nodes = invalid.node_count();
     let mut malformed = node("LeakyRelu", &["x"], "out");
     field(&mut malformed, 5, &int_attr("alpha", 1));
-    assert!(
-        lower(
-            &mut invalid,
-            Msg::new(&malformed),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut invalid,
+        Msg::new(&malformed),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(invalid.node_count(), before_nodes);
 
@@ -6872,15 +6670,13 @@ fn leaky_relu_keeps_fractional_alpha_for_integer_input() {
     let mut malformed = node("LeakyRelu", &["x"], "out");
     field(&mut malformed, 5, &float_attr("alpha", 0.1));
     field(&mut malformed, 5, &float_attr("alpha", 0.2));
-    assert!(
-        lower(
-            &mut duplicate,
-            Msg::new(&malformed),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut duplicate,
+        Msg::new(&malformed),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(duplicate.node_count(), before_nodes);
 }
@@ -6920,15 +6716,13 @@ fn gather_normalizes_constant_negative_scalar_index_before_lowering() {
     let before_nodes = invalid.node_count();
     let mut malformed = node("Gather", &["x", "indices"], "out");
     field(&mut malformed, 5, &int_attr("axis", 1));
-    assert!(
-        lower(
-            &mut invalid,
-            Msg::new(&malformed),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut invalid,
+        Msg::new(&malformed),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(invalid.node_count(), before_nodes);
@@ -7061,12 +6855,10 @@ fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
             .count(),
         2
     );
-    assert!(
-        padded
-            .nodes
-            .iter()
-            .all(|node| !matches!(&node.op, crate::Op::Concat { .. }))
-    );
+    assert!(padded
+        .nodes
+        .iter()
+        .all(|node| !matches!(&node.op, crate::Op::Concat { .. })));
 
     let mut invalid = Graph::new();
     let lhs = invalid.input("lhs", [1, 2]);
@@ -7077,15 +6869,13 @@ fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
     let mut malformed = node("Concat", &["lhs", "rhs"], "out");
     field(&mut malformed, 5, &typed_int_attr("axis", 1));
     field(&mut malformed, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut invalid,
-            Msg::new(&malformed),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut invalid,
+        Msg::new(&malformed),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(invalid.node_count(), before_nodes);
 
@@ -7104,15 +6894,13 @@ fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
     let before_nodes = late.node_count();
     let mut malformed = node("Concat", &["first", "second", "wrong_rank"], "out");
     field(&mut malformed, 5, &typed_int_attr("axis", 0));
-    assert!(
-        lower(
-            &mut late,
-            Msg::new(&malformed),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut late,
+        Msg::new(&malformed),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(late.node_count(), before_nodes);
 
@@ -7124,15 +6912,13 @@ fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
     let before_nodes = overflow.node_count();
     let mut oversized = node("Concat", &["lhs", "rhs"], "out");
     field(&mut oversized, 5, &typed_int_attr("axis", 1));
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&oversized),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&oversized),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(overflow.node_count(), before_nodes);
 
@@ -7144,15 +6930,13 @@ fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
     let before_nodes = untyped.node_count();
     let mut malformed = node("Concat", &["lhs", "rhs"], "out");
     field(&mut malformed, 5, &int_attr("axis", 1));
-    assert!(
-        lower(
-            &mut untyped,
-            Msg::new(&malformed),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut untyped,
+        Msg::new(&malformed),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(untyped.node_count(), before_nodes);
 }
@@ -7231,15 +7015,13 @@ fn where_matches_tinygrad_branch_promotion_and_preflights() {
         for attr in attrs {
             field(&mut encoded, 5, &attr);
         }
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&encoded),
-                &mut values,
-                &mut BTreeMap::new(),
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&encoded),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(malformed.node_count(), before_nodes);
     }
@@ -7325,15 +7107,13 @@ fn equal_matches_tinygrad_common_dtype_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("Equal", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("axis", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -7426,15 +7206,13 @@ fn less_matches_tinygrad_common_dtype_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("Less", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -7519,15 +7297,13 @@ fn greater_matches_tinygrad_reversed_compare_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("Greater", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -7614,15 +7390,13 @@ fn less_or_equal_matches_tinygrad_not_greater_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("LessOrEqual", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -7707,15 +7481,13 @@ fn greater_or_equal_matches_tinygrad_not_less_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("GreaterOrEqual", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -7769,15 +7541,13 @@ fn add_matches_tinygrad_common_dtype_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("Add", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -7831,15 +7601,13 @@ fn sub_matches_tinygrad_common_dtype_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("Sub", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -7917,15 +7685,13 @@ fn mul_matches_tinygrad_common_dtype_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("Mul", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -8031,15 +7797,13 @@ fn div_matches_tinygrad_paths_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("Div", &["lhs", "rhs"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -8099,15 +7863,13 @@ fn pow_matches_tinygrad_base_dtype_policy_and_preflights() {
     let before_nodes = malformed.node_count();
     let mut encoded = node("Pow", &["base", "exponent"], "out");
     field(&mut encoded, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&encoded),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(malformed.node_count(), before_nodes);
 }
@@ -8152,15 +7914,13 @@ fn matmul_rejects_attributes_before_publication() {
     let before_nodes = invalid.node_count();
     let mut malformed = node("MatMul", &["lhs", "rhs"], "out");
     field(&mut malformed, 5, &int_attr("unexpected", 0));
-    assert!(
-        lower(
-            &mut invalid,
-            Msg::new(&malformed),
-            &mut values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut invalid,
+        Msg::new(&malformed),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(invalid.node_count(), before_nodes);
 }
@@ -8171,15 +7931,13 @@ fn static_phase_four_rejects_dynamic_dropout_training() {
     let x = g.input("x", [1]);
     let b = g.input("b", []);
     let mut values = BTreeMap::from([("x".into(), x), ("b".into(), b)]);
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&node("Dropout", &["x", "b"], "d")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut g,
+        Msg::new(&node("Dropout", &["x", "b"], "d")),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
 }
 
 #[test]
@@ -8335,7 +8093,7 @@ fn clip_matches_tinygrad_live_ordered_clamp_and_preflights_before_publication() 
         &mut constants,
     )
     .unwrap();
-    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert!(scalar.shape(values["out"]).unwrap().dims().is_empty());
     assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::F64);
 
     let mut empty = Graph::new();
@@ -8364,15 +8122,13 @@ fn clip_matches_tinygrad_live_ordered_clamp_and_preflights_before_publication() 
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -8387,15 +8143,13 @@ fn clip_matches_tinygrad_live_ordered_clamp_and_preflights_before_publication() 
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = incompatible.node_count();
-    assert!(
-        lower(
-            &mut incompatible,
-            Msg::new(&node("Clip", &["x", "min", "max"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut incompatible,
+        Msg::new(&node("Clip", &["x", "min", "max"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(incompatible.node_count(), before_nodes);
@@ -8408,15 +8162,13 @@ fn clip_matches_tinygrad_live_ordered_clamp_and_preflights_before_publication() 
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Clip", &["x", "min"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Clip", &["x", "min"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -8443,15 +8195,13 @@ fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
     let mut constant_graph = Graph::new();
     let mut constant_values = BTreeMap::new();
     let mut constants = BTreeMap::new();
-    assert!(
-        lower(
-            &mut constant_graph,
-            Msg::new(&invalid_constant),
-            &mut constant_values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut constant_graph,
+        Msg::new(&invalid_constant),
+        &mut constant_values,
+        &mut constants,
+    )
+    .is_err());
     assert!(constant_values.is_empty());
     assert!(constants.is_empty());
     assert_eq!(constant_graph.node_count(), 0);
@@ -8465,15 +8215,13 @@ fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
     let mut cast_values = BTreeMap::from([("x".into(), x)]);
     let before_values = cast_values.clone();
     let before_nodes = cast_graph.node_count();
-    assert!(
-        lower(
-            &mut cast_graph,
-            Msg::new(&invalid_cast),
-            &mut cast_values,
-            &mut BTreeMap::new(),
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut cast_graph,
+        Msg::new(&invalid_cast),
+        &mut cast_values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
     assert_eq!(cast_values, before_values);
     assert_eq!(cast_graph.node_count(), before_nodes);
 
@@ -8613,15 +8361,13 @@ fn cast_uses_strict_typed_to_and_preserves_same_dtype_identity() {
         for attr in attrs {
             field(&mut encoded, 5, &attr);
         }
-        assert!(
-            lower(
-                &mut invalid,
-                Msg::new(&encoded),
-                &mut values,
-                &mut BTreeMap::new(),
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut invalid,
+            Msg::new(&encoded),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(invalid.node_count(), before_nodes);
     }
@@ -8633,15 +8379,13 @@ fn reductions_and_arg_reject_dynamic_and_malformed_controls() {
     let x = g.input("x", [2, 2]);
     let axes = g.input_dtype("axes", [1], DType::I64);
     let mut values = BTreeMap::from([("x".into(), x), ("axes".into(), axes)]);
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&node("ReduceSum", &["x", "axes"], "s")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut g,
+        Msg::new(&node("ReduceSum", &["x", "axes"], "s")),
+        &mut values,
+        &mut BTreeMap::new()
+    )
+    .is_err());
     let mut arg = node("ArgMax", &["x"], "a");
     field(&mut arg, 5, &int_attr("select_last_index", 1));
     assert!(lower(&mut g, Msg::new(&arg), &mut values, &mut BTreeMap::new()).is_err());
@@ -8794,7 +8538,7 @@ fn reduce_sum_square_matches_tinygrad_typed_sum_and_preflights() {
             )]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[]);
+    assert!(output.shape().dims().is_empty());
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values(), &[30.]);
 
@@ -9036,15 +8780,13 @@ fn reduce_sum_square_matches_tinygrad_typed_sum_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -9057,15 +8799,13 @@ fn reduce_sum_square_matches_tinygrad_typed_sum_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceSumSquare", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceSumSquare", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -9096,7 +8836,7 @@ fn reduce_l1_matches_tinygrad_abs_then_typed_sum_and_preflights() {
             )]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[]);
+    assert!(output.shape().dims().is_empty());
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values(), &[10.]);
 
@@ -9348,15 +9088,13 @@ fn reduce_l1_matches_tinygrad_abs_then_typed_sum_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -9369,15 +9107,13 @@ fn reduce_l1_matches_tinygrad_abs_then_typed_sum_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceL1", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceL1", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -9448,7 +9184,7 @@ fn abs_matches_tinygrad_sign_times_input_and_preflights_before_publication() {
             &mut constants,
         )
         .unwrap();
-        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert!(typed.shape(values["out"]).unwrap().dims().is_empty());
         assert_eq!(typed.dtype(values["out"]).unwrap(), dtype);
     }
 
@@ -9501,7 +9237,7 @@ fn abs_matches_tinygrad_sign_times_input_and_preflights_before_publication() {
     .unwrap();
     let local = gradient.grad(values["out"], x).unwrap();
     assert_eq!(gradient.dtype(local).unwrap(), DType::F32);
-    assert_eq!(gradient.shape(local).unwrap().dims(), &[]);
+    assert!(gradient.shape(local).unwrap().dims().is_empty());
 
     for invalid in [node("Abs", &[], "out"), {
         let mut encoded = node("Abs", &["x"], "out");
@@ -9515,15 +9251,13 @@ fn abs_matches_tinygrad_sign_times_input_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -9536,15 +9270,13 @@ fn abs_matches_tinygrad_sign_times_input_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Abs", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Abs", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -9673,7 +9405,7 @@ fn neg_matches_tinygrad_unary_contract_and_preflights_before_publication() {
             &mut constants,
         )
         .unwrap();
-        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert!(typed.shape(values["out"]).unwrap().dims().is_empty());
         assert_eq!(typed.dtype(values["out"]).unwrap(), dtype);
     }
 
@@ -9716,15 +9448,13 @@ fn neg_matches_tinygrad_unary_contract_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -9737,15 +9467,13 @@ fn neg_matches_tinygrad_unary_contract_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Neg", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Neg", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -9880,7 +9608,7 @@ fn relu_matches_tinygrad_strict_select_contract_and_preflights_before_publicatio
             &mut constants,
         )
         .unwrap();
-        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert!(typed.shape(values["out"]).unwrap().dims().is_empty());
         assert_eq!(typed.dtype(values["out"]).unwrap(), dtype);
     }
 
@@ -9923,15 +9651,13 @@ fn relu_matches_tinygrad_strict_select_contract_and_preflights_before_publicatio
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -9944,15 +9670,13 @@ fn relu_matches_tinygrad_strict_select_contract_and_preflights_before_publicatio
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Relu", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Relu", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -10035,7 +9759,7 @@ fn sigmoid_uses_tinygrad_typed_exp2_reciprocal_path_and_preflights() {
             &mut constants,
         )
         .unwrap();
-        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert!(typed.shape(values["out"]).unwrap().dims().is_empty());
         assert_eq!(typed.dtype(values["out"]).unwrap(), output_dtype);
     }
 
@@ -10086,15 +9810,13 @@ fn sigmoid_uses_tinygrad_typed_exp2_reciprocal_path_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -10107,15 +9829,13 @@ fn sigmoid_uses_tinygrad_typed_exp2_reciprocal_path_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Sigmoid", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Sigmoid", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -10198,7 +9918,7 @@ fn tanh_uses_tinygrad_typed_sigmoid_composition_and_preflights() {
             &mut constants,
         )
         .unwrap();
-        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert!(typed.shape(values["out"]).unwrap().dims().is_empty());
         assert_eq!(typed.dtype(values["out"]).unwrap(), output_dtype);
     }
 
@@ -10249,15 +9969,13 @@ fn tanh_uses_tinygrad_typed_sigmoid_composition_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -10270,15 +9988,13 @@ fn tanh_uses_tinygrad_typed_sigmoid_composition_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Tanh", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Tanh", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -10459,15 +10175,13 @@ fn reduce_mean_matches_tinygrad_typed_sum_true_division_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -10480,15 +10194,13 @@ fn reduce_mean_matches_tinygrad_typed_sum_true_division_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceMean", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceMean", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -10554,7 +10266,7 @@ fn reduce_sum_matches_tinygrad_typed_accumulation_and_preflights() {
         &mut constants,
     )
     .unwrap();
-    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert!(scalar.shape(values["out"]).unwrap().dims().is_empty());
     assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::I32);
 
     for (input_dtype, output_dtype) in [
@@ -10694,15 +10406,13 @@ fn reduce_sum_matches_tinygrad_typed_accumulation_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -10715,15 +10425,13 @@ fn reduce_sum_matches_tinygrad_typed_accumulation_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceSum", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceSum", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -10791,7 +10499,7 @@ fn reduce_prod_matches_tinygrad_source_dtype_identity_and_preflights() {
             &mut constants,
         )
         .unwrap();
-        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert!(typed.shape(values["out"]).unwrap().dims().is_empty());
         assert_eq!(typed.dtype(values["out"]).unwrap(), dtype);
     }
 
@@ -10889,15 +10597,13 @@ fn reduce_prod_matches_tinygrad_source_dtype_identity_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -10910,15 +10616,13 @@ fn reduce_prod_matches_tinygrad_source_dtype_identity_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceProd", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceProd", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -11043,7 +10747,7 @@ fn reduce_min_matches_tinygrad_empty_identity_and_preflights() {
         &mut constants,
     )
     .unwrap();
-    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert!(scalar.shape(values["out"]).unwrap().dims().is_empty());
     assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::F64);
 
     let mut gradient = Graph::new();
@@ -11076,15 +10780,13 @@ fn reduce_min_matches_tinygrad_empty_identity_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -11097,15 +10799,13 @@ fn reduce_min_matches_tinygrad_empty_identity_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceMin", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceMin", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -11230,7 +10930,7 @@ fn reduce_max_matches_tinygrad_empty_identity_and_preflights() {
         &mut constants,
     )
     .unwrap();
-    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert!(scalar.shape(values["out"]).unwrap().dims().is_empty());
     assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::F64);
 
     let mut gradient = Graph::new();
@@ -11263,15 +10963,13 @@ fn reduce_max_matches_tinygrad_empty_identity_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -11284,15 +10982,13 @@ fn reduce_max_matches_tinygrad_empty_identity_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceMax", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceMax", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -11318,7 +11014,7 @@ fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2], vec![3., 4.]).unwrap())]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[]);
+    assert!(output.shape().dims().is_empty());
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values(), &[5.]);
 
@@ -11551,15 +11247,13 @@ fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -11572,15 +11266,13 @@ fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceL2", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceL2", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -11609,7 +11301,7 @@ fn reduce_log_sum_matches_tinygrad_typed_sum_log2_ln2_and_preflights() {
             &HashMap::from([("x".into(), TensorData::new([2], vec![1., 3.]).unwrap())]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[]);
+    assert!(output.shape().dims().is_empty());
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values(), &[4.0f32.log2() * std::f32::consts::LN_2]);
 
@@ -11819,15 +11511,13 @@ fn reduce_log_sum_matches_tinygrad_typed_sum_log2_ln2_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -11840,15 +11530,13 @@ fn reduce_log_sum_matches_tinygrad_typed_sum_log2_ln2_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceLogSum", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceLogSum", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -11879,7 +11567,7 @@ fn reduce_log_sum_exp_matches_tinygrad_direct_exp_sum_log_and_preflights() {
             )]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[]);
+    assert!(output.shape().dims().is_empty());
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(
         output.values(),
@@ -11966,7 +11654,7 @@ fn reduce_log_sum_exp_matches_tinygrad_direct_exp_sum_log_and_preflights() {
             &HashMap::from([("x".into(), TensorData::scalar(1000.))]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[]);
+    assert!(output.shape().dims().is_empty());
     assert_eq!(output.values(), &[f32::INFINITY]);
 
     // Exp sets the calculation width: narrow floats return their post-exp
@@ -12118,15 +11806,13 @@ fn reduce_log_sum_exp_matches_tinygrad_direct_exp_sum_log_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -12139,15 +11825,13 @@ fn reduce_log_sum_exp_matches_tinygrad_direct_exp_sum_log_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ReduceLogSumExp", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceLogSumExp", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -12400,15 +12084,13 @@ fn pad_supports_signed_constant_crop_and_preflights_pads_rank() {
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
     let invalid = node("Pad", &["x", "pads"], "out");
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -12448,15 +12130,13 @@ fn expand_aligns_leading_rank_and_preflights_shape_rank() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&node("Expand", &["x", "shape"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Expand", &["x", "shape"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -12516,15 +12196,13 @@ fn tile_preserves_repeat_order_and_preflights_repeats_rank() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&node("Tile", &["x", "repeats"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Tile", &["x", "repeats"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -12565,15 +12243,13 @@ fn constant_of_shape_preflights_shape_and_fill_broadcast_before_publication() {
         5,
         &tensor_attr("value", &typed_i64_tensor(&[1, 1], &[9])),
     );
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&invalid),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -12603,15 +12279,13 @@ fn shape_clamps_signed_endpoints_and_preflights_i64_dimensions() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&node("Shape", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Shape", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -12629,15 +12303,13 @@ fn shape_clamps_signed_endpoints_and_preflights_i64_dimensions() {
         let before_nodes = malformed.node_count();
         let mut invalid = node("Shape", &["x"], "out");
         field(&mut invalid, 5, &endpoint);
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -12661,7 +12333,7 @@ fn size_is_static_i64_and_preflights_before_publication() {
         let output = CpuBackend
             .execute(&g, values["out"], &HashMap::new())
             .unwrap();
-        assert_eq!(output.shape().dims(), &[]);
+        assert!(output.shape().dims().is_empty());
         assert_eq!(output.dtype(), DType::I64);
         assert_eq!(output.scalar_at(0).as_i64(), expected);
     }
@@ -12689,15 +12361,13 @@ fn size_is_static_i64_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Size", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Size", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -12713,15 +12383,13 @@ fn size_is_static_i64_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = byte_overflow.node_count();
-    assert!(
-        lower(
-            &mut byte_overflow,
-            Msg::new(&node("Size", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut byte_overflow,
+        Msg::new(&node("Size", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(byte_overflow.node_count(), before_nodes);
@@ -12777,15 +12445,13 @@ fn not_matches_tinygrad_bool_cast_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -12798,15 +12464,13 @@ fn not_matches_tinygrad_bool_cast_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Not", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Not", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -12864,15 +12528,13 @@ fn isinf_matches_tinygrad_sign_selection_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -12885,15 +12547,13 @@ fn isinf_matches_tinygrad_sign_selection_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("IsInf", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("IsInf", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -12960,15 +12620,13 @@ fn isnan_matches_tinygrad_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -12981,15 +12639,13 @@ fn isnan_matches_tinygrad_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("IsNaN", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("IsNaN", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -13029,15 +12685,13 @@ fn reciprocal_matches_tinygrad_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -13050,15 +12704,13 @@ fn reciprocal_matches_tinygrad_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Reciprocal", &["x"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Reciprocal", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -13106,15 +12758,13 @@ fn xor_matches_tinygrad_bool_cast_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -13128,15 +12778,13 @@ fn xor_matches_tinygrad_bool_cast_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = mismatch.node_count();
-    assert!(
-        lower(
-            &mut mismatch,
-            Msg::new(&node("Xor", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Xor", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(mismatch.node_count(), before_nodes);
@@ -13149,15 +12797,13 @@ fn xor_matches_tinygrad_bool_cast_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Xor", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Xor", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -13172,15 +12818,13 @@ fn xor_matches_tinygrad_bool_cast_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = late_overflow.node_count();
-    assert!(
-        lower(
-            &mut late_overflow,
-            Msg::new(&node("Xor", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut late_overflow,
+        Msg::new(&node("Xor", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(late_overflow.node_count(), before_nodes);
@@ -13262,15 +12906,13 @@ fn bitwise_and_matches_tinygrad_integer_broadcasting_and_preflights_before_publi
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = invalid.node_count();
-        assert!(
-            lower(
-                &mut invalid,
-                Msg::new(&node("BitwiseAnd", &["lhs", "rhs"], "out")),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut invalid,
+            Msg::new(&node("BitwiseAnd", &["lhs", "rhs"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(invalid.node_count(), before_nodes);
@@ -13286,15 +12928,13 @@ fn bitwise_and_matches_tinygrad_integer_broadcasting_and_preflights_before_publi
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("BitwiseAnd", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("BitwiseAnd", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -13309,15 +12949,13 @@ fn bitwise_and_matches_tinygrad_integer_broadcasting_and_preflights_before_publi
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&attributed),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&attributed),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -13412,7 +13050,7 @@ fn bitwise_or_matches_tinygrad_integer_broadcasting_and_preflights_before_public
         &mut BTreeMap::new(),
     )
     .unwrap();
-    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert!(scalar.shape(values["out"]).unwrap().dims().is_empty());
     assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::I32);
 
     // A float source and the source LUB's I64/U64 -> F32 bridge are not valid
@@ -13426,15 +13064,13 @@ fn bitwise_or_matches_tinygrad_integer_broadcasting_and_preflights_before_public
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = invalid.node_count();
-        assert!(
-            lower(
-                &mut invalid,
-                Msg::new(&node("BitwiseOr", &["lhs", "rhs"], "out")),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut invalid,
+            Msg::new(&node("BitwiseOr", &["lhs", "rhs"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(invalid.node_count(), before_nodes);
@@ -13448,15 +13084,13 @@ fn bitwise_or_matches_tinygrad_integer_broadcasting_and_preflights_before_public
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("BitwiseOr", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("BitwiseOr", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -13471,15 +13105,13 @@ fn bitwise_or_matches_tinygrad_integer_broadcasting_and_preflights_before_public
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&attributed),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&attributed),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -13574,7 +13206,7 @@ fn bitwise_xor_matches_tinygrad_integer_broadcasting_and_preflights_before_publi
         &mut BTreeMap::new(),
     )
     .unwrap();
-    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert!(scalar.shape(values["out"]).unwrap().dims().is_empty());
     assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::I32);
 
     for (lhs_dtype, rhs_dtype) in [(DType::F32, DType::I32), (DType::I64, DType::U64)] {
@@ -13586,15 +13218,13 @@ fn bitwise_xor_matches_tinygrad_integer_broadcasting_and_preflights_before_publi
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = invalid.node_count();
-        assert!(
-            lower(
-                &mut invalid,
-                Msg::new(&node("BitwiseXor", &["lhs", "rhs"], "out")),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut invalid,
+            Msg::new(&node("BitwiseXor", &["lhs", "rhs"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(invalid.node_count(), before_nodes);
@@ -13608,15 +13238,13 @@ fn bitwise_xor_matches_tinygrad_integer_broadcasting_and_preflights_before_publi
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("BitwiseXor", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("BitwiseXor", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -13631,15 +13259,13 @@ fn bitwise_xor_matches_tinygrad_integer_broadcasting_and_preflights_before_publi
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&attributed),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&attributed),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -13695,11 +13321,11 @@ fn bitwise_not_matches_tinygrad_typed_masks_and_preflights_before_publication() 
                 panic!("integer BitwiseNot mask must be a scalar constant");
             };
             assert_eq!(mask.dtype(), dtype);
-            assert_eq!(mask.shape().dims(), &[]);
+            assert!(mask.shape().dims().is_empty());
             match dtype {
-                DType::U8 => assert_eq!(mask.scalar_at(0).as_u64(), u8::MAX.into()),
-                DType::U16 => assert_eq!(mask.scalar_at(0).as_u64(), u16::MAX.into()),
-                DType::U32 => assert_eq!(mask.scalar_at(0).as_u64(), u32::MAX.into()),
+                DType::U8 => assert_eq!(mask.scalar_at(0).as_u64(), u64::from(u8::MAX)),
+                DType::U16 => assert_eq!(mask.scalar_at(0).as_u64(), u64::from(u16::MAX)),
+                DType::U32 => assert_eq!(mask.scalar_at(0).as_u64(), u64::from(u32::MAX)),
                 DType::U64 => assert_eq!(mask.scalar_at(0).as_u64(), u64::MAX),
                 _ => assert_eq!(mask.scalar_at(0).as_i64(), -1),
             }
@@ -13727,7 +13353,7 @@ fn bitwise_not_matches_tinygrad_typed_masks_and_preflights_before_publication() 
             )]),
         )
         .unwrap();
-    assert_eq!(output.scalar_at(0).as_u64(), u8::MAX.into());
+    assert_eq!(output.scalar_at(0).as_u64(), u64::from(u8::MAX));
     assert_eq!(output.scalar_at(1).as_u64(), 0);
 
     let mut scalar = Graph::new();
@@ -13740,7 +13366,7 @@ fn bitwise_not_matches_tinygrad_typed_masks_and_preflights_before_publication() 
         &mut BTreeMap::new(),
     )
     .unwrap();
-    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert!(scalar.shape(values["out"]).unwrap().dims().is_empty());
     assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::I32);
 
     let mut empty = Graph::new();
@@ -13764,15 +13390,13 @@ fn bitwise_not_matches_tinygrad_typed_masks_and_preflights_before_publication() 
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = invalid.node_count();
-        assert!(
-            lower(
-                &mut invalid,
-                Msg::new(&node("BitwiseNot", &["input"], "out")),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut invalid,
+            Msg::new(&node("BitwiseNot", &["input"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(invalid.node_count(), before_nodes);
@@ -13785,15 +13409,13 @@ fn bitwise_not_matches_tinygrad_typed_masks_and_preflights_before_publication() 
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("BitwiseNot", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("BitwiseNot", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -13807,15 +13429,13 @@ fn bitwise_not_matches_tinygrad_typed_masks_and_preflights_before_publication() 
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&attributed),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&attributed),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -13902,15 +13522,13 @@ fn and_matches_tinygrad_value_select_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -13924,15 +13542,13 @@ fn and_matches_tinygrad_value_select_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = mismatch.node_count();
-    assert!(
-        lower(
-            &mut mismatch,
-            Msg::new(&node("And", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("And", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(mismatch.node_count(), before_nodes);
@@ -13945,15 +13561,13 @@ fn and_matches_tinygrad_value_select_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("And", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("And", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -14040,15 +13654,13 @@ fn or_matches_tinygrad_value_select_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -14062,15 +13674,13 @@ fn or_matches_tinygrad_value_select_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = mismatch.node_count();
-    assert!(
-        lower(
-            &mut mismatch,
-            Msg::new(&node("Or", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Or", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(mismatch.node_count(), before_nodes);
@@ -14083,15 +13693,13 @@ fn or_matches_tinygrad_value_select_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Or", &["lhs", "rhs"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Or", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -14127,15 +13735,13 @@ fn identity_aliases_its_input_without_graph_growth_and_rejects_attributes() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -14211,15 +13817,13 @@ fn cast_like_uses_only_static_target_dtype_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -14233,15 +13837,13 @@ fn cast_like_uses_only_static_target_dtype_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("CastLike", &["input", "target"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("CastLike", &["input", "target"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -14260,15 +13862,13 @@ fn cast_like_uses_only_static_target_dtype_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = result_overflow.node_count();
-    assert!(
-        lower(
-            &mut result_overflow,
-            Msg::new(&node("CastLike", &["input", "target"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut result_overflow,
+        Msg::new(&node("CastLike", &["input", "target"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(result_overflow.node_count(), before_nodes);
@@ -14357,15 +13957,13 @@ fn variadic_sum_matches_tinygrad_left_fold_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -14379,15 +13977,13 @@ fn variadic_sum_matches_tinygrad_left_fold_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = mismatch.node_count();
-    assert!(
-        lower(
-            &mut mismatch,
-            Msg::new(&node("Sum", &["first", "second"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Sum", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(mismatch.node_count(), before_nodes);
@@ -14400,15 +13996,13 @@ fn variadic_sum_matches_tinygrad_left_fold_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Sum", &["first", "second"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Sum", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -14432,15 +14026,13 @@ fn variadic_sum_matches_tinygrad_left_fold_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = late_overflow.node_count();
-    assert!(
-        lower(
-            &mut late_overflow,
-            Msg::new(&node("Sum", &["first", "second", "third"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut late_overflow,
+        Msg::new(&node("Sum", &["first", "second", "third"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(late_overflow.node_count(), before_nodes);
@@ -14613,15 +14205,13 @@ fn variadic_max_matches_tinygrad_ordered_fold_and_preflights_before_publication(
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -14635,15 +14225,13 @@ fn variadic_max_matches_tinygrad_ordered_fold_and_preflights_before_publication(
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = mismatch.node_count();
-    assert!(
-        lower(
-            &mut mismatch,
-            Msg::new(&node("Max", &["first", "second"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Max", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(mismatch.node_count(), before_nodes);
@@ -14656,15 +14244,13 @@ fn variadic_max_matches_tinygrad_ordered_fold_and_preflights_before_publication(
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Max", &["first", "second"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Max", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -14868,15 +14454,13 @@ fn variadic_min_matches_tinygrad_ordered_fold_and_preflights_before_publication(
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -14890,15 +14474,13 @@ fn variadic_min_matches_tinygrad_ordered_fold_and_preflights_before_publication(
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = mismatch.node_count();
-    assert!(
-        lower(
-            &mut mismatch,
-            Msg::new(&node("Min", &["first", "second"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Min", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(mismatch.node_count(), before_nodes);
@@ -14911,15 +14493,13 @@ fn variadic_min_matches_tinygrad_ordered_fold_and_preflights_before_publication(
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Min", &["first", "second"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Min", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15016,15 +14596,13 @@ fn variadic_mean_matches_tinygrad_sum_then_true_division_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15038,15 +14616,13 @@ fn variadic_mean_matches_tinygrad_sum_then_true_division_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = mismatch.node_count();
-    assert!(
-        lower(
-            &mut mismatch,
-            Msg::new(&node("Mean", &["first", "second"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Mean", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(mismatch.node_count(), before_nodes);
@@ -15059,15 +14635,13 @@ fn variadic_mean_matches_tinygrad_sum_then_true_division_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Mean", &["first", "second"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Mean", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15091,15 +14665,13 @@ fn variadic_mean_matches_tinygrad_sum_then_true_division_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = late_overflow.node_count();
-    assert!(
-        lower(
-            &mut late_overflow,
-            Msg::new(&node("Mean", &["first", "second", "third"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut late_overflow,
+        Msg::new(&node("Mean", &["first", "second", "third"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(late_overflow.node_count(), before_nodes);
@@ -15167,15 +14739,13 @@ fn exp_preserves_graph_unary_semantics_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15188,15 +14758,13 @@ fn exp_preserves_graph_unary_semantics_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Exp", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Exp", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15268,15 +14836,13 @@ fn floor_preserves_graph_unary_semantics_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15289,15 +14855,13 @@ fn floor_preserves_graph_unary_semantics_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Floor", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Floor", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15369,15 +14933,13 @@ fn ceil_preserves_graph_unary_semantics_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15390,15 +14952,13 @@ fn ceil_preserves_graph_unary_semantics_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Ceil", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Ceil", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15491,15 +15051,13 @@ fn sign_matches_tinygrad_special_values_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15512,15 +15070,13 @@ fn sign_matches_tinygrad_special_values_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Sign", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Sign", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15613,15 +15169,13 @@ fn round_matches_ties_to_even_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15634,15 +15188,13 @@ fn round_matches_ties_to_even_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Round", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Round", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15730,15 +15282,13 @@ fn erf_preserves_graph_special_values_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15751,15 +15301,13 @@ fn erf_preserves_graph_special_values_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Erf", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Erf", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15845,15 +15393,13 @@ fn sinh_preserves_graph_special_values_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15866,15 +15412,13 @@ fn sinh_preserves_graph_special_values_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Sinh", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Sinh", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -15960,15 +15504,13 @@ fn cosh_preserves_graph_special_values_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -15981,15 +15523,13 @@ fn cosh_preserves_graph_special_values_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Cosh", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Cosh", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16075,15 +15615,13 @@ fn asinh_preserves_graph_special_values_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16096,15 +15634,13 @@ fn asinh_preserves_graph_special_values_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Asinh", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Asinh", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16179,15 +15715,13 @@ fn acosh_preserves_graph_domain_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16200,15 +15734,13 @@ fn acosh_preserves_graph_domain_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Acosh", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Acosh", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16282,15 +15814,13 @@ fn atanh_preserves_graph_domain_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16303,15 +15833,13 @@ fn atanh_preserves_graph_domain_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Atanh", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Atanh", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16379,15 +15907,13 @@ fn log_preserves_graph_unary_semantics_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16400,15 +15926,13 @@ fn log_preserves_graph_unary_semantics_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Log", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Log", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16478,15 +16002,13 @@ fn sqrt_preserves_graph_unary_semantics_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16499,15 +16021,13 @@ fn sqrt_preserves_graph_unary_semantics_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Sqrt", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Sqrt", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16585,15 +16105,13 @@ fn sin_matches_tinygrad_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16606,15 +16124,13 @@ fn sin_matches_tinygrad_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Sin", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Sin", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16692,15 +16208,13 @@ fn cos_matches_tinygrad_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16713,15 +16227,13 @@ fn cos_matches_tinygrad_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Cos", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Cos", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16789,15 +16301,13 @@ fn tan_matches_tinygrad_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16810,15 +16320,13 @@ fn tan_matches_tinygrad_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Tan", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Tan", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16887,15 +16395,13 @@ fn asin_matches_tinygrad_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -16908,15 +16414,13 @@ fn asin_matches_tinygrad_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Asin", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Asin", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -16984,15 +16488,13 @@ fn acos_matches_tinygrad_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -17005,15 +16507,13 @@ fn acos_matches_tinygrad_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Acos", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Acos", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -17108,7 +16608,7 @@ fn hard_sigmoid_uses_typed_float_attributes_and_strict_select_clamping() {
                 &HashMap::from([("input".into(), data)]),
             )
             .unwrap();
-        assert_eq!(output.shape().dims(), &[]);
+        assert!(output.shape().dims().is_empty());
         assert_eq!(
             output.dtype(),
             if dtype.is_float() { dtype } else { DType::F32 }
@@ -17232,15 +16732,13 @@ fn hard_sigmoid_uses_typed_float_attributes_and_strict_select_clamping() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -17253,15 +16751,13 @@ fn hard_sigmoid_uses_typed_float_attributes_and_strict_select_clamping() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("HardSigmoid", &["input"], "out")),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("HardSigmoid", &["input"], "out")),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -17330,7 +16826,7 @@ fn hard_swish_matches_tinygrad_literal_hardswish_and_preflights() {
         )
         .unwrap();
         assert_eq!(graph.dtype(values["out"]).unwrap(), expected);
-        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[]);
+        assert!(graph.shape(values["out"]).unwrap().dims().is_empty());
     }
 
     let mut attribute = node("HardSwish", &["input"], "out");
@@ -17343,15 +16839,13 @@ fn hard_swish_matches_tinygrad_literal_hardswish_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -17364,15 +16858,13 @@ fn hard_swish_matches_tinygrad_literal_hardswish_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("HardSwish", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("HardSwish", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -17434,7 +16926,7 @@ fn mish_matches_tinygrad_literal_softplus_tanh_and_preflights() {
         )
         .unwrap();
         assert_eq!(graph.dtype(values["out"]).unwrap(), expected);
-        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[]);
+        assert!(graph.shape(values["out"]).unwrap().dims().is_empty());
     }
 
     let mut attribute = node("Mish", &["input"], "out");
@@ -17447,15 +16939,13 @@ fn mish_matches_tinygrad_literal_softplus_tanh_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -17468,15 +16958,13 @@ fn mish_matches_tinygrad_literal_softplus_tanh_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Mish", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Mish", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -17632,7 +17120,7 @@ fn shrink_activation_preserves_tinygrad_mask_products_and_preflights() {
                 &HashMap::from([("input".into(), data)]),
             )
             .unwrap();
-        assert_eq!(output.shape().dims(), &[]);
+        assert!(output.shape().dims().is_empty());
         assert_eq!(output.dtype(), expected_dtype);
     }
 
@@ -17691,15 +17179,13 @@ fn shrink_activation_preserves_tinygrad_mask_products_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -17709,15 +17195,13 @@ fn shrink_activation_preserves_tinygrad_mask_products_and_preflights() {
     let mut values = BTreeMap::new();
     let mut constants = BTreeMap::new();
     let before_nodes = missing.node_count();
-    assert!(
-        lower(
-            &mut missing,
-            Msg::new(&node("Shrink", &["missing"], "out")),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut missing,
+        Msg::new(&node("Shrink", &["missing"], "out")),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert!(values.is_empty());
     assert!(constants.is_empty());
     assert_eq!(missing.node_count(), before_nodes);
@@ -17729,15 +17213,13 @@ fn shrink_activation_preserves_tinygrad_mask_products_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Shrink", &["input"], "out")),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Shrink", &["input"], "out")),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -17790,7 +17272,7 @@ fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
             &HashMap::from([("input".into(), TensorData::scalar(-0.0))]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[]);
+    assert!(output.shape().dims().is_empty());
     assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
 
     for alpha in [f32::NAN, f32::INFINITY] {
@@ -17898,7 +17380,7 @@ fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
                 &HashMap::from([("input".into(), data)]),
             )
             .unwrap();
-        assert_eq!(output.shape().dims(), &[]);
+        assert!(output.shape().dims().is_empty());
         assert_eq!(output.dtype(), expected);
     }
 
@@ -17956,15 +17438,13 @@ fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -17978,15 +17458,13 @@ fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&missing),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&missing),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -17998,15 +17476,13 @@ fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("ThresholdedRelu", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ThresholdedRelu", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -18019,15 +17495,13 @@ fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = byte_overflow.node_count();
-    assert!(
-        lower(
-            &mut byte_overflow,
-            Msg::new(&node("ThresholdedRelu", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut byte_overflow,
+        Msg::new(&node("ThresholdedRelu", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(byte_overflow.node_count(), before_nodes);
@@ -18081,7 +17555,7 @@ fn binarizer_matches_tinygrad_strict_float_output_and_preflights() {
             &HashMap::from([("input".into(), TensorData::scalar(-0.0))]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[]);
+    assert!(output.shape().dims().is_empty());
     assert_eq!(output.values(), &[1.]);
 
     for threshold in [f32::NAN, f32::INFINITY] {
@@ -18187,7 +17661,7 @@ fn binarizer_matches_tinygrad_strict_float_output_and_preflights() {
                 &HashMap::from([("input".into(), data)]),
             )
             .unwrap();
-        assert_eq!(output.shape().dims(), &[]);
+        assert!(output.shape().dims().is_empty());
         assert_eq!(output.dtype(), DType::F32);
         assert_eq!(output.values(), &[1.]);
     }
@@ -18247,15 +17721,13 @@ fn binarizer_matches_tinygrad_strict_float_output_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -18269,15 +17741,13 @@ fn binarizer_matches_tinygrad_strict_float_output_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&missing),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&missing),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -18292,15 +17762,13 @@ fn binarizer_matches_tinygrad_strict_float_output_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Binarizer", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Binarizer", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -18492,15 +17960,13 @@ fn prelu_matches_tinygrad_strict_branching_and_preflights() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -18515,15 +17981,13 @@ fn prelu_matches_tinygrad_strict_branching_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = malformed.node_count();
-    assert!(
-        lower(
-            &mut malformed,
-            Msg::new(&mismatch),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&mismatch),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
@@ -18536,15 +18000,13 @@ fn prelu_matches_tinygrad_strict_branching_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("PRelu", &["input", "slope"], "out")),
-            &mut values,
-            &mut constants
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("PRelu", &["input", "slope"], "out")),
+        &mut values,
+        &mut constants
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
@@ -18559,15 +18021,13 @@ fn prelu_matches_tinygrad_strict_branching_and_preflights() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = byte_overflow.node_count();
-    assert!(
-        lower(
-            &mut byte_overflow,
-            Msg::new(&node("PRelu", &["input", "slope"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut byte_overflow,
+        Msg::new(&node("PRelu", &["input", "slope"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(byte_overflow.node_count(), before_nodes);
@@ -18635,15 +18095,13 @@ fn atan_matches_tinygrad_and_preflights_before_publication() {
         let before_values = values.clone();
         let before_constants = constants.clone();
         let before_nodes = malformed.node_count();
-        assert!(
-            lower(
-                &mut malformed,
-                Msg::new(&invalid),
-                &mut values,
-                &mut constants,
-            )
-            .is_err()
-        );
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
         assert_eq!(values, before_values);
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
@@ -18656,15 +18114,13 @@ fn atan_matches_tinygrad_and_preflights_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = overflow.node_count();
-    assert!(
-        lower(
-            &mut overflow,
-            Msg::new(&node("Atan", &["input"], "out")),
-            &mut values,
-            &mut constants,
-        )
-        .is_err()
-    );
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Atan", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);

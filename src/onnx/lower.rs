@@ -9,11 +9,11 @@ use super::{
         typed_scalar_i64_attr,
     },
     tensor::{onnx_dtype, tensor_data},
-    wire::{Msg, var},
+    wire::{var, Msg},
 };
 use crate::{
-    Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, Slice,
-    TensorData, ir::reduction_shape,
+    ir::reduction_shape, Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType, Result,
+    Scalar, Shape, Slice, TensorData,
 };
 use std::collections::BTreeMap;
 
@@ -1308,6 +1308,7 @@ fn lp_normalization_plan(
     }
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
     let extent = |shape: &Shape, dtype: DType, what: &str| {
         shape
             .numel()?
@@ -1669,11 +1670,12 @@ fn layer_normalization_plan(
             return Err(bad("LayerNormalization scalar promotion mismatch"));
         }
     }
+    let axes = (axis..shape.rank()).map(|i| i as isize).collect();
     Ok(LayerNormalizationPlan {
         input_dtype,
         output_dtype,
         shape,
-        axes: (axis..shape.rank()).map(|i| i as isize).collect(),
+        axes,
         sum_dtypes: ReductionDType::new(DType::F32, DType::F32),
         count,
         epsilon,
@@ -2504,7 +2506,14 @@ fn center_crop_pad_zero(dtype: DType) -> Scalar {
         DType::Bool => Scalar::Bool(false),
         DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(0),
         DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(0),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(0.0),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(0.0),
     }
 }
 
@@ -4826,7 +4835,7 @@ fn slice_plan(
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .map(|(_, _, _, length)| length)
-            .collect(),
+            .collect::<Vec<_>>(),
     );
     output_shape.numel()?;
     output_shape
@@ -5068,7 +5077,14 @@ fn cumsum_zero(dtype: DType) -> Scalar {
         DType::Bool => Scalar::Bool(false),
         DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(0),
         DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(0),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(0.0),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(0.0),
     }
 }
 
@@ -5134,10 +5150,14 @@ fn cumsum_plan(
                     .enumerate()
                     .map(
                         |(dimension, &extent)| {
-                            if dimension == axis { end + 1 } else { extent }
+                            if dimension == axis {
+                                end + 1
+                            } else {
+                                extent
+                            }
                         },
                     )
-                    .collect(),
+                    .collect::<Vec<_>>(),
             );
             prefix.numel()?;
             let reduced = Shape::new(
@@ -5146,7 +5166,7 @@ fn cumsum_plan(
                     .iter()
                     .enumerate()
                     .map(|(dimension, &extent)| if dimension == axis { 1 } else { extent })
-                    .collect(),
+                    .collect::<Vec<_>>(),
             );
             reduced.numel()?;
             concat_extent = concat_extent
@@ -6006,7 +6026,14 @@ fn max_identity(dtype: DType) -> Scalar {
         DType::U32 => Scalar::U(0),
         DType::I64 => Scalar::I(i64::MIN),
         DType::U64 => Scalar::U(0),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(f64::NEG_INFINITY),
     }
 }
 
@@ -6021,7 +6048,14 @@ fn min_identity(dtype: DType) -> Scalar {
         DType::U32 => Scalar::U(u32::MAX.into()),
         DType::I64 => Scalar::I(i64::MAX),
         DType::U64 => Scalar::U(u64::MAX),
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::INFINITY),
+        DType::F8E4M3
+        | DType::F8E5M2
+        | DType::F8E4M3FNUZ
+        | DType::F8E5M2FNUZ
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Scalar::F(f64::INFINITY),
     }
 }
 
@@ -6045,7 +6079,7 @@ fn global_max_pool_plan(g: &Graph, x: NodeId) -> Result<GlobalMaxPoolPlan> {
                 .iter()
                 .enumerate()
                 .map(|(axis, &extent)| if axis >= 2 { 1 } else { extent })
-                .collect(),
+                .collect::<Vec<_>>(),
         )
     };
     let output_numel = output_shape.numel()?;
@@ -7761,8 +7795,8 @@ pub(super) fn lower(
             // false scalar promotes to x's dtype; RustGrad's Bool promotion
             // has that same result for the select value branches.
             let equal = g.eq(lhs, rhs)?;
-            let false = g.full_with_dtype([], Scalar::Bool(false), DType::Bool)?;
-            g.select(equal, lhs, false)?
+            let false_value = g.full_with_dtype([], Scalar::Bool(false), DType::Bool)?;
+            g.select(equal, lhs, false_value)?
         }
         "Or" if ins.len() == 2 && attrs.is_empty() => {
             let lhs = get(0)?;
@@ -8159,6 +8193,13 @@ pub(super) fn lower(
                 DType::F64
             } else {
                 DType::F32
+            };
+            let extent = |shape: &Shape, dtype: DType, what: &str| {
+                shape
+                    .numel()?
+                    .checked_mul(dtype.itemsize())
+                    .ok_or_else(|| bad(format!("Binarizer {what} byte extent overflow")))
+                    .map(|_| ())
             };
             let output_dtype = if input_dtype == DType::Bool {
                 DType::I32

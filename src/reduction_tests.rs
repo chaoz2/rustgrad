@@ -174,25 +174,28 @@ fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
         let leading_nan = execute(
             &graph,
             output,
-            TensorData::new([2], vec![f64::NAN, 3.0]).unwrap(),
+            TensorData::from_scalars([2], DType::F64, [Scalar::F(f64::NAN), Scalar::F(3.0)])
+                .unwrap(),
         );
         assert!(leading_nan.scalar_at(0).as_f64().is_nan());
         let later_nan = execute(
             &graph,
             output,
-            TensorData::new([2], vec![3.0, f64::NAN]).unwrap(),
+            TensorData::from_scalars([2], DType::F64, [Scalar::F(3.0), Scalar::F(f64::NAN)])
+                .unwrap(),
         );
         assert_eq!(later_nan.scalar_at(0).as_f64(), 3.0);
         let all_nan = execute(
             &graph,
             output,
-            TensorData::new([2], vec![f64::NAN, f64::NAN]).unwrap(),
+            TensorData::from_scalars([2], DType::F64, [Scalar::F(f64::NAN), Scalar::F(f64::NAN)])
+                .unwrap(),
         );
         assert!(all_nan.scalar_at(0).as_f64().is_nan());
         let signed_zero = execute(
             &graph,
             output,
-            TensorData::new([2], vec![-0.0, 0.0]).unwrap(),
+            TensorData::from_scalars([2], DType::F64, [Scalar::F(-0.0), Scalar::F(0.0)]).unwrap(),
         );
         assert_eq!(
             signed_zero.scalar_at(0).as_f64().to_bits(),
@@ -217,12 +220,10 @@ fn extrema_retain_leading_nan_and_ignore_later_nan_in_gradients() {
                 .as_f64();
             if nan_index == 0 {
                 assert!(forward.is_nan(), "{kind:?} retains a leading NaN");
-                assert!(
-                    execute(&graph, gradient, input)
-                        .to_vec_f64()
-                        .iter()
-                        .all(|value| value.is_nan())
-                );
+                assert!(execute(&graph, gradient, input)
+                    .to_vec_f64()
+                    .iter()
+                    .all(|value| value.is_nan()));
                 continue;
             }
             let expected = match kind {
@@ -333,12 +334,10 @@ fn empty_reduction_contract_is_typed_and_explicit() {
             execute(&graph, sum, input.clone()).to_vec_f64(),
             vec![0.; 2]
         );
-        assert!(
-            execute(&graph, mean, input.clone())
-                .to_vec_f64()
-                .iter()
-                .all(|value| value.is_nan())
-        );
+        assert!(execute(&graph, mean, input.clone())
+            .to_vec_f64()
+            .iter()
+            .all(|value| value.is_nan()));
         assert_eq!(execute(&graph, product, input).to_vec_f64(), vec![1.; 2]);
 
         for (kind, op) in [(ReduceKind::Max, "max"), (ReduceKind::Min, "min")] {
@@ -413,12 +412,10 @@ fn reduce_grad_has_inspectable_label_shape_and_dtype() {
     assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 2]));
     assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
     let trace = graph.trace(gradient).unwrap();
-    assert!(
-        trace
-            .steps
-            .iter()
-            .any(|step| step.operation.contains("reduce_grad_Product"))
-    );
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| step.operation.contains("reduce_grad_Product")));
 }
 
 #[test]

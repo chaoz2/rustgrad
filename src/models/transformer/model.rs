@@ -1,16 +1,16 @@
 use super::{
+    layer::{append_dense_layer, embedding, linear, rms_norm},
     LlamaDecoderSchema, LlamaOutputBinding, OUTPUT_NORM, OUTPUT_WEIGHT, ROPE_FREQS,
     TOKEN_EMBEDDING,
-    layer::{append_dense_layer, embedding, linear, rms_norm},
 };
 use crate::{
-    Backend, CpuBackend, DType, Error, Graph, NodeId, Op, QuantizedMatmulPlan, Scalar, Shape,
-    TensorData,
     gguf::{
         GgmlLayout, GgmlType, GgufError, GgufFile, GgufMetadataAccessError, QuantizedRowGatherPlan,
         QuantizedTensorData,
     },
     tokenizer::{SimpleTokenizer, TokenizerError},
+    Backend, CpuBackend, DType, Error, Graph, NodeId, Op, QuantizedMatmulPlan, Scalar, Shape,
+    TensorData,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -738,6 +738,7 @@ impl LlamaModel {
         )?;
         let mut cache_nodes = Vec::with_capacity(self.config.layer_count);
         let mut quantized_linears = QuantizedLinearBindings::new();
+        let schema = self.config.schema;
         for layer in 0..self.config.layer_count {
             let previous = past.map(|past| &past[layer]);
             let tensor_prefix = format!("blk.{layer}");

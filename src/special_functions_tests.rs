@@ -205,31 +205,21 @@ fn copysign_is_the_source_literal_predicate_reciprocal_select_graph() {
         .into_iter()
         .map(|step| step.operation)
         .collect();
-    assert!(
-        operations
-            .iter()
-            .any(|operation| operation.starts_with("reciprocal("))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|operation| operation.starts_with("logical_or("))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|operation| operation.starts_with("sign("))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|operation| operation.starts_with("neg("))
-    );
-    assert!(
-        !operations
-            .iter()
-            .any(|operation| operation.starts_with("copysign("))
-    );
+    assert!(operations
+        .iter()
+        .any(|operation| operation.starts_with("reciprocal(")));
+    assert!(operations
+        .iter()
+        .any(|operation| operation.starts_with("logical_or(")));
+    assert!(operations
+        .iter()
+        .any(|operation| operation.starts_with("sign(")));
+    assert!(operations
+        .iter()
+        .any(|operation| operation.starts_with("neg(")));
+    assert!(!operations
+        .iter()
+        .any(|operation| operation.starts_with("copysign(")));
 }
 
 #[test]
@@ -576,11 +566,10 @@ fn elu_scalar_matches_tinygrad_weak_default_without_changing_live_alpha_api() {
         let x = nonfloat.input_dtype("x", [], dtype);
         let output = nonfloat.elu_scalar(x, 0.125).unwrap();
         assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
-        assert!(
-            nonfloat.nodes.iter().any(|node| {
-                matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32)
-            })
-        );
+        assert!(nonfloat
+            .nodes
+            .iter()
+            .any(|node| { matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32) }));
     }
 
     let mut empty = Graph::new();
@@ -654,19 +643,15 @@ fn elu_with_scalar_preserves_tinygrad_untyped_alpha_staging() {
     let mut bridge = Graph::new();
     let x = bridge.input_dtype("x", [], DType::I64);
     let alpha = bridge.input_dtype("alpha", [], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.elu(x, alpha).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.elu(x, alpha).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut scalar = Graph::new();
     let x = scalar.input_dtype("x", [], DType::F64);
     let output = scalar.elu_with_scalar(x, Scalar::F(f64::NAN)).unwrap();
     let loss = scalar.sum_all(output).unwrap();
-    assert_eq!(
-        scalar.shape(scalar.grad(loss, x).unwrap()).unwrap(),
-        &Shape::new([])
-    );
+    let gradient = scalar.grad(loss, x).unwrap();
+    assert_eq!(scalar.shape(gradient).unwrap(), &Shape::new([]));
 
     let mut empty = Graph::new();
     let x = empty.input_dtype("x", [0, 2], DType::BF16);
@@ -676,19 +661,15 @@ fn elu_with_scalar_preserves_tinygrad_untyped_alpha_staging() {
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .elu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
-            .is_err()
-    );
+    assert!(malformed
+        .elu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .elu_with_scalar(overflow, Scalar::F(-0.5))
-            .is_err()
-    );
+    assert!(malformed
+        .elu_with_scalar(overflow, Scalar::F(-0.5))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -1025,40 +1006,28 @@ fn softplus_scalar_and_default_preserve_tinygrad_literal_staging() {
     }
     let mut default = Graph::new();
     let x = default.input_dtype("x", [], DType::F16);
-    assert_eq!(
-        default.dtype(default.softplus_default(x).unwrap()).unwrap(),
-        DType::F16
-    );
+    let output = default.softplus_default(x).unwrap();
+    assert_eq!(default.dtype(output).unwrap(), DType::F16);
     let mut bridge = Graph::new();
     let x = bridge.input_dtype("x", [], DType::I64);
     let beta = bridge.input_dtype("beta", [], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.softplus(x, beta).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.softplus(x, beta).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
     let mut empty = Graph::new();
     let x = empty.input_dtype("x", [0, 2], DType::BF16);
-    assert_eq!(
-        empty
-            .shape(empty.softplus_with_scalar(x, Scalar::I(1)).unwrap())
-            .unwrap(),
-        &Shape::new([0, 2])
-    );
+    let output = empty.softplus_with_scalar(x, Scalar::I(1)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .softplus_with_scalar(crate::NodeId(usize::MAX), Scalar::F(1.0))
-            .is_err()
-    );
+    assert!(malformed
+        .softplus_with_scalar(crate::NodeId(usize::MAX), Scalar::F(1.0))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .softplus_with_scalar(overflow, Scalar::F(1.0))
-            .is_err()
-    );
+    assert!(malformed
+        .softplus_with_scalar(overflow, Scalar::F(1.0))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -1247,10 +1216,8 @@ fn selu_with_scalars_preserves_tinygrad_untyped_parameter_consumers() {
     let x = bridge.input_dtype("x", [], DType::I64);
     let alpha = bridge.input_dtype("alpha", [], DType::U64);
     let gamma = bridge.input_dtype("gamma", [], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.selu(x, alpha, gamma).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.selu(x, alpha, gamma).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut scalar = Graph::new();
     let x = scalar.input_dtype("x", [], DType::F64);
@@ -1258,10 +1225,8 @@ fn selu_with_scalars_preserves_tinygrad_untyped_parameter_consumers() {
         .selu_with_scalars(x, Scalar::F(f64::NAN), Scalar::F(f64::INFINITY))
         .unwrap();
     let loss = scalar.sum_all(output).unwrap();
-    assert_eq!(
-        scalar.shape(scalar.grad(loss, x).unwrap()).unwrap(),
-        &Shape::new([])
-    );
+    let gradient = scalar.grad(loss, x).unwrap();
+    assert_eq!(scalar.shape(gradient).unwrap(), &Shape::new([]));
 
     let mut empty = Graph::new();
     let x = empty.input_dtype("x", [0, 2], DType::BF16);
@@ -1273,19 +1238,15 @@ fn selu_with_scalars_preserves_tinygrad_untyped_parameter_consumers() {
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .selu_with_scalars(crate::NodeId(usize::MAX), Scalar::Bool(true), Scalar::I(1))
-            .is_err()
-    );
+    assert!(malformed
+        .selu_with_scalars(crate::NodeId(usize::MAX), Scalar::Bool(true), Scalar::I(1))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .selu_with_scalars(overflow, Scalar::F(-0.5), Scalar::F(1.0))
-            .is_err()
-    );
+    assert!(malformed
+        .selu_with_scalars(overflow, Scalar::F(-0.5), Scalar::F(1.0))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -1736,11 +1697,10 @@ fn leaky_relu_scalar_matches_tinygrad_weak_default_without_changing_live_slope_a
         let x = nonfloat.input_dtype("x", [], dtype);
         let output = nonfloat.leaky_relu_scalar(x, 0.125).unwrap();
         assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
-        assert!(
-            nonfloat.nodes.iter().any(|node| {
-                matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32)
-            })
-        );
+        assert!(nonfloat
+            .nodes
+            .iter()
+            .any(|node| { matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32) }));
     }
 
     let mut empty = Graph::new();
@@ -1751,11 +1711,9 @@ fn leaky_relu_scalar_matches_tinygrad_weak_default_without_changing_live_slope_a
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .leaky_relu_default(crate::NodeId(usize::MAX))
-            .is_err()
-    );
+    assert!(malformed
+        .leaky_relu_default(crate::NodeId(usize::MAX))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX], DType::F32);
     let before = malformed.node_count();
@@ -1819,10 +1777,8 @@ fn leaky_relu_with_scalar_preserves_tinygrad_untyped_slope_surface() {
     let mut bridge = Graph::new();
     let x = bridge.input_dtype("x", [], DType::I64);
     let slope = bridge.input_dtype("slope", [], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.leaky_relu(x, slope).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.leaky_relu(x, slope).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut scalar = Graph::new();
     let x = scalar.input_dtype("x", [], DType::F64);
@@ -1830,10 +1786,8 @@ fn leaky_relu_with_scalar_preserves_tinygrad_untyped_slope_surface() {
         .leaky_relu_with_scalar(x, Scalar::F(f64::NAN))
         .unwrap();
     let loss = scalar.sum_all(output).unwrap();
-    assert_eq!(
-        scalar.shape(scalar.grad(loss, x).unwrap()).unwrap(),
-        &Shape::new([])
-    );
+    let gradient = scalar.grad(loss, x).unwrap();
+    assert_eq!(scalar.shape(gradient).unwrap(), &Shape::new([]));
 
     let mut empty = Graph::new();
     let x = empty.input_dtype("x", [0, 2], DType::BF16);
@@ -1843,19 +1797,15 @@ fn leaky_relu_with_scalar_preserves_tinygrad_untyped_slope_surface() {
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .leaky_relu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
-            .is_err()
-    );
+    assert!(malformed
+        .leaky_relu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .leaky_relu_with_scalar(overflow, Scalar::F(-0.5))
-            .is_err()
-    );
+    assert!(malformed
+        .leaky_relu_with_scalar(overflow, Scalar::F(-0.5))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -2081,11 +2031,10 @@ fn celu_scalar_matches_tinygrad_weak_default_without_changing_live_alpha_api() {
         let x = nonfloat.input_dtype("x", [], dtype);
         let output = nonfloat.celu_scalar(x, 0.125).unwrap();
         assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
-        assert!(
-            nonfloat.nodes.iter().any(|node| {
-                matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32)
-            })
-        );
+        assert!(nonfloat
+            .nodes
+            .iter()
+            .any(|node| { matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32) }));
     }
 
     let mut empty = Graph::new();
@@ -2161,37 +2110,29 @@ fn celu_with_scalar_preserves_tinygrad_per_consumer_alpha_commitment() {
     let x = staged.input_dtype("x", [], DType::I16);
     let output = staged.celu_with_scalar(x, Scalar::I(-1)).unwrap();
     assert_eq!(staged.dtype(output).unwrap(), DType::F32);
-    assert!(
-        staged
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Constant(data)
-        if data.dtype() == DType::I16 && data.scalar_at(0).as_i64() == -1))
-    );
-    assert!(
-        staged
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Constant(data)
-        if data.dtype() == DType::F32 && data.scalar_at(0).as_i64() == -1))
-    );
+    assert!(staged
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Constant(data)
+        if data.dtype() == DType::I16 && data.scalar_at(0).as_i64() == -1)));
+    assert!(staged
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Constant(data)
+        if data.dtype() == DType::F32 && data.scalar_at(0).as_i64() == -1)));
 
     let mut bridge = Graph::new();
     let x = bridge.input_dtype("x", [], DType::I64);
     let alpha = bridge.input_dtype("alpha", [], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.celu(x, alpha).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.celu(x, alpha).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut scalar = Graph::new();
     let x = scalar.input_dtype("x", [], DType::F64);
     let output = scalar.celu_with_scalar(x, Scalar::F(f64::NAN)).unwrap();
     let loss = scalar.sum_all(output).unwrap();
-    assert_eq!(
-        scalar.shape(scalar.grad(loss, x).unwrap()).unwrap(),
-        &Shape::new([])
-    );
+    let gradient = scalar.grad(loss, x).unwrap();
+    assert_eq!(scalar.shape(gradient).unwrap(), &Shape::new([]));
 
     let mut empty = Graph::new();
     let x = empty.input_dtype("x", [0, 2], DType::BF16);
@@ -2201,19 +2142,15 @@ fn celu_with_scalar_preserves_tinygrad_per_consumer_alpha_commitment() {
 
     let mut malformed = Graph::new();
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .celu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
-            .is_err()
-    );
+    assert!(malformed
+        .celu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .celu_with_scalar(overflow, Scalar::F(-0.5))
-            .is_err()
-    );
+    assert!(malformed
+        .celu_with_scalar(overflow, Scalar::F(-0.5))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -2353,10 +2290,8 @@ fn quick_gelu_uses_tinygrad_typed_sigmoid_composition_and_preflights() {
     ] {
         let mut promoted = Graph::new();
         let x = promoted.input_dtype("x", [], dtype);
-        assert_eq!(
-            promoted.dtype(promoted.quick_gelu(x).unwrap()).unwrap(),
-            DType::F32
-        );
+        let output = promoted.quick_gelu(x).unwrap();
+        assert_eq!(promoted.dtype(output).unwrap(), DType::F32);
     }
     let mut empty = Graph::new();
     let x = empty.input_dtype("x", [0], DType::F16);
@@ -2737,16 +2672,12 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
         .into_iter()
         .map(|step| step.operation)
         .collect::<Vec<_>>();
-    assert!(
-        operations
-            .iter()
-            .any(|operation| operation.starts_with("maximum("))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|operation| operation.starts_with("abs("))
-    );
+    assert!(operations
+        .iter()
+        .any(|operation| operation.starts_with("maximum(")));
+    assert!(operations
+        .iter()
+        .any(|operation| operation.starts_with("abs(")));
 }
 
 #[test]

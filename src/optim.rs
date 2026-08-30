@@ -5,7 +5,7 @@
 //! step checks the captured parameter versions before replacement, so callers
 //! must rebuild/evaluate the next graph cycle after an update.
 
-use crate::nn::{Module, ParameterRestore, StateDict, next_version, restore_parameters};
+use crate::nn::{next_version, restore_parameters, Module, ParameterRestore, StateDict};
 use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
@@ -525,10 +525,6 @@ impl LearningRateScheduler {
         self.step_metric(optimizer, None)
     }
     pub fn step_metric(&mut self, optimizer: &mut Optimizer, metric: Option<f64>) -> Result<()> {
-        let next_epoch = self
-            .epoch()
-            .checked_add(1)
-            .ok_or_else(|| invalid("scheduler epoch counter overflow"))?;
         match self {
             Self::MultiStep {
                 state,
@@ -1156,9 +1152,9 @@ impl Optimizer {
                 parameter: entry.parameter.clone(),
                 data: from_f64(snapshot.shape, snapshot.dtype, updated)?,
                 expected_version: snapshot.version,
-                restored_version: snapshot.version.wrapping_add(1),
+                restored_version: next_version,
             });
-            entry.version = snapshot.version.wrapping_add(1);
+            entry.version = next_version;
             entry.first_step = false;
         }
         next.step = next_step;
@@ -1935,16 +1931,14 @@ mod tests {
         let parameter = parameter(&mut graph, vec![1.]);
         let before = parameter.snapshot().unwrap();
         for momentum in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(
-                Optimizer::lars(
-                    vec![("p".into(), parameter.clone())],
-                    LarsConfig {
-                        momentum,
-                        ..LarsConfig::default()
-                    },
-                )
-                .is_err()
-            );
+            assert!(Optimizer::lars(
+                vec![("p".into(), parameter.clone())],
+                LarsConfig {
+                    momentum,
+                    ..LarsConfig::default()
+                },
+            )
+            .is_err());
             assert_eq!(parameter.snapshot().unwrap().data, before.data);
         }
 
@@ -2916,26 +2910,22 @@ mod tests {
             )]))
             .unwrap();
         assert_eq!(bf16.snapshot().unwrap().dtype, DType::BF16);
-        assert!(
-            to_f64(&bf16.snapshot().unwrap().data)
-                .iter()
-                .all(|x| x.is_finite())
-        );
+        assert!(to_f64(&bf16.snapshot().unwrap().data)
+            .iter()
+            .all(|x| x.is_finite()));
         let mut invalid_graph = Graph::new();
         let vector = parameter(&mut invalid_graph, vec![1.]);
         assert!(Optimizer::muon(vec![("v".into(), vector)], MuonConfig::default()).is_err());
         let empty = matrix_parameter(&mut invalid_graph, &[0, 2], DType::F32, &[]);
         assert!(Optimizer::muon(vec![("e".into(), empty)], MuonConfig::default()).is_err());
-        assert!(
-            Optimizer::muon(
-                vec![("x".into(), a.clone())],
-                MuonConfig {
-                    ns_coefficients: vec![],
-                    ..MuonConfig::default()
-                }
-            )
-            .is_err()
-        );
+        assert!(Optimizer::muon(
+            vec![("x".into(), a.clone())],
+            MuonConfig {
+                ns_coefficients: vec![],
+                ..MuonConfig::default()
+            }
+        )
+        .is_err());
         let integer = matrix_parameter(&mut invalid_graph, &[2, 2], DType::I32, &[1., 2., 3., 4.]);
         assert!(Optimizer::muon(vec![("i".into(), integer)], MuonConfig::default()).is_err());
         let zero = matrix_parameter(&mut invalid_graph, &[2, 2], DType::F32, &[0., 0., 0., 0.]);
@@ -2961,11 +2951,9 @@ mod tests {
         let stale = matrix_gradient(&tied, &[2, 2], &[0.1, 0.2, 0.3, 0.4]);
         tied.replace(TensorData::new([2, 2], vec![2., 2., 2., 2.]).unwrap())
             .unwrap();
-        assert!(
-            tied_optimizer
-                .step(&BTreeMap::from([("a".into(), stale)]))
-                .is_err()
-        );
+        assert!(tied_optimizer
+            .step(&BTreeMap::from([("a".into(), stale)]))
+            .is_err());
     }
 
     fn skip_list_group(first: Parameter, second: Parameter) -> OptimizerGroup {
@@ -3012,24 +3000,20 @@ mod tests {
         assert!((values(&lars)[0] - 0.9).abs() < 1e-6);
         assert!((values(&sgd_parameter)[0] - 1.8).abs() < 1e-6);
         let before = (values(&lars), values(&sgd_parameter));
-        assert!(
-            group
-                .step(&BTreeMap::from([(
-                    "lars".into(),
-                    gradient(&lars, vec![1.])
-                )]))
-                .is_err()
-        );
+        assert!(group
+            .step(&BTreeMap::from([(
+                "lars".into(),
+                gradient(&lars, vec![1.])
+            )]))
+            .is_err());
         assert_eq!((values(&lars), values(&sgd_parameter)), before);
         let overlap =
             Optimizer::sgd(vec![("other".into(), lars.clone())], SgdConfig::default()).unwrap();
-        assert!(
-            OptimizerGroup::new(vec![
-                Optimizer::sgd(vec![("lars".into(), lars)], SgdConfig::default()).unwrap(),
-                overlap,
-            ])
-            .is_err()
-        );
+        assert!(OptimizerGroup::new(vec![
+            Optimizer::sgd(vec![("lars".into(), lars)], SgdConfig::default()).unwrap(),
+            overlap,
+        ])
+        .is_err());
     }
 
     #[test]
@@ -3043,14 +3027,12 @@ mod tests {
             .replace(TensorData::new([1], vec![3.]).unwrap())
             .unwrap();
         let before = values(&left);
-        assert!(
-            group
-                .step(&BTreeMap::from([
-                    ("lars".into(), gradient(&left, vec![1.])),
-                    ("sgd".into(), stale_right),
-                ]))
-                .is_err()
-        );
+        assert!(group
+            .step(&BTreeMap::from([
+                ("lars".into(), gradient(&left, vec![1.])),
+                ("sgd".into(), stale_right),
+            ]))
+            .is_err());
         assert_eq!(values(&left), before);
 
         let mut a_graph = Graph::new();
@@ -3076,16 +3058,12 @@ mod tests {
             ]))
             .unwrap();
         let checkpoint = saved.state_dict().unwrap();
-        assert!(
-            checkpoint
-                .tensors()
-                .contains_key("optimizer_group.0.optimizer.lars.momentum")
-        );
-        assert!(
-            checkpoint
-                .tensors()
-                .contains_key("optimizer_group.1.optimizer.sgd.momentum")
-        );
+        assert!(checkpoint
+            .tensors()
+            .contains_key("optimizer_group.0.optimizer.lars.momentum"));
+        assert!(checkpoint
+            .tensors()
+            .contains_key("optimizer_group.1.optimizer.sgd.momentum"));
         let mut resumed_graph = Graph::new();
         let resumed_left = parameter(&mut resumed_graph, values(&saved_left));
         let resumed_right = parameter(&mut resumed_graph, values(&saved_right));
@@ -3135,23 +3113,24 @@ mod tests {
     #[test]
     fn adam_step_counter_overflow_rejects_before_optimizer_or_group_publication() {
         let mut graph = Graph::new();
-        let parameter = parameter(&mut graph, vec![1.]);
-        let mut optimizer =
-            Optimizer::adam(vec![("p".into(), parameter.clone())], AdamConfig::default()).unwrap();
+        let parameter_value = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::adam(
+            vec![("p".into(), parameter_value.clone())],
+            AdamConfig::default(),
+        )
+        .unwrap();
         optimizer.step = u64::MAX;
-        let gradient = gradient(&parameter, vec![0.5]);
-        let parameter_before = values(&parameter);
+        let parameter_gradient = gradient(&parameter_value, vec![0.5]);
+        let parameter_before = values(&parameter_value);
         let state_before = optimizer.state_dict().unwrap();
-        assert!(
-            optimizer
-                .step(&BTreeMap::from([("p".into(), gradient.clone())]))
-                .is_err()
-        );
-        assert_eq!(values(&parameter), parameter_before);
+        assert!(optimizer
+            .step(&BTreeMap::from([("p".into(), parameter_gradient.clone())]))
+            .is_err());
+        assert_eq!(values(&parameter_value), parameter_before);
         assert_eq!(optimizer.state_dict().unwrap(), state_before);
         optimizer.step = 0;
         optimizer
-            .step(&BTreeMap::from([("p".into(), gradient)]))
+            .step(&BTreeMap::from([("p".into(), parameter_gradient)]))
             .unwrap();
         assert_eq!(optimizer.step_count(), 1);
 
@@ -3166,14 +3145,12 @@ mod tests {
         let left_before = values(&left);
         let right_before = values(&right);
         let state_before = group.state_dict().unwrap();
-        assert!(
-            group
-                .step(&BTreeMap::from([
-                    ("left".into(), gradient(&left, vec![0.5])),
-                    ("right".into(), gradient(&right, vec![0.25])),
-                ]))
-                .is_err()
-        );
+        assert!(group
+            .step(&BTreeMap::from([
+                ("left".into(), gradient(&left, vec![0.5])),
+                ("right".into(), gradient(&right, vec![0.25])),
+            ]))
+            .is_err());
         assert_eq!(values(&left), left_before);
         assert_eq!(values(&right), right_before);
         assert_eq!(group.state_dict().unwrap(), state_before);
@@ -3435,15 +3412,13 @@ mod tests {
         let before_scheduler = resumed_scheduler.state_dict().unwrap();
         let mut bad_scheduler = scheduler_state.into_tensors();
         bad_scheduler.remove("scheduler.epoch");
-        assert!(
-            load_optimizer_scheduler_state(
-                &mut resumed,
-                &mut resumed_scheduler,
-                &optimizer_state,
-                &StateDict::from(bad_scheduler)
-            )
-            .is_err()
-        );
+        assert!(load_optimizer_scheduler_state(
+            &mut resumed,
+            &mut resumed_scheduler,
+            &optimizer_state,
+            &StateDict::from(bad_scheduler)
+        )
+        .is_err());
         assert_eq!(resumed.state_dict().unwrap(), before_optimizer);
         assert_eq!(resumed_scheduler.state_dict().unwrap(), before_scheduler);
     }
@@ -3502,11 +3477,9 @@ mod tests {
         let before = resumed.state_dict().unwrap();
         let mut malformed = checkpoint.clone().into_tensors();
         malformed.remove("optimizer.p.momentum");
-        assert!(
-            resumed
-                .load_state_dict(&StateDict::from(malformed))
-                .is_err()
-        );
+        assert!(resumed
+            .load_state_dict(&StateDict::from(malformed))
+            .is_err());
         assert_eq!(resumed.state_dict().unwrap(), before);
 
         let mut mismatch_graph = Graph::new();
@@ -3548,14 +3521,12 @@ mod tests {
 
         let before_parameter = parameter.value().unwrap();
         let before_optimizer = optimizer.state_dict().unwrap();
-        assert!(
-            optimizer
-                .step(&BTreeMap::from([(
-                    "p".into(),
-                    gradient(&parameter, vec![0.25]),
-                )]))
-                .is_err()
-        );
+        assert!(optimizer
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&parameter, vec![0.25]),
+            )]))
+            .is_err());
         assert_eq!(parameter.value().unwrap(), before_parameter);
         assert_eq!(optimizer.state_dict().unwrap(), before_optimizer);
     }
@@ -3618,11 +3589,9 @@ mod tests {
         assert_eq!(mismatch.state_dict().unwrap(), before_mismatch);
         let mut malformed = before_scheduler.clone().into_tensors();
         malformed.remove("scheduler.epoch");
-        assert!(
-            mismatch
-                .load_state_dict(&StateDict::from(malformed))
-                .is_err()
-        );
+        assert!(mismatch
+            .load_state_dict(&StateDict::from(malformed))
+            .is_err());
         assert_eq!(mismatch.state_dict().unwrap(), before_mismatch);
 
         let first = parameter(&mut graph, vec![1.]);

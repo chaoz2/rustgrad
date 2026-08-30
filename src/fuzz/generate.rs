@@ -69,6 +69,7 @@ fn reduction_tensor(
                 let value = (raw % 3) as i64 - 1;
                 Scalar::F(value as f64)
             }
+            _ => unreachable!("float8 reduction fuzz is not generated"),
         }
     });
     FuzzTensor::from_tensor(

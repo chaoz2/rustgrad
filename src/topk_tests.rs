@@ -11,7 +11,7 @@ fn cpu(graph: &Graph, output: crate::NodeId, input: TensorData) -> TensorData {
 fn topk_is_a_stable_sort_pair_followed_by_checked_slices() {
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [2, 4], DType::I32);
-    let (values, indices) = graph.topk(x, 3, -1, true).unwrap();
+    let (values, indices) = graph.topk(x, 3, -1, true, true).unwrap();
     let input =
         TensorData::from_scalars([2, 4], DType::I32, [1, 1, 0, 1, 1, 3, 3, 2].map(Scalar::I))
             .unwrap();
@@ -55,7 +55,7 @@ fn topk_is_a_stable_sort_pair_followed_by_checked_slices() {
 fn topk_smallest_signed_axis_zero_and_zero_extent_preserve_static_contracts() {
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [2, 3], DType::I16);
-    let (values, indices) = graph.topk(x, 2, -2, false).unwrap();
+    let (values, indices) = graph.topk(x, 2, -2, false, true).unwrap();
     let input =
         TensorData::from_scalars([2, 3], DType::I16, [3, 1, 2, 0, 4, -1].map(Scalar::I)).unwrap();
     assert_eq!(
@@ -69,7 +69,7 @@ fn topk_smallest_signed_axis_zero_and_zero_extent_preserve_static_contracts() {
 
     let mut zero = Graph::new();
     let x = zero.input_dtype("x", [2, 3], DType::Bool);
-    let (values, indices) = zero.topk(x, 0, 1, true).unwrap();
+    let (values, indices) = zero.topk(x, 0, 1, true, true).unwrap();
     let input = TensorData::from_scalars(
         [2, 3],
         DType::Bool,
@@ -84,7 +84,7 @@ fn topk_smallest_signed_axis_zero_and_zero_extent_preserve_static_contracts() {
 
     let mut empty = Graph::new();
     let x = empty.input_dtype("x", [2, 0, 3], DType::F32);
-    let (values, indices) = empty.topk(x, 0, -2, true).unwrap();
+    let (values, indices) = empty.topk(x, 0, -2, true, true).unwrap();
     let input = TensorData::from_scalars([2, 0, 3], DType::F32, []).unwrap();
     assert_eq!(
         cpu(&empty, values, input.clone()).shape(),
@@ -99,7 +99,7 @@ fn topk_preflights_axis_rank_and_k_without_graph_mutation() {
     let x = graph.input_dtype("x", [2, 3], DType::F32);
     let before = graph.trace(x).unwrap();
     assert!(matches!(
-        graph.topk(x, 4, 1, true),
+        graph.topk(x, 4, 1, true, true),
         Err(Error::InvalidBounds {
             axis: 1,
             end: 4,
@@ -109,7 +109,7 @@ fn topk_preflights_axis_rank_and_k_without_graph_mutation() {
     ));
     assert_eq!(graph.trace(x).unwrap(), before);
     assert!(matches!(
-        graph.topk(x, 1, 2, true),
+        graph.topk(x, 1, 2, true, true),
         Err(Error::InvalidReductionAxes { node, rank: 2, .. }) if node == x
     ));
     assert_eq!(graph.trace(x).unwrap(), before);
@@ -117,8 +117,12 @@ fn topk_preflights_axis_rank_and_k_without_graph_mutation() {
     let scalar = graph.input_dtype("scalar", [], DType::F32);
     let scalar_before = graph.trace(scalar).unwrap();
     assert!(matches!(
-        graph.topk(scalar, 1, -1, true),
-        Err(Error::InvalidReductionAxes { node, rank: 0, .. }) if node == scalar
+        graph.topk(scalar, 1, -1, true, true),
+        Err(Error::InvalidAxis {
+            node,
+            axis: 0,
+            rank: 0,
+        }) if node == scalar
     ));
     assert_eq!(graph.trace(scalar).unwrap(), scalar_before);
 }

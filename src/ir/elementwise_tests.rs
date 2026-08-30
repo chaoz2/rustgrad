@@ -261,8 +261,8 @@ fn sequential_is_heterogeneous_ordered_and_preserves_prefix_failures() {
         .sequential(
             input,
             vec![
-                Box::new(|g, x| g.mul_scalar(x, Scalar::F(2.0))),
-                Box::new(|g, x| g.add_scalar(x, Scalar::F(1.0))),
+                Box::new(|g: &mut Graph, x: NodeId| g.mul_scalar(x, Scalar::F(2.0))),
+                Box::new(|g: &mut Graph, x: NodeId| g.add_scalar(x, Scalar::F(1.0))),
             ],
         )
         .unwrap();
@@ -280,23 +280,21 @@ fn sequential_is_heterogeneous_ordered_and_preserves_prefix_failures() {
     let invoked_later = Rc::new(Cell::new(false));
     let later = invoked_later.clone();
     let before = graph.node_count();
-    assert!(
-        graph
-            .sequential(
-                input,
-                vec![
-                    Box::new(|g, x| g.add_scalar(x, Scalar::F(3.0))),
-                    Box::new(|_, _| Err(Error::InvalidRandom {
-                        reason: "sequential stop"
-                    })),
-                    Box::new(move |_, _| {
-                        later.set(true);
-                        Ok(input)
-                    }),
-                ],
-            )
-            .is_err()
-    );
+    assert!(graph
+        .sequential(
+            input,
+            vec![
+                Box::new(|g, x| g.add_scalar(x, Scalar::F(3.0))),
+                Box::new(|_, _| Err(Error::InvalidRandom {
+                    reason: "sequential stop"
+                })),
+                Box::new(move |_, _| {
+                    later.set(true);
+                    Ok(input)
+                }),
+            ],
+        )
+        .is_err());
     assert_eq!(graph.node_count(), before + 2);
     assert!(!invoked_later.get());
 }
@@ -514,26 +512,24 @@ fn allclose_matches_tinygrad_isclose_then_all_for_broadcast_special_and_empty_do
     let output = graph.allclose(lhs, rhs, 1e-5, 1e-8, false).unwrap();
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
     assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
-    assert!(
-        CpuBackend
-            .execute(
-                &graph,
-                output,
-                &HashMap::from([
-                    (
-                        "lhs".into(),
-                        TensorData::new([2, 1], vec![1.0, 1.0]).unwrap()
-                    ),
-                    (
-                        "rhs".into(),
-                        TensorData::new([1, 3], vec![1.0, 1.000_005, 1.0]).unwrap(),
-                    ),
-                ]),
-            )
-            .unwrap()
-            .scalar_at(0)
-            .as_bool()
-    );
+    assert!(CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::new([2, 1], vec![1.0, 1.0]).unwrap()
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::new([1, 3], vec![1.0, 1.000_005, 1.0]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap()
+        .scalar_at(0)
+        .as_bool());
 
     let mut specials = Graph::new();
     let lhs = specials.input("lhs", [3]);
@@ -568,50 +564,44 @@ fn allclose_matches_tinygrad_isclose_then_all_for_broadcast_special_and_empty_do
             .unwrap(),
         ),
     ]);
-    assert!(
-        !CpuBackend
-            .execute(&specials, unequal_nan, &bindings)
-            .unwrap()
-            .scalar_at(0)
-            .as_bool()
-    );
-    assert!(
-        CpuBackend
-            .execute(&specials, equal_nan, &bindings)
-            .unwrap()
-            .scalar_at(0)
-            .as_bool()
-    );
+    assert!(!CpuBackend
+        .execute(&specials, unequal_nan, &bindings)
+        .unwrap()
+        .scalar_at(0)
+        .as_bool());
+    assert!(CpuBackend
+        .execute(&specials, equal_nan, &bindings)
+        .unwrap()
+        .scalar_at(0)
+        .as_bool());
 
     let mut empty = Graph::new();
     let lhs = empty.input_dtype("lhs", [0, 3], DType::BF16);
     let rhs = empty.input_dtype("rhs", [1, 3], DType::BF16);
     let output = empty.allclose(lhs, rhs, 1e-5, 1e-8, false).unwrap();
-    assert!(
-        CpuBackend
-            .execute(
-                &empty,
-                output,
-                &HashMap::from([
-                    (
-                        "lhs".into(),
-                        TensorData::from_scalars([0, 3], DType::BF16, []).unwrap(),
-                    ),
-                    (
-                        "rhs".into(),
-                        TensorData::from_scalars(
-                            [1, 3],
-                            DType::BF16,
-                            [Scalar::F(1.0), Scalar::F(-0.0), Scalar::F(f64::INFINITY)],
-                        )
-                        .unwrap(),
-                    ),
-                ]),
-            )
-            .unwrap()
-            .scalar_at(0)
-            .as_bool()
-    );
+    assert!(CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars([0, 3], DType::BF16, []).unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [1, 3],
+                        DType::BF16,
+                        [Scalar::F(1.0), Scalar::F(-0.0), Scalar::F(f64::INFINITY)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap()
+        .scalar_at(0)
+        .as_bool());
 }
 
 #[test]
@@ -636,11 +626,9 @@ fn allclose_commits_tolerances_at_rhs_width_and_preflights_before_constants() {
     let overflow = malformed.input_dtype("overflow", [usize::MAX], DType::F64);
     let scalar = malformed.input_dtype("scalar", [], DType::F64);
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .allclose(overflow, scalar, 1e-5, 1e-8, false)
-            .is_err()
-    );
+    assert!(malformed
+        .allclose(overflow, scalar, 1e-5, 1e-8, false)
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -816,11 +804,9 @@ fn isclose_scalar_preserves_special_empty_and_atomic_failure_contracts() {
     let overflow = malformed.input_dtype("overflow", [usize::MAX], DType::F64);
     let scalar = malformed.input_dtype("scalar", [], DType::F64);
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .isclose_scalar(overflow, scalar, 1e-5, 1e-8, false)
-            .is_err()
-    );
+    assert!(malformed
+        .isclose_scalar(overflow, scalar, 1e-5, 1e-8, false)
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 }
 
@@ -861,9 +847,8 @@ fn logaddexp_reuses_tinygrad_lub_operands_and_preserves_stable_composition() {
     let lhs = differentiable.input("lhs", [1, 2]);
     let rhs = differentiable.input("rhs", [1]);
     let output = differentiable.logaddexp(lhs, rhs).unwrap();
-    let gradient = differentiable
-        .grad(differentiable.sum_all(output).unwrap(), lhs)
-        .unwrap();
+    let loss = differentiable.sum_all(output).unwrap();
+    let gradient = differentiable.grad(loss, lhs).unwrap();
     assert_eq!(differentiable.shape(gradient).unwrap(), &Shape::new([1, 2]));
 
     let mut specials = Graph::new();
@@ -905,35 +890,33 @@ fn logaddexp_reuses_tinygrad_lub_operands_and_preserves_stable_composition() {
     let output = empty.logaddexp(lhs, rhs).unwrap();
     assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
     assert_eq!(empty.dtype(output).unwrap(), DType::F16);
-    assert!(
-        CpuBackend
-            .execute(
-                &empty,
-                output,
-                &HashMap::from([
-                    (
-                        "lhs".into(),
-                        TensorData::from_scalars([0, 3], DType::F16, []).unwrap()
-                    ),
-                    (
-                        "rhs".into(),
-                        TensorData::from_scalars(
-                            [1, 3],
-                            DType::F16,
-                            [
-                                Scalar::F(-0.0),
-                                Scalar::F(f64::INFINITY),
-                                Scalar::F(f64::NAN)
-                            ],
-                        )
-                        .unwrap(),
-                    ),
-                ]),
-            )
-            .unwrap()
-            .to_vec_f64()
-            .is_empty()
-    );
+    assert!(CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars([0, 3], DType::F16, []).unwrap()
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [1, 3],
+                        DType::F16,
+                        [
+                            Scalar::F(-0.0),
+                            Scalar::F(f64::INFINITY),
+                            Scalar::F(f64::NAN)
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap()
+        .to_vec_f64()
+        .is_empty());
 }
 
 #[test]
@@ -1197,30 +1180,18 @@ fn public_where_scalar_branches_match_tinygrad_reference_order() {
     let boolean = weak.input_dtype("boolean", [], DType::Bool);
     let integral = weak.input_dtype("integral", [], DType::I16);
     let narrow = weak.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        weak.dtype(
-            weak.where_true_scalar(condition, Scalar::I(1), boolean)
-                .unwrap()
-        )
-        .unwrap(),
-        DType::I32,
-    );
-    assert_eq!(
-        weak.dtype(
-            weak.where_false_scalar(condition, integral, Scalar::F(-0.0))
-                .unwrap()
-        )
-        .unwrap(),
-        DType::F32,
-    );
-    assert_eq!(
-        weak.dtype(
-            weak.where_true_scalar(condition, Scalar::I(1), narrow)
-                .unwrap()
-        )
-        .unwrap(),
-        DType::F16,
-    );
+    let boolean_output = weak
+        .where_true_scalar(condition, Scalar::I(1), boolean)
+        .unwrap();
+    assert_eq!(weak.dtype(boolean_output).unwrap(), DType::I32);
+    let integral_output = weak
+        .where_false_scalar(condition, integral, Scalar::F(-0.0))
+        .unwrap();
+    assert_eq!(weak.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = weak
+        .where_true_scalar(condition, Scalar::I(1), narrow)
+        .unwrap();
+    assert_eq!(weak.dtype(narrow_output).unwrap(), DType::F16);
 
     // The live alias preserves the existing source F32 bridge for I64/U64.
     let mut bridge = Graph::new();
@@ -1751,12 +1722,8 @@ fn equality_scalar_forms_preserve_weak_lub_and_eq_not_ne_structure() {
 
     let mut scalar = Graph::new();
     let input = scalar.input_dtype("input", [], DType::F64);
-    assert_eq!(
-        scalar
-            .shape(scalar.eq_scalar(input, Scalar::F(-0.0)).unwrap())
-            .unwrap(),
-        &Shape::new([])
-    );
+    let output = scalar.eq_scalar(input, Scalar::F(-0.0)).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
 
     let mut empty = Graph::new();
     let input = empty.input_dtype("input", [0, 2], DType::BF16);
@@ -2575,24 +2542,12 @@ fn ordered_comparison_scalar_forms_preserve_tensor_and_reflected_orientations() 
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integer = mixed.input_dtype("integer", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.lt_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::Bool
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.scalar_ge(Scalar::F(-0.0), integer).unwrap())
-            .unwrap(),
-        DType::Bool
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.gt_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::Bool
-    );
+    let boolean_output = mixed.lt_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::Bool);
+    let integer_output = mixed.scalar_ge(Scalar::F(-0.0), integer).unwrap();
+    assert_eq!(mixed.dtype(integer_output).unwrap(), DType::Bool);
+    let narrow_output = mixed.gt_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::Bool);
     assert!(
         (0..mixed.node_count()).any(|index| matches!(mixed.op(NodeId(index)).unwrap(),
         Op::Constant(data) if data.dtype() == DType::I32 && data.scalar_at(0).as_i64() == 1))
@@ -2607,12 +2562,8 @@ fn ordered_comparison_scalar_forms_preserve_tensor_and_reflected_orientations() 
 
     let mut scalar = Graph::new();
     let input = scalar.input_dtype("input", [], DType::F64);
-    assert_eq!(
-        scalar
-            .shape(scalar.ge_scalar(input, Scalar::F(-0.0)).unwrap())
-            .unwrap(),
-        &Shape::new([])
-    );
+    let output = scalar.ge_scalar(input, Scalar::F(-0.0)).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
 
     let mut empty = Graph::new();
     let input = empty.input_dtype("input", [0, 2], DType::BF16);
@@ -2749,32 +2700,18 @@ fn add_scalar_commits_weak_values_and_preserves_reflected_root_order() {
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.add_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::I32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.scalar_add(Scalar::F(-0.0), integral).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.add_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F16
-    );
+    let boolean_output = mixed.add_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
+    let integral_output = mixed.scalar_add(Scalar::F(-0.0), integral).unwrap();
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = mixed.add_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [2], DType::I64);
     let rhs = bridge.input_dtype("rhs", [2], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.add(lhs, rhs).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.add(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut specials = Graph::new();
     let input = specials.input_dtype("input", [2, 1], DType::F64);
@@ -2796,7 +2733,7 @@ fn add_scalar_commits_weak_values_and_preserves_reflected_root_order() {
     let loss = specials.sum_all(negative_zero).unwrap();
     let gradient = specials.grad(loss, input).unwrap();
     assert_eq!(specials.shape(gradient).unwrap(), &Shape::new([2, 1]));
-    let reverse_loss = specials.sum_all(infinity).unwrap();
+    let reverse_loss = specials.sum_all(nan).unwrap();
     let reverse_gradient = specials.grad(reverse_loss, input).unwrap();
     assert_eq!(
         specials.shape(reverse_gradient).unwrap(),
@@ -3033,32 +2970,18 @@ fn sub_scalar_preserves_tinygrad_neg_then_add_and_reflected_order() {
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.sub_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::I32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.scalar_sub(Scalar::F(-0.0), integral).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.sub_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F16
-    );
+    let boolean_output = mixed.sub_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
+    let integral_output = mixed.scalar_sub(Scalar::F(-0.0), integral).unwrap();
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = mixed.sub_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [2], DType::I64);
     let rhs = bridge.input_dtype("rhs", [2], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.sub(lhs, rhs).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.sub(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut specials = Graph::new();
     let input = specials.input_dtype("input", [2, 1], DType::F64);
@@ -3323,32 +3246,18 @@ fn mul_scalar_commits_weak_values_and_preserves_reflected_root_order() {
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.mul_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::I32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.scalar_mul(Scalar::F(-0.0), integral).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.mul_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F16
-    );
+    let boolean_output = mixed.mul_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::I32);
+    let integral_output = mixed.scalar_mul(Scalar::F(-0.0), integral).unwrap();
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = mixed.mul_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [2], DType::I64);
     let rhs = bridge.input_dtype("rhs", [2], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.mul(lhs, rhs).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.mul(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut specials = Graph::new();
     let input = specials.input_dtype("input", [2, 1], DType::F64);
@@ -3678,32 +3587,18 @@ fn div_scalar_preserves_true_division_roles_and_storage_boundaries() {
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.div_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.scalar_div(Scalar::F(-0.0), integral).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.div_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F16
-    );
+    let boolean_output = mixed.div_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    let integral_output = mixed.scalar_div(Scalar::F(-0.0), integral).unwrap();
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = mixed.div_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [2], DType::I64);
     let rhs = bridge.input_dtype("rhs", [2], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.div(lhs, rhs).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.div(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut specials = Graph::new();
     let input = specials.input_dtype("input", [2, 1], DType::F64);
@@ -3878,10 +3773,8 @@ fn div_matches_tinygrad_bool_special_values_and_broadcast_vjp() {
     let mut narrow = Graph::new();
     let lhs = narrow.input_dtype("lhs", [], DType::F16);
     let rhs = narrow.input_dtype("rhs", [], DType::F16);
-    assert_eq!(
-        narrow.dtype(narrow.div(lhs, rhs).unwrap()).unwrap(),
-        DType::F16
-    );
+    let output = narrow.div(lhs, rhs).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::F16);
 }
 
 #[test]
@@ -4062,10 +3955,8 @@ fn trunc_div_matches_tinygrad_bool_float_special_values_and_narrow_dtype() {
     let mut narrow = Graph::new();
     let lhs = narrow.input_dtype("lhs", [], DType::F16);
     let rhs = narrow.input_dtype("rhs", [], DType::F16);
-    assert_eq!(
-        narrow.dtype(narrow.trunc_div(lhs, rhs).unwrap()).unwrap(),
-        DType::F16
-    );
+    let output = narrow.trunc_div(lhs, rhs).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::F16);
 }
 
 #[test]
@@ -4137,24 +4028,12 @@ fn trunc_div_scalar_preserves_source_integer_and_float_branches() {
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.trunc_div_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.scalar_trunc_div(Scalar::F(-0.0), integral).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.trunc_div_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F16
-    );
+    let boolean_output = mixed.trunc_div_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    let integral_output = mixed.scalar_trunc_div(Scalar::F(-0.0), integral).unwrap();
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = mixed.trunc_div_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [1, 3], DType::I64);
@@ -4401,32 +4280,18 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.floor_div_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.scalar_floor_div(Scalar::F(-0.0), integral).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.floor_div_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F16
-    );
+    let boolean_output = mixed.floor_div_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    let integral_output = mixed.scalar_floor_div(Scalar::F(-0.0), integral).unwrap();
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = mixed.floor_div_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [2], DType::I64);
     let rhs = bridge.input_dtype("rhs", [2], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.floor_div(lhs, rhs).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.floor_div(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     // Integer zero divisors retain the typed-zero sentinel and the full
     // correction Select tree; no host division or partial scalar publication.
@@ -4572,16 +4437,12 @@ fn floor_div_matches_tinygrad_bool_float_special_values_and_narrow_dtype() {
     let mut narrow = Graph::new();
     let lhs = narrow.input_dtype("lhs", [], DType::F16);
     let rhs = narrow.input_dtype("rhs", [], DType::F16);
-    assert_eq!(
-        narrow.dtype(narrow.floor_div(lhs, rhs).unwrap()).unwrap(),
-        DType::F16
-    );
+    let output = narrow.floor_div(lhs, rhs).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::F16);
     let lhs = narrow.input_dtype("bf16_lhs", [], DType::BF16);
     let rhs = narrow.input_dtype("bf16_rhs", [], DType::BF16);
-    assert_eq!(
-        narrow.dtype(narrow.floor_div(lhs, rhs).unwrap()).unwrap(),
-        DType::BF16
-    );
+    let output = narrow.floor_div(lhs, rhs).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::BF16);
 }
 
 #[test]
@@ -4728,32 +4589,18 @@ fn modulo_scalar_preserves_floor_composition_and_reflected_roles() {
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.modulo_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.scalar_modulo(Scalar::F(-0.0), integral).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.modulo_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F16
-    );
+    let boolean_output = mixed.modulo_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    let integral_output = mixed.scalar_modulo(Scalar::F(-0.0), integral).unwrap();
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = mixed.modulo_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [2], DType::I64);
     let rhs = bridge.input_dtype("rhs", [2], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.modulo(lhs, rhs).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.modulo(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut sentinel = Graph::new();
     let input = sentinel.input_dtype("input", [2], DType::I16);
@@ -4866,32 +4713,18 @@ fn fmod_scalar_preserves_non_reflected_trunc_composition() {
     let boolean = mixed.input_dtype("boolean", [], DType::Bool);
     let integral = mixed.input_dtype("integral", [], DType::I16);
     let narrow = mixed.input_dtype("narrow", [], DType::F16);
-    assert_eq!(
-        mixed
-            .dtype(mixed.fmod_scalar(boolean, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.fmod_scalar(integral, Scalar::F(-0.0)).unwrap())
-            .unwrap(),
-        DType::F32
-    );
-    assert_eq!(
-        mixed
-            .dtype(mixed.fmod_scalar(narrow, Scalar::I(1)).unwrap())
-            .unwrap(),
-        DType::F16
-    );
+    let boolean_output = mixed.fmod_scalar(boolean, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(boolean_output).unwrap(), DType::F32);
+    let integral_output = mixed.fmod_scalar(integral, Scalar::F(-0.0)).unwrap();
+    assert_eq!(mixed.dtype(integral_output).unwrap(), DType::F32);
+    let narrow_output = mixed.fmod_scalar(narrow, Scalar::I(1)).unwrap();
+    assert_eq!(mixed.dtype(narrow_output).unwrap(), DType::F16);
 
     let mut bridge = Graph::new();
     let lhs = bridge.input_dtype("lhs", [2], DType::I64);
     let rhs = bridge.input_dtype("rhs", [2], DType::U64);
-    assert_eq!(
-        bridge.dtype(bridge.fmod(lhs, rhs).unwrap()).unwrap(),
-        DType::F32
-    );
+    let output = bridge.fmod(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
 
     let mut sentinel = Graph::new();
     let input = sentinel.input_dtype("input", [2], DType::I16);
@@ -5069,16 +4902,12 @@ fn modulo_matches_tinygrad_float_bool_special_values_and_vjp() {
     let mut narrow = Graph::new();
     let lhs = narrow.input_dtype("lhs", [], DType::F16);
     let rhs = narrow.input_dtype("rhs", [], DType::F16);
-    assert_eq!(
-        narrow.dtype(narrow.modulo(lhs, rhs).unwrap()).unwrap(),
-        DType::F16
-    );
+    let output = narrow.modulo(lhs, rhs).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::F16);
     let lhs = narrow.input_dtype("bf16_lhs", [], DType::BF16);
     let rhs = narrow.input_dtype("bf16_rhs", [], DType::BF16);
-    assert_eq!(
-        narrow.dtype(narrow.modulo(lhs, rhs).unwrap()).unwrap(),
-        DType::BF16
-    );
+    let output = narrow.modulo(lhs, rhs).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::BF16);
 }
 
 #[test]
@@ -5267,16 +5096,12 @@ fn fmod_matches_tinygrad_float_bool_special_values_and_vjp() {
     let mut narrow = Graph::new();
     let lhs = narrow.input_dtype("lhs", [], DType::F16);
     let rhs = narrow.input_dtype("rhs", [], DType::F16);
-    assert_eq!(
-        narrow.dtype(narrow.fmod(lhs, rhs).unwrap()).unwrap(),
-        DType::F16
-    );
+    let output = narrow.fmod(lhs, rhs).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::F16);
     let lhs = narrow.input_dtype("bf16_lhs", [], DType::BF16);
     let rhs = narrow.input_dtype("bf16_rhs", [], DType::BF16);
-    assert_eq!(
-        narrow.dtype(narrow.fmod(lhs, rhs).unwrap()).unwrap(),
-        DType::BF16
-    );
+    let output = narrow.fmod(lhs, rhs).unwrap();
+    assert_eq!(narrow.dtype(output).unwrap(), DType::BF16);
 }
 
 #[test]
@@ -5524,11 +5349,9 @@ fn hardtanh_scalar_defaults_and_clamp_scalar_failures_are_atomic() {
     let mut overflow = Graph::new();
     let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F32);
     let nodes = overflow.node_count();
-    assert!(
-        overflow
-            .clamp_with_scalars(input, Some(Scalar::F(-1.0)), None)
-            .is_err()
-    );
+    assert!(overflow
+        .clamp_with_scalars(input, Some(Scalar::F(-1.0)), None)
+        .is_err());
     assert_eq!(overflow.node_count(), nodes);
 }
 
@@ -6122,14 +5945,10 @@ fn sign_uses_tinygrad_ordered_nan_and_signed_zero_contract() {
     let unsigned_output = discrete.sign(unsigned).unwrap();
     let f16 = discrete.input_dtype("f16", [], DType::F16);
     let bf16 = discrete.input_dtype("bf16", [], DType::BF16);
-    assert_eq!(
-        discrete.dtype(discrete.sign(f16).unwrap()).unwrap(),
-        DType::F16
-    );
-    assert_eq!(
-        discrete.dtype(discrete.sign(bf16).unwrap()).unwrap(),
-        DType::BF16
-    );
+    let f16_output = discrete.sign(f16).unwrap();
+    assert_eq!(discrete.dtype(f16_output).unwrap(), DType::F16);
+    let bf16_output = discrete.sign(bf16).unwrap();
+    assert_eq!(discrete.dtype(bf16_output).unwrap(), DType::BF16);
     let bindings = HashMap::from([
         ("boolean".into(), bool_data([2], [false, true])),
         (
@@ -6226,9 +6045,8 @@ fn reciprocal_preserves_tinygrad_alu_dtype_special_and_vjp_contract() {
     let mut differentiable = Graph::new();
     let input = differentiable.input_dtype("input", [2], DType::F64);
     let output = differentiable.reciprocal(input).unwrap();
-    let gradient = differentiable
-        .grad(differentiable.sum_all(output).unwrap(), input)
-        .unwrap();
+    let loss = differentiable.sum_all(output).unwrap();
+    let gradient = differentiable.grad(loss, input).unwrap();
     assert_eq!(
         CpuBackend
             .execute(
@@ -6399,14 +6217,11 @@ fn exp_uses_tinygrad_exp2_promotion_special_values_and_vjp() {
     assert_eq!(values.scalar_at(3).as_f64(), 0.0);
     assert!(values.scalar_at(4).as_f64().is_nan());
 
-    let loss = graph.sum_all(output).unwrap();
-    let gradient = graph.grad(loss, input).unwrap();
     let mut differentiable = Graph::new();
     let input = differentiable.input_dtype("input", [2], DType::F64);
     let output = differentiable.exp(input).unwrap();
-    let gradient = differentiable
-        .grad(differentiable.sum_all(output).unwrap(), input)
-        .unwrap();
+    let loss = differentiable.sum_all(output).unwrap();
+    let gradient = differentiable.grad(loss, input).unwrap();
     let gradient_values = CpuBackend
         .execute(
             &differentiable,
@@ -6567,11 +6382,9 @@ fn exp2_preserves_tinygrad_storage_width_special_values_and_vjp() {
         )
         .unwrap()
         .to_vec_f64();
-    assert!(
-        gradient_values
-            .iter()
-            .all(|value| (*value - std::f64::consts::LN_2).abs() < 1e-12)
-    );
+    assert!(gradient_values
+        .iter()
+        .all(|value| (*value - std::f64::consts::LN_2).abs() < 1e-12));
 
     let mut dtypes = Graph::new();
     let f16 = dtypes.input_dtype("f16", [1], DType::F16);
@@ -6640,7 +6453,8 @@ fn exp2_preserves_tinygrad_storage_width_special_values_and_vjp() {
     let mut narrow = Graph::new();
     let input = narrow.input_dtype("input", [1], DType::F16);
     let output = narrow.exp2(input).unwrap();
-    let gradient = narrow.grad(narrow.sum_all(output).unwrap(), input).unwrap();
+    let loss = narrow.sum_all(output).unwrap();
+    let gradient = narrow.grad(loss, input).unwrap();
     assert_eq!(narrow.dtype(gradient).unwrap(), DType::F16);
     assert!(
         (CpuBackend
@@ -7201,21 +7015,19 @@ fn sin_preserves_direct_storage_and_tinygrad_phase_shift_vjp() {
         "tinygrad differentiates sin through a phase-shifted Sin, not Cos"
     );
     let expected = (std::f64::consts::FRAC_PI_2 - 0.0).sin();
-    assert!(
-        CpuBackend
-            .execute(
-                &graph,
-                gradient,
-                &HashMap::from([(
-                    "input".into(),
-                    TensorData::from_scalars([7], DType::F64, [Scalar::F(0.0); 7]).unwrap(),
-                )]),
-            )
-            .unwrap()
-            .to_vec_f64()
-            .iter()
-            .all(|value| (*value - expected).abs() < 1e-12)
-    );
+    assert!(CpuBackend
+        .execute(
+            &graph,
+            gradient,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([7], DType::F64, [Scalar::F(0.0); 7]).unwrap(),
+            )]),
+        )
+        .unwrap()
+        .to_vec_f64()
+        .iter()
+        .all(|value| (*value - expected).abs() < 1e-12));
 
     let mut dtypes = Graph::new();
     for (name, dtype, output_dtype) in [
@@ -7764,28 +7576,29 @@ fn sinh_uses_tinygrad_exp_difference_division_and_preflight() {
         matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Neg, input: source }
             if *source == input)
     }));
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [7],
-                DType::F64,
-                [
-                    Scalar::F(-0.0),
-                    Scalar::F(0.0),
-                    Scalar::F(1.0),
-                    Scalar::F(-1.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(1.0),
+                        Scalar::F(-1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert_eq!(values.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
     assert_eq!(values.scalar_at(1).as_f64().to_bits(), 0.0f64.to_bits());
     assert!(
@@ -7888,28 +7701,29 @@ fn cosh_uses_tinygrad_exp_sum_division_and_preflight() {
         matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Neg, input: source }
             if *source == input)
     }));
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [7],
-                DType::F64,
-                [
-                    Scalar::F(-0.0),
-                    Scalar::F(0.0),
-                    Scalar::F(1.0),
-                    Scalar::F(-1.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(1.0),
+                        Scalar::F(-1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert_eq!(values.scalar_at(0).as_f64().to_bits(), 1.0f64.to_bits());
     assert_eq!(values.scalar_at(1).as_f64().to_bits(), 1.0f64.to_bits());
     assert!(
@@ -8012,28 +7826,29 @@ fn asinh_uses_tinygrad_square_sqrt_log_and_preflight() {
             }
         )
     }));
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [7],
-                DType::F64,
-                [
-                    Scalar::F(-0.0),
-                    Scalar::F(0.0),
-                    Scalar::F(1.0),
-                    Scalar::F(-1.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(1.0),
+                        Scalar::F(-1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert_eq!(values.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
     assert_eq!(values.scalar_at(1).as_f64().to_bits(), 0.0f64.to_bits());
     assert!((values.scalar_at(2).as_f64() - (1.0f64 + 2.0f64.sqrt()).ln()).abs() < 1e-12);
@@ -8129,28 +7944,29 @@ fn acosh_uses_tinygrad_square_sub_sqrt_log_and_preflight() {
             }
         )
     }));
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [7],
-                DType::F64,
-                [
-                    Scalar::F(1.0),
-                    Scalar::F(2.0),
-                    Scalar::F(-0.0),
-                    Scalar::F(0.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(1.0),
+                        Scalar::F(2.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert_eq!(values.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
     assert!((values.scalar_at(1).as_f64() - (2.0f64 + 3.0f64.sqrt()).ln()).abs() < 1e-12);
     assert!(values.scalar_at(2).as_f64().is_nan());
@@ -8246,30 +8062,31 @@ fn atanh_uses_tinygrad_ratio_log_division_and_preflight() {
             }
         )
     }));
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [9],
-                DType::F64,
-                [
-                    Scalar::F(-1.0),
-                    Scalar::F(1.0),
-                    Scalar::F(-0.0),
-                    Scalar::F(0.0),
-                    Scalar::F(0.5),
-                    Scalar::F(2.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [9],
+                    DType::F64,
+                    [
+                        Scalar::F(-1.0),
+                        Scalar::F(1.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(0.5),
+                        Scalar::F(2.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert!(
         values.scalar_at(0).as_f64().is_infinite()
             && values.scalar_at(0).as_f64().is_sign_negative()
@@ -8375,28 +8192,29 @@ fn erf_uses_tinygrad_aands_polynomial_and_preflight() {
             .count()
             >= 2
     );
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [7],
-                DType::F64,
-                [
-                    Scalar::F(-1.0),
-                    Scalar::F(-0.0),
-                    Scalar::F(0.0),
-                    Scalar::F(1.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(-1.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert!((values.scalar_at(0).as_f64() + 0.84270079).abs() < 1e-6);
     assert!(values.scalar_at(1).as_f64().abs() < 1e-12);
     assert!(values.scalar_at(2).as_f64().abs() < 1e-12);
@@ -8471,29 +8289,30 @@ fn floor_uses_tinygrad_trunc_compare_select_and_preflight() {
         matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Trunc, input: source }
             if *source == input)
     }));
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [8],
-                DType::F64,
-                [
-                    Scalar::F(-1.5),
-                    Scalar::F(-1.0),
-                    Scalar::F(-0.0),
-                    Scalar::F(0.5),
-                    Scalar::F(1.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [8],
+                    DType::F64,
+                    [
+                        Scalar::F(-1.5),
+                        Scalar::F(-1.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.5),
+                        Scalar::F(1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert_eq!(values.to_vec_f64()[0..2], [-2.0, -1.0]);
     assert_eq!(values.scalar_at(2).as_f64().to_bits(), (-0.0f64).to_bits());
     assert_eq!(values.scalar_at(3).as_f64(), 0.0);
@@ -8559,29 +8378,30 @@ fn ceil_uses_tinygrad_trunc_compare_select_and_preflight() {
             }
         )
     }));
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [8],
-                DType::F64,
-                [
-                    Scalar::F(-1.5),
-                    Scalar::F(-1.0),
-                    Scalar::F(-0.0),
-                    Scalar::F(0.5),
-                    Scalar::F(1.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [8],
+                    DType::F64,
+                    [
+                        Scalar::F(-1.5),
+                        Scalar::F(-1.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.5),
+                        Scalar::F(1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert_eq!(values.to_vec_f64()[0..2], [-1.0, -1.0]);
     assert_eq!(values.scalar_at(2).as_f64().to_bits(), (-0.0f64).to_bits());
     assert_eq!(values.scalar_at(3).as_f64(), 1.0);
@@ -8639,29 +8459,30 @@ fn trunc_preserves_tinygrad_direct_alu_and_preflight() {
     assert!(
         matches!(graph.op(output).unwrap(), Op::Unary { op: UnaryOp::Trunc, input: source } if *source == input)
     );
-    let values = CpuBackend::execute(
-        &graph,
-        output,
-        &HashMap::from([(
-            "input".into(),
-            TensorData::from_scalars(
-                [8],
-                DType::F64,
-                [
-                    Scalar::F(-1.5),
-                    Scalar::F(-1.0),
-                    Scalar::F(-0.0),
-                    Scalar::F(0.5),
-                    Scalar::F(1.0),
-                    Scalar::F(f64::INFINITY),
-                    Scalar::F(f64::NEG_INFINITY),
-                    Scalar::F(f64::NAN),
-                ],
-            )
-            .unwrap(),
-        )]),
-    )
-    .unwrap();
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [8],
+                    DType::F64,
+                    [
+                        Scalar::F(-1.5),
+                        Scalar::F(-1.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.5),
+                        Scalar::F(1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
     assert_eq!(values.to_vec_f64()[0..2], [-1.0, -1.0]);
     assert_eq!(values.scalar_at(2).as_f64().to_bits(), (-0.0f64).to_bits());
     assert_eq!(values.scalar_at(3).as_f64(), 0.0);
@@ -8873,9 +8694,9 @@ fn bitwise_not_uses_tinygrad_logical_not_or_storage_typed_xor_and_preflights() {
             assert_eq!(mask.dtype(), dtype);
             assert_eq!(mask.shape(), &Shape::new([]));
             match dtype {
-                DType::U8 => assert_eq!(mask.scalar_at(0).as_u64(), u8::MAX.into()),
-                DType::U16 => assert_eq!(mask.scalar_at(0).as_u64(), u16::MAX.into()),
-                DType::U32 => assert_eq!(mask.scalar_at(0).as_u64(), u32::MAX.into()),
+                DType::U8 => assert_eq!(mask.scalar_at(0).as_u64(), u64::from(u8::MAX)),
+                DType::U16 => assert_eq!(mask.scalar_at(0).as_u64(), u64::from(u16::MAX)),
+                DType::U32 => assert_eq!(mask.scalar_at(0).as_u64(), u64::from(u32::MAX)),
                 DType::U64 => assert_eq!(mask.scalar_at(0).as_u64(), u64::MAX),
                 _ => assert_eq!(mask.scalar_at(0).as_i64(), -1),
             }
@@ -9010,7 +8831,7 @@ fn bitwise_binary_public_and_scalar_forms_use_tinygrad_lub_before_publication() 
     assert_eq!(mixed.shape(scalar_output).unwrap(), &Shape::new([]));
     assert!(
         matches!(mixed.op(scalar_output).unwrap(), Op::Binary { op: BinaryOp::BitXor, lhs, rhs }
-        if *lhs == scalar_input && matches!(mixed.op(*rhs).unwrap(), Op::Constant(data) if data.dtype() == DType::U8 && data.scalar_at(0).as_u64() == u8::MAX.into()))
+        if *lhs == scalar_input && matches!(mixed.op(*rhs).unwrap(), Op::Constant(data) if data.dtype() == DType::U8 && data.scalar_at(0).as_u64() == u64::from(u8::MAX)))
     );
     let reflected = mixed
         .scalar_bitwise_and(Scalar::U(3), scalar_input)
@@ -9280,30 +9101,26 @@ fn log10_commits_weak_scale_at_log2_storage_width_and_preflights() {
         DType::U64,
     ] {
         let input = dtypes.input_dtype(format!("{dtype:?}"), [1], dtype);
-        assert_eq!(
-            dtypes.dtype(dtypes.log10(input).unwrap()).unwrap(),
-            DType::F32
-        );
+        let output = dtypes.log10(input).unwrap();
+        assert_eq!(dtypes.dtype(output).unwrap(), DType::F32);
     }
 
     let mut empty = Graph::new();
     let input = empty.input_dtype("input", [0], DType::BF16);
     let output = empty.log10(input).unwrap();
     assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
-    assert!(
-        CpuBackend
-            .execute(
-                &empty,
-                output,
-                &HashMap::from([(
-                    "input".into(),
-                    TensorData::from_scalars([0], DType::BF16, []).unwrap()
-                )]),
-            )
-            .unwrap()
-            .to_vec_f64()
-            .is_empty()
-    );
+    assert!(CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([0], DType::BF16, []).unwrap()
+            )]),
+        )
+        .unwrap()
+        .to_vec_f64()
+        .is_empty());
 
     let before = graph.node_count();
     assert!(matches!(
@@ -9389,30 +9206,26 @@ fn logsigmoid_uses_tinygrad_neg_softplus_neg_with_typed_default_beta() {
         DType::U64,
     ] {
         let input = dtypes.input_dtype(format!("{dtype:?}"), [1], dtype);
-        assert_eq!(
-            dtypes.dtype(dtypes.logsigmoid(input).unwrap()).unwrap(),
-            DType::F32
-        );
+        let output = dtypes.logsigmoid(input).unwrap();
+        assert_eq!(dtypes.dtype(output).unwrap(), DType::F32);
     }
 
     let mut empty = Graph::new();
     let input = empty.input_dtype("input", [0], DType::BF16);
     let output = empty.logsigmoid(input).unwrap();
     assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
-    assert!(
-        CpuBackend
-            .execute(
-                &empty,
-                output,
-                &HashMap::from([(
-                    "input".into(),
-                    TensorData::from_scalars([0], DType::BF16, []).unwrap()
-                )]),
-            )
-            .unwrap()
-            .to_vec_f64()
-            .is_empty()
-    );
+    assert!(CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([0], DType::BF16, []).unwrap()
+            )]),
+        )
+        .unwrap()
+        .to_vec_f64()
+        .is_empty());
 }
 
 #[test]
@@ -9497,11 +9310,9 @@ fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
         )
         .unwrap()
         .to_vec_f64();
-    assert!(
-        gradient_values
-            .iter()
-            .all(|value| (*value - 0.5).abs() < 1e-12)
-    );
+    assert!(gradient_values
+        .iter()
+        .all(|value| (*value - 0.5).abs() < 1e-12));
 
     let mut dtypes = Graph::new();
     let f16 = dtypes.input_dtype("f16", [1], DType::F16);
@@ -9627,11 +9438,9 @@ fn log2_preserves_tinygrad_storage_width_special_values_and_typed_vjp() {
         .unwrap()
         .to_vec_f64();
     let expected = 1.0 / (2.0 * std::f64::consts::LN_2);
-    assert!(
-        gradient_values
-            .iter()
-            .all(|value| (*value - expected).abs() < 1e-12)
-    );
+    assert!(gradient_values
+        .iter()
+        .all(|value| (*value - expected).abs() < 1e-12));
 
     let mut dtypes = Graph::new();
     for (name, dtype, output_dtype) in [
@@ -9990,22 +9799,20 @@ fn lerp_preflights_all_operands_and_preserves_broadcast_vjps() {
     let weight = scalar.input("weight", []);
     let output = scalar.lerp(start, end, weight).unwrap();
     assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
-    assert!(
-        CpuBackend
-            .execute(
-                &scalar,
-                output,
-                &HashMap::from([
-                    ("start".into(), TensorData::scalar(1.0)),
-                    ("end".into(), TensorData::scalar(f32::INFINITY)),
-                    ("weight".into(), TensorData::scalar(0.0)),
-                ]),
-            )
-            .unwrap()
-            .scalar_at(0)
-            .as_f64()
-            .is_nan()
-    );
+    assert!(CpuBackend
+        .execute(
+            &scalar,
+            output,
+            &HashMap::from([
+                ("start".into(), TensorData::scalar(1.0)),
+                ("end".into(), TensorData::scalar(f32::INFINITY)),
+                ("weight".into(), TensorData::scalar(0.0)),
+            ]),
+        )
+        .unwrap()
+        .scalar_at(0)
+        .as_f64()
+        .is_nan());
 
     let mut empty = Graph::new();
     let start = empty.input("start", [0]);
@@ -10410,10 +10217,8 @@ fn linear_is_source_dot_not_raw_matmul_and_is_atomic() {
         .unwrap();
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 4]));
     assert_eq!(graph.dtype(output).unwrap(), DType::F32);
-    assert!(
-        (0..graph.node_count())
-            .all(|node| !matches!(graph.op(NodeId(node)).unwrap(), Op::Matmul { .. }))
-    );
+    assert!((0..graph.node_count())
+        .all(|node| !matches!(graph.op(NodeId(node)).unwrap(), Op::Matmul { .. })));
     assert!((0..graph.node_count()).any(|node| matches!(
         graph.op(NodeId(node)).unwrap(),
         Op::Binary {
@@ -10430,27 +10235,19 @@ fn linear_is_source_dot_not_raw_matmul_and_is_atomic() {
     )));
     // Dot's sole transpose applies to its own reshaped rhs, never directly
     // to the caller's weight as the stale conventional layout did.
-    assert!(
-        (0..graph.node_count())
-            .filter_map(|node| match graph.op(NodeId(node)).unwrap() {
-                Op::Permute { input, .. } => Some(*input),
-                _ => None,
-            })
-            .all(|input| matches!(graph.op(input).unwrap(), Op::Reshape { .. }))
-    );
+    assert!((0..graph.node_count())
+        .filter_map(|node| match graph.op(NodeId(node)).unwrap() {
+            Op::Permute { input, .. } => Some(*input),
+            _ => None,
+        })
+        .all(|input| matches!(graph.op(input).unwrap(), Op::Reshape { .. })));
     let loss = graph.sum_all(output).unwrap();
-    assert_eq!(
-        graph.shape(graph.grad(loss, input).unwrap()).unwrap(),
-        &Shape::new([2, 3])
-    );
-    assert_eq!(
-        graph.shape(graph.grad(loss, weight).unwrap()).unwrap(),
-        &Shape::new([3, 4])
-    );
-    assert_eq!(
-        graph.shape(graph.grad(loss, bias).unwrap()).unwrap(),
-        &Shape::new([4])
-    );
+    let input_gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.shape(input_gradient).unwrap(), &Shape::new([2, 3]));
+    let weight_gradient = graph.grad(loss, weight).unwrap();
+    assert_eq!(graph.shape(weight_gradient).unwrap(), &Shape::new([3, 4]));
+    let bias_gradient = graph.grad(loss, bias).unwrap();
+    assert_eq!(graph.shape(bias_gradient).unwrap(), &Shape::new([4]));
 
     let mut rank_one = Graph::new();
     let input = rank_one.input_dtype("input", [2, 3], DType::U8);
@@ -10509,10 +10306,8 @@ fn public_pad_modes_are_literal_composites_and_atomic() {
     // Nonzero source fill is Bool-mask Where, so its weak scalar can widen
     // the raw-pad payload instead of being forcibly truncated by Op::Pad.
     assert_eq!(constant.dtype(output).unwrap(), DType::F32);
-    assert!(
-        (0..constant.node_count())
-            .any(|node| matches!(constant.op(NodeId(node)).unwrap(), Op::Select { .. }))
-    );
+    assert!((0..constant.node_count())
+        .any(|node| matches!(constant.op(NodeId(node)).unwrap(), Op::Select { .. })));
     let signed_zero = constant
         .pad_with_mode(input, [(0, 0)], PadMode::Constant, Scalar::F(-0.0))
         .unwrap();
@@ -10525,11 +10320,9 @@ fn public_pad_modes_are_literal_composites_and_atomic() {
         .unwrap();
     assert_eq!(circular.shape(output).unwrap(), &Shape::new([3]));
     let nodes = circular.node_count();
-    assert!(
-        circular
-            .pad_with_mode(input, [(4, 0)], PadMode::Circular, Scalar::I(0))
-            .is_err()
-    );
+    assert!(circular
+        .pad_with_mode(input, [(4, 0)], PadMode::Circular, Scalar::I(0))
+        .is_err());
     assert_eq!(circular.node_count(), nodes);
 
     let mut reflected = Graph::new();
@@ -10538,17 +10331,11 @@ fn public_pad_modes_are_literal_composites_and_atomic() {
         .pad_with_mode(input, [(1, -1)], PadMode::Reflect, Scalar::I(0))
         .unwrap();
     assert_eq!(reflected.shape(output).unwrap(), &Shape::new([3]));
-    assert!(
-        (0..reflected.node_count())
-            .any(|node| matches!(reflected.op(NodeId(node)).unwrap(), Op::Stride { .. }))
-    );
+    assert!((0..reflected.node_count())
+        .any(|node| matches!(reflected.op(NodeId(node)).unwrap(), Op::Stride { .. })));
     let loss = reflected.sum_all(output).unwrap();
-    assert_eq!(
-        reflected
-            .shape(reflected.grad(loss, input).unwrap())
-            .unwrap(),
-        &Shape::new([3])
-    );
+    let gradient = reflected.grad(loss, input).unwrap();
+    assert_eq!(reflected.shape(gradient).unwrap(), &Shape::new([3]));
 
     let mut replicate = Graph::new();
     let input = replicate.input("x", [2, 1]);
@@ -10556,10 +10343,8 @@ fn public_pad_modes_are_literal_composites_and_atomic() {
         .pad_with_mode(input, [(0, 0), (2, 1)], PadMode::Replicate, Scalar::I(0))
         .unwrap();
     assert_eq!(replicate.shape(output).unwrap(), &Shape::new([2, 4]));
-    assert!(
-        (0..replicate.node_count())
-            .any(|node| matches!(replicate.op(NodeId(node)).unwrap(), Op::Expand { .. }))
-    );
+    assert!((0..replicate.node_count())
+        .any(|node| matches!(replicate.op(NodeId(node)).unwrap(), Op::Expand { .. })));
 
     let mut scalar = Graph::new();
     let input = scalar.input("x", []);
@@ -10608,15 +10393,11 @@ fn public_pad_to_is_strict_target_shape_and_source_mask_fill() {
         .unwrap();
     assert_eq!(graph.shape(filled).unwrap(), &Shape::new([2, 2]));
     assert_eq!(graph.dtype(filled).unwrap(), DType::F32);
-    assert!(
-        (0..graph.node_count())
-            .any(|node| matches!(graph.op(NodeId(node)).unwrap(), Op::Select { .. }))
-    );
+    assert!((0..graph.node_count())
+        .any(|node| matches!(graph.op(NodeId(node)).unwrap(), Op::Select { .. })));
     let loss = graph.sum_all(default).unwrap();
-    assert_eq!(
-        graph.shape(graph.grad(loss, input).unwrap()).unwrap(),
-        &Shape::new([1, 2])
-    );
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([1, 2]));
 
     // Source returns self before considering `value` when no target extent
     // changes, including a signed-zero/nonrepresentable scalar.
@@ -10637,11 +10418,9 @@ fn public_pad_to_is_strict_target_shape_and_source_mask_fill() {
     let before = malformed.node_count();
     assert!(malformed.pad_to(input, [Some(2)]).is_err());
     assert_eq!(malformed.node_count(), before);
-    assert!(
-        malformed
-            .pad_to(NodeId(usize::MAX), [Some(2), Some(3)])
-            .is_err()
-    );
+    assert!(malformed
+        .pad_to(NodeId(usize::MAX), [Some(2), Some(3)])
+        .is_err());
     assert_eq!(malformed.node_count(), before);
     let overflow = malformed.input_dtype(
         "overflow",
@@ -10719,21 +10498,19 @@ fn softplus_uses_tinygrad_logaddexp_and_preflights_beta() {
     let beta = scalar.input("beta", []);
     let output = scalar.softplus(input, beta).unwrap();
     assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
-    assert!(
-        CpuBackend
-            .execute(
-                &scalar,
-                output,
-                &HashMap::from([
-                    ("input".into(), TensorData::scalar(0.0)),
-                    ("beta".into(), TensorData::scalar(1.0)),
-                ]),
-            )
-            .unwrap()
-            .scalar_at(0)
-            .as_f64()
-            .is_finite()
-    );
+    assert!(CpuBackend
+        .execute(
+            &scalar,
+            output,
+            &HashMap::from([
+                ("input".into(), TensorData::scalar(0.0)),
+                ("beta".into(), TensorData::scalar(1.0)),
+            ]),
+        )
+        .unwrap()
+        .scalar_at(0)
+        .as_f64()
+        .is_finite());
 
     let mut empty = Graph::new();
     let input = empty.input("input", [0]);
@@ -10907,10 +10684,8 @@ fn hardsigmoid_scalar_preserves_source_left_alpha_and_staged_relu_difference() {
         ));
         assert!((0..graph.node_count()).any(|index| matches!(graph.op(NodeId(index)).unwrap(),
             Op::Binary { op: BinaryOp::Mul, lhs, rhs } if matches!(graph.op(*lhs).unwrap(), Op::Constant(_)) && *rhs == input)));
-        assert!(matches!(
-            graph.grad(graph.sum_all(output).unwrap(), input),
-            Ok(_)
-        ));
+        let loss = graph.sum_all(output).unwrap();
+        assert!(matches!(graph.grad(loss, input), Ok(_)));
     }
 
     let mut default = Graph::new();
@@ -11011,10 +10786,8 @@ fn gelu_default_delegates_to_tinygrad_tanh_without_affecting_onnx_mode() {
             ..
         }
     )));
-    assert!(matches!(
-        graph.grad(graph.sum_all(output).unwrap(), input),
-        Ok(_)
-    ));
+    let loss = graph.sum_all(output).unwrap();
+    assert!(matches!(graph.grad(loss, input), Ok(_)));
 
     for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
         let mut narrow = Graph::new();
@@ -11036,12 +10809,8 @@ fn gelu_default_delegates_to_tinygrad_tanh_without_affecting_onnx_mode() {
     ] {
         let mut promoted = Graph::new();
         let input = promoted.input_dtype("input", [], dtype);
-        assert_eq!(
-            promoted
-                .dtype(promoted.gelu_default(input).unwrap())
-                .unwrap(),
-            DType::F32
-        );
+        let output = promoted.gelu_default(input).unwrap();
+        assert_eq!(promoted.dtype(output).unwrap(), DType::F32);
     }
 
     let mut empty = Graph::new();
@@ -11088,10 +10857,8 @@ fn batchnorm_is_source_literal_affine_with_raw_axis_membership() {
             ..
         }
     ));
-    assert!(matches!(
-        graph.grad(graph.sum_all(output).unwrap(), input),
-        Ok(_)
-    ));
+    let loss = graph.sum_all(output).unwrap();
+    assert!(matches!(graph.grad(loss, input), Ok(_)));
 
     let mut default_axis = Graph::new();
     let input = default_axis.input("x", [2, 3]);
@@ -11173,7 +10940,7 @@ fn source_dot_uses_tinygrad_typed_sum_and_source_layout() {
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 4]));
     assert_eq!(graph.dtype(output).unwrap(), DType::F16);
     assert!(graph.nodes.iter().any(|node| {
-        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: false, .. } if axes == &vec![-1])
+        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: false, .. } if axes == &vec![2])
             && node.dtype == DType::F32
     }));
     // Narrow products are accumulated in F32, then source-cast back.
@@ -11195,7 +10962,8 @@ fn source_dot_uses_tinygrad_typed_sum_and_source_layout() {
     let loss = graph.sum_all(output).unwrap();
     let gradient = graph.grad(loss, lhs).unwrap();
     assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 3]));
-    assert!(graph.grad(graph.sum_all(gradient).unwrap(), lhs).is_ok());
+    let gradient_loss = graph.sum_all(gradient).unwrap();
+    assert!(graph.grad(gradient_loss, lhs).is_ok());
 
     // The literal Mul then Sum sequence owns IEEE special propagation rather
     // than inheriting a raw Matmul implementation.
@@ -11331,35 +11099,31 @@ fn qr_is_full_householder_composition_with_typed_dot_updates() {
             ..
         }
     )));
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Select { .. }))
-    );
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Select { .. })));
     assert!(graph.nodes.iter().any(|node| {
-        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, axes, .. } if axes == &vec![-1])
+        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, axes, .. } if axes.len() == 1)
             && node.dtype == DType::F32
     }));
-    assert!(
-        !graph
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Matmul { .. }))
-    );
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Matmul { .. })));
     // Eye and the Householder row index use scalar-backed lazy ranges only.
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.op {
-                Op::Constant(data) => Some(data.len()),
-                _ => None,
-            })
-            .all(|len| len == 1)
-    );
-    assert!(graph.grad(graph.sum_all(q).unwrap(), input).is_ok());
-    assert!(graph.grad(graph.sum_all(r).unwrap(), input).is_ok());
+    assert!(graph
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Constant(data) => Some(data.len()),
+            _ => None,
+        })
+        .all(|len| len == 1));
+    let q_loss = graph.sum_all(q).unwrap();
+    assert!(graph.grad(q_loss, input).is_ok());
+    let r_loss = graph.sum_all(r).unwrap();
+    assert!(graph.grad(r_loss, input).is_ok());
 }
 
 #[test]
@@ -11434,27 +11198,24 @@ fn newton_schulz_is_source_literal_typed_dot_polynomial() {
     )));
     assert!(graph.nodes.iter().any(|node| {
         matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: true, .. }
-            if axes == &vec![-2, -1])
+            if axes == &vec![0, 1])
     }));
     // Every polynomial Gram/update product is the typed Dot composite, not
     // raw Matmul, and lazy/scalar construction never carries a dense payload.
-    assert!(
-        !graph
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Matmul { .. }))
-    );
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.op {
-                Op::Constant(data) => Some(data.len()),
-                _ => None,
-            })
-            .all(|len| len == 1)
-    );
-    assert!(graph.grad(graph.sum_all(output).unwrap(), input).is_ok());
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Matmul { .. })));
+    assert!(graph
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Constant(data) => Some(data.len()),
+            _ => None,
+        })
+        .all(|len| len == 1));
+    let loss = graph.sum_all(output).unwrap();
+    assert!(graph.grad(loss, input).is_ok());
 }
 
 #[test]
@@ -11465,11 +11226,10 @@ fn newton_schulz_covers_rectangular_batches_steps_and_empty_shapes() {
         .newton_schulz(input, 1, &[1, -1], f64::INFINITY)
         .unwrap();
     assert_eq!(tall.shape(output).unwrap(), &Shape::new([3, 2]));
-    assert!(
-        tall.nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Permute { .. }))
-    );
+    assert!(tall
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Permute { .. })));
 
     let mut batched = Graph::new();
     let input = batched.input_dtype("x", [2, 2, 4], DType::I16);
@@ -11542,39 +11302,32 @@ fn scatter_reduce_is_source_one_hot_select_composition_for_every_kind() {
                 .unwrap();
             assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
             assert_eq!(graph.dtype(output).unwrap(), DType::F16);
-            assert!(
-                graph
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(&node.op, Op::Select { .. }))
-            );
-            assert!(
-                graph
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(&node.op, Op::Reduce { axes, .. } if axes == &vec![-1]))
-            );
+            assert!(graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Select { .. })));
+            assert!(graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Reduce { axes, .. } if axes.len() == 1)));
             // Invalid negative/out-of-range labels stay false through Eq and
             // Select; raw Scatter would instead expose an indexing contract.
-            assert!(
-                !graph
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(&node.op, Op::Scatter { .. }))
-            );
-            assert!(
-                graph
-                    .nodes
-                    .iter()
-                    .filter_map(|node| match &node.op {
-                        Op::Constant(data) => Some(data.len()),
-                        _ => None,
-                    })
-                    .all(|length| length == 1)
-            );
-            assert!(graph.grad(graph.sum_all(output).unwrap(), base).is_ok());
-            assert!(graph.grad(graph.sum_all(output).unwrap(), src).is_ok());
-            assert!(graph.grad(graph.sum_all(output).unwrap(), index).is_err());
+            assert!(!graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Scatter { .. })));
+            assert!(graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|length| length == 1));
+            let loss = graph.sum_all(output).unwrap();
+            assert!(graph.grad(loss, base).is_ok());
+            assert!(graph.grad(loss, src).is_ok());
+            assert!(graph.grad(loss, index).is_err());
         }
     }
 }
@@ -11616,27 +11369,23 @@ fn scatter_reduce_covers_signed_dims_zero_domains_and_dtype_boundaries() {
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 0]));
     // The Bool one-hot range is source-default I32 unless endpoint planning
     // requires I64; it is never materialized as a dense class constant.
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.op {
-                Op::Constant(data) => Some(data.len()),
-                _ => None,
-            })
-            .all(|length| length == 1)
-    );
+    assert!(graph
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Constant(data) => Some(data.len()),
+            _ => None,
+        })
+        .all(|length| length == 1));
 
     let mut scalar = Graph::new();
     let base = scalar.input_dtype("base", [], DType::F32);
     let index = scalar.input_dtype("index", [], DType::I32);
     let src = scalar.input_dtype("src", [], DType::F32);
     let before = scalar.node_count();
-    assert!(
-        scalar
-            .scatter_reduce_default(base, 0, index, src, ScatterReduceKind::Sum)
-            .is_err()
-    );
+    assert!(scalar
+        .scatter_reduce_default(base, 0, index, src, ScatterReduceKind::Sum)
+        .is_err());
     assert_eq!(scalar.node_count(), before);
 }
 
@@ -11647,11 +11396,9 @@ fn scatter_reduce_preflights_malformed_and_late_overflow_atomically() {
     let index = malformed.input_dtype("index", [2, 2], DType::F32);
     let src = malformed.input_dtype("src", [2, 2], DType::F32);
     let before = malformed.node_count();
-    assert!(
-        malformed
-            .scatter_reduce_default(base, 1, index, src, ScatterReduceKind::Sum)
-            .is_err()
-    );
+    assert!(malformed
+        .scatter_reduce_default(base, 1, index, src, ScatterReduceKind::Sum)
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 
     let mut overflow = Graph::new();
@@ -11702,15 +11449,14 @@ fn tinygrad_scatter_replacement_is_ordered_mask_fold_not_raw_scatter() {
             .count()
             >= 3
     );
-    assert!(
-        !graph
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Scatter { .. }))
-    );
-    assert!(graph.grad(graph.sum_all(output).unwrap(), base).is_ok());
-    assert!(graph.grad(graph.sum_all(output).unwrap(), src).is_ok());
-    assert!(graph.grad(graph.sum_all(output).unwrap(), index).is_err());
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Scatter { .. })));
+    let loss = graph.sum_all(output).unwrap();
+    assert!(graph.grad(loss, base).is_ok());
+    assert!(graph.grad(loss, src).is_ok());
+    assert!(graph.grad(loss, index).is_err());
 }
 
 #[test]
@@ -11742,29 +11488,23 @@ fn tinygrad_scatter_scalar_modes_reuse_literal_scatter_reduce() {
                 .scatter_tinygrad(base, 1, index, ScatterSource::Scalar(Scalar::F(-0.0)), mode)
                 .unwrap();
             assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
-            assert!(
-                !graph
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(&node.op, Op::Scatter { .. }))
-            );
-            assert!(
-                graph
-                    .nodes
-                    .iter()
-                    .filter_map(|node| match &node.op {
-                        Op::Constant(data) => Some(data.len()),
-                        _ => None,
-                    })
-                    .all(|length| length == 1)
-            );
+            assert!(!graph
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, Op::Scatter { .. })));
+            assert!(graph
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Op::Constant(data) => Some(data.len()),
+                    _ => None,
+                })
+                .all(|length| length == 1));
             if mode != ScatterMode::Replace {
-                assert!(
-                    graph
-                        .nodes
-                        .iter()
-                        .any(|node| matches!(&node.op, Op::Reduce { .. }))
-                );
+                assert!(graph
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(&node.op, Op::Reduce { .. })));
             }
         }
     }
@@ -11777,22 +11517,18 @@ fn tinygrad_scatter_preflights_live_reduce_shapes_and_late_fold_overflow() {
     let index = live_reduce.input_dtype("index", [2, 2], DType::I32);
     let src = live_reduce.input_dtype("src", [2, 2], DType::F32);
     let before = live_reduce.node_count();
-    assert!(
-        live_reduce
-            .scatter_tinygrad(base, 1, index, ScatterSource::Tensor(src), ScatterMode::Add)
-            .is_err()
-    );
+    assert!(live_reduce
+        .scatter_tinygrad(base, 1, index, ScatterSource::Tensor(src), ScatterMode::Add)
+        .is_err());
     assert_eq!(live_reduce.node_count(), before);
 
     let mut mismatch = Graph::new();
     let base = mismatch.input_dtype("base", [2, 3], DType::F32);
     let index = mismatch.input_dtype("index", [2, 2], DType::F32);
     let before = mismatch.node_count();
-    assert!(
-        mismatch
-            .scatter_tinygrad_default(base, 1, index, ScatterSource::Scalar(Scalar::I(1)))
-            .is_err()
-    );
+    assert!(mismatch
+        .scatter_tinygrad_default(base, 1, index, ScatterSource::Scalar(Scalar::I(1)))
+        .is_err());
     assert_eq!(mismatch.node_count(), before);
 
     let mut overflow = Graph::new();
@@ -11815,18 +11551,14 @@ fn tinygrad_gather_is_source_one_hot_select_not_raw_gather() {
     let output = graph.gather_tinygrad(value, -1, index).unwrap();
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 2]));
     assert_eq!(graph.dtype(output).unwrap(), DType::F16);
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Shrink { .. }))
-    );
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Select { .. }))
-    );
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Shrink { .. })));
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Select { .. })));
     assert!(graph.nodes.iter().any(|node| matches!(
         &node.op,
         Op::Reduce {
@@ -11834,24 +11566,21 @@ fn tinygrad_gather_is_source_one_hot_select_not_raw_gather() {
             ..
         }
     )));
-    assert!(
-        !graph
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Gather { .. }))
-    );
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.op {
-                Op::Constant(data) => Some(data.len()),
-                _ => None,
-            })
-            .all(|length| length == 1)
-    );
-    assert!(graph.grad(graph.sum_all(output).unwrap(), value).is_ok());
-    assert!(graph.grad(graph.sum_all(output).unwrap(), index).is_err());
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Gather { .. })));
+    assert!(graph
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Constant(data) => Some(data.len()),
+            _ => None,
+        })
+        .all(|length| length == 1));
+    let loss = graph.sum_all(output).unwrap();
+    assert!(graph.grad(loss, value).is_ok());
+    assert!(graph.grad(loss, index).is_err());
 }
 
 #[test]
@@ -11922,12 +11651,10 @@ fn tinygrad_matmul_wrappers_are_exact_typed_dot_shells() {
     assert_eq!(forward.dtype(output).unwrap(), DType::F16);
     assert!(forward.nodes.iter().any(|node| matches!(&node.op,
         Op::Reduce { kind: ReduceKind::Sum, .. } if node.dtype == DType::F32)));
-    assert!(
-        !forward
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Matmul { .. }))
-    );
+    assert!(!forward
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Matmul { .. })));
 
     let mut reflected = Graph::new();
     let rhs = reflected.input_dtype("rhs", [3, 4], DType::I64);
@@ -11935,12 +11662,10 @@ fn tinygrad_matmul_wrappers_are_exact_typed_dot_shells() {
     let output = reflected.rmatmul_tinygrad_default(rhs, lhs).unwrap();
     assert_eq!(reflected.shape(output).unwrap(), &Shape::new([2, 4]));
     assert_eq!(reflected.dtype(output).unwrap(), DType::F32);
-    assert!(
-        !reflected
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, Op::Matmul { .. }))
-    );
+    assert!(!reflected
+        .nodes
+        .iter()
+        .any(|node| matches!(&node.op, Op::Matmul { .. })));
 }
 
 #[test]
@@ -11959,7 +11684,8 @@ fn tinygrad_matmul_wrappers_cover_rank_families_dtype_and_atomic_errors() {
         .unwrap();
     assert_eq!(batch.shape(output).unwrap(), &Shape::new([2, 3, 5]));
     assert_eq!(batch.dtype(output).unwrap(), DType::F64);
-    assert!(batch.grad(batch.sum_all(output).unwrap(), lhs).is_ok());
+    let loss = batch.sum_all(output).unwrap();
+    assert!(batch.grad(loss, lhs).is_ok());
 
     let mut scalar = Graph::new();
     let lhs = scalar.input_dtype("lhs", [], DType::F32);
@@ -12012,7 +11738,8 @@ fn tinygrad_usum_and_uprod_are_ordered_receiver_selected_folds() {
         if *lhs == first && *rhs == second)
     );
     assert_eq!(numeric.shape(sum).unwrap(), &Shape::new([2, 3]));
-    assert!(numeric.grad(numeric.sum_all(sum).unwrap(), first).is_ok());
+    let sum_loss = numeric.sum_all(sum).unwrap();
+    assert!(numeric.grad(sum_loss, first).is_ok());
 
     let product = numeric.uprod(first, &[second, third]).unwrap();
     let Op::Binary {
@@ -12028,11 +11755,8 @@ fn tinygrad_usum_and_uprod_are_ordered_receiver_selected_folds() {
         matches!(numeric.op(*product_prefix).unwrap(), Op::Binary { op: BinaryOp::Mul, lhs, rhs }
         if *lhs == first && *rhs == second)
     );
-    assert!(
-        numeric
-            .grad(numeric.sum_all(product).unwrap(), first)
-            .is_ok()
-    );
+    let product_loss = numeric.sum_all(product).unwrap();
+    assert!(numeric.grad(product_loss, first).is_ok());
 
     let mut boolean = Graph::new();
     let first = boolean.input_dtype("first", [2], DType::Bool);
