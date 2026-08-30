@@ -4926,12 +4926,13 @@ mod tests {
         );
         let narrow = graph.add(x, integer).unwrap();
         assert_eq!(graph.dtype(narrow).unwrap(), DType::F8E4M3);
-        assert!(matches!(
-            CpuBackend.execute(&graph, narrow, &HashMap::from([("x".into(), lhs)])),
-            Err(Error::UnsupportedDType {
-                dtype: DType::F8E4M3
-            })
-        ));
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, narrow, &HashMap::from([("x".into(), lhs)]))
+                .unwrap()
+                .to_vec_f64(),
+            vec![2.0, 4.0]
+        );
     }
 
     #[test]
