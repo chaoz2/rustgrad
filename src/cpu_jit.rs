@@ -3626,7 +3626,7 @@ mod tests {
         assert!(finite_source.contains("!="));
         assert!(matches!(
             composed.grad(both, input),
-            Err(crate::Error::NoGradient(_))
+            Err(crate::Error::NonDifferentiableTarget(node)) if node == both
         ));
     }
 

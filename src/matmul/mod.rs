@@ -273,12 +273,14 @@ fn geometry(lhs_shape: &Shape, rhs_shape: &Shape) -> Result<MatmulGeometry, Matm
     let rank = lhs_batch.len().max(rhs_batch.len());
     let mut batch_shape = Vec::with_capacity(rank);
     for i in 0..rank {
-        let lhs = lhs_batch
-            .get(i + lhs_batch.len().saturating_sub(rank))
+        let lhs = i
+            .checked_sub(rank - lhs_batch.len())
+            .and_then(|axis| lhs_batch.get(axis))
             .copied()
             .unwrap_or(1);
-        let rhs = rhs_batch
-            .get(i + rhs_batch.len().saturating_sub(rank))
+        let rhs = i
+            .checked_sub(rank - rhs_batch.len())
+            .and_then(|axis| rhs_batch.get(axis))
             .copied()
             .unwrap_or(1);
         if lhs != rhs && lhs != 1 && rhs != 1 {

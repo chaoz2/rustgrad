@@ -4119,7 +4119,8 @@ fn trunc_div_scalar_preserves_source_integer_and_float_branches() {
             ..
         }
     ));
-    let gradient = specials.grad(negative_zero, input).unwrap();
+    let loss = specials.sum_all(negative_zero).unwrap();
+    let gradient = specials.grad(loss, input).unwrap();
     assert_eq!(specials.dtype(gradient).unwrap(), DType::F64);
 
     let mut empty = Graph::new();
@@ -4358,7 +4359,8 @@ fn floor_div_scalar_preserves_source_integer_and_float_branches() {
     for output in [negative_zero, infinity, nan] {
         assert!(matches!(specials.op(output).unwrap(), Op::Select { .. }));
     }
-    let gradient = specials.grad(negative_zero, input).unwrap();
+    let loss = specials.sum_all(negative_zero).unwrap();
+    let gradient = specials.grad(loss, input).unwrap();
     assert_eq!(specials.dtype(gradient).unwrap(), DType::F64);
 
     let mut empty = Graph::new();
