@@ -9,11 +9,11 @@ use super::{
         typed_scalar_i64_attr,
     },
     tensor::{onnx_dtype, tensor_data},
-    wire::{Msg, var},
+    wire::{var, Msg},
 };
 use crate::{
-    Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, Slice,
-    TensorData, ir::reduction_shape,
+    ir::reduction_shape, Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType, Result,
+    Scalar, Shape, Slice, TensorData,
 };
 use std::collections::BTreeMap;
 
@@ -5158,7 +5158,11 @@ fn cumsum_plan(
                     .enumerate()
                     .map(
                         |(dimension, &extent)| {
-                            if dimension == axis { end + 1 } else { extent }
+                            if dimension == axis {
+                                end + 1
+                            } else {
+                                extent
+                            }
                         },
                     )
                     .collect::<Vec<_>>(),
@@ -6512,7 +6516,8 @@ pub(super) fn lower(
                 let alpha = g.constant(plan.alpha);
                 let bias = g.constant(plan.bias);
                 let beta = g.constant(plan.beta);
-                let denominator = g.add(g.mul(pooled, alpha)?, bias)?;
+                let scaled = g.mul(pooled, alpha)?;
+                let denominator = g.add(scaled, bias)?;
                 let denominator = g.pow(denominator, beta)?;
                 let numerator = if plan.input_dtype == plan.output_dtype {
                     input
@@ -6628,11 +6633,14 @@ pub(super) fn lower(
                 let alpha = g.constant(plan.alpha);
                 // Match Tensor.elu literally: each ReLU is a strict select.
                 // This intentionally maps NaN through the false branch.
-                let positive = g.select(g.gt(x, zero)?, x, zero)?;
+                let positive_condition = g.gt(x, zero)?;
+                let positive = g.select(positive_condition, x, zero)?;
                 let exp_x = g.exp(x)?;
                 let negative_raw = g.sub(one, exp_x)?;
-                let negative = g.select(g.gt(negative_raw, zero)?, negative_raw, zero)?;
-                let output = g.sub(positive, g.mul(alpha, negative)?)?;
+                let negative_condition = g.gt(negative_raw, zero)?;
+                let negative = g.select(negative_condition, negative_raw, zero)?;
+                let scaled_negative = g.mul(alpha, negative)?;
+                let output = g.sub(positive, scaled_negative)?;
                 debug_assert_eq!(g.shape(output).expect("Elu shape preflighted"), &plan.shape);
                 debug_assert_eq!(
                     g.dtype(output).expect("Elu dtype preflighted"),
@@ -6675,7 +6683,9 @@ pub(super) fn lower(
                 // SELU's >= condition deliberately keeps both signed zeroes
                 // on the X branch; NaN takes the exponential branch.
                 let condition = g.ge(x, zero)?;
-                let negative = g.mul(alpha, g.sub(g.exp(x)?, one)?)?;
+                let exponentiated = g.exp(x)?;
+                let shifted = g.sub(exponentiated, one)?;
+                let negative = g.mul(alpha, shifted)?;
                 let branch = g.select(condition, x, negative)?;
                 let output = g.mul(gamma, branch)?;
                 debug_assert_eq!(
@@ -6709,7 +6719,9 @@ pub(super) fn lower(
                 let neg_inv_ln2 = g.constant(plan.neg_inv_ln2);
                 let scaled = g.mul(x, alpha)?;
                 let exponent = g.mul(scaled, neg_inv_ln2)?;
-                let sigmoid = g.reciprocal(g.add(one, g.exp2(exponent)?)?)?;
+                let exponentiated = g.exp2(exponent)?;
+                let denominator = g.add(one, exponentiated)?;
+                let sigmoid = g.reciprocal(denominator)?;
                 let output = g.mul(x, sigmoid)?;
                 debug_assert_eq!(
                     g.shape(output).expect("Swish shape preflighted"),
@@ -6728,7 +6740,8 @@ pub(super) fn lower(
             // Do not simplify away either default-beta boundary: tinygrad's
             // parameterless ONNX dispatch invokes the literal public
             // `(1/beta) * (x*beta).logaddexp(0)` composition.
-            let output = g.softplus(input, g.constant(plan.beta))?;
+            let beta = g.constant(plan.beta);
+            let output = g.softplus(input, beta)?;
             debug_assert_eq!(
                 g.shape(output).expect("Softplus shape preflighted"),
                 &plan.shape
@@ -6754,9 +6767,11 @@ pub(super) fn lower(
                 // abs is `x * sign(x)` and true division is reciprocal then
                 // multiply. Unary Abs and Graph::softsign erase those
                 // source-visible storage and signed-zero boundaries.
-                let absolute = g.mul(input, g.sign(input)?)?;
+                let sign = g.sign(input)?;
+                let absolute = g.mul(input, sign)?;
                 let denominator = g.add(one, absolute)?;
-                let output = g.mul(input, g.reciprocal(denominator)?)?;
+                let reciprocal = g.reciprocal(denominator)?;
+                let output = g.mul(input, reciprocal)?;
                 debug_assert_eq!(
                     g.shape(output).expect("Softsign shape preflighted"),
                     &plan.shape
@@ -6799,8 +6814,10 @@ pub(super) fn lower(
             let classes = g.constant(plan.classes);
             let classes = g.reshape(classes, plan.class_shape)?;
             let mask = g.eq(indices, classes)?;
-            let off = g.squeeze(g.shrink(values_input, plan.off_bounds)?, Some(0))?;
-            let on = g.squeeze(g.shrink(values_input, plan.on_bounds)?, Some(0))?;
+            let off = g.shrink(values_input, plan.off_bounds)?;
+            let off = g.squeeze(off, Some(0))?;
+            let on = g.shrink(values_input, plan.on_bounds)?;
+            let on = g.squeeze(on, Some(0))?;
             let output = g.select(mask, on, off)?;
             debug_assert_eq!(
                 g.shape(output).expect("OneHot shape preflighted"),
@@ -6821,7 +6838,8 @@ pub(super) fn lower(
                 input
             } else {
                 let indices = g.argmax(input, Some(plan.axis), false)?;
-                let first = g.squeeze(g.shrink(input, plan.first_bounds)?, Some(plan.axis))?;
+                let first = g.shrink(input, plan.first_bounds)?;
+                let first = g.squeeze(first, Some(plan.axis))?;
                 let leading_nan = g.isnan(first)?;
                 let sentinel = g.constant(plan.sentinel);
                 let indices = g.select(leading_nan, sentinel, indices)?;
@@ -7167,7 +7185,8 @@ pub(super) fn lower(
             let output = if plan.integer_division {
                 g.trunc_div(lhs, rhs)?
             } else {
-                let quotient = g.mul(lhs, g.reciprocal(rhs)?)?;
+                let reciprocal = g.reciprocal(rhs)?;
+                let quotient = g.mul(lhs, reciprocal)?;
                 if plan.truncate {
                     g.trunc(quotient)?
                 } else {
@@ -7394,14 +7413,16 @@ pub(super) fn lower(
                 };
                 // `_softmax` detaches only Max, then carries the centered
                 // Exp/Sum branch into the source's reciprocal multiplication.
-                let centered = g.sub(x, g.detach(maximum)?)?;
+                let detached_maximum = g.detach(maximum)?;
+                let centered = g.sub(x, detached_maximum)?;
                 let exp_work = if plan.exp_work_dtype == plan.source_dtype {
                     centered
                 } else {
                     g.cast(centered, plan.exp_work_dtype)?
                 };
                 let inv_ln2 = g.constant(plan.inv_ln2);
-                let exponentials = g.exp2(g.mul(exp_work, inv_ln2)?)?;
+                let exponent = g.mul(exp_work, inv_ln2)?;
+                let exponentials = g.exp2(exponent)?;
                 let exponentials = if plan.exp_dtype == plan.exp_work_dtype {
                     exponentials
                 } else {
@@ -7443,14 +7464,16 @@ pub(super) fn lower(
                 };
                 // The source detaches only the maximum branch before the
                 // centering subtraction; the Exp/Sum/Log path remains live.
-                let centered = g.sub(x, g.detach(maximum)?)?;
+                let detached_maximum = g.detach(maximum)?;
+                let centered = g.sub(x, detached_maximum)?;
                 let exp_work = if plan.exp_work_dtype == plan.source_dtype {
                     centered
                 } else {
                     g.cast(centered, plan.exp_work_dtype)?
                 };
                 let inv_ln2 = g.constant(plan.inv_ln2);
-                let exponentials = g.exp2(g.mul(exp_work, inv_ln2)?)?;
+                let exponent = g.mul(exp_work, inv_ln2)?;
+                let exponentials = g.exp2(exponent)?;
                 let exponentials = if plan.exp_dtype == plan.exp_work_dtype {
                     exponentials
                 } else {
@@ -7628,7 +7651,8 @@ pub(super) fn lower(
             // Tensor.__le__ is `(self > rhs).logical_not()`, not a direct
             // ordered LE operation.  This retains tinygrad's unordered-NaN
             // truth value and its literal nondifferentiable graph structure.
-            let output = g.logical_not(g.gt(lhs, rhs)?)?;
+            let greater = g.gt(lhs, rhs)?;
+            let output = g.logical_not(greater)?;
             debug_assert_eq!(
                 g.shape(output).expect("LessOrEqual shape preflighted"),
                 &plan.output_shape
@@ -7680,7 +7704,8 @@ pub(super) fn lower(
             } else {
                 g.cast(plan.rhs, plan.comparison_dtype)?
             };
-            let output = g.logical_not(g.lt(lhs, rhs)?)?;
+            let less = g.lt(lhs, rhs)?;
+            let output = g.logical_not(less)?;
             debug_assert_eq!(
                 g.shape(output).expect("GreaterOrEqual shape preflighted"),
                 &plan.output_shape
@@ -7852,7 +7877,8 @@ pub(super) fn lower(
                 };
             let value = g.pow(base, exponent)?;
             let output = if plan.integer_base {
-                g.cast(g.round(value)?, plan.output_dtype)?
+                let rounded = g.round(value)?;
+                g.cast(rounded, plan.output_dtype)?
             } else {
                 value
             };
@@ -8254,13 +8280,15 @@ pub(super) fn lower(
             } else {
                 g.cast(x, comparison_dtype)?
             };
-            let condition = g.gt(comparison_x, g.constant(alpha_value))?;
+            let alpha = g.constant(alpha_value);
+            let condition = g.gt(comparison_x, alpha)?;
             let on_true = if input_dtype == output_dtype {
                 x
             } else {
                 g.cast(x, output_dtype)?
             };
-            g.select(condition, on_true, g.constant(zero_value))?
+            let zero = g.constant(zero_value);
+            g.select(condition, on_true, zero)?
         }
         "Binarizer" if ins.len() == 1 => {
             if attrs.keys().any(|name| name != "threshold") {
@@ -8373,7 +8401,8 @@ pub(super) fn lower(
 
             // tinygrad deliberately uses `X > 0`: zero and NaN take the
             // scaled branch, unlike Graph::leaky_relu's `< 0` helper.
-            let condition = g.gt(x, g.constant(zero_value))?;
+            let zero = g.constant(zero_value);
+            let condition = g.gt(x, zero)?;
             let (x_value, slope) = if exceptional_promotion {
                 (g.cast(x, DType::F32)?, g.cast(slope, DType::F32)?)
             } else {
@@ -8399,7 +8428,8 @@ pub(super) fn lower(
                 };
                 // Source clamp is `(value < min).where(min, value)`: ties
                 // and NaNs retain the prior value rather than using extrema.
-                value = g.select(g.lt(lhs, bound)?, bound, lhs)?;
+                let below = g.lt(lhs, bound)?;
+                value = g.select(below, bound, lhs)?;
                 debug_assert_eq!(
                     g.shape(value).expect("Clip minimum preflighted"),
                     &stage.shape
@@ -8421,7 +8451,8 @@ pub(super) fn lower(
                     g.cast(stage.bound, stage.dtype)?
                 };
                 // Source then applies `(value > max).where(max, value)`.
-                value = g.select(g.gt(lhs, bound)?, bound, lhs)?;
+                let above = g.gt(lhs, bound)?;
+                value = g.select(above, bound, lhs)?;
                 debug_assert_eq!(
                     g.shape(value).expect("Clip maximum preflighted"),
                     &stage.shape
@@ -8882,7 +8913,8 @@ pub(super) fn lower(
             };
             // Tensor.div is reciprocal then multiplication, not Graph::div.
             let divisor = g.constant(plan.divisor);
-            let mean = g.mul(division_input, g.reciprocal(divisor)?)?;
+            let reciprocal = g.reciprocal(divisor)?;
+            let mean = g.mul(division_input, reciprocal)?;
             let output = if plan.division_dtype == plan.output_dtype {
                 mean
             } else {
@@ -9182,17 +9214,21 @@ pub(super) fn lower(
                     true,
                     plan.sum_dtypes,
                 )?;
-                let mean = g.mul(mean_sum, g.reciprocal(count)?)?;
+                let mean_reciprocal = g.reciprocal(count)?;
+                let mean = g.mul(mean_sum, mean_reciprocal)?;
                 let centered = g.sub(x32, mean)?;
+                let squares = g.mul(centered, centered)?;
                 let variance_sum = g.reduce_with_dtypes(
-                    g.mul(centered, centered)?,
+                    squares,
                     ReduceKind::Sum,
                     Some(plan.axes),
                     true,
                     plan.sum_dtypes,
                 )?;
-                let variance = g.mul(variance_sum, g.reciprocal(count)?)?;
-                let inv_std_dev = g.rsqrt(g.add(variance, epsilon)?)?;
+                let variance_reciprocal = g.reciprocal(count)?;
+                let variance = g.mul(variance_sum, variance_reciprocal)?;
+                let stabilized_variance = g.add(variance, epsilon)?;
+                let inv_std_dev = g.rsqrt(stabilized_variance)?;
                 let normalized = g.mul(centered, inv_std_dev)?;
                 let restored = g.cast(normalized, plan.input_dtype)?;
                 let output = g.mul(restored, scale)?;
@@ -9229,8 +9265,10 @@ pub(super) fn lower(
                 true,
                 ReductionDType::new(DType::F32, DType::F32),
             )?;
-            let mean = g.mul(sum, g.reciprocal(count)?)?;
-            let norm = g.rsqrt(g.add(mean, epsilon)?)?;
+            let reciprocal = g.reciprocal(count)?;
+            let mean = g.mul(sum, reciprocal)?;
+            let stabilized_mean = g.add(mean, epsilon)?;
+            let norm = g.rsqrt(stabilized_mean)?;
             let normalized = g.mul(input, norm)?;
             let output = g.mul(normalized, scale)?;
             debug_assert_eq!(
@@ -9266,7 +9304,9 @@ pub(super) fn lower(
                     true,
                     sum_dtypes,
                 )?;
-                let mean = g.cast(g.mul(mean_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
+                let mean_reciprocal = g.reciprocal(count)?;
+                let mean = g.mul(mean_sum, mean_reciprocal)?;
+                let mean = g.cast(mean, plan.work_dtype)?;
                 let numerator = g.sub(input, mean)?;
                 let variance_mean_sum = g.reduce_with_dtypes(
                     input,
@@ -9275,10 +9315,9 @@ pub(super) fn lower(
                     true,
                     sum_dtypes,
                 )?;
-                let variance_mean = g.cast(
-                    g.mul(variance_mean_sum, g.reciprocal(count)?)?,
-                    plan.work_dtype,
-                )?;
+                let variance_mean_reciprocal = g.reciprocal(count)?;
+                let variance_mean = g.mul(variance_mean_sum, variance_mean_reciprocal)?;
+                let variance_mean = g.cast(variance_mean, plan.work_dtype)?;
                 let deviations = g.sub(input, variance_mean)?;
                 let squares = g.square(deviations)?;
                 // `Tensor.var` explicitly recasts the storage-width squares
@@ -9291,10 +9330,13 @@ pub(super) fn lower(
                     true,
                     sum_dtypes,
                 )?;
-                let variance =
-                    g.cast(g.mul(variance_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
-                let denominator = g.add(g.sqrt(variance)?, epsilon)?;
-                let output = g.mul(numerator, g.reciprocal(denominator)?)?;
+                let variance_reciprocal = g.reciprocal(count)?;
+                let variance = g.mul(variance_sum, variance_reciprocal)?;
+                let variance = g.cast(variance, plan.work_dtype)?;
+                let standard_deviation = g.sqrt(variance)?;
+                let denominator = g.add(standard_deviation, epsilon)?;
+                let reciprocal = g.reciprocal(denominator)?;
+                let output = g.mul(numerator, reciprocal)?;
                 debug_assert_eq!(
                     g.shape(output)
                         .expect("MeanVarianceNormalization shape preflighted"),
@@ -9321,7 +9363,8 @@ pub(super) fn lower(
                 let base = if plan.l1 {
                     // Tensor.abs is `x * sign(x)`, retaining -0 and wrapping
                     // signed minima before the source Sum contract.
-                    g.mul(input, g.sign(input)?)?
+                    let sign = g.sign(input)?;
+                    g.mul(input, sign)?
                 } else {
                     // Tensor.square is literally x*x, not UnaryOp::Square.
                     g.mul(input, input)?
@@ -9339,7 +9382,8 @@ pub(super) fn lower(
                         .expect("LpNormalization denominator preflighted"),
                     plan.denominator_dtype
                 );
-                let output = g.mul(input, g.reciprocal(denominator)?)?;
+                let reciprocal = g.reciprocal(denominator)?;
+                let output = g.mul(input, reciprocal)?;
                 debug_assert_eq!(
                     g.shape(output).expect("LpNormalization shape preflighted"),
                     &plan.shape
@@ -9384,7 +9428,8 @@ pub(super) fn lower(
             } else {
                 g.cast(summed, plan.work_dtype)?
             };
-            let average = g.div(summed, g.constant(plan.divisor))?;
+            let divisor = g.constant(plan.divisor);
+            let average = g.div(summed, divisor)?;
             let output = if plan.output_dtype == plan.work_dtype {
                 average
             } else {
@@ -9413,7 +9458,7 @@ pub(super) fn lower(
                 // Do not call Graph::reduce here: it correctly fail-closes
                 // generic empty extrema, whereas this source form has an
                 // explicit identity contract.
-                g.full_with_dtype(plan.output_shape, plan.max_identity, plan.dtype)?
+                g.full_with_dtype(plan.output_shape.clone(), plan.max_identity, plan.dtype)?
             } else {
                 // A zero retained N/C extent stays an empty result rather
                 // than becoming a populated identity tensor.
