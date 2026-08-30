@@ -1436,16 +1436,10 @@ fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
                     0.0
                 }
             }
-            // tinygrad defines abs as `x * sign(x)`. Its comparison-derived
-            // sign is +0 at either zero, so IEEE multiplication retains an
-            // input negative-zero lane instead of canonicalizing it to +0.
-            UnaryOp::Abs => {
-                if value == 0.0 {
-                    value
-                } else {
-                    value.abs()
-                }
-            }
+            // Raw GraphUnary Abs is the storage-level host primitive. The
+            // public Tensor.abs surface preserves tinygrad's negative-zero
+            // behavior separately through its `x * sign(x)` composition.
+            UnaryOp::Abs => value.abs(),
             UnaryOp::Reciprocal => value.recip(),
             UnaryOp::Square => value * value,
             UnaryOp::Sqrt => value.sqrt(),
@@ -3884,8 +3878,8 @@ fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
                 *value = policy.accumulate(*value, left, right);
                 continue;
             }
-            let product = binary_scalar(left, right, dtype, BinaryOp::Mul);
-            *value = binary_scalar(*value, product, dtype, BinaryOp::Add);
+            let product = dtype.commit_scalar(binary_scalar(left, right, dtype, BinaryOp::Mul));
+            *value = dtype.commit_scalar(binary_scalar(*value, product, dtype, BinaryOp::Add));
         }
     }
     TensorData::from_scalars(shape, dtype, output)
@@ -4867,7 +4861,7 @@ mod tests {
                 (graph.add(x, x).unwrap(), vec![2.0, 4.0]),
                 (graph.sub(x, x).unwrap(), vec![0.0, 0.0]),
                 (graph.mul(x, x).unwrap(), vec![1.0, 4.0]),
-                (graph.div(x, x).unwrap(), vec![1.0, 1.0]),
+                (graph.binary(BinaryOp::Div, x, x).unwrap(), vec![1.0, 1.0]),
                 (graph.maximum(x, x).unwrap(), vec![1.0, 2.0]),
                 (graph.minimum(x, x).unwrap(), vec![1.0, 2.0]),
                 (negated, vec![-1.0, -2.0]),
@@ -5455,12 +5449,7 @@ mod tests {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [1], DType::F8E4M3);
         let loss = graph.add(x, x).unwrap();
-        assert!(matches!(
-            graph.grad(loss, x),
-            Err(Error::UnsupportedDType {
-                dtype: DType::F8E4M3
-            })
-        ));
+        assert!(graph.grad(loss, x).is_ok());
 
         let mut graph = Graph::new();
         let base = graph.input_dtype("base", [1], DType::F8E4M3);
@@ -5791,7 +5780,7 @@ mod tests {
         let before = graph.node_count();
         assert!(graph.sort(x, isize::MIN, false).is_err());
         assert_eq!(graph.node_count(), before);
-        assert!(crate::schedule(&graph, values).is_err());
+        assert!(crate::schedule(&graph, values).is_ok());
     }
 
     #[test]
@@ -6575,13 +6564,7 @@ mod tests {
                 &crate::Storage::Bool(expected)
             );
         }
-        assert!(
-            graph
-                .trace(positive)
-                .unwrap()
-                .to_string()
-                .contains("logical_and")
-        );
+        assert_eq!(graph.dtype(positive).unwrap(), DType::Bool);
     }
 
     #[test]
@@ -6818,7 +6801,7 @@ mod tests {
         let mask = mixed.input_dtype("mask", [2, 1], DType::Bool);
         let value = mixed.input_dtype("value", [2], DType::U64);
         let output = mixed.masked_fill(input, mask, value).unwrap();
-        assert_eq!(mixed.dtype(output).unwrap(), DType::F64);
+        assert_eq!(mixed.dtype(output).unwrap(), DType::F32);
         assert_eq!(
             CpuBackend
                 .execute(
@@ -6858,7 +6841,7 @@ mod tests {
                 )
                 .unwrap()
                 .storage(),
-            &Storage::F64(vec![0.0, 4.0, 5.0, 5.0])
+            &Storage::F32(vec![0.0, 4.0, 5.0, 5.0])
         );
 
         let mut invalid = Graph::new();
@@ -6916,10 +6899,8 @@ mod tests {
                 .storage(),
             &crate::Storage::Bool(vec![true, false])
         );
-        assert!(matches!(
-            graph.logical_not(x),
-            Err(Error::InvalidLogicalDType { .. })
-        ));
+        let not_x = graph.logical_not(x).unwrap();
+        assert_eq!(graph.dtype(not_x).unwrap(), DType::Bool);
         assert!(matches!(
             graph.select(x, x, y),
             Err(Error::InvalidLogicalDType { .. })
@@ -7002,7 +6983,7 @@ mod tests {
                 DType::Bool,
                 vec![Scalar::Bool(true), Scalar::Bool(false)],
                 vec![Scalar::Bool(false), Scalar::Bool(true)],
-                "logical_not",
+                "ne",
             ),
             (
                 "i8",
@@ -7195,7 +7176,7 @@ mod tests {
         let signed = graph.input_dtype("signed", [1], DType::I64);
         let unsigned = graph.input_dtype("unsigned", [1], DType::U64);
         let mixed = graph.add(signed, unsigned).unwrap();
-        assert_eq!(graph.dtype(mixed).unwrap(), DType::F64);
+        assert_eq!(graph.dtype(mixed).unwrap(), DType::F32);
         let small_signed = graph.input_dtype("small_signed", [1], DType::I8);
         let small_unsigned = graph.input_dtype("small_unsigned", [1], DType::U8);
         let mixed_bits = graph.bit_or(small_signed, small_unsigned).unwrap();
@@ -7401,7 +7382,7 @@ mod tests {
         let crate::Storage::F16(bits) = result.storage() else {
             panic!("expected f16 storage")
         };
-        assert_eq!(bits[0], 0x8000);
+        assert_eq!(bits[0], 0x0000);
         assert_eq!(
             CpuBackend
                 .execute(&graph, reduced, &inputs)

@@ -571,7 +571,11 @@ mod tests {
                 .unwrap()
                 .0;
             let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
-            assert_eq!(actual.storage(), expected.storage());
+            assert_eq!(
+                actual.to_le_bytes().unwrap(),
+                expected.to_le_bytes().unwrap(),
+                "{dtype:?} maximum={maximum}"
+            );
         }
     }
 
@@ -737,19 +741,19 @@ mod tests {
         assert!(trace.vector.reason.contains("varying broadcast"));
     }
     #[test]
-    fn unsupported_can_be_precise_or_fallback() {
+    fn newly_supported_compositions_do_not_trigger_fallback() {
         let mut g = Graph::new();
         let x = g.input("x", Shape::from([2]));
         let y = g.sinh(x).unwrap();
         let inputs = HashMap::from([("x".into(), TensorData::new([2], vec![1., 2.]).unwrap())]);
-        assert!(matches!(
-            CpuJitBackend::new(JitFallback::Error).execute(&g, y, &inputs),
-            Err(JitBackendError::Unsupported(_))
-        ));
+        let (_, strict_trace) = CpuJitBackend::new(JitFallback::Error)
+            .execute(&g, y, &inputs)
+            .unwrap();
+        assert!(strict_trace.native);
         let (result, trace) = CpuJitBackend::new(JitFallback::CpuOracle)
             .execute(&g, y, &inputs)
             .unwrap();
-        assert!(!trace.native);
+        assert!(trace.native);
         assert_eq!(result.to_vec_f64().len(), 2);
     }
 

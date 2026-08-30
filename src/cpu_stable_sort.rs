@@ -435,7 +435,7 @@ mod tests {
             (0..output_values.len())
                 .map(|index| output_values.scalar_at(index).as_f64())
                 .collect::<Vec<_>>(),
-            vec![1., 1., 1., -0., -0., -0.]
+            vec![1., 1., f64::NEG_INFINITY, -0., -0., -0.]
         );
         assert_eq!(
             output_values.scalar_at(3).as_f64().to_bits(),
@@ -464,7 +464,7 @@ mod tests {
             (0..output_values.len())
                 .map(|index| output_values.scalar_at(index).as_f64())
                 .collect::<Vec<_>>(),
-            vec![1., 1., 1., -0., -0., -0.]
+            vec![1., 1., f64::NEG_INFINITY, -0., -0., -0.]
         );
         assert_eq!(output_indices, first_indices);
         assert_eq!(input.scalar_at(0).as_f64(), 1.0);

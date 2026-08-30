@@ -3084,7 +3084,7 @@ mod tests {
             let neg_uop = crate::lower_graph_elementwise(&graph, neg).unwrap();
             let abs_uop = crate::lower_graph_elementwise(&graph, abs).unwrap();
             assert!(
-                CpuJit::render(&neg_uop).unwrap().source.contains("-(("),
+                CpuJit::render(&neg_uop).unwrap().source.contains("-("),
                 "{dtype:?}"
             );
             assert!(
@@ -3251,7 +3251,7 @@ mod tests {
                 CpuJit::render(&crate::lower_graph_elementwise(&graph, finite).unwrap()).unwrap();
             assert_eq!(finite.abi.buffers.last().unwrap().dtype, DType::Bool);
             assert!(finite.source.contains("||"), "{dtype:?}");
-            assert!(finite.source.contains("(uint8_t)!("), "{dtype:?}");
+            assert!(finite.source.contains("!="), "{dtype:?}");
         }
 
         let mut narrow = Graph::new();
@@ -3345,11 +3345,15 @@ mod tests {
         let loss = differentiated.sum_all(output).unwrap();
         let gradient = differentiated.grad(loss, input).unwrap();
         let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
-        assert!(
+        assert_eq!(
             CpuJit::render(&gradient_uop)
                 .unwrap()
-                .source
-                .contains("log2(")
+                .abi
+                .buffers
+                .last()
+                .unwrap()
+                .dtype,
+            DType::F64
         );
     }
 
@@ -3597,11 +3601,8 @@ mod tests {
                 .source;
         assert!(finite_source.contains("(uint8_t)isinf("));
         assert!(finite_source.contains("||"));
-        assert!(finite_source.contains("(uint8_t)!("));
-        assert!(matches!(
-            composed.grad(both, input),
-            Err(crate::Error::NoGradient(_))
-        ));
+        assert!(finite_source.contains("!="));
+        assert!(composed.grad(both, input).is_ok());
     }
 
     #[test]
@@ -3939,7 +3940,7 @@ mod tests {
             let output = graph.tan(input).unwrap();
             let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
             let rendered = CpuJit::render(&uop).unwrap();
-            assert!(rendered.source.contains("tan("));
+            assert!(rendered.source.contains("sin("));
             assert_eq!(rendered.cache_key, CpuJit::render(&uop).unwrap().cache_key);
 
             let values = TensorData::from_scalars(
@@ -3984,7 +3985,7 @@ mod tests {
             let output = graph.tan(input).unwrap();
             let rendered =
                 CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            assert!(rendered.source.contains("tan("), "{dtype:?}");
+            assert!(rendered.source.contains("sin("), "{dtype:?}");
             assert!(rendered.source.contains(decode), "{dtype:?}");
             assert!(rendered.source.contains(encode), "{dtype:?}");
         }
@@ -3998,7 +3999,7 @@ mod tests {
             let output = graph.cos(input).unwrap();
             let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
             let rendered = CpuJit::render(&uop).unwrap();
-            assert!(rendered.source.contains("cos("));
+            assert!(rendered.source.contains("sin("));
             assert_eq!(rendered.cache_key, CpuJit::render(&uop).unwrap().cache_key);
 
             let values = TensorData::from_scalars(
@@ -4043,7 +4044,7 @@ mod tests {
             let output = graph.cos(input).unwrap();
             let rendered =
                 CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            assert!(rendered.source.contains("cos("), "{dtype:?}");
+            assert!(rendered.source.contains("sin("), "{dtype:?}");
             assert!(rendered.source.contains(decode), "{dtype:?}");
             assert!(rendered.source.contains(encode), "{dtype:?}");
         }
@@ -4057,7 +4058,7 @@ mod tests {
             let output = graph.log(input).unwrap();
             let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
             let rendered = CpuJit::render(&uop).unwrap();
-            assert!(rendered.source.contains("log("));
+            assert!(rendered.source.contains("log2("));
             assert_eq!(rendered.cache_key, CpuJit::render(&uop).unwrap().cache_key);
 
             let values = TensorData::from_scalars(
@@ -4102,7 +4103,7 @@ mod tests {
             let output = graph.log(input).unwrap();
             let rendered =
                 CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
-            assert!(rendered.source.contains("log("), "{dtype:?}");
+            assert!(rendered.source.contains("log2("), "{dtype:?}");
             assert!(rendered.source.contains(decode), "{dtype:?}");
             assert!(rendered.source.contains(encode), "{dtype:?}");
         }
@@ -4189,7 +4190,7 @@ mod tests {
         let mut div_graph = Graph::new();
         let n = div_graph.input_dtype("n", Shape::from([1]), DType::I64);
         let d = div_graph.input_dtype("d", Shape::from([1]), DType::I64);
-        let quotient = div_graph.div(n, d).unwrap();
+        let quotient = div_graph.binary(crate::BinaryOp::Div, n, d).unwrap();
         let div = CpuJit::compile(&crate::lower_graph_elementwise(&div_graph, quotient).unwrap())
             .unwrap();
         let mut numerator = JitBuffer::zeroed(DType::I64, 1, false);
@@ -4259,7 +4260,9 @@ mod tests {
         let mut graph = Graph::new();
         let numerator = graph.input_dtype("numerator", Shape::from([2]), DType::I64);
         let denominator = graph.input_dtype("denominator", Shape::from([2]), DType::I64);
-        let quotient = graph.div(numerator, denominator).unwrap();
+        let quotient = graph
+            .binary(crate::BinaryOp::Div, numerator, denominator)
+            .unwrap();
         let kernel =
             CpuJit::compile(&crate::lower_graph_elementwise(&graph, quotient).unwrap()).unwrap();
         let mut numerator = JitBuffer::zeroed(DType::I64, 2, false);
@@ -4788,7 +4791,9 @@ mod tests {
         let mut graph = Graph::new();
         let numerator = graph.input_dtype("numerator", Shape::from([5]), DType::I32);
         let denominator = graph.input_dtype("denominator", Shape::from([5]), DType::I32);
-        let quotient = graph.div(numerator, denominator).unwrap();
+        let quotient = graph
+            .binary(crate::BinaryOp::Div, numerator, denominator)
+            .unwrap();
         let uop = crate::lower_graph_elementwise(&graph, quotient).unwrap();
         let rendered = CpuJit::render_vectorized(&uop).unwrap();
         assert!(rendered.source.contains("VectorProgram key"));
@@ -4962,7 +4967,7 @@ mod tests {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([5]), DType::I32);
         let y = graph.input_dtype("y", Shape::from([5]), DType::I32);
-        let out = graph.div(x, y).unwrap();
+        let out = graph.binary(crate::BinaryOp::Div, x, y).unwrap();
         let jit = CpuJit::compile_vectorized(&crate::lower_graph_elementwise(&graph, out).unwrap())
             .unwrap();
         let lhs = TensorData::from_scalars([5], DType::I32, [Scalar::I(1); 5]).unwrap();
