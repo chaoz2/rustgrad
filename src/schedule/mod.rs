@@ -210,13 +210,20 @@ impl Schedule {
                 validate_buffer_desc(input)?;
             }
             item.validate_input_bindings()?;
-            for binding in &item.input_bindings {
-                if let Some(producer) = output_producers.get(&binding.desc.id)
-                    && (*producer >= item.id || !item.dependencies.contains(producer))
-                {
-                    return Err(ScheduleError::Binding(
-                        "scheduled input producer edge is absent".into(),
-                    ));
+            // Effect items address persistent state buffers. An earlier
+            // effect may read the initial value of a buffer that a later
+            // effect overwrites under the same stable ID, so future output
+            // ownership is not a pure producer relation. Effect-specific
+            // ordering and value bindings are validated below.
+            if !item.is_effect() {
+                for binding in &item.input_bindings {
+                    if let Some(producer) = output_producers.get(&binding.desc.id)
+                        && (*producer >= item.id || !item.dependencies.contains(producer))
+                    {
+                        return Err(ScheduleError::Binding(
+                            "scheduled input producer edge is absent".into(),
+                        ));
+                    }
                 }
             }
             item.kernel.validate().map_err(ScheduleError::UOp)?;

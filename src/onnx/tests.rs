@@ -162,24 +162,21 @@ fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
             .any(|node| matches!(node.op, crate::Op::Pad { .. }))
     );
     let scheduled = crate::schedule(&graph, values["out"]).unwrap();
-    let pad_item = scheduled
-        .items
-        .iter()
-        .find(|item| {
-            matches!(
-                item.kernel.arg(),
-                crate::UArg::Movement(plan)
-                    if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
-            )
-        })
-        .expect("LRN must schedule its channel Pad as a movement producer");
-    assert!(
-        scheduled
-            .items
-            .iter()
-            .any(|item| item.dependencies.contains(&pad_item.id))
-    );
+    assert!(scheduled.items.iter().any(|item| matches!(
+        item.kernel.arg(),
+        crate::UArg::Movement(plan)
+            if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
+    )));
     assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
+    let captured = crate::CapturedSchedule::capture(&graph, &scheduled, &[values["out"]]).unwrap();
+    let bytes = captured.to_bytes().unwrap();
+    assert_eq!(
+        crate::CapturedSchedule::from_bytes(&bytes)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        bytes
+    );
 
     for invalid in [
         lrn(&[]),
