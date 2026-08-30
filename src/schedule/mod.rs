@@ -525,10 +525,9 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
     let effect = crate::EffectSchedule::lower(graph)
         .map_err(|error| ScheduleError::Binding(error.to_string()))?;
     let mut items = Vec::new();
-    for (position, pair) in effect.uops.chunks_exact(2).enumerate() {
-        let after = &pair[1];
-        let payload = &after.payload;
-        let node = NodeId::from_index(
+    for (position, node) in effect.nodes().iter().enumerate() {
+        let payload = node.payload();
+        let output_node = NodeId::from_index(
             usize::try_from(payload.target.buffer).map_err(|_| ScheduleError::Overflow)?,
         );
         let source_node = NodeId::from_index(
@@ -548,21 +547,21 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
         // Effect step IDs are stable construction identities.  Resolve them
         // through this table rather than assuming they happen to equal item
         // positions.
-        let dependencies = after
-            .after
+        let dependencies = node
+            .predecessors()
             .iter()
             .map(|step| {
                 effect
-                    .uops
-                    .chunks_exact(2)
-                    .position(|candidate| candidate[1].payload.step == *step)
+                    .nodes()
+                    .iter()
+                    .position(|candidate| candidate.payload().step == *step)
                     .map(|position| position as u64)
                     .ok_or_else(|| ScheduleError::Binding("effect predecessor is absent".into()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut item = ScheduleItem {
             id: position as u64,
-            node,
+            node: output_node,
             dependencies,
             consumers: vec![],
             inputs: vec![source.clone()],
@@ -575,7 +574,7 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
             external_materializations: vec![],
             outputs: ScheduledOutputs::single(output.clone()),
             output,
-            kernel: after.uop.clone(),
+            kernel: node.after_uop(),
             boundary: Some(ScheduleBoundary::Effect),
             cache_key: 0,
         };

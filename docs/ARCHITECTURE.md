@@ -449,9 +449,13 @@ owns one generation-checked `HostSlotPool` lease per logical buffer and stages
 every successor from immutable detached snapshots; it validates every target
 then atomically commits the final per-buffer values, so an injected or borrow
 failure leaves bytes, versions, slot identities, and pool liveness unchanged.
-Its canonical STORE/AFTER UOps lower to ordinary effect-boundary `ScheduleItem`s
-with stable dependencies; `realize_effects_persistent` uses that same canonical
-schedule rather than a parallel runtime IR. `schedule::mixed` adds a typed,
+Each public `EffectScheduleNode` owns one validated assignment payload and its
+predecessor IDs. It synthesizes the matching STORE source and AFTER root on
+demand, so the schedule cannot retain mismatched kinds, payload copies, or UOp
+graphs. Those private-wire STORE/AFTER UOps lower to ordinary effect-boundary
+`ScheduleItem`s with stable dependencies; `realize_effects_persistent` uses
+that same canonical schedule rather than a parallel runtime IR.
+`schedule::mixed` adds a typed,
 immutable pure-output-to-STORE binding and transactional realization: pure
 values are owned until the pool-wide effect commit. Typed
 `ScheduleStateBinding` injects one immutable, version-checked persistent

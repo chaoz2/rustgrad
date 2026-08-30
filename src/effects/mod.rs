@@ -21,7 +21,7 @@ pub use bridge::{EffectSourceBridge, PersistentInputBinding, PureEffectBinding};
 pub use runtime::{
     EffectRuntime, PersistentRuntimeStats, PersistentSlotIdentity, PersistentSnapshot, RuntimeError,
 };
-pub use schedule::{EffectPayload, EffectSchedule, EffectUOp, EffectUOpKind};
+pub use schedule::{EffectPayload, EffectSchedule, EffectScheduleNode};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BufferState {
@@ -834,7 +834,7 @@ mod tests {
         );
         assert_eq!(next.state().version, 1);
         let schedule = EffectSchedule::lower(&graph).unwrap();
-        assert_eq!(schedule.uops.len(), 2);
+        assert_eq!(schedule.nodes().len(), 1);
         assert_ne!(schedule.cache_key, 0);
     }
 
@@ -1134,13 +1134,30 @@ mod tests {
         let c = graph.assign(&a, &b).unwrap();
         graph.assign(&b, &c).unwrap();
         let schedule = EffectSchedule::lower(&graph).unwrap();
-        assert_eq!(schedule.uops.len(), 4);
+        assert_eq!(schedule.nodes().len(), 2);
+        let first = &schedule.nodes()[0];
+        let second = &schedule.nodes()[1];
+        assert!(first.predecessors().is_empty());
+        assert_eq!(second.predecessors(), &[0]);
+        let store = first.store_uop();
+        let after = first.after_uop();
+        assert!(matches!(
+            store.operation(),
+            crate::Operation::EffectStore(payload) if payload.as_ref() == first.payload()
+        ));
+        assert!(matches!(
+            after.operation(),
+            crate::Operation::After(payload) if payload.as_ref() == first.payload()
+        ));
+        assert_eq!(after.sources(), std::slice::from_ref(&store));
+        let encoded = crate::uop::artifact::encode_effect_aware(&after).unwrap();
+        assert_eq!(crate::uop::artifact::decode(&encoded).unwrap(), after);
         assert_eq!(
             EffectSchedule::lower(&graph).unwrap().cache_key,
             schedule.cache_key
         );
         assert!(matches!(
-            crate::uop::artifact::encode(&schedule.uops[0].uop),
+            crate::uop::artifact::encode(&schedule.nodes()[0].store_uop()),
             Err(crate::uop::artifact::ArtifactError::Unsupported)
         ));
         assert!(matches!(
@@ -1155,6 +1172,28 @@ mod tests {
             schedule.execute(&graph, None).unwrap().values[&1].storage(),
             &crate::Storage::F32(vec![3.0])
         );
+    }
+
+    #[test]
+    fn effect_schedule_node_rejects_invalid_payload_before_uop_synthesis() {
+        let payload = EffectPayload {
+            step: 0,
+            target: state(1, 1),
+            source: BufferState {
+                dtype: DType::F32,
+                ..state(2, 0)
+            },
+            snapshot: state(1, 0),
+            target_view: None,
+            index_plan: None,
+        };
+        assert!(matches!(
+            EffectScheduleNode::assignment(payload, vec![]),
+            Err(EffectError::DescriptorMismatch {
+                buffer: 1,
+                version: 1
+            })
+        ));
     }
 
     #[test]
