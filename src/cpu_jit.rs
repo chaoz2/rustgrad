@@ -2100,7 +2100,7 @@ fn emit_vector_insts(
                 let a = input(0)?;
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable unary type".into()))?;
-                let expr = match inst.payload.operation() {
+                let expr = match &inst.payload.operation {
                     crate::Operation::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
                         format!("!{}[l]", a)
                     }
@@ -2156,10 +2156,10 @@ fn emit_vector_insts(
                 let (a, b) = (input(0)?, input(1)?);
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable binary type".into()))?;
-                let crate::Operation::GraphBinary(op) = inst.payload.operation() else {
+                let crate::Operation::GraphBinary(op) = &inst.payload.operation else {
                     return Err(JitError::Unsupported("portable binary opcode".into()));
                 };
-                let expr = vector_binary_expr(ty, op, &a, &b, &format!("{base}+l"))?;
+                let expr = vector_binary_expr(ty, *op, &a, &b, &format!("{base}+l"))?;
                 lines.push(format!(
                     "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
                     ctype(ty),
@@ -2175,7 +2175,7 @@ fn emit_vector_insts(
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 compare destination".into()))?;
                 let (a, b) = (input(0)?, input(1)?);
-                let op = match inst.payload.operation() {
+                let op = match &inst.payload.operation {
                     crate::Operation::GraphCompare(crate::CompareOp::Eq) => "==",
                     crate::Operation::GraphCompare(crate::CompareOp::Ne) => "!=",
                     crate::Operation::GraphCompare(crate::CompareOp::Lt) => "<",
