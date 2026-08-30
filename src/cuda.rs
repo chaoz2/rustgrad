@@ -5493,9 +5493,9 @@ pub(crate) mod tests {
                     .and_then(|store| store.sources().first())
                     .map(|index| index.arg())
                 {
-                    Some(crate::UArg::BufferIndex { buffer, .. }) => *buffer,
+                    Some(crate::UArgRef::BufferIndex { buffer, .. }) => *buffer,
                     _ if matches!(program.kind(), crate::UOpKind::Random) => match program.arg() {
-                        crate::UArg::Random(plan) => plan.output.index() as u64,
+                        crate::UArgRef::Random(plan) => plan.output.index() as u64,
                         _ => return Self::INVALID_MEMORY,
                     },
                     _ => return Self::INVALID_MEMORY,

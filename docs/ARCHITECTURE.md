@@ -1087,6 +1087,53 @@ store interpreter for pure elementwise graphs. Bindings clone `TensorData` at
 the execution boundary, so the UOp runtime cannot borrow or alias caller
 storage. The CPU backend remains the differential semantic oracle.
 
+`UOpNode` stores one typed `Operation`, its result type, and its sources. Each
+`Operation` variant owns its payload, removing the former invalid cross-product
+of an independently stored kind and untyped argument. The small `define_uops!`
+registry declares every variant once and generates the enum plus its stable
+compatibility kind projection, borrowed payload view, and generic
+family/arity/effect metadata. Direct DAG validation, rewrite purity, artifacts,
+and visualization consume those generated interfaces rather than maintaining
+independent taxonomy lists. Artifact encoding and legacy backend seams request
+explicit owned `UOpKind`/`UArg` projections; they are not stored in the DAG and
+the existing numeric tags and version gates are unchanged.
+
+This is an intentional pre-1.0 Rust source migration. `UOp::from_operation`
+is the infallible typed constructor; legacy opcode/argument callers use
+fallible `UOp::try_new`, which rejects mismatched pairs without publishing a
+node. `UOp::kind()` returns the lightweight opcode projection by value and
+`UOp::arg()` returns a borrowed `UArgRef`. `LinearPayload` likewise stores one
+typed `operation` instead of public duplicate `uop_kind` and `arg` fields.
+Downstream code should match `Operation` when it needs payload semantics and
+request compatibility projections only at wire or backend boundaries.
+
+The generated metadata does not replace semantic boundaries. Detailed type/control
+validation, portable interpretation, schedule lowering, artifact tag codecs,
+and CPU/PTX/OpenCL/Metal/WebGPU rendering remain local exhaustive matches because
+their accepted subsets and failure behavior intentionally differ. The same
+rule applies to future refactors: shared taxonomy policy moves into the typed
+enum, while evaluation, wire ABI, and backend capability decisions stay
+visible and fail closed. Remaining high-value follow-ups are ordered as:
+
+1. reconcile repeated scalar/linear/vector instruction-family mapping where a
+   single typed mapping is demonstrably shared;
+2. centralize presentation names without coupling them to artifact tags;
+3. leave backend capability lists local unless two backends first share an
+   exact typed lowering contract.
+
+The current exhaustive-switch inventory is intentional and reviewable:
+
+| Hotspot | Responsibility | Disposition |
+| --- | --- | --- |
+| `uop::validate_one` | dtype, indexing, control pairing, and payload semantics | canonical semantic boundary; keep exhaustive |
+| `uop::artifact` structural validation | typed operation, source-shape, and wire admission | consume generated operation metadata plus explicit wire validation |
+| `uop::artifact` kind codec | stable numeric tags and version gates | canonical wire boundary; keep exhaustive |
+| `kernel` evaluators | portable operation semantics | canonical interpreter boundary; keep exhaustive |
+| `schedule` lowering | materialization, dependencies, and fusion roots | canonical planning boundary; keep exhaustive |
+| `viz` | operation-specific names and retained payload fields | consume shared family; keep presentation metadata local |
+| CPU/PTX/device renderers | backend capability and source emission | canonical backend boundaries; keep exhaustive and fail closed |
+| linear/vector instruction mapping | scalar versus vector instruction families | highest-priority follow-up after proving a shared typed contract |
+
 Future scheduling will turn validated effect/control UOps into kernel bodies;
 renderers will consume that scheduled form. Rewrites only touch pure nodes and
 memoize by structural identity, so they cannot reorder stores, barriers, or

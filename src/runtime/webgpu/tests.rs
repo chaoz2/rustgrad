@@ -3,8 +3,8 @@ use crate::kernel::execute_lowered_elementwise;
 use crate::{
     AddressSpace, Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor,
     CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc,
-    NodeId, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, UOp, UOpKind, UType,
-    ViewMap, schedule,
+    NodeId, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, UArgRef, UOp, UOpKind,
+    UType, ViewMap, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawAdapter, RawBuffer, RawCommand,
@@ -815,8 +815,8 @@ impl Dispatch for MockDispatch {
                 if let Some(id) =
                     transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
                         let buffer_id = match arg {
-                            crate::UArg::BufferIndex { buffer, .. }
-                            | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                            crate::UArgRef::BufferIndex { buffer, .. }
+                            | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
                             _ => {
                                 return Err(WebGpuError::InvalidBinding(
                                     "mock transaction load index".into(),
@@ -1099,7 +1099,7 @@ fn captured_random_plans_render_and_mock_execute_without_stream_state() {
     for output in [uniform, normal, signed, unsigned] {
         let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
         let rendered = renderer.render(&root).unwrap();
-        let UArg::Random(plan) = root.arg() else {
+        let UArgRef::Random(plan) = root.arg() else {
             panic!("missing random plan")
         };
         let expected = plan.execute().unwrap().to_le_bytes().unwrap();
@@ -1197,12 +1197,12 @@ fn execute_webgpu_semantics(program: &UOp, bindings: &KernelBindings) -> crate::
         .find(|node| matches!(node.kind(), UOpKind::Store))
         .ok_or(crate::Error::InvalidIndex)?;
     let index = store.sources().first().ok_or(crate::Error::InvalidIndex)?;
-    let UArg::BufferIndex { output_shape, .. } = index.arg() else {
+    let UArgRef::BufferIndex { output_shape, .. } = index.arg() else {
         return Err(crate::Error::InvalidIndex);
     };
     let dtype = index.ty().ok_or(crate::Error::InvalidIndex)?.scalar;
     if dtype == DType::BF16
-        && store.sources()[1].kind() == &UOpKind::Cast
+        && store.sources()[1].kind() == UOpKind::Cast
         && store.sources()[1]
             .sources()
             .first()
@@ -1237,7 +1237,7 @@ fn eval_webgpu_narrow(
     };
     match node.kind() {
         UOpKind::Const => match node.arg() {
-            UArg::Scalar { dtype, bits } => quantize_webgpu_scalar(
+            UArgRef::Scalar { dtype, bits } => quantize_webgpu_scalar(
                 *dtype,
                 match dtype {
                     DType::Bool => Scalar::Bool(*bits != 0),
@@ -1254,12 +1254,12 @@ fn eval_webgpu_narrow(
         UOpKind::Load => {
             let index = node.sources().first().ok_or(crate::Error::InvalidIndex)?;
             let (buffer, input_shape, view) = match index.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     input_shape,
                     ..
                 } => (*buffer, input_shape, None),
-                UArg::ViewBufferIndex {
+                UArgRef::ViewBufferIndex {
                     buffer,
                     input_shape,
                     view,
@@ -1287,7 +1287,7 @@ fn eval_webgpu_narrow(
         UOpKind::GraphBinary(op) => {
             let lhs = child(0)?;
             let rhs = child(1)?;
-            quantize_webgpu_scalar(dtype, webgpu_binary(lhs, rhs, dtype, *op)?)
+            quantize_webgpu_scalar(dtype, webgpu_binary(lhs, rhs, dtype, op)?)
         }
         UOpKind::Binary(op) => {
             use crate::uop::Binary::{Add, Eq, Le, Lt, Mul, Sub};
@@ -1976,13 +1976,14 @@ fn narrow_scalar_literals_preserve_raw_bits_at_the_storage_boundary() {
     ] {
         let ty = UType::scalar(dtype);
         let shape = Shape::new([]);
-        let range = UOp::new(
+        let range = UOp::try_new(
             UOpKind::Range,
             Some(UType::scalar(DType::I64)),
             vec![UOp::constant(1, UType::scalar(DType::I64))],
             UArg::RangeAxis(0),
-        );
-        let address = UOp::new(
+        )
+        .unwrap();
+        let address = UOp::try_new(
             UOpKind::DefineGlobal,
             Some(ty),
             vec![],
@@ -1991,8 +1992,9 @@ fn narrow_scalar_literals_preserve_raw_bits_at_the_storage_boundary() {
                 name: "literal".into(),
                 element: ty,
             },
-        );
-        let index = UOp::new(
+        )
+        .unwrap();
+        let index = UOp::try_new(
             UOpKind::Index,
             Some(ty),
             vec![address, range.clone()],
@@ -2002,17 +2004,19 @@ fn narrow_scalar_literals_preserve_raw_bits_at_the_storage_boundary() {
                 input_shape: shape.clone(),
                 output_shape: shape,
             },
-        );
+        )
+        .unwrap();
         let rendered = WgslRenderer::new(1, capabilities())
             .unwrap()
             .render(&UOp::sink(vec![
-                UOp::new(
+                UOp::try_new(
                     UOpKind::Store,
                     None,
                     vec![index, UOp::scalar_constant(dtype, bits, ty)],
                     UArg::None,
-                ),
-                UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+                )
+                .unwrap(),
+                UOp::try_new(UOpKind::EndRange, None, vec![range], UArg::None).unwrap(),
             ]))
             .unwrap();
         assert!(rendered.source.contains(marker), "{dtype:?}");

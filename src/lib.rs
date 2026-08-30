@@ -271,7 +271,9 @@ pub use torch::{
 pub use trace::{CompileTrace, TraceStep};
 pub use training_checkpoint::{PortableTrainingCheckpoint, TrainingCheckpoint};
 pub use uop::{
-    AddressSpace, AffineView, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType, ViewMap,
+    AddressSpace, AddressValue, AffineView, Binary as UBinary, IndexValue, LiteralValue,
+    MatmulValue, MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue,
+    TensorGuardValue, UArg, UArgRef, UOp, UOpError, UOpKind, UPat, UType, VariableValue, ViewMap,
 };
 pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
 pub use viz::{

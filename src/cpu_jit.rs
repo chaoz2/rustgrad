@@ -5,7 +5,7 @@
 //! buffer id; shapes and dtypes are validated by the caller before this unsafe
 //! boundary is crossed.  This module never allocates executable memory: the OS
 //! dynamic loader owns executable mappings and `JitKernel` owns the library.
-use crate::{DType, SymbolicShape, SymbolicVar, UArg, UOp, UOpKind};
+use crate::{DType, SymbolicShape, SymbolicVar, UArgRef, UOp, UOpKind};
 use std::{
     collections::BTreeMap,
     ffi::{CString, c_char, c_int, c_void},
@@ -602,7 +602,7 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     })
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
-    if let (UOpKind::Random, UArg::Random(plan)) = (root.kind(), root.arg()) {
+    if let (UOpKind::Random, UArgRef::Random(plan)) = (root.kind(), root.arg()) {
         return random::render(plan);
     }
     if matches!(root.kind(), UOpKind::Matmul)
@@ -625,7 +625,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     {
         return render_quantized_row_gather(plan);
     }
-    if let (UOpKind::Movement, UArg::Movement(plan)) = (root.kind(), root.arg()) {
+    if let (UOpKind::Movement, UArgRef::Movement(plan)) = (root.kind(), root.arg()) {
         return render_movement(plan);
     }
     let nodes = root
@@ -652,7 +652,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         .sources()
         .first()
         .ok_or_else(|| JitError::Unsupported("Store without index".into()))?;
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         buffer: out_id,
         elements: extent,
         ..
@@ -672,10 +672,10 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             return Err(JitError::Unsupported("load without index".into()));
         };
         let (buffer, elements) = match index.arg() {
-            UArg::BufferIndex {
+            UArgRef::BufferIndex {
                 buffer, elements, ..
             } => (*buffer, *elements),
-            UArg::ViewBufferIndex { buffer, view, .. } => (
+            UArgRef::ViewBufferIndex { buffer, view, .. } => (
                 *buffer,
                 view.source_shape
                     .numel()
@@ -2011,11 +2011,11 @@ fn emit_vector_insts(
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 splat without destination".into()))?;
-                let (ty, literal) = match inst.payload.arg {
-                    crate::UArg::Scalar { dtype, bits } => {
-                        (dst_ty.unwrap_or(dtype), literal_expr(dtype, bits))
+                let (ty, literal) = match inst.payload.arg() {
+                    crate::UArgRef::Scalar { dtype, bits } => {
+                        (dst_ty.unwrap_or(*dtype), literal_expr(*dtype, *bits))
                     }
-                    crate::UArg::Int(value) => (
+                    crate::UArgRef::Int(value) => (
                         dst_ty.ok_or_else(|| {
                             JitError::Unsupported("portable constant type".into())
                         })?,
@@ -2097,7 +2097,7 @@ fn emit_vector_insts(
                 let a = input(0)?;
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable unary type".into()))?;
-                let expr = match inst.payload.uop_kind {
+                let expr = match inst.payload.kind() {
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
                         format!("!{}[l]", a)
                     }
@@ -2153,7 +2153,7 @@ fn emit_vector_insts(
                 let (a, b) = (input(0)?, input(1)?);
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable binary type".into()))?;
-                let crate::UOpKind::GraphBinary(op) = inst.payload.uop_kind else {
+                let crate::UOpKind::GraphBinary(op) = inst.payload.kind() else {
                     return Err(JitError::Unsupported("portable binary opcode".into()));
                 };
                 let expr = vector_binary_expr(ty, op, &a, &b, &format!("{base}+l"))?;
@@ -2172,7 +2172,7 @@ fn emit_vector_insts(
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 compare destination".into()))?;
                 let (a, b) = (input(0)?, input(1)?);
-                let op = match inst.payload.uop_kind {
+                let op = match inst.payload.kind() {
                     crate::UOpKind::GraphCompare(crate::CompareOp::Eq) => "==",
                     crate::UOpKind::GraphCompare(crate::CompareOp::Ne) => "!=",
                     crate::UOpKind::GraphCompare(crate::CompareOp::Lt) => "<",
@@ -2303,7 +2303,7 @@ fn render_reduction(
         .sources()
         .first()
         .ok_or_else(|| JitError::Unsupported("reduction init".into()))?;
-    let UArg::Reduction {
+    let UArgRef::Reduction {
         input_shape,
         output_shape,
         axes,
@@ -2516,12 +2516,12 @@ fn emit(
     let mut s = |i: usize| emit(&n.sources()[i], ids, map, lines);
     match n.kind() {
         UOpKind::Const => match n.arg() {
-            UArg::Int(v) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
-            UArg::Scalar { dtype, bits } if *dtype == ty && dtype.is_float8() => {
+            UArgRef::Int(v) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
+            UArgRef::Scalar { dtype, bits } if *dtype == ty && dtype.is_float8() => {
                 Ok(format!("((uint8_t)0x{:02x}u)", *bits as u8))
             }
-            UArg::Scalar { dtype, bits } if *dtype == ty => Ok(literal_expr(*dtype, *bits)),
-            UArg::Scalar { .. } => {
+            UArgRef::Scalar { dtype, bits } if *dtype == ty => Ok(literal_expr(*dtype, *bits)),
+            UArgRef::Scalar { .. } => {
                 Err(JitError::Unsupported("scalar literal/type mismatch".into()))
             }
             _ => Err(JitError::Unsupported("non-integer const".into())),
@@ -2532,13 +2532,13 @@ fn emit(
                 .first()
                 .ok_or_else(|| JitError::Unsupported("load no index".into()))?;
             let (buffer, off) = match ix.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
                 } => (*buffer, broadcast_offset(input_shape, output_shape)),
-                UArg::ViewBufferIndex {
+                UArgRef::ViewBufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
@@ -2772,7 +2772,7 @@ fn emit(
                 | crate::BinaryOp::FMod
                     if !ty.is_float() =>
                 {
-                    return Ok(int_call(*op, ty, &a, &b));
+                    return Ok(int_call(op, ty, &a, &b));
                 }
                 crate::BinaryOp::Shl if !ty.is_float() => {
                     return Ok(format!(

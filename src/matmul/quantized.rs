@@ -243,7 +243,7 @@ mod tests {
     use super::*;
     use crate::{
         CapturedBackendPolicy, CapturedBatch, CapturedReplayExecutor, CapturedReplayOptions,
-        CapturedSchedule, CpuJit, GgmlType, UArg,
+        CapturedSchedule, CpuJit, GgmlType,
     };
     use std::collections::BTreeMap;
 
@@ -444,7 +444,7 @@ mod tests {
                 .internal_temporaries(&[NodeId::from_index(22)])
                 .is_empty()
             );
-            let UArg::QuantizedMatmul(plan) = decoded.items[0].kernel.arg() else {
+            let crate::UArgRef::QuantizedMatmul(plan) = decoded.items[0].kernel.arg() else {
                 panic!("quantized matmul payload")
             };
             let rendered = CpuJit::render(&decoded.items[0].kernel).unwrap();

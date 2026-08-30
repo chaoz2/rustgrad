@@ -44,6 +44,25 @@ Avoid:
 - direct pushes or force pushes to `main`;
 - mixing refactors, generated churn, and behavior changes without a clear need.
 
+### Universal-operation taxonomy
+
+Each UOp stores one typed `Operation` whose enum variant owns its payload; do
+not add a parallel kind field or an untyped payload field. Declare new variants
+once in the `define_uops!` registry so it generates the enum, compatibility
+kind projection, borrowed payload view, and generic family/arity/effect
+metadata together. Generic taxonomy policy must not be restated as variant
+lists in artifact validation, visualization, scheduling utilities, or
+rewrites.
+
+Exhaustive matches remain required where the variants have genuinely different
+semantics: detailed validation, interpreter evaluation, artifact numeric tags
+and version gates, schedule lowering, and each backend's renderer/capability
+boundary. Those switches must fail closed for unsupported variants rather than
+infer support from the generic family. Legacy `UOpKind`/`UArg` values are owned
+projections only at explicit wire or backend compatibility boundaries, never
+independent node state. This distinction keeps one canonical taxonomy without
+hiding backend-specific contracts behind trait objects.
+
 If stacking is necessary, keep the stack shallow, state the dependency in every
 PR, and retarget the child to `main` immediately after its parent merges.
 

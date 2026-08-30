@@ -2,7 +2,7 @@ use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
     AddressSpace, Backend, BinaryOp, BufferRole, CpuBackend, DType, Graph, KernelBindings,
-    KernelBufferDesc, Scalar, Shape, TensorData, UArg, UOp, UOpKind, UType, schedule,
+    KernelBufferDesc, Scalar, Shape, TensorData, UArg, UArgRef, UOp, UOpKind, UType, schedule,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -533,8 +533,8 @@ impl Dispatch for MockDispatch {
                 let fault =
                     transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
                         let buffer = match arg {
-                            UArg::BufferIndex { buffer, .. }
-                            | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                            UArgRef::BufferIndex { buffer, .. }
+                            | UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
                             _ => {
                                 return Err(OpenClError::InvalidBinding(
                                     "semantic load index".into(),
@@ -752,7 +752,7 @@ fn captured_random_plans_render_and_mock_execute_without_stream_state() {
     for output in [uniform, normal, randint] {
         let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
         let rendered = renderer.render(&root).unwrap();
-        let UArg::Random(plan) = root.arg() else {
+        let UArgRef::Random(plan) = root.arg() else {
             panic!("missing random plan")
         };
         let expected = plan.execute().unwrap().to_le_bytes().unwrap();
@@ -1153,13 +1153,14 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
     let literal_source = |dtype, bits| {
         let ty = UType::scalar(dtype);
         let shape = Shape::new([]);
-        let range = UOp::new(
+        let range = UOp::try_new(
             UOpKind::Range,
             Some(UType::scalar(DType::I64)),
             vec![UOp::constant(1, UType::scalar(DType::I64))],
             UArg::RangeAxis(0),
-        );
-        let address = UOp::new(
+        )
+        .unwrap();
+        let address = UOp::try_new(
             UOpKind::DefineGlobal,
             Some(ty),
             vec![],
@@ -1168,8 +1169,9 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
                 name: "literal".into(),
                 element: ty,
             },
-        );
-        let index = UOp::new(
+        )
+        .unwrap();
+        let index = UOp::try_new(
             UOpKind::Index,
             Some(ty),
             vec![address, range.clone()],
@@ -1179,16 +1181,18 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
                 input_shape: shape.clone(),
                 output_shape: shape,
             },
-        );
+        )
+        .unwrap();
         renderer
             .render(&UOp::sink(vec![
-                UOp::new(
+                UOp::try_new(
                     UOpKind::Store,
                     None,
                     vec![index, UOp::scalar_constant(dtype, bits, ty)],
                     UArg::None,
-                ),
-                UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+                )
+                .unwrap(),
+                UOp::try_new(UOpKind::EndRange, None, vec![range], UArg::None).unwrap(),
             ]))
             .unwrap()
             .source
@@ -2698,7 +2702,7 @@ fn guarded_shift_reconstructs_count_through_static_view() {
             .rhs
             .sources()[0]
             .arg(),
-        UArg::ViewBufferIndex { .. }
+        UArgRef::ViewBufferIndex { .. }
     ));
     let mock = Arc::new(MockDispatch::default());
     let (context, queue) = setup(mock);

@@ -561,7 +561,7 @@ fn interpret_item(
         }
         return crate::execute_elementwise(graph, item.node, inputs).map_err(|e| e.to_string());
     }
-    if let crate::UArg::Movement(plan) = item.kernel.arg() {
+    if let crate::UArgRef::Movement(plan) = item.kernel.arg() {
         let operands = plan
             .input_operands()
             .into_iter()
@@ -620,7 +620,7 @@ fn interpret_sort_pair(
     inputs: &HashMap<String, TensorData>,
     values: &HashMap<u64, TensorData>,
 ) -> Result<(TensorData, TensorData), String> {
-    let crate::UArg::Sort {
+    let crate::UArgRef::Sort {
         input,
         input_shape,
         axis,

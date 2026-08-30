@@ -633,8 +633,8 @@ impl OpenClTransaction<'_> {
     ) -> Result<i64, OpenClError> {
         let value = detail_rhs_at(transaction, guard, logical, |arg, dtype, logical| {
             let buffer_id = match arg {
-                crate::UArg::BufferIndex { buffer, .. }
-                | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                crate::UArgRef::BufferIndex { buffer, .. }
+                | crate::UArgRef::ViewBufferIndex { buffer, .. } => *buffer,
                 _ => return Err(OpenClError::InvalidBinding("detail load index".into())),
             };
             let position = self

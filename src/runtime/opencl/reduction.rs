@@ -1,6 +1,6 @@
 //! Correctness-first serial reduction geometry for OpenCL C.
 use super::{OpenClCapabilities, OpenClError};
-use crate::{DType, ReduceKind, Shape, UArg, UOp, UOpKind};
+use crate::{DType, ReduceKind, Shape, UArgRef, UOp, UOpKind};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct OpenClReduction {
@@ -32,7 +32,7 @@ impl OpenClReduction {
             .first()
             .and_then(|update| update.sources().first())
             .ok_or_else(|| OpenClError::Unsupported("malformed reduction chain".into()))?;
-        let UArg::Reduction {
+        let UArgRef::Reduction {
             input_shape,
             output_shape,
             axes,
@@ -62,7 +62,7 @@ impl OpenClReduction {
         Ok(Self {
             input: input_shape.clone(),
             output: output_shape.clone(),
-            axes: axes.clone(),
+            axes: axes.to_vec(),
             keepdim: *keepdim,
             kind: *kind,
             reduction_len,

@@ -9,8 +9,8 @@
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
-    AddressSpace, BufferView, CudaError, DType, Function, LaunchConfig, Shape, Stream, UArg, UOp,
-    UOpKind, UType,
+    AddressSpace, BufferView, CudaError, DType, Function, LaunchConfig, Shape, Stream, UArg,
+    UArgRef, UOp, UOpKind, UType,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -350,13 +350,13 @@ impl PtxRenderer {
                 return false;
             };
             let (
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer: input_buffer,
                     elements: input_elements,
                     input_shape,
                     output_shape: input_output_shape,
                 },
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer: output_buffer,
                     elements: output_elements,
                     input_shape: output_input_shape,
@@ -367,18 +367,18 @@ impl PtxRenderer {
                 return false;
             };
             let (
-                UArg::Address {
+                UArgRef::Address {
                     space: input_space,
                     name: input_name,
                     element: input_element,
                 },
-                UArg::Address {
+                UArgRef::Address {
                     space: output_space,
                     name: output_name,
                     element: output_element,
                 },
-                UArg::Int(bound),
-                UArg::RangeAxis(axis),
+                UArgRef::Int(bound),
+                UArgRef::RangeAxis(axis),
             ) = (
                 input_address.arg(),
                 output_address.arg(),
@@ -405,8 +405,8 @@ impl PtxRenderer {
                 && *output_space == AddressSpace::Global
                 && input_element.scalar == DType::F32
                 && output_element.scalar == DType::F32
-                && input_name == &format!("b{input_buffer}")
-                && output_name == &format!("b{output_buffer}")
+                && input_name == format!("b{input_buffer}")
+                && output_name == format!("b{output_buffer}")
                 && input_buffer != output_buffer
                 && input_index.ty().is_some_and(|ty| ty.scalar == DType::F32)
                 && load.ty().is_some_and(|ty| ty.scalar == DType::F32)
@@ -527,7 +527,7 @@ fn render(
     allow_linked_f32_exp: bool,
 ) -> Result<RenderedPtx, PtxError> {
     if matches!(root.kind(), UOpKind::Random) {
-        let UArg::Random(plan) = root.arg() else {
+        let UArgRef::Random(plan) = root.arg() else {
             return Err(PtxError::Unsupported("random payload is absent".into()));
         };
         return render_random(renderer, root, plan);
@@ -542,9 +542,9 @@ fn render(
     }
     if matches!(root.kind(), UOpKind::Matmul) {
         return match root.arg() {
-            UArg::Matmul(plan) => matmul::render_serial(renderer, plan),
-            UArg::TiledMatmul(payload) => matmul::render_tiled(renderer, payload),
-            UArg::TensorCoreMatmul(payload) => matmul::render_tensor_core(renderer, payload),
+            UArgRef::Matmul(plan) => matmul::render_serial(renderer, plan),
+            UArgRef::TiledMatmul(payload) => matmul::render_tiled(renderer, payload),
+            UArgRef::TensorCoreMatmul(payload) => matmul::render_tensor_core(renderer, payload),
             _ => Err(PtxError::Unsupported("matmul payload is absent".into())),
         };
     }
@@ -560,7 +560,7 @@ fn render(
         .sources()
         .first()
         .ok_or_else(|| PtxError::Unsupported("Store without index".into()))?;
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         buffer: out_id,
         elements: extent,
         output_shape,
@@ -583,7 +583,7 @@ fn render(
     // generic storage subset.
     let generic_storage = nodes.iter().all(|node| {
         let storage_ok = match node.arg() {
-            UArg::BufferIndex { .. } | UArg::ViewBufferIndex { .. } => {
+            UArgRef::BufferIndex { .. } | UArgRef::ViewBufferIndex { .. } => {
                 node.ty().is_some_and(|ty| reject_dtype(ty.scalar).is_ok())
             }
             _ => true,
@@ -617,13 +617,13 @@ fn render(
     let reduction = reduction_spec(store)?;
     for node in &nodes {
         if let Some((buffer, elements, source_shape)) = match node.arg() {
-            UArg::BufferIndex {
+            UArgRef::BufferIndex {
                 buffer,
                 elements,
                 input_shape,
                 ..
             } => Some((buffer, *elements, input_shape.clone())),
-            UArg::ViewBufferIndex { buffer, view, .. } => Some((
+            UArgRef::ViewBufferIndex { buffer, view, .. } => Some((
                 buffer,
                 view.source_shape.numel().map_err(|_| PtxError::Overflow)?,
                 view.source_shape.clone(),
@@ -665,7 +665,9 @@ fn render(
             return Err(PtxError::InvalidBinding("load without index".into()));
         };
         let buffer = match index.arg() {
-            UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+            UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
+                *buffer
+            }
             _ => return Err(PtxError::InvalidBinding("load index lacks buffer".into())),
         };
         if seen.insert(buffer, ()).is_none() {
@@ -1274,7 +1276,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     if let UOpKind::GraphBinary(op @ (crate::BinaryOp::Maximum | crate::BinaryOp::Minimum)) =
         value.kind()
     {
-        return scoped_binary_plan(store, sm, *op, ScopedStorageMode::Extrema);
+        return scoped_binary_plan(store, sm, op, ScopedStorageMode::Extrema);
     }
     if matches!(
         value.kind(),
@@ -1432,22 +1434,21 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         ));
     }
     let output_shape = match output_index.arg() {
-        UArg::BufferIndex { output_shape, .. } => output_shape,
+        UArgRef::BufferIndex { output_shape, .. } => output_shape,
         _ => {
             return Err(PtxError::Unsupported(
                 "scoped narrow-storage ABI requires a concrete output buffer".into(),
             ));
         }
     };
-    if (sqrt_direct || sqrt_cast) && matches!(input_index.arg(), UArg::ViewBufferIndex { .. }) {
+    if (sqrt_direct || sqrt_cast) && matches!(input_index.arg(), UArgRef::ViewBufferIndex { .. }) {
         return Err(PtxError::Unsupported(
             "scoped Sqrt does not admit affine-view inputs".into(),
         ));
     }
     let input_shape = match input_index.arg() {
-        UArg::BufferIndex { output_shape, .. } | UArg::ViewBufferIndex { output_shape, .. } => {
-            output_shape
-        }
+        UArgRef::BufferIndex { output_shape, .. }
+        | UArgRef::ViewBufferIndex { output_shape, .. } => output_shape,
         _ => {
             return Err(PtxError::Unsupported(
                 "scoped narrow-storage ABI requires a concrete input buffer".into(),
@@ -1457,7 +1458,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     if input_shape != output_shape
         || output_shape.numel().map_err(|_| PtxError::Overflow)?
             != match output_index.arg() {
-                UArg::BufferIndex { elements, .. } => *elements,
+                UArgRef::BufferIndex { elements, .. } => *elements,
                 _ => unreachable!(),
             }
     {
@@ -1496,7 +1497,7 @@ fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     let [sqrt_input] = sqrt.sources() else {
         return Err(PtxError::Unsupported("Rsqrt Sqrt needs input".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements,
         output_shape,
         ..
@@ -1540,7 +1541,7 @@ fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     let [index] = load.sources() else {
         return Err(PtxError::Unsupported("Rsqrt load needs index".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: input_elements,
         input_shape,
         output_shape: input_output,
@@ -1595,7 +1596,7 @@ fn scoped_binary_plan(
     let UOpKind::GraphBinary(actual_op) = value.kind() else {
         return Ok(None);
     };
-    if *actual_op != op {
+    if actual_op != op {
         return Ok(None);
     }
     let [left, right] = value.sources() else {
@@ -1604,7 +1605,7 @@ fn scoped_binary_plan(
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -1696,13 +1697,13 @@ fn scoped_binary_plan(
         }
         let input_index = index(load)?;
         let (elements, input_shape, operand_output) = match input_index.arg() {
-            UArg::BufferIndex {
+            UArgRef::BufferIndex {
                 elements,
                 input_shape,
                 output_shape,
                 ..
             } => (*elements, input_shape, output_shape),
-            UArg::ViewBufferIndex {
+            UArgRef::ViewBufferIndex {
                 elements,
                 input_shape,
                 output_shape,
@@ -1743,13 +1744,13 @@ fn scoped_binary_plan(
         }
     }
     let left_shape = match index(left_load)?.arg() {
-        UArg::BufferIndex { input_shape, .. } | UArg::ViewBufferIndex { input_shape, .. } => {
+        UArgRef::BufferIndex { input_shape, .. } | UArgRef::ViewBufferIndex { input_shape, .. } => {
             input_shape
         }
         _ => unreachable!(),
     };
     let right_shape = match index(right_load)?.arg() {
-        UArg::BufferIndex { input_shape, .. } | UArg::ViewBufferIndex { input_shape, .. } => {
+        UArgRef::BufferIndex { input_shape, .. } | UArgRef::ViewBufferIndex { input_shape, .. } => {
             input_shape
         }
         _ => unreachable!(),
@@ -1799,18 +1800,20 @@ fn scoped_sub_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     if negated.ty() != value.ty() || right.ty() != value.ty() {
         return Ok(None);
     }
-    let synthetic = UOp::new(
+    let synthetic = UOp::try_new(
         UOpKind::GraphBinary(crate::BinaryOp::Sub),
         value.ty(),
         vec![left.clone(), right.clone()],
         UArg::None,
-    );
-    let proof = UOp::new(
+    )
+    .unwrap();
+    let proof = UOp::try_new(
         UOpKind::Store,
         None,
         vec![output.clone(), synthetic],
         UArg::None,
-    );
+    )
+    .unwrap();
     scoped_binary_plan(&proof, sm, crate::BinaryOp::Sub, ScopedStorageMode::Sub)
 }
 
@@ -1826,7 +1829,7 @@ fn scoped_compare_value_proof(
     let UOpKind::GraphCompare(actual) = value.kind() else {
         return Ok(None);
     };
-    if *actual != expected {
+    if actual != expected {
         return Ok(None);
     }
     let [left, right] = value.sources() else {
@@ -1870,7 +1873,7 @@ fn scoped_compare_value_proof(
                 "public Eq load needs one index".into(),
             ));
         };
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             elements,
             input_shape,
             output_shape,
@@ -1936,11 +1939,11 @@ fn scoped_compare_value_proof(
     let left_index = index(left_load, domain_shape)?;
     let right_index = index(right_load, domain_shape)?;
     let left_shape = match left_index.arg() {
-        UArg::BufferIndex { input_shape, .. } => input_shape,
+        UArgRef::BufferIndex { input_shape, .. } => input_shape,
         _ => unreachable!(),
     };
     let right_shape = match right_index.arg() {
-        UArg::BufferIndex { input_shape, .. } => input_shape,
+        UArgRef::BufferIndex { input_shape, .. } => input_shape,
         _ => unreachable!(),
     };
     let comparison_shape = left_shape
@@ -1984,7 +1987,7 @@ fn scoped_compare_value_plan(
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -2039,9 +2042,9 @@ fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Ptx
         || !matches!(truth.kind(), UOpKind::Const)
         || !matches!(
             truth.arg(),
-            UArg::Scalar {
-                dtype: DType::Bool,
-                bits: 1
+            UArgRef::Scalar {
+                dtype: &DType::Bool,
+                bits: &1
             }
         )
         || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
@@ -2049,12 +2052,13 @@ fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Ptx
     {
         return Ok(None);
     }
-    let proof = UOp::new(
+    let proof = UOp::try_new(
         UOpKind::Store,
         None,
         vec![output.clone(), unequal.clone()],
         UArg::None,
-    );
+    )
+    .unwrap();
     if scoped_compare_value_plan(&proof, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)?.is_some()
     {
         Ok(Some(ScopedStorageMode::Eq))
@@ -2096,16 +2100,16 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
         || !matches!(truth.kind(), UOpKind::Const)
         || !matches!(
             truth.arg(),
-            UArg::Scalar {
-                dtype: DType::Bool,
-                bits: 1
+            UArgRef::Scalar {
+                dtype: &DType::Bool,
+                bits: &1
             }
         )
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -2134,7 +2138,7 @@ fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageM
         .ty()
         .ok_or_else(|| PtxError::Unsupported("untyped public logical-not input".into()))?
         .scalar;
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements,
         input_shape,
         output_shape: input_output,
@@ -2184,7 +2188,7 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     {
         return Ok(None);
     }
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -2213,7 +2217,7 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         .ty()
         .ok_or_else(|| PtxError::Unsupported("untyped public IsInf input".into()))?
         .scalar;
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements,
         input_shape,
         output_shape: input_output,
@@ -2295,16 +2299,16 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
         || !matches!(truth.kind(), UOpKind::Const)
         || !matches!(
             truth.arg(),
-            UArg::Scalar {
-                dtype: DType::Bool,
-                bits: 1
+            UArgRef::Scalar {
+                dtype: &DType::Bool,
+                bits: &1
             }
         )
         || !truth.sources().is_empty()
     {
         return Ok(None);
     }
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -2324,21 +2328,23 @@ fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode
             "public IsFinite output descriptor is invalid".into(),
         ));
     }
-    let isinf_store = UOp::new(
+    let isinf_store = UOp::try_new(
         UOpKind::Store,
         None,
         vec![output.clone(), infinite.clone()],
         UArg::None,
-    );
+    )
+    .unwrap();
     if scoped_isinf_plan(&isinf_store, sm)?.is_none() {
         return Ok(None);
     }
-    let isnan_store = UOp::new(
+    let isnan_store = UOp::try_new(
         UOpKind::Store,
         None,
         vec![output.clone(), nan.clone()],
         UArg::None,
-    );
+    )
+    .unwrap();
     if scoped_compare_value_plan(
         &isnan_store,
         sm,
@@ -2378,21 +2384,22 @@ fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorage
         || !matches!(truth.kind(), UOpKind::Const)
         || !matches!(
             truth.arg(),
-            UArg::Scalar {
-                dtype: DType::Bool,
-                bits: 1
+            UArgRef::Scalar {
+                dtype: &DType::Bool,
+                bits: &1
             }
         )
         || truth.ty().map(|t| t.scalar) != Some(DType::Bool)
     {
         return Ok(None);
     }
-    let proof = UOp::new(
+    let proof = UOp::try_new(
         UOpKind::Store,
         None,
         vec![output.clone(), inner.clone()],
         UArg::None,
-    );
+    )
+    .unwrap();
     if scoped_compare_value_plan(
         &proof,
         sm,
@@ -2455,9 +2462,9 @@ fn scoped_select_predicate_shape(
                 || !matches!(truth.kind(), UOpKind::Const)
                 || !matches!(
                     truth.arg(),
-                    UArg::Scalar {
-                        dtype: DType::Bool,
-                        bits: 1
+                    UArgRef::Scalar {
+                        dtype: &DType::Bool,
+                        bits: &1
                     }
                 )
                 || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
@@ -2502,7 +2509,7 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -2550,7 +2557,7 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
         ));
     }
     if !matches!(zero.kind(), UOpKind::Const)
-        || !matches!(zero.arg(), UArg::Scalar { dtype, bits: 0 } if *dtype == output_dtype)
+        || !matches!(zero.arg(), UArgRef::Scalar { dtype, bits } if *dtype == output_dtype && *bits == 0)
         || !zero.sources().is_empty()
     {
         return Ok(None);
@@ -2563,7 +2570,7 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
             "public ReLU input load needs one index".into(),
         ));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: input_elements,
         input_shape,
         output_shape: input_output_shape,
@@ -2624,7 +2631,7 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -2672,7 +2679,7 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
         || scaled.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || input_value.ty().map(|ty| ty.scalar) != Some(output_dtype)
         || !matches!(zero.kind(), UOpKind::Const)
-        || !matches!(zero.arg(), UArg::Scalar { bits: 0, .. })
+        || !matches!(zero.arg(), UArgRef::Scalar { bits, .. } if *bits == 0)
         || !zero.sources().is_empty()
     {
         return Ok(None);
@@ -2712,7 +2719,7 @@ fn scoped_leaky_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
                 "public LeakyReLU {role} load needs one index"
             )));
         };
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             elements,
             input_shape,
             output_shape,
@@ -2817,7 +2824,7 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
             "Clamp Store needs index and value".into(),
         ));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements,
         output_shape,
         ..
@@ -2872,7 +2879,7 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         let [index] = load.sources() else {
             return Err(PtxError::Unsupported("Clamp load arity".into()));
         };
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             elements,
             input_shape,
             output_shape,
@@ -3058,7 +3065,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
     let Some(output) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -3117,7 +3124,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
                 "public Select {role} load needs one index"
             )));
         };
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             elements,
             input_shape,
             output_shape,
@@ -3157,7 +3164,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         }
         let index = index(condition, output_shape, "condition")?;
         let shape = match index.arg() {
-            UArg::BufferIndex { input_shape, .. } => input_shape.clone(),
+            UArgRef::BufferIndex { input_shape, .. } => input_shape.clone(),
             _ => unreachable!(),
         };
         (shape, dtype)
@@ -3211,7 +3218,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
     let false_index = index(false_load, output_shape, "false payload")?;
     fn input_shape(index: &UOp) -> &Shape {
         match index.arg() {
-            UArg::BufferIndex { input_shape, .. } => input_shape,
+            UArgRef::BufferIndex { input_shape, .. } => input_shape,
             _ => unreachable!(),
         }
     }
@@ -3267,7 +3274,7 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -3340,7 +3347,7 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
                 "public Div load needs one index".into(),
             ));
         };
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             elements,
             input_shape,
             output_shape,
@@ -3428,11 +3435,11 @@ fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
     let lhs_index = index(lhs_load, output_shape)?;
     let rhs_index = index(rhs_load, output_shape)?;
     let lhs_shape = match lhs_index.arg() {
-        UArg::BufferIndex { input_shape, .. } => input_shape,
+        UArgRef::BufferIndex { input_shape, .. } => input_shape,
         _ => unreachable!(),
     };
     let rhs_shape = match rhs_index.arg() {
-        UArg::BufferIndex { input_shape, .. } => input_shape,
+        UArgRef::BufferIndex { input_shape, .. } => input_shape,
         _ => unreachable!(),
     };
     if lhs_shape
@@ -3506,7 +3513,7 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
     let Some(output_index) = store.sources().first() else {
         return Err(PtxError::Unsupported("Store without index".into()));
     };
-    let UArg::BufferIndex {
+    let UArgRef::BufferIndex {
         elements: output_elements,
         output_shape,
         ..
@@ -3532,7 +3539,7 @@ fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxErr
                 "Bool Sub load needs one index".into(),
             ));
         };
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             elements,
             input_shape,
             output_shape,
@@ -4220,8 +4227,8 @@ fn emit(
     };
     match n.kind() {
         UOpKind::Const => match n.arg() {
-            UArg::Int(v) => lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty))),
-            UArg::Scalar { dtype, bits } if *dtype == ty => {
+            UArgRef::Int(v) => lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty))),
+            UArgRef::Scalar { dtype, bits } if *dtype == ty => {
                 // Bool is logically one bit but PTX tensors store it in an
                 // addressable byte.  A scalar Bool literal must use that
                 // physical width as well; `mov.b1` is not a valid register
@@ -4230,7 +4237,7 @@ fn emit(
                 let digits = width as usize / 4;
                 lines.push(format!("  mov.b{width} {dst}, 0x{bits:0digits$x};"));
             }
-            UArg::Scalar { .. } => {
+            UArgRef::Scalar { .. } => {
                 return Err(PtxError::Unsupported("scalar literal/type mismatch".into()));
             }
             _ => return Err(PtxError::Unsupported("invalid constant".into())),
@@ -4241,13 +4248,13 @@ fn emit(
                 .first()
                 .ok_or_else(|| PtxError::Unsupported("Load without index".into()))?;
             let (buffer, input_shape, output_shape, view) = match ix.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
                 } => (buffer, input_shape, output_shape, None),
-                UArg::ViewBufferIndex {
+                UArgRef::ViewBufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
@@ -4392,13 +4399,13 @@ fn emit(
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
-            if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Sub) {
+            if op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Sub) {
                 // The whole-root proof owns this exact `Add(lhs, Neg(rhs))`
                 // composition. The enclosing Add emits one typed Sub, so the
                 // structural Neg contributes its source value unchanged.
                 return Ok(a);
             }
-            if *op == crate::UnaryOp::IsInf
+            if op == crate::UnaryOp::IsInf
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite)
@@ -4416,7 +4423,7 @@ fn emit(
                 emit_isinf_predicate(lines, &dst, a, source_dtype);
                 return Ok(dst);
             }
-            if *op == crate::UnaryOp::Reciprocal
+            if op == crate::UnaryOp::Reciprocal
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
@@ -4438,7 +4445,7 @@ fn emit(
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
                 return Ok(dst);
             }
-            if *op == crate::UnaryOp::Sqrt
+            if op == crate::UnaryOp::Sqrt
                 && matches!(
                     storage_mode,
                     Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast)
@@ -4461,7 +4468,7 @@ fn emit(
                 lines.push(format!("  sqrt.rn.f64 {dst}, {wide};"));
                 return Ok(dst);
             }
-            if *op == crate::UnaryOp::Sqrt && storage_mode == Some(ScopedStorageMode::Rsqrt) {
+            if op == crate::UnaryOp::Sqrt && storage_mode == Some(ScopedStorageMode::Rsqrt) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Sqrt input".into()))?
@@ -4469,7 +4476,7 @@ fn emit(
                 emit_rsqrt_sqrt_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
             }
-            if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Rsqrt) {
+            if op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Rsqrt) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Reciprocal input".into()))?
@@ -4483,7 +4490,7 @@ fn emit(
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
                 return Ok(dst);
             }
-            if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Div) {
+            if op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Div) {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| {
@@ -4493,7 +4500,7 @@ fn emit(
                 emit_div_reciprocal_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
             }
-            if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
+            if op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
                 match ty {
                     DType::I8 | DType::I16 | DType::I32 => {
                         lines.push(format!("  neg.s32 {dst}, {a};"));
@@ -4521,7 +4528,7 @@ fn emit(
                 }
                 return Ok(dst);
             }
-            if *op == crate::UnaryOp::Sign {
+            if op == crate::UnaryOp::Sign {
                 // Sign is source-equivalent to ordered comparisons and
                 // selects, rather than PTX's host-dependent `sign` intrinsic.
                 // In particular, both zero signs produce +0 and unordered
@@ -4615,7 +4622,7 @@ fn emit(
         UOpKind::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
             if storage_mode == Some(ScopedStorageMode::LeakyRelu) {
-                if *op != crate::BinaryOp::Mul {
+                if op != crate::BinaryOp::Mul {
                     return Err(PtxError::Unsupported(
                         "public LeakyReLU requires only its slope * input branch".into(),
                     ));
@@ -4697,13 +4704,12 @@ fn emit(
                         | ScopedStorageMode::SubBool
                 )
             ) && matches!(
-                *op,
+                op,
                 crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub
             ) {
-                let is_sub = *op == crate::BinaryOp::Sub
-                    || (storage_mode == Some(ScopedStorageMode::Sub)
-                        && *op == crate::BinaryOp::Add);
-                let is_add = *op == crate::BinaryOp::Add && !is_sub;
+                let is_sub = op == crate::BinaryOp::Sub
+                    || (storage_mode == Some(ScopedStorageMode::Sub) && op == crate::BinaryOp::Add);
+                let is_add = op == crate::BinaryOp::Add && !is_sub;
                 match ty {
                     DType::Bool if is_add => lines.push(format!("  or.b32 {dst}, {a}, {b};")),
                     DType::Bool if !is_sub => lines.push(format!("  and.b32 {dst}, {a}, {b};")),
@@ -4784,7 +4790,7 @@ fn emit(
                 }
                 return Ok(dst);
             }
-            if storage_mode == Some(ScopedStorageMode::Abs) && *op == crate::BinaryOp::Mul {
+            if storage_mode == Some(ScopedStorageMode::Abs) && op == crate::BinaryOp::Mul {
                 let mnemonic = match ty {
                     DType::Bool => {
                         lines.push(format!("  and.b32 {dst}, {a}, {b};"));
@@ -4808,7 +4814,7 @@ fn emit(
                 return Ok(dst);
             }
             if storage_mode == Some(ScopedStorageMode::Extrema) {
-                if !matches!(*op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) {
+                if !matches!(op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) {
                     return Err(PtxError::Unsupported(
                         "scoped extrema root does not match its public operation".into(),
                     ));
@@ -4830,7 +4836,7 @@ fn emit(
                 // Ordered predicates select rhs only when it strictly wins.
                 // Equality, signed-zero ties, and every unordered NaN case
                 // retain lhs and its exact stored payload.
-                let predicate = if *op == crate::BinaryOp::Maximum {
+                let predicate = if op == crate::BinaryOp::Maximum {
                     "lt"
                 } else {
                     "gt"
@@ -4862,13 +4868,13 @@ fn emit(
                 ));
                 return Ok(dst);
             }
-            if matches!(*op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) {
+            if matches!(op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) {
                 if matches!(ty, DType::F16 | DType::BF16) {
                     return Err(PtxError::Unsupported(
                         "ordered maximum/minimum for narrow float lacks an exact PTX path".into(),
                     ));
                 }
-                let predicate = if *op == crate::BinaryOp::Maximum {
+                let predicate = if op == crate::BinaryOp::Maximum {
                     "lt"
                 } else {
                     "gt"
@@ -4920,12 +4926,12 @@ fn emit(
                         | ScopedStorageMode::Clamp
                 )
             ) {
-                if storage_mode == Some(ScopedStorageMode::Relu) && *op != crate::CompareOp::Lt {
+                if storage_mode == Some(ScopedStorageMode::Relu) && op != crate::CompareOp::Lt {
                     return Err(PtxError::Unsupported(
                         "public ReLU requires ordered zero < input".into(),
                     ));
                 }
-                if storage_mode == Some(ScopedStorageMode::LeakyRelu) && *op != crate::CompareOp::Lt
+                if storage_mode == Some(ScopedStorageMode::LeakyRelu) && op != crate::CompareOp::Lt
                 {
                     return Err(PtxError::Unsupported(
                         "public LeakyReLU requires ordered input < zero".into(),
@@ -5007,7 +5013,7 @@ fn emit(
                 return Ok(dst);
             }
             if storage_mode == Some(ScopedStorageMode::LogicalNot) {
-                if *op != crate::CompareOp::Ne
+                if op != crate::CompareOp::Ne
                     || n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                     || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
                 {
@@ -5024,7 +5030,7 @@ fn emit(
                 return Ok(dst);
             }
             if storage_mode == Some(ScopedStorageMode::IsFinite) {
-                if *op != crate::CompareOp::Ne {
+                if op != crate::CompareOp::Ne {
                     return Err(PtxError::Unsupported(
                         "scoped IsFinite has a non-Ne comparison".into(),
                     ));
@@ -5077,8 +5083,8 @@ fn emit(
                     crate::CompareOp::Lt
                 };
                 let public_eq_stage =
-                    storage_mode == Some(ScopedStorageMode::Eq) && *op == crate::CompareOp::Ne;
-                if *op != expected && !public_eq_stage {
+                    storage_mode == Some(ScopedStorageMode::Eq) && op == crate::CompareOp::Ne;
+                if op != expected && !public_eq_stage {
                     return Err(PtxError::Unsupported(
                         "scoped predicate does not match its root plan".into(),
                     ));
@@ -5311,7 +5317,7 @@ fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
         .sources()
         .first()
         .ok_or_else(|| PtxError::Unsupported("reduction update without init".into()))?;
-    let UArg::Reduction {
+    let UArgRef::Reduction {
         input_shape,
         output_shape,
         axes,
@@ -6830,6 +6836,21 @@ mod tests {
             .unwrap()
     }
 
+    fn global(dtype: DType, buffer: u64) -> UOp {
+        let element = UType::scalar(dtype);
+        UOp::try_new(
+            UOpKind::DefineGlobal,
+            Some(element),
+            vec![],
+            UArg::Address {
+                space: AddressSpace::Global,
+                name: format!("b{buffer}"),
+                element,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn extrema_ptx_has_a_scoped_lhs_preserving_root() {
         let renderer = PtxRenderer::new(80).unwrap();
@@ -7293,13 +7314,8 @@ mod tests {
     }
     fn kernel(dtype: DType) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
-        let addr = UOp::new(
-            UOpKind::DefineGlobal,
-            Some(UType::scalar(dtype)),
-            vec![],
-            UArg::None,
-        );
-        let ix = UOp::new(
+        let addr = global(dtype, 1);
+        let ix = UOp::try_new(
             UOpKind::Index,
             Some(UType::scalar(dtype)),
             vec![addr, range],
@@ -7309,81 +7325,67 @@ mod tests {
                 input_shape: crate::Shape::new(vec![4]),
                 output_shape: crate::Shape::new(vec![4]),
             },
-        );
-        let load = UOp::new(
+        )
+        .unwrap();
+        let load = UOp::try_new(
             UOpKind::Load,
             Some(UType::scalar(dtype)),
             vec![ix.clone()],
             UArg::None,
-        );
-        let value = UOp::new(
+        )
+        .unwrap();
+        let value = UOp::try_new(
             UOpKind::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![load, UOp::constant(1, UType::scalar(dtype))],
             UArg::None,
-        );
-        UOp::sink(vec![UOp::new(
-            UOpKind::Store,
-            None,
-            vec![ix, value],
-            UArg::None,
-        )])
+        )
+        .unwrap();
+        UOp::sink(vec![
+            UOp::try_new(UOpKind::Store, None, vec![ix, value], UArg::None).unwrap(),
+        ])
     }
     fn unary_kernel(dtype: DType, op: crate::UnaryOp, shape: crate::Shape) -> UOp {
         let elements = shape.numel().unwrap();
         let range = UOp::constant(elements as i64, UType::scalar(DType::I64));
-        let index = UOp::new(
+        let index = UOp::try_new(
             UOpKind::Index,
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::new(
-                    UOpKind::DefineGlobal,
-                    Some(UType::scalar(dtype)),
-                    vec![],
-                    UArg::None,
-                ),
-                range,
-            ],
+            vec![global(dtype, 1), range],
             UArg::BufferIndex {
                 buffer: 1,
                 elements,
                 input_shape: shape.clone(),
                 output_shape: shape,
             },
-        );
-        let value = UOp::new(
+        )
+        .unwrap();
+        let value = UOp::try_new(
             UOpKind::GraphUnary(op),
             Some(UType::scalar(dtype)),
-            vec![UOp::new(
-                UOpKind::Load,
-                Some(UType::scalar(dtype)),
-                vec![index.clone()],
-                UArg::None,
-            )],
+            vec![
+                UOp::try_new(
+                    UOpKind::Load,
+                    Some(UType::scalar(dtype)),
+                    vec![index.clone()],
+                    UArg::None,
+                )
+                .unwrap(),
+            ],
             UArg::None,
-        );
-        UOp::sink(vec![UOp::new(
-            UOpKind::Store,
-            None,
-            vec![index, value],
-            UArg::None,
-        )])
+        )
+        .unwrap();
+        UOp::sink(vec![
+            UOp::try_new(UOpKind::Store, None, vec![index, value], UArg::None).unwrap(),
+        ])
     }
     fn broadcast_unary_kernel(dtype: DType, op: crate::UnaryOp) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer, input_shape: crate::Shape| {
-            UOp::new(
+            UOp::try_new(
                 UOpKind::Index,
                 Some(UType::scalar(dtype)),
-                vec![
-                    UOp::new(
-                        UOpKind::DefineGlobal,
-                        Some(UType::scalar(dtype)),
-                        vec![],
-                        UArg::None,
-                    ),
-                    range.clone(),
-                ],
+                vec![global(dtype, buffer), range.clone()],
                 UArg::BufferIndex {
                     buffer,
                     elements: input_shape.numel().unwrap(),
@@ -7391,26 +7393,28 @@ mod tests {
                     output_shape: crate::Shape::new(vec![2, 2]),
                 },
             )
+            .unwrap()
         };
         let input = index(1, crate::Shape::new(vec![1, 2]));
         let output = index(2, crate::Shape::new(vec![2, 2]));
-        let value = UOp::new(
+        let value = UOp::try_new(
             UOpKind::GraphUnary(op),
             Some(UType::scalar(dtype)),
-            vec![UOp::new(
-                UOpKind::Load,
-                Some(UType::scalar(dtype)),
-                vec![input],
-                UArg::None,
-            )],
+            vec![
+                UOp::try_new(
+                    UOpKind::Load,
+                    Some(UType::scalar(dtype)),
+                    vec![input],
+                    UArg::None,
+                )
+                .unwrap(),
+            ],
             UArg::None,
-        );
-        UOp::sink(vec![UOp::new(
-            UOpKind::Store,
-            None,
-            vec![output, value],
-            UArg::None,
-        )])
+        )
+        .unwrap();
+        UOp::sink(vec![
+            UOp::try_new(UOpKind::Store, None, vec![output, value], UArg::None).unwrap(),
+        ])
     }
     fn static_view_unary_kernel(dtype: DType, op: crate::UnaryOp, offset: usize) -> UOp {
         let output_shape = crate::Shape::new(vec![2, 2]);
@@ -7421,18 +7425,10 @@ mod tests {
             offset,
         };
         let range = UOp::constant(4, UType::scalar(DType::I64));
-        let input = UOp::new(
+        let input = UOp::try_new(
             UOpKind::Index,
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::new(
-                    UOpKind::DefineGlobal,
-                    Some(UType::scalar(dtype)),
-                    vec![],
-                    UArg::None,
-                ),
-                range.clone(),
-            ],
+            vec![global(dtype, 1), range.clone()],
             UArg::ViewBufferIndex {
                 buffer: 1,
                 elements: 4,
@@ -7440,59 +7436,46 @@ mod tests {
                 output_shape: output_shape.clone(),
                 view: view.into(),
             },
-        );
-        let output = UOp::new(
+        )
+        .unwrap();
+        let output = UOp::try_new(
             UOpKind::Index,
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::new(
-                    UOpKind::DefineGlobal,
-                    Some(UType::scalar(dtype)),
-                    vec![],
-                    UArg::None,
-                ),
-                range,
-            ],
+            vec![global(dtype, 2), range],
             UArg::BufferIndex {
                 buffer: 2,
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape,
             },
-        );
-        let value = UOp::new(
+        )
+        .unwrap();
+        let value = UOp::try_new(
             UOpKind::GraphUnary(op),
             Some(UType::scalar(dtype)),
-            vec![UOp::new(
-                UOpKind::Load,
-                Some(UType::scalar(dtype)),
-                vec![input],
-                UArg::None,
-            )],
+            vec![
+                UOp::try_new(
+                    UOpKind::Load,
+                    Some(UType::scalar(dtype)),
+                    vec![input],
+                    UArg::None,
+                )
+                .unwrap(),
+            ],
             UArg::None,
-        );
-        UOp::sink(vec![UOp::new(
-            UOpKind::Store,
-            None,
-            vec![output, value],
-            UArg::None,
-        )])
+        )
+        .unwrap();
+        UOp::sink(vec![
+            UOp::try_new(UOpKind::Store, None, vec![output, value], UArg::None).unwrap(),
+        ])
     }
     fn broadcast_add_kernel(dtype: DType) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer, shape: Vec<usize>| {
-            UOp::new(
+            UOp::try_new(
                 UOpKind::Index,
                 Some(UType::scalar(dtype)),
-                vec![
-                    UOp::new(
-                        UOpKind::DefineGlobal,
-                        Some(UType::scalar(dtype)),
-                        vec![],
-                        UArg::None,
-                    ),
-                    range.clone(),
-                ],
+                vec![global(dtype, buffer), range.clone()],
                 UArg::BufferIndex {
                     buffer,
                     elements: shape.iter().product(),
@@ -7500,35 +7483,36 @@ mod tests {
                     output_shape: crate::Shape::new(vec![2, 2]),
                 },
             )
+            .unwrap()
         };
         let left = index(1, vec![2, 2]);
         let right = index(2, vec![1, 2]);
         let out = index(3, vec![2, 2]);
-        let add = UOp::new(
+        let add = UOp::try_new(
             UOpKind::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![
-                UOp::new(
+                UOp::try_new(
                     UOpKind::Load,
                     Some(UType::scalar(dtype)),
                     vec![left],
                     UArg::None,
-                ),
-                UOp::new(
+                )
+                .unwrap(),
+                UOp::try_new(
                     UOpKind::Load,
                     Some(UType::scalar(dtype)),
                     vec![right],
                     UArg::None,
-                ),
+                )
+                .unwrap(),
             ],
             UArg::None,
-        );
-        UOp::sink(vec![UOp::new(
-            UOpKind::Store,
-            None,
-            vec![out, add],
-            UArg::None,
-        )])
+        )
+        .unwrap();
+        UOp::sink(vec![
+            UOp::try_new(UOpKind::Store, None, vec![out, add], UArg::None).unwrap(),
+        ])
     }
 
     fn static_view_add_kernel(dtype: DType, offset: usize) -> UOp {
@@ -7542,18 +7526,10 @@ mod tests {
         };
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let index = |buffer| {
-            UOp::new(
+            UOp::try_new(
                 UOpKind::Index,
                 Some(UType::scalar(dtype)),
-                vec![
-                    UOp::new(
-                        UOpKind::DefineGlobal,
-                        Some(UType::scalar(dtype)),
-                        vec![],
-                        UArg::None,
-                    ),
-                    range.clone(),
-                ],
+                vec![global(dtype, buffer), range.clone()],
                 UArg::ViewBufferIndex {
                     buffer,
                     elements: 4,
@@ -7562,53 +7538,47 @@ mod tests {
                     view: view.clone().into(),
                 },
             )
+            .unwrap()
         };
         let left = index(1);
         let right = index(2);
-        let output = UOp::new(
+        let output = UOp::try_new(
             UOpKind::Index,
             Some(UType::scalar(dtype)),
-            vec![
-                UOp::new(
-                    UOpKind::DefineGlobal,
-                    Some(UType::scalar(dtype)),
-                    vec![],
-                    UArg::None,
-                ),
-                range,
-            ],
+            vec![global(dtype, 3), range],
             UArg::BufferIndex {
                 buffer: 3,
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape,
             },
-        );
-        let value = UOp::new(
+        )
+        .unwrap();
+        let value = UOp::try_new(
             UOpKind::GraphBinary(crate::BinaryOp::Add),
             Some(UType::scalar(dtype)),
             vec![
-                UOp::new(
+                UOp::try_new(
                     UOpKind::Load,
                     Some(UType::scalar(dtype)),
                     vec![left],
                     UArg::None,
-                ),
-                UOp::new(
+                )
+                .unwrap(),
+                UOp::try_new(
                     UOpKind::Load,
                     Some(UType::scalar(dtype)),
                     vec![right],
                     UArg::None,
-                ),
+                )
+                .unwrap(),
             ],
             UArg::None,
-        );
-        UOp::sink(vec![UOp::new(
-            UOpKind::Store,
-            None,
-            vec![output, value],
-            UArg::None,
-        )])
+        )
+        .unwrap();
+        UOp::sink(vec![
+            UOp::try_new(UOpKind::Store, None, vec![output, value], UArg::None).unwrap(),
+        ])
     }
 
     #[test]

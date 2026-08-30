@@ -1,5 +1,7 @@
 //! Bounded portable node-table encoding for validated UOps.
-use super::{AddressSpace, AffineView, Binary, UArg, UOp, UOpKind, UType, Unary, ViewMap};
+use super::{
+    AddressSpace, AffineView, Binary, Operation, UArg, UOp, UOpKind, UType, Unary, ViewMap,
+};
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
     MatmulKernelPlan, MatmulResourceEstimate, MatmulTargetCaps, MmaFragmentLayout, MmaInstruction,
@@ -77,11 +79,13 @@ fn encode_inner(root: &UOp, effects: bool) -> Result<Vec<u8>, ArtifactError> {
     w.u32(nodes.len() as u32)?;
     w.u32((nodes.len() - 1) as u32)?;
     for (id, node) in nodes.iter().enumerate() {
-        validate_fields(node.kind(), node.ty(), node.arg(), node.sources(), effects)?;
+        let kind = node.kind();
+        let arg = node.arg().to_owned();
+        validate_fields(&kind, node.ty(), &arg, node.sources(), effects)?;
         w.u32(id as u32)?;
-        write_kind(&mut w, node.kind(), effects)?;
+        write_kind(&mut w, &kind, effects)?;
         write_type(&mut w, node.ty())?;
-        write_arg(&mut w, node.arg(), effects)?;
+        write_arg(&mut w, &arg, effects)?;
         if node.sources().len() > MAX_SOURCES {
             return Err(ArtifactError::Format("source limit"));
         }
@@ -171,7 +175,10 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             &sources,
             version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION,
         )?;
-        nodes.push(UOp::from_artifact(kind, ty, sources, arg));
+        nodes.push(
+            UOp::from_artifact(kind, ty, sources, arg)
+                .map_err(|_| ArtifactError::Format("kind argument"))?,
+        );
     }
     if !r.done() {
         return Err(ArtifactError::Format("trailing bytes"));
@@ -347,79 +354,17 @@ fn validate_fields(
         }
         _ => {}
     }
-    let arg_ok = match kind {
-        UOpKind::Const | UOpKind::VConst => matches!(arg, UArg::Int(_) | UArg::Scalar { .. }),
-        UOpKind::DefineVar => matches!(arg, UArg::Variable { .. }),
-        UOpKind::DefineGlobal | UOpKind::DefineLocal | UOpKind::DefineRegister => {
-            matches!(arg, UArg::Address { .. })
-        }
-        UOpKind::Special => matches!(arg, UArg::Name(_)),
-        UOpKind::Range => matches!(arg, UArg::RangeAxis(_)),
-        UOpKind::Gep => matches!(arg, UArg::GepLane(_)),
-        UOpKind::Index => matches!(arg, UArg::BufferIndex { .. } | UArg::ViewBufferIndex { .. }),
-        UOpKind::ReduceInit => matches!(arg, UArg::Reduction { .. }),
-        UOpKind::Matmul => matches!(
-            arg,
-            UArg::Matmul(_)
-                | UArg::TiledMatmul(_)
-                | UArg::TensorCoreMatmul(_)
-                | UArg::QuantizedMatmul(_)
-        ),
-        UOpKind::Conv2d => matches!(arg, UArg::Conv2d(_)),
-        UOpKind::Movement => matches!(arg, UArg::Movement(_) | UArg::QuantizedRowGather(_)),
-        UOpKind::Random => matches!(arg, UArg::Random(_)),
-        UOpKind::PrefixScan => matches!(arg, UArg::PrefixScan { .. }),
-        UOpKind::Sort => matches!(arg, UArg::Sort { .. }),
-        UOpKind::TensorGuard => matches!(arg, UArg::TensorGuard { .. }),
-        UOpKind::EffectStore | UOpKind::After => effects && matches!(arg, UArg::Effect(_)),
-        _ => matches!(arg, UArg::None),
-    };
-    if !arg_ok {
+    let operation = Operation::from_legacy(*kind, arg.clone())
+        .map_err(|_| ArtifactError::Format("kind argument"))?;
+    // RGUA's effects envelope is a wire-format distinction, not a general
+    // impurity classification. Ordinary Store, Barrier, and Sink operations
+    // have always been valid in the standard envelope; only stateful effect
+    // transactions carry EffectStore/After and require the effects envelope.
+    if matches!(operation.kind(), UOpKind::EffectStore | UOpKind::After) && !effects {
         return Err(ArtifactError::Format("kind argument"));
     }
-    let arity_ok = match kind {
-        UOpKind::Const
-        | UOpKind::VConst
-        | UOpKind::DefineVar
-        | UOpKind::DefineGlobal
-        | UOpKind::DefineLocal
-        | UOpKind::DefineRegister
-        | UOpKind::Special
-        | UOpKind::Matmul
-        | UOpKind::Conv2d
-        | UOpKind::Movement
-        | UOpKind::Random
-        | UOpKind::PrefixScan
-        | UOpKind::Sort
-        | UOpKind::TensorGuard
-        | UOpKind::ReduceInit
-        | UOpKind::Barrier => sources.is_empty(),
-        UOpKind::Range
-        | UOpKind::EndRange
-        | UOpKind::If
-        | UOpKind::EndIf
-        | UOpKind::Unary(_)
-        | UOpKind::GraphUnary(_)
-        | UOpKind::ReduceFinalize
-        | UOpKind::Cast
-        | UOpKind::Bitcast
-        | UOpKind::Gep
-        | UOpKind::Load => sources.len() == 1,
-        UOpKind::Binary(_)
-        | UOpKind::GraphBinary(_)
-        | UOpKind::GraphCompare(_)
-        | UOpKind::ReduceAccumulate
-        | UOpKind::Index
-        | UOpKind::Store => sources.len() == 2,
-        UOpKind::GraphLogical(LogicalOp::Not) => sources.len() == 1,
-        UOpKind::GraphLogical(LogicalOp::And | LogicalOp::Or) => sources.len() == 2,
-        UOpKind::Ternary(super::Ternary::Where) => sources.len() == 3,
-        UOpKind::Vectorize => !sources.is_empty(),
-        UOpKind::Sink => true,
-        UOpKind::EffectStore => effects && sources.is_empty(),
-        UOpKind::After => effects && sources.len() == 1,
-    };
-    if !arity_ok {
+    let signature = operation.signature();
+    if !signature.arity.accepts(sources.len()) {
         return Err(ArtifactError::Format("kind sources"));
     }
     let type_ok = match kind {
@@ -471,9 +416,12 @@ fn validate_fields(
             ty == Some(UType::scalar(DType::Bool)) && sources.iter().all(|x| x.ty() == ty)
         }
         UOpKind::Matmul => {
-            arg.matmul_plan()
+            operation
+                .argument()
+                .matmul_plan()
                 .is_some_and(|plan| ty == Some(UType::scalar(plan.dtype)))
-                || arg
+                || operation
+                    .argument()
                     .quantized_matmul_plan()
                     .is_some_and(|plan| ty == Some(UType::scalar(plan.output_dtype)))
         }
@@ -2422,6 +2370,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UArgRef;
 
     fn finish(mut w: Writer) -> Vec<u8> {
         let sum = checksum(&w.out);
@@ -2453,7 +2402,7 @@ mod tests {
     }
     #[test]
     fn tensor_guard_v17_round_trip_and_legacy_exclusion_are_exact() {
-        let guard = UOp::new(
+        let guard = UOp::try_new(
             UOpKind::TensorGuard,
             Some(UType::scalar(DType::F32)),
             vec![],
@@ -2463,7 +2412,8 @@ mod tests {
                 axis: 1,
                 dtype: DType::F32,
             },
-        );
+        )
+        .unwrap();
         let bytes = encode(&guard).unwrap();
         assert_eq!(bytes, encode(&guard).unwrap());
         assert_eq!(decode(&bytes).unwrap(), guard);
@@ -2480,6 +2430,24 @@ mod tests {
         let root = UOp::binary(Binary::Add, x.clone(), x);
         let decoded = decode(&encode(&root).unwrap()).unwrap();
         assert!(decoded.sources()[0].shares_node_with(&decoded.sources()[1]));
+    }
+
+    #[test]
+    fn standard_envelope_retains_ordinary_impure_kernel_nodes() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let output = graph.relu(input).unwrap();
+        let root = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let kinds = root
+            .topological()
+            .unwrap()
+            .into_iter()
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&UOpKind::Store));
+        assert!(kinds.contains(&UOpKind::Sink));
+        let bytes = encode(&root).unwrap();
+        assert_eq!(decode(&bytes).unwrap(), root);
     }
     #[test]
     fn matmul_payload_round_trip_and_validation_are_exact() {
@@ -2506,17 +2474,18 @@ mod tests {
         legacy_version[body_len..].copy_from_slice(&sum.to_le_bytes());
         assert!(decode(&legacy_version).is_err());
 
-        let UArg::Matmul(plan) = root.arg() else {
+        let UArgRef::Matmul(plan) = root.arg() else {
             panic!("matmul payload missing");
         };
-        let mut malformed = plan.as_ref().clone();
+        let mut malformed = plan.clone();
         malformed.k += 1;
-        let malformed = UOp::new(
+        let malformed = UOp::try_new(
             UOpKind::Matmul,
             Some(UType::scalar(DType::F64)),
             vec![],
             UArg::Matmul(Box::new(malformed)),
-        );
+        )
+        .unwrap();
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
 
@@ -2528,28 +2497,30 @@ mod tests {
         let tiled_bytes = encode(&tiled).unwrap();
         assert_eq!(decode(&tiled_bytes).unwrap(), tiled);
         assert_eq!(encode(&decode(&tiled_bytes).unwrap()).unwrap(), tiled_bytes);
-        let UArg::TiledMatmul(payload) = tiled.arg() else {
+        let UArgRef::TiledMatmul(payload) = tiled.arg() else {
             panic!("tiled matmul payload missing");
         };
-        let mut malformed = payload.as_ref().clone();
+        let mut malformed = payload.clone();
         malformed.tile.barriers[0].uniform = false;
-        let malformed = UOp::new(
+        let malformed = UOp::try_new(
             UOpKind::Matmul,
             Some(UType::scalar(DType::F32)),
             vec![],
             UArg::TiledMatmul(Box::new(malformed)),
-        );
+        )
+        .unwrap();
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
 
-        let mut misaligned = payload.as_ref().clone();
+        let mut misaligned = payload.clone();
         misaligned.tile.lhs_shared.alignment = 3;
-        let misaligned = UOp::new(
+        let misaligned = UOp::try_new(
             UOpKind::Matmul,
             Some(UType::scalar(DType::F32)),
             vec![],
             UArg::TiledMatmul(Box::new(misaligned)),
-        );
+        )
+        .unwrap();
         assert!(misaligned.validate().is_err());
         assert!(encode(&misaligned).is_err());
 
@@ -2574,17 +2545,18 @@ mod tests {
         assert_eq!(bytes, encode(&decoded).unwrap());
         assert_eq!(root, decoded);
 
-        let UArg::Movement(plan) = root.arg() else {
+        let UArgRef::Movement(plan) = root.arg() else {
             panic!("movement payload missing");
         };
-        let mut malformed = plan.as_ref().clone();
+        let mut malformed = plan.clone();
         malformed.output_shape = Shape::from([3, 2]);
-        let malformed = UOp::new(
+        let malformed = UOp::try_new(
             UOpKind::Movement,
             Some(UType::scalar(DType::F32)),
             vec![],
             UArg::Movement(Box::new(malformed)),
-        );
+        )
+        .unwrap();
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
 
@@ -2598,7 +2570,7 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(encode(&decoded).unwrap(), bytes);
         assert_eq!(decoded, root);
-        let UArg::Movement(plan) = root.arg() else {
+        let UArgRef::Movement(plan) = root.arg() else {
             panic!("movement payload missing");
         };
         assert!(matches!(
@@ -2618,7 +2590,7 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(encode(&decoded).unwrap(), bytes);
         assert_eq!(decoded, root);
-        let UArg::Movement(plan) = root.arg() else {
+        let UArgRef::Movement(plan) = root.arg() else {
             panic!("movement payload missing");
         };
         assert!(matches!(
@@ -2639,7 +2611,7 @@ mod tests {
         let root = crate::kernel::lower_graph_computed_affine_view(&graph, output).unwrap();
         let bytes = encode(&root).unwrap();
         assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes);
-        let UArg::Movement(plan) = root.arg() else {
+        let UArgRef::Movement(plan) = root.arg() else {
             panic!("movement payload missing");
         };
         assert!(matches!(plan.kind, MovementKernelKind::AffineCopy { .. }));

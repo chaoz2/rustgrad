@@ -210,11 +210,10 @@ impl CapturedSchedule {
             weight.descriptor().clone(),
         )
         .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
-        let kernel = crate::UOp::new(
-            crate::UOpKind::Matmul,
+        let kernel = crate::UOp::from_operation(
+            crate::Operation::Matmul(crate::MatmulValue::Quantized(Box::new(plan.clone()))),
             Some(crate::UType::scalar(crate::DType::F32)),
             Vec::new(),
-            crate::UArg::QuantizedMatmul(Box::new(plan.clone())),
         );
         kernel
             .validate()
@@ -325,11 +324,12 @@ impl CapturedSchedule {
             &weight,
         )
         .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
-        let kernel = crate::UOp::new(
-            crate::UOpKind::Movement,
+        let kernel = crate::UOp::from_operation(
+            crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(Box::new(
+                plan.clone(),
+            ))),
             Some(crate::UType::scalar(crate::DType::F32)),
             Vec::new(),
-            crate::UArg::QuantizedRowGather(Box::new(plan.clone())),
         );
         kernel
             .validate()

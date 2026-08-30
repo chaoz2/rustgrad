@@ -53,7 +53,7 @@ pub fn linear_viz(linear: &LinearKernel) -> Result<VizGraph, VizError> {
         )
         .field("dtype", dtype_name(inst.dtype))
         .field("lanes", inst.lanes.to_string())
-        .field("uop", kind_name(&inst.payload.uop_kind));
+        .field("uop", kind_name(&inst.payload.kind()));
         if let Some(dst) = inst.dst {
             node = node.field("dst", dst.to_string());
         }
@@ -214,7 +214,7 @@ pub fn vector_viz(program: &VectorProgram, spaces: &MemorySpacePlan) -> Result<V
             vector_kind(&inst.kind),
         )
         .field("lanes", inst.lanes.to_string())
-        .field("uop", kind_name(&inst.payload.uop_kind))
+        .field("uop", kind_name(&inst.payload.kind()))
         .field(
             "mask",
             inst.mask

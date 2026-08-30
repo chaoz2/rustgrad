@@ -2,7 +2,7 @@
 use super::{
     MetalCapabilities, MetalError, guard::emit_transactional, transaction::MetalTransactionAbi,
 };
-use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind};
+use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArgRef, UOp, UOpKind};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -110,7 +110,7 @@ impl MetalRenderer {
     /// Lowers a validated scheduled UOp into the exact static subset.
     pub fn render(&self, root: &UOp) -> Result<RenderedMetal, MetalError> {
         if matches!(root.kind(), UOpKind::Random) {
-            let UArg::Random(plan) = root.arg() else {
+            let UArgRef::Random(plan) = root.arg() else {
                 return Err(MetalError::Unsupported("random payload is absent".into()));
             };
             return super::random::render(self, plan);
@@ -152,7 +152,7 @@ impl MetalRenderer {
             .sources()
             .first()
             .ok_or_else(|| MetalError::Unsupported("store has no index".into()))?;
-        let UArg::BufferIndex {
+        let UArgRef::BufferIndex {
             buffer: output_id,
             elements: extent,
             input_shape: output_shape,
@@ -177,13 +177,13 @@ impl MetalRenderer {
         let mut inventory = BTreeMap::<u64, MetalBufferAbi>::new();
         for node in &nodes {
             let (buffer, source_shape, elements, view) = match node.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     elements,
                     input_shape,
                     ..
                 } => (*buffer, input_shape.clone(), *elements, None),
-                UArg::ViewBufferIndex { buffer, view, .. } => {
+                UArgRef::ViewBufferIndex { buffer, view, .. } => {
                     let access = MetalViewAccess::new(view)?;
                     let elements = access
                         .source_shape
@@ -226,7 +226,9 @@ impl MetalRenderer {
                 .first()
                 .ok_or_else(|| MetalError::InvalidBinding("load lacks index".into()))?;
             let buffer = match index.arg() {
-                UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                UArgRef::BufferIndex { buffer, .. } | UArgRef::ViewBufferIndex { buffer, .. } => {
+                    *buffer
+                }
                 _ => {
                     return Err(MetalError::Unsupported(
                         "load requires a checked static buffer index".into(),
@@ -384,20 +386,20 @@ fn emit_expr(
         };
     match node.kind() {
         UOpKind::Const => match node.arg() {
-            UArg::Scalar {
-                dtype: DType::F32,
+            UArgRef::Scalar {
+                dtype: &DType::F32,
                 bits,
             } => Ok(format!("as_type<float>((uint)0x{:08x}u)", *bits as u32)),
-            UArg::Scalar {
-                dtype: DType::Bool,
+            UArgRef::Scalar {
+                dtype: &DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("(uchar){bits}u")),
-            UArg::Scalar {
-                dtype: DType::I32,
+            UArgRef::Scalar {
+                dtype: &DType::I32,
                 bits,
             } => Ok(format!("as_type<int>((uint)0x{:08x}u)", *bits as u32)),
-            UArg::Scalar {
-                dtype: DType::U32,
+            UArgRef::Scalar {
+                dtype: &DType::U32,
                 bits,
             } => Ok(format!("(uint)0x{:08x}u", *bits as u32)),
             _ => Err(MetalError::Unsupported(
@@ -410,13 +412,13 @@ fn emit_expr(
                 .first()
                 .ok_or_else(|| MetalError::Unsupported("load has no index".into()))?;
             let (buffer, input_shape, output_shape, view) = match index.arg() {
-                UArg::BufferIndex {
+                UArgRef::BufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
                 } => (*buffer, input_shape, output_shape, None),
-                UArg::ViewBufferIndex {
+                UArgRef::ViewBufferIndex {
                     buffer,
                     input_shape,
                     output_shape,
@@ -483,7 +485,7 @@ fn emit_expr(
         UOpKind::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
-            emit_binary(*op, dtype, &lhs, &rhs)
+            emit_binary(op, dtype, &lhs, &rhs)
         }
         UOpKind::Binary(op) => {
             let lhs = child(0, source_map, lines)?;
