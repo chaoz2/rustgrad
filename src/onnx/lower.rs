@@ -8749,7 +8749,7 @@ pub(super) fn lower(
                     min_identity(plan.dtype),
                     plan.dtype,
                 )?),
-                ReduceMinLowering::Reduce => g.reduce(x, ReduceKind::Min, Some(axes), keepdims)?,
+                ReduceMinLowering::Reduce => g.min_with_axes(x, Some(axes), keepdims)?,
             };
             debug_assert_eq!(
                 g.shape(output).expect("ReduceMin shape preflighted"),
@@ -9452,7 +9452,7 @@ pub(super) fn lower(
             } else {
                 // A zero retained N/C extent stays an empty result rather
                 // than becoming a populated identity tensor.
-                g.reduce(x, ReduceKind::Max, Some(plan.axes), true)?
+                g.max_with_axes(x, Some(plan.axes), true)?
             };
             debug_assert_eq!(
                 g.shape(output).expect("GlobalMaxPool shape preflighted"),
