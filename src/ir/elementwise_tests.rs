@@ -276,23 +276,19 @@ fn sequential_is_heterogeneous_ordered_and_preserves_prefix_failures() {
     let invoked_later = Rc::new(Cell::new(false));
     let later = invoked_later.clone();
     let before = graph.node_count();
-    assert!(
-        graph
-            .sequential(
-                input,
-                vec![
-                    Box::new(|g, x| g.add_scalar(x, Scalar::F(3.0))),
-                    Box::new(|_, _| Err(Error::InvalidRandom {
-                        reason: "sequential stop"
-                    })),
-                    Box::new(move |_, _| {
-                        later.set(true);
-                        Ok(input)
-                    }),
-                ],
-            )
-            .is_err()
-    );
+    let transforms: Vec<GraphSequentialTransform> = vec![
+        Box::new(|g, x| g.add_scalar(x, Scalar::F(3.0))),
+        Box::new(|_, _| {
+            Err(Error::InvalidRandom {
+                reason: "sequential stop",
+            })
+        }),
+        Box::new(move |_, _| {
+            later.set(true);
+            Ok(input)
+        }),
+    ];
+    assert!(graph.sequential(input, transforms).is_err());
     assert_eq!(graph.node_count(), before + 2);
     assert!(!invoked_later.get());
 }
