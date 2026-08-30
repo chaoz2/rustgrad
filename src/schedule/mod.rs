@@ -185,6 +185,16 @@ impl Schedule {
                 "schedule item IDs are not contiguous and ordered".into(),
             ));
         }
+        let mut output_producers = BTreeMap::new();
+        for item in &self.items {
+            for output in item.outputs.iter() {
+                if output_producers.insert(output.id, item.id).is_some() {
+                    return Err(ScheduleError::Binding(
+                        "scheduled output has multiple producers".into(),
+                    ));
+                }
+            }
+        }
         self.validate_dag_edges(&ids)?;
         for item in &self.items {
             if item.outputs.primary() != &item.output {
@@ -200,6 +210,15 @@ impl Schedule {
                 validate_buffer_desc(input)?;
             }
             item.validate_input_bindings()?;
+            for binding in &item.input_bindings {
+                if let Some(producer) = output_producers.get(&binding.desc.id)
+                    && (*producer >= item.id || !item.dependencies.contains(producer))
+                {
+                    return Err(ScheduleError::Binding(
+                        "scheduled input producer edge is absent".into(),
+                    ));
+                }
+            }
             item.kernel.validate().map_err(ScheduleError::UOp)?;
             if item.is_effect() {
                 if !item.outputs.is_single()
@@ -1604,10 +1623,6 @@ fn schedule_many_with_external(
             }
         }
         let id = *node_to_item.get(&index).ok_or(ScheduleError::Overflow)?;
-        let dependencies: Vec<u64> = inputs
-            .iter()
-            .filter_map(|desc| node_to_item.get(&(desc.id as usize)).copied())
-            .collect();
         let external_materializations = input_bindings(&kernel, &inputs, &output)?
             .iter()
             .filter(|binding| external.contains(&binding.input_node.index()))
@@ -1615,6 +1630,24 @@ fn schedule_many_with_external(
             .collect::<Vec<_>>();
         let input_bindings = input_bindings(&kernel, &inputs, &output)?;
         let quantized_input_bindings = quantized_input_bindings(&kernel)?;
+        // Executable dependencies follow the final ordered pointer ABI, not
+        // the earlier traversal inventory. This keeps lifetime/reuse edges
+        // exact when a computed-base affine view rewrites a leaf into its
+        // materialized producer. Unsupported boundary items have no lowered
+        // ABI, so retain their diagnostic traversal dependencies instead.
+        let dependencies = if boundary.is_none() {
+            input_bindings
+                .iter()
+                .filter_map(|binding| node_to_item.get(&(binding.desc.id as usize)).copied())
+                .collect::<BTreeSet<_>>()
+        } else {
+            inputs
+                .iter()
+                .filter_map(|desc| node_to_item.get(&(desc.id as usize)).copied())
+                .collect::<BTreeSet<_>>()
+        }
+        .into_iter()
+        .collect::<Vec<_>>();
         let mut item = ScheduleItem {
             id,
             node,

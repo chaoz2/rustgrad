@@ -5491,8 +5491,8 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         &[0., 4., 5., 6., 7., 0., 0., 0., 8., 9., 10., 11., 0., 0.]
     );
     // Crop remains an affine view and the final constant Pad remains in the
-    // source Graph. The Pad is an explicit movement producer for the final
-    // affine view, so scheduling must retain a checked producer edge.
+    // source Graph. The requested output is therefore the explicit movement
+    // item itself, with the crop represented by its checked input view.
     assert!(
         mixed_graph
             .nodes
@@ -5516,7 +5516,12 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
         .iter()
         .find(|item| item.node == mixed_values["out"])
         .expect("requested CenterCropPad output must be scheduled");
-    assert!(output_item.dependencies.contains(&pad_item.id));
+    assert_eq!(output_item.id, pad_item.id);
+    assert!(matches!(
+        output_item.kernel.arg(),
+        crate::UArg::Movement(plan)
+            if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
+    ));
     assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
 
     let (_, _, _, default_axes) = run(

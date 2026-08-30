@@ -12364,6 +12364,8 @@ fn tinygrad_contiguous_materializes_exact_values_and_preserves_buffer_identities
 
     let scheduled = crate::schedule(&graph, contiguous).unwrap();
     assert_eq!(scheduled.items.len(), 2);
+    assert_eq!(scheduled.items[1].dependencies, [scheduled.items[0].id]);
+    assert_eq!(scheduled.items[0].consumers, [scheduled.items[1].id]);
     let crate::UArg::Movement(plan) = scheduled.items.last().unwrap().kernel.arg() else {
         panic!("contiguous must schedule as a movement copy")
     };
@@ -12371,6 +12373,14 @@ fn tinygrad_contiguous_materializes_exact_values_and_preserves_buffer_identities
         &plan.kind,
         crate::MovementKernelKind::Contiguous { input: operand }
             if operand.node == transposed && operand.shape == Shape::new([3, 2])
+    ));
+    let mut missing_edge = scheduled.clone();
+    missing_edge.items[0].consumers.clear();
+    missing_edge.items[1].dependencies.clear();
+    assert!(matches!(
+        missing_edge.validate(),
+        Err(crate::ScheduleError::Binding(reason))
+            if reason == "scheduled input producer edge is absent"
     ));
     let captured = crate::CapturedSchedule::capture(&graph, &scheduled, &[contiguous]).unwrap();
     let encoded = captured.to_bytes().unwrap();
