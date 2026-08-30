@@ -1015,7 +1015,8 @@ fn cpu_session_metal_zero_domain_preflights_without_resources() {
 fn cpu_session_metal_unsupported_preflight_has_no_resource_side_effect() {
     let mut session = CpuSession::new();
     let input = session.variable([2], [1.0, -2.0]).unwrap();
-    let output = session.relu(&input).unwrap();
+    let weight = session.tensor([2, 1], [1.0, 2.0]).unwrap();
+    let output = session.matmul(&input, &weight).unwrap();
     let mock = Arc::new(MockDispatch::default());
     let device = test_device(mock.clone());
     mock.clear_calls();
@@ -1519,8 +1520,8 @@ fn renderer_identity_and_unsupported_boundaries_are_pre_submission() {
     assert!(integer_rendered.source.contains("as_type<uint>"));
     assert!(integer_rendered.transaction.is_none());
 
-    let divided = integer_graph.div(lhs, rhs).unwrap();
-    let floored = integer_graph.floor_div(lhs, rhs).unwrap();
+    let divided = integer_graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
+    let floored = integer_graph.binary(BinaryOp::FloorDiv, lhs, rhs).unwrap();
     let divided = MetalRenderer::new(4, capabilities())
         .unwrap()
         .render(&schedule(&integer_graph, divided).unwrap().items[0].kernel)
@@ -1605,7 +1606,9 @@ fn checked_copies_and_command_retention_preserve_resources() {
         .render(&item.kernel)
         .unwrap();
     let pipeline = device.cache().load(&rendered).unwrap();
-    assert_eq!(rendered.buffers.len(), 3);
+    // The scalar constant is embedded directly in the typed UOp, so the ABI
+    // owns only the input and output buffers.
+    assert_eq!(rendered.buffers.len(), 2);
     let wrong_buffers = rendered
         .buffers
         .iter()
@@ -1750,17 +1753,7 @@ fn exact_i32_u32_arithmetic_guard_matrix_matches_cpu() {
             let mut graph = Graph::new();
             let lhs = graph.input_dtype("lhs", [4], dtype);
             let rhs = graph.input_dtype("rhs", [4], dtype);
-            let output = match operation {
-                BinaryOp::Div => graph.div(lhs, rhs),
-                BinaryOp::FloorDiv => graph.floor_div(lhs, rhs),
-                BinaryOp::TruncDiv => graph.trunc_div(lhs, rhs),
-                BinaryOp::Mod => graph.modulo(lhs, rhs),
-                BinaryOp::FMod => graph.fmod(lhs, rhs),
-                BinaryOp::Shl => graph.shl(lhs, rhs),
-                BinaryOp::Shr => graph.shr(lhs, rhs),
-                _ => unreachable!(),
-            }
-            .unwrap();
+            let output = graph.binary(operation, lhs, rhs).unwrap();
             let lhs_value = if dtype == DType::I32 {
                 ints(&[-9, -7, 8, i32::MIN])
             } else {
@@ -1828,11 +1821,11 @@ fn nested_guard_order_detail_rollback_retry_and_stale_swap_are_exact() {
     let divisor = graph.input_dtype("divisor", [4], DType::I32);
     let count_lhs = graph.input_dtype("count_lhs", [4], DType::I32);
     let count_rhs = graph.input_dtype("count_rhs", [1], DType::I32);
-    let quotient = graph.div(lhs, divisor).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
     let quotient = graph.cast(quotient, DType::U32).unwrap();
     let quotient = graph.cast(quotient, DType::I32).unwrap();
     let count = graph.add(count_lhs, count_rhs).unwrap();
-    let shifted = graph.shl(quotient, count).unwrap();
+    let shifted = graph.binary(BinaryOp::Shl, quotient, count).unwrap();
     let output = graph.add(shifted, lhs).unwrap();
     let item = &schedule(&graph, output).unwrap().items[0];
     let rendered = MetalRenderer::new(2, capabilities())
@@ -1974,8 +1967,8 @@ fn transaction_failures_lazy_branches_zero_domain_and_cleanup_preserve_visibilit
     let lhs = graph.input_dtype("lhs", [2], DType::I32);
     let divisor = graph.input_dtype("divisor", [2], DType::I32);
     let count = graph.input_dtype("count", [2], DType::I32);
-    let quotient = graph.div(lhs, divisor).unwrap();
-    let shifted = graph.shl(lhs, count).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
+    let shifted = graph.binary(BinaryOp::Shl, lhs, count).unwrap();
     let output = graph.select(condition, quotient, shifted).unwrap();
     let rendered = MetalRenderer::new(2, capabilities())
         .unwrap()
@@ -2071,7 +2064,9 @@ fn transaction_failures_lazy_branches_zero_domain_and_cleanup_preserve_visibilit
     let mut empty_graph = Graph::new();
     let empty_lhs = empty_graph.input_dtype("lhs", [0], DType::U32);
     let empty_rhs = empty_graph.input_dtype("rhs", [0], DType::U32);
-    let empty_output = empty_graph.div(empty_lhs, empty_rhs).unwrap();
+    let empty_output = empty_graph
+        .binary(BinaryOp::Div, empty_lhs, empty_rhs)
+        .unwrap();
     let empty_rendered = MetalRenderer::new(1, capabilities())
         .unwrap()
         .render(&schedule(&empty_graph, empty_output).unwrap().items[0].kernel)
@@ -2112,7 +2107,7 @@ fn lazy_logical_branches_and_affine_shift_detail_are_exact() {
     let divisor = and_graph.input_dtype("divisor", [2], DType::I32);
     let zero =
         and_graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
-    let quotient = and_graph.div(lhs, divisor).unwrap();
+    let quotient = and_graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
     let positive = and_graph.gt(quotient, zero).unwrap();
     let and_output = and_graph.logical_and(mask, positive).unwrap();
     let and_inputs = HashMap::from([
@@ -2133,7 +2128,7 @@ fn lazy_logical_branches_and_affine_shift_detail_are_exact() {
     let count = or_graph.input_dtype("count", [2], DType::I32);
     let zero =
         or_graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
-    let shifted = or_graph.shl(lhs, count).unwrap();
+    let shifted = or_graph.binary(BinaryOp::Shl, lhs, count).unwrap();
     let positive = or_graph.gt(shifted, zero).unwrap();
     let or_output = or_graph.logical_or(mask, positive).unwrap();
     let or_inputs = HashMap::from([
@@ -2152,7 +2147,7 @@ fn lazy_logical_branches_and_affine_shift_detail_are_exact() {
     let lhs = view_graph.input_dtype("lhs", [2, 2], DType::I32);
     let rhs_storage = view_graph.input_dtype("rhs", [2, 4], DType::I32);
     let rhs = view_graph.shrink(rhs_storage, [(0, 2), (1, 3)]).unwrap();
-    let view_output = view_graph.shl(lhs, rhs).unwrap();
+    let view_output = view_graph.binary(BinaryOp::Shl, lhs, rhs).unwrap();
     let rendered = MetalRenderer::new(2, capabilities())
         .unwrap()
         .render(&schedule(&view_graph, view_output).unwrap().items[0].kernel)
@@ -2270,9 +2265,9 @@ fn live_metal_i32_transaction_success_and_fault_rollback_smoke() {
     let lhs = graph.input_dtype("lhs", [2], DType::I32);
     let divisor = graph.input_dtype("divisor", [2], DType::I32);
     let count = graph.input_dtype("count", [2], DType::I32);
-    let quotient = graph.div(lhs, divisor).unwrap();
-    let shifted_left = graph.shl(quotient, count).unwrap();
-    let output = graph.shr(shifted_left, count).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
+    let shifted_left = graph.binary(BinaryOp::Shl, quotient, count).unwrap();
+    let output = graph.binary(BinaryOp::Shr, shifted_left, count).unwrap();
     let item = &schedule(&graph, output).unwrap().items[0];
     let rendered = MetalRenderer::new(2, device.info().capabilities.clone())
         .unwrap()

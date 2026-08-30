@@ -2132,7 +2132,7 @@ fn narrow_capability_packing_cache_and_pre_submission_rejections_are_exact() {
     let mut guarded = Graph::new();
     let values = guarded.input_dtype("values", [3], DType::F16);
     let divisors = guarded.input_dtype("divisors", [3], DType::F16);
-    let divided = guarded.div(values, divisors).unwrap();
+    let divided = guarded.binary(BinaryOp::Div, values, divisors).unwrap();
     let guarded_item = &schedule(&guarded, divided).unwrap().items[0];
     assert!(matches!(
         WgslRenderer::new(4, capabilities()).unwrap().render(&guarded_item.kernel),
@@ -2187,17 +2187,7 @@ fn guarded_i32_u32_operation_matrix_matches_cpu_bytes() {
             let mut graph = Graph::new();
             let lhs = graph.input_dtype("lhs", [4], dtype);
             let rhs = graph.input_dtype("rhs", [4], dtype);
-            let output = match operation {
-                BinaryOp::Div => graph.div(lhs, rhs),
-                BinaryOp::FloorDiv => graph.floor_div(lhs, rhs),
-                BinaryOp::TruncDiv => graph.trunc_div(lhs, rhs),
-                BinaryOp::Mod => graph.modulo(lhs, rhs),
-                BinaryOp::FMod => graph.fmod(lhs, rhs),
-                BinaryOp::Shl => graph.shl(lhs, rhs),
-                BinaryOp::Shr => graph.shr(lhs, rhs),
-                _ => unreachable!(),
-            }
-            .unwrap();
+            let output = graph.binary(operation, lhs, rhs).unwrap();
             let lhs_value = if dtype == DType::I32 {
                 ints(&[-9, -7, 8, i32::MIN])
             } else {
@@ -2275,8 +2265,8 @@ fn renderer_identity_and_unsupported_work_are_pre_submission() {
     let mut int_graph = Graph::new();
     let lhs = int_graph.input_dtype("lhs", [4], DType::I32);
     let rhs = int_graph.input_dtype("rhs", [4], DType::I32);
-    let divided_node = int_graph.div(lhs, rhs).unwrap();
-    let floored_node = int_graph.floor_div(lhs, rhs).unwrap();
+    let divided_node = int_graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
+    let floored_node = int_graph.binary(BinaryOp::FloorDiv, lhs, rhs).unwrap();
     let divided = WgslRenderer::new(4, capabilities())
         .unwrap()
         .render(&schedule(&int_graph, divided_node).unwrap().items[0].kernel)
@@ -2320,11 +2310,11 @@ fn nested_guards_choose_earliest_fault_and_commit_only_clean_generation() {
     let divisor = graph.input_dtype("divisor", [4], DType::I32);
     let count_lhs = graph.input_dtype("count_lhs", [4], DType::I32);
     let count_rhs = graph.input_dtype("count_rhs", [1], DType::I32);
-    let quotient = graph.div(lhs, divisor).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
     let quotient = graph.cast(quotient, DType::U32).unwrap();
     let quotient = graph.cast(quotient, DType::I32).unwrap();
     let count = graph.add(count_lhs, count_rhs).unwrap();
-    let shifted = graph.shl(quotient, count).unwrap();
+    let shifted = graph.binary(BinaryOp::Shl, quotient, count).unwrap();
     let output = graph.add(shifted, lhs).unwrap();
     let item = &schedule(&graph, output).unwrap().items[0];
     let rendered = WgslRenderer::new(2, capabilities())
@@ -2462,8 +2452,8 @@ fn transaction_failures_zero_domain_retry_and_capability_preflight_preserve_visi
     let lhs = graph.input_dtype("lhs", [2], DType::I32);
     let divisor = graph.input_dtype("divisor", [2], DType::I32);
     let count = graph.input_dtype("count", [2], DType::I32);
-    let quotient = graph.div(lhs, divisor).unwrap();
-    let shifted = graph.shl(lhs, count).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
+    let shifted = graph.binary(BinaryOp::Shl, lhs, count).unwrap();
     let output = graph.select(condition, quotient, shifted).unwrap();
     let rendered = WgslRenderer::new(2, capabilities())
         .unwrap()
@@ -2614,7 +2604,7 @@ fn lazy_logical_guards_and_affine_shift_detail_match_cpu_contract() {
     let divisor = and_graph.input_dtype("divisor", [2], DType::I32);
     let zero =
         and_graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
-    let quotient = and_graph.div(lhs, divisor).unwrap();
+    let quotient = and_graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
     let positive = and_graph.gt(quotient, zero).unwrap();
     let output = and_graph.logical_and(mask, positive).unwrap();
     let inputs = HashMap::from([
@@ -2635,7 +2625,7 @@ fn lazy_logical_guards_and_affine_shift_detail_match_cpu_contract() {
     let count = or_graph.input_dtype("count", [2], DType::I32);
     let zero =
         or_graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
-    let shifted = or_graph.shl(lhs, count).unwrap();
+    let shifted = or_graph.binary(BinaryOp::Shl, lhs, count).unwrap();
     let positive = or_graph.gt(shifted, zero).unwrap();
     let output = or_graph.logical_or(mask, positive).unwrap();
     let inputs = HashMap::from([
@@ -2654,7 +2644,7 @@ fn lazy_logical_guards_and_affine_shift_detail_match_cpu_contract() {
     let lhs = view_graph.input_dtype("lhs", [2, 2], DType::I32);
     let rhs_storage = view_graph.input_dtype("rhs", [2, 4], DType::I32);
     let rhs = view_graph.shrink(rhs_storage, [(0, 2), (1, 3)]).unwrap();
-    let output = view_graph.shl(lhs, rhs).unwrap();
+    let output = view_graph.binary(BinaryOp::Shl, lhs, rhs).unwrap();
     let rendered = WgslRenderer::new(2, capabilities())
         .unwrap()
         .render(&schedule(&view_graph, output).unwrap().items[0].kernel)

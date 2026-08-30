@@ -3054,12 +3054,16 @@ impl Stream {
     }
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
-        self.closed.store(true, Ordering::Release);
         let _g = self.owner.current()?;
         check(
             self.owner.dispatch(),
             self.owner.dispatch().stream_destroy(self.raw),
-        )
+        )?;
+        // Publish closure only after the driver accepts destruction. A
+        // one-shot destroy failure must leave Drop able to retry the owned
+        // stream rather than silently leaking it.
+        self.closed.store(true, Ordering::Release);
+        Ok(())
     }
 }
 impl Drop for Stream {

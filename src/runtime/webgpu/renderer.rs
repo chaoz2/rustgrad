@@ -665,6 +665,35 @@ fn emit_expr(
                 .scalar;
             emit_cast(source, dtype, &value)
         }
+        UOpKind::GraphUnary(op) => {
+            let value = child(0, source_map, lines)?;
+            let expression = match (op, dtype) {
+                (crate::UnaryOp::Neg, DType::F16 | DType::BF16 | DType::F32) => {
+                    format!("(-({value}))")
+                }
+                (crate::UnaryOp::Neg, DType::I32) => {
+                    format!("bitcast<i32>(0u - bitcast<u32>({value}))")
+                }
+                (crate::UnaryOp::Neg, DType::U32) => format!("(0u - ({value}))"),
+                (crate::UnaryOp::Neg, DType::Bool) => format!("!({value})"),
+                (crate::UnaryOp::Abs, DType::F16 | DType::BF16 | DType::F32) => {
+                    format!("abs({value})")
+                }
+                (crate::UnaryOp::Abs, DType::I32) => format!(
+                    "select(bitcast<i32>(0u - bitcast<u32>({value})), ({value}), ({value}) >= 0i)"
+                ),
+                (crate::UnaryOp::Abs, DType::U32 | DType::Bool) => value,
+                (crate::UnaryOp::Reciprocal, DType::F16 | DType::BF16 | DType::F32) => {
+                    format!("(1.0 / ({value}))")
+                }
+                _ => {
+                    return Err(WebGpuError::Unsupported(format!(
+                        "unary {op:?} for {dtype:?}"
+                    )));
+                }
+            };
+            Ok(narrow::quantize(dtype, &expression).unwrap_or(expression))
+        }
         UOpKind::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;

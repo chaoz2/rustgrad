@@ -1780,7 +1780,7 @@ fn renderer_rejects_unsupported_work_before_icd_calls() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [2], DType::I32);
     let rhs = graph.input_dtype("rhs", [2], DType::I32);
-    let output = graph.div(lhs, rhs).unwrap();
+    let output = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
     let item = &schedule(&graph, output).unwrap().items[0];
     let rendered = OpenClRenderer::default().render(&item.kernel).unwrap();
     assert!(rendered.transaction.is_some());
@@ -1806,7 +1806,7 @@ fn renderer_rejects_unsupported_work_before_icd_calls() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [2, 2], DType::I32);
     let rhs = graph.input_dtype("rhs", [2, 2], DType::I32);
-    let divided = graph.div(lhs, rhs).unwrap();
+    let divided = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
     let reduced = graph.sum(divided, 1).unwrap();
     let item = &schedule(&graph, reduced).unwrap().items[0];
     let rendered = OpenClRenderer::with_capabilities(1, OpenClCapabilities::FULL)
@@ -1822,7 +1822,7 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [4], DType::I32);
     let rhs = graph.input_dtype("rhs", [4], DType::I32);
-    let output = graph.floor_div(lhs, rhs).unwrap();
+    let output = graph.binary(BinaryOp::FloorDiv, lhs, rhs).unwrap();
     let item = &schedule(&graph, output).unwrap().items[0];
     let renderer = OpenClRenderer::new(2).unwrap();
     let rendered = renderer.render(&item.kernel).unwrap();
@@ -1978,11 +1978,11 @@ fn nested_guards_order_faults_and_reconstruct_computed_shift_counts() {
     let divisor = graph.input_dtype("divisor", [4], DType::I32);
     let count_lhs = graph.input_dtype("count_lhs", [4], DType::I32);
     let count_rhs = graph.input_dtype("count_rhs", [1], DType::I32);
-    let quotient = graph.div(lhs, divisor).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
     let quotient = graph.cast(quotient, DType::U32).unwrap();
     let quotient = graph.cast(quotient, DType::I32).unwrap();
     let count = graph.add(count_lhs, count_rhs).unwrap();
-    let shifted = graph.shl(quotient, count).unwrap();
+    let shifted = graph.binary(BinaryOp::Shl, quotient, count).unwrap();
     let output = graph.add(shifted, lhs).unwrap();
     let item = &schedule(&graph, output).unwrap().items[0];
     let renderer = OpenClRenderer::new(2).unwrap();
@@ -2100,8 +2100,8 @@ fn transactional_select_does_not_evaluate_the_unselected_guard() {
     let lhs = graph.input_dtype("lhs", [2], DType::I32);
     let divisor = graph.input_dtype("divisor", [2], DType::I32);
     let count = graph.input_dtype("count", [2], DType::I32);
-    let quotient = graph.div(lhs, divisor).unwrap();
-    let shifted = graph.shl(lhs, count).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
+    let shifted = graph.binary(BinaryOp::Shl, lhs, count).unwrap();
     let output = graph.select(condition, quotient, shifted).unwrap();
     let renderer = OpenClRenderer::new(2).unwrap();
     let rendered = renderer
@@ -2138,8 +2138,8 @@ fn guarded_reductions_order_source_faults_and_swap_only_clean_results() {
     let lhs = graph.input_dtype("lhs", [2, 3], DType::I32);
     let divisor = graph.input_dtype("divisor", [2, 3], DType::I32);
     let counts = graph.input_dtype("counts", [2, 3], DType::I32);
-    let quotient = graph.div(lhs, divisor).unwrap();
-    let shifted = graph.shl(quotient, counts).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
+    let shifted = graph.binary(BinaryOp::Shl, quotient, counts).unwrap();
     let output = graph
         .reduce(shifted, crate::ReduceKind::Sum, Some(vec![1]), false)
         .unwrap();
@@ -2278,7 +2278,7 @@ fn guarded_reduction_kind_and_integer_width_matrix_matches_cpu() {
             let mut graph = Graph::new();
             let lhs = graph.input_dtype("lhs", [2, 3], dtype);
             let rhs = graph.input_dtype("rhs", [1], dtype);
-            let quotient = graph.div(lhs, rhs).unwrap();
+            let quotient = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
             let output = graph.reduce(quotient, kind, Some(vec![1]), true).unwrap();
             let scalar = |value: u64| {
                 if matches!(dtype, DType::I32 | DType::I64) {
@@ -2332,7 +2332,7 @@ fn guarded_reduction_kind_and_integer_width_matrix_matches_cpu() {
     let storage = graph.input_dtype("storage", [2, 4], DType::I32);
     let view = graph.shrink(storage, [(0, 2), (1, 4)]).unwrap();
     let rhs = graph.input_dtype("rhs", [1], DType::I32);
-    let quotient = graph.div(view, rhs).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, view, rhs).unwrap();
     let output = graph
         .reduce(quotient, crate::ReduceKind::Product, Some(vec![1]), false)
         .unwrap();
@@ -2372,7 +2372,7 @@ fn guarded_reduction_kind_and_integer_width_matrix_matches_cpu() {
         let mut graph = Graph::new();
         let lhs = graph.input_dtype("lhs", shape, DType::I32);
         let rhs = graph.input_dtype("rhs", shape, DType::I32);
-        let quotient = graph.div(lhs, rhs).unwrap();
+        let quotient = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
         let output = graph
             .reduce(quotient, crate::ReduceKind::Sum, Some(vec![1]), false)
             .unwrap();
@@ -2413,7 +2413,7 @@ fn transactional_logical_and_or_skip_inactive_reduction_guards() {
         let condition = graph.input_dtype("condition", [4], DType::Bool);
         let lhs = graph.input_dtype("lhs", [4], DType::I32);
         let divisor = graph.input_dtype("divisor", [4], DType::I32);
-        let quotient = graph.div(lhs, divisor).unwrap();
+        let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
         let zero =
             graph.constant(TensorData::from_scalars([], DType::I32, [Scalar::I(0)]).unwrap());
         let positive = graph.gt(quotient, zero).unwrap();
@@ -2473,8 +2473,8 @@ fn nested_guarded_integer_widths_match_cpu_oracle() {
         let divisor = graph.input_dtype("divisor", [2], dtype);
         let shifted = graph.input_dtype("shifted", [2], dtype);
         let count = graph.input_dtype("count", [1], dtype);
-        let quotient = graph.div(lhs, divisor).unwrap();
-        let shifted_value = graph.shl(shifted, count).unwrap();
+        let quotient = graph.binary(BinaryOp::Div, lhs, divisor).unwrap();
+        let shifted_value = graph.binary(BinaryOp::Shl, shifted, count).unwrap();
         let output = graph.add(quotient, shifted_value).unwrap();
         let rendered = renderer
             .render(&schedule(&graph, output).unwrap().items[0].kernel)
@@ -2529,7 +2529,7 @@ fn visible_generation_releases_old_allocation_after_retained_event() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [2], DType::I32);
     let rhs = graph.input_dtype("rhs", [2], DType::I32);
-    let output = graph.div(lhs, rhs).unwrap();
+    let output = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
     let rendered = OpenClRenderer::new(2)
         .unwrap()
         .render(&schedule(&graph, output).unwrap().items[0].kernel)
@@ -2598,17 +2598,7 @@ fn guarded_integer_operation_and_width_matrix_matches_cpu() {
             let mut graph = Graph::new();
             let lhs = graph.input_dtype("lhs", [4], dtype);
             let rhs = graph.input_dtype("rhs", [4], dtype);
-            let output = match operation {
-                BinaryOp::Div => graph.div(lhs, rhs),
-                BinaryOp::FloorDiv => graph.floor_div(lhs, rhs),
-                BinaryOp::TruncDiv => graph.trunc_div(lhs, rhs),
-                BinaryOp::Mod => graph.modulo(lhs, rhs),
-                BinaryOp::FMod => graph.fmod(lhs, rhs),
-                BinaryOp::Shl => graph.shl(lhs, rhs),
-                BinaryOp::Shr => graph.shr(lhs, rhs),
-                _ => unreachable!(),
-            }
-            .unwrap();
+            let output = graph.binary(operation, lhs, rhs).unwrap();
             let signed = matches!(dtype, DType::I32 | DType::I64);
             let lhs_values = if signed {
                 [
@@ -2672,7 +2662,7 @@ fn guarded_integer_operation_and_width_matrix_matches_cpu() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [0], DType::U32);
     let rhs = graph.input_dtype("rhs", [0], DType::U32);
-    let output = graph.div(lhs, rhs).unwrap();
+    let output = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
     let renderer = OpenClRenderer::new(1).unwrap();
     let rendered = renderer
         .render(&schedule(&graph, output).unwrap().items[0].kernel)
@@ -2698,7 +2688,7 @@ fn guarded_shift_reconstructs_count_through_static_view() {
     let lhs = graph.input_dtype("lhs", [2, 2], DType::I32);
     let rhs_storage = graph.input_dtype("rhs", [2, 4], DType::I32);
     let rhs = graph.shrink(rhs_storage, [(0, 2), (1, 3)]).unwrap();
-    let output = graph.shl(lhs, rhs).unwrap();
+    let output = graph.binary(BinaryOp::Shl, lhs, rhs).unwrap();
     let rendered = OpenClRenderer::new(2)
         .unwrap()
         .render(&schedule(&graph, output).unwrap().items[0].kernel)
@@ -2804,7 +2794,7 @@ fn live_opencl_discovery_smoke() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [4], DType::I32);
     let rhs = graph.input_dtype("rhs", [4], DType::I32);
-    let output = graph.floor_div(lhs, rhs).unwrap();
+    let output = graph.binary(BinaryOp::FloorDiv, lhs, rhs).unwrap();
     let ints = |values: &[i32]| {
         TensorData::from_scalars(
             [values.len()],
@@ -2936,7 +2926,7 @@ fn live_opencl_static_view_and_reduction_smoke() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [2, 2], DType::I32);
     let rhs = graph.input_dtype("rhs", [2, 2], DType::I32);
-    let quotient = graph.div(lhs, rhs).unwrap();
+    let quotient = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
     let output = graph
         .reduce(quotient, crate::ReduceKind::Sum, Some(vec![1]), false)
         .unwrap();

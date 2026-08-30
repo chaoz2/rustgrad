@@ -1510,9 +1510,9 @@ mod tests {
             let expected = native_sum(DType::I32, &left, &right);
             write(&mock, &primaries[0], &inputs[0], &left);
             write(&mock, &primaries[1], &inputs[1], &right);
-            let allocations = [
-                mock.live_allocation_count(primaries[0].owner()),
-                mock.live_allocation_count(primaries[1].owner()),
+            let leased_bytes = [
+                primaries[0].allocator().stats().logical_leased_bytes,
+                primaries[1].allocator().stats().logical_leased_bytes,
             ];
             if is_peer {
                 mock.fail_peer_after(1, 2);
@@ -1525,12 +1525,12 @@ mod tests {
             assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), left);
             assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), right);
             assert_eq!(
-                mock.live_allocation_count(primaries[0].owner()),
-                allocations[0]
+                primaries[0].allocator().stats().logical_leased_bytes,
+                leased_bytes[0]
             );
             assert_eq!(
-                mock.live_allocation_count(primaries[1].owner()),
-                allocations[1]
+                primaries[1].allocator().stats().logical_leased_bytes,
+                leased_bytes[1]
             );
             assert_eq!(primaries[0].allocator().deferred_bytes(), 0);
             assert_eq!(primaries[1].allocator().deferred_bytes(), 0);
@@ -1638,9 +1638,9 @@ mod tests {
         for (rank, bytes) in values.iter().enumerate() {
             write(&mock, &primaries[rank], &inputs[rank], bytes);
         }
-        let allocations: Vec<_> = primaries
+        let leased_bytes: Vec<_> = primaries
             .iter()
-            .map(|primary| mock.live_allocation_count(primary.owner()))
+            .map(|primary| primary.allocator().stats().logical_leased_bytes)
             .collect();
         let stream_creates = mock
             .calls()
@@ -1666,8 +1666,8 @@ mod tests {
                 values[rank]
             );
             assert_eq!(
-                mock.live_allocation_count(primaries[rank].owner()),
-                allocations[rank]
+                primaries[rank].allocator().stats().logical_leased_bytes,
+                leased_bytes[rank]
             );
             assert_eq!(primaries[rank].allocator().deferred_bytes(), 0);
         }

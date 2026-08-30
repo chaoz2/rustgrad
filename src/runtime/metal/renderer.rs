@@ -454,9 +454,30 @@ fn emit_expr(
                 (DType::I32 | DType::U32, DType::Bool) => Ok(format!("(uchar)(({value}) != 0)")),
                 (DType::I32, DType::U32) => Ok(format!("as_type<uint>({value})")),
                 (DType::U32, DType::I32) => Ok(format!("as_type<int>({value})")),
+                (DType::I32 | DType::U32, DType::F32) => Ok(format!("(float)({value})")),
                 _ => Err(MetalError::Unsupported(
                     "cast is outside the exact Metal subset".into(),
                 )),
+            }
+        }
+        UOpKind::GraphUnary(op) => {
+            let value = child(0, source_map, lines)?;
+            match (op, dtype) {
+                (crate::UnaryOp::Neg, DType::F32) => Ok(format!("(-({value}))")),
+                (crate::UnaryOp::Neg, DType::I32) => {
+                    Ok(format!("as_type<int>((uint)0u - as_type<uint>({value}))"))
+                }
+                (crate::UnaryOp::Neg, DType::U32) => Ok(format!("((uint)0u - ({value}))")),
+                (crate::UnaryOp::Abs, DType::F32) => Ok(format!("fabs({value})")),
+                (crate::UnaryOp::Abs, DType::I32) => Ok(format!(
+                    "select(as_type<int>((uint)0u - as_type<uint>({value})), ({value}), ({value}) >= 0)"
+                )),
+                (crate::UnaryOp::Abs, DType::U32 | DType::Bool) => Ok(value),
+                (crate::UnaryOp::Neg, DType::Bool) => Ok(format!("(uchar)!({value})")),
+                (crate::UnaryOp::Reciprocal, DType::F32) => Ok(format!("(1.0f / ({value}))")),
+                _ => Err(MetalError::Unsupported(format!(
+                    "unary {op:?} for {dtype:?}"
+                ))),
             }
         }
         UOpKind::GraphBinary(op) => {

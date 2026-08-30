@@ -655,6 +655,10 @@ fn emit_expr(
                 (Some(DType::U32), DType::I32) => Ok(format!("as_int({value})")),
                 (Some(DType::I64), DType::U64) => Ok(format!("as_ulong({value})")),
                 (Some(DType::U64), DType::I64) => Ok(format!("as_long({value})")),
+                (Some(DType::I32), DType::F32) => Ok(format!("((float)({value}))")),
+                (Some(DType::U32), DType::F32) => Ok(format!("((float)({value}))")),
+                (Some(DType::I64), DType::F32) => Ok(format!("((float)({value}))")),
+                (Some(DType::U64), DType::F32) => Ok(format!("((float)({value}))")),
                 (Some(DType::F32), DType::F64) => Ok(format!("((double)({value}))")),
                 (Some(DType::F64), DType::F32) => Ok(format!("((float)({value}))")),
                 (Some(source), target)
@@ -687,6 +691,11 @@ fn emit_expr(
                 (crate::UnaryOp::Neg, DType::I64) => {
                     Ok(format!("as_long((ulong)0ul - as_ulong({value}))"))
                 }
+                (crate::UnaryOp::Reciprocal, DType::F16 | DType::BF16 | DType::F32) => {
+                    let result = format!("(1.0f / ({value}))");
+                    Ok(narrow::quantize(dtype, &result).unwrap_or(result))
+                }
+                (crate::UnaryOp::Reciprocal, DType::F64) => Ok(format!("(1.0 / ({value}))")),
                 _ => Err(OpenClError::Unsupported(format!(
                     "unary {op:?} for {dtype:?}"
                 ))),
