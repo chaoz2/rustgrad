@@ -1581,6 +1581,11 @@ impl<'a> LinkState<'a> {
     fn create(dispatch: &'a dyn Dispatch) -> Result<Self, CudaError> {
         let mut raw = ptr::null_mut();
         check(dispatch, dispatch.link_create(&[], &mut [], &mut raw)?)?;
+        if raw.is_null() {
+            return Err(CudaError::InvalidArgument(
+                "link create returned null state",
+            ));
+        }
         Ok(Self { dispatch, raw })
     }
     fn add(&self, input: &LinkInput) -> Result<(), CudaError> {
@@ -1910,7 +1915,7 @@ impl DeviceBuffer {
 }
 
 /// One checked candidate-to-caller-output copy in a primary-context output
-/// transaction.  This is crate-private on purpose: callers must first prove
+/// publication. This is crate-private on purpose: callers must first prove
 /// their schedule/resource ownership and cannot use it as a general copy
 /// convenience API.
 #[derive(Clone, Copy)]
@@ -1925,11 +1930,11 @@ impl<'a> PrimaryOutputCommit<'a> {
     }
 }
 
-/// Failure from the private caller-owned-output transaction boundary.
+/// Failure from the private caller-owned-output publication boundary.
 ///
-/// A successful rollback keeps the exact copy/completion failure.  A failed
-/// restoration is deliberately distinct so callers never mistake a partly
-/// restored external output for an ordinary retryable copy failure.
+/// A successful best-effort rollback keeps the exact copy/completion failure.
+/// A failed restoration is deliberately distinct: caller-owned outputs may
+/// then be partially modified and must not be treated as retryable state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PrimaryOutputCommitError {
     Commit(CudaError),
@@ -1945,7 +1950,7 @@ impl fmt::Display for PrimaryOutputCommitError {
             Self::Commit(error) => error.fmt(f),
             Self::CommitAndRollback { commit, rollback } => write!(
                 f,
-                "CUDA caller-output commit failed ({commit}); rollback also failed ({rollback})"
+                "CUDA caller-output commit failed ({commit}); best-effort rollback also failed ({rollback}); caller outputs may be partially modified"
             ),
         }
     }
@@ -1954,14 +1959,16 @@ impl fmt::Display for PrimaryOutputCommitError {
 impl std::error::Error for PrimaryOutputCommitError {}
 
 impl PrimaryContext {
-    /// Atomically commits checked candidate views into caller-owned outputs.
+    /// Copies checked candidates into caller-owned outputs with rollback.
     ///
     /// This intentionally lives beside the primary-context ownership checks,
-    /// not the sharded executor.  It is a narrow internal transaction seam for
+    /// not the sharded executor. It is a narrow internal publication seam for
     /// prepared capture plans: every target is backed up and synchronized
-    /// before the first mutation, and a failed commit restores every target in
-    /// deterministic input order before temporary buffers are dropped.
-    pub(crate) fn commit_caller_owned_outputs_atomically(
+    /// before the first mutation, and a failed commit attempts to restore every
+    /// target in deterministic input order. CUDA copy or completion failure
+    /// can persist during restoration, in which case the typed composite error
+    /// reports that caller-owned outputs may remain partially modified.
+    pub(crate) fn commit_caller_owned_outputs_with_rollback(
         &self,
         stream: &Stream,
         commits: &[PrimaryOutputCommit<'_>],
@@ -2026,6 +2033,8 @@ impl PrimaryContext {
         backups: &[DeviceBuffer],
     ) -> Result<(), CudaError> {
         for (commit, backup) in commits.iter().zip(backups) {
+            #[cfg(test)]
+            self.output_commit_checkpoint(PrimaryOutputCommitPhase::Restore)?;
             let backup_view = backup.view();
             let mut transfer = commit.target.copy_from_view_async(
                 0,
@@ -2035,8 +2044,6 @@ impl PrimaryContext {
                 stream,
             )?;
             transfer.wait()?;
-            #[cfg(test)]
-            self.output_commit_checkpoint(PrimaryOutputCommitPhase::Restore)?;
         }
         Ok(())
     }
@@ -4069,9 +4076,6 @@ impl PrimaryLinkedKernel {
     pub fn module(&self) -> &PrimaryLinkedModule {
         &self.module
     }
-    pub(crate) fn function_identity(&self) -> usize {
-        self.function.identity()
-    }
     /// Registers semantics against the exact retained `Function` that this
     /// linked kernel launches.  Keeping the handle lookup here prevents an
     /// adapter from ever registering a separately looked-up function handle.
@@ -4085,6 +4089,16 @@ impl PrimaryLinkedKernel {
             key,
             semantics,
         );
+    }
+}
+impl Drop for PrimaryLinkedKernel {
+    fn drop(&mut self) {
+        // Linked rendered wrappers may share this exact lower function while
+        // retaining different launch geometry. Keep mock/interpreter semantics
+        // registered until the last lower-function owner is released.
+        self.module
+            .primary()
+            .unregister_generic_kernel_semantics(self.function.identity());
     }
 }
 
@@ -5117,6 +5131,7 @@ pub(crate) mod tests {
         module_result: AtomicI32,
         function_result: AtomicI32,
         link_create_result: AtomicI32,
+        null_link_state: AtomicBool,
         link_add_data_result: AtomicI32,
         link_complete_result: AtomicI32,
         link_destroy_result: AtomicI32,
@@ -5190,6 +5205,7 @@ pub(crate) mod tests {
                 module_result: AtomicI32::new(0),
                 function_result: AtomicI32::new(0),
                 link_create_result: AtomicI32::new(0),
+                null_link_state: AtomicBool::new(false),
                 link_add_data_result: AtomicI32::new(0),
                 link_complete_result: AtomicI32::new(0),
                 link_destroy_result: AtomicI32::new(0),
@@ -5828,6 +5844,9 @@ pub(crate) mod tests {
         pub(crate) fn set_link_create_result(&self, result: CuResult) {
             self.link_create_result.store(result, Ordering::Release);
         }
+        pub(crate) fn set_null_link_state(&self, null: bool) {
+            self.null_link_state.store(null, Ordering::Release);
+        }
         pub(crate) fn set_link_add_data_result(&self, result: CuResult) {
             self.link_add_data_result.store(result, Ordering::Release);
         }
@@ -6461,6 +6480,10 @@ pub(crate) mod tests {
             self.call("link_create");
             let result = self.link_create_result.load(Ordering::Acquire);
             if result == CUDA_SUCCESS {
+                if self.null_link_state.load(Ordering::Acquire) {
+                    *state = ptr::null_mut();
+                    return Ok(result);
+                }
                 let raw = self.next_link_state.fetch_add(1, Ordering::AcqRel);
                 self.link_states.lock().unwrap().insert(raw);
                 *state = raw as CuLinkState;
@@ -7911,6 +7934,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn link_state_rejects_successful_null_create_before_raii_or_link_work() {
+        let mock = Mock::default();
+        mock.set_null_link_state(true);
+        assert!(matches!(
+            LinkState::create(&mock),
+            Err(CudaError::InvalidArgument(
+                "link create returned null state"
+            ))
+        ));
+        assert_eq!(mock.live_link_state_count(), 0);
+        assert_eq!(mock.calls(), ["link_create"]);
+    }
+
+    #[test]
     fn linked_module_loader_orders_cleanup_and_retries() {
         let mock = Arc::new(Mock::default());
         let context = context(&mock);
@@ -8531,7 +8568,7 @@ pub(crate) mod tests {
         // final copy fails, after which both targets must be restored.
         mock.fail_dtod_after(3, 97);
         assert!(matches!(
-            primary.commit_caller_owned_outputs_atomically(&stream, &commits),
+            primary.commit_caller_owned_outputs_with_rollback(&stream, &commits),
             Err(PrimaryOutputCommitError::Commit(CudaError::Driver {
                 code: 97,
                 ..
@@ -8544,18 +8581,18 @@ pub(crate) mod tests {
         assert_eq!(bytes, [8, 8, 8, 8]);
         assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
         let calls = mock.calls();
-        let transaction_calls = &calls[call_start..];
-        let first_copy = transaction_calls
+        let publication_calls = &calls[call_start..];
+        let first_copy = publication_calls
             .iter()
             .position(|call| *call == "dtod_async")
             .unwrap();
-        let first_backup_allocation = transaction_calls
+        let first_backup_allocation = publication_calls
             .iter()
             .position(|call| *call == "alloc")
             .unwrap();
         assert!(first_backup_allocation < first_copy);
         assert!(
-            transaction_calls
+            publication_calls
                 .iter()
                 .filter(|call| **call == "dtod_async")
                 .count()
@@ -8565,7 +8602,7 @@ pub(crate) mod tests {
         // The Mock injection is one-shot.  The same caller-owned leases can
         // be committed again without reinitializing their external targets.
         primary
-            .commit_caller_owned_outputs_atomically(&stream, &commits)
+            .commit_caller_owned_outputs_with_rollback(&stream, &commits)
             .unwrap();
         target_a.copy_to(0, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3, 4]);
@@ -8591,14 +8628,14 @@ pub(crate) mod tests {
         let calls = mock.calls().len();
 
         assert!(matches!(
-            primary.commit_caller_owned_outputs_atomically(
+            primary.commit_caller_owned_outputs_with_rollback(
                 &stream,
                 &[PrimaryOutputCommit::new(other_source.view(), target.view())],
             ),
             Err(PrimaryOutputCommitError::Commit(CudaError::ContextMismatch))
         ));
         assert!(matches!(
-            primary.commit_caller_owned_outputs_atomically(
+            primary.commit_caller_owned_outputs_with_rollback(
                 &stream,
                 &[
                     PrimaryOutputCommit::new(source.view(), target.view()),

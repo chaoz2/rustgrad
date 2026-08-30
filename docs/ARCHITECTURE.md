@@ -1741,8 +1741,8 @@ all operational calls instead go through a typed `Dispatch` trait, which keeps
 the default test suite deterministic and CUDA-free.
 
 The Driver boundary treats a successful status plus a null graph, graph-exec,
-module, or function output as an invalid argument before constructing an RAII
-owner or issuing a launch. Peer-copy submission independently requires its
+module, function, or link-state output as an invalid argument before
+constructing an RAII owner or issuing later work. Peer-copy submission independently requires its
 own optional Driver symbol, rather than inferring it from ordinary async-copy
 support. Mock stream-wait Driver failures are surfaced without consuming the
 owned stream/event dependency, so the unchanged pair can be retried. These
@@ -1807,21 +1807,27 @@ rejected until a device-status ABI exists. f16/bf16 are likewise intentionally
 rejected until their capability-specific conversion and requantization path is
 proven. Transcendental unary functions remain rejected by the ordinary
 renderer. The sole exception is `LinkedF32ExpRequest`: after an exact F32 Exp
-UOp proof and one matching NVVM `__nv_expf: f32 -> f32` producer attestation,
-it emits a versioned external call and loads only through the linked caches.
+UOp proof with distinct canonical `DefineGlobal` buffers, one shared axis-zero
+`Range`/`EndRange`, and a range bound equal to the dense element count, plus one
+matching NVVM `__nv_expf: f32 -> f32` producer attestation, it emits a versioned
+external call and loads only through linked caches keyed by launch block size.
 
 `linked_exp/` owns the corresponding resource boundary. Its v1 descriptor and
-sidecar are canonical, payload-free records tied to one captured schedule and
-one request. Preparation revalidates the captured UOp and F32 input/output ABI;
-rebind then requires the original immutable link bytes and exact caller-owned
-primary-context leases. The dedicated launcher stages into a private candidate
-and commits the caller output through backup/copy/rollback. A separate v2
-artifact admits exactly two independent items and commits both outputs as one
-transaction. Generic captured replay cannot consume either sidecar. The mock
-uses link/request/cache, generic-launch/completion, and transaction-phase hooks
-to prove failure cleanup and retry; live CUDA/ptxas, broader operations/dtypes,
-payload embedding, resource discovery, and general captured-device replay are
-still outside this boundary.
+sidecar are canonical, payload-free records tied to one fully revalidated
+captured schedule and one request. Preparation revalidates the complete capture,
+captured UOp, and F32 input/output ABI; rebind then requires the original
+immutable link bytes and exact caller-owned primary-context leases. The
+dedicated launcher stages into a private candidate and publishes through
+backup/copy with best-effort rollback. A separate v2 artifact admits exactly
+two independent requested outputs and publishes them in order through the same
+mechanism. Persistent CUDA failure can also prevent restoration, in which case
+the composite error explicitly reports that caller-owned outputs may be
+partially modified; neither route claims atomic commit. Generic captured replay
+cannot consume either sidecar. The mock uses link/request/cache,
+generic-launch/completion, and commit/rollback-phase hooks to prove successful
+rollback and the documented partial-mutation boundary; live CUDA/ptxas, broader
+operations/dtypes, payload embedding, resource discovery, and general
+captured-device replay are still outside this boundary.
 
 Static sum, mean, product, min, and max UOp programs have a separate correctness-first PTX path.
 One CUDA thread owns one logical output and serially walks the normalized

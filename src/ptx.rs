@@ -9,7 +9,8 @@
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
-    BufferView, CudaError, DType, Function, LaunchConfig, Shape, Stream, UArg, UOp, UOpKind,
+    AddressSpace, BufferView, CudaError, DType, Function, LaunchConfig, Shape, Stream, UArg, UOp,
+    UOpKind, UType,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -336,31 +337,84 @@ impl PtxRenderer {
             let [input_index] = load.sources() else {
                 return false;
             };
+            let [output_address, output_range] = output_index.sources() else {
+                return false;
+            };
+            let [input_address, input_range] = input_index.sources() else {
+                return false;
+            };
+            let [range_bound] = input_range.sources() else {
+                return false;
+            };
+            let [ended_range] = end_range.sources() else {
+                return false;
+            };
             let (
                 UArg::BufferIndex {
+                    buffer: input_buffer,
                     elements: input_elements,
                     input_shape,
                     output_shape: input_output_shape,
-                    ..
                 },
                 UArg::BufferIndex {
+                    buffer: output_buffer,
                     elements: output_elements,
                     input_shape: output_input_shape,
                     output_shape,
-                    ..
                 },
             ) = (input_index.arg(), output_index.arg())
             else {
                 return false;
             };
+            let (
+                UArg::Address {
+                    space: input_space,
+                    name: input_name,
+                    element: input_element,
+                },
+                UArg::Address {
+                    space: output_space,
+                    name: output_name,
+                    element: output_element,
+                },
+                UArg::Int(bound),
+                UArg::RangeAxis(axis),
+            ) = (
+                input_address.arg(),
+                output_address.arg(),
+                range_bound.arg(),
+                input_range.arg(),
+            )
+            else {
+                return false;
+            };
             matches!(exp.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))
                 && matches!(load.kind(), UOpKind::Load)
+                && matches!(input_index.kind(), UOpKind::Index)
+                && matches!(output_index.kind(), UOpKind::Index)
+                && matches!(input_address.kind(), UOpKind::DefineGlobal)
+                && matches!(output_address.kind(), UOpKind::DefineGlobal)
+                && matches!(input_range.kind(), UOpKind::Range)
+                && matches!(range_bound.kind(), UOpKind::Const)
+                && input_range.ty() == Some(UType::scalar(DType::I64))
+                && range_bound.ty() == Some(UType::scalar(DType::I64))
+                && input_range.shares_node_with(output_range)
+                && input_range.shares_node_with(ended_range)
+                && *axis == 0
+                && *input_space == AddressSpace::Global
+                && *output_space == AddressSpace::Global
+                && input_element.scalar == DType::F32
+                && output_element.scalar == DType::F32
+                && input_name == &format!("b{input_buffer}")
+                && output_name == &format!("b{output_buffer}")
+                && input_buffer != output_buffer
                 && input_index.ty().is_some_and(|ty| ty.scalar == DType::F32)
                 && load.ty().is_some_and(|ty| ty.scalar == DType::F32)
                 && exp.ty().is_some_and(|ty| ty.scalar == DType::F32)
                 && output_index.ty().is_some_and(|ty| ty.scalar == DType::F32)
                 && *input_elements != 0
                 && input_elements == output_elements
+                && i64::try_from(*input_elements).ok() == Some(*bound)
                 && input_shape == input_output_shape
                 && input_shape == output_input_shape
                 && input_shape == output_shape
@@ -395,7 +449,7 @@ impl PtxRenderer {
     }
 }
 
-/// Atomic opt-in request for the sole linked external-math route. It prevents
+/// Closed opt-in request for the sole linked external-math route. It prevents
 /// callers from mixing a raw renderer version, UOp, NVVM attestation, or entry
 /// symbol across separately validated steps.
 #[derive(Clone)]
@@ -427,7 +481,7 @@ impl LinkedF32ExpRequest {
             .map_err(|_| PtxError::InvalidBinding("linked F32 Exp kernel symbol".into()))?;
         let input_identity = crate::cuda::linked_module_identity(&inputs)?;
         let identity = format!(
-            "linked-f32-exp-v{}:{}:{}:{}",
+            "linked-f32-exp-v{}:{}:{}:{}:{block_size}",
             LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
             input_identity.cache_key(),
             rendered.cache_key,
@@ -5980,6 +6034,11 @@ pub struct PrimaryLinkedRenderedKernel {
 unsafe impl Send for PrimaryLinkedRenderedKernel {}
 unsafe impl Sync for PrimaryLinkedRenderedKernel {}
 impl PrimaryLinkedRenderedKernel {
+    /// Launch geometry retained by this exact cache entry.
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
     pub fn launch(
         &self,
         stream: &Stream,
@@ -6033,13 +6092,6 @@ impl PrimaryLinkedRenderedKernel {
         Ok(())
     }
 }
-impl Drop for PrimaryLinkedRenderedKernel {
-    fn drop(&mut self) {
-        self.primary
-            .unregister_generic_kernel_semantics(self.kernel.function_identity());
-    }
-}
-
 /// Explicitly versioned adapter for rendered kernels that require caller-owned
 /// linked inputs.  Existing `PtxCache` and `ConcurrentPtxCache` never use it.
 pub struct PrimaryLinkedRenderedKernelCache {
@@ -6090,7 +6142,7 @@ impl PrimaryLinkedRenderedKernelCache {
         inputs.extend_from_slice(linked_inputs);
         let linked_identity = crate::cuda::linked_module_identity(&inputs)?;
         let key = format!(
-            "linked-rendered-v{renderer_contract_version}:{}:{ptx_fingerprint:016x}:{}:{}",
+            "linked-rendered-v{renderer_contract_version}:{}:{ptx_fingerprint:016x}:{}:{}:{block_size}",
             linked_identity.cache_key(),
             rendered.cache_key,
             symbol.to_string_lossy(),
@@ -6158,7 +6210,14 @@ impl PrimaryLinkedRenderedKernelCache {
                         .wait(state)
                         .expect("linked rendered entry mutex poisoned")
                 }
-                LinkedRenderedState::Ready(kernel) => return Ok(kernel.clone()),
+                LinkedRenderedState::Ready(kernel) => {
+                    if kernel.block_size() != block_size {
+                        return Err(PtxError::InvalidBinding(
+                            "linked rendered cache block size".into(),
+                        ));
+                    }
+                    return Ok(kernel.clone());
+                }
                 LinkedRenderedState::Failed(error) => return Err(error.clone()),
             }
         }

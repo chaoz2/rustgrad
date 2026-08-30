@@ -1,5 +1,7 @@
-//! Versioned, payload-free proof and transactional launcher for exactly two
-//! independent linked F32 Exp capture items.
+//! Versioned, payload-free proof and dedicated launcher for exactly two
+//! independent linked F32 Exp capture items. Caller-output publication uses
+//! best-effort rollback and exposes possible partial mutation when restoration
+//! itself fails.
 
 use crate::{
     BufferDesc, CapturedSchedule, DType, PrimaryContext,
@@ -100,8 +102,8 @@ pub struct BoundLinkedF32ExpBatchResources {
     bindings: BTreeMap<String, LinkedF32ExpResourceBinding>,
 }
 
-/// Data-only two-consumer preparation.  `candidate_id` and `target_id` are
-/// logical transaction records, never caller-provided writable candidates.
+/// Data-only two-consumer preparation. `candidate_id` and `target_id` are
+/// logical staging records, never caller-provided writable candidates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedLinkedF32ExpBatchCapture {
     pub capture_identity: u64,
@@ -135,8 +137,18 @@ impl LinkedF32ExpBatchArtifact {
         sm: u32,
         records: &[(LinkedF32ExpRequest, LinkedF32ExpResourceDescriptor)],
     ) -> Result<Self, crate::ptx::PtxError> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|_| invalid("linked Exp batch captured schedule"))?;
         if capture.items.len() != 2 || capture.requested.len() != 2 || records.len() != 2 {
             return Err(invalid("linked Exp batch cardinality"));
+        }
+        if !capture
+            .requested
+            .iter()
+            .copied()
+            .eq(capture.items.iter().map(|item| item.primary_output().id))
+        {
+            return Err(invalid("linked Exp batch requested outputs"));
         }
         let mut slots = Vec::with_capacity(2);
         for (item, (request, descriptor)) in capture.items.iter().zip(records) {
@@ -191,8 +203,17 @@ impl LinkedF32ExpBatchArtifact {
             ),
         >,
     ) -> Result<BoundLinkedF32ExpBatchResources, crate::ptx::PtxError> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|_| invalid("linked Exp batch captured schedule"))?;
         self.validate()?;
-        if capture.identity != self.capture_identity || records.len() != 2 {
+        if capture.identity != self.capture_identity
+            || records.len() != 2
+            || !capture
+                .requested
+                .iter()
+                .copied()
+                .eq(self.slots.iter().map(|slot| slot.output.id))
+        {
             return Err(invalid("linked Exp batch rebind inventory"));
         }
         let mut bindings = BTreeMap::new();
@@ -280,9 +301,16 @@ impl PreparedLinkedF32ExpBatchCapture {
         artifact: &LinkedF32ExpBatchArtifact,
         bound: &BoundLinkedF32ExpBatchResources,
     ) -> Result<Self, crate::ptx::PtxError> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|_| invalid("linked Exp batch captured schedule"))?;
         if capture.identity != artifact.capture_identity
             || bound.artifact.artifact_identity != artifact.artifact_identity
             || bound.bindings.len() != 2
+            || !capture
+                .requested
+                .iter()
+                .copied()
+                .eq(artifact.slots.iter().map(|slot| slot.output.id))
         {
             return Err(invalid("linked Exp batch prepared linkage"));
         }
@@ -458,7 +486,7 @@ pub fn execute_prepared_linked_f32_exp_batch(
         )?;
     }
     primary
-        .commit_caller_owned_outputs_atomically(
+        .commit_caller_owned_outputs_with_rollback(
             &stream,
             &[
                 PrimaryOutputCommit::new(candidates[0].view(), bound.targets()[0]),
@@ -601,6 +629,24 @@ mod tests {
     fn linked_exp_batch_v2_rejects_noncanonical_cardinality_order_and_tamper_preflight() {
         let (mock, capture, primary, artifact, records) = fixture();
         let before = mock.calls().len();
+        let pairs = records
+            .iter()
+            .map(|(request, descriptor, _)| (request.clone(), descriptor.clone()))
+            .collect::<Vec<_>>();
+        let mut swapped_requested = capture.clone();
+        swapped_requested.requested.reverse();
+        swapped_requested.identity =
+            crate::schedule::artifact::identity(&swapped_requested).unwrap();
+        assert!(crate::schedule::artifact::validate_capture(&swapped_requested).is_ok());
+        assert!(
+            LinkedF32ExpBatchArtifact::from_capture_requests(
+                &swapped_requested,
+                &primary,
+                80,
+                &pairs,
+            )
+            .is_err()
+        );
         let mut reversed = artifact.clone();
         reversed.slots.reverse();
         assert!(reversed.encode().is_err());
@@ -676,7 +722,8 @@ mod tests {
     }
 
     #[test]
-    fn linked_exp_batch_launcher_commits_two_independent_candidates_atomically() {
+    fn linked_exp_batch_launcher_exposes_partial_state_when_rollback_fails() {
+        use crate::cuda::PrimaryOutputCommitPhase;
         use std::num::NonZeroUsize;
         let (mock, capture, primary, artifact, records) = fixture();
         let requests = records
@@ -735,6 +782,21 @@ mod tests {
                 assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0));
             }
         }
+
+        for (_, target, source) in &owned {
+            target.copy_from(0, &vec![0x5a; source.len()]).unwrap();
+        }
+        mock.fail_output_commit_phase_after(PrimaryOutputCommitPhase::Commit, 0, 71);
+        mock.fail_output_commit_phase_after(PrimaryOutputCommitPhase::Restore, 0, 72);
+        let error = execute_prepared_linked_f32_exp_batch(&bound, &primary, 80, &requests, &cache)
+            .unwrap_err();
+        assert!(error.to_string().contains("partially modified"));
+        let mut first = vec![0; owned[0].2.len()];
+        owned[0].1.copy_to(0, &mut first).unwrap();
+        assert_ne!(first, vec![0x5a; owned[0].2.len()]);
+        let mut second = vec![0; owned[1].2.len()];
+        owned[1].1.copy_to(0, &mut second).unwrap();
+        assert_eq!(second, vec![0x5a; owned[1].2.len()]);
         assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
     }
 }

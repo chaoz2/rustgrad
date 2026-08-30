@@ -715,7 +715,6 @@ impl UOp {
             arg,
         }))
     }
-    #[cfg(test)]
     pub(crate) fn shares_node_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }

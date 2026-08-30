@@ -53,6 +53,8 @@ impl LinkedF32ExpResourceArtifact {
         descriptor: &LinkedF32ExpResourceDescriptor,
         request: &LinkedF32ExpRequest,
     ) -> Result<Self, crate::ptx::PtxError> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|_| invalid("linked resource captured schedule"))?;
         if descriptor.request_identity != request.identity() {
             return Err(invalid("linked resource request identity"));
         }
@@ -105,6 +107,8 @@ impl LinkedF32ExpResourceArtifact {
         descriptors: &BTreeMap<String, LinkedF32ExpResourceDescriptor>,
         payloads: &BTreeMap<String, Vec<LinkInput>>,
     ) -> Result<BoundLinkedF32ExpResources, crate::ptx::PtxError> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|_| invalid("linked resource captured schedule"))?;
         self.validate()?;
         if self.capture_identity != capture.identity {
             return Err(invalid("linked resource capture identity"));

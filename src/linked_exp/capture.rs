@@ -2,8 +2,9 @@
 //!
 //! This is deliberately not a `CapturedReplayExecutor` backend. It verifies
 //! the decoded capture ABI against the typed linked request and bound sidecar,
-//! rebinds caller-owned leases, then exposes only the dedicated transactional
-//! launcher below.
+//! rebinds caller-owned leases, then exposes only the dedicated launcher
+//! below. Caller-output publication uses best-effort rollback and reports
+//! possible partial mutation when restoration itself fails.
 
 use crate::{
     BufferDesc, CapturedSchedule, DType, PrimaryContext,
@@ -45,6 +46,8 @@ impl PreparedLinkedF32ExpCapture {
         sm: u32,
         request: &LinkedF32ExpRequest,
     ) -> Result<Self, crate::ptx::PtxError> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|_| invalid("linked Exp captured schedule"))?;
         let sidecar_bytes = sidecar.encode()?;
         let canonical = LinkedF32ExpResourceArtifact::decode(&sidecar_bytes)?;
         if &canonical != sidecar
@@ -172,15 +175,15 @@ impl PreparedLinkedF32ExpCapture {
     }
 }
 
-/// Closed external role inventory for the prepared one-consumer route.  The
-/// candidate is intentionally a logical transaction identity only: callers
+/// Closed external role inventory for the prepared one-consumer route. The
+/// candidate is intentionally a logical staging identity only: callers
 /// never provide a writable candidate lease, and the future launcher must
 /// allocate it after this data-only rebind succeeds.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PreparedLinkedF32ExpExternalRole {
     Input,
     FinalTarget,
-    TransactionCandidate,
+    StagedCandidate,
 }
 
 /// Immutable payload-free external binding schema for one prepared Exp item.
@@ -234,7 +237,7 @@ impl PreparedLinkedF32ExpBindingTable {
             sm,
             input_role: PreparedLinkedF32ExpExternalRole::Input,
             target_role: PreparedLinkedF32ExpExternalRole::FinalTarget,
-            candidate_role: PreparedLinkedF32ExpExternalRole::TransactionCandidate,
+            candidate_role: PreparedLinkedF32ExpExternalRole::StagedCandidate,
             identity: String::new(),
         };
         table.identity = table.canonical_identity();
@@ -284,7 +287,7 @@ impl PreparedLinkedF32ExpBindingTable {
             || self.sm != sm
             || self.input_role != PreparedLinkedF32ExpExternalRole::Input
             || self.target_role != PreparedLinkedF32ExpExternalRole::FinalTarget
-            || self.candidate_role != PreparedLinkedF32ExpExternalRole::TransactionCandidate
+            || self.candidate_role != PreparedLinkedF32ExpExternalRole::StagedCandidate
             || request.identity() != prepared.request_identity
         {
             return Err(invalid("linked Exp prepared binding linkage"));
@@ -375,7 +378,7 @@ pub fn execute_prepared_linked_f32_exp(
         true,
     )?;
     primary
-        .commit_caller_owned_outputs_atomically(
+        .commit_caller_owned_outputs_with_rollback(
             &stream,
             &[PrimaryOutputCommit::new(candidate.view(), bound.target())],
         )
@@ -513,6 +516,20 @@ mod tests {
             )
             .is_err()
         );
+        let mut tampered_item = capture.clone();
+        tampered_item.items[0].id ^= 1;
+        assert_eq!(tampered_item.identity, capture.identity);
+        assert!(
+            PreparedLinkedF32ExpCapture::prepare(
+                &tampered_item,
+                &sidecar,
+                &bound,
+                &primary,
+                80,
+                &request,
+            )
+            .is_err()
+        );
         assert!(
             PreparedLinkedF32ExpCapture::prepare(
                 &capture, &sidecar, &bound, &primary, 81, &request,
@@ -520,6 +537,195 @@ mod tests {
             .is_err()
         );
         assert_eq!(mock.calls().len(), before);
+    }
+
+    #[test]
+    fn linked_exp_renderer_rejects_noncanonical_index_and_range_graphs() {
+        use crate::{AddressSpace, UArg, UOp, UOpKind, UType};
+
+        let (_, capture, _, request, _, _) = fixture();
+        let renderer = PtxRenderer::new(80).unwrap();
+        let canonical = &capture.items[0].kernel;
+        let store = &canonical.sources()[0];
+        let end_range = &canonical.sources()[1];
+        let output_index = &store.sources()[0];
+        let exp = &store.sources()[1];
+        let load = &exp.sources()[0];
+        let input_index = &load.sources()[0];
+        let input_address = input_index.sources()[0].clone();
+        let output_address = output_index.sources()[0].clone();
+        let range = input_index.sources()[1].clone();
+        let rebuild = |input_address: UOp,
+                       input_offset: UOp,
+                       output_address: UOp,
+                       output_offset: UOp,
+                       ended_range: UOp| {
+            let input_index = UOp::new(
+                UOpKind::Index,
+                input_index.ty(),
+                vec![input_address, input_offset],
+                input_index.arg().clone(),
+            );
+            let output_index = UOp::new(
+                UOpKind::Index,
+                output_index.ty(),
+                vec![output_address, output_offset],
+                output_index.arg().clone(),
+            );
+            let load = UOp::new(UOpKind::Load, load.ty(), vec![input_index], UArg::None);
+            let exp = UOp::new(
+                UOpKind::GraphUnary(crate::UnaryOp::Exp),
+                exp.ty(),
+                vec![load],
+                UArg::None,
+            );
+            UOp::sink(vec![
+                UOp::new(UOpKind::Store, None, vec![output_index, exp], UArg::None),
+                UOp::new(UOpKind::EndRange, None, vec![ended_range], UArg::None),
+            ])
+        };
+
+        let constant_index = rebuild(
+            input_address.clone(),
+            UOp::constant(0, UType::scalar(DType::I64)),
+            output_address.clone(),
+            range.clone(),
+            range.clone(),
+        );
+        let wrong_bound = UOp::new(
+            UOpKind::Range,
+            Some(UType::scalar(DType::I64)),
+            vec![UOp::constant(4, UType::scalar(DType::I64))],
+            UArg::RangeAxis(0),
+        );
+        let out_of_bounds = rebuild(
+            input_address.clone(),
+            wrong_bound.clone(),
+            output_address.clone(),
+            wrong_bound.clone(),
+            wrong_bound,
+        );
+        let wrong_address = UOp::new(
+            UOpKind::DefineGlobal,
+            Some(UType::scalar(DType::F32)),
+            vec![],
+            UArg::Address {
+                space: AddressSpace::Global,
+                name: "b999".into(),
+                element: UType::scalar(DType::F32),
+            },
+        );
+        let wrong_buffer_identity = rebuild(
+            wrong_address,
+            range.clone(),
+            output_address.clone(),
+            range.clone(),
+            range.clone(),
+        );
+        let different_end = UOp::new(
+            UOpKind::Range,
+            Some(UType::scalar(DType::I64)),
+            vec![UOp::constant(3, UType::scalar(DType::I64))],
+            UArg::RangeAxis(1),
+        );
+        let mismatched_end = rebuild(
+            input_address,
+            range.clone(),
+            output_address,
+            range,
+            different_end,
+        );
+        let separate_equal_range = UOp::new(
+            UOpKind::Range,
+            Some(UType::scalar(DType::I64)),
+            input_index.sources()[1].sources().to_vec(),
+            UArg::RangeAxis(0),
+        );
+        assert_eq!(separate_equal_range, input_index.sources()[1]);
+        assert!(!separate_equal_range.shares_node_with(&input_index.sources()[1]));
+        let unshared_range = rebuild(
+            input_index.sources()[0].clone(),
+            input_index.sources()[1].clone(),
+            output_index.sources()[0].clone(),
+            separate_equal_range.clone(),
+            separate_equal_range,
+        );
+        for malformed in [
+            constant_index,
+            out_of_bounds,
+            wrong_buffer_identity,
+            mismatched_end,
+            unshared_range,
+        ] {
+            assert!(
+                renderer
+                    .render_linked_f32_exp(&malformed, request.link_inputs())
+                    .is_err()
+            );
+        }
+        assert!(matches!(end_range.kind(), UOpKind::EndRange));
+    }
+
+    #[test]
+    fn linked_exp_block_size_is_part_of_request_and_cache_identity() {
+        use std::num::NonZeroUsize;
+
+        let (mock, capture, primary, request, _, _) = fixture();
+        let renderer = PtxRenderer::new(80).unwrap();
+        let alternate = LinkedF32ExpRequest::new(
+            renderer,
+            &capture.items[0].kernel,
+            request.link_inputs().to_vec(),
+            &request.rendered().entry,
+            64,
+        )
+        .unwrap();
+        assert_ne!(request.identity(), alternate.identity());
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let first = request.load(&primary, &cache).unwrap();
+        let second = alternate.load(&primary, &cache).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.block_size(), 32);
+        assert_eq!(second.block_size(), 64);
+        assert_eq!(cache.len(), 2);
+        // The lower linked module/function is independent of launch geometry
+        // and is intentionally shared by both block-size-specific wrappers.
+        assert_eq!(mock.generic_kernel_count(), 1);
+
+        let bytes = capture.items[0].primary_output().bytes;
+        let input = primary.allocate(NonZeroUsize::new(bytes).unwrap()).unwrap();
+        let output = primary.allocate(NonZeroUsize::new(bytes).unwrap()).unwrap();
+        input.copy_from(0, &vec![0; bytes]).unwrap();
+        output.copy_from(0, &vec![0x5a; bytes]).unwrap();
+        let stream = primary.stream().unwrap();
+        drop(cache);
+        drop(first);
+        assert_eq!(mock.generic_kernel_count(), 1);
+        second
+            .launch(
+                &stream,
+                &[
+                    PtxBinding {
+                        buffer: input.view(),
+                        dtype: DType::F32,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: output.view(),
+                        dtype: DType::F32,
+                        mutable: true,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+        let mut actual = vec![0; bytes];
+        output.copy_to(0, &mut actual).unwrap();
+        assert_eq!(actual, [1.0_f32.to_le_bytes(); 3].concat());
+        drop(second);
+        assert_eq!(mock.generic_kernel_count(), 0);
     }
 
     #[test]
@@ -676,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_linked_exp_launcher_failures_preserve_target_and_retry() {
+    fn prepared_linked_exp_launcher_recoverable_failures_preserve_target() {
         use std::num::NonZeroUsize;
 
         let (mock, capture, primary, request, sidecar, bound_resources) = fixture();
@@ -725,8 +931,8 @@ mod tests {
         assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
 
         // One backup submission then the final candidate-to-target submission
-        // fails. The transaction rolls the caller target back before the
-        // candidate and backup allocations are released.
+        // fails. This one-shot failure permits the best-effort restoration to
+        // complete before the candidate and backup allocations are released.
         mock.fail_dtod_after(1, 91);
         assert!(execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).is_err());
         target.copy_to(0, &mut actual).unwrap();
@@ -774,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_linked_exp_launcher_propagates_atomic_commit_phases() {
+    fn prepared_linked_exp_launcher_reports_best_effort_rollback_boundaries() {
         use crate::cuda::PrimaryOutputCommitPhase;
         use std::num::NonZeroUsize;
         let (mock, capture, primary, request, sidecar, resources) = fixture();
@@ -818,6 +1024,14 @@ mod tests {
         let error =
             execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap_err();
         assert!(error.to_string().contains("rollback"));
+        assert!(error.to_string().contains("partially modified"));
+        target.copy_to(0, &mut actual).unwrap();
+        assert_eq!(
+            actual,
+            [
+                0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+            ]
+        );
         assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
         target.copy_from(0, &snapshot).unwrap();
         execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
