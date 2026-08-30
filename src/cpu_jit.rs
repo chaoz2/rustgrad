@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v27";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v28";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -638,8 +638,10 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         )
     });
     let needs_f8_encode = nodes.iter().any(|node| {
-        matches!(node.kind(), UOpKind::Cast | UOpKind::ReduceFinalize)
-            && node.ty().is_some_and(|ty| ty.scalar.is_float8())
+        matches!(
+            node.kind(),
+            UOpKind::GraphBinary(_) | UOpKind::Cast | UOpKind::ReduceFinalize
+        ) && node.ty().is_some_and(|ty| ty.scalar.is_float8())
     });
     let store = root
         .sources()
@@ -726,12 +728,14 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     let extent = *extent;
     let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
     // Float8 storage is a tagged byte encoding, never an ordered integer.
-    // Numeric comparisons have one complete decode-only contract. WHERE has
-    // a separate storage contract: a Bool condition chooses one homogeneous
-    // raw Float8 byte, so neither branch is decoded or re-encoded. CAST uses
-    // the exact host codec in both directions, preserving same-format bytes.
-    // Validate those cases node-by-node and fail closed for every other
-    // Float8 ALU graph rather than treating payload bytes as numeric lanes.
+    // Homogeneous arithmetic/extrema decode both operands and exactly encode
+    // every typed result boundary. Numeric comparisons have a decode-only
+    // contract. WHERE has a separate storage contract: a Bool condition
+    // chooses one homogeneous raw Float8 byte, so neither branch is decoded
+    // or re-encoded. CAST uses the exact host codec in both directions,
+    // preserving same-format bytes. Validate those cases node-by-node and
+    // fail closed for every other Float8 ALU graph rather than treating
+    // payload bytes as numeric lanes.
     for node in &nodes {
         if !matches!(
             node.kind(),
@@ -759,6 +763,17 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             continue;
         }
         match node.kind() {
+            UOpKind::GraphBinary(
+                crate::BinaryOp::Add
+                | crate::BinaryOp::Sub
+                | crate::BinaryOp::Mul
+                | crate::BinaryOp::Div
+                | crate::BinaryOp::Maximum
+                | crate::BinaryOp::Minimum,
+            ) if node_dtype.is_some_and(DType::is_float8)
+                && source_types.len() == 2
+                && source_types[0] == node_dtype
+                && source_types[1] == node_dtype => {}
             UOpKind::GraphCompare(_)
                 if node_dtype == Some(DType::Bool)
                     && source_types.len() == 2
@@ -776,6 +791,12 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                     "native Float8 comparison requires one homogeneous format".into(),
                 ));
             }
+            UOpKind::GraphBinary(_) => {
+                return Err(JitError::Unsupported(
+                    "native Float8 binary requires one homogeneous format and Add/Sub/Mul/Div/Maximum/Minimum"
+                        .into(),
+                ));
+            }
             UOpKind::Ternary(crate::uop::Ternary::Where) => {
                 return Err(JitError::Unsupported(
                     "native Float8 selection requires homogeneous branches".into(),
@@ -783,7 +804,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             }
             _ => {
                 return Err(JitError::Unsupported(
-                    "native Float8 elementwise supports comparisons, raw selection, and typed casts only"
+                    "native Float8 elementwise supports homogeneous binary arithmetic/extrema, comparisons, raw selection, and typed casts only"
                         .into(),
                 ));
             }
@@ -2723,7 +2744,23 @@ fn emit(
             Ok(x)
         }
         UOpKind::GraphBinary(op) => {
-            let (a, b) = (s(0)?, s(1)?);
+            let (mut a, mut b) = (s(0)?, s(1)?);
+            if ty.is_float8() {
+                a = float8_decode_expr(ty, &a).expect("guarded Float8 binary dtype");
+                b = float8_decode_expr(ty, &b).expect("guarded Float8 binary dtype");
+                let value = match op {
+                    crate::BinaryOp::Add => format!("(({a})+({b}))"),
+                    crate::BinaryOp::Sub => format!("(({a})-({b}))"),
+                    crate::BinaryOp::Mul => format!("(({a})*({b}))"),
+                    crate::BinaryOp::Div => format!("(({a})/({b}))"),
+                    crate::BinaryOp::Maximum => format!("(({a})<({b})?({b}):({a}))"),
+                    crate::BinaryOp::Minimum => format!("(({a})>({b})?({b}):({a}))"),
+                    _ => return Err(JitError::Unsupported(format!("Float8 binary {op:?}"))),
+                };
+                return Ok(
+                    float8_encode_expr(ty, &value).expect("guarded Float8 binary output dtype")
+                );
+            }
             let x = match op {
                 crate::BinaryOp::Add => "+",
                 crate::BinaryOp::Sub => "-",
@@ -3343,7 +3380,15 @@ mod tests {
     }
 
     #[test]
-    fn float8_compare_decodes_select_preserves_raw_and_other_alu_fails_closed() {
+    fn float8_binary_and_compare_decode_select_preserves_raw_and_other_alu_fails_closed() {
+        let binary_operations = [
+            crate::BinaryOp::Add,
+            crate::BinaryOp::Sub,
+            crate::BinaryOp::Mul,
+            crate::BinaryOp::Div,
+            crate::BinaryOp::Maximum,
+            crate::BinaryOp::Minimum,
+        ];
         let operations = [
             CompareOp::Eq,
             CompareOp::Ne,
@@ -3394,6 +3439,61 @@ mod tests {
                 )),
             )
             .unwrap();
+
+            for op in binary_operations {
+                let mut graph = Graph::new();
+                let lhs = graph.input_dtype("lhs", [6], dtype);
+                let rhs = graph.input_dtype("rhs", [6], dtype);
+                let output = graph.binary(op, lhs, rhs).unwrap();
+                let bindings = HashMap::from([
+                    ("lhs".into(), lhs_values.clone()),
+                    ("rhs".into(), rhs_values.clone()),
+                ]);
+                let expected = CpuBackend.execute(&graph, output, &bindings).unwrap();
+                assert_eq!(
+                    crate::execute_elementwise(&graph, output, &bindings)
+                        .unwrap()
+                        .storage(),
+                    expected.storage(),
+                    "captured {dtype:?} {op:?}",
+                );
+                let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+                let scalar_rendered = CpuJit::render(&uop).unwrap();
+                let vector_rendered = CpuJit::render_vectorized(&uop).unwrap();
+                assert!(
+                    scalar_rendered.source.matches("rg_f8_decode(").count() > 1
+                        && scalar_rendered.source.matches("rg_f8_encode(").count() > 1,
+                    "{dtype:?} {op:?}"
+                );
+                assert!(
+                    vector_rendered.source.matches("rg_f8_decode(").count() > 1
+                        && vector_rendered.source.matches("rg_f8_encode(").count() > 1
+                        && !vector_rendered.source.contains("B2 VectorProgram"),
+                    "{dtype:?} {op:?}"
+                );
+
+                // Add on every format proves that the exact codecs compose
+                // with each raw-byte ABI. Running every operation for one
+                // format additionally covers all admitted native formulas.
+                if op == crate::BinaryOp::Add || dtype == DType::F8E4M3 {
+                    for kernel in [
+                        CpuJit::compile(&uop).unwrap(),
+                        CpuJit::compile_vectorized(&uop).unwrap(),
+                    ] {
+                        let mut buffers = [
+                            JitBuffer::from_tensor(&lhs_values, false),
+                            JitBuffer::from_tensor(&rhs_values, false),
+                            JitBuffer::zeroed(dtype, expected.len(), true),
+                        ];
+                        kernel.call(&mut buffers, &[]).unwrap();
+                        let actual = buffers[2]
+                            .clone()
+                            .into_tensor(expected.shape().clone())
+                            .unwrap();
+                        assert_eq!(actual.storage(), expected.storage(), "{dtype:?} {op:?}");
+                    }
+                }
+            }
 
             for op in operations {
                 let mut graph = Graph::new();
@@ -3480,12 +3580,25 @@ mod tests {
             let mut graph = Graph::new();
             let lhs = graph.input_dtype("lhs", [1], dtype);
             let rhs = graph.input_dtype("rhs", [1], dtype);
-            let output = graph.binary(crate::BinaryOp::Add, lhs, rhs).unwrap();
+            let output = graph.binary(crate::BinaryOp::FloorDiv, lhs, rhs).unwrap();
             let error = CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap())
                 .unwrap_err();
             assert!(
                 matches!(&error, JitError::Unsupported(reason)
-                    if reason == "native Float8 elementwise supports comparisons, raw selection, and typed casts only"),
+                    if reason == "native Float8 binary requires one homogeneous format and Add/Sub/Mul/Div/Maximum/Minimum"),
+                "{dtype:?}: {error:?}"
+            );
+
+            let mut mixed_binary = Graph::new();
+            let lhs = mixed_binary.input_dtype("lhs", [1], dtype);
+            let rhs = mixed_binary.input_dtype("rhs", [1], DType::F16);
+            let output = mixed_binary.binary(crate::BinaryOp::Add, lhs, rhs).unwrap();
+            let error =
+                CpuJit::render(&crate::lower_graph_elementwise(&mixed_binary, output).unwrap())
+                    .unwrap_err();
+            assert!(
+                matches!(&error, JitError::Unsupported(reason)
+                    if reason == "native Float8 binary requires one homogeneous format and Add/Sub/Mul/Div/Maximum/Minimum"),
                 "{dtype:?}: {error:?}"
             );
 
@@ -3505,7 +3618,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v27");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v28");
 
         let execute = |graph: &Graph,
                        output,
@@ -3675,7 +3788,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v27");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v28");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
