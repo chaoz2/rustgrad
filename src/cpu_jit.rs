@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v25";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v26";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -724,9 +724,10 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     // Float8 storage is a tagged byte encoding, never an ordered integer.
     // Numeric comparisons have one complete decode-only contract. WHERE has
     // a separate storage contract: a Bool condition chooses one homogeneous
-    // raw Float8 byte, so neither branch is decoded or re-encoded. Validate
-    // those two cases node-by-node and fail closed for every other Float8 ALU
-    // graph rather than silently treating payload bytes as numeric lanes.
+    // raw Float8 byte, so neither branch is decoded or re-encoded. CAST uses
+    // the exact host codec in both directions, preserving same-format bytes.
+    // Validate those cases node-by-node and fail closed for every other
+    // Float8 ALU graph rather than treating payload bytes as numeric lanes.
     for node in &nodes {
         if !matches!(
             node.kind(),
@@ -765,6 +766,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                     && source_types[0] == Some(DType::Bool)
                     && source_types[1] == node_dtype
                     && source_types[2] == node_dtype => {}
+            UOpKind::Cast if source_types.len() == 1 && source_types[0].is_some() => {}
             UOpKind::GraphCompare(_) => {
                 return Err(JitError::Unsupported(
                     "native Float8 comparison requires one homogeneous format".into(),
@@ -777,7 +779,8 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             }
             _ => {
                 return Err(JitError::Unsupported(
-                    "native Float8 elementwise supports comparisons and raw selection only".into(),
+                    "native Float8 elementwise supports comparisons, raw selection, and typed casts only"
+                        .into(),
                 ));
             }
         }
@@ -840,6 +843,9 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         // terminal exponent for infinity/NaN, and E4M3 reserves only its
         // terminal mantissa. ldexp keeps subnormal and normal powers exact.
         "static double rg_f8_decode(uint8_t x,int bias,unsigned mb,unsigned mode){unsigned em=(1u<<(7u-mb))-1u,mm=(1u<<mb)-1u,e=(x>>mb)&em,m=x&mm,s=x>>7;if(mode==2u&&x==0x80u)return NAN;if((x&0x7fu)==0u)return s?-0.0:0.0;if(mode!=2u&&e==em){if(mode==1u){double v=m?NAN:INFINITY;return s?-v:v;}if(m==mm)return NAN;}double v=e?ldexp(1.0+(double)m/(double)(mm+1u),(int)e-bias):ldexp((double)m/(double)(mm+1u),1-bias);return s?-v:v;}".into(),
+        // Exact Float8Format::encode mirror. The thresholds are f64 payload
+        // bits, so conversion is independent of the host long-double ABI.
+        "static uint8_t rg_f8_encode(double x,int bias,unsigned sb,unsigned mode,uint64_t min_half,uint64_t overflow,uint8_t max_normal,uint64_t min_normal){if(mode==2u&&!isfinite(x))return 0x80u;if(mode==2u&&x==0.0)return 0u;uint8_t sign=signbit(x)?0x80u:0u;if(mode==0u&&!isfinite(x))return sign?0xffu:0x7fu;if(mode==1u&&!isfinite(x))return(uint8_t)(sign|(isinf(x)?0x7cu:0x7fu));union{double f;uint64_t u;}v={x};uint64_t bits=v.u,abs=bits&UINT64_C(0x7fffffffffffffff),mask=(UINT64_C(1)<<(sb-1u))-1u,mantissa=(bits>>(53u-sb))&mask,half=UINT64_C(1)<<(52u-sb),result;int exponent=(int)((bits>>52)&0x7ffu)-1023+bias;if(abs<=min_half)result=0;else if(abs>overflow)result=max_normal;else if(abs>=min_normal){result=((uint64_t)exponent<<(sb-1u))|mantissa;uint64_t round_bits=bits&((half<<1u)-1u);if(round_bits>half||(round_bits==half&&(mantissa&1u)))result++;}else{unsigned shift=(unsigned)(1-exponent);mantissa|=UINT64_C(1)<<(sb-1u);result=mantissa>>shift;uint64_t h=half<<shift,round_bits=(bits|(UINT64_C(1)<<52))&((h<<1u)-1u);if(round_bits>h||(round_bits==h&&(result&1u)))result++;}if(mode==2u&&result==0)return 0;return(uint8_t)(result|sign);}".into(),
         "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
@@ -2517,7 +2523,15 @@ fn emit(
                 ))
             }
         }
-        UOpKind::Cast => Ok(cast_expression(ty, s(0)?)),
+        UOpKind::Cast => {
+            let source_dtype = n
+                .sources()
+                .first()
+                .and_then(|source| source.ty())
+                .ok_or_else(|| JitError::Unsupported("untyped cast input".into()))?
+                .scalar;
+            Ok(cast_expression(source_dtype, ty, s(0)?))
+        }
         UOpKind::GraphUnary(op) => {
             let input_ty = n
                 .sources()
@@ -2844,6 +2858,50 @@ fn float8_decode_expr(dtype: DType, raw: &str) -> Option<String> {
         "rg_f8_decode(({raw}),{bias},{mantissa_bits}u,{mode}u)"
     ))
 }
+fn float8_encode_expr(dtype: DType, value: &str) -> Option<String> {
+    let (bias, significand_bits, mode, min_half, overflow, max_normal, min_normal) = match dtype {
+        DType::F8E4M3 => (
+            7,
+            4,
+            0,
+            0x3F50_0000_0000_0000u64,
+            0x407D_0000_0000_0000u64,
+            0x7eu8,
+            0x3F90_0000_0000_0000u64,
+        ),
+        DType::F8E5M2 => (
+            15,
+            3,
+            1,
+            0x3EE0_0000_0000_0000u64,
+            0x40ED_FFFF_FFFF_FFFFu64,
+            0x7bu8,
+            0x3F10_0000_0000_0000u64,
+        ),
+        DType::F8E4M3FNUZ => (
+            8,
+            4,
+            2,
+            0x3F40_0000_0000_0000u64,
+            0x406E_FFFF_FFFF_FFFFu64,
+            0x7fu8,
+            0x3F80_0000_0000_0000u64,
+        ),
+        DType::F8E5M2FNUZ => (
+            16,
+            3,
+            2,
+            0x3ED0_0000_0000_0000u64,
+            0x40ED_FFFF_FFFF_FFFFu64,
+            0x7fu8,
+            0x3F00_0000_0000_0000u64,
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "rg_f8_encode((double)({value}),{bias},{significand_bits}u,{mode}u,UINT64_C(0x{min_half:016x}),UINT64_C(0x{overflow:016x}),0x{max_normal:02x}u,UINT64_C(0x{min_normal:016x}))"
+    ))
+}
 fn broadcast_offset(input: &crate::Shape, output: &crate::Shape) -> String {
     if input == output {
         return "rg_i".into();
@@ -2927,8 +2985,19 @@ fn expr_ctype(d: DType) -> &'static str {
 /// A fused narrow CAST has a typed storage boundary. C `float` alone is not
 /// that boundary, so explicitly encode then decode F16/BF16 before a later
 /// expression consumes the value. The helpers use raw payload-aware encoding.
-fn cast_expression(dtype: DType, value: String) -> String {
+fn cast_expression(source_dtype: DType, dtype: DType, value: String) -> String {
+    if source_dtype == dtype && dtype.is_float8() {
+        return value;
+    }
+    let value = if source_dtype.is_float8() {
+        float8_decode_expr(source_dtype, &value).expect("guarded Float8 source dtype")
+    } else {
+        value
+    };
     match dtype {
+        dtype if dtype.is_float8() => {
+            float8_encode_expr(dtype, &value).expect("guarded Float8 target dtype")
+        }
         DType::Bool => format!("((uint8_t)(({value})!=0))"),
         DType::F16 => format!("rg_f16_to_f32(rg_f32_to_f16((float)({value})))"),
         DType::BF16 => format!("rg_bf16_to_f32(rg_f32_to_bf16((float)({value})))"),
@@ -3388,7 +3457,7 @@ mod tests {
                 .unwrap_err();
             assert!(
                 matches!(&error, JitError::Unsupported(reason)
-                    if reason == "native Float8 elementwise supports comparisons and raw selection only"),
+                    if reason == "native Float8 elementwise supports comparisons, raw selection, and typed casts only"),
                 "{dtype:?}: {error:?}"
             );
 
@@ -3403,6 +3472,130 @@ mod tests {
                     if reason == "native Float8 comparison requires one homogeneous format"),
                 "{dtype:?}: {error:?}"
             );
+        }
+    }
+
+    #[test]
+    fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v26");
+
+        let execute = |graph: &Graph,
+                       output,
+                       input: &TensorData,
+                       expected: &TensorData,
+                       source: DType,
+                       target: DType| {
+            let uop = crate::lower_graph_elementwise(graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(!vector.source.contains("B2 VectorProgram"));
+            if source.is_float8() && source != target {
+                assert!(scalar.source.matches("rg_f8_decode(").count() > 1);
+            }
+            if target.is_float8() && source != target {
+                assert!(scalar.source.matches("rg_f8_encode(").count() > 1);
+            }
+            for kernel in [
+                CpuJit::compile(&uop).unwrap(),
+                CpuJit::compile_vectorized(&uop).unwrap(),
+            ] {
+                let mut buffers = [
+                    JitBuffer::from_tensor(input, false),
+                    JitBuffer::zeroed(target, expected.len(), true),
+                ];
+                kernel.call(&mut buffers, &[]).unwrap();
+                let actual = buffers[1]
+                    .clone()
+                    .into_tensor(expected.shape().clone())
+                    .unwrap();
+                assert_eq!(
+                    actual.storage(),
+                    expected.storage(),
+                    "{source:?} -> {target:?}"
+                );
+            }
+        };
+
+        let codec_values = TensorData::from_storage(
+            [12],
+            Storage::F64(vec![
+                0.0,
+                -0.0,
+                0.000_976_562_5,
+                0.001_953_125,
+                1.0625,
+                1.1875,
+                240.0,
+                448.0,
+                57_344.0,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NAN,
+            ]),
+        )
+        .unwrap();
+
+        for (index, dtype) in DType::FP8S.into_iter().enumerate() {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", codec_values.shape().clone(), DType::F64);
+            let output = graph.cast(input, dtype).unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("input".into(), codec_values.clone())]),
+                )
+                .unwrap();
+            execute(&graph, output, &codec_values, &expected, DType::F64, dtype);
+
+            let format = dtype.float8_format().unwrap();
+            let raw = TensorData::from_storage(
+                [8],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    format,
+                    vec![0x00, 0x80, 0x01, 0x38, 0x7e, 0x7f, 0xa5, 0xff],
+                )),
+            )
+            .unwrap();
+            let mut identity_graph = Graph::new();
+            let input = identity_graph.input_dtype("input", [8], dtype);
+            let output = identity_graph.cast(input, dtype).unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &identity_graph,
+                    output,
+                    &HashMap::from([("input".into(), raw.clone())]),
+                )
+                .unwrap();
+            assert_eq!(expected.storage(), raw.storage());
+            execute(&identity_graph, output, &raw, &expected, dtype, dtype);
+
+            let finite = TensorData::from_scalars(
+                [6],
+                dtype,
+                [
+                    Scalar::F(0.0),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.001_953_125),
+                    Scalar::F(1.0),
+                    Scalar::F(2.0),
+                    Scalar::F(16.0),
+                ],
+            )
+            .unwrap();
+            for target in [DType::F64, DType::FP8S[(index + 1) % DType::FP8S.len()]] {
+                let mut graph = Graph::new();
+                let input = graph.input_dtype("input", [6], dtype);
+                let output = graph.cast(input, target).unwrap();
+                let expected = CpuBackend
+                    .execute(
+                        &graph,
+                        output,
+                        &HashMap::from([("input".into(), finite.clone())]),
+                    )
+                    .unwrap();
+                execute(&graph, output, &finite, &expected, dtype, target);
+            }
         }
     }
 
@@ -3454,7 +3647,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v25");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v26");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
