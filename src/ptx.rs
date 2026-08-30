@@ -13,7 +13,7 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    ffi::{CString, c_void},
+    ffi::{CStr, CString, c_void},
     fmt,
     rc::Rc,
     sync::{Arc, Condvar, Mutex},
@@ -27,6 +27,8 @@ mod matmul_tests;
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v28";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
+/// Versioned contract for the sole opt-in linked NVVM-backed F32 Exp route.
+pub const LINKED_F32_EXP_RENDERER_CONTRACT_VERSION: u32 = 1;
 #[allow(dead_code)]
 const COLLECTIVE_ADD_RENDERER_VERSION: &str = "rustgrad-ptx-collective-add-v1";
 
@@ -301,7 +303,36 @@ impl PtxRenderer {
         })
     }
     pub fn render(&self, kernel: &UOp) -> Result<RenderedPtx, PtxError> {
-        render(self, kernel)
+        render(self, kernel, false)
+    }
+    /// Renders only an explicitly attested F32 `GraphUnary::Exp` for linked
+    /// pre-CUDA-12 NVVM libdevice input. The default renderer stays closed.
+    pub fn render_linked_f32_exp(
+        &self,
+        kernel: &UOp,
+        linked_inputs: &[crate::cuda::LinkInput],
+    ) -> Result<RenderedPtx, PtxError> {
+        if !linked_inputs.iter().any(|input| {
+            input.supports_nvvm_export(self.sm, "__nv_expf", crate::cuda::NvvmPrototype::F32ToF32)
+        }) {
+            return Err(PtxError::Unsupported("linked F32 Exp NVVM contract".into()));
+        }
+        let nodes = kernel
+            .topological()
+            .map_err(|error| PtxError::Unsupported(error.to_string()))?;
+        if nodes
+            .iter()
+            .filter(|node| matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp)))
+            .count()
+            != 1
+            || nodes.iter().any(|node| {
+                matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))
+                    && node.ty().is_none_or(|ty| ty.scalar != DType::F32)
+            })
+        {
+            return Err(PtxError::Unsupported("linked F32 Exp graph".into()));
+        }
+        render(self, kernel, true)
     }
     /// Renders the explicit correctness-first serial policy for a validated
     /// Matmul plan with the fixed lhs/rhs/output ABI.
@@ -328,7 +359,83 @@ impl PtxRenderer {
     }
 }
 
-fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
+/// Atomic opt-in request for the sole linked external-math route. It prevents
+/// callers from mixing a raw renderer version, UOp, NVVM attestation, or entry
+/// symbol across separately validated steps.
+#[derive(Clone)]
+pub struct LinkedF32ExpRequest {
+    inputs: Vec<crate::cuda::LinkInput>,
+    rendered: Arc<RenderedPtx>,
+    symbol: CString,
+    block_size: u32,
+    identity: String,
+}
+impl LinkedF32ExpRequest {
+    pub fn new(
+        renderer: PtxRenderer,
+        kernel: &UOp,
+        inputs: Vec<crate::cuda::LinkInput>,
+        kernel_symbol: &str,
+        block_size: u32,
+    ) -> Result<Self, PtxError> {
+        if inputs.len() != 1 || block_size == 0 {
+            return Err(PtxError::InvalidBinding("linked F32 Exp request".into()));
+        }
+        let rendered = Arc::new(renderer.render_linked_f32_exp(kernel, &inputs)?);
+        if rendered.entry != kernel_symbol {
+            return Err(PtxError::InvalidBinding(
+                "linked F32 Exp kernel symbol".into(),
+            ));
+        }
+        let symbol = CString::new(kernel_symbol)
+            .map_err(|_| PtxError::InvalidBinding("linked F32 Exp kernel symbol".into()))?;
+        let input_identity = crate::cuda::linked_module_identity(&inputs)?;
+        let identity = format!(
+            "linked-f32-exp-v{}:{}:{}:{}",
+            LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
+            input_identity.cache_key(),
+            rendered.cache_key,
+            kernel_symbol,
+        );
+        Ok(Self {
+            inputs,
+            rendered,
+            symbol,
+            block_size,
+            identity,
+        })
+    }
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+    pub fn rendered(&self) -> &RenderedPtx {
+        &self.rendered
+    }
+    /// Immutable caller-owned link inputs retained by this request.
+    pub fn link_inputs(&self) -> &[crate::cuda::LinkInput] {
+        &self.inputs
+    }
+    pub fn load(
+        &self,
+        primary: &crate::PrimaryContext,
+        cache: &PrimaryLinkedRenderedKernelCache,
+    ) -> Result<Arc<PrimaryLinkedRenderedKernel>, PtxError> {
+        cache.get_or_load(
+            primary,
+            LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
+            &self.inputs,
+            self.rendered.clone(),
+            &self.symbol,
+            self.block_size,
+        )
+    }
+}
+
+fn render(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    allow_linked_f32_exp: bool,
+) -> Result<RenderedPtx, PtxError> {
     if matches!(root.kind(), UOpKind::Random) {
         let UArg::Random(plan) = root.arg() else {
             return Err(PtxError::Unsupported("random payload is absent".into()));
@@ -496,8 +603,13 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         "".into(),
-        format!(".visible .entry {entry}("),
     ];
+    if allow_linked_f32_exp {
+        lines.push("// linked-f32-exp-v1: pre-CUDA-12 NVVM __nv_expf ABI inference".into());
+        lines.push(".extern .func (.param .b32 func_retval0) __nv_expf(.param .b32 x);".into());
+        lines.push("".into());
+    }
+    lines.push(format!(".visible .entry {entry}("));
     for (n, buffer) in buffers.iter().enumerate() {
         lines.push(format!("  .param .u64 p{n},"));
         let _ = buffer;
@@ -546,6 +658,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         "%r3",
         false,
         storage_mode,
+        allow_linked_f32_exp,
     )?;
     let out = buffers.iter().find(|b| b.id == *out_id).unwrap();
     let oi = ids[out_id] + 1;
@@ -3903,6 +4016,7 @@ fn emit(
     linear: &str,
     allow_reduction_narrow: bool,
     storage_mode: Option<ScopedStorageMode>,
+    allow_linked_f32_exp: bool,
 ) -> Result<String, PtxError> {
     let id = map.len();
     map.insert(id, lines.len() + 1);
@@ -3926,6 +4040,7 @@ fn emit(
             linear,
             allow_reduction_narrow,
             storage_mode,
+            allow_linked_f32_exp,
         )
     };
     let dst = match ty {
@@ -4386,6 +4501,18 @@ fn emit(
             let mnemonic = match (op, ty) {
                 (crate::UnaryOp::Neg, DType::I32 | DType::I64 | DType::F32 | DType::F64) => "neg",
                 (crate::UnaryOp::Abs, DType::I32 | DType::I64 | DType::F32 | DType::F64) => "abs",
+                (crate::UnaryOp::Exp, DType::F32) if allow_linked_f32_exp => {
+                    lines.extend([
+                        format!("  mov.b32 %r38, {a};"),
+                        "  .param .b32 exp_arg;".into(),
+                        "  .param .b32 exp_ret;".into(),
+                        "  st.param.b32 [exp_arg], %r38;".into(),
+                        "  call.uni (exp_ret), __nv_expf, (exp_arg);".into(),
+                        "  ld.param.b32 %r39, [exp_ret];".into(),
+                        format!("  mov.b32 {dst}, %r39;"),
+                    ]);
+                    return Ok(dst);
+                }
                 _ => {
                     return Err(PtxError::Unsupported(format!(
                         "unary {op:?} for {ty:?} is outside the exact PTX subset"
@@ -5288,6 +5415,7 @@ fn render_reduction(
             "%r4",
             true,
             None,
+            false,
         )?;
         if extrema {
             let convert = match value_dtype {
@@ -5799,6 +5927,217 @@ pub struct PrimaryPtxKernel {
     function: Function,
     block_size: u32,
     primary: crate::PrimaryContext,
+}
+
+/// A retained rendered PTX kernel loaded through the separate linked-module
+/// caches.  It is intentionally not a `PrimaryPtxKernel`: legacy single-PTX
+/// loading and cache keys remain unchanged.
+pub struct PrimaryLinkedRenderedKernel {
+    rendered: Arc<RenderedPtx>,
+    kernel: Arc<crate::cuda::PrimaryLinkedKernel>,
+    primary: crate::PrimaryContext,
+    block_size: u32,
+}
+unsafe impl Send for PrimaryLinkedRenderedKernel {}
+unsafe impl Sync for PrimaryLinkedRenderedKernel {}
+impl PrimaryLinkedRenderedKernel {
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        bindings: &[PtxBinding<'_>],
+        synchronize: bool,
+    ) -> Result<(), PtxError> {
+        if !stream.belongs_to_primary(&self.primary) {
+            return Err(PtxError::Cuda(CudaError::ContextMismatch));
+        }
+        if bindings.len() != self.rendered.buffers.len() {
+            return Err(PtxError::InvalidBinding("wrong buffer count".into()));
+        }
+        if self.rendered.extent == 0 {
+            return Ok(());
+        }
+        let mut words = Vec::with_capacity(bindings.len() + 1);
+        for (index, (want, got)) in self.rendered.buffers.iter().zip(bindings).enumerate() {
+            if want.dtype != got.dtype || want.mutable != got.mutable {
+                return Err(PtxError::InvalidBinding(format!(
+                    "buffer {} ABI mismatch",
+                    want.id
+                )));
+            }
+            if !got.buffer.belongs_to_primary(&self.primary) {
+                return Err(PtxError::Cuda(CudaError::ContextMismatch));
+            }
+            let need = want
+                .elements
+                .checked_mul(want.dtype.itemsize())
+                .ok_or(PtxError::Overflow)?;
+            if got.buffer.len() < need {
+                return Err(PtxError::InvalidBinding("buffer too small".into()));
+            }
+            let pointer = got.buffer.device_ptr()?;
+            self.rendered.validate_pointer_alignment(index, pointer)?;
+            words.push(pointer);
+        }
+        words.push(self.rendered.extent as u64);
+        let mut args: Vec<*mut c_void> = words
+            .iter_mut()
+            .map(|word| (word as *mut u64).cast())
+            .collect();
+        self.kernel.launch(
+            self.rendered.launch_config(self.block_size)?,
+            stream,
+            &mut args,
+        )?;
+        if synchronize {
+            stream.synchronize_generic_kernel_completion()?;
+        }
+        Ok(())
+    }
+}
+impl Drop for PrimaryLinkedRenderedKernel {
+    fn drop(&mut self) {
+        self.primary
+            .unregister_generic_kernel_semantics(self.kernel.function_identity());
+    }
+}
+
+/// Explicitly versioned adapter for rendered kernels that require caller-owned
+/// linked inputs.  Existing `PtxCache` and `ConcurrentPtxCache` never use it.
+pub struct PrimaryLinkedRenderedKernelCache {
+    kernels: Arc<crate::cuda::PrimaryLinkedKernelCache>,
+    entries: Mutex<HashMap<(usize, crate::DeviceId, String), Arc<LinkedRenderedEntry>>>,
+}
+struct LinkedRenderedEntry {
+    state: Mutex<LinkedRenderedState>,
+    ready: Condvar,
+}
+enum LinkedRenderedState {
+    Loading,
+    Ready(Arc<PrimaryLinkedRenderedKernel>),
+    Failed(PtxError),
+}
+impl PrimaryLinkedRenderedKernelCache {
+    pub fn new(kernels: Arc<crate::cuda::PrimaryLinkedKernelCache>) -> Self {
+        Self {
+            kernels,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn get_or_load(
+        &self,
+        primary: &crate::PrimaryContext,
+        renderer_contract_version: u32,
+        linked_inputs: &[crate::cuda::LinkInput],
+        rendered: Arc<RenderedPtx>,
+        symbol: &CStr,
+        block_size: u32,
+    ) -> Result<Arc<PrimaryLinkedRenderedKernel>, PtxError> {
+        if renderer_contract_version == 0 || symbol.to_bytes().is_empty() || block_size == 0 {
+            return Err(PtxError::InvalidBinding(
+                "linked rendered kernel contract".into(),
+            ));
+        }
+        rendered.validate()?;
+        let semantics = Arc::new(GenericKernelSemantics::from_rendered(&rendered)?);
+        let ptx_fingerprint = linked_rendered_fingerprint(rendered.source.as_bytes());
+        let generated_name = format!(
+            "rustgrad-linked-renderer-v{renderer_contract_version}-{ptx_fingerprint:016x}-{}.ptx",
+            rendered.cache_key,
+        );
+        let generated =
+            crate::cuda::LinkInput::ptx(&generated_name, rendered.source.as_bytes().to_vec())?;
+        let mut inputs = Vec::with_capacity(linked_inputs.len() + 1);
+        inputs.push(generated);
+        inputs.extend_from_slice(linked_inputs);
+        let linked_identity = crate::cuda::linked_module_identity(&inputs)?;
+        let key = format!(
+            "linked-rendered-v{renderer_contract_version}:{}:{ptx_fingerprint:016x}:{}:{}",
+            linked_identity.cache_key(),
+            rendered.cache_key,
+            symbol.to_string_lossy(),
+        );
+        let full_key = (primary.identity(), primary.device(), key.clone());
+        let (entry, leader) = {
+            let mut entries = self
+                .entries
+                .lock()
+                .expect("linked rendered cache mutex poisoned");
+            match entries.get(&full_key) {
+                Some(entry) => (entry.clone(), false),
+                None => {
+                    let entry = Arc::new(LinkedRenderedEntry {
+                        state: Mutex::new(LinkedRenderedState::Loading),
+                        ready: Condvar::new(),
+                    });
+                    entries.insert(full_key.clone(), entry.clone());
+                    (entry, true)
+                }
+            }
+        };
+        if leader {
+            let result = self
+                .kernels
+                .get_or_load(primary, &inputs, symbol)
+                .map_err(PtxError::from)
+                .map(|kernel| {
+                    kernel.register_generic_semantics(&key, semantics);
+                    let kernel_primary = kernel.module().primary().clone();
+                    Arc::new(PrimaryLinkedRenderedKernel {
+                        rendered,
+                        kernel,
+                        primary: kernel_primary,
+                        block_size,
+                    })
+                });
+            let mut state = entry
+                .state
+                .lock()
+                .expect("linked rendered entry mutex poisoned");
+            *state = match &result {
+                Ok(kernel) => LinkedRenderedState::Ready(kernel.clone()),
+                Err(error) => LinkedRenderedState::Failed(error.clone()),
+            };
+            entry.ready.notify_all();
+            drop(state);
+            if result.is_err() {
+                self.entries
+                    .lock()
+                    .expect("linked rendered cache mutex poisoned")
+                    .remove(&full_key);
+            }
+            return result;
+        }
+        let mut state = entry
+            .state
+            .lock()
+            .expect("linked rendered entry mutex poisoned");
+        loop {
+            match &*state {
+                LinkedRenderedState::Loading => {
+                    state = entry
+                        .ready
+                        .wait(state)
+                        .expect("linked rendered entry mutex poisoned")
+                }
+                LinkedRenderedState::Ready(kernel) => return Ok(kernel.clone()),
+                LinkedRenderedState::Failed(error) => return Err(error.clone()),
+            }
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("linked rendered cache mutex poisoned")
+            .len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+fn linked_rendered_fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 /// In-flight primary PTX launch profiling. The sample borrows the launch
 /// stream and bindings, retaining those resources and the kernel through an

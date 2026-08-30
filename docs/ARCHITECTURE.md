@@ -1749,6 +1749,14 @@ owned stream/event dependency, so the unchanged pair can be retried. These
 are mock/source safety contracts only; they neither invent an ABI nor claim
 live CUDA or multi-GPU validation.
 
+The linked-module path is an explicit opt-in beside legacy PTX module loading.
+`LinkInput` owns ordered immutable PTX, CUDA-library, or caller-attested
+pre-CUDA-12 NVVM bytes; a versioned content identity feeds owner-scoped
+module/function caches. A private RAII link state destroys every created
+`CUlinkState` after success or failure, and missing `cuLink*` symbols fail
+closed. No toolkit discovery, filesystem lookup, payload serialization, or
+claim about CUDA 12+ NVVM input is implicit in this path.
+
 Retained primary contexts additionally carry a stable Rust owner identity.
 `Dispatch` has default no-op registration and per-thread enter/exit/current
 observation hooks so deterministic mocks can distinguish owners even when the
@@ -1797,8 +1805,23 @@ and lower to PTX scalar instructions; bool/unsigned and all other unary pairs
 are structured renderer errors. Guarded integer division, modulo and shifts are
 rejected until a device-status ABI exists. f16/bf16 are likewise intentionally
 rejected until their capability-specific conversion and requantization path is
-proven. Transcendental unary functions remain rejected because this renderer
-does not yet carry a versioned libdevice contract.
+proven. Transcendental unary functions remain rejected by the ordinary
+renderer. The sole exception is `LinkedF32ExpRequest`: after an exact F32 Exp
+UOp proof and one matching NVVM `__nv_expf: f32 -> f32` producer attestation,
+it emits a versioned external call and loads only through the linked caches.
+
+`linked_exp/` owns the corresponding resource boundary. Its v1 descriptor and
+sidecar are canonical, payload-free records tied to one captured schedule and
+one request. Preparation revalidates the captured UOp and F32 input/output ABI;
+rebind then requires the original immutable link bytes and exact caller-owned
+primary-context leases. The dedicated launcher stages into a private candidate
+and commits the caller output through backup/copy/rollback. A separate v2
+artifact admits exactly two independent items and commits both outputs as one
+transaction. Generic captured replay cannot consume either sidecar. The mock
+uses link/request/cache, generic-launch/completion, and transaction-phase hooks
+to prove failure cleanup and retry; live CUDA/ptxas, broader operations/dtypes,
+payload embedding, resource discovery, and general captured-device replay are
+still outside this boundary.
 
 Static sum, mean, product, min, and max UOp programs have a separate correctness-first PTX path.
 One CUDA thread owns one logical output and serially walks the normalized

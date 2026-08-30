@@ -24,6 +24,7 @@ pub mod interop;
 pub mod ir;
 pub mod kernel;
 pub mod linearize;
+pub mod linked_exp;
 pub mod loss;
 pub mod matmul;
 pub mod random;
@@ -81,9 +82,12 @@ pub use cpu_stable_sort::{
 pub use cuda::{
     BufferLease, BufferView, Capability, Capture, Context, ContextGuard, CudaAllocator, CudaError,
     CudaGraph, CudaModule, Device, DeviceBuffer, DeviceId, Driver, Event, Function, GraphExec,
-    LaunchConfig, ModuleLoadMetadata, ModuleLoadOptions, PeerAccess, PeerTransfer,
-    PinnedHostBuffer, PrimaryBlock, PrimaryBufferLease, PrimaryContext, PrimaryContextGuard,
-    PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, PrimaryPoolStats, Stream, Transfer,
+    LaunchConfig, LinkInput, LinkInputKind, LinkInputResourceDescriptor, LinkedModuleIdentity,
+    ModuleLoadMetadata, ModuleLoadOptions, NvvmExportContract, NvvmProducerContract, NvvmPrototype,
+    PeerAccess, PeerTransfer, PinnedHostBuffer, PrimaryBlock, PrimaryBufferLease, PrimaryContext,
+    PrimaryContextGuard, PrimaryCudaAllocator, PrimaryEventFence, PrimaryLinkedKernel,
+    PrimaryLinkedKernelCache, PrimaryLinkedModule, PrimaryLinkedModuleCache, PrimaryOwner,
+    PrimaryPoolStats, Stream, Transfer, linked_module_identity,
 };
 pub use datasets::{
     BatchIter, Cifar10, Cifar10FileError, Cifar10ReadLimits, ClassificationBatch,
@@ -151,6 +155,7 @@ pub use linearize::{
     LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearPayload,
     LinearProgram, LinearizeError, LiveInterval, RegisterAssignment, RegisterClass, allocate,
 };
+pub use linked_exp::*;
 pub use loss::{
     LossOptions, Reduction, SparseCategoricalCrossEntropyOptions, binary_cross_entropy,
     binary_cross_entropy_with_logits, cross_entropy, nll_loss, sparse_categorical_cross_entropy,
@@ -190,8 +195,9 @@ pub use onnx::{
 };
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use ptx::{
-    ConcurrentPtxCache, PrimaryPtxKernel, PtxBinding, PtxCache, PtxError, PtxKernel,
-    PtxLaunchGeometry, PtxRenderer, RenderedPtx,
+    ConcurrentPtxCache, LINKED_F32_EXP_RENDERER_CONTRACT_VERSION, LinkedF32ExpRequest,
+    PrimaryLinkedRenderedKernel, PrimaryLinkedRenderedKernelCache, PrimaryPtxKernel, PtxBinding,
+    PtxCache, PtxError, PtxKernel, PtxLaunchGeometry, PtxRenderer, RenderedPtx,
 };
 pub use runtime::mapped::{MappedBackingId, MappedTensor, MappedTensorError, MappedTensorPolicy};
 pub use runtime::mapped_mut::{MutableMappedFile, MutableMappedFileError};
