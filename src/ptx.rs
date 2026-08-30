@@ -2230,12 +2230,10 @@ fn scoped_select_predicate_shape(
         }
         UOpKind::GraphCompare(crate::CompareOp::Ne) => {
             if matches!(value.sources(), [left, right] if matches!(left.kind(), UOpKind::Load | UOpKind::Cast) && matches!(right.kind(), UOpKind::Load | UOpKind::Cast))
-            {
-                if let Some(shape) =
+                && let Some(shape) =
                     scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Ne)?
-                {
-                    return Ok(Some(shape));
-                }
+            {
+                return Ok(Some(shape));
             }
             let [cast, truth] = value.sources() else {
                 return Ok(None);
