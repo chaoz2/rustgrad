@@ -26,14 +26,6 @@ impl std::error::Error for RangeifyError {}
 /// Resolves the statically provable shrink subset into one source storage map.
 /// Computed producers deliberately remain an explicit materialization boundary.
 pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
-    fn positive_reshape(
-        view: AffineView,
-        op: impl FnOnce(ViewMap) -> Result<ViewMap, crate::UOpError>,
-    ) -> Result<AffineView, RangeifyError> {
-        op(view.as_unsigned().map_err(|_| RangeifyError::Invalid)?)
-            .map(AffineView::from)
-            .map_err(|_| RangeifyError::Invalid)
-    }
     fn go(g: &Graph, n: NodeId) -> Result<(NodeId, AffineView), RangeifyError> {
         match g.op(n).map_err(|_| RangeifyError::Invalid)? {
             Op::Input { .. } | Op::Constant(_) => {
@@ -48,7 +40,7 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
                 let (src, view) = go(g, *input)?;
                 Ok((
                     src,
-                    positive_reshape(view, |map| map.reshape(shape.clone()))
+                    view.reshape_read(shape.clone())
                         .map_err(|_| RangeifyError::Unsupported(n))?,
                 ))
             }
@@ -117,14 +109,6 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
 /// Source-backed views deliberately stay on the ordinary load-addressing path;
 /// this helper exists only for the explicit owned materialization boundary.
 pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
-    fn positive_reshape(
-        view: AffineView,
-        op: impl FnOnce(ViewMap) -> Result<ViewMap, crate::UOpError>,
-    ) -> Result<AffineView, RangeifyError> {
-        op(view.as_unsigned().map_err(|_| RangeifyError::Invalid)?)
-            .map(AffineView::from)
-            .map_err(|_| RangeifyError::Invalid)
-    }
     fn go(g: &Graph, n: NodeId) -> Result<(NodeId, AffineView), RangeifyError> {
         match g.op(n).map_err(|_| RangeifyError::Invalid)? {
             Op::Shrink { input, bounds } => {
@@ -138,7 +122,7 @@ pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedVie
                 let (source, view) = go(g, *input)?;
                 Ok((
                     source,
-                    positive_reshape(view, |map| map.reshape(shape.clone()))
+                    view.reshape_read(shape.clone())
                         .map_err(|_| RangeifyError::Unsupported(n))?,
                 ))
             }
@@ -292,6 +276,12 @@ mod tests {
         assert_eq!(view.strides, vec![-1]);
         assert_eq!(view.element_offset(0).unwrap(), 3);
         assert_eq!(view.element_offset(3).unwrap(), 0);
+
+        let unsqueezed = graph.reshape(reverse, [1, 4, 1]).unwrap();
+        let view = static_view(&graph, unsqueezed).unwrap().view;
+        assert_eq!(view.strides, vec![0, -1, 0]);
+        assert_eq!(view.element_offset(0).unwrap(), 3);
+        assert_eq!(view.element_offset(3).unwrap(), 0);
     }
 
     #[test]
@@ -323,5 +313,62 @@ mod tests {
         assert_eq!(view.strides, vec![-1, 4]);
         assert_eq!(view.element_offset(0).unwrap(), 2);
         assert_eq!(view.element_offset(3).unwrap(), 5);
+    }
+
+    #[test]
+    fn singleton_reshape_preserves_strided_source_and_computed_views() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 3]);
+        let padded = graph
+            .pad(input, [(0, 0), (1, 1)], crate::Scalar::F(0.0))
+            .unwrap();
+        let window = graph
+            .stride(
+                padded,
+                [
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    Slice {
+                        start: Some(1),
+                        stop: Some(4),
+                        step: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let unsqueezed = graph.reshape(window, [1, 3, 1]).unwrap();
+        let planned = computed_view(&graph, unsqueezed).unwrap();
+        assert_eq!(planned.source, padded);
+        assert_eq!(planned.view.logical_shape, Shape::from([1, 3, 1]));
+        assert_eq!(planned.view.strides, vec![0, 1, 0]);
+        assert_eq!(planned.view.offset, 1);
+        assert_eq!(planned.view.element_offset(0).unwrap(), 1);
+        assert_eq!(planned.view.element_offset(2).unwrap(), 3);
+
+        let source_window = graph
+            .stride(
+                input,
+                [
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    Slice {
+                        start: Some(0),
+                        stop: Some(3),
+                        step: 2,
+                    },
+                ],
+            )
+            .unwrap();
+        let source_unsqueezed = graph.reshape(source_window, [1, 2, 1]).unwrap();
+        let source_plan = static_view(&graph, source_unsqueezed).unwrap();
+        assert_eq!(source_plan.source, input);
+        assert_eq!(source_plan.view.strides, vec![0, 2, 0]);
+        assert_eq!(source_plan.view.element_offset(1).unwrap(), 2);
     }
 }

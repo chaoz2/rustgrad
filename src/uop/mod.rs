@@ -360,6 +360,65 @@ impl AffineView {
         out.validate_read()?;
         Ok(out)
     }
+    /// Reshapes a read map when the physical addressing remains provably
+    /// affine. Dense positive-stride maps retain the general `ViewMap`
+    /// reshape contract. Non-contiguous and signed maps may only insert or
+    /// remove singleton axes, which never changes a logical coordinate or its
+    /// source address.
+    pub fn reshape_read(&self, shape: Shape) -> Result<Self, UOpError> {
+        if self.logical_shape.numel().ok() != shape.numel().ok() {
+            return Err(UOpError::InvalidIndex);
+        }
+        if let Ok(view) = self.as_unsigned()
+            && let Ok(reshaped) = view.reshape(shape.clone())
+        {
+            return Ok(reshaped.into());
+        }
+
+        let source_axes = self
+            .logical_shape
+            .dims()
+            .iter()
+            .copied()
+            .zip(self.strides.iter().copied())
+            .filter(|(dim, _)| *dim != 1)
+            .collect::<Vec<_>>();
+        let target_axes = shape
+            .dims()
+            .iter()
+            .copied()
+            .filter(|dim| *dim != 1)
+            .collect::<Vec<_>>();
+        if source_axes.iter().map(|(dim, _)| *dim).collect::<Vec<_>>() != target_axes {
+            return Err(UOpError::InvalidIndex);
+        }
+        let mut source_axes = source_axes.into_iter();
+        let strides = shape
+            .dims()
+            .iter()
+            .map(|dim| {
+                if *dim == 1 {
+                    Ok(0)
+                } else {
+                    source_axes
+                        .next()
+                        .map(|(_, stride)| stride)
+                        .ok_or(UOpError::InvalidIndex)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if source_axes.next().is_some() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let out = Self {
+            source_shape: self.source_shape.clone(),
+            logical_shape: shape,
+            strides,
+            offset: self.offset,
+        };
+        out.validate_read()?;
+        Ok(out)
+    }
     /// Broadcasts singleton logical dimensions. Reads may deliberately become
     /// noninjective, but write-target validation remains separate.
     pub fn expand(&self, shape: Shape) -> Result<Self, UOpError> {
