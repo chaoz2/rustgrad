@@ -6542,10 +6542,11 @@ mod tests {
         let lhs = non_lub.cast(lhs, DType::F64).unwrap();
         let rhs = non_lub.cast(rhs, DType::F64).unwrap();
         let output = non_lub.maximum(lhs, rhs).unwrap();
-        assert!(matches!(
-            renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()),
-            Err(PtxError::Unsupported(_))
-        ));
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&non_lub, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("setp.lt.f64"));
+        assert!(rendered.source.contains("selp.f64"));
 
         let mut viewed = Graph::new();
         let raw_lhs = viewed.input_dtype("lhs", [1, 2], DType::F16);
@@ -8461,7 +8462,7 @@ mod tests {
         let output = boolean.sub(lhs, rhs).unwrap();
         assert!(
             matches!(boolean.op(output).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Add, lhs: left, rhs: right }
-            if *left == lhs && matches!(boolean.op(*right).unwrap(), crate::Op::Logical { op: crate::LogicalOp::Not, .. }))
+            if *left == lhs && matches!(boolean.op(*right).unwrap(), crate::Op::Compare { op: crate::CompareOp::Ne, .. }))
         );
         let rendered = renderer
             .render(&crate::lower_graph_elementwise(&boolean, output).unwrap())
@@ -9085,10 +9086,11 @@ mod tests {
         let mut finite = Graph::new();
         let input = finite.input_dtype("input", [1], DType::F32);
         let output = finite.isfinite(input).unwrap();
-        assert!(matches!(
-            renderer.render(&crate::lower_graph_elementwise(&finite, output).unwrap()),
-            Err(PtxError::Unsupported(_))
-        ));
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&finite, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("or.b32"));
+        assert!(rendered.source.contains("not.pred"));
         let mut signs = Graph::new();
         let input = signs.input_dtype("input", [1], DType::F32);
         let output = signs.isinf_with_signs(input, true, false).unwrap();
@@ -10681,10 +10683,11 @@ mod tests {
         let input = compound.input_dtype("x", [1], DType::F16);
         let negated = compound.neg(input).unwrap();
         let combined = compound.add(input, negated).unwrap();
-        assert!(matches!(
-            renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()),
-            Err(PtxError::Unsupported(_))
-        ));
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&compound, combined).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("xor.b32"));
+        assert!(rendered.source.contains("add.rn.f32"));
 
         // Numeric Neg retains its source-composed reverse rule; Bool is a
         // logical predicate and remains outside differentiable paths.

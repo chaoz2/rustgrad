@@ -667,8 +667,9 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
             assert_eq!(
                 crate::execute_elementwise(&built.graph, built.output, &built.oracle)
                     .unwrap()
-                    .storage(),
-                oracle.storage(),
+                    .to_le_bytes()
+                    .unwrap(),
+                oracle.to_le_bytes().unwrap(),
                 "empty {dtype:?} {reduction:?}",
             );
             let scheduled = schedule(&built.graph, built.output).unwrap();
@@ -4083,22 +4084,29 @@ fn fixed_campaigns_match_interpreter_and_strict_native() {
 }
 
 #[test]
-fn unsupported_native_cases_remain_explicit() {
+fn regression_native_cases_remain_explicit_and_portable() {
     let mut unsupported = 0;
+    let mut native_matches = 0;
     for (index, case) in regression_cases().iter().enumerate() {
         for comparison in run_case(3, index as u64, case, true).unwrap() {
-            if matches!(
-                comparison,
+            match comparison {
+                FuzzComparison::Match {
+                    path: FuzzPath::NativeScalar | FuzzPath::NativeVector,
+                    ..
+                } => native_matches += 1,
                 FuzzComparison::Unsupported {
                     path: FuzzPath::NativeScalar | FuzzPath::NativeVector,
                     ..
+                } => unsupported += 1,
+                FuzzComparison::Failure(failure) => {
+                    panic!("regression native failure: {failure:?}")
                 }
-            ) {
-                unsupported += 1;
+                _ => {}
             }
         }
     }
-    assert!(unsupported > 0);
+    assert!(native_matches > 0);
+    assert_eq!(unsupported, 0);
 }
 
 #[test]
@@ -4107,13 +4115,16 @@ fn regression_cases_cover_edges_without_current_failures() {
     assert_eq!(cases.len(), 60);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
-            assert!(matches!(
-                comparison,
-                FuzzComparison::Match {
-                    path: FuzzPath::CapturedInterpreter,
-                    ..
-                }
-            ));
+            assert!(
+                matches!(
+                    comparison,
+                    FuzzComparison::Match {
+                        path: FuzzPath::CapturedInterpreter,
+                        ..
+                    }
+                ),
+                "regression case {index}: {comparison:?}"
+            );
         }
     }
 }
