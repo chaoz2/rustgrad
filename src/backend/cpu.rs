@@ -154,12 +154,6 @@ impl Backend for CpuBackend {
                 )?);
                 continue;
             }
-            if let Op::Cast { input, dtype } = node.op
-                && (graph.nodes[input.index()].dtype.is_float8() || dtype.is_float8())
-                && !(graph.nodes[input.index()].dtype.is_float() && dtype.is_float())
-            {
-                return Err(Error::UnsupportedDType { dtype: node.dtype });
-            }
             if reaches_float8 && !float8_cpu_capability(&node.op) {
                 return Err(Error::UnsupportedDType { dtype: node.dtype });
             }
@@ -5737,13 +5731,11 @@ mod tests {
                     let mut graph = Graph::new();
                     let input = graph.input_dtype("x", [1], source);
                     let cast = graph.cast(input, target).unwrap();
-                    assert!(
-                        matches!(
-                            CpuBackend.execute(&graph, cast, &HashMap::from([("x".into(), data)])),
-                            Err(Error::UnsupportedDType { .. })
-                        ),
-                        "{source:?} -> {target:?}"
-                    );
+                    let output = CpuBackend
+                        .execute(&graph, cast, &HashMap::from([("x".into(), data)]))
+                        .unwrap();
+                    assert_eq!(output.dtype(), target, "{source:?} -> {target:?}");
+                    assert_eq!(output.scalar_at(0).unwrap().as_f64(), 1.0);
                 }
             }
         }

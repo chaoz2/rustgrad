@@ -637,6 +637,9 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             UOpKind::GraphUnary(crate::UnaryOp::Erf | crate::UnaryOp::Erfc)
         )
     });
+    let needs_f8_encode = nodes.iter().any(|node| {
+        matches!(node.kind(), UOpKind::Cast) && node.ty().is_some_and(|ty| ty.scalar.is_float8())
+    });
     let store = root
         .sources()
         .iter()
@@ -843,9 +846,6 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         // terminal exponent for infinity/NaN, and E4M3 reserves only its
         // terminal mantissa. ldexp keeps subnormal and normal powers exact.
         "static double rg_f8_decode(uint8_t x,int bias,unsigned mb,unsigned mode){unsigned em=(1u<<(7u-mb))-1u,mm=(1u<<mb)-1u,e=(x>>mb)&em,m=x&mm,s=x>>7;if(mode==2u&&x==0x80u)return NAN;if((x&0x7fu)==0u)return s?-0.0:0.0;if(mode!=2u&&e==em){if(mode==1u){double v=m?NAN:INFINITY;return s?-v:v;}if(m==mm)return NAN;}double v=e?ldexp(1.0+(double)m/(double)(mm+1u),(int)e-bias):ldexp((double)m/(double)(mm+1u),1-bias);return s?-v:v;}".into(),
-        // Exact Float8Format::encode mirror. The thresholds are f64 payload
-        // bits, so conversion is independent of the host long-double ABI.
-        "static uint8_t rg_f8_encode(double x,int bias,unsigned sb,unsigned mode,uint64_t min_half,uint64_t overflow,uint8_t max_normal,uint64_t min_normal){if(mode==2u&&!isfinite(x))return 0x80u;if(mode==2u&&x==0.0)return 0u;uint8_t sign=signbit(x)?0x80u:0u;if(mode==0u&&!isfinite(x))return sign?0xffu:0x7fu;if(mode==1u&&!isfinite(x))return(uint8_t)(sign|(isinf(x)?0x7cu:0x7fu));union{double f;uint64_t u;}v={x};uint64_t bits=v.u,abs=bits&UINT64_C(0x7fffffffffffffff),mask=(UINT64_C(1)<<(sb-1u))-1u,mantissa=(bits>>(53u-sb))&mask,half=UINT64_C(1)<<(52u-sb),result;int exponent=(int)((bits>>52)&0x7ffu)-1023+bias;if(abs<=min_half)result=0;else if(abs>overflow)result=max_normal;else if(abs>=min_normal){result=((uint64_t)exponent<<(sb-1u))|mantissa;uint64_t round_bits=bits&((half<<1u)-1u);if(round_bits>half||(round_bits==half&&(mantissa&1u)))result++;}else{unsigned shift=(unsigned)(1-exponent);mantissa|=UINT64_C(1)<<(sb-1u);result=mantissa>>shift;uint64_t h=half<<shift,round_bits=(bits|(UINT64_C(1)<<52))&((h<<1u)-1u);if(round_bits>h||(round_bits==h&&(result&1u)))result++;}if(mode==2u&&result==0)return 0;return(uint8_t)(result|sign);}".into(),
         "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
@@ -860,6 +860,18 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         if plan.enabled { format!("  for (size_t rg_base = 0; rg_base + {}u <= {extent}u; rg_base += {}u) {{ for (size_t rg_lane = 0; rg_lane < {}u; ++rg_lane) {{ size_t rg_i = rg_base + rg_lane;", plan.lanes, plan.lanes, plan.lanes) } else { format!("  for (size_t rg_i = 0; rg_i < {extent}u; ++rg_i) {{") },
     ];
+    if needs_f8_encode {
+        let kernel_index = lines
+            .iter()
+            .position(|line| line.starts_with("int rustgrad_kernel"))
+            .expect("renderer always emits the kernel declaration");
+        lines.insert(
+            kernel_index,
+            // Exact Float8Format::encode mirror. The thresholds are f64
+            // payload bits, so conversion is independent of long-double ABI.
+            "static uint8_t rg_f8_encode(double x,int bias,unsigned sb,unsigned mode,uint64_t min_half,uint64_t overflow,uint8_t max_normal,uint64_t min_normal){if(mode==2u&&!isfinite(x))return 0x80u;if(mode==2u&&x==0.0)return 0u;uint8_t sign=signbit(x)?0x80u:0u;if(mode==0u&&!isfinite(x))return sign?0xffu:0x7fu;if(mode==1u&&!isfinite(x))return(uint8_t)(sign|(isinf(x)?0x7cu:0x7fu));union{double f;uint64_t u;}v={x};uint64_t bits=v.u,abs=bits&UINT64_C(0x7fffffffffffffff),mask=(UINT64_C(1)<<(sb-1u))-1u,mantissa=(bits>>(53u-sb))&mask,half=UINT64_C(1)<<(52u-sb),result;int exponent=(int)((bits>>52)&0x7ffu)-1023+bias;if(abs<=min_half)result=0;else if(abs>overflow)result=max_normal;else if(abs>=min_normal){result=((uint64_t)exponent<<(sb-1u))|mantissa;uint64_t round_bits=bits&((half<<1u)-1u);if(round_bits>half||(round_bits==half&&(mantissa&1u)))result++;}else{unsigned shift=(unsigned)(1-exponent);mantissa|=UINT64_C(1)<<(sb-1u);result=mantissa>>shift;uint64_t h=half<<shift,round_bits=(bits|(UINT64_C(1)<<52))&((h<<1u)-1u);if(round_bits>h||(round_bits==h&&(result&1u)))result++;}if(mode==2u&&result==0)return 0;return(uint8_t)(result|sign);}".into(),
+        );
+    }
     if needs_erf {
         let kernel_index = lines
             .iter()
