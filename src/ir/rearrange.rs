@@ -350,6 +350,21 @@ impl RearrangePattern {
 impl Graph {
     /// Circularly shifts a tensor by static signed amounts. With `dims=None`,
     /// the row-major flattened tensor is shifted and reshaped back.
+    ///
+    /// This is the original public RustGrad roll surface. It remains a thin
+    /// compatibility delegate so callers retain the descriptor-first,
+    /// source-aligned implementation in [`Self::roll_static`].
+    pub fn roll(
+        &mut self,
+        input: NodeId,
+        shifts: &[isize],
+        dims: Option<&[isize]>,
+    ) -> Result<NodeId> {
+        self.roll_static(input, shifts, dims)
+    }
+
+    /// Circularly shifts a tensor by static signed amounts. With `dims=None`,
+    /// the row-major flattened tensor is shifted and reshaped back.
     pub fn roll_static(
         &mut self,
         input: NodeId,

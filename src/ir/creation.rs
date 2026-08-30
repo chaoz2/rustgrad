@@ -4706,7 +4706,8 @@ impl Graph {
     /// Source-literal public tinygrad `Tensor.roll(shifts, dims=None)`.
     ///
     /// This is deliberately distinct from the established one-axis
-    /// [`Self::roll`] API. It retains Python's scalar/tuple control behavior,
+    /// [`Self::roll_axis`] API and the slice-based [`Self::roll`] compatibility
+    /// surface. It retains Python's scalar/tuple control behavior,
     /// repeated-dimension final-wins rule, and flattening default while a
     /// cloned literal `flatten? -> repeat -> shrink -> reshape?` rehearsal
     /// proves every descriptor and byte extent before the caller graph moves.
