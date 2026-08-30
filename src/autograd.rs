@@ -387,7 +387,8 @@ impl Graph {
         } else if loss_shape.numel()? != 1 {
             return Err(Error::NonScalarLoss(loss_shape));
         } else {
-            let seed_data = filled(self.node(loss)?.shape.clone(), 1.0)?;
+            let loss_node = self.node(loss)?;
+            let seed_data = filled(loss_node.shape.clone(), 1.0, loss_node.dtype)?;
             self.constant(seed_data)
         };
         let mut grads = vec![None; original_len];
@@ -434,7 +435,8 @@ impl Graph {
                             self.mul(upstream, mask)?
                         }
                         UnaryOp::Step => {
-                            let zeros = filled(self.node(input)?.shape.clone(), 0.0)?;
+                            let input_node = self.node(input)?;
+                            let zeros = filled(input_node.shape.clone(), 0.0, input_node.dtype)?;
                             self.constant(zeros)
                         }
                         UnaryOp::Abs => {
@@ -450,7 +452,9 @@ impl Graph {
                             self.mul(local, node)?
                         }
                         UnaryOp::Square => {
-                            let two = self.constant(TensorData::scalar(2.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let two =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(2), dtype));
                             let scale = self.mul(two, input)?;
                             self.mul(upstream, scale)?
                         }
@@ -461,7 +465,9 @@ impl Graph {
                             self.div(upstream, denominator)?
                         }
                         UnaryOp::Rsqrt => {
-                            let two = self.constant(TensorData::scalar(2.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let two =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(2), dtype));
                             let square = self.mul(node, node)?;
                             let cube = self.mul(square, node)?;
                             let scaled = self.div(cube, two)?;
@@ -517,14 +523,19 @@ impl Graph {
                             self.mul(upstream, local)?
                         }
                         UnaryOp::Tanh => {
-                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let one =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(1), dtype));
                             let square = self.mul(node, node)?;
                             let local = self.sub(one, square)?;
                             self.mul(upstream, local)?
                         }
                         UnaryOp::Erf | UnaryOp::Erfc => {
-                            let two_over_sqrt_pi = self
-                                .constant(TensorData::scalar(2.0f32 / std::f32::consts::PI.sqrt()));
+                            let dtype = self.node(node)?.dtype;
+                            let two_over_sqrt_pi = self.constant(TensorData::scalar_with_dtype(
+                                Scalar::F(2.0 / std::f64::consts::PI.sqrt()),
+                                dtype,
+                            ));
                             let square = self.square(input)?;
                             let neg_square = self.neg(square)?;
                             let exponential = self.exp(neg_square)?;
@@ -537,14 +548,18 @@ impl Graph {
                             self.mul(upstream, local)?
                         }
                         UnaryOp::Asin => {
-                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let one =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(1), dtype));
                             let square = self.square(input)?;
                             let difference = self.sub(one, square)?;
                             let denominator = self.sqrt(difference)?;
                             self.div(upstream, denominator)?
                         }
                         UnaryOp::Acos => {
-                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let one =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(1), dtype));
                             let square = self.square(input)?;
                             let difference = self.sub(one, square)?;
                             let denominator = self.sqrt(difference)?;
@@ -552,27 +567,35 @@ impl Graph {
                             self.neg(quotient)?
                         }
                         UnaryOp::Atan => {
-                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let one =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(1), dtype));
                             let square = self.square(input)?;
                             let denominator = self.add(one, square)?;
                             self.div(upstream, denominator)?
                         }
                         UnaryOp::Asinh => {
-                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let one =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(1), dtype));
                             let square = self.square(input)?;
                             let sum = self.add(square, one)?;
                             let denominator = self.sqrt(sum)?;
                             self.div(upstream, denominator)?
                         }
                         UnaryOp::Acosh => {
-                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let one =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(1), dtype));
                             let square = self.square(input)?;
                             let difference = self.sub(square, one)?;
                             let denominator = self.sqrt(difference)?;
                             self.div(upstream, denominator)?
                         }
                         UnaryOp::Atanh => {
-                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let dtype = self.node(node)?.dtype;
+                            let one =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(1), dtype));
                             let square = self.square(input)?;
                             let denominator = self.sub(one, square)?;
                             self.div(upstream, denominator)?
@@ -587,7 +610,8 @@ impl Graph {
                         | UnaryOp::IsNan
                         | UnaryOp::IsInf
                         | UnaryOp::IsFinite => {
-                            let zeros = filled(self.node(input)?.shape.clone(), 0.0)?;
+                            let input_node = self.node(input)?;
+                            let zeros = filled(input_node.shape.clone(), 0.0, input_node.dtype)?;
                             self.constant(zeros)
                         }
                     };
@@ -655,8 +679,9 @@ impl Graph {
                             let lhs_sign = self.sign(lhs)?;
                             let local = self.copysign(lhs_sign, rhs)?;
                             let lhs_grad = self.mul(upstream, local)?;
+                            let rhs_node = self.node(rhs)?;
                             let rhs_grad =
-                                self.constant(filled(self.node(rhs)?.shape.clone(), 0.0)?);
+                                self.constant(filled(rhs_node.shape.clone(), 0.0, rhs_node.dtype)?);
                             (lhs_grad, rhs_grad)
                         }
                         BinaryOp::Maximum | BinaryOp::Minimum => {
@@ -671,8 +696,11 @@ impl Graph {
                                 self.lt(lhs, rhs)?
                             };
                             let equal = self.eq(lhs, rhs)?;
-                            let zero = self.constant(TensorData::scalar(0.0f32));
-                            let half = self.constant(TensorData::scalar(0.5f32));
+                            let dtype = self.node(upstream)?.dtype;
+                            let zero =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::I(0), dtype));
+                            let half =
+                                self.constant(TensorData::scalar_with_dtype(Scalar::F(0.5), dtype));
                             let half_upstream = self.mul(upstream, half)?;
                             let lhs_tie = self.select(equal, half_upstream, zero)?;
                             let rhs_tie = self.select(equal, half_upstream, zero)?;
@@ -689,10 +717,12 @@ impl Graph {
                         | BinaryOp::BitXor
                         | BinaryOp::Shl
                         | BinaryOp::Shr => {
+                            let lhs_node = self.node(lhs)?;
                             let zeros_l =
-                                self.constant(filled(self.node(lhs)?.shape.clone(), 0.0)?);
+                                self.constant(filled(lhs_node.shape.clone(), 0.0, lhs_node.dtype)?);
+                            let rhs_node = self.node(rhs)?;
                             let zeros_r =
-                                self.constant(filled(self.node(rhs)?.shape.clone(), 0.0)?);
+                                self.constant(filled(rhs_node.shape.clone(), 0.0, rhs_node.dtype)?);
                             (zeros_l, zeros_r)
                         }
                     };
@@ -739,7 +769,11 @@ impl Graph {
                     }
                     let reshaped = self.reshape(upstream, Shape::new(dims))?;
                     let up = self.expand(reshaped, shape)?;
-                    let divisor = self.constant(TensorData::scalar(count as f32));
+                    let dtype = self.node(up)?.dtype;
+                    let divisor = self.constant(TensorData::scalar_with_dtype(
+                        Scalar::U(count as u64),
+                        dtype,
+                    ));
                     let grad = self.div(up, divisor)?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
@@ -814,7 +848,7 @@ impl Graph {
                         } else {
                             self.cast(upstream, source_dtype)?
                         };
-                        let zeros = self.constant(filled(source_shape, 0.0)?);
+                        let zeros = self.constant(filled(source_shape, 0.0, source_dtype)?);
                         self.scatter_add(zeros, indices, upstream, axis)?
                     };
                     self.accumulate(&mut grads, input, grad)?;
@@ -885,7 +919,8 @@ impl Graph {
                 }
                 Op::Gather { input, index, axis } => {
                     let shape = self.node(input)?.shape.clone();
-                    let zeros = self.constant(filled(shape, 0.0)?);
+                    let dtype = self.node(input)?.dtype;
+                    let zeros = self.constant(filled(shape, 0.0, dtype)?);
                     let grad = self.scatter_add(zeros, index, upstream, axis)?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
@@ -1211,7 +1246,8 @@ impl Graph {
                     on_true,
                     on_false,
                 } => {
-                    let zeros = filled(self.node(upstream)?.shape.clone(), 0.0)?;
+                    let upstream_node = self.node(upstream)?;
+                    let zeros = filled(upstream_node.shape.clone(), 0.0, upstream_node.dtype)?;
                     let zeros = self.constant(zeros);
                     let true_grad = self.select(condition, upstream, zeros)?;
                     let false_grad = self.select(condition, zeros, upstream)?;
@@ -1366,8 +1402,13 @@ impl Graph {
     }
 }
 
-fn filled(shape: Shape, value: f32) -> Result<TensorData> {
-    TensorData::new(shape.clone(), vec![value; shape.numel()?])
+fn filled(shape: Shape, value: f64, dtype: DType) -> Result<TensorData> {
+    let elements = shape.numel()?;
+    TensorData::from_scalars(
+        shape,
+        dtype,
+        std::iter::repeat_n(Scalar::F(value), elements),
+    )
 }
 
 #[cfg(test)]
