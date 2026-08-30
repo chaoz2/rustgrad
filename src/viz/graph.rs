@@ -126,10 +126,6 @@ fn einsum_plan_key(plan: &EinsumPlan) -> String {
     )
 }
 
-fn unsupported(op: &Op) -> VizError {
-    VizError::UnsupportedGraphOp(op_class(op).into())
-}
-
 fn dependency(role: impl Into<String>, id: NodeId) -> (String, NodeId) {
     (role.into(), id)
 }
@@ -350,7 +346,6 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
             bias,
             ..
         } => convolution_gradient_vjp_dependencies(*cotangent, *upstream, *input, *weight, *bias),
-        _ => return Err(unsupported(op)),
     })
 }
 
@@ -372,7 +367,6 @@ fn op_class(op: &Op) -> &'static str {
         Op::Sort { .. } => "sort",
         Op::TensorGuard { .. } => "tensor_guard",
         Op::ArgReduce { .. } => "arg_reduce",
-        Op::Sort { .. } => "sort",
         Op::ReduceGrad { .. } => "reduce_grad",
         Op::ReduceGradVjp { .. } => "reduce_grad_vjp",
         Op::SumTo { .. } => "sum_to",
@@ -647,7 +641,6 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("target", target.to_string())
             .field("wrt", wrt.to_string()),
         Op::Detach { .. } | Op::Select { .. } | Op::Matmul { .. } => node,
-        _ => return Err(unsupported(op)),
     })
 }
 

@@ -471,7 +471,6 @@ fn clip_plan(
     };
     let min = stage(1, "minimum")?;
     let max = stage(2, "maximum")?;
-    drop(stage);
     Ok(ClipPlan {
         min,
         max,
@@ -604,7 +603,8 @@ fn static_one_hot_depth(constants: &BTreeMap<String, TensorData>, name: &str) ->
         .ok_or_else(|| bad("OneHot depth must be a constant initializer"))?;
     let shape = value.shape();
     shape.numel()?;
-    if !(shape.rank() == 0 || (shape.rank() == 1 && shape.dims() == &[1])) || value.len() != 1 {
+    let scalar_or_singleton = shape.rank() == 0 || shape.dims() == &[1];
+    if !scalar_or_singleton || value.len() != 1 {
         return Err(bad(
             "OneHot depth must be a scalar or length-one rank-1 tensor",
         ));
@@ -827,7 +827,7 @@ fn argmax_plan(
         let data = TensorData::from_scalars(
             output_shape,
             DType::I64,
-            std::iter::repeat(Scalar::I(value)).take(output_numel),
+            std::iter::repeat_n(Scalar::I(value), output_numel),
         )?;
         return Ok(ArgMaxPlan {
             axis: isize::try_from(axis).map_err(|_| bad("ArgMax axis overflow"))?,
@@ -1321,7 +1321,7 @@ fn lp_normalization_plan(
         shape
             .numel()?
             .checked_mul(dtype.itemsize())
-            .ok_or_else(|| bad(&format!("LpNormalization {what} byte extent overflow")))
+            .ok_or_else(|| bad(format!("LpNormalization {what} byte extent overflow")))
     };
     // The source branches begin with either `x * sign(x)` or `x * x`; both
     // retain the original descriptor.  Tensor.sum then materializes its
@@ -1353,9 +1353,7 @@ fn lp_normalization_plan(
     // branch, including zero, negative, and otherwise nonstandard values.
     let l1 = strict_typed_scalar_i64_attr(n, "p")?.unwrap_or(2) == 1;
     let sum_dtypes = ReductionDType::sum_default(input_dtype);
-    let denominator_dtype = if l1 {
-        sum_dtypes.output
-    } else if sum_dtypes.output.is_float() {
+    let denominator_dtype = if l1 || sum_dtypes.output.is_float() {
         sum_dtypes.output
     } else {
         DType::F32
@@ -1426,7 +1424,7 @@ fn rms_normalization_plan(
         shape
             .numel()?
             .checked_mul(dtype.itemsize())
-            .ok_or_else(|| bad(&format!("RMSNormalization {what} byte extent overflow")))
+            .ok_or_else(|| bad(format!("RMSNormalization {what} byte extent overflow")))
     };
     extent(&shape, input_dtype, "input")?;
     extent(&scale_shape, scale_dtype, "scale")?;
@@ -1761,7 +1759,6 @@ struct GlobalAveragePoolPlan {
 }
 
 struct SoftplusPlan {
-    input_dtype: DType,
     output_dtype: DType,
     shape: Shape,
     beta: TensorData,
@@ -1897,7 +1894,6 @@ fn softplus_plan(
         return Err(bad("Softplus scalar promotion mismatch"));
     }
     Ok(SoftplusPlan {
-        input_dtype,
         output_dtype,
         shape,
         beta,
@@ -2006,14 +2002,12 @@ fn mod_plan(
         .numel()?
         .checked_mul(dtype.itemsize())
         .ok_or_else(|| bad("Mod output byte extent overflow"))?;
-    if dtype.is_integer() {
-        if let Some(value) = constants.get(rhs_name) {
-            if value.dtype().is_integer()
-                && (0..value.len()).any(|i| value.scalar_at(i).as_i64() == 0)
-            {
-                return Err(bad("Mod integer divisor constant contains zero"));
-            }
-        }
+    if dtype.is_integer()
+        && let Some(value) = constants.get(rhs_name)
+        && value.dtype().is_integer()
+        && (0..value.len()).any(|i| value.scalar_at(i).as_i64() == 0)
+    {
+        return Err(bad("Mod integer divisor constant contains zero"));
     }
     Ok(ModPlan { fmod, shape, dtype })
 }
@@ -3008,7 +3002,8 @@ fn static_i32_i64_scalar(
     }
     let shape = value.shape();
     shape.numel()?;
-    if !(shape.rank() == 0 || (shape.rank() == 1 && shape.dims() == &[1])) || value.len() != 1 {
+    let scalar_or_singleton = shape.rank() == 0 || shape.dims() == &[1];
+    if !scalar_or_singleton || value.len() != 1 {
         return Err(bad(format!(
             "{operator} value must be a scalar or length-one rank-1 tensor"
         )));
@@ -5732,9 +5727,7 @@ fn log_softmax_plan(
                 .dims()
                 .iter()
                 .enumerate()
-                .map(|(index, &dimension)| {
-                    (index == axis as usize).then_some(1).unwrap_or(dimension)
-                })
+                .map(|(index, &dimension)| if index == axis as usize { 1 } else { dimension })
                 .collect::<Vec<_>>(),
         ),
     };
@@ -5859,9 +5852,7 @@ fn softmax_plan(
                 .dims()
                 .iter()
                 .enumerate()
-                .map(|(index, &dimension)| {
-                    (index == axis as usize).then_some(1).unwrap_or(dimension)
-                })
+                .map(|(index, &dimension)| if index == axis as usize { 1 } else { dimension })
                 .collect::<Vec<_>>(),
         ),
     };
@@ -8627,7 +8618,7 @@ pub(super) fn lower(
                 let index = TensorData::from_scalars(
                     index_shape,
                     data.dtype(),
-                    std::iter::repeat(Scalar::I(index)).take(index_len),
+                    std::iter::repeat_n(Scalar::I(index), index_len),
                 )?;
                 let index = g.constant(index);
                 let gathered = g.gather(x, index, axis)?;
@@ -8719,7 +8710,7 @@ pub(super) fn lower(
                     // tinygrad obtains the result by expanding this tensor.
                     // Its explicit [0] special case is the sole empty shape
                     // that bypasses that broadcast check.
-                    if shape.dims() != &[0]
+                    if shape.dims() != [0]
                         && value.shape().broadcast_with(&shape).as_ref() != Ok(&shape)
                     {
                         return Err(bad(
@@ -9524,7 +9515,7 @@ pub(super) fn lower(
             g.avg_pool(x, options)?
         }
         "DequantizeLinear" if (2..=3).contains(&ins.len()) => {
-            let inputs = (0..ins.len()).map(|i| get(i)).collect::<Result<Vec<_>>>()?;
+            let inputs = (0..ins.len()).map(get).collect::<Result<Vec<_>>>()?;
             let plan = dequantize_linear_plan(g, &inputs, &ins, &n, &attrs)?;
             let DequantizeLinearPlan {
                 x: plan_x,

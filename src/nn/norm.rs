@@ -2,8 +2,7 @@
 
 use super::{
     Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward, Parameter, ParameterRestore,
-    ParameterSnapshot, PendingModeEffects, StateKind, parameter::next_version, restore_parameters,
-    state::join,
+    ParameterSnapshot, PendingModeEffects, StateKind, restore_parameters, state::join,
 };
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::sync::{
@@ -554,7 +553,6 @@ impl LayerNorm {
     }
 
     fn new_impl(shape: Shape, eps: f32, affine: bool) -> Result<Self> {
-        let shape = shape;
         if shape.rank() == 0 || shape.dims().contains(&0) || !eps.is_finite() || eps < 0.0 {
             return Err(Error::InvalidRandom {
                 reason: "invalid LayerNorm shape or epsilon",

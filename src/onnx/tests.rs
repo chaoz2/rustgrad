@@ -5219,7 +5219,7 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
     let (_, _, _, dcr) = run(
         vec![1, 8, 1, 1],
         DType::F32,
-        &[block_two.clone()],
+        std::slice::from_ref(&block_two),
         (0..8).map(|value| value as f32).collect(),
     );
     assert_eq!(dcr.shape().dims(), &[1, 2, 2, 2]);
@@ -5262,7 +5262,7 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     lower(
         &mut zero_channel,
-        Msg::new(&depth_to_space(&[block_two.clone()])),
+        Msg::new(&depth_to_space(std::slice::from_ref(&block_two))),
         &mut values,
         &mut BTreeMap::new(),
     )
@@ -5292,7 +5292,7 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
         let mut values = BTreeMap::from([("x".into(), x)]);
         lower(
             &mut graph,
-            Msg::new(&depth_to_space(&[block_two.clone()])),
+            Msg::new(&depth_to_space(std::slice::from_ref(&block_two))),
             &mut values,
             &mut BTreeMap::new(),
         )
@@ -5373,7 +5373,7 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
         assert!(
             lower(
                 &mut malformed,
-                Msg::new(&depth_to_space(&[block_two.clone()])),
+                Msg::new(&depth_to_space(std::slice::from_ref(&block_two))),
                 &mut values,
                 &mut BTreeMap::new(),
             )
@@ -5389,7 +5389,7 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
     assert!(
         lower(
             &mut missing,
-            Msg::new(&depth_to_space(&[block_two.clone()])),
+            Msg::new(&depth_to_space(std::slice::from_ref(&block_two))),
             &mut values,
             &mut BTreeMap::new(),
         )
@@ -16136,7 +16136,7 @@ fn acosh_preserves_graph_domain_and_preflights_before_publication() {
         .unwrap();
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.values()[0], 0.0);
-    assert!((output.values()[1] - 1.3169579).abs() < 1e-6);
+    assert!((output.values()[1] - 1.316_958).abs() < 1e-6);
     assert!((output.values()[2] - 2.063437).abs() < 1e-6);
     assert!(output.values()[3].is_nan());
     assert!(output.values()[4].is_nan());
@@ -16165,7 +16165,7 @@ fn acosh_preserves_graph_domain_and_preflights_before_publication() {
         )
         .unwrap();
     assert_eq!(output.dtype(), DType::F32);
-    assert!((output.values()[0] - 1.3169579).abs() < 1e-6);
+    assert!((output.values()[0] - 1.316_958).abs() < 1e-6);
 
     let mut attribute = node("Acosh", &["input"], "out");
     field(&mut attribute, 5, &int_attr("unused", 1));

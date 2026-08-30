@@ -10,8 +10,6 @@ use super::{
 /// `F16` and `BF16` storage uses IEEE bit patterns. This keeps the storage
 /// boundary lossless even on targets without native half precision arithmetic.
 use super::Float8Format;
-use core::fmt;
-use core::str::FromStr;
 #[derive(
     Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, serde::Deserialize, serde::Serialize,
 )]

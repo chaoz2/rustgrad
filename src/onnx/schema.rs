@@ -4,7 +4,9 @@ use super::{
     bad,
     wire::{Msg, one_bytes, one_varint, var},
 };
-use crate::{DType, PoolOptions, Result, Shape, TensorData};
+#[cfg(test)]
+use crate::Shape;
+use crate::{DType, PoolOptions, Result, TensorData};
 use std::collections::BTreeMap;
 
 pub(super) fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
@@ -487,6 +489,7 @@ pub(super) fn const_i64(c: &BTreeMap<String, TensorData>, name: &str) -> Result<
     }
     Ok((0..x.len()).map(|i| x.scalar_at(i).as_i64()).collect())
 }
+#[cfg(test)]
 pub(super) fn reshape_dims(old: &[usize], shape: &[i64]) -> Result<Shape> {
     let mut out = Vec::new();
     let mut infer = None;

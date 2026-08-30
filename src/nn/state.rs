@@ -416,7 +416,7 @@ pub trait Module {
             // before replacement.  Keep it in this preflight phase and clone
             // raw storage so narrow payloads, NaNs, and signed zero survive.
             let value = if value.shape() != &snapshot.shape {
-                if singleton_scalar_rank_one_pair(value, &snapshot) {
+                if singleton_scalar_rank_one_pair(value, snapshot) {
                     TensorData::from_storage(snapshot.shape.clone(), value.storage().clone())?
                 } else {
                     report.shape_mismatches.push(name.clone());

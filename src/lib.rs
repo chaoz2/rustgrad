@@ -252,7 +252,7 @@ pub use tensor::{
     DType, DTypeCategory, Float8Format, Float8Storage, LiteralScalar, Scalar, Shape, Storage,
     TensorData, TensorDataReader, TensorList,
 };
-pub(crate) use tensor::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
+pub(crate) use tensor::{bf16_to_f32, f16_to_f32};
 pub use torch::{
     TorchStateFileError, TorchStateLimit, TorchStateReadLimits, extract_tar_files,
     load_legacy_torch_state_dict, load_torch_state_dict, load_torch_state_dict_strict,

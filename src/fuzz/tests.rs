@@ -913,7 +913,7 @@ fn generated_unary_cases_are_valid_diverse_and_deterministic() {
                 .unwrap();
             coverage[dtype_index][usize::from(op == FuzzUnaryOp::Abs)] = true;
             scalar |= input.shape.is_empty();
-            empty |= input.shape.iter().any(|extent| *extent == 0);
+            empty |= input.shape.contains(&0);
         }
     }
 
@@ -951,7 +951,7 @@ fn generated_compare_cases_are_valid_diverse_and_deterministic() {
             ops.insert(op);
             dtypes.insert(lhs.dtype);
             scalar |= lhs.shape.is_empty();
-            empty |= lhs.shape.iter().any(|extent| *extent == 0);
+            empty |= lhs.shape.contains(&0);
             scalar_rhs |= rhs.shape.is_empty();
             matching_rhs |= rhs.shape == lhs.shape;
             right_aligned_rhs |=
@@ -992,7 +992,7 @@ fn generated_logical_cases_are_valid_diverse_and_deterministic() {
             true_lane |= lhs.bytes.contains(&1) || rhs.bytes.contains(&1);
             false_lane |= lhs.bytes.contains(&0) || rhs.bytes.contains(&0);
             scalar |= lhs.shape.is_empty();
-            empty |= lhs.shape.iter().any(|extent| *extent == 0);
+            empty |= lhs.shape.contains(&0);
             scalar_rhs |= rhs.shape.is_empty();
             matching_rhs |= rhs.shape == lhs.shape;
             assert_eq!(lhs.dtype, DType::Bool);
@@ -1026,7 +1026,7 @@ fn generated_logical_not_cases_are_valid_diverse_and_deterministic() {
             };
             found = true;
             scalar |= input.shape.is_empty();
-            empty |= input.shape.iter().any(|extent| *extent == 0);
+            empty |= input.shape.contains(&0);
             match input.to_tensor().unwrap().storage() {
                 Storage::Bool(values) => {
                     boolean = true;
@@ -1040,7 +1040,7 @@ fn generated_logical_not_cases_are_valid_diverse_and_deterministic() {
                 }
                 Storage::F32(values) => {
                     f32 = true;
-                    zero |= values.iter().any(|value| *value == 0.0);
+                    zero |= values.contains(&0.0);
                     nonzero |= values.iter().any(|value| *value != 0.0);
                 }
                 _ => unreachable!("logical-not generator selects only Bool/I32/F32"),
@@ -1803,7 +1803,7 @@ fn generated_binary_cases_reach_all_ops_dtypes_and_broadcast_geometries() {
             pairs.insert((op, lhs.dtype));
             scalar_rhs |= rhs.shape.is_empty();
             scalar |= lhs.shape.is_empty();
-            empty |= lhs.shape.iter().any(|extent| *extent == 0);
+            empty |= lhs.shape.contains(&0);
         }
     }
     assert_eq!(pairs.len(), 52);
@@ -1838,7 +1838,7 @@ fn generated_pad_cases_are_valid_diverse_and_deterministic() {
             assert!(fill.shape.is_empty());
             assert_eq!(fill.dtype, input.dtype);
             scalar |= input.shape.is_empty();
-            empty |= input.shape.iter().any(|extent| *extent == 0);
+            empty |= input.shape.contains(&0);
             before |= padding.iter().any(|(before, _)| *before != 0);
             after |= padding.iter().any(|(_, after)| *after != 0);
             asymmetric |= padding.iter().any(|(before, after)| before != after);
@@ -2315,8 +2315,7 @@ fn generated_gather_cases_are_valid_diverse_and_deterministic() {
                 assert!(value >= 0 && (value as usize) < input.shape[axis]);
                 duplicate |= !values.insert(value);
             }
-            empty |= input.shape.iter().any(|extent| *extent == 0)
-                || index.shape.iter().any(|extent| *extent == 0);
+            empty |= input.shape.contains(&0) || index.shape.contains(&0);
             axes.insert((input.shape.len(), axis));
             dtypes.insert(input.dtype);
             index_i32 |= index.dtype == DType::I32;
@@ -2720,8 +2719,7 @@ fn generated_scatter_cases_are_valid_diverse_and_deterministic() {
                 assert!(value >= 0 && (value as usize) < base.shape[axis]);
                 duplicate |= !values.insert(value);
             }
-            empty |= base.shape.iter().any(|extent| *extent == 0)
-                || index.shape.iter().any(|extent| *extent == 0);
+            empty |= base.shape.contains(&0) || index.shape.contains(&0);
             zero_axis |= base.shape[axis] == 0;
             axes.insert((base.shape.len(), axis));
             index_i32 |= index.dtype == DType::I32;

@@ -485,12 +485,11 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 .map(|_| [0, 1, 2, 3][rng.pick(4)])
                 .collect::<Vec<_>>();
             let mut index_shape = Vec::with_capacity(rank);
-            for dimension in 0..rank {
+            for (dimension, &source) in input_shape.iter().enumerate() {
                 if dimension == axis {
-                    let source = input_shape[dimension];
                     index_shape.push(if source == 0 { 0 } else { rng.pick(4) });
                 } else {
-                    index_shape.push(rng.pick(input_shape[dimension] + 1));
+                    index_shape.push(rng.pick(source + 1));
                 }
             }
             let index_dtype = [DType::I32, DType::I64][rng.pick(2)];
@@ -531,12 +530,11 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
                 .map(|_| [0, 1, 2, 3][rng.pick(4)])
                 .collect::<Vec<_>>();
             let mut index_shape = Vec::with_capacity(rank);
-            for dimension in 0..rank {
+            for (dimension, &source) in base_shape.iter().enumerate() {
                 if dimension == axis {
-                    let source = base_shape[dimension];
                     index_shape.push(if source == 0 { 0 } else { rng.pick(4) });
                 } else {
-                    index_shape.push(rng.pick(base_shape[dimension] + 1));
+                    index_shape.push(rng.pick(source + 1));
                 }
             }
             let updates_shape = index_shape

@@ -846,30 +846,6 @@ fn boolv(x: i64) -> bool {
     x != 0
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn symbolic_identity_reservation_never_wraps_or_reuses_a_sentinel() {
-        let counter = AtomicU64::new(u64::MAX - 1);
-        assert_eq!(reserve_variable_id(&counter), Ok(u64::MAX - 1));
-        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
-        assert_eq!(
-            reserve_variable_id(&counter),
-            Err(SymbolicError::IdentityExhausted)
-        );
-        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
-    }
-
-    #[test]
-    fn symbolic_artifact_loader_rejects_identity_sentinels() {
-        assert!(matches!(
-            SymbolicVar::from_artifact(u64::MAX, "x".into(), 0, 1),
-            Err(SymbolicError::InvalidBounds { .. })
-        ));
-    }
-}
 fn bool_possibilities(bounds: Bounds) -> Vec<bool> {
     let mut values = Vec::new();
     if bounds.min <= 0 && bounds.max >= 0 {
@@ -1010,4 +986,29 @@ fn fmt_join(f: &mut fmt::Formatter<'_>, op: &str, xs: &[SymbolicExpr]) -> fmt::R
         write!(f, "{x}")?
     }
     write!(f, ")")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbolic_identity_reservation_never_wraps_or_reuses_a_sentinel() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(reserve_variable_id(&counter), Ok(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            reserve_variable_id(&counter),
+            Err(SymbolicError::IdentityExhausted)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn symbolic_artifact_loader_rejects_identity_sentinels() {
+        assert!(matches!(
+            SymbolicVar::from_artifact(u64::MAX, "x".into(), 0, 1),
+            Err(SymbolicError::InvalidBounds { .. })
+        ));
+    }
 }
