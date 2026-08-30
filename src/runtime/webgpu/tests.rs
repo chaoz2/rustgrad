@@ -2562,7 +2562,7 @@ fn transaction_failures_zero_domain_retry_and_capability_preflight_preserve_visi
     let mut empty = Graph::new();
     let empty_lhs = empty.input_dtype("lhs", [0], DType::U32);
     let empty_rhs = empty.input_dtype("rhs", [0], DType::U32);
-    let empty_output = empty.div(empty_lhs, empty_rhs).unwrap();
+    let empty_output = empty.binary(BinaryOp::Div, empty_lhs, empty_rhs).unwrap();
     let empty_rendered = WgslRenderer::new(1, capabilities())
         .unwrap()
         .render(&schedule(&empty, empty_output).unwrap().items[0].kernel)
@@ -2587,7 +2587,7 @@ fn transaction_failures_zero_domain_retry_and_capability_preflight_preserve_visi
     let mut simple = Graph::new();
     let lhs = simple.input_dtype("lhs", [1], DType::I32);
     let rhs = simple.input_dtype("rhs", [1], DType::I32);
-    let divided = simple.div(lhs, rhs).unwrap();
+    let divided = simple.binary(BinaryOp::Div, lhs, rhs).unwrap();
     assert!(matches!(
         WgslRenderer::new(1, insufficient)
             .unwrap()

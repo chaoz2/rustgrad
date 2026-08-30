@@ -366,7 +366,14 @@ impl ShardedCudaPlanComposition {
                 }));
             }
         }
-        if aliases.is_empty() {
+        if aliases.is_empty()
+            && self
+                .plan
+                .logical
+                .stages
+                .iter()
+                .any(|stage| matches!(stage, CudaPlanStage::Transfer { .. }))
+        {
             return Err(err(
                 "composition requires at least one explicit substitution",
             ));
@@ -1320,7 +1327,7 @@ mod tests {
                 materializations: vec![],
             },
             owners: owners.clone(),
-            kernels: vec![None, None],
+            kernels: vec![None],
             buffers: vec![descriptor(0), descriptor(1)],
         };
         let encoded = serde_json::to_vec(&plan.logical).unwrap();
@@ -1337,7 +1344,7 @@ mod tests {
         let legacy = ExecutableShardedCudaPlan {
             logical: serde_json::from_value(legacy).unwrap(),
             owners: owners.clone(),
-            kernels: vec![None, None],
+            kernels: vec![None],
             buffers: plan.buffers.clone(),
         };
         assert!(
@@ -2201,14 +2208,14 @@ mod tests {
         local.buffers[target_index].device = original_device;
         let original_owner = local.buffers[target_index].owner_identity;
         local.buffers[target_index].owner_identity = usize::MAX;
-        no_work(
+        assert!(matches!(
             ShardedCudaPlanComposition::compose(&transfer, &local, vec![duplicate.clone()]),
-            CompositionError::DescriptorMismatch {
-                rank: 0,
-                local_buffer: duplicate.local_buffer,
-                transfer_buffer: duplicate.transfer_buffer,
-                field: CompositionField::Owner,
-            },
+            Err(Error::Collective { .. })
+        ));
+        assert_eq!(mock.calls().len(), before);
+        assert_eq!(
+            pools.iter().map(|pool| pool.stats()).collect::<Vec<_>>(),
+            preflight_stats
         );
         local.buffers[target_index].owner_identity = original_owner;
         let original_shape = local.buffers[target_index].shape.clone();

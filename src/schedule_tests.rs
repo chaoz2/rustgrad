@@ -430,7 +430,10 @@ fn temporary_reuse_is_deterministic_and_never_overlaps_or_mismatches() {
     let malformed = buffer(13, 16, 3);
     assert!(matches!(
         plan_temporary_reuse(&[item(0, vec![], malformed.clone())], &[malformed]),
-        Err(crate::MemoryPlanError::InvalidSchedule(_))
+        Err(crate::MemoryPlanError::InvalidAlignment {
+            buffer: 13,
+            alignment: 3
+        })
     ));
 }
 

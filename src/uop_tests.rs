@@ -9,6 +9,10 @@ fn f32t() -> UType {
     UType::scalar(DType::F32)
 }
 
+fn i32t() -> UType {
+    UType::scalar(DType::I32)
+}
+
 #[test]
 fn uop_spec_and_dag_order_are_deterministic() {
     let x = UOp::constant(4, i64t());
@@ -30,8 +34,8 @@ fn uop_spec_and_dag_order_are_deterministic() {
 
 #[test]
 fn upat_rewrites_are_prioritized_shared_and_pure() {
-    let x = UOp::scalar_constant(DType::F32, 7.0_f32.to_bits() as u64, f32t());
-    let zero = UOp::scalar_constant(DType::F32, 0, f32t());
+    let x = UOp::scalar_constant(DType::I32, 7, i32t());
+    let zero = UOp::scalar_constant(DType::I32, 0, i32t());
     let shared = UOp::binary(Binary::Add, x.clone(), zero);
     let root = UOp::sink(vec![shared.clone(), shared]);
     let pattern = UPat::op(UOpKind::Binary(Binary::Add))
@@ -48,8 +52,8 @@ fn upat_rewrites_are_prioritized_shared_and_pure() {
 
 #[test]
 fn raw_scalar_identity_rewrite_is_type_checked_and_preserves_signed_zero() {
-    let x = UOp::scalar_constant(DType::F32, 3.0_f32.to_bits() as u64, f32t());
-    let positive_zero = UOp::scalar_constant(DType::F32, 0, f32t());
+    let x = UOp::scalar_constant(DType::I32, 3, i32t());
+    let positive_zero = UOp::scalar_constant(DType::I32, 0, i32t());
     let lhs = UOp::binary(Binary::Add, positive_zero.clone(), x.clone());
     let rhs = UOp::binary(Binary::Add, x.clone(), positive_zero);
     let root = UOp::sink(vec![lhs, rhs]);
@@ -268,8 +272,11 @@ fn scalar_literals_retain_raw_storage_bits() {
 #[test]
 fn typed_scalar_rewrite_leaves_fixed_schedule_cache_identity_stable() {
     let mut graph = Graph::new();
-    let x = graph.input("x", Shape::new([]));
-    let zero = graph.constant(TensorData::scalar(0.0));
+    let x = graph.input_dtype("x", Shape::new([]), DType::I32);
+    let zero = graph.constant(TensorData::scalar_with_dtype(
+        crate::Scalar::I(0),
+        DType::I32,
+    ));
     let output = graph.add(x, zero).unwrap();
     let first = crate::schedule(&graph, output).unwrap();
     let second = crate::schedule(&graph, output).unwrap();

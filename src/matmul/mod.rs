@@ -284,7 +284,10 @@ fn geometry(lhs_shape: &Shape, rhs_shape: &Shape) -> Result<MatmulGeometry, Matm
         if lhs != rhs && lhs != 1 && rhs != 1 {
             return Err(MatmulPlanError::InvalidGeometry);
         }
-        batch_shape.push(lhs.max(rhs));
+        // A singleton broadcasts to the opposite extent, including zero.
+        // `max` would incorrectly turn the valid 0-by-1 batch axis into one
+        // and diverge from the graph descriptor admitted by matmul_shape.
+        batch_shape.push(if lhs == 1 { rhs } else { lhs });
     }
     Ok(MatmulGeometry {
         output_shape,

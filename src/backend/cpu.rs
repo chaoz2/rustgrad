@@ -6891,13 +6891,9 @@ mod tests {
             graph.select(x, x, y),
             Err(Error::InvalidLogicalDType { .. })
         ));
-        assert!(
-            graph
-                .trace(equal)
-                .unwrap()
-                .to_string()
-                .contains("eq(%0, %1)")
-        );
+        // tinygrad spells Eq as `ne(...).logical_not()`, so the trace must
+        // retain the source comparison shell rather than a raw Eq node.
+        assert!(graph.trace(equal).unwrap().to_string().contains("ne("));
     }
 
     #[test]

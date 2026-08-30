@@ -1667,7 +1667,10 @@ mod tests {
     fn unsupported_native_policy_is_explicit() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2]), DType::F32);
-        let output = graph.sinh(x).unwrap();
+        // Public sinh is now a source-literal Exp/Sub/Div composition that
+        // native replay supports. Keep this policy test on a genuinely raw
+        // unary operation outside the native C renderer's owned subset.
+        let output = graph.unary(crate::UnaryOp::Erf, x).unwrap();
         let capture = captured(&graph, &[output]);
         let values = BTreeMap::from([("x".into(), TensorData::new([2], vec![0., 1.]).unwrap())]);
         let executor = CapturedReplayExecutor::default();

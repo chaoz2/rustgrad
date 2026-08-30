@@ -454,7 +454,15 @@ fn validate_fields(
                         matches!(index.kind(), UOpKind::Index) && index.ty() == value.ty()
                     })
         }
-        UOpKind::GraphUnary(_) | UOpKind::Unary(_) => sources.first().is_some_and(|x| x.ty() == ty),
+        UOpKind::GraphUnary(op) => sources
+            .first()
+            .and_then(|source| source.ty())
+            .zip(ty)
+            .is_some_and(|(source, output)| {
+                source.lanes == output.lanes
+                    && crate::ir::unary_dtype(*op, source.scalar) == output.scalar
+            }),
+        UOpKind::Unary(_) => sources.first().is_some_and(|x| x.ty() == ty),
         UOpKind::GraphBinary(_) => ty.is_some() && sources.iter().all(|x| x.ty().is_some()),
         UOpKind::GraphCompare(_) => {
             ty == Some(UType::scalar(DType::Bool)) && sources.iter().all(|x| x.ty().is_some())

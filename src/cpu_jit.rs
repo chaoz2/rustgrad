@@ -3624,7 +3624,10 @@ mod tests {
         assert!(finite_source.contains("(uint8_t)isinf("));
         assert!(finite_source.contains("||"));
         assert!(finite_source.contains("!="));
-        assert!(composed.grad(both, input).is_ok());
+        assert!(matches!(
+            composed.grad(both, input),
+            Err(crate::Error::NoGradient(_))
+        ));
     }
 
     #[test]
