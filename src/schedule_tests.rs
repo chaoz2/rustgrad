@@ -33,6 +33,40 @@ fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
 }
 
 #[test]
+fn requested_source_values_are_passthroughs_not_schedule_producers() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", Shape::from([2]), DType::F32);
+    let constant = graph.constant(
+        TensorData::from_scalars(
+            [2],
+            DType::F32,
+            [crate::Scalar::F(-0.0), crate::Scalar::F(f64::NAN)],
+        )
+        .unwrap(),
+    );
+    let computed = graph.add(input, constant).unwrap();
+
+    for source in [input, constant] {
+        let scheduled = schedule(&graph, source).unwrap();
+        assert!(scheduled.items.is_empty());
+        scheduled.validate().unwrap();
+    }
+
+    let scheduled = schedule_many(&graph, &[input, constant, computed]).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert_eq!(scheduled.items[0].node, computed);
+    assert_eq!(
+        scheduled.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input, constant]
+    );
+}
+
+#[test]
 fn scheduled_outputs_are_nonempty_ordered_and_preserve_single_cache_identity() {
     let output = buffer(7, 4, 1);
     assert!(ScheduledOutputs::new(vec![]).is_err());

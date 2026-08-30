@@ -112,6 +112,58 @@ impl CapturedSchedule {
             }
             produced.extend(item.outputs.iter().map(|output| output.id));
         }
+        // A source-owned requested value has no scheduled producer. Preserve
+        // it in the existing replay input/constant ownership tables so replay
+        // can return the exact caller value without fabricating an aliasing
+        // kernel item. Any computed requested value still requires one unique
+        // scheduled producer and fails closed below.
+        for node in requested {
+            let id = node.index() as u64;
+            if produced.contains(&id) {
+                continue;
+            }
+            let shape = graph
+                .shape(*node)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+                .clone();
+            let dtype = graph
+                .dtype(*node)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+            let bytes = shape
+                .numel()
+                .map_err(|error| ReplayError::Descriptor(error.to_string()))?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| ReplayError::Descriptor("requested value byte overflow".into()))?;
+            let desc = crate::BufferDesc {
+                id,
+                shape,
+                dtype,
+                bytes,
+                alignment: dtype.itemsize().max(1),
+                read_only: true,
+                view: None,
+            };
+            match graph
+                .op(*node)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            {
+                Op::Input { name } => {
+                    inputs.entry(name.clone()).or_insert(ReplayInput {
+                        name: name.clone(),
+                        node: *node,
+                        desc,
+                    });
+                }
+                Op::Constant(value) => {
+                    constants.insert(id, value.clone());
+                }
+                _ => {
+                    return Err(ReplayError::Corrupt(format!(
+                        "requested value {id} has no scheduled producer"
+                    )));
+                }
+            }
+        }
         let inputs = inputs.into_values().collect::<Vec<_>>();
         let mut capture = Self {
             items: schedule.items.clone(),
@@ -461,6 +513,84 @@ mod tests {
         assert!(matches!(
             CapturedSchedule::capture(&graph, &schedule, &[guard]),
             Err(ReplayError::Unsupported(reason)) if reason.contains("tensor guard")
+        ));
+    }
+
+    #[test]
+    fn source_passthrough_capture_roundtrips_and_replays_without_items() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([3]), DType::F32);
+        let constant_value = TensorData::from_scalars(
+            [3],
+            DType::F32,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(f64::NAN),
+                Scalar::F(f64::INFINITY),
+            ],
+        )
+        .unwrap();
+        let constant = graph.constant(constant_value.clone());
+        let provided_value = TensorData::from_scalars(
+            [3],
+            DType::F32,
+            [Scalar::F(1.0), Scalar::F(-2.0), Scalar::F(3.0)],
+        )
+        .unwrap();
+
+        let schedule = crate::schedule_many(&graph, &[input, constant]).unwrap();
+        assert!(schedule.items.is_empty());
+        let capture = CapturedSchedule::capture(&graph, &schedule, &[input, constant]).unwrap();
+        assert!(capture.items.is_empty());
+        assert_eq!(capture.inputs.len(), 1);
+        assert_eq!(capture.constants.len(), 1);
+
+        let bytes = capture.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+        let provided = BTreeMap::from([("input".into(), provided_value.clone())]);
+        let replay = crate::CapturedReplayExecutor::default()
+            .replay(
+                &decoded,
+                &provided,
+                crate::CapturedReplayOptions {
+                    backend: crate::CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        assert!(replay.trace.items.is_empty());
+        assert_eq!(replay.outputs[0].storage(), provided_value.storage());
+        assert_eq!(replay.outputs[1].storage(), constant_value.storage());
+    }
+
+    #[test]
+    fn mixed_source_and_computed_requests_keep_order_and_unique_ownership() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([2]), DType::I32);
+        let constant_value =
+            TensorData::from_scalars([2], DType::I32, [Scalar::I(4), Scalar::I(-1)]).unwrap();
+        let constant = graph.constant(constant_value.clone());
+        let computed = graph.add(input, constant).unwrap();
+        let requested = [constant, computed, input];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        let capture = CapturedSchedule::capture(&graph, &schedule, &requested).unwrap();
+        let decoded = CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+        let input_value =
+            TensorData::from_scalars([2], DType::I32, [Scalar::I(2), Scalar::I(3)]).unwrap();
+        let outputs = decoded
+            .replay(&BTreeMap::from([("input".into(), input_value.clone())]))
+            .unwrap();
+
+        assert_eq!(outputs[0].storage(), constant_value.storage());
+        assert_eq!(outputs[1].storage(), &crate::Storage::I32(vec![6, 2]));
+        assert_eq!(outputs[2].storage(), input_value.storage());
+
+        let mut malformed = decoded;
+        malformed.requested.push(999);
+        assert!(matches!(
+            malformed.replay(&BTreeMap::from([("input".into(), input_value)])),
+            Err(ReplayError::Corrupt(_))
         ));
     }
 

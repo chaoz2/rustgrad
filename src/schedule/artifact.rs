@@ -1037,10 +1037,13 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
             .iter()
             .flat_map(|x| &x.input_bindings)
             .find(|x| x.desc.id == *id)
-            .map(|x| &x.desc)
-            .ok_or(ArtifactError::Format("unbound constant"))?;
-        if value.shape() != &desc.shape || value.dtype() != desc.dtype {
-            return Err(ArtifactError::Format("constant descriptor"));
+            .map(|x| &x.desc);
+        if let Some(desc) = desc {
+            if value.shape() != &desc.shape || value.dtype() != desc.dtype {
+                return Err(ArtifactError::Format("constant descriptor"));
+            }
+        } else if !c.requested.contains(id) {
+            return Err(ArtifactError::Format("unbound constant"));
         }
     }
     for (id, value) in &c.quantized_constants {
@@ -1057,7 +1060,7 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
             return Err(ArtifactError::Format("quantized constant descriptor"));
         }
     }
-    let mut available = input_ids;
+    let mut available = input_ids.clone();
     available.extend(c.constants.keys().copied());
     available.extend(c.quantized_constants.keys().copied());
     for item in &c.items {
@@ -1085,6 +1088,7 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
             .iter()
             .map(|binding| binding.input_node.index() as u64)
     }));
+    used.extend(c.requested.iter().copied());
     if c.inputs.iter().any(|x| !used.contains(&x.desc.id)) {
         return Err(ArtifactError::Format("unused replay input"));
     }
@@ -1097,11 +1101,17 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
         .iter()
         .flat_map(|item| item.outputs.iter().map(|output| output.id))
         .collect::<BTreeSet<_>>();
+    let replay_values = input_ids
+        .iter()
+        .copied()
+        .chain(c.constants.keys().copied())
+        .chain(outputs.iter().copied())
+        .collect::<BTreeSet<_>>();
     if c.requested
         .iter()
-        .any(|x| !requested.insert(*x) || !outputs.contains(x))
+        .any(|x| !requested.insert(*x) || !replay_values.contains(x))
     {
-        return Err(ArtifactError::Format("requested output"));
+        return Err(ArtifactError::Format("requested value"));
     }
     if c.symbolic.is_some() && c.specialized_from.is_some() {
         return Err(ArtifactError::Format("symbolic specialization state"));
@@ -1181,11 +1191,16 @@ fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError>
     }
 
     let mut requested = BTreeSet::new();
-    if c.requested
+    let passthrough_ids = c
+        .inputs
         .iter()
-        .any(|id| !requested.insert(*id) || !output_ids.contains(id))
-    {
-        return Err(ArtifactError::Format("requested output"));
+        .map(|input| input.desc.id)
+        .chain(c.constants.keys().copied())
+        .collect::<BTreeSet<_>>();
+    if c.requested.iter().any(|id| {
+        !requested.insert(*id) || (!output_ids.contains(id) && !passthrough_ids.contains(id))
+    }) {
+        return Err(ArtifactError::Format("requested value"));
     }
     if c.inputs
         .iter()
@@ -1208,7 +1223,9 @@ fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError>
         .iter()
         .map(|item| item.primary_output().id)
         .collect::<BTreeSet<_>>();
-    projected.requested.retain(|id| primary_ids.contains(id));
+    projected
+        .requested
+        .retain(|id| primary_ids.contains(id) || passthrough_ids.contains(id));
     let provenance = projected.specialized_from.clone();
     for item in &mut projected.items {
         item.outputs = ScheduledOutputs::single(item.output.clone());

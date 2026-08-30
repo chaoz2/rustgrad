@@ -1371,6 +1371,11 @@ fn schedule_many_with_external(
         .filter(|index| {
             let id = NodeId::from_index(*index);
             !external.contains(index)
+                // Inputs and constants are caller/graph-owned values, not
+                // scheduled producers. A requested source value is retained
+                // by capture as an explicit passthrough instead of becoming
+                // a fake in-place kernel whose input and output IDs alias.
+                && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_)))
                 && !matches!(
                     graph.op(id),
                     Ok(Op::Sort {

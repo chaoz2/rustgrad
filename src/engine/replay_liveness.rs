@@ -28,15 +28,25 @@ impl ReplayLivenessPlan {
                 demanded.insert(item.id);
             }
         }
-        if requested.len()
-            != capture
-                .items
-                .iter()
-                .filter(|item| requested.contains(&item.primary_output().id))
-                .count()
+        let source_values = capture
+            .inputs
+            .iter()
+            .map(|input| input.desc.id)
+            .chain(capture.constants.keys().copied())
+            .collect::<BTreeSet<_>>();
+        let produced_requested = capture
+            .items
+            .iter()
+            .filter(|item| requested.contains(&item.primary_output().id))
+            .count();
+        if requested
+            .iter()
+            .filter(|id| !source_values.contains(id))
+            .count()
+            != produced_requested
         {
             return Err(ReplayError::Corrupt(
-                "requested output has no unique captured producer".into(),
+                "requested value has no unique captured owner".into(),
             ));
         }
 
@@ -125,5 +135,37 @@ mod tests {
             ReplayLivenessPlan::analyze(&capture),
             Err(ReplayError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn accepts_source_owned_requested_values_without_producers() {
+        let capture = CapturedSchedule {
+            items: vec![],
+            inputs: vec![super::capture::ReplayInput {
+                name: "input".into(),
+                node: crate::NodeId::from_index(3),
+                desc: crate::BufferDesc {
+                    id: 3,
+                    shape: crate::Shape::from([2]),
+                    dtype: crate::DType::F32,
+                    bytes: 8,
+                    alignment: 4,
+                    read_only: true,
+                    view: None,
+                },
+            }],
+            constants: std::collections::BTreeMap::from([(
+                4,
+                crate::TensorData::zeros_with_dtype([2], crate::DType::F32).unwrap(),
+            )]),
+            quantized_constants: Default::default(),
+            requested: vec![3, 4],
+            identity: 0,
+            symbolic: None,
+            specialized_from: None,
+        };
+        let plan = ReplayLivenessPlan::analyze(&capture).unwrap();
+        assert_eq!(plan.pruned_item_count(), 0);
+        assert_eq!(plan.materialized_zero_item_count(), 0);
     }
 }
