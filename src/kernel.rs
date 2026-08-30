@@ -479,6 +479,10 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 Op::Cast { input, .. } => {
                     UOp::cast(lower(graph, *input, out, range, memo, materialized)?, ty)
                 }
+                // Detach is an autograd boundary, not a runtime value
+                // transformation. Native lowering keeps the same typed value
+                // while Graph reverse-mode traversal owns the gradient stop.
+                Op::Detach { input } => lower(graph, *input, out, range, memo, materialized)?,
                 Op::Unary { op, input } => UOp::new(
                     UOpKind::GraphUnary(*op),
                     Some(ty),

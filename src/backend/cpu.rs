@@ -1205,40 +1205,26 @@ fn select(
     let on_false = values
         .get(on_false.index())
         .ok_or(Error::UnknownNode(on_false))?;
-    if dtype.is_float8() && on_true.dtype() == dtype && on_false.dtype() == dtype {
-        let (Storage::Float8(true_storage), Storage::Float8(false_storage)) =
-            (on_true.storage(), on_false.storage())
-        else {
-            unreachable!("float8 dtype has float8 storage");
-        };
-        let raw = (0..output_shape.numel()?)
-            .map(|linear| {
-                if condition
-                    .scalar_at(broadcast_offset(linear, output_shape, condition.shape()))
-                    .as_bool()
-                {
-                    true_storage.as_raw()[broadcast_offset(linear, output_shape, on_true.shape())]
-                } else {
-                    false_storage.as_raw()[broadcast_offset(linear, output_shape, on_false.shape())]
-                }
-            })
-            .collect::<Vec<_>>();
-        return TensorData::from_storage(
-            output_shape.clone(),
-            Storage::Float8(Float8Storage::from_raw(true_storage.format(), raw)),
-        );
-    }
-    let data = (0..output_shape.numel()?).map(|linear| {
-        let condition = condition
+    debug_assert_eq!(on_true.dtype(), dtype);
+    debug_assert_eq!(on_false.dtype(), dtype);
+    let len = output_shape.numel()?;
+    let false_offsets = (0..len)
+        .map(|linear| broadcast_offset(linear, output_shape, on_false.shape()))
+        .collect::<Vec<_>>();
+    let mut output = on_false.reorder_raw(output_shape.clone(), &false_offsets)?;
+    let mut destinations = Vec::new();
+    let mut sources = Vec::new();
+    for linear in 0..len {
+        if condition
             .scalar_at(broadcast_offset(linear, output_shape, condition.shape()))
-            .as_bool();
-        if condition {
-            on_true.scalar_at(broadcast_offset(linear, output_shape, on_true.shape()))
-        } else {
-            on_false.scalar_at(broadcast_offset(linear, output_shape, on_false.shape()))
+            .as_bool()
+        {
+            destinations.push(linear);
+            sources.push(broadcast_offset(linear, output_shape, on_true.shape()));
         }
-    });
-    TensorData::from_scalars(output_shape.clone(), dtype, data)
+    }
+    output.replace_raw_offsets(on_true, &destinations, &sources)?;
+    Ok(output)
 }
 
 fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar {

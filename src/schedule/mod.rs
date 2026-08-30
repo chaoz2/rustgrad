@@ -987,6 +987,7 @@ fn supported(op: &Op) -> bool {
             | Op::Constant(_)
             | Op::Random { .. }
             | Op::Cast { .. }
+            | Op::Detach { .. }
             | Op::Unary { .. }
             | Op::Binary { .. }
             | Op::Compare { .. }
@@ -997,6 +998,7 @@ fn supported(op: &Op) -> bool {
             | Op::Permute { .. }
             | Op::Expand { .. }
             | Op::Stride { .. }
+            | Op::Pad { .. }
             | Op::Concat { .. }
             | Op::Gather { .. }
             | Op::Scatter { .. }
@@ -1067,6 +1069,7 @@ pub fn schedule_with_external_materializations(
         }
         let children: Vec<NodeId> = match graph.op(node).map_err(ScheduleError::Graph)? {
             Op::Cast { input, .. }
+            | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
             | Op::Reshape { input, .. }
@@ -1076,7 +1079,8 @@ pub fn schedule_with_external_materializations(
             | Op::Reduce { input, .. }
             | Op::PrefixScan { input, .. }
             | Op::TensorGuard { input, .. }
-            | Op::Sort { input, .. } => vec![*input],
+            | Op::Sort { input, .. }
+            | Op::Pad { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
@@ -1159,6 +1163,7 @@ fn schedule_many_with_external(
         };
         match g.op(id).map_err(ScheduleError::Graph)? {
             Op::Cast { input, .. }
+            | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
             | Op::Reshape { input, .. }
@@ -1168,7 +1173,8 @@ fn schedule_many_with_external(
             | Op::Reduce { input, .. }
             | Op::PrefixScan { input, .. }
             | Op::TensorGuard { input, .. }
-            | Op::Sort { input, .. } => child(*input)?,
+            | Op::Sort { input, .. }
+            | Op::Pad { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => {
@@ -1321,6 +1327,7 @@ fn schedule_many_with_external(
                             | Op::Sort { .. }
                             | Op::Matmul { .. }
                             | Op::Conv2d { .. }
+                            | Op::Pad { .. }
                             | Op::Concat { .. }
                             | Op::Gather { .. }
                             | Op::Scatter { .. })
@@ -1371,11 +1378,13 @@ fn schedule_many_with_external(
             }
             Op::Random { .. } => {}
             Op::Cast { input, .. }
+            | Op::Detach { input }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
             | Op::PrefixScan { input, .. }
             | Op::TensorGuard { input, .. }
-            | Op::Sort { input, .. } => leaves(g, *input, roots, here, out, boundary, external)?,
+            | Op::Sort { input, .. }
+            | Op::Pad { input, .. } => leaves(g, *input, roots, here, out, boundary, external)?,
             Op::Shrink { input, .. }
             | Op::Reshape { input, .. }
             | Op::Permute { input, .. }
@@ -1493,7 +1502,7 @@ fn schedule_many_with_external(
                 }
                 Op::Conv2d { .. } => crate::kernel::lower_graph_static_conv2d(graph, node)
                     .map_err(ScheduleError::UOp)?,
-                Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
+                Op::Pad { .. } | Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
                     crate::kernel::lower_graph_movement(graph, node).map_err(ScheduleError::UOp)?
                 }
                 Op::Shrink { .. }

@@ -486,7 +486,12 @@ fn validate_fields(
             matches!(arg, UArg::TensorGuard { dtype, .. } if ty == Some(UType::scalar(*dtype)))
         }
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
-        UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
+        // ReduceFinalize is the explicit accumulator-to-output storage
+        // boundary. Default narrow reductions therefore legitimately consume
+        // an F32 accumulator while producing F16/BF16 output storage.
+        UOpKind::ReduceFinalize => ty
+            .zip(sources.first().and_then(|source| source.ty()))
+            .is_some_and(|(output, accumulator)| output.lanes == accumulator.lanes),
         UOpKind::Ternary(super::Ternary::Where) => {
             sources
                 .first()

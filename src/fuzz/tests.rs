@@ -252,9 +252,15 @@ fn matmul_cases_round_trip_capture_and_keep_f32_storage_rounding() {
         assert_eq!(scheduled.items.len(), 1);
         let item = &scheduled.items[0];
         assert!(matches!(item.kernel.kind(), UOpKind::Matmul));
-        assert!(
-            matches!(item.kernel.arg(), UArg::Matmul(rendered) if rendered.m == plan.m && rendered.n == plan.n && rendered.k == plan.k && rendered.batch_shape == plan.batch_shape)
-        );
+        let rendered_plan = item
+            .kernel
+            .arg()
+            .matmul_plan()
+            .expect("all static Matmul payloads retain their normalized base plan");
+        assert_eq!(rendered_plan.m, plan.m);
+        assert_eq!(rendered_plan.n, plan.n);
+        assert_eq!(rendered_plan.k, plan.k);
+        assert_eq!(rendered_plan.batch_shape, plan.batch_shape);
         let rendered = CpuJit::render(&item.kernel).unwrap();
         if plan.dtype == DType::F32 {
             assert!(rendered.source.contains("float rg_acc=0.0f;"));
@@ -524,8 +530,9 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
         assert_eq!(
             crate::execute_elementwise(&built.graph, built.output, &built.oracle)
                 .unwrap()
-                .storage(),
-            oracle.storage(),
+                .to_le_bytes()
+                .unwrap(),
+            oracle.to_le_bytes().unwrap(),
             "{dtype:?} {reduction:?} special-lane ordering",
         );
     }
@@ -1163,7 +1170,7 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
         assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
         assert_eq!(graph.dtype(output).unwrap(), dtype);
         let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
-        assert!(matches!(uop.kind(), UOpKind::Store));
+        assert!(matches!(uop.kind(), UOpKind::Sink));
         assert!(CpuJit::render(&uop).is_ok());
         let vector = CpuJit::render_vectorized(&uop).unwrap();
         if matches!(dtype, DType::F16 | DType::BF16) {
@@ -2408,9 +2415,13 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
             matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Gather { .. }))
         );
         let scalar = CpuJit::render(&item.kernel).unwrap();
-        assert!(
-            scalar.source.contains("rg_selected < 0") && scalar.source.contains("failure[1]=3")
-        );
+        if index.shape.numel().unwrap() != 0 {
+            assert!(
+                scalar.source.contains("rg_selected < 0") && scalar.source.contains("failure[1]=3")
+            );
+        } else {
+            assert!(scalar.source.contains("empty gather domain"));
+        }
         assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
         let captured =
             CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
@@ -2830,6 +2841,7 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
         let MovementKernelKind::Scatter {
             axis: planned,
             add: planned_add,
+            index,
             ..
         } = &plan.kind
         else {
@@ -2846,15 +2858,18 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
             matches!(item.kernel.arg(), UArg::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Scatter { .. }))
         );
         let scalar = CpuJit::render(&item.kernel).unwrap();
-        assert!(
-            scalar.source.contains("memcpy(")
-                && scalar.source.contains("rg_selected < 0")
-                && scalar.source.contains("failure[1]=3")
-        );
-        if *op == FuzzScatterOp::Add {
-            assert!(scalar.source.contains("] += ((const"));
+        assert!(scalar.source.contains("memcpy("));
+        if index.shape.numel().unwrap() == 0 {
+            assert!(!scalar.source.contains("rg_selected"));
         } else {
-            assert!(scalar.source.contains("] = ((const"));
+            assert!(
+                scalar.source.contains("rg_selected < 0") && scalar.source.contains("failure[1]=3")
+            );
+            if *op == FuzzScatterOp::Add {
+                assert!(scalar.source.contains("] += ((const"));
+            } else {
+                assert!(scalar.source.contains("] = ((const"));
+            }
         }
         assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
         let captured =
@@ -3625,7 +3640,7 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
                 assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
                 assert!(scalar.source.contains("rg_f"), "{dtype:?}");
             } else if matches!(dtype, DType::F32 | DType::I32) {
-                assert!(vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+                assert_eq!(vector.abi.buffers.last().unwrap().dtype, DType::Bool);
             }
             let captured =
                 CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
@@ -4089,7 +4104,7 @@ fn unsupported_native_cases_remain_explicit() {
 #[test]
 fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
-    assert_eq!(cases.len(), 40);
+    assert_eq!(cases.len(), 60);
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
             assert!(matches!(
