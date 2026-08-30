@@ -9,11 +9,11 @@ use super::{
         typed_scalar_i64_attr,
     },
     tensor::{onnx_dtype, tensor_data},
-    wire::{var, Msg},
+    wire::{Msg, var},
 };
 use crate::{
-    ir::reduction_shape, Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType, Result,
-    Scalar, Shape, Slice, TensorData,
+    Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, Slice,
+    TensorData, ir::reduction_shape,
 };
 use std::collections::BTreeMap;
 
@@ -5158,11 +5158,7 @@ fn cumsum_plan(
                     .enumerate()
                     .map(
                         |(dimension, &extent)| {
-                            if dimension == axis {
-                                end + 1
-                            } else {
-                                extent
-                            }
+                            if dimension == axis { end + 1 } else { extent }
                         },
                     )
                     .collect::<Vec<_>>(),
