@@ -61,7 +61,7 @@ impl ReplayLivenessPlan {
                 ));
             }
             let zero_domain = item
-                .output
+                .primary_output()
                 .shape
                 .numel()
                 .map_err(|error| ReplayError::Descriptor(error.to_string()))?
@@ -82,7 +82,7 @@ impl ReplayLivenessPlan {
         let mut plan = Self::default();
         for item in &capture.items {
             let zero_domain = item
-                .output
+                .primary_output()
                 .shape
                 .numel()
                 .map_err(|error| ReplayError::Descriptor(error.to_string()))?
