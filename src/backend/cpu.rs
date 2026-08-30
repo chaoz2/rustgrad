@@ -1771,22 +1771,6 @@ fn prefix_scan(
     )
 }
 
-/// Stable row-major ordering used by the CPU oracle. The graph validates the
-/// signed axis before this point; values preserve their original scalar bits
-/// while indices are typed I32 positions along that axis.
-fn stable_sort(
-    input: &TensorData,
-    axis: usize,
-    descending: bool,
-    output: crate::SortOutput,
-    output_dtype: DType,
-) -> Result<TensorData> {
-    let (values, indices) = stable_sort_pair(input, axis, descending)?;
-    Ok(match output {
-        crate::SortOutput::Values => values.cast(output_dtype),
-        crate::SortOutput::Indices => indices.cast(output_dtype),
-    })
-}
 fn reduce_grad(
     input: &TensorData,
     upstream: &TensorData,
@@ -2116,7 +2100,8 @@ fn tinygrad_sort_flip_green(
 ) -> Result<()> {
     let index = DenseIndex::new(shape.clone())?;
     let source = values.to_vec();
-    for linear in 0..index.len() {
+    debug_assert_eq!(values.len(), index.len());
+    for (linear, value) in values.iter_mut().enumerate() {
         let coordinates = index.coords(linear)?;
         if coordinates[crossover_axis] != 1 {
             continue;
@@ -2127,7 +2112,7 @@ fn tinygrad_sort_flip_green(
                 flipped[axis] = shape.dims()[axis] - 1 - flipped[axis];
             }
         }
-        values[linear] = source[index.offset(&flipped)?];
+        *value = source[index.offset(&flipped)?];
     }
     Ok(())
 }
@@ -2204,7 +2189,7 @@ fn tinygrad_bitonic_values(
 
     // Unflatten is a contiguous reshape: only the descriptor changes.
     let mut working_dimensions = original_shape.dims()[..axis].to_vec();
-    working_dimensions.extend(std::iter::repeat(2usize).take(stages));
+    working_dimensions.extend(std::iter::repeat_n(2usize, stages));
     working_dimensions.extend_from_slice(&original_shape.dims()[axis + 1..]);
     let working_shape = Shape::new(working_dimensions);
     for stage in 1..=stages {

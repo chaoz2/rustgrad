@@ -1010,10 +1010,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     if matches!(
         value.kind(),
         UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)
-    ) {
-        if let Some(mode) = scoped_rsqrt_plan(store, sm)? {
-            return Ok(Some(mode));
-        }
+    ) && let Some(mode) = scoped_rsqrt_plan(store, sm)?
+    {
+        return Ok(Some(mode));
     }
     let (load, mode) = match value.kind() {
         UOpKind::GraphUnary(crate::UnaryOp::Sign) => {
@@ -1361,7 +1360,7 @@ fn scoped_binary_plan(
         ));
     }
 
-    fn operand<'a>(node: &'a UOp) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
+    fn operand(node: &UOp) -> Result<(&UOp, Option<&UOp>), PtxError> {
         match node.kind() {
             UOpKind::Load => Ok((node, None)),
             UOpKind::Cast => {
@@ -1380,7 +1379,7 @@ fn scoped_binary_plan(
             )),
         }
     }
-    fn index<'a>(load: &'a UOp) -> Result<&'a UOp, PtxError> {
+    fn index(load: &UOp) -> Result<&UOp, PtxError> {
         let [index] = load.sources() else {
             return Err(PtxError::Unsupported("Mul load must have one index".into()));
         };
@@ -1507,7 +1506,7 @@ fn scoped_compare_value_proof(
             "public Eq output descriptor is invalid".into(),
         ));
     }
-    fn operand<'a>(node: &'a UOp) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
+    fn operand(node: &UOp) -> Result<(&UOp, Option<&UOp>), PtxError> {
         match node.kind() {
             UOpKind::Load => Ok((node, None)),
             UOpKind::Cast => {
@@ -1620,15 +1619,14 @@ fn scoped_compare_value_proof(
             "public Eq broadcast/output extent is invalid".into(),
         ));
     }
-    if matches!(left_dtype, DType::F16)
+    if (matches!(left_dtype, DType::F16)
         || matches!(right_dtype, DType::F16)
-        || comparison_dtype == DType::F16
+        || comparison_dtype == DType::F16)
+        && sm < 53
     {
-        if sm < 53 {
-            return Err(PtxError::Unsupported(
-                "F16 public Eq conversion requires sm_53 or newer".into(),
-            ));
-        }
+        return Err(PtxError::Unsupported(
+            "F16 public Eq conversion requires sm_53 or newer".into(),
+        ));
     }
     reject_sign_storage_dtype(left_dtype)?;
     reject_sign_storage_dtype(right_dtype)?;
@@ -2507,9 +2505,7 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
         }
         Ok((source, input_shape))
     }
-    fn parts<'a>(
-        node: &'a UOp,
-    ) -> Result<(&'a UOp, &'a UOp, &'a UOp, &'a UOp, &'a UOp, DType), PtxError> {
+    fn parts(node: &UOp) -> Result<(&UOp, &UOp, &UOp, &UOp, &UOp, DType), PtxError> {
         let UOpKind::Ternary(crate::uop::Ternary::Where) = node.kind() else {
             return Err(PtxError::Unsupported("Clamp stage needs Select".into()));
         };
@@ -2595,7 +2591,7 @@ fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
                 ));
             }
             if value.ty().map(|ty| ty.scalar) != Some(root_dtype)
-                || (lower_dtype == root_dtype) != !casted
+                || (lower_dtype == root_dtype) == casted
             {
                 return Err(PtxError::Unsupported(
                     "Clamp intermediate storage boundary is invalid".into(),
@@ -2700,7 +2696,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         }
         Ok(node)
     }
-    fn payload<'a>(node: &'a UOp) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
+    fn payload(node: &UOp) -> Result<(&UOp, Option<&UOp>), PtxError> {
         match node.kind() {
             UOpKind::Load => Ok((node, None)),
             UOpKind::Cast => {

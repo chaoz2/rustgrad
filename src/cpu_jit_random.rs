@@ -5,8 +5,8 @@
 //! mutable implicit-stream registry for state.
 
 use super::{
-    ABI_VERSION, BufferAbi, DType, JitError, KernelAbi, KernelPointerAbi, RENDERER_VERSION,
-    RenderedC, native_cache_key,
+    ABI_VERSION, BufferAbi, DType, JitError, KernelAbi, KernelPointerAbi, RenderedC,
+    native_cache_key,
 };
 use crate::{RandomKind, random::plan::RandomKernelPlan};
 use std::collections::BTreeMap;

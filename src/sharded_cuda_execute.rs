@@ -4101,8 +4101,8 @@ mod tests {
             "incomplete transfer routes reject before Driver work"
         );
         assert_eq!(environment.external.len(), 2);
-        for rank in 0..2 {
-            let mut actual = vec![0; source_bytes[rank].len()];
+        for (rank, expected) in source_bytes.iter().enumerate() {
+            let mut actual = vec![0; expected.len()];
             environment
                 .external
                 .get(&(rank, source.nodes()[rank].index() as u64))
@@ -4111,7 +4111,7 @@ mod tests {
                 .unwrap()
                 .copy_to(0, &mut actual)
                 .unwrap();
-            assert_eq!(actual, source_bytes[rank]);
+            assert_eq!(&actual, expected);
         }
         let CudaPlanStage::Transfer { routes, .. } = &mut plan.logical.stages[0] else {
             unreachable!();

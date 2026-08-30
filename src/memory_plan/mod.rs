@@ -358,28 +358,6 @@ impl MemoryPlan {
     }
 }
 
-/// Checks the complete declared producer inventory before any allocator state
-/// or request vector can be made visible. Multi-output ownership is modeled
-/// here, but deliberately rejected until executors can publish every member
-/// atomically.
-fn validate_output_inventory(items: &[ScheduleItem]) -> Result<(), MemoryPlanError> {
-    let mut owners = BTreeSet::new();
-    for item in items {
-        if item.primary_output() != &item.output {
-            return Err(MemoryPlanError::InvalidOutputProjection(item.id));
-        }
-        for output in item.outputs.iter() {
-            if !owners.insert(output.id) {
-                return Err(MemoryPlanError::DuplicateBuffer(output.id));
-            }
-        }
-    }
-    if let Some(item) = items.iter().find(|item| !item.outputs.is_single()) {
-        return Err(MemoryPlanError::UnsupportedMultiOutput(item.id));
-    }
-    Ok(())
-}
-
 fn request_last_position(
     items: &[ScheduleItem],
     request: &AllocationRequest,
