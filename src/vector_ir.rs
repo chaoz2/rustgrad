@@ -1,5 +1,7 @@
 //! Explicit backend-neutral vector instructions over assigned register spaces.
-use crate::{LinearInstKind, LinearKernel, LinearPayload, MemorySpacePlan, RegisterBinding};
+use crate::{
+    LaneInstruction, LaneProgramInstruction, LinearKernel, MemorySpacePlan, RegisterBinding,
+};
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
     fmt,
@@ -7,43 +9,14 @@ use std::{
 };
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum VectorOperand {
-    Register {
-        physical: u32,
-        vector: bool,
-        dtype: crate::DType,
-    },
-    Global {
-        buffer: u64,
-    },
-}
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum VectorInstKind {
-    Splat,
-    Address,
-    Index,
-    Load { buffer: u64 },
-    Cast,
-    Unary,
-    Binary,
-    Compare,
-    Select,
-    Store { buffer: u64 },
-    Control,
-}
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct VectorInst {
-    pub index: u32,
-    pub dst: Option<VectorOperand>,
-    pub inputs: Vec<VectorOperand>,
-    pub kind: VectorInstKind,
-    pub lanes: u16,
-    pub mask: Vec<bool>,
-    pub payload: LinearPayload,
+pub struct VectorOperand {
+    pub physical: u32,
+    pub vector: bool,
+    pub dtype: crate::DType,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VectorProgram {
-    pub instructions: Vec<VectorInst>,
+    pub instructions: Vec<LaneProgramInstruction<VectorOperand>>,
     pub lanes: u16,
     pub main_elements: usize,
     pub tail_elements: usize,
@@ -55,7 +28,6 @@ pub struct VectorProgram {
 pub enum VectorIrError {
     MissingRegister(u32),
     InvalidMask { instruction: u32 },
-    InvalidRegisterClass(u32),
     InvalidAddress(u64),
     Unsupported(String),
 }
@@ -88,16 +60,6 @@ impl VectorProgram {
         if self.main_elements % lanes != 0 || self.tail_elements >= lanes {
             return Err(invalid());
         }
-        let expected_mask = (0..lanes)
-            .map(|lane| lane < self.tail_elements)
-            .collect::<Vec<_>>();
-        for instruction in &self.instructions {
-            if instruction.lanes != self.lanes || instruction.mask != expected_mask {
-                return Err(VectorIrError::InvalidMask {
-                    instruction: instruction.index,
-                });
-            }
-        }
         Ok(())
     }
 
@@ -113,7 +75,8 @@ impl VectorProgram {
             ));
         }
         for inst in &self.instructions {
-            let ty = inst.payload.ty.map(|ty| ty.scalar);
+            let view = inst.instruction.view();
+            let ty = view.result_type().map(|ty| ty.scalar);
             // B2 physically represents narrow lanes as raw u16 values, while
             // the source-correct scalar renderer must decode to float for
             // every arithmetic/select operation and encode again at storage
@@ -121,23 +84,12 @@ impl VectorProgram {
             // a narrow register, including Load/Store whose payload type can
             // be absent, until B2 has a tagged half-vector ABI.
             let narrow_register = |operand: &VectorOperand| {
-                matches!(
-                    operand,
-                    VectorOperand::Register {
-                        dtype: crate::DType::F16 | crate::DType::BF16,
-                        ..
-                    }
-                )
+                matches!(operand.dtype, crate::DType::F16 | crate::DType::BF16)
             };
-            let float8_register = |operand: &VectorOperand| {
-                matches!(
-                    operand,
-                    VectorOperand::Register { dtype, .. } if dtype.is_float8()
-                )
-            };
+            let float8_register = |operand: &VectorOperand| operand.dtype.is_float8();
             if matches!(ty, Some(crate::DType::F16 | crate::DType::BF16))
-                || inst.dst.as_ref().is_some_and(narrow_register)
-                || inst.inputs.iter().any(narrow_register)
+                || view.output().is_some_and(narrow_register)
+                || view.inputs().any(narrow_register)
             {
                 return Err(VectorIrError::Unsupported(
                     "portable narrow vector ABI needs tagged float lanes".into(),
@@ -148,103 +100,104 @@ impl VectorProgram {
             // comparisons and raw-byte Select on the legacy scalar-per-lane
             // renderer even when Load/Store payload types are absent.
             if ty.is_some_and(crate::DType::is_float8)
-                || inst.dst.as_ref().is_some_and(float8_register)
-                || inst.inputs.iter().any(float8_register)
+                || view.output().is_some_and(float8_register)
+                || view.inputs().any(float8_register)
             {
                 return Err(VectorIrError::Unsupported(
                     "portable Float8 vector ABI needs tagged decoded lanes".into(),
                 ));
             }
-            if !matches!(
-                inst.kind,
-                VectorInstKind::Splat
-                    | VectorInstKind::Address
-                    | VectorInstKind::Index
-                    | VectorInstKind::Control
-            ) && ty.is_some_and(|ty| {
-                !matches!(
-                    ty,
-                    crate::DType::Bool
-                        | crate::DType::I8
-                        | crate::DType::I16
-                        | crate::DType::I32
-                        | crate::DType::I64
-                        | crate::DType::U8
-                        | crate::DType::U16
-                        | crate::DType::U32
-                        | crate::DType::U64
-                        | crate::DType::F16
-                        | crate::DType::BF16
-                        | crate::DType::F32
-                        | crate::DType::F64
-                )
-            }) {
+            let structural = matches!(
+                &inst.instruction,
+                LaneInstruction::Constant { .. }
+                    | LaneInstruction::Address { .. }
+                    | LaneInstruction::Range { .. }
+                    | LaneInstruction::Index { .. }
+            );
+            if !structural
+                && ty.is_some_and(|ty| {
+                    !matches!(
+                        ty,
+                        crate::DType::Bool
+                            | crate::DType::I8
+                            | crate::DType::I16
+                            | crate::DType::I32
+                            | crate::DType::I64
+                            | crate::DType::U8
+                            | crate::DType::U16
+                            | crate::DType::U32
+                            | crate::DType::U64
+                            | crate::DType::F16
+                            | crate::DType::BF16
+                            | crate::DType::F32
+                            | crate::DType::F64
+                    )
+                })
+            {
                 return Err(VectorIrError::Unsupported(format!("portable dtype {ty:?}")));
             }
-            match inst.kind {
-                VectorInstKind::Splat
-                | VectorInstKind::Address
-                | VectorInstKind::Index
-                | VectorInstKind::Load { .. }
-                | VectorInstKind::Cast
-                | VectorInstKind::Unary
-                | VectorInstKind::Binary
-                | VectorInstKind::Compare
-                | VectorInstKind::Select
-                | VectorInstKind::Store { .. }
-                | VectorInstKind::Control => {}
-            }
             if matches!(
-                &inst.payload.operation,
-                crate::Operation::ReduceInit(_)
-                    | crate::Operation::ReduceAccumulate
-                    | crate::Operation::ReduceFinalize
-                    | crate::Operation::Barrier
-            ) {
-                return Err(VectorIrError::Unsupported(
-                    "portable effects/reductions".into(),
-                ));
-            }
-            if matches!(
-                &inst.payload.operation,
-                crate::Operation::Index(crate::IndexValue::View { .. })
+                &inst.instruction,
+                LaneInstruction::Index {
+                    output: crate::IndexRef {
+                        value: crate::IndexValue::View { .. },
+                        ..
+                    },
+                    ..
+                }
             ) {
                 return Err(VectorIrError::Unsupported(
                     "portable vector instruction ABI does not encode affine view offsets".into(),
                 ));
             }
-            // The physical B1 emitter intentionally supports a narrower
-            // opcode set than the generic VectorInstKind tags. Keep an
-            // otherwise valid logical/core ALU program on the fallback path
-            // instead of letting it fail after vector planning.
-            if matches!(inst.kind, VectorInstKind::Unary)
-                && !matches!(
-                    &inst.payload.operation,
-                    crate::Operation::GraphUnary(crate::UnaryOp::Neg | crate::UnaryOp::Abs)
-                )
-            {
-                return Err(VectorIrError::Unsupported("portable unary opcode".into()));
-            }
-            if matches!(inst.kind, VectorInstKind::Binary)
-                && !matches!(
-                    &inst.payload.operation,
-                    crate::Operation::GraphBinary(
+            match &inst.instruction {
+                LaneInstruction::GraphUnary {
+                    op: crate::UnaryOp::Neg | crate::UnaryOp::Abs,
+                    ..
+                } => {}
+                LaneInstruction::CoreUnary { .. }
+                | LaneInstruction::GraphUnary { .. }
+                | LaneInstruction::LogicalNot { .. } => {
+                    return Err(VectorIrError::Unsupported("portable unary opcode".into()));
+                }
+                LaneInstruction::GraphBinary {
+                    op:
                         crate::BinaryOp::Add
-                            | crate::BinaryOp::Sub
-                            | crate::BinaryOp::Mul
-                            | crate::BinaryOp::Div
-                            | crate::BinaryOp::FloorDiv
-                            | crate::BinaryOp::TruncDiv
-                            | crate::BinaryOp::Mod
-                            | crate::BinaryOp::FMod
-                            | crate::BinaryOp::Shl
-                            | crate::BinaryOp::Shr
-                    )
-                )
-            {
-                return Err(VectorIrError::Unsupported("portable binary opcode".into()));
+                        | crate::BinaryOp::Sub
+                        | crate::BinaryOp::Mul
+                        | crate::BinaryOp::Div
+                        | crate::BinaryOp::FloorDiv
+                        | crate::BinaryOp::TruncDiv
+                        | crate::BinaryOp::Mod
+                        | crate::BinaryOp::FMod
+                        | crate::BinaryOp::Shl
+                        | crate::BinaryOp::Shr,
+                    ..
+                } => {}
+                LaneInstruction::CoreBinary { .. }
+                | LaneInstruction::CoreEq { .. }
+                | LaneInstruction::CoreLt { .. }
+                | LaneInstruction::CoreLe { .. }
+                | LaneInstruction::GraphBinary { .. }
+                | LaneInstruction::LogicalAnd { .. }
+                | LaneInstruction::LogicalOr { .. } => {
+                    return Err(VectorIrError::Unsupported("portable binary opcode".into()));
+                }
+                _ => {}
             }
-            if let crate::Operation::GraphBinary(op) = &inst.payload.operation {
+            if matches!(&inst.instruction, LaneInstruction::Bitcast { .. }) {
+                return Err(VectorIrError::Unsupported("portable bitcast opcode".into()));
+            }
+            if matches!(
+                &inst.instruction,
+                LaneInstruction::Address { output }
+                    if output.value.space != crate::AddressSpace::Global
+            ) {
+                return Err(VectorIrError::Unsupported(
+                    "portable lane address requires global memory".into(),
+                ));
+            }
+            if let LaneInstruction::GraphBinary { op, .. } = &inst.instruction {
                 if ty.is_some_and(crate::DType::is_float)
                     && !matches!(
                         op,
@@ -287,43 +240,27 @@ impl VectorProgram {
         let enabled = linear.enabled;
         let fallback_reason = (!enabled).then(|| linear.reason.clone());
         let lanes = if enabled { linear.lanes as u16 } else { 1 };
-        let mask = if enabled {
-            linear.tail_mask.clone()
-        } else {
-            vec![true]
-        };
-        let mut instructions = Vec::with_capacity(linear.program.instructions.len());
-        for inst in &linear.program.instructions {
-            let operand = |reg: u32| physical(regs.get(&reg).copied(), reg);
-            let inputs = inst
-                .inputs
+        let instructions = if enabled {
+            linear
+                .program
+                .instructions
                 .iter()
-                .map(|r| operand(*r))
-                .collect::<Result<Vec<_>, _>>()?;
-            let kind = match &inst.kind {
-                LinearInstKind::Constant => VectorInstKind::Splat,
-                LinearInstKind::Address => VectorInstKind::Address,
-                LinearInstKind::Index => VectorInstKind::Index,
-                LinearInstKind::Load { buffer } => VectorInstKind::Load { buffer: *buffer },
-                LinearInstKind::Cast => VectorInstKind::Cast,
-                LinearInstKind::Unary => VectorInstKind::Unary,
-                LinearInstKind::Binary => VectorInstKind::Binary,
-                LinearInstKind::Compare => VectorInstKind::Compare,
-                LinearInstKind::Select => VectorInstKind::Select,
-                LinearInstKind::Store { buffer } => VectorInstKind::Store { buffer: *buffer },
-                LinearInstKind::Other(_) => VectorInstKind::Control,
-            };
-            let dst = inst.dst.map(operand).transpose()?;
-            instructions.push(VectorInst {
-                index: inst.index,
-                dst,
-                inputs,
-                kind,
-                lanes,
-                mask: mask.clone(),
-                payload: inst.payload.clone(),
-            });
-        }
+                .map(|inst| {
+                    let instruction = inst
+                        .instruction
+                        .map_operands(|reg| physical(regs.get(reg).copied(), *reg))?;
+                    instruction
+                        .validate()
+                        .map_err(|error| VectorIrError::Unsupported(error.to_string()))?;
+                    Ok(LaneProgramInstruction {
+                        index: inst.index,
+                        instruction,
+                    })
+                })
+                .collect::<Result<Vec<_>, VectorIrError>>()?
+        } else {
+            Vec::new()
+        };
         let mut out = Self {
             instructions,
             lanes,
@@ -339,35 +276,24 @@ impl VectorProgram {
     }
     pub fn validate(&self, spaces: &MemorySpacePlan) -> Result<(), VectorIrError> {
         self.validate_lane_control()?;
-        let register_set = spaces
-            .registers
-            .iter()
-            .map(|r| {
-                (
-                    r.physical_reg,
-                    matches!(r.space, crate::MemorySpace::RegisterVector),
-                    r.dtype,
-                )
-            })
-            .collect::<Vec<_>>();
+        let key = |operand: &VectorOperand| (operand.physical, operand.vector, operand.dtype);
         for inst in &self.instructions {
-            if !payload_matches(&inst.kind, &inst.payload.operation) {
-                return Err(VectorIrError::Unsupported(
-                    "instruction/payload kind mismatch".into(),
-                ));
-            }
-            for op in inst.inputs.iter().chain(inst.dst.iter()) {
-                if let VectorOperand::Register {
-                    physical,
-                    vector,
-                    dtype,
-                } = op
-                    && !register_set.contains(&(*physical, *vector, *dtype))
-                {
-                    return Err(VectorIrError::InvalidRegisterClass(*physical));
+            let view = inst.instruction.view();
+            let output = view.output().zip(view.result_type());
+            for (_, expected) in view.typed_inputs().chain(output) {
+                let effective_lanes = if expected.lanes == 1 {
+                    self.lanes
+                } else {
+                    expected.lanes
+                };
+                if effective_lanes != self.lanes {
+                    return Err(VectorIrError::Unsupported(format!(
+                        "instruction {} has inconsistent lane width",
+                        inst.index
+                    )));
                 }
             }
-            if let VectorInstKind::Load { buffer } | VectorInstKind::Store { buffer } = inst.kind {
+            if let Some(buffer) = view.buffer {
                 let access = spaces
                     .globals
                     .iter()
@@ -378,7 +304,28 @@ impl VectorProgram {
                 }
             }
         }
-        Ok(())
+        crate::linearize::validate_lane_sequence(
+            &self.instructions,
+            &std::collections::BTreeSet::new(),
+            key,
+            |operand, instruction, descriptor| {
+                let expected_dtype = match descriptor.ty().scalar {
+                    crate::DType::F16 | crate::DType::BF16 => crate::DType::F32,
+                    dtype => dtype,
+                };
+                operand.dtype == expected_dtype
+                    && spaces.registers.iter().any(|binding| {
+                        binding.physical_reg == operand.physical
+                            && matches!(binding.space, crate::MemorySpace::RegisterVector)
+                                == operand.vector
+                            && binding.dtype == operand.dtype
+                            && binding.start <= instruction
+                            && instruction <= binding.end
+                    })
+            },
+            |_, _| true,
+        )
+        .map_err(VectorIrError::Unsupported)
     }
     fn rekey(&mut self) {
         let mut h = DefaultHasher::new();
@@ -391,45 +338,12 @@ impl VectorProgram {
         self.cache_key = h.finish();
     }
 }
-fn payload_matches(kind: &VectorInstKind, payload: &crate::Operation) -> bool {
-    matches!(
-        (kind, payload),
-        (
-            VectorInstKind::Splat,
-            crate::Operation::Const(_) | crate::Operation::VConst(_)
-        ) | (
-            VectorInstKind::Address,
-            crate::Operation::DefineGlobal(_)
-                | crate::Operation::DefineLocal(_)
-                | crate::Operation::DefineRegister(_)
-        ) | (VectorInstKind::Index, crate::Operation::Index(_))
-            | (VectorInstKind::Load { .. }, crate::Operation::Load)
-            | (
-                VectorInstKind::Cast,
-                crate::Operation::Cast | crate::Operation::Bitcast
-            )
-            | (
-                VectorInstKind::Unary,
-                crate::Operation::Unary(_) | crate::Operation::GraphUnary(_)
-            )
-            | (
-                VectorInstKind::Binary,
-                crate::Operation::Binary(_)
-                    | crate::Operation::GraphBinary(_)
-                    | crate::Operation::GraphLogical(_)
-            )
-            | (VectorInstKind::Compare, crate::Operation::GraphCompare(_))
-            | (VectorInstKind::Select, crate::Operation::Ternary(_))
-            | (VectorInstKind::Store { .. }, crate::Operation::Store)
-            | (VectorInstKind::Control, _)
-    )
-}
 fn physical(
     binding: Option<&RegisterBinding>,
     virtual_reg: u32,
 ) -> Result<VectorOperand, VectorIrError> {
     let b = binding.ok_or(VectorIrError::MissingRegister(virtual_reg))?;
-    Ok(VectorOperand::Register {
+    Ok(VectorOperand {
         physical: b.physical_reg,
         vector: matches!(b.space, crate::MemorySpace::RegisterVector),
         dtype: b.dtype,
@@ -454,34 +368,23 @@ mod tests {
             p.cache_key,
             VectorProgram::from_linear(&l, &s).unwrap().cache_key
         );
-        let mut malformed = p.clone();
-        malformed.instructions[0].mask.pop();
-        assert!(matches!(
-            malformed.validate(&s),
-            Err(VectorIrError::InvalidMask { .. })
-        ));
         let mut malformed_tail = VectorProgram::from_linear(&l, &s).unwrap();
         malformed_tail.tail_elements = usize::from(malformed_tail.lanes);
         assert!(matches!(
             malformed_tail.b1_eligibility(),
             Err(VectorIrError::InvalidMask { .. })
         ));
-        let mut malformed_tail_mask = VectorProgram::from_linear(&l, &s).unwrap();
-        malformed_tail_mask.instructions[0].mask.fill(false);
-        assert!(matches!(
-            malformed_tail_mask.b1_eligibility(),
-            Err(VectorIrError::InvalidMask { .. })
-        ));
         let mut bad_register = p;
         for instruction in &mut bad_register.instructions {
-            if let Some(VectorOperand::Register { physical, .. }) = instruction.dst.as_mut() {
-                *physical = u32::MAX;
-                break;
-            }
+            let LaneInstruction::Address { output } = &mut instruction.instruction else {
+                continue;
+            };
+            output.register.physical = u32::MAX;
+            break;
         }
         assert!(matches!(
             bad_register.validate(&s),
-            Err(VectorIrError::InvalidRegisterClass(u32::MAX))
+            Err(VectorIrError::Unsupported(reason)) if reason.contains("no live compatible binding")
         ));
     }
 
@@ -500,6 +403,157 @@ mod tests {
         assert!(matches!(
             program.b1_eligibility(),
             Err(VectorIrError::Unsupported(reason)) if reason == "portable binary opcode"
+        ));
+    }
+
+    #[test]
+    fn vector_validation_tracks_reaching_descriptor_and_lane_width() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([4]));
+        let output = graph.square(input).unwrap();
+        let linear =
+            crate::LinearKernel::from_uop(&lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+        let spaces = MemorySpacePlan::from_linear(&linear).unwrap();
+        let program = VectorProgram::from_linear(&linear, &spaces).unwrap();
+
+        let mut wrong_address = program.clone();
+        let mut changed = false;
+        for instruction in &mut wrong_address.instructions {
+            let LaneInstruction::Index { address, .. } = &mut instruction.instruction else {
+                continue;
+            };
+            address.value.name.push_str("_mismatch");
+            changed = true;
+            break;
+        }
+        assert!(changed);
+        assert!(matches!(
+            wrong_address.validate(&spaces),
+            Err(VectorIrError::Unsupported(reason)) if reason.contains("descriptor mismatch")
+        ));
+
+        let mut wrong_lanes = program.clone();
+        let mut changed = false;
+        for instruction in &mut wrong_lanes.instructions {
+            let LaneInstruction::Constant { output, .. } = &mut instruction.instruction else {
+                continue;
+            };
+            output.ty.lanes = 2;
+            changed = true;
+            break;
+        }
+        assert!(changed);
+        assert!(matches!(
+            wrong_lanes.validate(&spaces),
+            Err(VectorIrError::Unsupported(reason)) if reason.contains("lane width")
+        ));
+
+        let mut expired_spaces = spaces.clone();
+        let (instruction_index, operand) = program
+            .instructions
+            .iter()
+            .find_map(|instruction| {
+                (instruction.index > 0)
+                    .then(|| {
+                        instruction
+                            .instruction
+                            .view()
+                            .inputs()
+                            .next()
+                            .map(|operand| (instruction.index, operand.clone()))
+                    })
+                    .flatten()
+            })
+            .unwrap();
+        for binding in &mut expired_spaces.registers {
+            if binding.physical_reg == operand.physical
+                && matches!(binding.space, crate::MemorySpace::RegisterVector) == operand.vector
+                && binding.dtype == operand.dtype
+                && binding.start <= instruction_index
+                && instruction_index <= binding.end
+            {
+                binding.end = instruction_index - 1;
+            }
+        }
+        assert!(matches!(
+            program.validate(&expired_spaces),
+            Err(VectorIrError::Unsupported(reason)) if reason.contains("no live compatible binding")
+        ));
+    }
+
+    #[test]
+    fn bitcast_and_reduction_programs_fail_closed_before_vector_emission() {
+        let mut cast_graph = Graph::new();
+        let input = cast_graph.input("input", Shape::from([4]));
+        let output = cast_graph.cast(input, crate::DType::I32).unwrap();
+        let linear =
+            crate::LinearKernel::from_uop(&lower_graph_elementwise(&cast_graph, output).unwrap())
+                .unwrap();
+        let spaces = MemorySpacePlan::from_linear(&linear).unwrap();
+        let original = VectorProgram::from_linear(&linear, &spaces).unwrap();
+        let mut local_address = original.clone();
+        let mut changed = false;
+        for instruction in &mut local_address.instructions {
+            let LaneInstruction::Address { output } = &mut instruction.instruction else {
+                continue;
+            };
+            output.value.space = crate::AddressSpace::Local;
+            changed = true;
+            break;
+        }
+        assert!(changed);
+        assert!(matches!(
+            local_address.b1_eligibility(),
+            Err(VectorIrError::Unsupported(reason)) if reason.contains("global memory")
+        ));
+
+        let mut bitcast = original;
+        let mut changed = false;
+        for instruction in &mut bitcast.instructions {
+            let LaneInstruction::Cast { output, input } = &instruction.instruction else {
+                continue;
+            };
+            instruction.instruction = LaneInstruction::Bitcast {
+                output: output.clone(),
+                input: input.clone(),
+            };
+            changed = true;
+            break;
+        }
+        assert!(changed);
+        assert!(matches!(
+            bitcast.b1_eligibility(),
+            Err(VectorIrError::Unsupported(reason)) if reason == "portable bitcast opcode"
+        ));
+
+        let mut reduction_graph = Graph::new();
+        let input = reduction_graph.input("input", Shape::from([2, 3]));
+        let output = reduction_graph
+            .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        let scheduled = crate::schedule(&reduction_graph, output).unwrap();
+        let kernel = &scheduled.items.last().unwrap().kernel;
+        let linear = crate::LinearKernel::from_uop(kernel).unwrap();
+        assert!(!linear.enabled);
+        assert!(
+            linear
+                .program
+                .unsupported_operations
+                .iter()
+                .any(|operation| matches!(
+                    operation.operation,
+                    crate::Operation::ReduceInit(_)
+                        | crate::Operation::ReduceAccumulate
+                        | crate::Operation::ReduceFinalize
+                ))
+        );
+        let spaces = MemorySpacePlan::from_linear(&linear).unwrap();
+        let vector = VectorProgram::from_linear(&linear, &spaces).unwrap();
+        assert!(vector.instructions.is_empty());
+        assert!(matches!(
+            vector.b1_eligibility(),
+            Err(VectorIrError::Unsupported(_))
         ));
     }
 }

@@ -1,26 +1,7 @@
 use super::graph::{dtype_name, shape_name};
-use super::uop::kind_name;
 use super::{VizEdge, VizError, VizGraph, VizNode};
-use crate::{
-    LinearInstKind, LinearKernel, MemorySpace, MemorySpacePlan, VectorInstKind, VectorOperand,
-    VectorProgram,
-};
-
-fn linear_kind(kind: &LinearInstKind) -> &'static str {
-    match kind {
-        LinearInstKind::Constant => "constant",
-        LinearInstKind::Address => "address",
-        LinearInstKind::Index => "index",
-        LinearInstKind::Load { .. } => "load",
-        LinearInstKind::Cast => "cast",
-        LinearInstKind::Unary => "unary",
-        LinearInstKind::Binary => "binary",
-        LinearInstKind::Compare => "compare",
-        LinearInstKind::Select => "select",
-        LinearInstKind::Store { .. } => "store",
-        LinearInstKind::Other(_) => "other",
-    }
-}
+use crate::{LinearKernel, MemorySpace, MemorySpacePlan, VectorOperand, VectorProgram};
+use std::collections::BTreeMap;
 
 /// Inspects validated linear instructions, explicit value dependencies,
 /// register pressure, vector/tail geometry, buffer identities, and cache key.
@@ -42,33 +23,59 @@ pub fn linear_viz(linear: &LinearKernel) -> Result<VizGraph, VizError> {
             .field("cache_key", linear.cache_key.to_string())
             .field("enabled", linear.enabled.to_string())
             .field("reason", linear.reason.clone())
+            .field(
+                "control_operations",
+                linear
+                    .program
+                    .control_operations
+                    .iter()
+                    .map(|operation| format!("{}:{:?}", operation.index, operation.operation))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            )
+            .field(
+                "unsupported_operations",
+                linear
+                    .program
+                    .unsupported_operations
+                    .iter()
+                    .map(|operation| format!("{}:{:?}", operation.index, operation.operation))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            )
             .field("peak_scalar", linear.program.peak_scalar.to_string())
             .field("peak_vector", linear.program.peak_vector.to_string()),
     );
     for inst in &linear.program.instructions {
+        let view = inst.instruction.view();
         let mut node = VizNode::new(
             format!("l{}", inst.index),
             "linear_inst",
-            linear_kind(&inst.kind),
+            view.semantic_name,
         )
-        .field("dtype", dtype_name(inst.dtype))
-        .field("lanes", inst.lanes.to_string())
-        .field("uop", kind_name(&inst.payload.operation));
-        if let Some(dst) = inst.dst {
+        .field(
+            "dtype",
+            view.result_type()
+                .map(|ty| dtype_name(ty.scalar))
+                .unwrap_or("none"),
+        )
+        .field(
+            "lanes",
+            if linear.enabled { linear.lanes } else { 1 }.to_string(),
+        )
+        .field("uop", view.semantic_name);
+        if let Some(dst) = view.output() {
             node = node.field("dst", dst.to_string());
         }
-        if let LinearInstKind::Load { buffer } | LinearInstKind::Store { buffer } = inst.kind {
+        if let Some(buffer) = view.buffer {
             node = node.field("buffer", buffer.to_string());
         }
-        if let LinearInstKind::Other(reason) = &inst.kind {
-            node = node.field("detail", reason.clone());
-        }
-        for (slot, input) in inst.inputs.iter().enumerate() {
+        for (slot, input) in view.inputs().enumerate() {
             if let Some(producer) = linear
                 .program
                 .instructions
                 .iter()
-                .find(|candidate| candidate.dst == Some(*input))
+                .find(|candidate| candidate.instruction.view().output() == Some(input))
             {
                 edges.push(VizEdge::new(
                     format!("l{}", producer.index),
@@ -167,29 +174,8 @@ pub fn memory_space_viz(plan: &MemorySpacePlan) -> Result<VizGraph, VizError> {
     VizGraph::try_new("rustgrad_memory_space", nodes, edges)
 }
 
-fn vector_kind(kind: &VectorInstKind) -> &'static str {
-    match kind {
-        VectorInstKind::Splat => "splat",
-        VectorInstKind::Address => "address",
-        VectorInstKind::Index => "index",
-        VectorInstKind::Load { .. } => "load",
-        VectorInstKind::Cast => "cast",
-        VectorInstKind::Unary => "unary",
-        VectorInstKind::Binary => "binary",
-        VectorInstKind::Compare => "compare",
-        VectorInstKind::Select => "select",
-        VectorInstKind::Store { .. } => "store",
-        VectorInstKind::Control => "control",
-    }
-}
-
 fn operand_id(operand: &VectorOperand) -> String {
-    match operand {
-        VectorOperand::Register {
-            physical, vector, ..
-        } => format!("vr{}:{physical}", u8::from(*vector)),
-        VectorOperand::Global { buffer } => format!("vg{buffer}"),
-    }
+    format!("vr{}:{}", u8::from(operand.vector), operand.physical)
 }
 
 /// Inspects a validated vector program. Validation uses the supplied memory
@@ -207,37 +193,42 @@ pub fn vector_viz(program: &VectorProgram, spaces: &MemorySpacePlan) -> Result<V
             .field("enabled", program.enabled.to_string()),
     ];
     let mut edges = Vec::new();
+    let mask = (0..usize::from(program.lanes))
+        .map(|lane| {
+            if lane < program.tail_elements {
+                '1'
+            } else {
+                '0'
+            }
+        })
+        .collect::<String>();
+    let operand_key = |operand: &VectorOperand| (operand.physical, operand.vector, operand.dtype);
+    let mut definitions = BTreeMap::<(u32, bool, crate::DType), u32>::new();
     for inst in &program.instructions {
+        let view = inst.instruction.view();
         let mut node = VizNode::new(
             format!("v{}", inst.index),
             "vector_inst",
-            vector_kind(&inst.kind),
+            view.semantic_name,
         )
-        .field("lanes", inst.lanes.to_string())
-        .field("uop", kind_name(&inst.payload.operation))
-        .field(
-            "mask",
-            inst.mask
-                .iter()
-                .map(|bit| if *bit { '1' } else { '0' })
-                .collect::<String>(),
-        );
-        if let Some(dst) = &inst.dst {
+        .field("lanes", program.lanes.to_string())
+        .field("uop", view.semantic_name)
+        .field("mask", mask.clone());
+        if let Some(dst) = view.output() {
             node = node.field("dst", operand_id(dst));
         }
-        for (slot, input) in inst.inputs.iter().enumerate() {
-            if let Some(producer) = program
-                .instructions
-                .iter()
-                .find(|candidate| candidate.dst.as_ref() == Some(input))
-            {
+        for (slot, input) in view.inputs().enumerate() {
+            if let Some(producer) = definitions.get(&operand_key(input)) {
                 edges.push(VizEdge::new(
-                    format!("v{}", producer.index),
+                    format!("v{producer}"),
                     format!("v{}", inst.index),
                     "value",
                     slot.to_string(),
                 ));
             }
+        }
+        if let Some(output) = view.output() {
+            definitions.insert(operand_key(output), inst.index);
         }
         edges.push(VizEdge::new(
             format!("v{}", inst.index),

@@ -152,8 +152,9 @@ pub use kernel::{
     lower_graph_static_conv2d,
 };
 pub use linearize::{
-    LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearPayload,
-    LinearProgram, LinearizeError, LiveInterval, RegisterAssignment, RegisterClass, allocate,
+    AddressRef, IndexRef, LaneInstruction, LaneInstructionView, LaneProgramInstruction,
+    LaneSourceRecord, LinearAccess, LinearBuffer, LinearKernel, LinearProgram, LinearizeError,
+    LiveInterval, RegisterAssignment, RegisterClass, TypedValue, allocate,
 };
 pub use linked_exp::*;
 pub use loss::{
@@ -275,7 +276,7 @@ pub use uop::{
     MatmulValue, MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue,
     TensorGuardValue, UOp, UOpError, UPat, UType, VariableValue, ViewMap,
 };
-pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
+pub use vector_ir::{VectorIrError, VectorOperand, VectorProgram};
 pub use viz::{
     VizEdge, VizError, VizGraph, VizNode, captured_replay_trace_viz, captured_schedule_viz,
     captured_specialization_trace_viz, compile_trace_viz, cuda_collective_trace_viz, graph_viz,
