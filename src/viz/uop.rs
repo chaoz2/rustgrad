@@ -1,7 +1,7 @@
 use super::graph::{dtype_name, i64_list, shape_name, usize_list};
 use super::{VizEdge, VizError, VizGraph, VizNode};
 use crate::uop::{Binary, Unary};
-use crate::{AddressSpace, UArgRef, UOp, UOpKind};
+use crate::{AddressSpace, Operation, UArgRef, UOp};
 use std::collections::BTreeMap;
 
 fn unary_name(op: Unary) -> &'static str {
@@ -29,47 +29,47 @@ fn binary_name(op: Binary) -> &'static str {
     }
 }
 
-pub(super) fn kind_name(kind: &UOpKind) -> String {
+pub(super) fn kind_name(kind: &Operation) -> String {
     match kind {
-        UOpKind::Const => "const".into(),
-        UOpKind::VConst => "vconst".into(),
-        UOpKind::DefineVar => "define_var".into(),
-        UOpKind::DefineGlobal => "define_global".into(),
-        UOpKind::DefineLocal => "define_local".into(),
-        UOpKind::DefineRegister => "define_register".into(),
-        UOpKind::Special => "special".into(),
-        UOpKind::Range => "range".into(),
-        UOpKind::EndRange => "end_range".into(),
-        UOpKind::If => "if".into(),
-        UOpKind::EndIf => "end_if".into(),
-        UOpKind::Unary(op) => format!("unary.{}", unary_name(*op)),
-        UOpKind::Binary(op) => format!("binary.{}", binary_name(*op)),
-        UOpKind::GraphUnary(op) => format!("graph_unary.{}", op.name()),
-        UOpKind::GraphBinary(op) => format!("graph_binary.{}", op.name()),
-        UOpKind::GraphCompare(op) => format!("graph_compare.{}", op.name()),
-        UOpKind::GraphLogical(op) => format!("graph_logical.{}", op.name()),
-        UOpKind::Matmul => "matmul".into(),
-        UOpKind::Conv2d => "conv2d.static_1x1".into(),
-        UOpKind::Movement => "movement".into(),
-        UOpKind::Random => "random".into(),
-        UOpKind::PrefixScan => "prefix_scan".into(),
-        UOpKind::Sort => "sort.pair".into(),
-        UOpKind::TensorGuard => "tensor_guard".into(),
-        UOpKind::ReduceInit => "reduce_init".into(),
-        UOpKind::ReduceAccumulate => "reduce_accumulate".into(),
-        UOpKind::ReduceFinalize => "reduce_finalize".into(),
-        UOpKind::Ternary(_) => "ternary.where".into(),
-        UOpKind::Cast => "cast".into(),
-        UOpKind::Bitcast => "bitcast".into(),
-        UOpKind::Vectorize => "vectorize".into(),
-        UOpKind::Gep => "gep".into(),
-        UOpKind::Index => "index".into(),
-        UOpKind::Load => "load".into(),
-        UOpKind::Store => "store".into(),
-        UOpKind::EffectStore => "effect_store".into(),
-        UOpKind::After => "after".into(),
-        UOpKind::Barrier => "barrier".into(),
-        UOpKind::Sink => "sink".into(),
+        Operation::Const => "const".into(),
+        Operation::VConst => "vconst".into(),
+        Operation::DefineVar => "define_var".into(),
+        Operation::DefineGlobal => "define_global".into(),
+        Operation::DefineLocal => "define_local".into(),
+        Operation::DefineRegister => "define_register".into(),
+        Operation::Special => "special".into(),
+        Operation::Range => "range".into(),
+        Operation::EndRange => "end_range".into(),
+        Operation::If => "if".into(),
+        Operation::EndIf => "end_if".into(),
+        Operation::Unary(op) => format!("unary.{}", unary_name(*op)),
+        Operation::Binary(op) => format!("binary.{}", binary_name(*op)),
+        Operation::GraphUnary(op) => format!("graph_unary.{}", op.name()),
+        Operation::GraphBinary(op) => format!("graph_binary.{}", op.name()),
+        Operation::GraphCompare(op) => format!("graph_compare.{}", op.name()),
+        Operation::GraphLogical(op) => format!("graph_logical.{}", op.name()),
+        Operation::Matmul => "matmul".into(),
+        Operation::Conv2d => "conv2d.static_1x1".into(),
+        Operation::Movement => "movement".into(),
+        Operation::Random => "random".into(),
+        Operation::PrefixScan => "prefix_scan".into(),
+        Operation::Sort => "sort.pair".into(),
+        Operation::TensorGuard => "tensor_guard".into(),
+        Operation::ReduceInit => "reduce_init".into(),
+        Operation::ReduceAccumulate => "reduce_accumulate".into(),
+        Operation::ReduceFinalize => "reduce_finalize".into(),
+        Operation::Ternary(_) => "ternary.where".into(),
+        Operation::Cast => "cast".into(),
+        Operation::Bitcast => "bitcast".into(),
+        Operation::Vectorize => "vectorize".into(),
+        Operation::Gep => "gep".into(),
+        Operation::Index => "index".into(),
+        Operation::Load => "load".into(),
+        Operation::Store => "store".into(),
+        Operation::EffectStore => "effect_store".into(),
+        Operation::After => "after".into(),
+        Operation::Barrier => "barrier".into(),
+        Operation::Sink => "sink".into(),
     }
 }
 
@@ -345,7 +345,7 @@ pub fn uop_viz(root: &UOp) -> Result<VizGraph, VizError> {
     let mut viz_nodes = Vec::with_capacity(nodes.len());
     let mut edges = Vec::new();
     for (id, node) in nodes.iter().enumerate() {
-        let mut viz = VizNode::new(format!("u{id}"), "uop", kind_name(&node.kind()))
+        let mut viz = VizNode::new(format!("u{id}"), "uop", kind_name(&node.operation()))
             .field("family", node.operation().signature().family.name());
         if let Some(ty) = node.ty() {
             viz = viz.field("type", format!("{}x{}", dtype_name(ty.scalar), ty.lanes));

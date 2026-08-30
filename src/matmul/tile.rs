@@ -752,7 +752,7 @@ mod tests {
             Err(TiledMatmulError::InvalidPlan)
         ));
         let kernel = crate::UOp::try_new(
-            crate::UOpKind::Matmul,
+            crate::Operation::Matmul,
             Some(crate::UType::scalar(DType::F32)),
             vec![],
             crate::UArg::TiledMatmul(Box::new(TiledMatmulPayload {

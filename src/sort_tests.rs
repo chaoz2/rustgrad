@@ -117,8 +117,8 @@ fn sort_schedule_coalesces_one_typed_producer_and_cpu_materializes_both() {
         indices.index() as u64
     );
     assert!(matches!(
-        schedule.items[0].kernel.kind(),
-        crate::UOpKind::Sort
+        schedule.items[0].kernel.operation(),
+        crate::Operation::Sort
     ));
 
     let realized = crate::realize_graph(
@@ -180,7 +180,7 @@ fn sort_artifact_trace_rejection_and_invalid_axis_are_explicit() {
     assert!(
         crate::uop::artifact::encode(
             &crate::UOp::try_new(
-                crate::UOpKind::Sort,
+                crate::Operation::Sort,
                 Some(crate::UType::scalar(DType::F32)),
                 vec![],
                 crate::UArg::Sort {

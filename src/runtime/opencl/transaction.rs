@@ -1,6 +1,6 @@
 //! Typed metadata and bounded fault reconstruction for transactional kernels.
 use super::OpenClError;
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArgRef, UOp, UOpKind};
+use crate::{BinaryOp, CompareOp, DType, LogicalOp, Operation, Scalar, Shape, UArgRef, UOp};
 use std::collections::BTreeMap;
 
 pub const OPENCL_TRANSACTION_ABI_VERSION: u32 = 3;
@@ -90,7 +90,7 @@ impl OpenClTransactionAbi {
             .topological()
             .map_err(|error| OpenClError::Unsupported(error.to_string()))?
         {
-            let UOpKind::GraphBinary(op) = node.kind() else {
+            let Operation::GraphBinary(op) = node.operation() else {
                 continue;
             };
             let Some(operation) = GuardedIntegerOp::from_binary(op) else {
@@ -237,8 +237,8 @@ where
         .ty()
         .ok_or_else(|| OpenClError::InvalidBinding("untyped detail expression".into()))?
         .scalar;
-    let value = match node.kind() {
-        UOpKind::Const => match node.arg() {
+    let value = match node.operation() {
+        Operation::Const => match node.arg() {
             UArgRef::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits),
             UArgRef::Int(value) => Scalar::I(*value),
             _ => {
@@ -247,21 +247,21 @@ where
                 ));
             }
         },
-        UOpKind::Load => {
+        Operation::Load => {
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| OpenClError::InvalidBinding("detail load lacks index".into()))?;
             load(index.arg(), dtype, logical)?
         }
-        UOpKind::Cast => {
+        Operation::Cast => {
             let source = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             cast(source, dtype)
         }
-        UOpKind::GraphUnary(op) => {
+        Operation::GraphUnary(op) => {
             let source = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -274,7 +274,7 @@ where
                 _ => return Err(OpenClError::Unsupported("detail unary expression".into())),
             }
         }
-        UOpKind::GraphBinary(op) => {
+        Operation::GraphBinary(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -290,7 +290,7 @@ where
             }
             integer_binary(op, dtype, lhs, rhs)?
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -301,7 +301,7 @@ where
             };
             Scalar::Bool(compare(lhs, rhs, op))
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value.as_bool(),
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -319,7 +319,7 @@ where
                 }
             }
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             let condition = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),

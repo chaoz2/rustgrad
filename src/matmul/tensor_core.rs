@@ -632,7 +632,7 @@ mod tests {
         let mut bad_fragment = payload.clone();
         bad_fragment.tensor_core.fragments.lhs_registers_per_lane = 3;
         let bad_fragment = crate::UOp::try_new(
-            crate::UOpKind::Matmul,
+            crate::Operation::Matmul,
             Some(crate::UType::scalar(DType::F16)),
             vec![],
             crate::UArg::TensorCoreMatmul(Box::new(bad_fragment)),
@@ -644,7 +644,7 @@ mod tests {
         let mut bad_barrier = payload.clone();
         bad_barrier.tensor_core.barriers[0].uniform = false;
         let bad_barrier = crate::UOp::try_new(
-            crate::UOpKind::Matmul,
+            crate::Operation::Matmul,
             Some(crate::UType::scalar(DType::F16)),
             vec![],
             crate::UArg::TensorCoreMatmul(Box::new(bad_barrier)),
@@ -656,7 +656,7 @@ mod tests {
         let mut bad_layout = payload.clone();
         bad_layout.tensor_core.lhs_shared.alignment = 2;
         let bad_layout = crate::UOp::try_new(
-            crate::UOpKind::Matmul,
+            crate::Operation::Matmul,
             Some(crate::UType::scalar(DType::F16)),
             vec![],
             crate::UArg::TensorCoreMatmul(Box::new(bad_layout)),

@@ -2,8 +2,8 @@ use super::*;
 use crate::uop::Ternary;
 use crate::{
     Backend, CapturedSchedule, CompareOp, CpuBackend, CpuJit, DType, Float8Format, Float8Storage,
-    LogicalOp, MovementKernelKind, MovementKernelPlan, Op, ReduceKind, Scalar, Shape, Storage,
-    TensorData, UArgRef, UOpKind, UnaryOp, schedule,
+    LogicalOp, MovementKernelKind, MovementKernelPlan, Op, Operation, ReduceKind, Scalar, Shape,
+    Storage, TensorData, UArgRef, UnaryOp, schedule,
 };
 use std::{
     fs::{self, File},
@@ -251,7 +251,7 @@ fn matmul_cases_round_trip_capture_and_keep_f32_storage_rounding() {
         let scheduled = schedule(&built.graph, built.output).unwrap();
         assert_eq!(scheduled.items.len(), 1);
         let item = &scheduled.items[0];
-        assert!(matches!(item.kernel.kind(), UOpKind::Matmul));
+        assert!(matches!(item.kernel.operation(), Operation::Matmul));
         let rendered_plan = item
             .kernel
             .arg()
@@ -386,7 +386,7 @@ fn reduction_cases_round_trip_capture_render_and_preserve_extrema_payloads() {
                 .topological()
                 .unwrap()
                 .iter()
-                .any(|uop| { matches!(uop.kind(), UOpKind::ReduceFinalize) })
+                .any(|uop| { matches!(uop.operation(), Operation::ReduceFinalize) })
         );
         assert!(CpuJit::render(&item.kernel).is_ok());
         assert!(CpuJit::render_vectorized(&item.kernel).is_ok());
@@ -615,7 +615,7 @@ fn raw_reduction_dtype_matrix_preserves_output_policy_and_portable_execution_pat
                     .topological()
                     .unwrap()
                     .iter()
-                    .any(|node| matches!(node.kind(), UOpKind::ReduceFinalize))
+                    .any(|node| matches!(node.operation(), Operation::ReduceFinalize))
             );
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
@@ -1342,7 +1342,7 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
         assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
         assert_eq!(graph.dtype(output).unwrap(), dtype);
         let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
-        assert!(matches!(uop.kind(), UOpKind::Sink));
+        assert!(matches!(uop.operation(), Operation::Sink));
         assert!(CpuJit::render(&uop).is_ok());
         let vector = CpuJit::render_vectorized(&uop).unwrap();
         if matches!(dtype, DType::F16 | DType::BF16) || dtype.is_float8() {
@@ -1358,7 +1358,7 @@ fn select_cases_round_trip_capture_all_dtypes_and_vector_fallbacks() {
                 .topological()
                 .unwrap()
                 .iter()
-                .filter(|node| matches!(node.kind(), UOpKind::Ternary(Ternary::Where)))
+                .filter(|node| matches!(node.operation(), Operation::Ternary(Ternary::Where)))
                 .count(),
             1
         );
@@ -1488,7 +1488,7 @@ fn cast_cases_cover_the_safe_full_concrete_dtype_matrix_without_undefined_c_cast
                     .topological()
                     .unwrap()
                     .iter()
-                    .filter(|node| matches!(node.kind(), UOpKind::Cast))
+                    .filter(|node| matches!(node.operation(), Operation::Cast))
                     .count(),
                 1,
             );
@@ -1736,7 +1736,7 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
                     .topological()
                     .unwrap()
                     .iter()
-                    .filter(|node| matches!(node.kind(), UOpKind::GraphBinary(op) if op == raw_op))
+                    .filter(|node| matches!(node.operation(), Operation::GraphBinary(op) if op == raw_op))
                     .count(),
                 1,
             );
@@ -1773,11 +1773,9 @@ fn binary_cases_cover_all_homogeneous_dtypes_and_raw_storage_boundaries() {
                 );
             }
             if dtype.is_float8() {
-                assert!(
-                    uop.topological().unwrap().iter().any(
-                        |node| matches!(node.kind(), UOpKind::GraphBinary(op) if op == raw_op)
-                    )
-                );
+                assert!(uop.topological().unwrap().iter().any(
+                    |node| matches!(node.operation(), Operation::GraphBinary(op) if op == raw_op)
+                ));
                 assert!(
                     vector.source.matches("rg_f8_decode(").count() > 1
                         && vector.source.matches("rg_f8_encode(").count() > 1,
@@ -2252,7 +2250,7 @@ fn pad_cases_round_trip_minimize_and_capture_as_movement_plans() {
         assert_eq!(scheduled.items.len(), 1);
         let item = &scheduled.items[0];
         assert!(item.boundary.is_none());
-        assert!(matches!(item.kernel.kind(), UOpKind::Movement));
+        assert!(matches!(item.kernel.operation(), Operation::Movement));
         assert!(
             matches!(item.kernel.arg(), UArgRef::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Pad { .. }))
         );
@@ -2789,7 +2787,7 @@ fn gather_cases_round_trip_minimize_and_capture_as_movement_plans() {
         assert_eq!(scheduled.items.len(), 1);
         let item = &scheduled.items[0];
         assert!(item.boundary.is_none());
-        assert!(matches!(item.kernel.kind(), UOpKind::Movement));
+        assert!(matches!(item.kernel.operation(), Operation::Movement));
         assert!(
             matches!(item.kernel.arg(), UArgRef::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Gather { .. }))
         );
@@ -3275,7 +3273,7 @@ fn scatter_cases_round_trip_minimize_and_capture_as_movement_plans() {
         assert_eq!(scheduled.items.len(), 1);
         let item = &scheduled.items[0];
         assert!(item.boundary.is_none());
-        assert!(matches!(item.kernel.kind(), UOpKind::Movement));
+        assert!(matches!(item.kernel.operation(), Operation::Movement));
         assert!(
             matches!(item.kernel.arg(), UArgRef::Movement(plan) if matches!(&plan.kind, MovementKernelKind::Scatter { .. }))
         );
@@ -4061,16 +4059,17 @@ fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
         let assert_kernel = |kernel: &crate::UOp| {
             let nodes = kernel.topological().unwrap();
             assert!(nodes.iter().any(|node| {
-                matches!(node.kind(), UOpKind::Cast)
+                matches!(node.operation(), Operation::Cast)
                     && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
             }));
-            assert!(
-                nodes
-                    .iter()
-                    .any(|node| { matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)) })
-            );
+            assert!(nodes.iter().any(|node| {
+                matches!(node.operation(), Operation::GraphCompare(CompareOp::Ne))
+            }));
             assert!(!nodes.iter().any(|node| {
-                matches!(node.kind(), UOpKind::GraphLogical(crate::LogicalOp::Not))
+                matches!(
+                    node.operation(),
+                    Operation::GraphLogical(crate::LogicalOp::Not)
+                )
             }));
         };
         for item in &scheduled.items {
@@ -4185,14 +4184,14 @@ fn logical_cases_round_trip_minimize_and_capture_as_graph_logical() {
         let scheduled = schedule(&built.graph, built.output).unwrap();
         assert!(scheduled.items.iter().any(|item| {
             item.kernel.topological().unwrap().iter().any(
-                |uop| matches!(uop.kind(), UOpKind::GraphLogical(actual) if actual == graph_op),
+                |uop| matches!(uop.operation(), Operation::GraphLogical(actual) if actual == graph_op),
             )
         }));
         let captured =
             CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         assert!(captured.items.iter().any(|item| {
             item.kernel.topological().unwrap().iter().any(
-                |uop| matches!(uop.kind(), UOpKind::GraphLogical(actual) if actual == graph_op),
+                |uop| matches!(uop.operation(), Operation::GraphLogical(actual) if actual == graph_op),
             )
         }));
     }
@@ -4320,7 +4319,7 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
         let scheduled = schedule(&built.graph, built.output).unwrap();
         assert!(scheduled.items.iter().any(|item| {
             item.kernel.topological().unwrap().iter().any(
-                |uop| matches!(uop.kind(), UOpKind::GraphCompare(actual) if actual == graph_op),
+                |uop| matches!(uop.operation(), Operation::GraphCompare(actual) if actual == graph_op),
             )
         }));
         let captured =
@@ -4328,7 +4327,7 @@ fn compare_cases_round_trip_minimize_and_capture_as_graph_compare() {
         assert_eq!(captured.items.len(), scheduled.items.len());
         assert!(captured.items.iter().any(|item| {
             item.kernel.topological().unwrap().iter().any(
-                |uop| matches!(uop.kind(), UOpKind::GraphCompare(actual) if actual == graph_op),
+                |uop| matches!(uop.operation(), Operation::GraphCompare(actual) if actual == graph_op),
             )
         }));
     }
@@ -4512,7 +4511,7 @@ fn raw_compare_dtype_matrix_retains_typed_ordering_broadcast_and_renderer_paths(
             );
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert!(scheduled.items[0].kernel.topological().unwrap().iter().any(
-                |node| matches!(node.kind(), UOpKind::GraphCompare(actual) if actual == graph_op)
+                |node| matches!(node.operation(), Operation::GraphCompare(actual) if actual == graph_op)
             ));
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();
@@ -4757,13 +4756,12 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
                 assert!(
                     topological
                         .iter()
-                        .any(|node| matches!(node.kind(), UOpKind::Cast))
+                        .any(|node| matches!(node.operation(), Operation::Cast))
                 );
-                assert!(
-                    topological
-                        .iter()
-                        .any(|node| matches!(node.kind(), UOpKind::GraphCompare(CompareOp::Ne)))
-                );
+                assert!(topological.iter().any(|node| matches!(
+                    node.operation(),
+                    Operation::GraphCompare(CompareOp::Ne)
+                )));
             } else {
                 let expected = match op {
                     FuzzUnaryOp::Neg => UnaryOp::Neg,
@@ -4771,7 +4769,7 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
                     _ => unreachable!("loop contains only Neg and Abs"),
                 };
                 assert!(topological.iter().any(|node| {
-                    matches!(node.kind(), UOpKind::GraphUnary(actual) if actual == expected)
+                    matches!(node.operation(), Operation::GraphUnary(actual) if actual == expected)
                 }));
             }
             assert!(CpuJit::render(kernel).is_ok(), "{op:?} {dtype:?}");
@@ -4998,7 +4996,7 @@ fn portable_float_unaries_retain_graph_capture_and_native_contracts() {
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert_eq!(scheduled.items.len(), 1);
             assert!(scheduled.items[0].kernel.topological().unwrap().iter().any(
-                |node| matches!(node.kind(), UOpKind::GraphUnary(actual) if actual == graph_op)
+                |node| matches!(node.operation(), Operation::GraphUnary(actual) if actual == graph_op)
             ));
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             assert!(
@@ -5112,7 +5110,7 @@ fn portable_storage_unaries_cover_every_concrete_dtype_and_native_fallback() {
             let scheduled = schedule(&built.graph, built.output).unwrap();
             assert_eq!(scheduled.items.len(), 1);
             assert!(scheduled.items[0].kernel.topological().unwrap().iter().any(
-                |node| matches!(node.kind(), UOpKind::GraphUnary(actual) if actual == graph_op)
+                |node| matches!(node.operation(), Operation::GraphUnary(actual) if actual == graph_op)
             ));
             let scalar = CpuJit::render(&scheduled.items[0].kernel).unwrap();
             let vector = CpuJit::render_vectorized(&scheduled.items[0].kernel).unwrap();

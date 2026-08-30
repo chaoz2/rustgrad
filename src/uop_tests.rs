@@ -1,5 +1,5 @@
 use crate::uop::{
-    self, Binary, Ternary, UArg, UOpKind, UType, Walk,
+    self, Binary, Operation, Ternary, UArg, UType, Walk,
     spec::{OpArity, OpEffect, OpFamily},
 };
 use crate::{DType, Graph, Shape, TensorData, UArgRef, UOp, UPat};
@@ -27,7 +27,7 @@ fn uop_spec_and_dag_order_are_deterministic() {
     assert_eq!(order.len(), 4);
     assert_eq!(order.last(), Some(&root));
     let bad = UOp::try_new(
-        UOpKind::Binary(Binary::Add),
+        Operation::Binary(Binary::Add),
         Some(i64t()),
         vec![x],
         UArg::None,
@@ -47,7 +47,7 @@ fn typed_operation_registry_owns_family_arity_and_effect_policy() {
     let source = UOp::constant(1, i64t());
     assert_eq!(
         UOp::try_new(
-            UOpKind::GraphLogical(crate::LogicalOp::Not),
+            Operation::GraphLogical(crate::LogicalOp::Not),
             Some(UType::scalar(DType::Bool)),
             vec![source.clone()],
             UArg::None,
@@ -60,7 +60,7 @@ fn typed_operation_registry_owns_family_arity_and_effect_policy() {
     );
     assert_eq!(
         UOp::try_new(
-            UOpKind::GraphLogical(crate::LogicalOp::And),
+            Operation::GraphLogical(crate::LogicalOp::And),
             Some(UType::scalar(DType::Bool)),
             vec![source.clone(), source.clone()],
             UArg::None,
@@ -73,7 +73,7 @@ fn typed_operation_registry_owns_family_arity_and_effect_policy() {
     );
     assert_eq!(
         UOp::try_new(
-            UOpKind::Vectorize,
+            Operation::Vectorize,
             Some(i64t()),
             vec![source.clone()],
             UArg::None,
@@ -94,14 +94,14 @@ fn typed_operation_registry_owns_family_arity_and_effect_policy() {
     );
 
     let wrong_argument = UOp::try_new(
-        UOpKind::Unary(crate::uop::Unary::Neg),
+        Operation::Unary(crate::uop::Unary::Neg),
         Some(i64t()),
         vec![source.clone()],
         UArg::Int(0),
     );
     assert_eq!(wrong_argument, Err(crate::UOpError::InvalidArgument));
     let wrong_arity = UOp::try_new(
-        UOpKind::Binary(Binary::Add),
+        Operation::Binary(Binary::Add),
         Some(i64t()),
         vec![source],
         UArg::None,
@@ -122,7 +122,7 @@ fn graph_unary_predicates_have_bool_outputs_and_retain_typed_inputs() {
         crate::UnaryOp::IsFinite,
     ] {
         UOp::try_new(
-            UOpKind::GraphUnary(op),
+            Operation::GraphUnary(op),
             Some(UType::scalar(DType::Bool)),
             vec![input.clone()],
             UArg::None,
@@ -133,7 +133,7 @@ fn graph_unary_predicates_have_bool_outputs_and_retain_typed_inputs() {
     }
 
     let wrong_predicate_output = UOp::try_new(
-        UOpKind::GraphUnary(crate::UnaryOp::IsNan),
+        Operation::GraphUnary(crate::UnaryOp::IsNan),
         Some(f32t()),
         vec![input.clone()],
         UArg::None,
@@ -141,7 +141,7 @@ fn graph_unary_predicates_have_bool_outputs_and_retain_typed_inputs() {
     .unwrap();
     assert!(wrong_predicate_output.validate().is_err());
     let wrong_value_output = UOp::try_new(
-        UOpKind::GraphUnary(crate::UnaryOp::Relu),
+        Operation::GraphUnary(crate::UnaryOp::Relu),
         Some(UType::scalar(DType::Bool)),
         vec![input],
         UArg::None,
@@ -156,7 +156,7 @@ fn upat_rewrites_are_prioritized_shared_and_pure() {
     let zero = UOp::scalar_constant(DType::I32, 0, i32t());
     let shared = UOp::binary(Binary::Add, x.clone(), zero);
     let root = UOp::sink(vec![shared.clone(), shared]);
-    let pattern = UPat::op(UOpKind::Binary(Binary::Add))
+    let pattern = UPat::op(Operation::Binary(Binary::Add))
         .sources(vec![UPat::any().named("left"), UPat::any().named("right")]);
     assert_eq!(
         pattern.matches(&root.sources()[0]).unwrap().get("left"),
@@ -196,7 +196,7 @@ fn raw_scalar_identity_rewrite_is_type_checked_and_preserves_signed_zero() {
 fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
     let malformed = [
         UOp::try_new(
-            UOpKind::Const,
+            Operation::Const,
             Some(f32t()),
             vec![],
             UArg::Scalar {
@@ -206,7 +206,7 @@ fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
         )
         .unwrap(),
         UOp::try_new(
-            UOpKind::Const,
+            Operation::Const,
             Some(UType::scalar(DType::U8)),
             vec![],
             UArg::Scalar {
@@ -216,7 +216,7 @@ fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
         )
         .unwrap(),
         UOp::try_new(
-            UOpKind::VConst,
+            Operation::VConst,
             Some(UType::scalar(DType::Bool)),
             vec![],
             UArg::Scalar {
@@ -225,7 +225,7 @@ fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
             },
         )
         .unwrap(),
-        UOp::try_new(UOpKind::Const, None, vec![], UArg::Int(0)).unwrap(),
+        UOp::try_new(Operation::Const, None, vec![], UArg::Int(0)).unwrap(),
     ];
     for literal in malformed {
         assert!(literal.validate().is_err());
@@ -296,21 +296,21 @@ fn where_same_keeps_fallible_condition_but_folds_constant_condition() {
     let one = UOp::constant(1, i32t);
     let zero = UOp::constant(0, i32t);
     let div = UOp::try_new(
-        UOpKind::GraphBinary(crate::BinaryOp::Div),
+        Operation::GraphBinary(crate::BinaryOp::Div),
         Some(i32t),
         vec![one.clone(), zero],
         UArg::None,
     )
     .unwrap();
     let condition = UOp::try_new(
-        UOpKind::GraphCompare(crate::CompareOp::Eq),
+        Operation::GraphCompare(crate::CompareOp::Eq),
         Some(boolt),
         vec![div.clone(), one],
         UArg::None,
     )
     .unwrap();
     let guarded = UOp::try_new(
-        UOpKind::Ternary(Ternary::Where),
+        Operation::Ternary(Ternary::Where),
         Some(i32t),
         vec![condition.clone(), div.clone(), div.clone()],
         UArg::None,
@@ -328,7 +328,7 @@ fn where_same_keeps_fallible_condition_but_folds_constant_condition() {
     let nan = UOp::scalar_constant(DType::F32, 0x7fc0_1234, UType::scalar(DType::F32));
     let constant_condition = UOp::constant(0, boolt);
     let safe = UOp::try_new(
-        UOpKind::Ternary(Ternary::Where),
+        Operation::Ternary(Ternary::Where),
         Some(UType::scalar(DType::F32)),
         vec![constant_condition, nan.clone(), nan.clone()],
         UArg::None,
@@ -350,10 +350,10 @@ fn uop_graph_scalar_pilot_is_inspectable() {
     let y = graph.add(x, one).unwrap();
     let uop = uop::lower_graph_scalar(&graph, y).unwrap();
     uop.validate().unwrap();
-    assert!(matches!(uop.kind(), UOpKind::Binary(Binary::Add)));
+    assert!(matches!(uop.operation(), Operation::Binary(Binary::Add)));
     let condition = UOp::constant(1, UType::scalar(DType::Bool));
     let where_ = UOp::try_new(
-        UOpKind::Ternary(Ternary::Where),
+        Operation::Ternary(Ternary::Where),
         uop.ty(),
         vec![condition, uop.clone(), uop],
         UArg::None,
@@ -412,13 +412,13 @@ fn typed_scalar_rewrite_leaves_fixed_schedule_cache_identity_stable() {
     let (rewritten, trace) =
         uop::rewrite(&lowered, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
     assert_eq!(trace.rules, vec!["add-zero"]);
-    assert_eq!(rewritten.kind(), lowered.sources()[0].kind());
+    assert_eq!(rewritten.operation(), lowered.sources()[0].operation());
 }
 
 #[test]
 fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
     let base = UOp::try_new(
-        UOpKind::DefineGlobal,
+        Operation::DefineGlobal,
         Some(i64t()),
         vec![],
         UArg::Address {
@@ -429,14 +429,14 @@ fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
     )
     .unwrap();
     let range = UOp::try_new(
-        UOpKind::Range,
+        Operation::Range,
         Some(i64t()),
         vec![UOp::constant(6, i64t())],
         UArg::RangeAxis(0),
     )
     .unwrap();
     let invalid = UOp::try_new(
-        UOpKind::Index,
+        Operation::Index,
         Some(i64t()),
         vec![base, range.clone()],
         UArg::BufferIndex {
@@ -449,7 +449,7 @@ fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
     .unwrap();
     let root = UOp::sink(vec![
         invalid,
-        UOp::try_new(UOpKind::EndRange, None, vec![range], UArg::None).unwrap(),
+        UOp::try_new(Operation::EndRange, None, vec![range], UArg::None).unwrap(),
     ]);
     assert!(root.validate().is_err());
 }

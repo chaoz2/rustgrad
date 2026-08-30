@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn linked_exp_renderer_rejects_noncanonical_index_and_range_graphs() {
-        use crate::{AddressSpace, UArg, UOp, UOpKind, UType};
+        use crate::{AddressSpace, Operation, UArg, UOp, UType};
 
         let (_, capture, _, request, _, _) = fixture();
         let renderer = PtxRenderer::new(80).unwrap();
@@ -561,31 +561,31 @@ mod tests {
                        output_offset: UOp,
                        ended_range: UOp| {
             let input_index = UOp::try_new(
-                UOpKind::Index,
+                Operation::Index,
                 input_index.ty(),
                 vec![input_address, input_offset],
                 input_index.arg().to_owned(),
             )
             .unwrap();
             let output_index = UOp::try_new(
-                UOpKind::Index,
+                Operation::Index,
                 output_index.ty(),
                 vec![output_address, output_offset],
                 output_index.arg().to_owned(),
             )
             .unwrap();
             let load =
-                UOp::try_new(UOpKind::Load, load.ty(), vec![input_index], UArg::None).unwrap();
+                UOp::try_new(Operation::Load, load.ty(), vec![input_index], UArg::None).unwrap();
             let exp = UOp::try_new(
-                UOpKind::GraphUnary(crate::UnaryOp::Exp),
+                Operation::GraphUnary(crate::UnaryOp::Exp),
                 exp.ty(),
                 vec![load],
                 UArg::None,
             )
             .unwrap();
             UOp::sink(vec![
-                UOp::try_new(UOpKind::Store, None, vec![output_index, exp], UArg::None).unwrap(),
-                UOp::try_new(UOpKind::EndRange, None, vec![ended_range], UArg::None).unwrap(),
+                UOp::try_new(Operation::Store, None, vec![output_index, exp], UArg::None).unwrap(),
+                UOp::try_new(Operation::EndRange, None, vec![ended_range], UArg::None).unwrap(),
             ])
         };
 
@@ -597,7 +597,7 @@ mod tests {
             range.clone(),
         );
         let wrong_bound = UOp::try_new(
-            UOpKind::Range,
+            Operation::Range,
             Some(UType::scalar(DType::I64)),
             vec![UOp::constant(4, UType::scalar(DType::I64))],
             UArg::RangeAxis(0),
@@ -611,7 +611,7 @@ mod tests {
             wrong_bound,
         );
         let wrong_address = UOp::try_new(
-            UOpKind::DefineGlobal,
+            Operation::DefineGlobal,
             Some(UType::scalar(DType::F32)),
             vec![],
             UArg::Address {
@@ -629,7 +629,7 @@ mod tests {
             range.clone(),
         );
         let different_end = UOp::try_new(
-            UOpKind::Range,
+            Operation::Range,
             Some(UType::scalar(DType::I64)),
             vec![UOp::constant(3, UType::scalar(DType::I64))],
             UArg::RangeAxis(1),
@@ -643,7 +643,7 @@ mod tests {
             different_end,
         );
         let separate_equal_range = UOp::try_new(
-            UOpKind::Range,
+            Operation::Range,
             Some(UType::scalar(DType::I64)),
             input_index.sources()[1].sources().to_vec(),
             UArg::RangeAxis(0),
@@ -671,7 +671,7 @@ mod tests {
                     .is_err()
             );
         }
-        assert!(matches!(end_range.kind(), UOpKind::EndRange));
+        assert!(matches!(end_range.operation(), Operation::EndRange));
     }
 
     #[test]

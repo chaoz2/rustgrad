@@ -5489,15 +5489,19 @@ pub(crate) mod tests {
                 crate::ptx::KernelSemanticProgram::UOp(program) => match program
                     .sources()
                     .iter()
-                    .find(|node| matches!(node.kind(), crate::UOpKind::Store))
+                    .find(|node| matches!(node.operation(), crate::Operation::Store))
                     .and_then(|store| store.sources().first())
-                    .map(|index| index.arg())
+                    .map(|index| index.operation())
                 {
-                    Some(crate::UArgRef::BufferIndex { buffer, .. }) => *buffer,
-                    _ if matches!(program.kind(), crate::UOpKind::Random) => match program.arg() {
-                        crate::UArgRef::Random(plan) => plan.output.index() as u64,
-                        _ => return Self::INVALID_MEMORY,
-                    },
+                    Some(crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })) => {
+                        *buffer
+                    }
+                    _ if matches!(program.operation(), crate::Operation::Random(_)) => {
+                        match program.operation() {
+                            crate::Operation::Random(plan) => plan.output.index() as u64,
+                            _ => return Self::INVALID_MEMORY,
+                        }
+                    }
                     _ => return Self::INVALID_MEMORY,
                 },
                 crate::ptx::KernelSemanticProgram::Matmul(plan) => plan.output.index() as u64,

@@ -1,6 +1,8 @@
 //! Bounded portable node-table encoding for validated UOps.
 use super::{
-    AddressSpace, AffineView, Binary, Operation, UArg, UOp, UOpKind, UType, Unary, ViewMap,
+    AddressSpace, AddressValue, AffineView, Binary, IndexValue, LiteralValue, MatmulValue,
+    MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue, TensorGuardValue, UOp,
+    UType, Unary, VariableValue, ViewMap,
 };
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
@@ -27,6 +29,489 @@ const MAX_SOURCES: usize = 1 << 20;
 const MAX_COLLECTION: usize = 1 << 20;
 const MAX_STRING: usize = 1 << 20;
 const MAX_SYMBOLIC_DEPTH: usize = 256;
+
+/// Private RGUA opcode vocabulary. It exists only while encoding or decoding
+/// stable wire tags and is never stored in a UOp node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WireOpcode {
+    Const,
+    VConst,
+    DefineVar,
+    DefineGlobal,
+    DefineLocal,
+    DefineRegister,
+    Special,
+    Range,
+    EndRange,
+    If,
+    EndIf,
+    Unary(Unary),
+    Binary(Binary),
+    GraphUnary(UnaryOp),
+    GraphBinary(BinaryOp),
+    GraphCompare(CompareOp),
+    GraphLogical(LogicalOp),
+    Matmul,
+    Conv2d,
+    Movement,
+    Random,
+    PrefixScan,
+    Sort,
+    TensorGuard,
+    ReduceInit,
+    ReduceAccumulate,
+    ReduceFinalize,
+    Ternary(super::Ternary),
+    Cast,
+    Bitcast,
+    Vectorize,
+    Gep,
+    Index,
+    Load,
+    Store,
+    EffectStore,
+    After,
+    Barrier,
+    Sink,
+}
+
+/// Private owned payload used only by the stable RGUA codec. Runtime UOps
+/// store the corresponding typed [`Operation`] variant directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WireArg {
+    None,
+    Int(i64),
+    Scalar {
+        dtype: DType,
+        bits: u64,
+    },
+    Name(String),
+    Variable {
+        name: String,
+        bounds: SymbolicExpr,
+    },
+    Address {
+        space: AddressSpace,
+        name: String,
+        element: UType,
+    },
+    RangeAxis(u32),
+    GepLane(u16),
+    BufferIndex {
+        buffer: u64,
+        elements: usize,
+        input_shape: Shape,
+        output_shape: Shape,
+    },
+    ViewBufferIndex {
+        buffer: u64,
+        elements: usize,
+        input_shape: Shape,
+        output_shape: Shape,
+        view: AffineView,
+    },
+    Reduction {
+        input_shape: Shape,
+        output_shape: Shape,
+        axes: Vec<usize>,
+        keepdim: bool,
+        kind: ReduceKind,
+        mean: bool,
+    },
+    Matmul(Box<MatmulKernelPlan>),
+    Conv2d(Box<StaticConv2dPlan>),
+    TiledMatmul(Box<TiledMatmulPayload>),
+    TensorCoreMatmul(Box<TensorCoreMatmulPayload>),
+    QuantizedMatmul(Box<QuantizedMatmulPlan>),
+    QuantizedRowGather(Box<QuantizedRowGatherPlan>),
+    Movement(Box<MovementKernelPlan>),
+    Random(Box<crate::random::plan::RandomKernelPlan>),
+    PrefixScan {
+        input: NodeId,
+        input_shape: Shape,
+        output_shape: Shape,
+        axis: usize,
+        kind: crate::PrefixScanKind,
+        output: crate::PrefixScanOutput,
+        dtype: DType,
+    },
+    Sort {
+        input: NodeId,
+        input_shape: Shape,
+        axis: usize,
+        descending: bool,
+        values: NodeId,
+        indices: NodeId,
+        dtype: DType,
+    },
+    TensorGuard {
+        input: NodeId,
+        input_shape: Shape,
+        axis: usize,
+        dtype: DType,
+    },
+    Effect(Box<crate::EffectPayload>),
+}
+
+fn operation_to_wire(operation: &Operation) -> (WireOpcode, WireArg) {
+    match operation {
+        Operation::Const(LiteralValue::Int(value)) => (WireOpcode::Const, WireArg::Int(*value)),
+        Operation::Const(LiteralValue::Scalar { dtype, bits }) => (
+            WireOpcode::Const,
+            WireArg::Scalar {
+                dtype: *dtype,
+                bits: *bits,
+            },
+        ),
+        Operation::VConst(LiteralValue::Int(value)) => (WireOpcode::VConst, WireArg::Int(*value)),
+        Operation::VConst(LiteralValue::Scalar { dtype, bits }) => (
+            WireOpcode::VConst,
+            WireArg::Scalar {
+                dtype: *dtype,
+                bits: *bits,
+            },
+        ),
+        Operation::DefineVar(value) => (
+            WireOpcode::DefineVar,
+            WireArg::Variable {
+                name: value.name.clone(),
+                bounds: value.bounds.clone(),
+            },
+        ),
+        Operation::DefineGlobal(value) => address_to_wire(WireOpcode::DefineGlobal, value),
+        Operation::DefineLocal(value) => address_to_wire(WireOpcode::DefineLocal, value),
+        Operation::DefineRegister(value) => address_to_wire(WireOpcode::DefineRegister, value),
+        Operation::Special(name) => (WireOpcode::Special, WireArg::Name(name.clone())),
+        Operation::Range(axis) => (WireOpcode::Range, WireArg::RangeAxis(*axis)),
+        Operation::EndRange => (WireOpcode::EndRange, WireArg::None),
+        Operation::If => (WireOpcode::If, WireArg::None),
+        Operation::EndIf => (WireOpcode::EndIf, WireArg::None),
+        Operation::Unary(op) => (WireOpcode::Unary(*op), WireArg::None),
+        Operation::Binary(op) => (WireOpcode::Binary(*op), WireArg::None),
+        Operation::GraphUnary(op) => (WireOpcode::GraphUnary(*op), WireArg::None),
+        Operation::GraphBinary(op) => (WireOpcode::GraphBinary(*op), WireArg::None),
+        Operation::GraphCompare(op) => (WireOpcode::GraphCompare(*op), WireArg::None),
+        Operation::GraphLogical(op) => (WireOpcode::GraphLogical(*op), WireArg::None),
+        Operation::Matmul(MatmulValue::Serial(plan)) => {
+            (WireOpcode::Matmul, WireArg::Matmul(plan.clone()))
+        }
+        Operation::Matmul(MatmulValue::Tiled(plan)) => {
+            (WireOpcode::Matmul, WireArg::TiledMatmul(plan.clone()))
+        }
+        Operation::Matmul(MatmulValue::TensorCore(plan)) => {
+            (WireOpcode::Matmul, WireArg::TensorCoreMatmul(plan.clone()))
+        }
+        Operation::Matmul(MatmulValue::Quantized(plan)) => {
+            (WireOpcode::Matmul, WireArg::QuantizedMatmul(plan.clone()))
+        }
+        Operation::Conv2d(plan) => (WireOpcode::Conv2d, WireArg::Conv2d(plan.clone())),
+        Operation::Movement(MovementValue::Plan(plan)) => {
+            (WireOpcode::Movement, WireArg::Movement(plan.clone()))
+        }
+        Operation::Movement(MovementValue::QuantizedRowGather(plan)) => (
+            WireOpcode::Movement,
+            WireArg::QuantizedRowGather(plan.clone()),
+        ),
+        Operation::Random(plan) => (WireOpcode::Random, WireArg::Random(plan.clone())),
+        Operation::PrefixScan(value) => (
+            WireOpcode::PrefixScan,
+            WireArg::PrefixScan {
+                input: value.input,
+                input_shape: value.input_shape.clone(),
+                output_shape: value.output_shape.clone(),
+                axis: value.axis,
+                kind: value.kind,
+                output: value.output,
+                dtype: value.dtype,
+            },
+        ),
+        Operation::Sort(value) => (
+            WireOpcode::Sort,
+            WireArg::Sort {
+                input: value.input,
+                input_shape: value.input_shape.clone(),
+                axis: value.axis,
+                descending: value.descending,
+                values: value.values,
+                indices: value.indices,
+                dtype: value.dtype,
+            },
+        ),
+        Operation::TensorGuard(value) => (
+            WireOpcode::TensorGuard,
+            WireArg::TensorGuard {
+                input: value.input,
+                input_shape: value.input_shape.clone(),
+                axis: value.axis,
+                dtype: value.dtype,
+            },
+        ),
+        Operation::ReduceInit(value) => (
+            WireOpcode::ReduceInit,
+            WireArg::Reduction {
+                input_shape: value.input_shape.clone(),
+                output_shape: value.output_shape.clone(),
+                axes: value.axes.clone(),
+                keepdim: value.keepdim,
+                kind: value.kind,
+                mean: value.mean,
+            },
+        ),
+        Operation::ReduceAccumulate => (WireOpcode::ReduceAccumulate, WireArg::None),
+        Operation::ReduceFinalize => (WireOpcode::ReduceFinalize, WireArg::None),
+        Operation::Ternary(op) => (WireOpcode::Ternary(*op), WireArg::None),
+        Operation::Cast => (WireOpcode::Cast, WireArg::None),
+        Operation::Bitcast => (WireOpcode::Bitcast, WireArg::None),
+        Operation::Vectorize => (WireOpcode::Vectorize, WireArg::None),
+        Operation::Gep(lane) => (WireOpcode::Gep, WireArg::GepLane(*lane)),
+        Operation::Index(IndexValue::Buffer {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+        }) => (
+            WireOpcode::Index,
+            WireArg::BufferIndex {
+                buffer: *buffer,
+                elements: *elements,
+                input_shape: input_shape.clone(),
+                output_shape: output_shape.clone(),
+            },
+        ),
+        Operation::Index(IndexValue::View {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+            view,
+        }) => (
+            WireOpcode::Index,
+            WireArg::ViewBufferIndex {
+                buffer: *buffer,
+                elements: *elements,
+                input_shape: input_shape.clone(),
+                output_shape: output_shape.clone(),
+                view: view.clone(),
+            },
+        ),
+        Operation::Load => (WireOpcode::Load, WireArg::None),
+        Operation::Store => (WireOpcode::Store, WireArg::None),
+        Operation::EffectStore(payload) => {
+            (WireOpcode::EffectStore, WireArg::Effect(payload.clone()))
+        }
+        Operation::After(payload) => (WireOpcode::After, WireArg::Effect(payload.clone())),
+        Operation::Barrier => (WireOpcode::Barrier, WireArg::None),
+        Operation::Sink => (WireOpcode::Sink, WireArg::None),
+    }
+}
+
+fn address_to_wire(opcode: WireOpcode, value: &AddressValue) -> (WireOpcode, WireArg) {
+    (
+        opcode,
+        WireArg::Address {
+            space: value.space,
+            name: value.name.clone(),
+            element: value.element,
+        },
+    )
+}
+
+fn operation_from_wire(opcode: WireOpcode, arg: WireArg) -> Result<Operation, ArtifactError> {
+    Ok(match (opcode, arg) {
+        (WireOpcode::Const, WireArg::Int(value)) => Operation::Const(LiteralValue::Int(value)),
+        (WireOpcode::Const, WireArg::Scalar { dtype, bits }) => {
+            Operation::Const(LiteralValue::Scalar { dtype, bits })
+        }
+        (WireOpcode::VConst, WireArg::Int(value)) => Operation::VConst(LiteralValue::Int(value)),
+        (WireOpcode::VConst, WireArg::Scalar { dtype, bits }) => {
+            Operation::VConst(LiteralValue::Scalar { dtype, bits })
+        }
+        (WireOpcode::DefineVar, WireArg::Variable { name, bounds }) => {
+            Operation::DefineVar(VariableValue { name, bounds })
+        }
+        (
+            WireOpcode::DefineGlobal,
+            WireArg::Address {
+                space,
+                name,
+                element,
+            },
+        ) => Operation::DefineGlobal(AddressValue {
+            space,
+            name,
+            element,
+        }),
+        (
+            WireOpcode::DefineLocal,
+            WireArg::Address {
+                space,
+                name,
+                element,
+            },
+        ) => Operation::DefineLocal(AddressValue {
+            space,
+            name,
+            element,
+        }),
+        (
+            WireOpcode::DefineRegister,
+            WireArg::Address {
+                space,
+                name,
+                element,
+            },
+        ) => Operation::DefineRegister(AddressValue {
+            space,
+            name,
+            element,
+        }),
+        (WireOpcode::Special, WireArg::Name(name)) => Operation::Special(name),
+        (WireOpcode::Range, WireArg::RangeAxis(axis)) => Operation::Range(axis),
+        (WireOpcode::EndRange, WireArg::None) => Operation::EndRange,
+        (WireOpcode::If, WireArg::None) => Operation::If,
+        (WireOpcode::EndIf, WireArg::None) => Operation::EndIf,
+        (WireOpcode::Unary(op), WireArg::None) => Operation::Unary(op),
+        (WireOpcode::Binary(op), WireArg::None) => Operation::Binary(op),
+        (WireOpcode::GraphUnary(op), WireArg::None) => Operation::GraphUnary(op),
+        (WireOpcode::GraphBinary(op), WireArg::None) => Operation::GraphBinary(op),
+        (WireOpcode::GraphCompare(op), WireArg::None) => Operation::GraphCompare(op),
+        (WireOpcode::GraphLogical(op), WireArg::None) => Operation::GraphLogical(op),
+        (WireOpcode::Matmul, WireArg::Matmul(plan)) => Operation::Matmul(MatmulValue::Serial(plan)),
+        (WireOpcode::Matmul, WireArg::TiledMatmul(plan)) => {
+            Operation::Matmul(MatmulValue::Tiled(plan))
+        }
+        (WireOpcode::Matmul, WireArg::TensorCoreMatmul(plan)) => {
+            Operation::Matmul(MatmulValue::TensorCore(plan))
+        }
+        (WireOpcode::Matmul, WireArg::QuantizedMatmul(plan)) => {
+            Operation::Matmul(MatmulValue::Quantized(plan))
+        }
+        (WireOpcode::Conv2d, WireArg::Conv2d(plan)) => Operation::Conv2d(plan),
+        (WireOpcode::Movement, WireArg::Movement(plan)) => {
+            Operation::Movement(MovementValue::Plan(plan))
+        }
+        (WireOpcode::Movement, WireArg::QuantizedRowGather(plan)) => {
+            Operation::Movement(MovementValue::QuantizedRowGather(plan))
+        }
+        (WireOpcode::Random, WireArg::Random(plan)) => Operation::Random(plan),
+        (
+            WireOpcode::PrefixScan,
+            WireArg::PrefixScan {
+                input,
+                input_shape,
+                output_shape,
+                axis,
+                kind,
+                output,
+                dtype,
+            },
+        ) => Operation::PrefixScan(PrefixScanValue {
+            input,
+            input_shape,
+            output_shape,
+            axis,
+            kind,
+            output,
+            dtype,
+        }),
+        (
+            WireOpcode::Sort,
+            WireArg::Sort {
+                input,
+                input_shape,
+                axis,
+                descending,
+                values,
+                indices,
+                dtype,
+            },
+        ) => Operation::Sort(SortValue {
+            input,
+            input_shape,
+            axis,
+            descending,
+            values,
+            indices,
+            dtype,
+        }),
+        (
+            WireOpcode::TensorGuard,
+            WireArg::TensorGuard {
+                input,
+                input_shape,
+                axis,
+                dtype,
+            },
+        ) => Operation::TensorGuard(TensorGuardValue {
+            input,
+            input_shape,
+            axis,
+            dtype,
+        }),
+        (
+            WireOpcode::ReduceInit,
+            WireArg::Reduction {
+                input_shape,
+                output_shape,
+                axes,
+                keepdim,
+                kind,
+                mean,
+            },
+        ) => Operation::ReduceInit(ReductionValue {
+            input_shape,
+            output_shape,
+            axes,
+            keepdim,
+            kind,
+            mean,
+        }),
+        (WireOpcode::ReduceAccumulate, WireArg::None) => Operation::ReduceAccumulate,
+        (WireOpcode::ReduceFinalize, WireArg::None) => Operation::ReduceFinalize,
+        (WireOpcode::Ternary(op), WireArg::None) => Operation::Ternary(op),
+        (WireOpcode::Cast, WireArg::None) => Operation::Cast,
+        (WireOpcode::Bitcast, WireArg::None) => Operation::Bitcast,
+        (WireOpcode::Vectorize, WireArg::None) => Operation::Vectorize,
+        (WireOpcode::Gep, WireArg::GepLane(lane)) => Operation::Gep(lane),
+        (
+            WireOpcode::Index,
+            WireArg::BufferIndex {
+                buffer,
+                elements,
+                input_shape,
+                output_shape,
+            },
+        ) => Operation::Index(IndexValue::Buffer {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+        }),
+        (
+            WireOpcode::Index,
+            WireArg::ViewBufferIndex {
+                buffer,
+                elements,
+                input_shape,
+                output_shape,
+                view,
+            },
+        ) => Operation::Index(IndexValue::View {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+            view,
+        }),
+        (WireOpcode::Load, WireArg::None) => Operation::Load,
+        (WireOpcode::Store, WireArg::None) => Operation::Store,
+        (WireOpcode::EffectStore, WireArg::Effect(payload)) => Operation::EffectStore(payload),
+        (WireOpcode::After, WireArg::Effect(payload)) => Operation::After(payload),
+        (WireOpcode::Barrier, WireArg::None) => Operation::Barrier,
+        (WireOpcode::Sink, WireArg::None) => Operation::Sink,
+        _ => return Err(ArtifactError::Format("kind argument")),
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactError {
@@ -59,9 +544,12 @@ fn encode_inner(root: &UOp, effects: bool) -> Result<Vec<u8>, ArtifactError> {
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
     if !effects
-        && nodes
-            .iter()
-            .any(|node| matches!(node.kind(), UOpKind::EffectStore | UOpKind::After))
+        && nodes.iter().any(|node| {
+            matches!(
+                node.operation(),
+                Operation::EffectStore(_) | Operation::After(_)
+            )
+        })
     {
         return Err(ArtifactError::Unsupported);
     }
@@ -79,8 +567,7 @@ fn encode_inner(root: &UOp, effects: bool) -> Result<Vec<u8>, ArtifactError> {
     w.u32(nodes.len() as u32)?;
     w.u32((nodes.len() - 1) as u32)?;
     for (id, node) in nodes.iter().enumerate() {
-        let kind = node.kind();
-        let arg = node.arg().to_owned();
+        let (kind, arg) = operation_to_wire(node.operation());
         validate_fields(&kind, node.ty(), &arg, node.sources(), effects)?;
         w.u32(id as u32)?;
         write_kind(&mut w, &kind, effects)?;
@@ -175,10 +662,8 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             &sources,
             version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION,
         )?;
-        nodes.push(
-            UOp::from_artifact(kind, ty, sources, arg)
-                .map_err(|_| ArtifactError::Format("kind argument"))?,
-        );
+        let operation = operation_from_wire(kind, arg)?;
+        nodes.push(UOp::from_operation(operation, ty, sources));
     }
     if !r.done() {
         return Err(ArtifactError::Format("trailing bytes"));
@@ -197,9 +682,9 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
 }
 
 fn validate_fields(
-    kind: &UOpKind,
+    kind: &WireOpcode,
     ty: Option<UType>,
-    arg: &UArg,
+    arg: &WireArg,
     sources: &[UOp],
     effects: bool,
 ) -> Result<(), ArtifactError> {
@@ -207,10 +692,10 @@ fn validate_fields(
         return Err(ArtifactError::Format("lane width"));
     }
     match arg {
-        UArg::Scalar { dtype, bits } if !super::scalar_literal_is_valid(ty, *dtype, *bits) => {
+        WireArg::Scalar { dtype, bits } if !super::scalar_literal_is_valid(ty, *dtype, *bits) => {
             return Err(ArtifactError::Format("scalar literal"));
         }
-        UArg::Variable { name, bounds } => {
+        WireArg::Variable { name, bounds } => {
             if name.is_empty() || bounds.bounds().is_err() {
                 return Err(ArtifactError::Format("variable"));
             }
@@ -225,25 +710,25 @@ fn validate_fields(
                 }
             }
         }
-        UArg::Address { name, element, .. } => {
+        WireArg::Address { name, element, .. } => {
             if name.is_empty() || element.lanes == 0 {
                 return Err(ArtifactError::Format("address"));
             }
         }
-        UArg::BufferIndex {
+        WireArg::BufferIndex {
             elements,
             input_shape,
             output_shape,
             ..
         } => validate_index(*elements, input_shape, output_shape, None)?,
-        UArg::ViewBufferIndex {
+        WireArg::ViewBufferIndex {
             elements,
             input_shape,
             output_shape,
             view,
             ..
         } => validate_index(*elements, input_shape, output_shape, Some(view))?,
-        UArg::Reduction {
+        WireArg::Reduction {
             input_shape,
             output_shape,
             axes,
@@ -271,31 +756,31 @@ fn validate_fields(
                 return Err(ArtifactError::Format("reduction shape"));
             }
         }
-        UArg::Matmul(plan) => plan
+        WireArg::Matmul(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("matmul plan"))?,
-        UArg::Conv2d(plan) => plan
+        WireArg::Conv2d(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("static conv2d plan"))?,
-        UArg::TiledMatmul(payload) => payload
+        WireArg::TiledMatmul(payload) => payload
             .validate()
             .map_err(|_| ArtifactError::Format("tiled matmul plan"))?,
-        UArg::TensorCoreMatmul(payload) => payload
+        WireArg::TensorCoreMatmul(payload) => payload
             .validate()
             .map_err(|_| ArtifactError::Format("tensor-core matmul plan"))?,
-        UArg::QuantizedMatmul(plan) => plan
+        WireArg::QuantizedMatmul(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("quantized matmul plan"))?,
-        UArg::QuantizedRowGather(plan) => plan
+        WireArg::QuantizedRowGather(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("quantized row gather plan"))?,
-        UArg::Movement(plan) => plan
+        WireArg::Movement(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("movement plan"))?,
-        UArg::Random(plan) => plan
+        WireArg::Random(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("random plan"))?,
-        UArg::PrefixScan {
+        WireArg::PrefixScan {
             input_shape,
             output_shape,
             axis,
@@ -322,7 +807,7 @@ fn validate_fields(
                 return Err(ArtifactError::Format("prefix scan"));
             }
         }
-        UArg::Sort {
+        WireArg::Sort {
             input_shape,
             axis,
             values,
@@ -338,7 +823,7 @@ fn validate_fields(
                 return Err(ArtifactError::Format("sort"));
             }
         }
-        UArg::TensorGuard {
+        WireArg::TensorGuard {
             input_shape,
             axis,
             dtype,
@@ -354,52 +839,47 @@ fn validate_fields(
         }
         _ => {}
     }
-    let operation = Operation::from_legacy(*kind, arg.clone())
-        .map_err(|_| ArtifactError::Format("kind argument"))?;
+    let operation = operation_from_wire(*kind, arg.clone())?;
     // RGUA's effects envelope is a wire-format distinction, not a general
     // impurity classification. Ordinary Store, Barrier, and Sink operations
     // have always been valid in the standard envelope; only stateful effect
     // transactions carry EffectStore/After and require the effects envelope.
-    if matches!(operation.kind(), UOpKind::EffectStore | UOpKind::After) && !effects {
+    if matches!(operation, Operation::EffectStore(_) | Operation::After(_)) && !effects {
         return Err(ArtifactError::Format("kind argument"));
     }
-    let signature = operation.signature();
-    if !signature.arity.accepts(sources.len()) {
-        return Err(ArtifactError::Format("kind sources"));
-    }
     let type_ok = match kind {
-        UOpKind::Const | UOpKind::VConst => ty.is_some_and(|node_ty| match arg {
-            UArg::Scalar { dtype, .. } => node_ty.scalar == *dtype,
-            UArg::Int(_) => true,
+        WireOpcode::Const | WireOpcode::VConst => ty.is_some_and(|node_ty| match arg {
+            WireArg::Scalar { dtype, .. } => node_ty.scalar == *dtype,
+            WireArg::Int(_) => true,
             _ => false,
         }),
-        UOpKind::DefineGlobal => {
-            matches!(arg, UArg::Address { space: AddressSpace::Global, element, .. } if ty == Some(*element))
+        WireOpcode::DefineGlobal => {
+            matches!(arg, WireArg::Address { space: AddressSpace::Global, element, .. } if ty == Some(*element))
         }
-        UOpKind::DefineLocal => {
-            matches!(arg, UArg::Address { space: AddressSpace::Local, element, .. } if ty == Some(*element))
+        WireOpcode::DefineLocal => {
+            matches!(arg, WireArg::Address { space: AddressSpace::Local, element, .. } if ty == Some(*element))
         }
-        UOpKind::DefineRegister => {
-            matches!(arg, UArg::Address { space: AddressSpace::Register, element, .. } if ty == Some(*element))
+        WireOpcode::DefineRegister => {
+            matches!(arg, WireArg::Address { space: AddressSpace::Register, element, .. } if ty == Some(*element))
         }
-        UOpKind::Range => {
+        WireOpcode::Range => {
             ty.is_some_and(|x| x.scalar.is_integer())
                 && sources.first().is_some_and(|x| x.ty() == ty)
         }
-        UOpKind::Index => sources.first().is_some_and(|x| x.ty() == ty),
-        UOpKind::Load => sources
+        WireOpcode::Index => sources.first().is_some_and(|x| x.ty() == ty),
+        WireOpcode::Load => sources
             .first()
-            .is_some_and(|x| x.ty() == ty && matches!(x.kind(), UOpKind::Index)),
-        UOpKind::Store => {
+            .is_some_and(|x| x.ty() == ty && matches!(x.operation(), Operation::Index(_))),
+        WireOpcode::Store => {
             ty.is_none()
                 && sources
                     .first()
                     .zip(sources.get(1))
                     .is_some_and(|(index, value)| {
-                        matches!(index.kind(), UOpKind::Index) && index.ty() == value.ty()
+                        matches!(index.operation(), Operation::Index(_)) && index.ty() == value.ty()
                     })
         }
-        UOpKind::GraphUnary(op) => sources
+        WireOpcode::GraphUnary(op) => sources
             .first()
             .and_then(|source| source.ty())
             .zip(ty)
@@ -407,41 +887,44 @@ fn validate_fields(
                 source.lanes == output.lanes
                     && crate::ir::unary_dtype(*op, source.scalar) == output.scalar
             }),
-        UOpKind::Unary(_) => sources.first().is_some_and(|x| x.ty() == ty),
-        UOpKind::GraphBinary(_) => ty.is_some() && sources.iter().all(|x| x.ty().is_some()),
-        UOpKind::GraphCompare(_) => {
+        WireOpcode::Unary(_) => sources.first().is_some_and(|x| x.ty() == ty),
+        WireOpcode::GraphBinary(_) => ty.is_some() && sources.iter().all(|x| x.ty().is_some()),
+        WireOpcode::GraphCompare(_) => {
             ty == Some(UType::scalar(DType::Bool)) && sources.iter().all(|x| x.ty().is_some())
         }
-        UOpKind::GraphLogical(_) => {
+        WireOpcode::GraphLogical(_) => {
             ty == Some(UType::scalar(DType::Bool)) && sources.iter().all(|x| x.ty() == ty)
         }
-        UOpKind::Matmul => {
-            operation
-                .argument()
-                .matmul_plan()
-                .is_some_and(|plan| ty == Some(UType::scalar(plan.dtype)))
-                || operation
-                    .argument()
-                    .quantized_matmul_plan()
-                    .is_some_and(|plan| ty == Some(UType::scalar(plan.output_dtype)))
+        WireOpcode::Matmul => match &operation {
+            Operation::Matmul(MatmulValue::Serial(plan)) => ty == Some(UType::scalar(plan.dtype)),
+            Operation::Matmul(MatmulValue::Tiled(plan)) => {
+                ty == Some(UType::scalar(plan.matmul.dtype))
+            }
+            Operation::Matmul(MatmulValue::TensorCore(plan)) => {
+                ty == Some(UType::scalar(plan.matmul.dtype))
+            }
+            Operation::Matmul(MatmulValue::Quantized(plan)) => {
+                ty == Some(UType::scalar(plan.output_dtype))
+            }
+            _ => false,
+        },
+        WireOpcode::Movement => {
+            matches!(arg, WireArg::Movement(plan) if ty == Some(UType::scalar(plan.dtype)))
+                || matches!(arg, WireArg::QuantizedRowGather(plan) if ty == Some(UType::scalar(plan.output_dtype)))
         }
-        UOpKind::Movement => {
-            matches!(arg, UArg::Movement(plan) if ty == Some(UType::scalar(plan.dtype)))
-                || matches!(arg, UArg::QuantizedRowGather(plan) if ty == Some(UType::scalar(plan.output_dtype)))
+        WireOpcode::Random => {
+            matches!(arg, WireArg::Random(plan) if ty == Some(UType::scalar(plan.dtype)))
         }
-        UOpKind::Random => {
-            matches!(arg, UArg::Random(plan) if ty == Some(UType::scalar(plan.dtype)))
+        WireOpcode::PrefixScan => {
+            matches!(arg, WireArg::PrefixScan { dtype, .. } if ty == Some(UType::scalar(*dtype)))
         }
-        UOpKind::PrefixScan => {
-            matches!(arg, UArg::PrefixScan { dtype, .. } if ty == Some(UType::scalar(*dtype)))
+        WireOpcode::Sort => {
+            matches!(arg, WireArg::Sort { dtype, .. } if ty == Some(UType::scalar(*dtype)))
         }
-        UOpKind::Sort => {
-            matches!(arg, UArg::Sort { dtype, .. } if ty == Some(UType::scalar(*dtype)))
+        WireOpcode::TensorGuard => {
+            matches!(arg, WireArg::TensorGuard { dtype, .. } if ty == Some(UType::scalar(*dtype)))
         }
-        UOpKind::TensorGuard => {
-            matches!(arg, UArg::TensorGuard { dtype, .. } if ty == Some(UType::scalar(*dtype)))
-        }
-        UOpKind::ReduceAccumulate => {
+        WireOpcode::ReduceAccumulate => {
             ty.zip(sources.first().and_then(|source| source.ty()))
                 .is_some_and(|(accumulator, init)| accumulator == init)
                 && ty
@@ -451,10 +934,10 @@ fn validate_fields(
         // ReduceFinalize is the explicit accumulator-to-output storage
         // boundary. Default narrow reductions therefore legitimately consume
         // an F32 accumulator while producing F16/BF16 output storage.
-        UOpKind::ReduceFinalize => ty
+        WireOpcode::ReduceFinalize => ty
             .zip(sources.first().and_then(|source| source.ty()))
             .is_some_and(|(output, accumulator)| output.lanes == accumulator.lanes),
-        UOpKind::Ternary(super::Ternary::Where) => {
+        WireOpcode::Ternary(super::Ternary::Where) => {
             sources
                 .first()
                 .is_some_and(|x| x.ty() == Some(UType::scalar(DType::Bool)))
@@ -463,7 +946,7 @@ fn validate_fields(
                     .zip(sources.get(2))
                     .is_some_and(|(a, b)| a.ty() == ty && b.ty() == ty)
         }
-        UOpKind::Sink => ty.is_none(),
+        WireOpcode::Sink => ty.is_none(),
         _ => true,
     };
     if !type_ok {
@@ -571,8 +1054,8 @@ fn read_type(r: &mut Reader<'_>) -> Result<Option<UType>, ArtifactError> {
     }
 }
 
-fn write_kind(w: &mut Writer, kind: &UOpKind, effects: bool) -> Result<(), ArtifactError> {
-    use UOpKind::*;
+fn write_kind(w: &mut Writer, kind: &WireOpcode, effects: bool) -> Result<(), ArtifactError> {
+    use WireOpcode::*;
     let (tag, sub) = match kind {
         Const => (0, None),
         VConst => (1, None),
@@ -621,8 +1104,8 @@ fn write_kind(w: &mut Writer, kind: &UOpKind, effects: bool) -> Result<(), Artif
     }
     Ok(())
 }
-fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> {
-    use UOpKind::*;
+fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<WireOpcode, ArtifactError> {
+    use WireOpcode::*;
     Ok(match r.u8()? {
         0 => Const,
         1 => VConst,
@@ -670,28 +1153,28 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
     })
 }
 
-fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactError> {
+fn write_arg(w: &mut Writer, arg: &WireArg, effects: bool) -> Result<(), ArtifactError> {
     match arg {
-        UArg::None => w.u8(0),
-        UArg::Int(x) => {
+        WireArg::None => w.u8(0),
+        WireArg::Int(x) => {
             w.u8(1)?;
             w.i64(*x)
         }
-        UArg::Scalar { dtype, bits } => {
+        WireArg::Scalar { dtype, bits } => {
             w.u8(2)?;
             w.u8(dtype_tag(*dtype))?;
             w.u64(*bits)
         }
-        UArg::Name(x) => {
+        WireArg::Name(x) => {
             w.u8(3)?;
             w.string(x)
         }
-        UArg::Variable { name, bounds } => {
+        WireArg::Variable { name, bounds } => {
             w.u8(4)?;
             w.string(name)?;
             write_symbolic(w, bounds, 0)
         }
-        UArg::Address {
+        WireArg::Address {
             space,
             name,
             element,
@@ -705,15 +1188,15 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.string(name)?;
             write_type(w, Some(*element))
         }
-        UArg::RangeAxis(x) => {
+        WireArg::RangeAxis(x) => {
             w.u8(6)?;
             w.u32(*x)
         }
-        UArg::GepLane(x) => {
+        WireArg::GepLane(x) => {
             w.u8(7)?;
             w.u16(*x)
         }
-        UArg::BufferIndex {
+        WireArg::BufferIndex {
             buffer,
             elements,
             input_shape,
@@ -725,7 +1208,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             write_shape(w, input_shape)?;
             write_shape(w, output_shape)
         }
-        UArg::ViewBufferIndex {
+        WireArg::ViewBufferIndex {
             buffer,
             elements,
             input_shape,
@@ -739,7 +1222,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             write_shape(w, output_shape)?;
             write_affine_view(w, view)
         }
-        UArg::Reduction {
+        WireArg::Reduction {
             input_shape,
             output_shape,
             axes,
@@ -755,35 +1238,35 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.u8(tag_reduce(*kind))?;
             w.bool(*mean)
         }
-        UArg::Matmul(plan) => {
+        WireArg::Matmul(plan) => {
             w.u8(11)?;
             write_matmul(w, plan)
         }
-        UArg::Conv2d(plan) => {
+        WireArg::Conv2d(plan) => {
             w.u8(19)?;
             write_static_conv2d(w, plan)
         }
-        UArg::TiledMatmul(payload) => {
+        WireArg::TiledMatmul(payload) => {
             w.u8(13)?;
             write_tiled_matmul(w, payload)
         }
-        UArg::QuantizedMatmul(plan) => {
+        WireArg::QuantizedMatmul(plan) => {
             w.u8(14)?;
             write_quantized_matmul(w, plan)
         }
-        UArg::TensorCoreMatmul(payload) => {
+        WireArg::TensorCoreMatmul(payload) => {
             w.u8(15)?;
             write_tensor_core_matmul(w, payload)
         }
-        UArg::QuantizedRowGather(plan) => {
+        WireArg::QuantizedRowGather(plan) => {
             w.u8(16)?;
             write_quantized_row_gather(w, plan)
         }
-        UArg::Movement(plan) => {
+        WireArg::Movement(plan) => {
             w.u8(12)?;
             write_movement(w, plan)
         }
-        UArg::Random(plan) => {
+        WireArg::Random(plan) => {
             plan.validate()
                 .map_err(|_| ArtifactError::Format("random plan"))?;
             w.u8(17)?;
@@ -816,7 +1299,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.u32(plan.stream.device)?;
             w.usize(plan.word_count)
         }
-        UArg::PrefixScan {
+        WireArg::PrefixScan {
             input,
             input_shape,
             output_shape,
@@ -834,7 +1317,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.u8(tag_prefix_scan_output(*output))?;
             w.u8(dtype_tag(*dtype))
         }
-        UArg::Sort {
+        WireArg::Sort {
             input,
             input_shape,
             axis,
@@ -852,7 +1335,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.u64(indices.index() as u64)?;
             w.u8(dtype_tag(*dtype))
         }
-        UArg::TensorGuard {
+        WireArg::TensorGuard {
             input,
             input_shape,
             axis,
@@ -864,27 +1347,27 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.usize(*axis)?;
             w.u8(dtype_tag(*dtype))
         }
-        UArg::Effect(payload) if effects => {
+        WireArg::Effect(payload) if effects => {
             w.u8(18)?;
             write_effect_payload(w, payload)
         }
-        UArg::Effect(_) => Err(ArtifactError::Unsupported),
+        WireArg::Effect(_) => Err(ArtifactError::Unsupported),
     }
 }
-fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
+fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<WireArg, ArtifactError> {
     Ok(match r.u8()? {
-        0 => UArg::None,
-        1 => UArg::Int(r.i64()?),
-        2 => UArg::Scalar {
+        0 => WireArg::None,
+        1 => WireArg::Int(r.i64()?),
+        2 => WireArg::Scalar {
             dtype: dtype(r.u8()?)?,
             bits: r.u64()?,
         },
-        3 => UArg::Name(r.string()?),
-        4 => UArg::Variable {
+        3 => WireArg::Name(r.string()?),
+        4 => WireArg::Variable {
             name: r.string()?,
             bounds: read_symbolic(r, 0)?,
         },
-        5 => UArg::Address {
+        5 => WireArg::Address {
             space: match r.u8()? {
                 0 => AddressSpace::Global,
                 1 => AddressSpace::Local,
@@ -894,15 +1377,15 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             name: r.string()?,
             element: read_type(r)?.ok_or(ArtifactError::Format("address type"))?,
         },
-        6 => UArg::RangeAxis(r.u32()?),
-        7 => UArg::GepLane(r.u16()?),
-        8 => UArg::BufferIndex {
+        6 => WireArg::RangeAxis(r.u32()?),
+        7 => WireArg::GepLane(r.u16()?),
+        8 => WireArg::BufferIndex {
             buffer: r.u64()?,
             elements: r.usize()?,
             input_shape: read_shape(r)?,
             output_shape: read_shape(r)?,
         },
-        9 => UArg::ViewBufferIndex {
+        9 => WireArg::ViewBufferIndex {
             buffer: r.u64()?,
             elements: r.usize()?,
             input_shape: read_shape(r)?,
@@ -913,7 +1396,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
                 read_view(r)?.into()
             },
         },
-        10 => UArg::Reduction {
+        10 => WireArg::Reduction {
             input_shape: read_shape(r)?,
             output_shape: read_shape(r)?,
             axes: r.usizes()?,
@@ -921,12 +1404,12 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             kind: enum_reduce(r.u8()?)?,
             mean: r.bool()?,
         },
-        11 if version >= 3 => UArg::Matmul(Box::new(read_matmul(r)?)),
-        12 if version >= 4 => UArg::Movement(Box::new(read_movement(r)?)),
-        13 if version >= 5 => UArg::TiledMatmul(Box::new(read_tiled_matmul(r)?)),
-        14 if version >= 6 => UArg::QuantizedMatmul(Box::new(read_quantized_matmul(r)?)),
-        15 if version >= 7 => UArg::TensorCoreMatmul(Box::new(read_tensor_core_matmul(r)?)),
-        16 if version >= 8 => UArg::QuantizedRowGather(Box::new(read_quantized_row_gather(r)?)),
+        11 if version >= 3 => WireArg::Matmul(Box::new(read_matmul(r)?)),
+        12 if version >= 4 => WireArg::Movement(Box::new(read_movement(r)?)),
+        13 if version >= 5 => WireArg::TiledMatmul(Box::new(read_tiled_matmul(r)?)),
+        14 if version >= 6 => WireArg::QuantizedMatmul(Box::new(read_quantized_matmul(r)?)),
+        15 if version >= 7 => WireArg::TensorCoreMatmul(Box::new(read_tensor_core_matmul(r)?)),
+        16 if version >= 8 => WireArg::QuantizedRowGather(Box::new(read_quantized_row_gather(r)?)),
         17 if version >= 9 => {
             let output = crate::NodeId::from_index(
                 usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("random node"))?,
@@ -962,14 +1445,14 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             if plan.word_count != stored_words {
                 return Err(ArtifactError::Format("random words"));
             }
-            UArg::Random(Box::new(plan))
+            WireArg::Random(Box::new(plan))
         }
-        18 if version >= 11 => UArg::Effect(Box::new(read_effect_payload(
+        18 if version >= 11 => WireArg::Effect(Box::new(read_effect_payload(
             r,
             version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION,
         )?)),
-        19 if version >= 10 => UArg::Conv2d(Box::new(read_static_conv2d(r)?)),
-        20 if version >= 11 => UArg::PrefixScan {
+        19 if version >= 10 => WireArg::Conv2d(Box::new(read_static_conv2d(r)?)),
+        20 if version >= 11 => WireArg::PrefixScan {
             input: crate::NodeId::from_index(
                 usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("prefix scan node"))?,
             ),
@@ -988,7 +1471,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             },
             dtype: dtype(r.u8()?)?,
         },
-        21 if version >= 16 => UArg::Sort {
+        21 if version >= 16 => WireArg::Sort {
             input: crate::NodeId::from_index(
                 usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("sort input"))?,
             ),
@@ -1003,7 +1486,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             ),
             dtype: dtype(r.u8()?)?,
         },
-        22 if version >= 17 => UArg::TensorGuard {
+        22 if version >= 17 => WireArg::TensorGuard {
             input: crate::NodeId::from_index(
                 usize::try_from(r.u64()?)
                     .map_err(|_| ArtifactError::Format("tensor guard input"))?,
@@ -2403,10 +2886,10 @@ mod tests {
     #[test]
     fn tensor_guard_v17_round_trip_and_legacy_exclusion_are_exact() {
         let guard = UOp::try_new(
-            UOpKind::TensorGuard,
+            WireOpcode::TensorGuard,
             Some(UType::scalar(DType::F32)),
             vec![],
-            UArg::TensorGuard {
+            WireArg::TensorGuard {
                 input: crate::NodeId::from_index(3),
                 input_shape: Shape::from([2, 3]),
                 axis: 1,
@@ -2444,8 +2927,8 @@ mod tests {
             .into_iter()
             .map(|node| node.kind())
             .collect::<Vec<_>>();
-        assert!(kinds.contains(&UOpKind::Store));
-        assert!(kinds.contains(&UOpKind::Sink));
+        assert!(kinds.contains(&WireOpcode::Store));
+        assert!(kinds.contains(&WireOpcode::Sink));
         let bytes = encode(&root).unwrap();
         assert_eq!(decode(&bytes).unwrap(), root);
     }
@@ -2480,10 +2963,10 @@ mod tests {
         let mut malformed = plan.clone();
         malformed.k += 1;
         let malformed = UOp::try_new(
-            UOpKind::Matmul,
+            WireOpcode::Matmul,
             Some(UType::scalar(DType::F64)),
             vec![],
-            UArg::Matmul(Box::new(malformed)),
+            WireArg::Matmul(Box::new(malformed)),
         )
         .unwrap();
         assert!(malformed.validate().is_err());
@@ -2503,10 +2986,10 @@ mod tests {
         let mut malformed = payload.clone();
         malformed.tile.barriers[0].uniform = false;
         let malformed = UOp::try_new(
-            UOpKind::Matmul,
+            WireOpcode::Matmul,
             Some(UType::scalar(DType::F32)),
             vec![],
-            UArg::TiledMatmul(Box::new(malformed)),
+            WireArg::TiledMatmul(Box::new(malformed)),
         )
         .unwrap();
         assert!(malformed.validate().is_err());
@@ -2515,10 +2998,10 @@ mod tests {
         let mut misaligned = payload.clone();
         misaligned.tile.lhs_shared.alignment = 3;
         let misaligned = UOp::try_new(
-            UOpKind::Matmul,
+            WireOpcode::Matmul,
             Some(UType::scalar(DType::F32)),
             vec![],
-            UArg::TiledMatmul(Box::new(misaligned)),
+            WireArg::TiledMatmul(Box::new(misaligned)),
         )
         .unwrap();
         assert!(misaligned.validate().is_err());
@@ -2551,10 +3034,10 @@ mod tests {
         let mut malformed = plan.clone();
         malformed.output_shape = Shape::from([3, 2]);
         let malformed = UOp::try_new(
-            UOpKind::Movement,
+            WireOpcode::Movement,
             Some(UType::scalar(DType::F32)),
             vec![],
-            UArg::Movement(Box::new(malformed)),
+            WireArg::Movement(Box::new(malformed)),
         )
         .unwrap();
         assert!(malformed.validate().is_err());
@@ -2636,31 +3119,31 @@ mod tests {
 
         let mut out_of_order = header(1, 0);
         out_of_order.u32(1).unwrap();
-        write_kind(&mut out_of_order, &UOpKind::Const, false).unwrap();
+        write_kind(&mut out_of_order, &WireOpcode::Const, false).unwrap();
         write_type(&mut out_of_order, ty).unwrap();
-        write_arg(&mut out_of_order, &UArg::Int(1), false).unwrap();
+        write_arg(&mut out_of_order, &WireArg::Int(1), false).unwrap();
         out_of_order.u32(0).unwrap();
         assert!(decode(&finish(out_of_order)).is_err());
 
         let mut forward = header(2, 1);
         forward.u32(0).unwrap();
-        write_kind(&mut forward, &UOpKind::Cast, false).unwrap();
+        write_kind(&mut forward, &WireOpcode::Cast, false).unwrap();
         write_type(&mut forward, ty).unwrap();
-        write_arg(&mut forward, &UArg::None, false).unwrap();
+        write_arg(&mut forward, &WireArg::None, false).unwrap();
         forward.u32(1).unwrap();
         forward.u32(0).unwrap();
         forward.u32(1).unwrap();
-        write_kind(&mut forward, &UOpKind::Const, false).unwrap();
+        write_kind(&mut forward, &WireOpcode::Const, false).unwrap();
         write_type(&mut forward, ty).unwrap();
-        write_arg(&mut forward, &UArg::Int(1), false).unwrap();
+        write_arg(&mut forward, &WireArg::Int(1), false).unwrap();
         forward.u32(0).unwrap();
         assert!(decode(&finish(forward)).is_err());
 
         let mut wrong_arg = header(1, 0);
         wrong_arg.u32(0).unwrap();
-        write_kind(&mut wrong_arg, &UOpKind::Const, false).unwrap();
+        write_kind(&mut wrong_arg, &WireOpcode::Const, false).unwrap();
         write_type(&mut wrong_arg, ty).unwrap();
-        write_arg(&mut wrong_arg, &UArg::None, false).unwrap();
+        write_arg(&mut wrong_arg, &WireArg::None, false).unwrap();
         wrong_arg.u32(0).unwrap();
         assert!(decode(&finish(wrong_arg)).is_err());
 

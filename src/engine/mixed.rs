@@ -111,8 +111,10 @@ pub fn realize_mixed_effects(
     let mut source_values = BTreeMap::new();
     for binding in &schedule.value_bindings {
         let item = &schedule.items[binding.effect_item as usize];
-        let step = match item.kernel.arg() {
-            crate::UArgRef::Effect(payload) => payload.step,
+        let step = match item.kernel.operation() {
+            crate::Operation::EffectStore(payload) | crate::Operation::After(payload) => {
+                payload.step
+            }
             _ => {
                 return Err(super::RealizationError::Schedule(
                     "effect binding lacks typed payload".into(),

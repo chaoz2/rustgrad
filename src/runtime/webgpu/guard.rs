@@ -4,7 +4,7 @@ use super::{
     renderer::{WgslViewAccess, broadcast_offset, ordered_compare_operand},
     transaction::{GuardedIntegerOp, WebGpuTransactionAbi},
 };
-use crate::{DType, UArgRef, UOp, UOpKind};
+use crate::{DType, Operation, UArgRef, UOp};
 use std::collections::BTreeMap;
 
 pub(super) fn emit_transactional(
@@ -49,22 +49,22 @@ impl Emitter<'_> {
             .scalar;
         supported_transaction_dtype(dtype)?;
         let name = self.value_name();
-        match node.kind() {
-            UOpKind::Const => {
+        match node.operation() {
+            Operation::Const => {
                 let value = scalar_literal(node, dtype)?;
                 self.lines.push(format!(
                     "{indent}let {name}: {} = {value};",
                     wgsl_value_type(dtype)
                 ));
             }
-            UOpKind::Load => {
+            Operation::Load => {
                 let value = self.load(node, dtype)?;
                 self.lines.push(format!(
                     "{indent}let {name}: {} = {value};",
                     wgsl_value_type(dtype)
                 ));
             }
-            UOpKind::Cast => {
+            Operation::Cast => {
                 let source = self.node(&node.sources()[0], indent)?;
                 let source_dtype = node.sources()[0]
                     .ty()
@@ -73,7 +73,7 @@ impl Emitter<'_> {
                 let value = cast_expression(source_dtype, dtype, &source)?;
                 self.assign_if_ok(indent, dtype, &name, &value);
             }
-            UOpKind::GraphBinary(op) => {
+            Operation::GraphBinary(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 let rhs = self.node(&node.sources()[1], indent)?;
                 self.declare_zero(indent, dtype, &name);
@@ -100,7 +100,7 @@ impl Emitter<'_> {
                         .push(format!("{indent}if (rg_ok) {{ {name} = {value}; }}"));
                 }
             }
-            UOpKind::Binary(op) => {
+            Operation::Binary(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 let rhs = self.node(&node.sources()[1], indent)?;
                 self.declare_zero(indent, dtype, &name);
@@ -131,7 +131,7 @@ impl Emitter<'_> {
                 self.lines
                     .push(format!("{indent}if (rg_ok) {{ {name} = {value}; }}"));
             }
-            UOpKind::GraphCompare(op) => {
+            Operation::GraphCompare(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 let rhs = self.node(&node.sources()[1], indent)?;
                 let operand_dtype = node.sources()[0]
@@ -163,7 +163,7 @@ impl Emitter<'_> {
                     &format!("(({lhs}) {operator} ({rhs}))"),
                 );
             }
-            UOpKind::GraphLogical(op) => {
+            Operation::GraphLogical(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 self.declare_zero(indent, DType::Bool, &name);
                 match op {
@@ -189,7 +189,7 @@ impl Emitter<'_> {
                     }
                 }
             }
-            UOpKind::Ternary(crate::uop::Ternary::Where) => {
+            Operation::Ternary(crate::uop::Ternary::Where) => {
                 let condition = self.node(&node.sources()[0], indent)?;
                 self.declare_zero(indent, dtype, &name);
                 self.lines

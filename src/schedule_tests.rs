@@ -114,7 +114,7 @@ fn external_concat_materialization_makes_local_add_renderable() {
         direct
             .items
             .iter()
-            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::Movement))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::Movement))
     );
     let scheduled = schedule_with_external_materializations(&graph, &[out], &[joined]).unwrap();
     let item = scheduled
@@ -130,7 +130,7 @@ fn external_concat_materialization_makes_local_add_renderable() {
             .topological()
             .unwrap()
             .iter()
-            .any(|node| matches!(node.kind(), crate::UOpKind::Load))
+            .any(|node| matches!(node.operation(), crate::Operation::Load))
     );
     assert!(schedule_with_external_materializations(&graph, &[out], &[out]).is_err());
     assert!(schedule_with_external_materializations(&graph, &[out], &[left]).is_err());
@@ -408,7 +408,10 @@ fn matmul_materializes_computed_operands_and_participates_in_lifetimes() {
         .iter()
         .find(|item| item.node == product)
         .unwrap();
-    assert!(matches!(matmul.kernel.kind(), crate::UOpKind::Matmul));
+    assert!(matches!(
+        matmul.kernel.operation(),
+        crate::Operation::Matmul
+    ));
     assert_eq!(matmul.dependencies.len(), 1);
     assert_eq!(
         matmul

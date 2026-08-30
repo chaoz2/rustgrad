@@ -24,7 +24,7 @@ fn strict_native_artifacts_match_graph_and_independent_dense_reference() {
             .unwrap()
             .items
             .iter()
-            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::Movement))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::Movement))
     }));
     let executor = LlamaNativeExecutor::new();
     let actual = plan.execute(&executor).unwrap();

@@ -86,7 +86,7 @@ impl PreparedMetalPrefix {
     ) -> Result<Self, MetalError> {
         if items
             .iter()
-            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard))
         {
             return Err(MetalError::Unsupported(
                 "tensor guard is CPU-interpreter only".into(),

@@ -23,7 +23,7 @@ impl PreparedWebGpuPrefix {
     ) -> Result<Self, WebGpuError> {
         if items
             .iter()
-            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard))
         {
             return Err(WebGpuError::Unsupported(
                 "tensor guard is CPU-interpreter only".into(),

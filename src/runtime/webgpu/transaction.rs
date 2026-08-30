@@ -1,6 +1,6 @@
 //! Typed WebGPU transaction metadata and bounded fault reconstruction.
 use super::WebGpuError;
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArgRef, UOp, UOpKind};
+use crate::{BinaryOp, CompareOp, DType, LogicalOp, Operation, Scalar, Shape, UArgRef, UOp};
 use std::collections::BTreeMap;
 
 /// Schema version for guarded WebGPU candidate/status execution.
@@ -86,7 +86,7 @@ impl WebGpuTransactionAbi {
             .topological()
             .map_err(|error| WebGpuError::Unsupported(error.to_string()))?
         {
-            let UOpKind::GraphBinary(op) = node.kind() else {
+            let Operation::GraphBinary(op) = node.operation() else {
                 continue;
             };
             let Some(operation) = GuardedIntegerOp::from_binary(op) else {
@@ -162,7 +162,7 @@ impl WebGpuTransactionAbi {
         let count = u32::try_from(self.guards.len()).map_err(|_| WebGpuError::Overflow)?;
         for (position, guard) in self.guards.iter().enumerate() {
             let expected_id = u32::try_from(position).map_err(|_| WebGpuError::Overflow)?;
-            let UOpKind::GraphBinary(op) = guard.expression.kind() else {
+            let Operation::GraphBinary(op) = guard.expression.operation() else {
                 return Err(WebGpuError::InvalidBinding(
                     "transaction guard expression mismatch".into(),
                 ));
@@ -285,8 +285,8 @@ where
         .ty()
         .ok_or_else(|| WebGpuError::InvalidBinding("untyped detail expression".into()))?
         .scalar;
-    let value = match node.kind() {
-        UOpKind::Const => match node.arg() {
+    let value = match node.operation() {
+        Operation::Const => match node.arg() {
             UArgRef::Scalar { dtype, bits } => scalar_from_bits(*dtype, *bits)?,
             _ => {
                 return Err(WebGpuError::InvalidBinding(
@@ -294,21 +294,21 @@ where
                 ));
             }
         },
-        UOpKind::Load => {
+        Operation::Load => {
             let index = node
                 .sources()
                 .first()
                 .ok_or_else(|| WebGpuError::InvalidBinding("detail load lacks index".into()))?;
             load(index.arg(), dtype, logical)?
         }
-        UOpKind::Cast => {
+        Operation::Cast => {
             let source = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             cast(source, dtype)?
         }
-        UOpKind::GraphBinary(op) => {
+        Operation::GraphBinary(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -324,7 +324,7 @@ where
             }
             integer_binary(op, dtype, lhs, rhs)?
         }
-        UOpKind::Binary(op) => {
+        Operation::Binary(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -348,7 +348,7 @@ where
                 }
             }
         }
-        UOpKind::GraphCompare(op) => {
+        Operation::GraphCompare(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value,
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -359,7 +359,7 @@ where
             };
             Scalar::Bool(compare(lhs, rhs, op))
         }
-        UOpKind::GraphLogical(op) => {
+        Operation::GraphLogical(op) => {
             let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value.as_bool(),
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
@@ -376,7 +376,7 @@ where
                 }
             }
         }
-        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+        Operation::Ternary(crate::uop::Ternary::Where) => {
             let condition = match eval(&node.sources()[0], logical, guard_ids, load)? {
                 Evaluated::Value(value) => value.as_bool(),
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),

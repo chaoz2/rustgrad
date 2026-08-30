@@ -1,5 +1,5 @@
 //! Typed late linearization of ranged UOps for portable lane renderers.
-use crate::{DType, Operation, Shape, UArgRef, UOp, UOpKind};
+use crate::{DType, IndexValue, Operation, Shape, UOp};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     fmt,
@@ -70,15 +70,6 @@ pub struct LinearPayload {
     pub ty: Option<crate::UType>,
 }
 
-impl LinearPayload {
-    pub fn kind(&self) -> UOpKind {
-        self.operation.kind()
-    }
-
-    pub fn arg(&self) -> UArgRef<'_> {
-        self.operation.argument()
-    }
-}
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LinearInst {
     pub index: u32,
@@ -139,19 +130,19 @@ impl LinearKernel {
         let store = source
             .sources()
             .iter()
-            .find(|node| matches!(node.kind(), UOpKind::Store))
+            .find(|node| matches!(node.operation(), Operation::Store))
             .ok_or(LinearizeError::MissingStore)?;
         let output = store
             .sources()
             .first()
             .ok_or(LinearizeError::MissingStore)?;
-        let (output_buffer, elements, output_shape) = match output.arg() {
-            UArgRef::BufferIndex {
+        let (output_buffer, elements, output_shape) = match output.operation() {
+            Operation::Index(IndexValue::Buffer {
                 buffer,
                 elements,
                 output_shape,
                 ..
-            } => (*buffer, *elements, output_shape.clone()),
+            }) => (*buffer, *elements, output_shape.clone()),
             _ => return Err(LinearizeError::MissingStore),
         };
         let dtype = output.ty().ok_or(LinearizeError::Untyped)?.scalar;
@@ -164,11 +155,11 @@ impl LinearKernel {
         };
         if nodes.iter().any(|node| {
             matches!(
-                node.kind(),
-                UOpKind::ReduceInit
-                    | UOpKind::ReduceAccumulate
-                    | UOpKind::ReduceFinalize
-                    | UOpKind::Barrier
+                node.operation(),
+                Operation::ReduceInit
+                    | Operation::ReduceAccumulate
+                    | Operation::ReduceFinalize
+                    | Operation::Barrier
             )
         }) {
             enabled = false;
@@ -185,13 +176,13 @@ impl LinearKernel {
                 indexed_output,
                 offset,
                 contiguous,
-            ) = match node.arg() {
-                UArgRef::BufferIndex {
+            ) = match node.operation() {
+                Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements,
                     input_shape,
                     output_shape,
-                } => (
+                }) => (
                     *buffer,
                     *elements,
                     *elements,
@@ -200,13 +191,13 @@ impl LinearKernel {
                     0usize,
                     true,
                 ),
-                UArgRef::ViewBufferIndex {
+                Operation::Index(IndexValue::View {
                     buffer,
                     elements,
                     input_shape,
                     output_shape,
                     view,
-                } => {
+                }) => {
                     let contiguous = view.strides
                         == view
                             .logical_shape
@@ -352,34 +343,36 @@ fn linear_program(
         let inputs = node
             .sources()
             .iter()
-            .filter(|source| !matches!(source.kind(), UOpKind::Store))
+            .filter(|source| !matches!(source.operation(), Operation::Store))
             .filter_map(|source| ids.get(&format!("{source:?}")).copied())
             .collect::<Vec<_>>();
-        let kind = match node.kind() {
-            UOpKind::Const | UOpKind::VConst => LinearInstKind::Constant,
-            UOpKind::DefineGlobal | UOpKind::DefineLocal | UOpKind::DefineRegister => {
-                LinearInstKind::Address
+        let kind = match node.operation() {
+            Operation::Const(_) | Operation::VConst(_) => LinearInstKind::Constant,
+            Operation::DefineGlobal(_)
+            | Operation::DefineLocal(_)
+            | Operation::DefineRegister(_) => LinearInstKind::Address,
+            Operation::Index(_) => LinearInstKind::Index,
+            Operation::Load => {
+                match node
+                    .sources()
+                    .first()
+                    .and_then(|source| match source.operation() {
+                        Operation::Index(IndexValue::Buffer { buffer, .. })
+                        | Operation::Index(IndexValue::View { buffer, .. }) => Some(*buffer),
+                        _ => None,
+                    }) {
+                    Some(buffer) => LinearInstKind::Load { buffer },
+                    None => LinearInstKind::Other("untyped load".into()),
+                }
             }
-            UOpKind::Index => LinearInstKind::Index,
-            UOpKind::Load => match node
-                .sources()
-                .first()
-                .and_then(|source| match source.arg() {
-                    UArgRef::BufferIndex { buffer, .. }
-                    | UArgRef::ViewBufferIndex { buffer, .. } => Some(*buffer),
-                    _ => None,
-                }) {
-                Some(buffer) => LinearInstKind::Load { buffer },
-                None => LinearInstKind::Other("untyped load".into()),
-            },
-            UOpKind::Cast | UOpKind::Bitcast => LinearInstKind::Cast,
-            UOpKind::Unary(_) | UOpKind::GraphUnary(_) => LinearInstKind::Unary,
-            UOpKind::Binary(_) | UOpKind::GraphBinary(_) | UOpKind::GraphLogical(_) => {
+            Operation::Cast | Operation::Bitcast => LinearInstKind::Cast,
+            Operation::Unary(_) | Operation::GraphUnary(_) => LinearInstKind::Unary,
+            Operation::Binary(_) | Operation::GraphBinary(_) | Operation::GraphLogical(_) => {
                 LinearInstKind::Binary
             }
-            UOpKind::GraphCompare(_) => LinearInstKind::Compare,
-            UOpKind::Ternary(_) => LinearInstKind::Select,
-            UOpKind::Store => LinearInstKind::Store {
+            Operation::GraphCompare(_) => LinearInstKind::Compare,
+            Operation::Ternary(_) => LinearInstKind::Select,
+            Operation::Store => LinearInstKind::Store {
                 buffer: source_output_buffer(node).unwrap_or(u64::MAX),
             },
             other => LinearInstKind::Other(format!("{other:?}")),
@@ -423,10 +416,13 @@ fn linear_program(
     })
 }
 fn source_output_buffer(source: &UOp) -> Option<u64> {
-    source.sources().first().and_then(|node| match node.arg() {
-        UArgRef::BufferIndex { buffer, .. } => Some(*buffer),
-        _ => None,
-    })
+    source
+        .sources()
+        .first()
+        .and_then(|node| match node.operation() {
+            Operation::Index(IndexValue::Buffer { buffer, .. }) => Some(*buffer),
+            _ => None,
+        })
 }
 fn intervals(instructions: &[LinearInst]) -> Vec<LiveInterval> {
     let mut result = Vec::new();

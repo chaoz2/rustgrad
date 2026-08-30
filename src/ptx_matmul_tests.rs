@@ -3,7 +3,7 @@
 use super::{ConcurrentPtxCache, PtxBinding, PtxError, PtxRenderer};
 use crate::{
     Backend, CapturedSchedule, CpuBackend, CudaError, DType, Driver, Graph, MatmulKernelPlan,
-    Scalar, TensorData, UOpKind,
+    Operation, Scalar, TensorData,
 };
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
@@ -106,7 +106,7 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
         let captured = CapturedSchedule::capture(&graph, &schedule, &[output_node]).unwrap();
         let artifact = CapturedSchedule::from_bytes(&captured.to_bytes().unwrap()).unwrap();
         let kernel = &artifact.items[0].kernel;
-        let UOpKind::Matmul = kernel.kind() else {
+        let Operation::Matmul = kernel.operation() else {
             panic!("{} did not retain a matmul payload", case.name);
         };
         let shared_plan = kernel.arg().matmul_plan().unwrap();

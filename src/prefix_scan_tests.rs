@@ -116,7 +116,7 @@ fn cumsum_rejects_invalid_axes_without_graph_mutation() {
 #[test]
 fn prefix_scan_artifact_rejects_malformed_static_geometry() {
     let malformed = crate::UOp::try_new(
-        crate::UOpKind::PrefixScan,
+        crate::Operation::PrefixScan,
         Some(crate::UType::scalar(DType::I32)),
         vec![],
         crate::UArg::PrefixScan {

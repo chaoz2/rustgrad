@@ -2,7 +2,7 @@ use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
     AddressSpace, Backend, BinaryOp, BufferRole, CpuBackend, DType, Graph, KernelBindings,
-    KernelBufferDesc, Scalar, Shape, TensorData, UArg, UArgRef, UOp, UOpKind, UType, schedule,
+    KernelBufferDesc, Operation, Scalar, Shape, TensorData, UArg, UArgRef, UOp, UType, schedule,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -1154,14 +1154,14 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
         let ty = UType::scalar(dtype);
         let shape = Shape::new([]);
         let range = UOp::try_new(
-            UOpKind::Range,
+            Operation::Range,
             Some(UType::scalar(DType::I64)),
             vec![UOp::constant(1, UType::scalar(DType::I64))],
             UArg::RangeAxis(0),
         )
         .unwrap();
         let address = UOp::try_new(
-            UOpKind::DefineGlobal,
+            Operation::DefineGlobal,
             Some(ty),
             vec![],
             UArg::Address {
@@ -1172,7 +1172,7 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
         )
         .unwrap();
         let index = UOp::try_new(
-            UOpKind::Index,
+            Operation::Index,
             Some(ty),
             vec![address, range.clone()],
             UArg::BufferIndex {
@@ -1186,13 +1186,13 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
         renderer
             .render(&UOp::sink(vec![
                 UOp::try_new(
-                    UOpKind::Store,
+                    Operation::Store,
                     None,
                     vec![index, UOp::scalar_constant(dtype, bits, ty)],
                     UArg::None,
                 )
                 .unwrap(),
-                UOp::try_new(UOpKind::EndRange, None, vec![range], UArg::None).unwrap(),
+                UOp::try_new(Operation::EndRange, None, vec![range], UArg::None).unwrap(),
             ]))
             .unwrap()
             .source
