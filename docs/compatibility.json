@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:0a1a74b5257d536f",
+  "source_fingerprint": "fnv1a64:3236f5f4f1d5b495",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -441,7 +441,7 @@
       "subject": "CUDA kernel/PTX rendering, profiling and graph replay",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Deterministic PTX and mock module/function/cache/launch paths cover exact generic elementwise/static-view semantics, correctness-first reductions for stored dtypes, serial F32/F64 matmul boundaries, shared-memory tiled F32 matrix/broadcast matmul with tails, and exact-tile sm_80+ F16/BF16 m16n8k16 tensor-core matmul. Launch/shared validation, uniform barriers, source maps, and cache reuse are explicit; tiled and tensor-core mocks use independent simulators. Product/extrema retain their raw storage contracts. Tiled reductions, tensor-core tails/multi-warp/async staging, broader generic coverage, and live CUDA/ptxas validation remain open; `NativeDispatch` is unchanged."
+        "Acceptance requirement": "Deterministic PTX and mock module/function/cache/launch paths cover exact generic elementwise/static-view semantics, correctness-first reductions for stored dtypes, serial F32/F64 matmul boundaries, shared-memory tiled F32 matrix/broadcast matmul with tails, and exact-tile sm_80+ F16/BF16 m16n8k16 tensor-core matmul. Renderer identity `rustgrad-ptx-elementwise-v28` recognizes the exact scoped source roots for subtraction as `Add(lhs, Neg(rhs))` and equality as the source `logical_not(Ne)` shell, while typed generic Bool Add/Mul lower to OR/AND. Generic fallback validates every typed ALU edge and fails closed before rendering uncommitted mixed-type binary/comparison/select programs or numeric-to-Bool casts; other generic Bool binary operations remain unsupported. Launch/shared validation, uniform barriers, source maps, and cache reuse are explicit; tiled and tensor-core mocks use independent simulators. Product/extrema retain their raw storage contracts. Tiled reductions, tensor-core tails/multi-warp/async staging, broader generic coverage, and live CUDA/ptxas validation remain open; `NativeDispatch` is unchanged."
       }
     },
     {
