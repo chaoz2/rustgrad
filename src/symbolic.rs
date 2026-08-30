@@ -20,7 +20,11 @@ static NEXT_VARIABLE_ID: AtomicU64 = AtomicU64::new(1);
 fn reserve_variable_id(counter: &AtomicU64) -> Result<u64, SymbolicError> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-            (id != 0 && id != u64::MAX).then_some(id + 1)
+            if id == 0 || id == u64::MAX {
+                None
+            } else {
+                Some(id + 1)
+            }
         })
         .map_err(|_| SymbolicError::IdentityExhausted)
 }

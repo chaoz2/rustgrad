@@ -2,7 +2,8 @@
 
 use super::{
     Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward, Parameter, ParameterRestore,
-    ParameterSnapshot, PendingModeEffects, StateKind, restore_parameters, state::join,
+    ParameterSnapshot, PendingModeEffects, StateKind, parameter::next_version, restore_parameters,
+    state::join,
 };
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::sync::{
@@ -107,8 +108,14 @@ impl PendingBatchNormStats {
             });
         }
         let batches = batch_snapshot.data.scalar_at(0).as_u64();
+        let next_batches = batches.checked_add(1).ok_or(Error::BatchNormToken {
+            reason: "batch counter overflow",
+        })?;
+        let next_mean_version = next_version(self.mean_version)?;
+        let next_var_version = next_version(self.var_version)?;
+        let next_batch_version = next_version(self.batch_version)?;
         let factor = if self.momentum.is_nan() {
-            1.0 / (batches + 1) as f64
+            1.0 / next_batches as f64
         } else {
             self.momentum as f64
         };
@@ -134,19 +141,19 @@ impl PendingBatchNormStats {
                 parameter: self.running_mean.clone(),
                 data: blend(&mean_snapshot.data, &mean, 1.0)?,
                 expected_version: self.mean_version,
-                restored_version: self.mean_version.wrapping_add(1),
+                restored_version: next_mean_version,
             },
             ParameterRestore {
                 parameter: self.running_var.clone(),
                 data: blend(&var_snapshot.data, &variance, unbiased)?,
                 expected_version: self.var_version,
-                restored_version: self.var_version.wrapping_add(1),
+                restored_version: next_var_version,
             },
             ParameterRestore {
                 parameter: self.batches.clone(),
-                data: TensorData::scalar_with_dtype(Scalar::U(batches.wrapping_add(1)), DType::U64),
+                data: TensorData::scalar_with_dtype(Scalar::U(next_batches), DType::U64),
                 expected_version: self.batch_version,
-                restored_version: self.batch_version.wrapping_add(1),
+                restored_version: next_batch_version,
             },
         ])
     }
@@ -709,11 +716,6 @@ impl RMSNorm {
     }
 
     fn new_impl(dim: usize, eps: f32, affine: bool) -> Result<Self> {
-        if dim == 0 || !eps.is_finite() || eps < 0.0 {
-            return Err(Error::InvalidRandom {
-                reason: "invalid RMSNorm dimension or epsilon",
-            });
-        }
         Ok(Self {
             weight: affine
                 .then(|| Parameter::new(TensorData::ones(Shape::new([dim])).expect("valid"), true)),

@@ -163,6 +163,21 @@ impl MemoryPlan {
         temporaries: &[BufferDesc],
         reuse: bool,
     ) -> Result<Self, MemoryPlanError> {
+        // `from_temporaries` exposes allocation failures in memory-plan terms,
+        // even when the same descriptor also appears on a schedule item. Check
+        // the host allocation alignment before generic schedule validation so
+        // malformed caller-supplied temporaries retain that public error ABI.
+        for desc in temporaries {
+            if desc.alignment == 0
+                || !desc.alignment.is_power_of_two()
+                || (desc.bytes != 0 && desc.bytes % desc.alignment != 0)
+            {
+                return Err(MemoryPlanError::InvalidAlignment {
+                    buffer: desc.id,
+                    alignment: desc.alignment,
+                });
+            }
+        }
         for item in items {
             for output in item.outputs.iter() {
                 crate::schedule::validate_buffer_desc(output)

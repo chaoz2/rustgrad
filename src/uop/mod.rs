@@ -1399,7 +1399,9 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
             apply: |c, n| {
                 let x = c.get("x")?;
                 let zero = c.get("zero")?;
-                typed_positive_zero(zero, n.ty())
+                n.ty()
+                    .filter(|ty| !ty.scalar.is_float())
+                    .is_some_and(|ty| typed_positive_zero(zero, Some(ty)))
                     .then(|| x.clone())
                     .filter(|x| x.ty() == n.ty())
             },
@@ -1412,7 +1414,9 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
             apply: |c, n| {
                 let x = c.get("x")?;
                 let zero = c.get("zero")?;
-                typed_positive_zero(zero, n.ty())
+                n.ty()
+                    .filter(|ty| !ty.scalar.is_float())
+                    .is_some_and(|ty| typed_positive_zero(zero, Some(ty)))
                     .then(|| x.clone())
                     .filter(|x| x.ty() == n.ty())
             },
