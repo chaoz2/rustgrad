@@ -3256,16 +3256,21 @@ fn general_permute_captures_identity_and_affine_views_for_all_dtypes() {
         serde_json::from_value::<FuzzCase>(value).unwrap(),
         artifact_case
     );
+    let artifact_built = artifact_case.build().unwrap();
+    let expected = CpuBackend
+        .execute(
+            &artifact_built.graph,
+            artifact_built.output,
+            &artifact_built.oracle,
+        )
+        .unwrap();
     let artifact = FuzzFailureArtifact::new(
         17,
         29,
         artifact_case.clone(),
         FuzzPath::NativeVector,
         FuzzComparisonPolicy::ExactBytes,
-        FuzzOutcome::Error {
-            class: "expected".into(),
-            detail: "synthetic permute expectation".into(),
-        },
+        FuzzOutcome::value(&expected),
         FuzzOutcome::Error {
             class: "actual".into(),
             detail: "synthetic permute mismatch".into(),
