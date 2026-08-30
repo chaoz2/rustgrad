@@ -15,6 +15,10 @@ RustGrad is a Rust-native reimplementation of tinygrad's *capability*, not a lin
 - **Luminal:** a small graph vocabulary and explicit compiler pipeline;
 - **Burn:** composable backend boundaries, without forcing accelerator-specific capabilities into the common trait;
 - **dfdx:** shape and resource invariants encoded in types where that improves errors without preventing dynamic shapes;
+- **Candle:** small deployable Rust model workflows and practical safetensors/tokenizer integration, without adopting an eager-first runtime;
+- **tract:** a strict translation-versus-runtime boundary for model import and a compact, fail-closed deployment surface;
+- **ndarray:** ownership-aware dense values and views, with explicit copying and interoperability boundaries;
+- **tch-rs:** a PyTorch interoperability and workflow baseline, treated as a comparison rather than a compiler/runtime dependency because it binds LibTorch;
 - **RustTensor:** direct CPU/CUDA differential tests and an easy-to-follow reference path;
 - **cuda-oxide:** a future optional Rust-to-PTX kernel path, isolated because its toolchain is currently experimental.
 
