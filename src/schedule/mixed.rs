@@ -67,20 +67,7 @@ pub fn bind_states(
     }
     schedule.state_bindings = bindings;
     schedule.validate()?;
-    for item in &mut schedule.items {
-        let relevant = schedule
-            .state_bindings
-            .iter()
-            .filter(|binding| binding.consumer_item == item.id)
-            .collect::<Vec<_>>();
-        if !relevant.is_empty() {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            use std::hash::{Hash, Hasher};
-            item.cache_key.hash(&mut hasher);
-            relevant.hash(&mut hasher);
-            item.cache_key = hasher.finish();
-        }
-    }
+    super::rekey_schedule_items(&mut schedule.items, &schedule.state_bindings, None)?;
     Ok(schedule)
 }
 
@@ -200,9 +187,7 @@ pub fn combine(
     for item in &mut items {
         item.consumers.sort_unstable();
     }
-    for item in &mut items {
-        item.cache_key = super::item_cache_key(item);
-    }
+    super::rekey_schedule_items(&mut items, &state_bindings, None)?;
     let schedule = Schedule {
         items,
         value_bindings: bindings,

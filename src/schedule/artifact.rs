@@ -20,20 +20,24 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSA";
-const VERSION: u8 = 6;
+/// v7 replaces implementation-selected `DefaultHasher` item/specialization
+/// keys with the canonical versioned schedule-key codec.
+const VERSION: u8 = 7;
+const LAST_OPAQUE_KEY_VERSION: u8 = 6;
+const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 // The executable envelope supports ordered outputs; the inspection-only
 // multi-output envelope remains intentionally separate.
 /// Inspection-only scheduled-output envelope. This deliberately has a
 /// distinct magic and identity domain from the released single-output
 /// executable artifact above.
 const MULTI_MAGIC: &[u8; 4] = b"RGSO";
-const MULTI_VERSION: u8 = 1;
+const MULTI_VERSION: u8 = 2;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
 
 pub fn encode(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
-    validate(capture, false)?;
+    validate(capture, true)?;
     let identity = identity(capture)?;
     let mut w = Writer::new();
     w.bytes(MAGIC)?;
@@ -66,7 +70,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         return Err(ArtifactError::Format("schedule magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 1 | 2 | 3 | 4 | 5 | VERSION) {
+    if !(1..=VERSION).contains(&version) {
         return Err(ArtifactError::Format("schedule version"));
     }
     let stored_identity = r.u64()?;
@@ -74,21 +78,28 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
     if !r.done() {
         return Err(ArtifactError::Format("schedule trailing bytes"));
     }
-    validate(&capture, true)?;
-    let decoded_identity = match version {
-        1 => identity_v1(&capture)?,
-        2 => identity_v2(&capture)?,
-        3 => identity_v3(&capture)?,
-        4 => identity_v4(&capture)?,
-        5 => identity_v5(&capture)?,
-        _ => identity(&capture)?,
-    };
+    if version <= LAST_OPAQUE_KEY_VERSION {
+        // Historical item keys are authenticated bytes, not values the
+        // current process can reproduce. Validate every other executable
+        // field first while deliberately skipping only current-key equality.
+        validate(&capture, false)?;
+    } else {
+        validate(&capture, true)?;
+    }
+    let decoded_identity = fnv1a64(&bytes[HEADER_LEN..body]);
     if decoded_identity != stored_identity {
         return Err(ArtifactError::Format("schedule identity"));
     }
-    if version < VERSION {
+    if version <= LAST_OPAQUE_KEY_VERSION {
+        // Historical item keys were opaque `DefaultHasher` outputs. The
+        // original envelope identity above authenticates those exact stored
+        // bytes, while structural validation proves every executable field.
+        // Never claim a current process can reproduce the old key state:
+        // discard it and derive the current canonical identities instead.
+        rekey_current(&mut capture)?;
         capture.identity = identity(&capture)?;
     }
+    validate_capture(&capture)?;
     Ok(capture)
 }
 
@@ -96,7 +107,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
 /// collection. It is intentionally not accepted by the executable replay
 /// validation path: coupled producers have not been introduced yet.
 pub fn encode_scheduled_outputs(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
-    validate_scheduled_outputs(capture)?;
+    validate_scheduled_outputs(capture, true)?;
     let identity = scheduled_outputs_identity(capture)?;
     let mut w = Writer::new();
     w.bytes(MULTI_MAGIC)?;
@@ -131,17 +142,23 @@ pub fn decode_scheduled_outputs(bytes: &[u8]) -> Result<CapturedSchedule, Artifa
     if r.take(4)? != MULTI_MAGIC {
         return Err(ArtifactError::Format("scheduled-output magic"));
     }
-    if r.u8()? != MULTI_VERSION {
+    let version = r.u8()?;
+    if !(1..=MULTI_VERSION).contains(&version) {
         return Err(ArtifactError::Format("scheduled-output version"));
     }
     let stored_identity = r.u64()?;
-    let capture = read_scheduled_outputs_payload(&mut r, stored_identity)?;
+    let mut capture = read_scheduled_outputs_payload(&mut r, stored_identity)?;
     if !r.done() {
         return Err(ArtifactError::Format("schedule trailing bytes"));
     }
-    validate_scheduled_outputs(&capture)?;
-    if scheduled_outputs_identity(&capture)? != stored_identity {
+    validate_scheduled_outputs(&capture, version == MULTI_VERSION)?;
+    if fnv1a64(&bytes[HEADER_LEN..body]) != stored_identity {
         return Err(ArtifactError::Format("scheduled-output identity"));
+    }
+    if version < MULTI_VERSION {
+        rekey_current(&mut capture)?;
+        capture.identity = scheduled_outputs_identity(&capture)?;
+        validate_scheduled_outputs(&capture, true)?;
     }
     Ok(capture)
 }
@@ -156,9 +173,7 @@ pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError>
     {
         return Err(ArtifactError::Format("schedule length"));
     }
-    Ok(w.out.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-    }))
+    Ok(fnv1a64(&w.out))
 }
 
 pub(crate) fn scheduled_outputs_identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
@@ -171,9 +186,13 @@ pub(crate) fn scheduled_outputs_identity(capture: &CapturedSchedule) -> Result<u
     {
         return Err(ArtifactError::Format("schedule length"));
     }
-    Ok(w.out.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-    }))
+    Ok(fnv1a64(&w.out))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
@@ -194,6 +213,7 @@ fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactErr
     Ok(())
 }
 
+#[cfg(test)]
 fn write_payload_v5(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
     write_base(w, c, true, true, false)?;
     w.bool(c.symbolic.is_some())?;
@@ -212,6 +232,7 @@ fn write_payload_v5(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     Ok(())
 }
 
+#[cfg(test)]
 fn write_payload_v2(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
     write_payload_v1(w, c)?;
     w.bool(c.symbolic.is_some())?;
@@ -225,37 +246,7 @@ fn write_payload_v2(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     Ok(())
 }
 
-fn write_payload_v3(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_payload_v1(w, c)?;
-    w.bool(c.symbolic.is_some())?;
-    if let Some(schema) = &c.symbolic {
-        write_symbolic_schema(w, schema)?;
-    }
-    w.bool(c.specialized_from.is_some())?;
-    if let Some(provenance) = &c.specialized_from {
-        write_specialized_from(w, provenance)?;
-    }
-    Ok(())
-}
-
-fn write_payload_v4(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_base(w, c, true, false, false)?;
-    w.bool(c.symbolic.is_some())?;
-    if let Some(schema) = &c.symbolic {
-        write_symbolic_schema(w, schema)?;
-    }
-    w.bool(c.specialized_from.is_some())?;
-    if let Some(provenance) = &c.specialized_from {
-        write_specialized_from(w, provenance)?;
-    }
-    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
-    for (id, value) in &c.quantized_constants {
-        w.u64(*id)?;
-        write_quantized_data(w, value)?;
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn write_payload_v1(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
     write_base(w, c, false, false, false)
 }
@@ -464,6 +455,7 @@ fn read_scheduled_outputs_payload(
     })
 }
 
+#[cfg(test)]
 fn identity_v1(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     let mut writer = Writer::new();
     write_payload_v1(&mut writer, capture)?;
@@ -475,11 +467,10 @@ fn identity_v1(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     {
         return Err(ArtifactError::Format("schedule length"));
     }
-    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    }))
+    Ok(fnv1a64(&writer.out))
 }
 
+#[cfg(test)]
 fn identity_v2(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     let mut writer = Writer::new();
     write_payload_v2(&mut writer, capture)?;
@@ -491,43 +482,10 @@ fn identity_v2(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     {
         return Err(ArtifactError::Format("schedule length"));
     }
-    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    }))
+    Ok(fnv1a64(&writer.out))
 }
 
-fn identity_v3(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
-    let mut writer = Writer::new();
-    write_payload_v3(&mut writer, capture)?;
-    if writer
-        .out
-        .len()
-        .checked_add(17)
-        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
-    {
-        return Err(ArtifactError::Format("schedule length"));
-    }
-    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    }))
-}
-
-fn identity_v4(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
-    let mut writer = Writer::new();
-    write_payload_v4(&mut writer, capture)?;
-    if writer
-        .out
-        .len()
-        .checked_add(17)
-        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
-    {
-        return Err(ArtifactError::Format("schedule length"));
-    }
-    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    }))
-}
-
+#[cfg(test)]
 fn identity_v5(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     let mut writer = Writer::new();
     write_payload_v5(&mut writer, capture)?;
@@ -539,9 +497,7 @@ fn identity_v5(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     {
         return Err(ArtifactError::Format("schedule length"));
     }
-    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    }))
+    Ok(fnv1a64(&writer.out))
 }
 
 fn write_item(w: &mut Writer, x: &ScheduleItem, affine_views: bool) -> Result<(), ArtifactError> {
@@ -959,7 +915,7 @@ fn read_quantized_data(r: &mut Reader<'_>) -> Result<QuantizedTensorData, Artifa
     Ok(value)
 }
 
-fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
+fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactError> {
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
@@ -1036,17 +992,20 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
         {
             return Err(ArtifactError::Format("quantized kernel bindings"));
         }
-        let expected_cache_key = if let Some(provenance) = &c.specialized_from {
-            super::specialized_item_cache_key(
-                item,
-                provenance.source_identity,
-                &provenance.bindings,
-            )
-        } else {
-            super::item_cache_key(item)
-        };
-        if item.cache_key != expected_cache_key {
-            return Err(ArtifactError::Format("item cache identity"));
+        if validate_keys {
+            let expected_cache_key = if let Some(provenance) = &c.specialized_from {
+                super::specialized_item_cache_key(
+                    item,
+                    provenance.source_identity,
+                    &provenance.bindings,
+                )
+            } else {
+                super::item_cache_key(item)
+            }
+            .map_err(|_| ArtifactError::Format("item cache identity"))?;
+            if item.cache_key != expected_cache_key {
+                return Err(ArtifactError::Format("item cache identity"));
+            }
         }
     }
     let mut names = BTreeSet::new();
@@ -1164,7 +1123,23 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
     {
         return Err(ArtifactError::Format("specialization provenance"));
     }
-    let _ = decoded;
+    Ok(())
+}
+
+fn rekey_current(capture: &mut CapturedSchedule) -> Result<(), ArtifactError> {
+    let provenance = capture.specialized_from.clone();
+    for item in &mut capture.items {
+        item.cache_key = if let Some(provenance) = &provenance {
+            super::specialized_item_cache_key(
+                item,
+                provenance.source_identity,
+                &provenance.bindings,
+            )
+        } else {
+            super::item_cache_key(item)
+        }
+        .map_err(|_| ArtifactError::Format("item cache identity"))?;
+    }
     Ok(())
 }
 
@@ -1172,7 +1147,10 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
 /// executable artifact invariant. The legacy validator below still sees a
 /// single-output projection; this routine first validates the complete output
 /// inventory and then verifies its additional producer availability rules.
-fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError> {
+fn validate_scheduled_outputs(
+    c: &CapturedSchedule,
+    validate_keys: bool,
+) -> Result<(), ArtifactError> {
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
@@ -1209,17 +1187,20 @@ fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError>
         {
             return Err(ArtifactError::Format("scheduled-output binding"));
         }
-        let expected = if let Some(provenance) = &c.specialized_from {
-            super::specialized_item_cache_key(
-                item,
-                provenance.source_identity,
-                &provenance.bindings,
-            )
-        } else {
-            super::item_cache_key(item)
-        };
-        if item.cache_key != expected {
-            return Err(ArtifactError::Format("item cache identity"));
+        if validate_keys {
+            let expected = if let Some(provenance) = &c.specialized_from {
+                super::specialized_item_cache_key(
+                    item,
+                    provenance.source_identity,
+                    &provenance.bindings,
+                )
+            } else {
+                super::item_cache_key(item)
+            }
+            .map_err(|_| ArtifactError::Format("item cache identity"))?;
+            if item.cache_key != expected {
+                return Err(ArtifactError::Format("item cache identity"));
+            }
         }
     }
 
@@ -1270,7 +1251,8 @@ fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError>
             )
         } else {
             super::item_cache_key(item)
-        };
+        }
+        .map_err(|_| ArtifactError::Format("item cache identity"))?;
     }
     validate(&projected, true)?;
 
@@ -1662,6 +1644,14 @@ mod tests {
     use super::*;
     use crate::{DType, Graph, Scalar, Shape, Slice, TensorData};
 
+    fn decode_hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
     fn unchecked(capture: &CapturedSchedule) -> Vec<u8> {
         let mut w = Writer::new();
         w.bytes(MAGIC).unwrap();
@@ -1799,6 +1789,46 @@ mod tests {
     }
 
     #[test]
+    fn frozen_v6_opaque_keys_authenticate_then_upgrade_to_current_identity() {
+        // Frozen independently from the v6 writer. The historical cache key
+        // 0x8877665544332211 is deliberately not reproducible by the current
+        // codec; it remains covered by the v6 envelope identity and checksum.
+        let bytes = decode_hex(concat!(
+            "524753410618f1debba4c2a6f201000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000001000000000000",
+            "0000000000000000000b0400000000000000040000000000000000001c000000",
+            "52475541110100000000000000000000001d0000000000003d6ee4a600112233",
+            "44556677880000000000000000010000000000000000000000000000000000e3",
+            "12ed6b"
+        ));
+        let upgraded = decode(&bytes).unwrap();
+        assert_eq!(upgraded.items.len(), 1);
+        assert_ne!(upgraded.items[0].cache_key, 0x8877_6655_4433_2211);
+        assert_eq!(
+            upgraded.items[0].cache_key,
+            super::super::item_cache_key(&upgraded.items[0]).unwrap()
+        );
+        assert_ne!(upgraded.identity, 0xf2a6_c2a4_bbde_f118);
+
+        let current = encode(&upgraded).unwrap();
+        assert_eq!(current[4], VERSION);
+        let decoded = decode(&current).unwrap();
+        assert_eq!(decoded.identity, upgraded.identity);
+        assert_eq!(decoded.items[0].cache_key, upgraded.items[0].cache_key);
+        assert_eq!(encode(&decoded).unwrap(), current);
+
+        let mut forged = bytes;
+        forged[5] ^= 1;
+        let body = forged.len() - 4;
+        let sum = checksum(&forged[..body]);
+        forged[body..].copy_from_slice(&sum.to_le_bytes());
+        assert!(matches!(
+            decode(&forged),
+            Err(ArtifactError::Format("schedule identity"))
+        ));
+    }
+
+    #[test]
     fn signed_affine_views_round_trip_in_executable_artifacts() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2, 3], DType::I64);
@@ -1845,7 +1875,7 @@ mod tests {
         secondary.id = 99;
         item.outputs = ScheduledOutputs::new(vec![primary, secondary.clone()]).unwrap();
         item.output = item.primary_output().clone();
-        item.cache_key = crate::schedule::item_cache_key(item);
+        item.cache_key = crate::schedule::item_cache_key(item).unwrap();
         capture.identity = identity(&capture).unwrap();
 
         let decoded = decode(&encode(&capture).unwrap()).unwrap();
@@ -1947,6 +1977,27 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_specialization_keys_are_canonical_and_binding_sensitive() {
+        let symbolic = symbolic_fixture();
+        let variable = symbolic.symbolic_parameters()[0].variable().id();
+        let first =
+            crate::engine::symbolic::specialize_capture(&symbolic, &[(variable, 4)]).unwrap();
+        let repeated =
+            crate::engine::symbolic::specialize_capture(&symbolic, &[(variable, 4)]).unwrap();
+        let different =
+            crate::engine::symbolic::specialize_capture(&symbolic, &[(variable, 6)]).unwrap();
+        assert_eq!(first.items[0].cache_key, repeated.items[0].cache_key);
+        assert_ne!(first.items[0].cache_key, different.items[0].cache_key);
+        assert_eq!(first.identity, repeated.identity);
+        assert_ne!(first.identity, different.identity);
+        let bytes = encode(&first).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.identity, first.identity);
+        assert_eq!(decoded.items[0].cache_key, first.items[0].cache_key);
+        assert_eq!(encode(&decoded).unwrap(), bytes);
+    }
+
+    #[test]
     fn malformed_symbolic_views_and_constant_policies_fail_closed() {
         let capture = symbolic_view_fixture();
         let bytes = encode(&capture).unwrap();
@@ -2016,12 +2067,26 @@ mod tests {
         assert_eq!(single, encode_scheduled_outputs(&decoded).unwrap());
         assert_eq!(legacy, encode(&capture).unwrap());
 
+        let mut opaque = capture.clone();
+        opaque.items[0].cache_key = 0x8877_6655_4433_2211;
+        let mut v1 = unchecked_scheduled_outputs(&opaque);
+        v1[4] = 1;
+        let body = v1.len() - 4;
+        let sum = checksum(&v1[..body]);
+        v1[body..].copy_from_slice(&sum.to_le_bytes());
+        let upgraded = decode_scheduled_outputs(&v1).unwrap();
+        assert_eq!(
+            encode_scheduled_outputs(&upgraded).unwrap()[4],
+            MULTI_VERSION
+        );
+        assert_ne!(upgraded.items[0].cache_key, opaque.items[0].cache_key);
+
         let mut multi = capture.clone();
         let mut secondary = multi.items[0].output.clone();
         secondary.id = secondary.id.checked_add(1).unwrap();
         multi.items[0].outputs =
             ScheduledOutputs::new(vec![multi.items[0].output.clone(), secondary]).unwrap();
-        multi.items[0].cache_key = super::super::item_cache_key(&multi.items[0]);
+        multi.items[0].cache_key = super::super::item_cache_key(&multi.items[0]).unwrap();
         let bytes = encode_scheduled_outputs(&multi).unwrap();
         let decoded = decode_scheduled_outputs(&bytes).unwrap();
         assert_eq!(bytes, encode_scheduled_outputs(&decoded).unwrap());
@@ -2036,7 +2101,7 @@ mod tests {
         secondary.id = secondary.id.checked_add(1).unwrap();
         capture.items[0].outputs =
             ScheduledOutputs::new(vec![capture.items[0].output.clone(), secondary]).unwrap();
-        capture.items[0].cache_key = super::super::item_cache_key(&capture.items[0]);
+        capture.items[0].cache_key = super::super::item_cache_key(&capture.items[0]).unwrap();
         let mut bad_projection = capture.clone();
         let secondary_output = bad_projection.items[0]
             .outputs

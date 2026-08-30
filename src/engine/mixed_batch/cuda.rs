@@ -372,7 +372,7 @@ mod tests {
     fn ptx_mixed_batch_rejects_later_prefix_before_launch_or_commit() {
         let (first, first_end) = crate::engine::mixed_batch::test_support::pure_add_capture(91);
         let (mut later, _) = crate::engine::mixed_batch::test_support::pure_add_capture(92);
-        later.schedule.items[0].boundary = Some(crate::ScheduleBoundary::Unsupported("test"));
+        crate::engine::mixed_batch::test_support::mark_first_prefix_unsupported(&mut later, "test");
         let batch = CapturedMixedBatch::new(vec![first, later]).unwrap();
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let primary = Driver::from_dispatch(mock.clone())

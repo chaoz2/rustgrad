@@ -101,7 +101,9 @@ fn base_model(items: &[ScheduleItem]) -> Result<(Vec<VizNode>, Vec<VizEdge>), Vi
     for item in items {
         item.validate_input_bindings()
             .map_err(|error| VizError::InvalidSchedule(error.to_string()))?;
-        if item.cache_key != crate::schedule::item_cache_key(item) {
+        let expected_key = crate::schedule::item_cache_key(item)
+            .map_err(|error| VizError::InvalidSchedule(error.to_string()))?;
+        if item.cache_key != expected_key {
             return Err(VizError::InvalidSchedule(format!(
                 "item {} cache identity mismatch",
                 item.id

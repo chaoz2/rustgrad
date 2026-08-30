@@ -270,7 +270,8 @@ impl CapturedSchedule {
             boundary: None,
             cache_key: 0,
         };
-        item.cache_key = crate::schedule::item_cache_key(&item);
+        item.cache_key = crate::schedule::item_cache_key(&item)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         item.validate_input_bindings()
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         let mut capture = Self {
@@ -386,7 +387,8 @@ impl CapturedSchedule {
             boundary: None,
             cache_key: 0,
         };
-        item.cache_key = crate::schedule::item_cache_key(&item);
+        item.cache_key = crate::schedule::item_cache_key(&item)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         item.validate_input_bindings()
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         let mut capture = Self {
@@ -646,30 +648,48 @@ mod tests {
             .find(|binding| binding.input_node == state_input)
             .unwrap()
             .clone();
-        let state_bound = bind_schedule_states(
-            schedule,
-            vec![ScheduleStateBinding {
-                state: BufferState {
-                    buffer: 41,
-                    version: 7,
-                    shape: Shape::from([2]),
-                    dtype: DType::F32,
-                    bytes: 8,
-                },
-                view: None,
-                consumer_item: 0,
-                consumer_node: output,
-                input_node: state_input,
-                desc: input.desc,
-                abi_index: input.abi_index,
-            }],
+        let binding = ScheduleStateBinding {
+            state: BufferState {
+                buffer: 41,
+                version: 7,
+                shape: Shape::from([2]),
+                dtype: DType::F32,
+                bytes: 8,
+            },
+            view: None,
+            consumer_item: 0,
+            consumer_node: output,
+            input_node: state_input,
+            desc: input.desc,
+            abi_index: input.abi_index,
+        };
+        let state_bound = bind_schedule_states(schedule.clone(), vec![binding.clone()]).unwrap();
+        let repeated = bind_schedule_states(schedule.clone(), vec![binding.clone()]).unwrap();
+        let canonical = [(91, 4)];
+        let specialized_base =
+            crate::schedule::specialized_item_cache_key(&schedule.items[0], 77, &canonical)
+                .unwrap();
+        let specialized_state =
+            crate::schedule::state_bound_item_cache_key(specialized_base, &[&binding]).unwrap();
+        let mut specialized_items = schedule.items.clone();
+        crate::schedule::rekey_schedule_items(
+            &mut specialized_items,
+            std::slice::from_ref(&binding),
+            Some((77, &canonical)),
         )
         .unwrap();
+        assert_eq!(specialized_items[0].cache_key, specialized_state);
+        assert_ne!(specialized_items[0].cache_key, specialized_base);
+        let mut next_version = binding;
+        next_version.state.version += 1;
+        let changed = bind_schedule_states(schedule, vec![next_version]).unwrap();
         let item_keys = state_bound
             .items
             .iter()
             .map(|item| item.cache_key)
             .collect::<Vec<_>>();
+        assert_eq!(state_bound.items[0].cache_key, repeated.items[0].cache_key);
+        assert_ne!(state_bound.items[0].cache_key, changed.items[0].cache_key);
 
         assert!(matches!(
             CapturedSchedule::capture(&graph, &state_bound, &[output]),

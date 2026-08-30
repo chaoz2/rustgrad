@@ -1729,7 +1729,8 @@ pub(crate) fn specialize_capture(
             item.primary_output().id,
         )?;
         item.cache_key =
-            crate::schedule::specialized_item_cache_key(item, capture.identity, canonical);
+            crate::schedule::specialized_item_cache_key(item, capture.identity, canonical)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         item.validate_input_bindings()
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
     }
