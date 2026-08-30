@@ -317,19 +317,52 @@ impl PtxRenderer {
         }) {
             return Err(PtxError::Unsupported("linked F32 Exp NVVM contract".into()));
         }
-        let nodes = kernel
-            .topological()
-            .map_err(|error| PtxError::Unsupported(error.to_string()))?;
-        if nodes
-            .iter()
-            .filter(|node| matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp)))
-            .count()
-            != 1
-            || nodes.iter().any(|node| {
-                matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))
-                    && node.ty().is_none_or(|ty| ty.scalar != DType::F32)
-            })
-        {
+        let exact_f32_exp = (|| {
+            let [store] = kernel.sources() else {
+                return false;
+            };
+            if !matches!(kernel.kind(), UOpKind::Sink) || !matches!(store.kind(), UOpKind::Store) {
+                return false;
+            }
+            let [output_index, exp] = store.sources() else {
+                return false;
+            };
+            let [load] = exp.sources() else {
+                return false;
+            };
+            let [input_index] = load.sources() else {
+                return false;
+            };
+            let (
+                UArg::BufferIndex {
+                    elements: input_elements,
+                    input_shape,
+                    output_shape: input_output_shape,
+                    ..
+                },
+                UArg::BufferIndex {
+                    elements: output_elements,
+                    input_shape: output_input_shape,
+                    output_shape,
+                    ..
+                },
+            ) = (input_index.arg(), output_index.arg())
+            else {
+                return false;
+            };
+            matches!(exp.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))
+                && matches!(load.kind(), UOpKind::Load)
+                && input_index.ty().is_some_and(|ty| ty.scalar == DType::F32)
+                && load.ty().is_some_and(|ty| ty.scalar == DType::F32)
+                && exp.ty().is_some_and(|ty| ty.scalar == DType::F32)
+                && output_index.ty().is_some_and(|ty| ty.scalar == DType::F32)
+                && *input_elements != 0
+                && input_elements == output_elements
+                && input_shape == input_output_shape
+                && input_shape == output_input_shape
+                && input_shape == output_shape
+        })();
+        if !exact_f32_exp {
             return Err(PtxError::Unsupported("linked F32 Exp graph".into()));
         }
         render(self, kernel, true)

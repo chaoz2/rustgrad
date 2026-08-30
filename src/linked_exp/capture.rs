@@ -425,7 +425,7 @@ mod tests {
             .unwrap();
         let mut graph = Graph::new();
         let input = graph.input("input", shape);
-        let output = graph.exp(input).unwrap();
+        let output = graph.unary(crate::UnaryOp::Exp, input).unwrap();
         let schedule = crate::schedule(&graph, output).unwrap();
         let capture = CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
         let payload = b"attested-nvvm".to_vec();

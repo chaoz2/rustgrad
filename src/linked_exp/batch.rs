@@ -533,8 +533,8 @@ mod tests {
         let mut graph = Graph::new();
         let left_input = graph.input("left", Shape::from([2]));
         let right_input = graph.input("right", Shape::from([3]));
-        let left = graph.exp(left_input).unwrap();
-        let right = graph.exp(right_input).unwrap();
+        let left = graph.unary(crate::UnaryOp::Exp, left_input).unwrap();
+        let right = graph.unary(crate::UnaryOp::Exp, right_input).unwrap();
         let schedule = crate::schedule_many(&graph, &[left, right]).unwrap();
         let capture = CapturedSchedule::capture(&graph, &schedule, &[left, right]).unwrap();
         assert_eq!(capture.items.len(), 2);
