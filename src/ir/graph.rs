@@ -1448,7 +1448,7 @@ fn lower_scatter(
 
 fn chunk_plan(graph: &Graph, input: NodeId, chunks: usize, axis: isize) -> Result<ChunkPlan> {
     if chunks == 0 {
-        return Err(Error::InvalidRandom {
+        return Err(Error::InvalidSplit {
             reason: "chunk count must be positive",
         });
     }
