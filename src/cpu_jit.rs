@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v26";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v27";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -638,7 +638,8 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         )
     });
     let needs_f8_encode = nodes.iter().any(|node| {
-        matches!(node.kind(), UOpKind::Cast) && node.ty().is_some_and(|ty| ty.scalar.is_float8())
+        matches!(node.kind(), UOpKind::Cast | UOpKind::ReduceFinalize)
+            && node.ty().is_some_and(|ty| ty.scalar.is_float8())
     });
     let store = root
         .sources()
@@ -2344,6 +2345,18 @@ fn render_reduction(
         ));
         let mut map = BTreeMap::new();
         let value = emit(value_node, ids, &mut map, lines)?;
+        let value = if value_node.ty().is_some_and(|ty| ty.scalar.is_float8()) {
+            float8_decode_expr(
+                value_node
+                    .ty()
+                    .expect("guarded typed reduction lane")
+                    .scalar,
+                &value,
+            )
+            .expect("guarded Float8 reduction lane")
+        } else {
+            value
+        };
         if matches!(kind, crate::ReduceKind::Max) && out.dtype.is_float() {
             lines.push(format!(
                 "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
@@ -2393,6 +2406,9 @@ fn render_reduction(
         "rg_acc".into()
     };
     let store_value = match out.dtype {
+        dtype if dtype.is_float8() => {
+            float8_encode_expr(dtype, &store_value).expect("guarded Float8 reduction output")
+        }
         DType::F16 => format!("rg_f32_to_f16((float)({store_value}))"),
         DType::BF16 => format!("rg_f32_to_bf16((float)({store_value}))"),
         _ => store_value,
@@ -3489,7 +3505,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v26");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v27");
 
         let execute = |graph: &Graph,
                        output,
@@ -3659,7 +3675,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v26");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v27");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -5508,6 +5524,116 @@ mod tests {
                     "{dtype:?} {kind:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn float8_reduction_renderer_decodes_lanes_and_encodes_results() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let format = dtype.float8_format().unwrap();
+            let input = TensorData::from_storage(
+                [2, 3],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    format,
+                    [-0.0, 1.0, 2.0, -1.0, 0.5, 4.0]
+                        .into_iter()
+                        .map(|value| format.encode(value))
+                        .collect(),
+                )),
+            )
+            .unwrap();
+            let inputs = HashMap::from([("x".into(), input.clone())]);
+
+            for kind in [
+                crate::ReduceKind::Sum,
+                crate::ReduceKind::Mean,
+                crate::ReduceKind::Product,
+                crate::ReduceKind::Max,
+                crate::ReduceKind::Min,
+            ] {
+                let mut graph = Graph::new();
+                let x = graph.input_dtype("x", Shape::from([2, 3]), dtype);
+                let output = graph.reduce(x, kind, Some(vec![1]), false).unwrap();
+                let uop = crate::lower_graph_reduction(&graph, output).unwrap();
+                let rendered = CpuJit::render(&uop).unwrap();
+                assert!(
+                    rendered.source.matches("rg_f8_decode(").count() > 1,
+                    "{dtype:?} {kind:?}"
+                );
+                assert!(
+                    rendered.source.matches("rg_f8_encode(").count() > 1,
+                    "{dtype:?} {kind:?}"
+                );
+                let vectorized = CpuJit::render_vectorized(&uop).unwrap();
+                assert!(
+                    vectorized.source.matches("rg_f8_decode(").count() > 1
+                        && vectorized.source.matches("rg_f8_encode(").count() > 1,
+                    "{dtype:?} {kind:?}"
+                );
+                assert_eq!(
+                    crate::execute_elementwise(&graph, output, &inputs)
+                        .unwrap()
+                        .storage(),
+                    CpuBackend
+                        .execute(&graph, output, &inputs)
+                        .unwrap()
+                        .storage(),
+                    "captured {dtype:?} {kind:?}",
+                );
+
+                // One native execution per format proves that the generated
+                // decoder/encoder declarations compose and that the raw-byte
+                // ABI agrees with the CPU oracle. The other kinds share this
+                // exact boundary and retain their existing typed formulas.
+                if kind == crate::ReduceKind::Sum {
+                    let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+                    let jit = CpuJit::compile(&uop).unwrap();
+                    let mut buffers = [
+                        JitBuffer::from_tensor(&input, false),
+                        JitBuffer::zeroed(dtype, expected.len(), true),
+                    ];
+                    jit.call(&mut buffers, &[]).unwrap();
+                    let native = buffers
+                        .into_iter()
+                        .nth(1)
+                        .unwrap()
+                        .into_tensor(expected.shape().clone())
+                        .unwrap();
+                    assert_eq!(native.storage(), expected.storage(), "{dtype:?}");
+                }
+            }
+
+            let empty = TensorData::from_storage(
+                [2, 0],
+                Storage::Float8(crate::Float8Storage::from_raw(format, Vec::new())),
+            )
+            .unwrap();
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", Shape::from([2, 0]), dtype);
+            let output = graph
+                .reduce(x, crate::ReduceKind::Mean, Some(vec![1]), false)
+                .unwrap();
+            let inputs = HashMap::from([("x".into(), empty.clone())]);
+            let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+            let jit =
+                CpuJit::compile(&crate::lower_graph_reduction(&graph, output).unwrap()).unwrap();
+            let mut buffers = [
+                JitBuffer::from_tensor(&empty, false),
+                JitBuffer::zeroed(dtype, expected.len(), true),
+            ];
+            jit.call(&mut buffers, &[]).unwrap();
+            let native = buffers
+                .into_iter()
+                .nth(1)
+                .unwrap()
+                .into_tensor(expected.shape().clone())
+                .unwrap();
+            assert_eq!(native.storage(), expected.storage(), "empty {dtype:?}");
         }
     }
 
