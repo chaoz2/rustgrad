@@ -18,11 +18,18 @@ pub enum FuzzBinaryOp {
     Maximum,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FuzzUnaryOp {
     Neg,
     Abs,
+    Exp2,
+    Log2,
+    Sin,
+    Cos,
+    Tan,
+    Log,
+    Trunc,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -492,6 +499,13 @@ impl FuzzCase {
                     // direct GraphUnary Abs path shared by captured/native
                     // replay, just as Neg does for its numeric inputs.
                     FuzzUnaryOp::Abs => graph.unary(UnaryOp::Abs, input),
+                    FuzzUnaryOp::Exp2 => graph.unary(UnaryOp::Exp2, input),
+                    FuzzUnaryOp::Log2 => graph.unary(UnaryOp::Log2, input),
+                    FuzzUnaryOp::Sin => graph.unary(UnaryOp::Sin, input),
+                    FuzzUnaryOp::Cos => graph.unary(UnaryOp::Cos, input),
+                    FuzzUnaryOp::Tan => graph.unary(UnaryOp::Tan, input),
+                    FuzzUnaryOp::Log => graph.unary(UnaryOp::Log, input),
+                    FuzzUnaryOp::Trunc => graph.unary(UnaryOp::Trunc, input),
                 }
                 .map_err(|error| error.to_string())?
             }

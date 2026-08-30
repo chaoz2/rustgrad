@@ -132,6 +132,55 @@ pub fn regression_cases() -> Vec<FuzzCase> {
                 ]),
             ),
         },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Exp2,
+            input: tensor(
+                vec![5],
+                Storage::F32(vec![f32::NEG_INFINITY, -0.0, 1.0, f32::INFINITY, f32::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Log2,
+            input: tensor(
+                vec![5],
+                Storage::F64(vec![-0.0, 0.0, 1.0, f64::INFINITY, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Sin,
+            input: tensor(
+                vec![4],
+                Storage::F32(vec![-0.0, 1.0, f32::INFINITY, f32::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Cos,
+            input: tensor(
+                vec![4],
+                Storage::F64(vec![-0.0, 1.0, f64::INFINITY, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Tan,
+            input: tensor(
+                vec![4],
+                Storage::F32(vec![-0.0, 1.0, f32::INFINITY, f32::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Log,
+            input: tensor(
+                vec![5],
+                Storage::F64(vec![-0.0, 0.0, 1.0, f64::INFINITY, f64::NAN]),
+            ),
+        },
+        FuzzCase::Unary {
+            op: FuzzUnaryOp::Trunc,
+            input: tensor(
+                vec![5],
+                Storage::F32(vec![-0.0, -1.75, 1.75, f32::INFINITY, f32::NAN]),
+            ),
+        },
         FuzzCase::Compare {
             // IEEE partial comparison makes NaN unequal to itself, while
             // signed zero remains equal to positive zero.

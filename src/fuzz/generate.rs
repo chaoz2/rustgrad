@@ -318,26 +318,43 @@ pub fn generate_case(seed: u64, index: u64) -> FuzzCase {
             }
         }
         6 => {
-            // The public Neg route deliberately lowers Bool through
-            // logical_not; every other dtype remains a direct GraphUnary.
-            // Both it and direct GraphUnary Abs have a bounded CPU/captured/
-            // strict-native path for every concrete local storage dtype.
-            let dtype = [
-                DType::Bool,
-                DType::I8,
-                DType::U8,
-                DType::I16,
-                DType::U16,
-                DType::I32,
-                DType::U32,
-                DType::I64,
-                DType::U64,
-                DType::F16,
-                DType::BF16,
-                DType::F32,
-                DType::F64,
-            ][rng.pick(13)];
-            let op = [FuzzUnaryOp::Neg, FuzzUnaryOp::Abs][rng.pick(2)];
+            // Neg/Abs retain their all-storage surface. The additional raw
+            // transcendental/discrete operations are the exact F32/F64
+            // CPU/captured/strict-native intersection proven by the native
+            // renderer; narrow-float admission remains deliberately absent.
+            let (op, dtype) = if rng.pick(2) == 0 {
+                (
+                    [FuzzUnaryOp::Neg, FuzzUnaryOp::Abs][rng.pick(2)],
+                    [
+                        DType::Bool,
+                        DType::I8,
+                        DType::U8,
+                        DType::I16,
+                        DType::U16,
+                        DType::I32,
+                        DType::U32,
+                        DType::I64,
+                        DType::U64,
+                        DType::F16,
+                        DType::BF16,
+                        DType::F32,
+                        DType::F64,
+                    ][rng.pick(13)],
+                )
+            } else {
+                (
+                    [
+                        FuzzUnaryOp::Exp2,
+                        FuzzUnaryOp::Log2,
+                        FuzzUnaryOp::Sin,
+                        FuzzUnaryOp::Cos,
+                        FuzzUnaryOp::Tan,
+                        FuzzUnaryOp::Log,
+                        FuzzUnaryOp::Trunc,
+                    ][rng.pick(7)],
+                    [DType::F32, DType::F64][rng.pick(2)],
+                )
+            };
             let shape = static_shape(&mut rng);
             FuzzCase::Unary {
                 op,
