@@ -8408,16 +8408,13 @@ impl Graph {
                 .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
             return self.lazy_full_with_dtype(shape, Scalar::Bool(false), DType::Bool);
         }
-        if !dtype.is_float() {
-            return self.isinf(input);
-        }
         let infinity = if detect_positive {
-            f32::INFINITY
+            f64::INFINITY
         } else {
-            f32::NEG_INFINITY
+            f64::NEG_INFINITY
         };
-        let bound = self.constant(TensorData::scalar(infinity));
-        self.eq(input, bound)
+        let equal = self.eq_scalar(input, Scalar::F(infinity))?;
+        self.mul_scalar(equal, Scalar::Bool(true))
     }
 
     /// Backward-compatible singular spelling for the signed infinity filter.

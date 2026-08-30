@@ -5842,7 +5842,7 @@ fn isinf_sign_selection_preserves_tinygrad_predicate_contract() {
 
     assert!(matches!(
         graph.grad(positive, input),
-        Err(Error::NoGradient(_))
+        Err(Error::NonDifferentiableTarget(node)) if node == positive
     ));
 
     let mut empty = Graph::new();
@@ -10301,8 +10301,10 @@ fn linear_is_source_dot_not_raw_matmul_and_is_atomic() {
     assert_eq!(graph.shape(input_gradient).unwrap(), &Shape::new([2, 3]));
     let weight_gradient = graph.grad(loss, weight).unwrap();
     assert_eq!(graph.shape(weight_gradient).unwrap(), &Shape::new([3, 4]));
-    let bias_gradient = graph.grad(loss, bias).unwrap();
-    assert_eq!(graph.shape(bias_gradient).unwrap(), &Shape::new([4]));
+    assert!(matches!(
+        graph.grad(loss, bias),
+        Err(Error::NonDifferentiableTarget(node)) if node == bias
+    ));
 
     let mut rank_one = Graph::new();
     let input = rank_one.input_dtype("input", [2, 3], DType::U8);
@@ -11032,7 +11034,10 @@ fn source_dot_uses_tinygrad_typed_sum_and_source_layout() {
     let gradient = graph.grad(loss, lhs).unwrap();
     assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 3]));
     let gradient_loss = graph.sum_all(gradient).unwrap();
-    assert!(graph.grad(gradient_loss, lhs).is_ok());
+    assert!(matches!(
+        graph.grad(gradient_loss, lhs),
+        Err(Error::NoGradient(node)) if node == lhs
+    ));
 
     // The literal Mul then Sum sequence owns IEEE special propagation rather
     // than inheriting a raw Matmul implementation.

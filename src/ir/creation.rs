@@ -528,8 +528,8 @@ mod tests {
         };
         assert!(matches!(
             graph.op(*lhs).unwrap(),
-            Op::Reduce {
-                kind: crate::ReduceKind::Sum,
+            Op::PrefixScan {
+                kind: crate::PrefixScanKind::Sum,
                 ..
             }
         ));
@@ -1478,8 +1478,8 @@ mod tests {
         assert_eq!(graph.dtype(default).unwrap(), DType::F32);
         assert!((0..graph.node_count()).any(|n| matches!(
             graph.op(NodeId(n)).unwrap(),
-            Op::Reduce {
-                kind: crate::ReduceKind::Sum,
+            Op::PrefixScan {
+                kind: crate::PrefixScanKind::Sum,
                 ..
             }
         )));
@@ -1529,10 +1529,13 @@ mod tests {
         assert_eq!(graph.dtype(square).unwrap(), DType::F32);
         assert_eq!(graph.shape(rectangular).unwrap(), &Shape::new([2, 4]));
         assert_eq!(graph.shape(empty).unwrap(), &Shape::new([0, 3]));
-        assert!(
-            (0..graph.node_count())
-                .any(|n| matches!(graph.op(NodeId(n)).unwrap(), Op::Logical { .. }))
-        );
+        assert!((0..graph.node_count()).any(|n| matches!(
+            graph.op(NodeId(n)).unwrap(),
+            Op::Compare {
+                op: crate::CompareOp::Ne,
+                ..
+            }
+        )));
         assert!(
             graph
                 .nodes
@@ -4234,7 +4237,7 @@ impl Graph {
     /// Returns the upper triangular part of `input`, zeroing entries below
     /// `diagonal` in its final two dimensions.
     pub fn triu(&mut self, input: NodeId, diagonal: i64) -> Result<NodeId> {
-        self.triangular(input, diagonal, false)
+        self.triangular(input, diagonal, false, "triu")
     }
 
     /// Checked-in tinygrad's `Tensor.triu()` default main diagonal.
@@ -4245,7 +4248,7 @@ impl Graph {
     /// Returns the lower triangular part of `input`, zeroing entries above
     /// `diagonal` in its final two dimensions.
     pub fn tril(&mut self, input: NodeId, diagonal: i64) -> Result<NodeId> {
-        self.triangular(input, diagonal, true)
+        self.triangular(input, diagonal, true, "tril")
     }
 
     /// Checked-in tinygrad's `Tensor.tril()` default main diagonal.
@@ -4257,7 +4260,13 @@ impl Graph {
     /// tinygrad's public triangular helpers. Every rank, index extent,
     /// diagonal shift, and broadcast is validated before this appends its I64
     /// index constants, comparison, zero, or select nodes.
-    fn triangular(&mut self, input: NodeId, diagonal: i64, lower: bool) -> Result<NodeId> {
+    fn triangular(
+        &mut self,
+        input: NodeId,
+        diagonal: i64,
+        lower: bool,
+        op: &'static str,
+    ) -> Result<NodeId> {
         let (shape, dtype) = {
             let source = self.node(input)?;
             (source.shape.clone(), source.dtype)
@@ -4265,7 +4274,7 @@ impl Graph {
         shape.numel()?;
         if shape.rank() < 2 {
             return Err(Error::InvalidMovementRank {
-                op: "triangular",
+                op,
                 expected: 2,
                 actual: shape.rank(),
             });

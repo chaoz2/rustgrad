@@ -7,7 +7,9 @@ fn dot_keeps_leading_axes_as_an_outer_product() {
     let lhs = graph.input("lhs", [2, 2]);
     let rhs = graph.input("rhs", [3, 2, 1]);
     let output = graph.dot_default(lhs, rhs).unwrap();
-    assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3, 1]));
+    // tinygrad right-aligns the reshaped operands: [2,1,2] and
+    // [3,1,1,2] broadcast to [3,2,1,2] before the final-axis Sum.
+    assert_eq!(graph.shape(output).unwrap(), &Shape::from([3, 2, 1]));
     let values = HashMap::from([
         (
             "lhs".into(),
@@ -20,7 +22,7 @@ fn dot_keeps_leading_axes_as_an_outer_product() {
     ]);
     assert_eq!(
         CpuBackend.execute(&graph, output, &values).unwrap(),
-        TensorData::new([2, 3, 1], vec![3., 6., 9., 7., 14., 21.]).unwrap()
+        TensorData::new([3, 2, 1], vec![3., 7., 6., 14., 9., 21.]).unwrap()
     );
     assert!((0..graph.node_count()).any(|index| matches!(
         graph.op(NodeId(index)).unwrap(),

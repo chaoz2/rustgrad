@@ -848,10 +848,10 @@ mod tests {
         let value = CpuBackend
             .execute(&g, out.values, &HashMap::from([("x".into(), data.clone())]))
             .unwrap();
-        assert!(
-            value.scalar_at(0).as_f64().is_infinite()
-                && value.scalar_at(0).as_f64().is_sign_positive()
-        );
+        // Source Max retains its left operand on unordered comparisons, so a
+        // leading NaN remains the pooled value. The separate index branch
+        // replaces NaNs with dtype.min before selecting the source position.
+        assert!(value.scalar_at(0).as_f64().is_nan());
         let index = CpuBackend
             .execute(&g, out.indices, &HashMap::from([("x".into(), data)]))
             .unwrap();
@@ -1098,10 +1098,7 @@ mod tests {
         let value = CpuBackend
             .execute(&g, out.values, &HashMap::from([("x".into(), data.clone())]))
             .unwrap();
-        assert!(
-            value.scalar_at(0).as_f64().is_infinite()
-                && value.scalar_at(0).as_f64().is_sign_negative()
-        );
+        assert!(value.scalar_at(0).as_f64().is_nan());
         let index = CpuBackend
             .execute(&g, out.indices, &HashMap::from([("x".into(), data)]))
             .unwrap();

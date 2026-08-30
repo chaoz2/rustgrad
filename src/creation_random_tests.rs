@@ -522,8 +522,8 @@ fn one_hot_uses_a_scalar_backed_default_integer_range_and_preflights_the_full_gr
     );
     assert!(graph.nodes.iter().any(|node| matches!(
         &node.op,
-        Op::Reduce {
-            kind: crate::ReduceKind::Sum,
+        Op::PrefixScan {
+            kind: crate::PrefixScanKind::Sum,
             ..
         }
     )));
