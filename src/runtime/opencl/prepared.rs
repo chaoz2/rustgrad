@@ -3,131 +3,177 @@ use super::{
     OpenClBuffer, OpenClCache, OpenClContext, OpenClError, OpenClKernel, OpenClQueue,
     OpenClRenderer,
 };
-use crate::{ScheduleItem, TensorData};
+use crate::{DType, ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
-pub struct PreparedOpenClPrefix {
-    queue: OpenClQueue,
+use crate::runtime::static_schedule::{
+    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticRendered, StaticRenderedBuffer,
+    bind_rendered_buffers,
+};
+
+struct OpenClStaticAdapter {
+    context: OpenClContext,
+    renderer: OpenClRenderer,
     cache: OpenClCache,
-    items: Vec<(ScheduleItem, Rc<OpenClKernel>, Vec<OpenClBuffer>)>,
 }
+
+impl OpenClStaticAdapter {
+    fn new(context: OpenClContext, renderer: OpenClRenderer) -> Self {
+        let cache = context.cache();
+        Self {
+            context,
+            renderer,
+            cache,
+        }
+    }
+}
+
+impl Sealed for OpenClStaticAdapter {}
+
+impl StaticDeviceAdapter for OpenClStaticAdapter {
+    type Error = OpenClError;
+    type Rendered = super::RenderedOpenCl;
+    type Kernel = Rc<OpenClKernel>;
+    type Buffer = OpenClBuffer;
+    type Queue = OpenClQueue;
+
+    fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
+        let rendered = self.renderer.render(&item.kernel)?;
+        rendered.validate_schedule_bindings(item.ordered_inputs())?;
+        if rendered.transaction.is_some() {
+            return Err(OpenClError::Unsupported(
+                "guarded OpenCL prefixes require a staged candidate ABI".into(),
+            ));
+        }
+        let buffers = bind_rendered_buffers(
+            item,
+            rendered.buffers.iter().map(|abi| StaticRenderedBuffer {
+                id: abi.id,
+                dtype: abi.dtype,
+                source_shape: abi.source_shape.clone(),
+                elements: abi.elements,
+                mutable: abi.mutable,
+            }),
+            OpenClError::InvalidBinding,
+            || OpenClError::Overflow,
+        )?;
+        Ok(StaticRendered {
+            cache_key: rendered.cache_key.clone(),
+            extent: rendered.extent,
+            buffers,
+            artifact: rendered,
+        })
+    }
+
+    fn invalid_binding(reason: String) -> Self::Error {
+        OpenClError::InvalidBinding(reason)
+    }
+    fn unsupported(reason: String) -> Self::Error {
+        OpenClError::Unsupported(reason)
+    }
+    fn overflow() -> Self::Error {
+        OpenClError::Overflow
+    }
+    fn prepare_zero_extent(&self) -> bool {
+        true
+    }
+    fn compile(&self, rendered: &Self::Rendered) -> Result<Self::Kernel, Self::Error> {
+        self.cache
+            .load(rendered, "-cl-std=CL1.2", self.renderer.local_size)
+    }
+    fn compiled_cache_key(&self, kernel: &Self::Kernel) -> String {
+        kernel.cache_key().to_owned()
+    }
+    fn allocate(&self, elements: usize, dtype: DType) -> Result<Self::Buffer, Self::Error> {
+        self.context.allocate_typed(elements, dtype)
+    }
+    fn create_queue(&self) -> Result<Self::Queue, Self::Error> {
+        self.context.create_queue()
+    }
+    fn write(
+        &self,
+        queue: &Self::Queue,
+        buffer: &Self::Buffer,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        queue.write(buffer, 0, bytes)
+    }
+    fn launch_and_wait(
+        &self,
+        queue: &Self::Queue,
+        kernel: &Self::Kernel,
+        buffers: &[&Self::Buffer],
+    ) -> Result<(), Self::Error> {
+        if let Some(event) = kernel.launch(queue, buffers)? {
+            event.wait()?;
+        }
+        Ok(())
+    }
+    fn read(
+        &self,
+        queue: &Self::Queue,
+        buffer: &Self::Buffer,
+        bytes: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        queue.read(buffer, 0, bytes)
+    }
+    fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+/// A fully validated pure prefix whose logical intermediates remain device-resident.
+pub struct PreparedOpenClPrefix {
+    inner: PreparedStaticSchedule<OpenClStaticAdapter>,
+}
+
 impl PreparedOpenClPrefix {
     pub fn prepare(
         context: OpenClContext,
         items: &[ScheduleItem],
         renderer: OpenClRenderer,
     ) -> Result<Self, OpenClError> {
-        for item in items {
-            let nodes = item
-                .kernel
-                .topological()
-                .map_err(|_| OpenClError::InvalidBinding("cyclic schedule kernel".into()))?;
-            if nodes
-                .iter()
-                .any(|node| matches!(node.operation(), crate::Operation::TensorGuard(_)))
-            {
-                return Err(OpenClError::Unsupported(
-                    "tensor guard is CPU-interpreter only".into(),
-                ));
-            }
-        }
-        let queue = context.create_queue()?;
-        let cache = context.cache();
-        let mut prepared = Vec::with_capacity(items.len());
-        for item in items {
-            if item.boundary.is_some()
-                || item.is_effect()
-                || !item.quantized_input_bindings.is_empty()
-            {
-                return Err(OpenClError::Unsupported(
-                    "pure prefix item is outside OpenCL static execution".into(),
-                ));
-            }
-            let rendered = renderer.render(&item.kernel)?;
-            rendered.validate_schedule_bindings(item.ordered_inputs())?;
-            if rendered.transaction.is_some() {
-                return Err(OpenClError::Unsupported(
-                    "guarded OpenCL prefixes require a staged candidate ABI".into(),
-                ));
-            }
-            let kernel = cache.load(&rendered, "-cl-std=CL1.2", renderer.local_size)?;
-            let buffers = kernel
-                .rendered()
-                .buffers
-                .iter()
-                .map(|abi| context.allocate_typed(abi.elements, abi.dtype))
-                .collect::<Result<Vec<_>, _>>()?;
-            prepared.push((item.clone(), kernel, buffers));
-        }
         Ok(Self {
-            queue,
-            cache,
-            items: prepared,
+            inner: PreparedStaticSchedule::prepare(
+                OpenClStaticAdapter::new(context, renderer),
+                items,
+            )?,
         })
     }
-    pub fn cache_len(&self) -> usize {
-        self.cache.len()
+
+    pub(crate) fn prepare_for_outputs(
+        context: OpenClContext,
+        items: &[ScheduleItem],
+        retained: &[u64],
+        renderer: OpenClRenderer,
+    ) -> Result<Self, OpenClError> {
+        Ok(Self {
+            inner: PreparedStaticSchedule::prepare_for_outputs(
+                OpenClStaticAdapter::new(context, renderer),
+                items,
+                retained,
+            )?,
+        })
     }
-    /// Stable rendered-kernel identities retained by this prepared prefix.
+
+    pub fn cache_len(&self) -> usize {
+        self.inner.cache_len()
+    }
+    /// Stable rendered identities; zero-domain entries remain observable.
     pub fn kernel_cache_keys(&self) -> Vec<String> {
-        self.items
-            .iter()
-            .map(|(_, kernel, _)| kernel.cache_key().to_owned())
-            .collect()
+        self.inner.compiled_cache_keys()
     }
     pub fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), OpenClError> {
-        for (item, kernel, buffers) in &self.items {
-            for (abi, buffer) in kernel.rendered().buffers.iter().zip(buffers) {
-                if !abi.mutable {
-                    let value = values.get(&abi.id).ok_or_else(|| {
-                        OpenClError::InvalidBinding(format!("missing prefix input {}", abi.id))
-                    })?;
-                    self.queue.write(
-                        buffer,
-                        0,
-                        &value
-                            .to_le_bytes()
-                            .map_err(|_| OpenClError::InvalidBinding("input bytes".into()))?,
-                    )?;
-                }
-            }
-            if let Some(event) = kernel.launch(&self.queue, &buffers.iter().collect::<Vec<_>>())? {
-                event.wait()?;
-            }
-            let output = kernel
-                .rendered()
-                .buffers
-                .last()
-                .ok_or_else(|| OpenClError::InvalidBinding("missing output".into()))?;
-            let mut bytes = vec![
-                0;
-                output
-                    .elements
-                    .checked_mul(output.dtype.itemsize())
-                    .ok_or(OpenClError::Overflow)?
-            ];
-            self.queue.read(
-                buffers
-                    .last()
-                    .ok_or_else(|| OpenClError::InvalidBinding("missing output buffer".into()))?,
-                0,
-                &mut bytes,
-            )?;
-            values.insert(
-                output.id,
-                TensorData::from_le_bytes(output.source_shape.clone(), output.dtype, &bytes)
-                    .map_err(|_| OpenClError::InvalidBinding("output bytes".into()))?,
-            );
-            let _ = item;
-        }
-        Ok(())
+        self.inner.execute(values)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BinaryOp, DType, Graph, Scalar, Shape, Storage, TensorData, schedule};
+    use crate::{
+        BinaryOp, DType, Graph, Scalar, Shape, Storage, TensorData, schedule, schedule_many,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -149,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_prefix_preflights_then_executes_the_registered_semantic_kernel() {
+    fn retained_prefix_executes_the_registered_semantic_kernel() {
         let mock = Arc::new(super::super::tests::MockDispatch::default());
         let (context, _) = super::super::tests::setup(mock.clone());
         let mut graph = Graph::new();
@@ -159,14 +205,6 @@ mod tests {
         let items = schedule(&graph, output).unwrap().items;
         let prefix =
             PreparedOpenClPrefix::prepare(context, &items, OpenClRenderer::default()).unwrap();
-        let keys = prefix.kernel_cache_keys();
-        assert_eq!(keys, prefix.kernel_cache_keys());
-        assert!(
-            mock.calls()
-                .iter()
-                .all(|call| !call.contains("kernel_launch"))
-        );
-
         let mut values = BTreeMap::from([
             (
                 left.index() as u64,
@@ -178,11 +216,6 @@ mod tests {
             ),
         ]);
         prefix.execute(&mut values).unwrap();
-        assert!(
-            mock.calls()
-                .iter()
-                .any(|call| call.contains("kernel_launch"))
-        );
         assert_eq!(
             values[&(output.index() as u64)].storage(),
             &Storage::F32(vec![4.0, 6.0])
@@ -190,27 +223,114 @@ mod tests {
     }
 
     #[test]
-    fn retained_zero_domain_prefix_never_submits() {
+    fn public_branched_prefix_keeps_shared_values_on_device_then_returns_all_outputs() {
         let mock = Arc::new(super::super::tests::MockDispatch::default());
         let (context, _) = super::super::tests::setup(mock.clone());
         let mut graph = Graph::new();
-        let input = graph.input_dtype("input", [0], DType::F32);
-        let output = graph.unary(crate::UnaryOp::Neg, input).unwrap();
-        let prefix = PreparedOpenClPrefix::prepare(
-            context,
-            &schedule(&graph, output).unwrap().items,
-            OpenClRenderer::default(),
-        )
-        .unwrap();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let shared = graph.square(input).unwrap();
+        let one = graph.constant(TensorData::scalar(1.0));
+        let left = graph.add(shared, one).unwrap();
+        let right = graph.mul(shared, one).unwrap();
+        let schedule = schedule_many(&graph, &[left, right]).unwrap();
+        assert_eq!(schedule.items.len(), 3);
+        let prefix =
+            PreparedOpenClPrefix::prepare(context, &schedule.items, OpenClRenderer::default())
+                .unwrap();
+        let before = mock.calls();
         let mut values = BTreeMap::from([(
             input.index() as u64,
-            TensorData::from_storage(Shape::from([0]), Storage::F32(vec![])).unwrap(),
+            TensorData::from_storage(Shape::from([2]), Storage::F32(vec![2.0, 3.0])).unwrap(),
         )]);
         prefix.execute(&mut values).unwrap();
+        let calls = &mock.calls()[before.len()..];
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("write:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("read:"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            values[&(shared.index() as u64)].storage(),
+            &Storage::F32(vec![4.0, 9.0])
+        );
+        assert_eq!(
+            values[&(left.index() as u64)].storage(),
+            &Storage::F32(vec![5.0, 10.0])
+        );
+        assert_eq!(
+            values[&(right.index() as u64)].storage(),
+            &Storage::F32(vec![4.0, 9.0])
+        );
+    }
+
+    #[test]
+    fn zero_domain_preparation_preserves_cache_and_empty_reduction_abi() {
+        let mock = Arc::new(super::super::tests::MockDispatch::default());
+        let (context, _) = super::super::tests::setup(mock.clone());
+
+        let mut empty_graph = Graph::new();
+        let empty_input = empty_graph.input_dtype("empty", [0], DType::F32);
+        let empty_output = empty_graph.unary(crate::UnaryOp::Neg, empty_input).unwrap();
+        let empty_items = schedule(&empty_graph, empty_output).unwrap().items;
+        let rendered_empty_key = OpenClRenderer::default()
+            .render(&empty_items[0].kernel)
+            .unwrap()
+            .cache_key;
+        let empty =
+            PreparedOpenClPrefix::prepare(context.clone(), &empty_items, OpenClRenderer::default())
+                .unwrap();
+        assert_eq!(empty.cache_len(), 1);
+        assert_eq!(empty.kernel_cache_keys().len(), 1);
+        assert_ne!(empty.kernel_cache_keys()[0], rendered_empty_key);
+        let mut empty_values = BTreeMap::from([(
+            empty_input.index() as u64,
+            TensorData::from_storage(Shape::from([0]), Storage::F32(vec![])).unwrap(),
+        )]);
+        empty.execute(&mut empty_values).unwrap();
         assert!(
             mock.calls()
                 .iter()
                 .all(|call| !call.contains("kernel_launch"))
+        );
+        assert_eq!(
+            empty_values[&(empty_output.index() as u64)].shape(),
+            &Shape::from([0])
+        );
+
+        let mut reduction_graph = Graph::new();
+        let reduction_input = reduction_graph.input_dtype("input", [0, 2], DType::I32);
+        let reduction_output = reduction_graph
+            .reduce(
+                reduction_input,
+                crate::ReduceKind::Sum,
+                Some(vec![0]),
+                false,
+            )
+            .unwrap();
+        let reduction_items = schedule(&reduction_graph, reduction_output).unwrap().items;
+        let rendered = OpenClRenderer::default()
+            .render(&reduction_items[0].kernel)
+            .unwrap();
+        assert_eq!(rendered.buffers.len(), 1);
+        assert!(rendered.buffers[0].mutable);
+        let reduction =
+            PreparedOpenClPrefix::prepare(context, &reduction_items, OpenClRenderer::default())
+                .unwrap();
+        assert_eq!(reduction.kernel_cache_keys().len(), 1);
+        let mut reduction_values = BTreeMap::new();
+        reduction.execute(&mut reduction_values).unwrap();
+        assert_eq!(
+            reduction_values[&(reduction_output.index() as u64)].storage(),
+            &Storage::I32(vec![0, 0])
         );
     }
 }

@@ -27,9 +27,18 @@ struct WebGpuBackend {
 impl backend::PreparedBackend for WebGpuBackend {
     type Prepared = PreparedWebGpuPrefix;
 
-    fn prepare(&self, items: &[ScheduleItem]) -> Result<Self::Prepared, ReplayError> {
-        PreparedWebGpuPrefix::prepare(self.device.clone(), items, self.renderer.clone())
-            .map_err(|error| ReplayError::Execute(format!("WebGPU prepare: {error:?}")))
+    fn prepare(
+        &self,
+        items: &[ScheduleItem],
+        retained_outputs: &[u64],
+    ) -> Result<Self::Prepared, ReplayError> {
+        PreparedWebGpuPrefix::prepare_for_outputs(
+            self.device.clone(),
+            items,
+            retained_outputs,
+            self.renderer.clone(),
+        )
+        .map_err(|error| ReplayError::Execute(format!("WebGPU prepare: {error:?}")))
     }
 
     fn execute(
