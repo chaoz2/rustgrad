@@ -421,7 +421,7 @@ pub(crate) fn build_schema(
             Ok((parameter.variable.clone(), value))
         })
         .collect::<Result<BTreeMap<_, _>, ReplayError>>()?;
-    let movement_candidates = super::symbolic_view::candidates(seeds.values().cloned());
+    let movement_candidates = super::symbolic_view::candidates(seeds.values().cloned())?;
     let mut memo = BTreeMap::new();
     let mut guards = spec.guards.clone();
     let mut relevant = BTreeSet::new();
@@ -871,6 +871,57 @@ impl SymbolicSchema {
                         "symbolic elementwise domain is inconsistent".into(),
                     ));
                 }
+                match item.kernel.operation() {
+                    Operation::Movement(crate::MovementValue::Plan(plan)) => {
+                        let operands = plan
+                            .input_operands()
+                            .into_iter()
+                            .map(|operand| {
+                                Ok((
+                                    operand.node,
+                                    self.buffer_shapes
+                                        .get(&(operand.node.index() as u64))
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            ReplayError::Symbolic(
+                                                "symbolic movement operand shape is absent".into(),
+                                            )
+                                        })?,
+                                ))
+                            })
+                            .collect::<Result<BTreeMap<_, _>, ReplayError>>()?;
+                        let mut required_guards = Vec::new();
+                        let expected =
+                            symbolic_movement_output(plan, &operands, &mut required_guards)?;
+                        if &expected != output
+                            || required_guards
+                                .iter()
+                                .any(|guard| !self.guards.contains(guard))
+                        {
+                            return Err(ReplayError::Symbolic(
+                                "symbolic movement domain is inconsistent".into(),
+                            ));
+                        }
+                        let environment = self.template_environment()?;
+                        let specialized = specialize_movement_plan(
+                            plan,
+                            self,
+                            &environment,
+                            bind_shape(output, &environment)?,
+                        )?;
+                        if specialized != **plan {
+                            return Err(ReplayError::Symbolic(
+                                "symbolic movement template is inconsistent".into(),
+                            ));
+                        }
+                    }
+                    Operation::Movement(crate::MovementValue::QuantizedRowGather(_)) => {
+                        return Err(ReplayError::Unsupported(
+                            "symbolic quantized movement specialization is unavailable".into(),
+                        ));
+                    }
+                    _ => {}
+                }
             }
             SymbolicItemDomain::Reduction {
                 input_buffer,
@@ -1072,15 +1123,45 @@ fn derive_shape(
             .map(symbolic_from_concrete)
             .map_err(|error| ReplayError::Symbolic(error.to_string()))
     };
-    let shape = match graph
+    let operation = graph
         .op(node)
-        .map_err(|error| ReplayError::Symbolic(error.to_string()))?
-    {
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+    if matches!(
+        operation,
+        Op::Pad { .. }
+            | Op::Concat { .. }
+            | Op::Gather { .. }
+            | Op::Scatter { .. }
+            | Op::Bitcast { .. }
+            | Op::Contiguous { .. }
+    ) {
+        let plan = crate::MovementKernelPlan::from_graph(graph, node)
+            .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+        let mut operands = BTreeMap::new();
+        for operand in plan.input_operands() {
+            operands.insert(
+                operand.node,
+                derive_shape(
+                    graph,
+                    operand.node,
+                    seeds,
+                    movement_candidates,
+                    template_environment,
+                    memo,
+                    guards,
+                )?,
+            );
+        }
+        let shape = symbolic_movement_output(&plan, &operands, guards)?;
+        validate_shape_bounds(&shape)?;
+        memo.insert(node, shape.clone());
+        return Ok(shape);
+    }
+    let shape = match operation {
         Op::Input { .. } | Op::Constant(_) => {
             seeds.get(&node).cloned().map_or_else(concrete, Ok)?
         }
         Op::Cast { input, .. }
-        | Op::Contiguous { input }
         | Op::ContiguousBackward { input }
         | Op::Detach { input }
         | Op::Unary { input, .. } => derive_shape(
@@ -1092,10 +1173,6 @@ fn derive_shape(
             memo,
             guards,
         )?,
-        // Shape-changing bitcasts depend on the concrete final-axis byte
-        // extent. Keep that static descriptor instead of inventing a symbolic
-        // relation that the guarded replay ABI cannot encode yet.
-        Op::Bitcast { .. } => concrete()?,
         Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => broadcast_shapes(
             &derive_shape(
                 graph,
@@ -1320,6 +1397,204 @@ fn broadcast_shapes(
     }
     reversed.reverse();
     Ok(SymbolicShape::new(reversed))
+}
+
+fn symbolic_movement_output(
+    plan: &crate::MovementKernelPlan,
+    operands: &BTreeMap<NodeId, SymbolicShape>,
+    guards: &mut Vec<SymbolicGuard>,
+) -> Result<SymbolicShape, ReplayError> {
+    plan.validate()
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+    let shape = |operand: &crate::MovementOperand| {
+        operands.get(&operand.node).cloned().ok_or_else(|| {
+            ReplayError::Symbolic(format!(
+                "symbolic movement operand {} is absent",
+                operand.node.index()
+            ))
+        })
+    };
+    match &plan.kind {
+        crate::MovementKernelKind::AffineCopy { .. } => Err(ReplayError::Unsupported(
+            "symbolic computed affine-copy specialization is unavailable".into(),
+        )),
+        crate::MovementKernelKind::Pad { input, padding, .. } => {
+            let input = shape(input)?;
+            if padding.len() != input.rank() {
+                return Err(ReplayError::Symbolic(
+                    "symbolic pad rank is inconsistent".into(),
+                ));
+            }
+            Ok(SymbolicShape::new(
+                input
+                    .dims()
+                    .iter()
+                    .zip(padding)
+                    .map(|(dimension, (before, after))| {
+                        let padding = before.checked_add(*after).ok_or_else(|| {
+                            ReplayError::Symbolic("symbolic pad extent overflows".into())
+                        })?;
+                        let padding = i64::try_from(padding).map_err(|_| {
+                            ReplayError::Symbolic("symbolic pad extent exceeds i64".into())
+                        })?;
+                        Ok(SymbolicDim::new(
+                            dimension.expression().clone() + SymbolicExpr::constant(padding),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, ReplayError>>()?,
+            ))
+        }
+        crate::MovementKernelKind::Concat { inputs, axis } => {
+            let mut inputs = inputs.iter();
+            let first = inputs
+                .next()
+                .ok_or_else(|| ReplayError::Symbolic("symbolic concat has no operands".into()))?;
+            let first = shape(first)?;
+            if *axis >= first.rank() {
+                return Err(ReplayError::Symbolic(
+                    "symbolic concat axis is out of range".into(),
+                ));
+            }
+            let mut output = first.dims().to_vec();
+            for input in inputs {
+                let input = shape(input)?;
+                if input.rank() != first.rank() {
+                    return Err(ReplayError::Symbolic(
+                        "symbolic concat ranks are inconsistent".into(),
+                    ));
+                }
+                for (dimension, (output_dim, input_dim)) in
+                    output.iter_mut().zip(input.dims()).enumerate()
+                {
+                    if dimension == *axis {
+                        *output_dim = SymbolicDim::new(
+                            output_dim.expression().clone() + input_dim.expression().clone(),
+                        );
+                    } else if output_dim != input_dim {
+                        guards.push(SymbolicGuard::equal(
+                            output_dim.expression().clone(),
+                            input_dim.expression().clone(),
+                        ));
+                    }
+                }
+            }
+            Ok(SymbolicShape::new(output))
+        }
+        crate::MovementKernelKind::Gather { input, index, axis } => {
+            let input = shape(input)?;
+            let index = shape(index)?;
+            if *axis >= input.rank() || input.rank() != index.rank() {
+                return Err(ReplayError::Symbolic(
+                    "symbolic gather geometry is inconsistent".into(),
+                ));
+            }
+            for dimension in 0..input.rank() {
+                if dimension != *axis
+                    && !symbolic_less_equal(&index.dims()[dimension], &input.dims()[dimension])?
+                {
+                    return Err(ReplayError::Unsupported(
+                        "symbolic gather extent relation is not proven for the full domain".into(),
+                    ));
+                }
+            }
+            Ok(index)
+        }
+        crate::MovementKernelKind::Scatter {
+            base,
+            index,
+            updates,
+            axis,
+            ..
+        } => {
+            let base = shape(base)?;
+            let index = shape(index)?;
+            let updates = shape(updates)?;
+            if *axis >= base.rank() || base.rank() != index.rank() || updates.rank() != index.rank()
+            {
+                return Err(ReplayError::Symbolic(
+                    "symbolic scatter geometry is inconsistent".into(),
+                ));
+            }
+            for dimension in 0..index.rank() {
+                if (dimension != *axis
+                    && !symbolic_less_equal(&index.dims()[dimension], &base.dims()[dimension])?)
+                    || !symbolic_less_equal(&index.dims()[dimension], &updates.dims()[dimension])?
+                {
+                    return Err(ReplayError::Unsupported(
+                        "symbolic scatter extent relation is not proven for the full domain".into(),
+                    ));
+                }
+            }
+            Ok(base)
+        }
+        crate::MovementKernelKind::Bitcast { input } => {
+            if input.dtype.itemsize() != plan.dtype.itemsize() {
+                return Err(ReplayError::Unsupported(
+                    "symbolic shape-changing bitcast specialization is unavailable".into(),
+                ));
+            }
+            shape(input)
+        }
+        crate::MovementKernelKind::Contiguous { input } => shape(input),
+    }
+}
+
+fn symbolic_less_equal(left: &SymbolicDim, right: &SymbolicDim) -> Result<bool, ReplayError> {
+    if left == right {
+        return Ok(true);
+    }
+    let difference = (right.expression().clone() - left.expression().clone())
+        .simplify()
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+        .expression
+        .bounds()
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+    if difference.min >= 0 {
+        return Ok(true);
+    }
+
+    // The generic interval evaluator treats repeated variables independently.
+    // Cancel only structurally identical additive terms, then bound the two
+    // residual sums. This proves correlated relations such as n <= n + 1
+    // without assuming any unrecorded relationship between distinct terms.
+    fn terms(expression: &SymbolicExpr, out: &mut Vec<SymbolicExpr>) {
+        if let SymbolicExpr::Add(values) = expression {
+            for value in values {
+                terms(value, out);
+            }
+        } else {
+            out.push(expression.clone());
+        }
+    }
+    let mut left_terms = Vec::new();
+    let mut right_terms = Vec::new();
+    terms(left.expression(), &mut left_terms);
+    terms(right.expression(), &mut right_terms);
+    for left in &mut left_terms {
+        if let Some(position) = right_terms.iter().position(|right| right == left) {
+            *left = SymbolicExpr::constant(0);
+            right_terms.remove(position);
+        }
+    }
+    let left_max = left_terms
+        .iter()
+        .try_fold(0i64, |sum, term| {
+            sum.checked_add(term.bounds()?.max)
+                .ok_or(crate::SymbolicError::Overflow {
+                    op: "inequality left bound",
+                })
+        })
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+    let right_min = right_terms
+        .iter()
+        .try_fold(0i64, |sum, term| {
+            sum.checked_add(term.bounds()?.min)
+                .ok_or(crate::SymbolicError::Overflow {
+                    op: "inequality right bound",
+                })
+        })
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+    Ok(left_max <= right_min)
 }
 
 struct SymbolicMatmulGeometry {
@@ -1570,6 +1845,16 @@ pub(crate) fn specialize_kernel(
                     mean: *mean,
                 })
             }
+            Operation::Movement(crate::MovementValue::Plan(plan)) => {
+                Operation::Movement(crate::MovementValue::Plan(Box::new(
+                    specialize_movement_plan(plan, schema, environment, domain.output.clone())?,
+                )))
+            }
+            Operation::Movement(crate::MovementValue::QuantizedRowGather(_)) => {
+                return Err(ReplayError::Unsupported(
+                    "symbolic quantized movement specialization is unavailable".into(),
+                ));
+            }
             Operation::Matmul(value) => {
                 let (batch, m, n, k, lhs, rhs) = domain.matmul.as_ref().ok_or_else(|| {
                     ReplayError::Corrupt("matmul payload lacks symbolic domain".into())
@@ -1667,12 +1952,41 @@ pub(crate) fn specialize_kernel(
             _ => None,
         })
         .count();
-    if !matches!(root.operation(), Operation::Matmul(_)) && output != 1 {
+    if !matches!(
+        root.operation(),
+        Operation::Matmul(_) | Operation::Movement(_)
+    ) && output != 1
+    {
         return Err(ReplayError::Corrupt(
             "symbolic kernel output ABI is ambiguous".into(),
         ));
     }
     Ok(root)
+}
+
+fn specialize_movement_plan(
+    plan: &crate::MovementKernelPlan,
+    schema: &SymbolicSchema,
+    environment: &BTreeMap<SymbolicVar, i64>,
+    output_shape: Shape,
+) -> Result<crate::MovementKernelPlan, ReplayError> {
+    if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. }) {
+        return Err(ReplayError::Unsupported(
+            "symbolic computed affine-copy specialization is unavailable".into(),
+        ));
+    }
+    let operand_shapes = plan
+        .input_operands()
+        .into_iter()
+        .map(|operand| {
+            Ok((
+                operand.node,
+                schema.bind_shape(operand.node.index() as u64, environment)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ReplayError>>()?;
+    plan.specialize_shapes(&operand_shapes, output_shape)
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))
 }
 
 pub(crate) fn specialize_capture(

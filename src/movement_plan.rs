@@ -398,6 +398,87 @@ impl MovementKernelPlan {
         Ok(())
     }
 
+    /// Rebinds the shape-bearing descriptors in a captured movement plan.
+    ///
+    /// This deliberately retains the plan's operation-specific metadata and
+    /// routes the rebuilt value through the ordinary validator and cache-key
+    /// derivation. Affine copies require a separately specialized view and
+    /// differing-width bitcasts require a symbolic byte/divisibility proof;
+    /// neither can be reconstructed from buffer shapes alone.
+    pub(crate) fn specialize_shapes(
+        &self,
+        operand_shapes: &std::collections::BTreeMap<NodeId, Shape>,
+        output_shape: Shape,
+    ) -> Result<Self, MovementPlanError> {
+        let operand = |value: &MovementOperand| {
+            Ok(MovementOperand {
+                node: value.node,
+                shape: operand_shapes
+                    .get(&value.node)
+                    .cloned()
+                    .ok_or(MovementPlanError::InvalidGeometry)?,
+                dtype: value.dtype,
+            })
+        };
+        let kind = match &self.kind {
+            MovementKernelKind::AffineCopy { .. } => {
+                return Err(MovementPlanError::InvalidGeometry);
+            }
+            MovementKernelKind::Pad {
+                input,
+                padding,
+                fill_bits,
+            } => MovementKernelKind::Pad {
+                input: operand(input)?,
+                padding: padding.clone(),
+                fill_bits: *fill_bits,
+            },
+            MovementKernelKind::Concat { inputs, axis } => MovementKernelKind::Concat {
+                inputs: inputs.iter().map(operand).collect::<Result<Vec<_>, _>>()?,
+                axis: *axis,
+            },
+            MovementKernelKind::Gather { input, index, axis } => MovementKernelKind::Gather {
+                input: operand(input)?,
+                index: operand(index)?,
+                axis: *axis,
+            },
+            MovementKernelKind::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                add,
+            } => MovementKernelKind::Scatter {
+                base: operand(base)?,
+                index: operand(index)?,
+                updates: operand(updates)?,
+                axis: *axis,
+                add: *add,
+            },
+            MovementKernelKind::Bitcast { input } => {
+                if input.dtype.itemsize() != self.dtype.itemsize() {
+                    return Err(MovementPlanError::InvalidGeometry);
+                }
+                MovementKernelKind::Bitcast {
+                    input: operand(input)?,
+                }
+            }
+            MovementKernelKind::Contiguous { input } => MovementKernelKind::Contiguous {
+                input: operand(input)?,
+            },
+        };
+        let mut specialized = Self {
+            kind,
+            output: self.output,
+            output_shape,
+            dtype: self.dtype,
+            cache_key: 0,
+        };
+        specialized.cache_key = specialized.expected_cache_key();
+        specialized.validate()?;
+        Ok(specialized)
+    }
+
     pub fn input_operands(&self) -> Vec<&MovementOperand> {
         match &self.kind {
             MovementKernelKind::AffineCopy { input, .. } => vec![input],
