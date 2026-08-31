@@ -9,6 +9,7 @@ pub mod mixed_rebinding;
 mod replay_liveness;
 pub(crate) mod symbolic;
 pub(crate) mod symbolic_view;
+use crate::backend::{JitBackendError, PreparedScheduleItem, TensorValueStore};
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
     Backend, BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc,
@@ -20,7 +21,10 @@ pub use captured_replay::{
     CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace,
 };
 pub use mixed::realize_mixed_effects;
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fmt,
+};
 pub use symbolic::{SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +86,209 @@ pub struct RealizationTrace {
 pub struct Realized {
     pub outputs: Vec<TensorData>,
     pub trace: RealizationTrace,
+}
+
+enum PlannedRealizationItem {
+    Interpreter,
+    ZeroDomain { cache_hit: bool },
+    Native(PreparedScheduleItem),
+    Fallback(String),
+}
+
+struct PlannedRealization {
+    jit: Option<CpuJitBackend>,
+    items: Vec<PlannedRealizationItem>,
+}
+
+fn realization_jit_error(error: JitBackendError) -> RealizationError {
+    match error {
+        JitBackendError::Unsupported(reason) => RealizationError::Unsupported(reason),
+        other => RealizationError::Execution(other.to_string()),
+    }
+}
+
+fn fallback_execution_error(native_reason: &str, interpreter_reason: String) -> RealizationError {
+    RealizationError::Execution(format!("{native_reason}; {interpreter_reason}"))
+}
+
+/// Validates the complete pure topology and, for CPU JIT policies, compiles
+/// every admitted item before the first item can execute. This is the ordinary
+/// realization counterpart of captured replay's typed preparation phase.
+fn plan_realization(
+    schedule: &Schedule,
+    policy: RealizationPolicy,
+) -> Result<PlannedRealization, RealizationError> {
+    schedule
+        .validate()
+        .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+    let mut prior = BTreeSet::new();
+    for item in &schedule.items {
+        if item.boundary.is_some() {
+            return Err(RealizationError::Unsupported(format!(
+                "item {} has boundary {:?}",
+                item.id, item.boundary
+            )));
+        }
+        if item
+            .dependencies
+            .iter()
+            .any(|dependency| !prior.contains(dependency))
+        {
+            return Err(RealizationError::Schedule(format!(
+                "item {} uses a future dependency",
+                item.id
+            )));
+        }
+        prior.insert(item.id);
+    }
+
+    let RealizationPolicy::CpuJit {
+        fallback_to_interpreter,
+    } = policy
+    else {
+        return Ok(PlannedRealization {
+            jit: None,
+            items: schedule
+                .items
+                .iter()
+                .map(|_| PlannedRealizationItem::Interpreter)
+                .collect(),
+        });
+    };
+
+    let jit = CpuJitBackend::new(JitFallback::Error);
+    let mut capability = Vec::with_capacity(schedule.items.len());
+    for item in &schedule.items {
+        if matches!(item.kernel.operation(), crate::Operation::Sort(_)) {
+            let reason = "static sort pairs are CPU-interpreter only".to_string();
+            if fallback_to_interpreter {
+                capability.push(Err(reason));
+                continue;
+            }
+            return Err(RealizationError::Unsupported(reason));
+        }
+        if !item.quantized_input_bindings.is_empty() {
+            let reason =
+                "ordinary realization has no caller-owned packed quantized resources".to_string();
+            if fallback_to_interpreter {
+                capability.push(Err(reason));
+                continue;
+            }
+            return Err(RealizationError::Unsupported(reason));
+        }
+        let elements = item
+            .primary_output()
+            .shape
+            .numel()
+            .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+        if elements == 0 {
+            match jit.prepare_zero_domain_schedule_item(item) {
+                Ok(cache_hit) => capability.push(Ok(cache_hit)),
+                Err(error) if fallback_to_interpreter => capability.push(Err(error.to_string())),
+                Err(error) => return Err(realization_jit_error(error)),
+            }
+            continue;
+        }
+        match jit.validate_schedule_item(item) {
+            Ok(()) => capability.push(Ok(false)),
+            Err(error) if fallback_to_interpreter => capability.push(Err(error.to_string())),
+            Err(error) => return Err(realization_jit_error(error)),
+        }
+    }
+
+    let mut items = Vec::with_capacity(schedule.items.len());
+    for (item, capability) in schedule.items.iter().zip(capability) {
+        if matches!(item.kernel.operation(), crate::Operation::Sort(_))
+            || !item.quantized_input_bindings.is_empty()
+        {
+            let Err(reason) = capability else {
+                return Err(RealizationError::Schedule(
+                    "fallback-only item unexpectedly passed native capability".into(),
+                ));
+            };
+            items.push(PlannedRealizationItem::Fallback(reason));
+            continue;
+        }
+        if item
+            .primary_output()
+            .shape
+            .numel()
+            .map_err(|error| RealizationError::Schedule(error.to_string()))?
+            == 0
+        {
+            match capability {
+                Ok(cache_hit) => {
+                    items.push(PlannedRealizationItem::ZeroDomain { cache_hit });
+                }
+                Err(reason) => items.push(PlannedRealizationItem::Fallback(reason)),
+            }
+            continue;
+        }
+        if let Err(reason) = capability {
+            items.push(PlannedRealizationItem::Fallback(reason));
+            continue;
+        }
+        match jit.prepare_schedule_item(item) {
+            Ok(prepared) => items.push(PlannedRealizationItem::Native(prepared)),
+            Err(error) if fallback_to_interpreter => {
+                items.push(PlannedRealizationItem::Fallback(error.to_string()))
+            }
+            Err(error) => return Err(realization_jit_error(error)),
+        }
+    }
+    Ok(PlannedRealization {
+        jit: Some(jit),
+        items,
+    })
+}
+
+/// Ordinary realization historically permits unrelated caller inputs. Validate
+/// only the named Graph inputs that the scheduled ABI actually references,
+/// before memory planning, native compilation, or item execution begins.
+fn validate_realization_inputs(
+    graph: &Graph,
+    schedule: &Schedule,
+    provided: &HashMap<String, TensorData>,
+) -> Result<(), RealizationError> {
+    let mut expected = BTreeMap::<String, (Shape, crate::DType)>::new();
+    for item in &schedule.items {
+        for binding in item.ordered_inputs() {
+            let Op::Input { name } = graph
+                .op(binding.input_node)
+                .map_err(|error| RealizationError::Schedule(error.to_string()))?
+            else {
+                continue;
+            };
+            let descriptor = (
+                graph
+                    .shape(binding.input_node)
+                    .map_err(|error| RealizationError::Schedule(error.to_string()))?
+                    .clone(),
+                graph
+                    .dtype(binding.input_node)
+                    .map_err(|error| RealizationError::Schedule(error.to_string()))?,
+            );
+            if expected
+                .insert(name.clone(), descriptor.clone())
+                .is_some_and(|previous| previous != descriptor)
+            {
+                return Err(RealizationError::Schedule(format!(
+                    "input {name} has conflicting descriptors"
+                )));
+            }
+        }
+    }
+    for (name, (shape, dtype)) in expected {
+        let value = provided
+            .get(&name)
+            .ok_or_else(|| RealizationError::Execution(format!("missing input {name}")))?;
+        if value.shape() != &shape || value.dtype() != dtype {
+            return Err(RealizationError::Execution(format!(
+                "input {name} descriptor mismatch"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Executes a normal schedule whose items are exclusively universal
@@ -251,18 +458,22 @@ pub fn realize_with_options(
         ));
     }
     let policy = options.backend;
-    let plan = MemoryPlan::from_schedule(
+    validate_realization_inputs(graph, schedule, inputs)?;
+    let memory_plan = MemoryPlan::from_schedule(
         schedule,
         requested,
         options.memory_reuse == MemoryReuse::Enabled,
     )
     .map_err(RealizationError::Memory)?;
-    let assignments = plan
+    // Native compilation is still a pre-execution phase, but only begins
+    // after the complete input and allocation plans have succeeded.
+    let execution = plan_realization(schedule, policy)?;
+    let assignments = memory_plan
         .temporaries
         .iter()
         .map(|entry| (entry.buffer_id, entry))
         .collect::<HashMap<_, _>>();
-    let requests = plan
+    let requests = memory_plan
         .requests
         .iter()
         .map(|request| (request.buffer_id, request))
@@ -277,33 +488,7 @@ pub fn realize_with_options(
     let mut leases: HashMap<u64, HostBufferLease> = HashMap::new();
     let pool = HostSlotPool::new();
     let mut trace = RealizationTrace::default();
-    let jit = matches!(policy, RealizationPolicy::CpuJit { .. })
-        .then(|| CpuJitBackend::new(JitFallback::Error));
-    for item in &schedule.items {
-        if !item.outputs.is_single()
-            && !matches!(item.kernel.operation(), crate::Operation::Sort(_))
-        {
-            return Err(RealizationError::Unsupported(format!(
-                "item {} has no multi-output executor",
-                item.id
-            )));
-        }
-        if item.boundary.is_some() {
-            return Err(RealizationError::Unsupported(format!(
-                "item {} has boundary {:?}",
-                item.id, item.boundary
-            )));
-        }
-        if item
-            .dependencies
-            .iter()
-            .any(|dependency| !trace.items.iter().any(|entry| entry.item == *dependency))
-        {
-            return Err(RealizationError::Schedule(format!(
-                "item {} uses a future dependency",
-                item.id
-            )));
-        }
+    for (item, planned) in schedule.items.iter().zip(&execution.items) {
         let mut backend = ItemBackend::Interpreter;
         let mut lanes = 1;
         let mut vector_main = 0;
@@ -311,11 +496,6 @@ pub fn realize_with_options(
         let mut vector_reason = "interpreter scalar semantics".to_string();
         let materialized = materialized_values(&leases, &values).map_err(RealizationError::Host)?;
         let sort_pair = if matches!(item.kernel.operation(), crate::Operation::Sort(_)) {
-            if jit.is_some() {
-                return Err(RealizationError::Unsupported(
-                    "static sort pairs are CPU-interpreter only".into(),
-                ));
-            }
             Some(
                 interpret_sort_pair(graph, item, inputs, &materialized)
                     .map_err(RealizationError::Execution)?,
@@ -324,57 +504,56 @@ pub fn realize_with_options(
             None
         };
         let value = if let Some((values, _)) = &sort_pair {
-            values.clone()
-        } else if let Some(jit) = &jit {
-            let native_eligible = item.dependencies.is_empty()
-                && item.inputs.iter().all(|buffer| {
-                    matches!(
-                        graph.op(NodeId::from_index(buffer.id as usize)),
-                        Ok(Op::Input { .. } | Op::Constant(_))
-                    )
-                });
-            if native_eligible {
-                match jit.execute_native(graph, item.node, inputs) {
-                    Ok((value, execution)) => {
-                        backend = ItemBackend::NativeJit;
-                        lanes = execution.vector.lanes;
-                        vector_main = execution.vector_main;
-                        vector_tail = execution.vector_tail;
-                        vector_reason = execution.vector.reason;
-                        value
-                    }
-                    Err(error)
-                        if matches!(
-                            policy,
-                            RealizationPolicy::CpuJit {
-                                fallback_to_interpreter: true
-                            }
-                        ) =>
-                    {
-                        backend = ItemBackend::JitFallback;
-                        interpret_item(graph, item, inputs, &materialized)
-                            .map_err(|e| RealizationError::Execution(format!("{error}; {e}")))?
-                    }
-                    Err(error) => return Err(RealizationError::Execution(error.to_string())),
-                }
-            } else if matches!(
-                policy,
-                RealizationPolicy::CpuJit {
-                    fallback_to_interpreter: true
-                }
-            ) {
+            if let PlannedRealizationItem::Fallback(reason) = planned {
                 backend = ItemBackend::JitFallback;
-                interpret_item(graph, item, inputs, &materialized)
-                    .map_err(RealizationError::Execution)?
-            } else {
-                return Err(RealizationError::Unsupported(format!(
-                    "item {} cannot use native CPU JIT with materialized dependencies",
-                    item.id
-                )));
+                vector_reason = reason.clone();
             }
+            values.clone()
         } else {
-            interpret_item(graph, item, inputs, &materialized)
-                .map_err(RealizationError::Execution)?
+            match planned {
+                PlannedRealizationItem::Interpreter => {
+                    interpret_item(graph, item, inputs, &materialized)
+                        .map_err(RealizationError::Execution)?
+                }
+                PlannedRealizationItem::ZeroDomain { cache_hit } => {
+                    backend = ItemBackend::NativeJit;
+                    vector_reason = if *cache_hit {
+                        "native zero-domain skip (cache hit)".into()
+                    } else {
+                        "native zero-domain skip".into()
+                    };
+                    TensorData::zeros_with_dtype(
+                        item.primary_output().shape.clone(),
+                        item.primary_output().dtype,
+                    )
+                    .map_err(|error| RealizationError::Execution(error.to_string()))?
+                }
+                PlannedRealizationItem::Native(prepared) => {
+                    let jit = execution.jit.as_ref().ok_or_else(|| {
+                        RealizationError::Schedule("native item has no prepared backend".into())
+                    })?;
+                    let lookup = RealizationJitValues {
+                        graph,
+                        inputs,
+                        materialized: &materialized,
+                    };
+                    let (value, native) = jit
+                        .execute_prepared_schedule_item(item, &lookup, &BTreeMap::new(), prepared)
+                        .map_err(realization_jit_error)?;
+                    backend = ItemBackend::NativeJit;
+                    lanes = native.vector.lanes;
+                    vector_main = native.vector_main;
+                    vector_tail = native.vector_tail;
+                    vector_reason = native.vector.reason;
+                    value
+                }
+                PlannedRealizationItem::Fallback(reason) => {
+                    backend = ItemBackend::JitFallback;
+                    vector_reason = reason.clone();
+                    interpret_item(graph, item, inputs, &materialized)
+                        .map_err(|error| fallback_execution_error(reason, error))?
+                }
+            }
         };
         let output = item.primary_output();
         let assignment = assignments.get(&output.id);
@@ -443,7 +622,7 @@ pub fn realize_with_options(
                 values.insert(secondary.id, indices);
             }
         }
-        let released_buffers = plan
+        let released_buffers = memory_plan
             .temporaries
             .iter()
             .filter(|entry| {
@@ -484,7 +663,7 @@ pub fn realize_with_options(
                 .ok_or(RealizationError::MissingBuffer(node.index() as u64))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if pool.physical_slots().map_err(RealizationError::Host)? != plan.peak_allocations {
+    if pool.physical_slots().map_err(RealizationError::Host)? != memory_plan.peak_allocations {
         return Err(RealizationError::Schedule(
             "host pool slot count diverges from memory plan".into(),
         ));
@@ -515,6 +694,40 @@ fn materialized_values(
         values.insert(*buffer, view.tensor()?);
     }
     Ok(values)
+}
+
+/// Borrowed ordinary-realization lookup for prepared native schedule items.
+/// Compiler-created producers come from the memory plan; external inputs and
+/// constants remain graph-owned and are never copied into a second binding
+/// map merely to satisfy the captured-replay ABI.
+struct RealizationJitValues<'a> {
+    graph: &'a Graph,
+    inputs: &'a HashMap<String, TensorData>,
+    materialized: &'a HashMap<u64, TensorData>,
+}
+
+impl TensorValueStore for RealizationJitValues<'_> {
+    fn tensor(&self, id: u64, context: &str) -> Result<&TensorData, JitBackendError> {
+        if let Some(value) = self.materialized.get(&id) {
+            return Ok(value);
+        }
+        let node = NodeId::from_index(usize::try_from(id).map_err(|_| {
+            JitBackendError::Binding(format!("{context}: buffer {id} exceeds NodeId range"))
+        })?);
+        match self
+            .graph
+            .op(node)
+            .map_err(|error| JitBackendError::Binding(error.to_string()))?
+        {
+            Op::Input { name } => self.inputs.get(name).ok_or_else(|| {
+                JitBackendError::Binding(format!("{context}: missing input {name}"))
+            }),
+            Op::Constant(value) => Ok(value),
+            _ => Err(JitBackendError::Binding(format!(
+                "{context}: missing materialized buffer {id}"
+            ))),
+        }
+    }
 }
 
 /// Convenience entry point for the internal lazy path. Scheduling is repeated
@@ -700,7 +913,10 @@ fn interpret_sort_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, ReduceKind, Scalar, Shape, TensorData};
+    use crate::{
+        Backend, CpuBackend, DType, Float8Format, Float8Storage, ReduceKind, Scalar, Shape,
+        Storage, TensorData,
+    };
 
     #[test]
     fn multi_output_schedule_rejects_before_interpreter_materialization() {
@@ -788,7 +1004,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fallback.outputs[0].storage(), expected.storage());
-        assert_eq!(fallback.trace.items[1].backend, ItemBackend::JitFallback);
+        assert!(
+            fallback
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
     }
 
     #[test]
@@ -834,6 +1056,236 @@ mod tests {
         )
         .unwrap();
         assert_eq!(native.trace.items[0].backend, ItemBackend::NativeJit);
+    }
+
+    #[test]
+    fn dependent_contiguous_items_execute_through_the_prepared_cpu_jit_path() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let bias = graph.constant(TensorData::scalar(1.0));
+        let computed = graph.add(input, bias).unwrap();
+        let output = graph.contiguous(computed).unwrap();
+        let schedule = crate::schedule_many(&graph, &[output]).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        assert_eq!(schedule.items[1].dependencies, [schedule.items[0].id]);
+
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::new([2, 3], vec![-3.0, -0.0, 1.0, 2.0, 5.0, f32::INFINITY]).unwrap(),
+        )]);
+        let actual = realize(
+            &graph,
+            &schedule,
+            &[output],
+            &bindings,
+            RealizationPolicy::CpuJit {
+                fallback_to_interpreter: false,
+            },
+        )
+        .unwrap();
+        let expected = CpuBackend.execute(&graph, output, &bindings).unwrap();
+        assert_eq!(actual.outputs[0].storage(), expected.storage());
+        assert!(
+            actual
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
+    }
+
+    #[test]
+    fn dependent_contiguous_preserves_raw_views_float8_and_empty_geometry() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let permuted = graph.permute(input, [1, 0]).unwrap();
+        let output = graph.contiguous(permuted).unwrap();
+        let raw = TensorData::from_storage(
+            [2, 2],
+            Storage::F32(vec![
+                f32::from_bits(0x8000_0000),
+                f32::from_bits(0x7fc0_0123),
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ]),
+        )
+        .unwrap();
+        let bindings = HashMap::from([("input".into(), raw)]);
+        let realized = realize_graph(
+            &graph,
+            &[output],
+            &bindings,
+            RealizationPolicy::CpuJit {
+                fallback_to_interpreter: false,
+            },
+        )
+        .unwrap();
+        let Storage::F32(values) = realized.outputs[0].storage() else {
+            panic!("F32 contiguous output")
+        };
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [0x8000_0000, 0x7f80_0000, 0x7fc0_0123, 0xff80_0000]
+        );
+        assert!(
+            realized
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
+
+        let mut float8 = Graph::new();
+        let input = float8.input_dtype("input", [2, 2], DType::F8E4M3);
+        let permuted = float8.permute(input, [1, 0]).unwrap();
+        let output = float8.contiguous(permuted).unwrap();
+        let raw = TensorData::from_storage(
+            [2, 2],
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E4M3,
+                vec![0x00, 0x80, 0x7f, 0xff],
+            )),
+        )
+        .unwrap();
+        let realized = realize_graph(
+            &float8,
+            &[output],
+            &HashMap::from([("input".into(), raw)]),
+            RealizationPolicy::CpuJit {
+                fallback_to_interpreter: false,
+            },
+        )
+        .unwrap();
+        let Storage::Float8(values) = realized.outputs[0].storage() else {
+            panic!("Float8 contiguous output")
+        };
+        assert_eq!(values.as_raw(), [0x00, 0x7f, 0x80, 0xff]);
+
+        for shape in [Shape::new([]), Shape::new([0, 3])] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", shape.clone(), DType::F32);
+            let zero = graph.constant(TensorData::scalar(0.0));
+            let computed = graph.add(input, zero).unwrap();
+            let output = graph.contiguous(computed).unwrap();
+            let value = TensorData::zeros_with_dtype(shape.clone(), DType::F32).unwrap();
+            let realized = realize_graph(
+                &graph,
+                &[output],
+                &HashMap::from([("input".into(), value)]),
+                RealizationPolicy::CpuJit {
+                    fallback_to_interpreter: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(realized.outputs[0].shape(), &shape);
+            assert!(
+                realized
+                    .trace
+                    .items
+                    .iter()
+                    .all(|item| item.backend == ItemBackend::NativeJit)
+            );
+        }
+    }
+
+    #[test]
+    fn dependent_native_plan_rejects_late_topology_and_descriptor_faults() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let one = graph.constant(TensorData::scalar(1.0));
+        let computed = graph.add(input, one).unwrap();
+        let output = graph.contiguous(computed).unwrap();
+        let schedule = crate::schedule_many(&graph, &[output]).unwrap();
+
+        let mut malformed_edge = schedule.clone();
+        malformed_edge.items[1].dependencies.clear();
+        malformed_edge.items[1].cache_key =
+            crate::schedule::item_cache_key(&malformed_edge.items[1]).unwrap();
+        assert!(matches!(
+            plan_realization(
+                &malformed_edge,
+                RealizationPolicy::CpuJit {
+                    fallback_to_interpreter: false,
+                },
+            ),
+            Err(RealizationError::Schedule(_))
+        ));
+
+        let mut malformed_desc = schedule;
+        malformed_desc.items[1].input_bindings[0].desc.dtype = DType::I32;
+        malformed_desc.items[1].cache_key =
+            crate::schedule::item_cache_key(&malformed_desc.items[1]).unwrap();
+        assert!(matches!(
+            plan_realization(
+                &malformed_desc,
+                RealizationPolicy::CpuJit {
+                    fallback_to_interpreter: false,
+                },
+            ),
+            Err(RealizationError::Schedule(_))
+        ));
+    }
+
+    #[test]
+    fn fallback_failure_retains_native_and_interpreter_diagnostics() {
+        assert_eq!(
+            fallback_execution_error(
+                "CPU JIT unsupported: operation family",
+                "missing materialized buffer 7".into(),
+            ),
+            RealizationError::Execution(
+                "CPU JIT unsupported: operation family; missing materialized buffer 7".into(),
+            )
+        );
+    }
+
+    #[test]
+    fn all_external_inputs_are_validated_before_dependent_native_preparation() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], DType::F32);
+        let y = graph.input_dtype("y", [2], DType::F32);
+        let first = graph.square(x).unwrap();
+        let second = graph.add(first, y).unwrap();
+        let output = graph.contiguous(second).unwrap();
+        let schedule = crate::schedule_many(&graph, &[output]).unwrap();
+        assert!(schedule.items.len() >= 2);
+
+        let missing = HashMap::from([("x".into(), TensorData::new([2], vec![2.0, 3.0]).unwrap())]);
+        assert!(matches!(
+            realize(
+                &graph,
+                &schedule,
+                &[output],
+                &missing,
+                RealizationPolicy::CpuJit {
+                    fallback_to_interpreter: false,
+                },
+            ),
+            Err(RealizationError::Execution(reason)) if reason == "missing input y"
+        ));
+
+        let mismatch = HashMap::from([
+            ("x".into(), TensorData::new([2], vec![2.0, 3.0]).unwrap()),
+            ("y".into(), TensorData::new([1], vec![1.0]).unwrap()),
+            // Preserve ordinary realization's historical extra-input policy.
+            ("unused".into(), TensorData::scalar(7.0)),
+        ]);
+        assert!(matches!(
+            realize(
+                &graph,
+                &schedule,
+                &[output],
+                &mismatch,
+                RealizationPolicy::CpuJit {
+                    fallback_to_interpreter: false,
+                },
+            ),
+            Err(RealizationError::Execution(reason))
+                if reason == "input y descriptor mismatch"
+        ));
     }
 
     #[test]
@@ -942,7 +1394,7 @@ mod tests {
             jit.trace
                 .items
                 .iter()
-                .any(|entry| entry.backend == ItemBackend::JitFallback)
+                .all(|entry| entry.backend == ItemBackend::NativeJit)
         );
         assert!(
             actual
