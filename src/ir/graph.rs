@@ -4615,7 +4615,7 @@ impl Graph {
         ))
     }
 
-    /// Adds a first-class NCHW/OIHW 2D convolution node.
+    /// NCHW/OIHW syntax adapter over the rank-generic compositional core.
     pub fn conv2d(
         &mut self,
         input: NodeId,
@@ -4623,33 +4623,52 @@ impl Graph {
         bias: Option<NodeId>,
         options: Conv2dOptions,
     ) -> Result<NodeId> {
-        let input_node = self.node(input)?;
-        let weight_node = self.node(weight)?;
-        let shape = conv2d_shape(&input_node.shape, &weight_node.shape, options)?;
-        if let Some(bias) = bias {
-            let b = self.node(bias)?;
-            if b.shape != Shape::from([weight_node.shape.dims()[0]]) {
-                return Err(Error::InvalidConv2d {
-                    input: input_node.shape.clone(),
-                    weight: weight_node.shape.clone(),
-                    reason: "bias must be [output_channels]",
-                });
-            }
+        let input_shape = self.shape(input)?.clone();
+        let weight_shape = self.shape(weight)?.clone();
+        if input_shape.rank() != 4 || weight_shape.rank() != 4 {
+            return Err(Error::InvalidConv2d {
+                input: input_shape,
+                weight: weight_shape,
+                reason: "input and weight must be rank 4",
+            });
         }
-        let mut dtype = input_node.dtype.promote(weight_node.dtype);
-        if let Some(bias) = bias {
-            dtype = dtype.promote(self.node(bias)?.dtype);
-        }
-        Ok(self.push(
-            Op::Conv2d {
-                input,
-                weight,
-                bias,
-                options,
+        let groups = std::num::NonZeroUsize::new(options.groups).ok_or(Error::InvalidConv2d {
+            input: input_shape.clone(),
+            weight: weight_shape.clone(),
+            reason: "groups, stride, and dilation must be positive",
+        })?;
+        let padding = options
+            .padding
+            .into_iter()
+            .map(|value| {
+                i64::try_from(value).map_err(|_| Error::ShapeOverflow(input_shape.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let window = SpatialWindow::new(
+            weight_shape.dims()[2..].to_vec(),
+            options.stride,
+            options.dilation,
+            [(padding[0], padding[1]), (padding[2], padding[3])],
+        )
+        .map_err(|_| Error::InvalidConv2d {
+            input: input_shape.clone(),
+            weight: weight_shape.clone(),
+            reason: "groups, stride, and dilation must be positive",
+        })?;
+        self.convolution(
+            input,
+            weight,
+            bias,
+            ConvolutionSpec::new(window, groups, None),
+        )
+        .map_err(|error| match error {
+            Error::InvalidConvolution { reason, .. } => Error::InvalidConv2d {
+                input: input_shape,
+                weight: weight_shape,
+                reason,
             },
-            shape,
-            dtype,
-        ))
+            error => error,
+        })
     }
     pub fn conv_transpose2d(
         &mut self,

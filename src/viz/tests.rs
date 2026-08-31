@@ -550,7 +550,18 @@ fn convolution_graph_visualization_preserves_roles_geometry_and_derivatives() {
         dilation: [1, 2],
         padding: [1, 0, 2, 1],
     };
-    let forward = graph.conv2d(input, weight, Some(bias), options).unwrap();
+    // Visualization retains the legacy RGUA v10 operation family for artifact
+    // decode/replay even though public forward convolution is compositional.
+    let forward = graph.push(
+        crate::Op::Conv2d {
+            input,
+            weight,
+            bias: Some(bias),
+            options,
+        },
+        Shape::from([1, 2, 3, 5]),
+        DType::F32,
+    );
     let upstream = graph.input("upstream", [1, 2, 3, 5]);
     let gradient = graph
         .conv2d_grad(upstream, input, weight, Some(bias), options, 1)

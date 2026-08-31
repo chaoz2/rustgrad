@@ -5731,7 +5731,10 @@ mod tests {
                 &[1., 3., 5., 11., 24., 28., 1., 1., 1., 1., 3., 3.]
             )
         );
-        assert!(graph.trace(y).unwrap().to_string().contains("groups=2"));
+        let trace = graph.trace(y).unwrap().to_string();
+        assert!(trace.contains("Sum("));
+        assert!(trace.contains("concat("));
+        assert!(!trace.contains("conv2d("));
     }
 
     #[test]

@@ -503,20 +503,26 @@ mod tests {
     }
 
     #[test]
-    fn strict_native_static_conv_contract_rejects_before_cache_or_mutation() {
+    fn strict_native_static_conv_contract_matches_cpu_without_mutation() {
         let model = Conv2d::new_static(3, 2, [3, 3], Conv2dOptions::default(), false, 91).unwrap();
         let before = model.state_dict().unwrap();
         let executor = CapturedReplayExecutor::default();
+        let input = TensorData::new([1, 3, 3, 3], vec![1.0f32; 27]).unwrap();
+        let expected = infer_module_cpu(&model, input.clone()).unwrap();
+        let native = infer_module_native_cpu(&model, input.clone(), &executor, false).unwrap();
+        assert_eq!(native.output(), expected.output());
         assert!(
-            infer_module_native_cpu(
-                &model,
-                TensorData::new([1, 3, 3, 3], vec![1.0f32; 27]).unwrap(),
-                &executor,
-                false,
-            )
-            .is_err()
+            native
+                .trace()
+                .items
+                .iter()
+                .all(|item| item.backend == crate::ItemBackend::NativeJit)
         );
-        assert_eq!(executor.compile_cache_len(false), 0);
+        let cached = executor.compile_cache_len(false);
+        assert!(cached > 0);
+        let replay = infer_module_native_cpu(&model, input, &executor, false).unwrap();
+        assert_eq!(replay.output(), expected.output());
+        assert_eq!(executor.compile_cache_len(false), cached);
         assert_eq!(model.state_dict().unwrap(), before);
     }
 

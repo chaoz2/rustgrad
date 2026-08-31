@@ -65,6 +65,7 @@ src/
                          storage/lifecycle, and operation-family extensions
     mod.rs               concise module wiring and public re-exports
     types.rs             public IR vocabulary and operation options
+    convolution.rs       validated rank-generic windows/spec and compositional lowering
     dynamic.rs           typed dynamic-result nodes with rank/dtype contracts
     graph.rs             graph storage, bindings, lifecycle, and composition
     shape.rs             pure checked shape/dtype validation helpers
@@ -668,6 +669,13 @@ for ordinary `Sequential` or invent a global training flag.
 `nn/activation.rs` owns the state-free `ReLU` leaf, which delegates only to
 `Graph::relu`; it contributes no traversal state and lets ordinary
 `Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
+`ir/convolution.rs` owns one validated `SpatialWindow` and `ConvolutionSpec`,
+then lowers every new rank-generic forward convolution through ordinary movement,
+promotion, multiplication, typed reduction, and bias operations. `Graph::conv2d`
+is a syntax adapter rather than a second semantic node. No new public forward
+graph emits the old first-class Conv2d operation, but its graph encode, CPU
+oracle, autograd, scheduler, and visualization paths remain internal
+compatibility seams; StaticConv2d and RGUA v10 remain decodable and replayable.
 `nn/conv.rs` owns graph-free `Conv2d` construction plus its static one-input
 forward adapter; `nn/pool.rs` owns the matching `AvgPool2d`, `AdaptiveAvgPool2d`,
 and `MaxPool2d` adapters. `ConvTranspose2d` likewise owns a graph-independent

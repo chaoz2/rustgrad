@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:e39c30ad42223ae6",
+  "source_fingerprint": "fnv1a64:54f7c32de0871f12",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -234,7 +234,7 @@
       "subject": "Convolution, pooling and Winograd",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "CPU-oracle NCHW/OIHW Conv2d is acceptance-tested. **Static pooling is ✅ complete:** general trailing-spatial `max_pool`/`avg_pool` support arbitrary-rank options, including checked-in 3D tuple usage, and 2D wrappers delegate to the same normalized core. Generalized max indices return checked I32 flattened original-spatial indices with earliest-index ties; NaN, padding, dilation, ceil windows, divisors, and split-tie value gradients are acceptance-tested. Pooling behavior is validated from checked-in source and RustGrad's CPU oracle; only a live tinygrad runtime differential remains unavailable in this workspace. Winograd and broader convolution-family work remain."
+        "Acceptance requirement": "`Graph::convolution` is the canonical rank-generic core: validated `SpatialWindow` owns matching kernel/stride/dilation and signed asymmetric crop/padding, with positive extents whenever a spatial axis exists, while `ConvolutionSpec` binds a nonzero group count to the operand-LUB-derived default or explicit `ReductionDType`. The forward graph is tinygrad's compact Pad → logarithmically grouped Concat-materialized repeat tiles → shrink/reshape/permute windows → promoted Mul → typed Sum → optional promoted bias composition for 0D/1D/2D/3D, grouped/depthwise, anisotropic and empty-batch cases; `Graph::conv2d` is only its NCHW/OIHW syntax adapter and preserves the established `InvalidConv2d` admission surface. The materialized repeat boundary makes the remaining affine windows schedulable, capturable, and strict CPU-native replayable without a new backend operation. No new public forward graph emits `Op::Conv2d`, but its graph encode, CPU-oracle, autograd, scheduler, and visualization paths remain internal compatibility seams; `StaticConv2dPlan` and RGUA v10 remain decodable and replayable. **Static pooling is ✅ complete:** general trailing-spatial `max_pool`/`avg_pool` support arbitrary-rank options, including checked-in 3D tuple usage, and 2D wrappers delegate to the same normalized core. Generalized max indices return checked I32 flattened original-spatial indices with earliest-index ties; NaN, padding, dilation, ceil windows, divisors, and split-tie value gradients are acceptance-tested. Pooling behavior is validated from checked-in source and RustGrad's CPU oracle; only a live tinygrad runtime differential remains unavailable in this workspace. Transpose convolution, Winograd, symbolic windows, and live accelerator tuning remain separate."
       }
     },
     {

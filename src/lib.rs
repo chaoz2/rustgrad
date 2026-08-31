@@ -139,12 +139,13 @@ pub use host_buffer::HostBufferError;
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
-    ConvTranspose2dOptions, DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan,
-    DynamicAllocationTarget, DynamicBinding, DynamicCountStage, DynamicInput, DynamicNodeId,
-    DynamicOutputShape, ExpandExtent, Graph, LogicalOp, NodeId, Op, PadMode, Pool2dOptions,
-    PoolOptions, PrefixScanKind, PrefixScanOutput, RandomKind, RandomStream, ReduceKind,
-    ReductionDType, ReshapeExtent, RollDims, RollShifts, ShrinkRange, Slice, SortOutput,
-    SplitSections, SplitSizes, StaticIndexUpdateWrt, UnaryOp, UnflattenExtent, VarianceCorrection,
+    ConvTranspose2dOptions, ConvolutionSpec, DynamicAllocation, DynamicAllocationError,
+    DynamicAllocationPlan, DynamicAllocationTarget, DynamicBinding, DynamicCountStage,
+    DynamicInput, DynamicNodeId, DynamicOutputShape, ExpandExtent, Graph, LogicalOp, NodeId, Op,
+    PadMode, Pool2dOptions, PoolOptions, PrefixScanKind, PrefixScanOutput, RandomKind,
+    RandomStream, ReduceKind, ReductionDType, ReshapeExtent, RollDims, RollShifts, ShrinkRange,
+    Slice, SortOutput, SpatialWindow, SpatialWindowError, SplitSections, SplitSizes,
+    StaticIndexUpdateWrt, UnaryOp, UnflattenExtent, VarianceCorrection,
 };
 pub use ir::{ScatterMode, ScatterReduceKind, ScatterSource};
 pub use kernel::{
