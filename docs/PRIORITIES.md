@@ -389,21 +389,19 @@ adapters remain separate.
 
 ### 17. P1 — dynamic cardinality only when a P0 proves the blocker
 
-**Status:** deferred as a workflow blocker; bounded CPU P2 substrate released.
+**Status:** bounded exact-cardinality CPU runtime DAG released; broader routes deferred.
 **Owner:** `RustGrad — Symbolic Shapes`.
 
 **User outcome.** A representative imported model or user workflow with a
 runtime-sized selection can run without bespoke host glue.
 
-**Evidence and gap.** CPU-only `nonzero`, dynamic masked select, a narrow F32
-elementwise composition set, `DynamicSum`, and first-order VJPs exist. The
-bounded public `CpuSession` path now exposes exactly `masked_select_dynamic`,
-optional `Neg`/`Square`, one checked F32 static-scalar `Add`/`Sub`/`Mul`, and
-scalar `Sum`/forward-only `Mean`, returning detached exact-cardinality CPU
-results through the canonical allocation plan and typed mixed schedule. There
-is deliberately no dynamic-to-dynamic binary composition, general dynamic
-broadcasting, dynamic session autograd, artifact/capture/replay/native
-JIT/device lowering, or dynamic-mean autograd.
+**Evidence and gap.** CPU-only source-policy `nonzero`, dynamic masked select,
+shared-count `Neg`/`Square` and `Add`/`Sub`/`Mul` DAGs, checked scalar operands,
+composable `Sum`/forward-only `Mean`, and first-order Sum VJPs exist. The public
+`CpuSession` path exposes the same exact shape expressions and rejects foreign
+session provenance. General dynamic broadcasting, session-level dynamic
+autograd, artifact/capture/replay/native JIT/device lowering, and dynamic-mean
+autograd remain deliberately unavailable.
 No current P0 acceptance has yet demonstrated that the remaining generality is
 its concrete blocker.
 

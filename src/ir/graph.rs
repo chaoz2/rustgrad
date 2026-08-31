@@ -1,4 +1,4 @@
-use super::creation::lazy_arange_default_int_plan;
+use super::creation::{LazyArangePlan, lazy_arange_default_int_plan};
 use super::*;
 use crate::nn::{ParameterId, ParameterSnapshot};
 use crate::{
@@ -9,6 +9,33 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
+
+fn nonzero_coordinate_dtype(shape: &Shape) -> Result<DType> {
+    let mut dtype = DType::I32;
+    for &extent in shape.dims() {
+        let maximum_coordinate = extent.saturating_sub(1);
+        i64::try_from(maximum_coordinate).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        if maximum_coordinate > i32::MAX as usize {
+            dtype = DType::I64;
+        }
+    }
+    Ok(dtype)
+}
+
+fn nonzero_coordinate_range_plan(extent: usize) -> Result<LazyArangePlan> {
+    let shape = Shape::from([extent]);
+    let dtype = nonzero_coordinate_dtype(&shape)?;
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    Ok(LazyArangePlan {
+        shape,
+        dtype,
+        step: TensorData::scalar_with_dtype(Scalar::I(1), dtype),
+        offset: TensorData::scalar_with_dtype(Scalar::I(-1), dtype),
+    })
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Node {
@@ -1833,53 +1860,60 @@ impl Graph {
     /// Returns row-major coordinates of every nonzero input element. Its
     /// concrete shape is `[count, input_rank]` after realization.
     pub fn nonzero(&mut self, input: NodeId) -> Result<DynamicNodeId> {
-        self.node(input)?;
+        let shape = &self.node(input)?.shape;
+        let rank = shape.rank();
+        let dtype = nonzero_coordinate_dtype(shape)?;
         let id = DynamicNodeId {
             graph: self.id,
             index: self.dynamic_nodes.len(),
         };
-        self.dynamic_nodes.push(DynamicNode::nonzero(input));
+        self.dynamic_nodes
+            .push(DynamicNode::nonzero(id, input, rank, dtype));
         Ok(id)
     }
 
     /// Fixed-shape `nonzero(size=...)`, matching tinygrad's row-major
     /// pad/truncate form without introducing a new dynamic-result primitive.
     ///
-    /// The result has shape `[size, input_rank]`. Every extent, the flattened
-    /// selection length, and every `arange` endpoint are checked before this
-    /// method appends its comparison, movement, or selection composition.
+    /// The result has shape `[size, input_rank]`. Every extent and the complete
+    /// literal composition are clone-rehearsed before this method appends its
+    /// comparison, movement, or selection nodes. Coordinate ranges are planned
+    /// from their exact length, so the final valid I64 coordinate needs no
+    /// unrepresentable exclusive endpoint.
     pub fn nonzero_fixed(&mut self, input: NodeId, size: usize, fill: Scalar) -> Result<NodeId> {
+        let mut rehearsal = self.clone();
+        rehearsal.lower_nonzero_fixed(input, size, fill)?;
+        self.lower_nonzero_fixed(input, size, fill)
+    }
+
+    fn lower_nonzero_fixed(&mut self, input: NodeId, size: usize, fill: Scalar) -> Result<NodeId> {
         let (shape, dtype) = {
             let source = self.node(input)?;
             (source.shape.clone(), source.dtype)
         };
         let count = shape.numel()?;
         let rank = shape.rank();
+        let coordinate_dtype = nonzero_coordinate_dtype(&shape)?;
         let selection_len = size
             .checked_mul(rank)
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-        for &dimension in shape.dims() {
-            i64::try_from(dimension).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        if rank == 0 || count == 0 {
+            return self.lazy_full_with_dtype([size, rank], fill, coordinate_dtype);
         }
-        if rank == 0 {
-            return self.zeros_with_dtype([size, 0], DType::I32);
-        }
+        let range_plans = shape
+            .dims()
+            .iter()
+            .copied()
+            .map(nonzero_coordinate_range_plan)
+            .collect::<Result<Vec<_>>>()?;
 
         let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), dtype));
         let mask = self.ne(input, zero)?;
         let flattened_mask = self.reshape(mask, Shape::from([count]))?;
         let mut coordinates = Vec::with_capacity(rank);
-        for (axis, &dimension) in shape.dims().iter().enumerate() {
-            let range = self.arange(0, dimension as i64, 1)?;
-            // tinygrad's default integer arange uses its default I32 width
-            // until a coordinate no longer fits, then widens. Preserve that
-            // observable index dtype rather than exposing Graph::arange's
-            // legacy I64 storage for ordinary shapes.
-            let range = if dimension <= i32::MAX as usize {
-                self.cast(range, DType::I32)?
-            } else {
-                range
-            };
+        for (axis, plan) in range_plans.into_iter().enumerate() {
+            let dimension = plan.shape.dims()[0];
+            let range = self.lower_lazy_arange(plan)?;
             let mut coordinate_shape = vec![1; rank];
             coordinate_shape[axis] = dimension;
             let range = self.reshape(range, Shape::new(coordinate_shape))?;
@@ -1916,7 +1950,7 @@ impl Graph {
             index: self.dynamic_nodes.len(),
         };
         self.dynamic_nodes
-            .push(DynamicNode::masked_select(input, mask, source.dtype));
+            .push(DynamicNode::masked_select(id, input, mask, source.dtype));
         Ok(id)
     }
 
@@ -1931,7 +1965,10 @@ impl Graph {
 
     /// Reduces a dynamic result to a scalar dynamic loss.
     pub fn dynamic_sum(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
-        let dtype = self.dynamic_node(input)?.dtype;
+        let source = self.dynamic_node(input)?;
+        let dtype = super::dynamic_reduction_dtypes(source.dtype, ReduceKind::Sum)
+            .expect("dynamic Sum is supported")
+            .output;
         let id = DynamicNodeId {
             graph: self.id,
             index: self.dynamic_nodes.len(),
@@ -1943,11 +1980,9 @@ impl Graph {
     /// Reduces a dynamic rank-one result using the ordinary mean dtype policy.
     pub fn dynamic_mean(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
         let source = self.dynamic_node(input)?;
-        let dtype = if source.dtype.is_float() {
-            source.dtype
-        } else {
-            DType::F32
-        };
+        let dtype = super::dynamic_reduction_dtypes(source.dtype, ReduceKind::Mean)
+            .expect("dynamic Mean is supported")
+            .output;
         let id = DynamicNodeId {
             graph: self.id,
             index: self.dynamic_nodes.len(),
@@ -1963,7 +1998,9 @@ impl Graph {
                 "unsupported dynamic unary",
             ));
         }
-        let dtype = self.dynamic_node(input)?.dtype;
+        let source = self.dynamic_node(input)?;
+        let dtype = source.dtype;
+        let output = source.output;
         if !dtype.is_float() {
             return Err(Error::InvalidElementwiseDType {
                 op: op.name(),
@@ -1975,7 +2012,7 @@ impl Graph {
             index: self.dynamic_nodes.len(),
         };
         self.dynamic_nodes
-            .push(DynamicNode::unary(op, input, dtype));
+            .push(DynamicNode::unary(op, input, output, dtype));
         Ok(id)
     }
 
@@ -1992,8 +2029,19 @@ impl Graph {
             ));
         }
         let lhs_node = self.dynamic_node(lhs)?;
+        let lhs_output = lhs_node.output;
+        let mut output = lhs_output;
         let rhs_dtype = match rhs {
-            DynamicInput::Dynamic(id) => self.dynamic_node(id)?.dtype,
+            DynamicInput::Dynamic(id) => {
+                let rhs_node = self.dynamic_node(id)?;
+                output = match (lhs_output, rhs_node.output) {
+                    (DynamicOutputShape::Scalar, rhs) => rhs,
+                    (lhs, DynamicOutputShape::Scalar) => lhs,
+                    (lhs, rhs) if lhs == rhs => lhs,
+                    _ => return Err(Error::InvalidIndex),
+                };
+                rhs_node.dtype
+            }
             DynamicInput::StaticScalar(id) => {
                 let node = self.node(id)?;
                 if node.shape.numel()? != 1 {
@@ -2002,7 +2050,7 @@ impl Graph {
                 node.dtype
             }
         };
-        let dtype = lhs_node.dtype.promote(rhs_dtype);
+        let dtype = source_lub(lhs_node.dtype, rhs_dtype);
         if !dtype.is_float() {
             return Err(Error::InvalidElementwiseDType {
                 op: "dynamic_binary",
@@ -2017,6 +2065,7 @@ impl Graph {
             op,
             DynamicInput::Dynamic(lhs),
             rhs,
+            output,
             dtype,
         ));
         Ok(id)

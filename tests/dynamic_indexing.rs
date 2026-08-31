@@ -23,7 +23,7 @@ fn nonzero_realizes_row_major_coordinates_with_fresh_runtime_shapes() {
         some.output,
         TensorData::from_scalars(
             [2, 2],
-            DType::I64,
+            DType::I32,
             [Scalar::I(0), Scalar::I(1), Scalar::I(1), Scalar::I(0)]
         )
         .unwrap()
@@ -36,6 +36,7 @@ fn nonzero_realizes_row_major_coordinates_with_fresh_runtime_shapes() {
         )
         .unwrap();
     assert_eq!(none.shape.shape(), &[0, 2].into());
+    assert_eq!(none.output.dtype(), DType::I32);
     assert_eq!(none.output.len(), 0);
 }
 

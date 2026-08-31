@@ -98,20 +98,27 @@ pub struct Tensor {
 
 /// A graph-owned exact-cardinality CPU value.
 ///
-/// It can only be produced by [`CpuSession::masked_select_dynamic`] and then
-/// consumed by this session's bounded F32 dynamic operations. It deliberately
-/// has no static shape because its extent is fixed only after CPU realization.
+/// Its concrete shape is produced by the runtime instruction DAG. The handle
+/// exposes the exact shape expression and dtype, but no invented bound. Count
+/// provenance is graph-local: it may be compared within this session, while
+/// every operation still validates the owning session token.
 #[derive(Clone, Debug)]
 pub struct DynamicTensor {
     session: u64,
     node: DynamicNodeId,
     dtype: DType,
+    shape: crate::DynamicOutputShape,
 }
 
 impl DynamicTensor {
     /// Storage dtype propagated by the exact runtime-buffer plan.
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// Exact runtime shape expression, including count provenance.
+    pub fn shape_expression(&self) -> crate::DynamicOutputShape {
+        self.shape
     }
 }
 
@@ -435,10 +442,10 @@ impl CpuSession {
     /// Selects F32 values at a broadcast Bool mask into an exact rank-one CPU
     /// result. Its length is the row-major true-count at realization time.
     ///
-    /// The dynamic value remains bounded to this session's `neg`, `square`,
-    /// scalar `add`/`sub`/`mul`, `sum`, `mean`, and `realize_dynamic` methods.
-    /// Capture, artifacts, native JIT, devices, arbitrary dynamic operations,
-    /// and dynamic reverse mode remain deliberately unavailable.
+    /// The dynamic value composes through this session's pointwise unary,
+    /// same-provenance binary, checked scalar, reduction, and realization
+    /// methods. Capture, artifacts, native JIT, devices, general broadcasting,
+    /// and session-level dynamic reverse mode remain deliberately unavailable.
     pub fn masked_select_dynamic(
         &mut self,
         input: &Tensor,
@@ -457,17 +464,25 @@ impl CpuSession {
         self.dynamic_handle(node)
     }
 
-    /// Negates one bounded dynamic F32 value through its exact runtime buffer.
+    /// Returns source-compatible row-major nonzero coordinates with exact
+    /// runtime shape `[count, input_rank]`.
+    pub fn nonzero_dynamic(&mut self, input: &Tensor) -> Result<DynamicTensor> {
+        let input = self.node(input)?;
+        let node = self.graph.nonzero(input)?;
+        self.dynamic_handle(node)
+    }
+
+    /// Negates one floating dynamic value through its exact runtime buffer.
     pub fn dynamic_neg(&mut self, input: &DynamicTensor) -> Result<DynamicTensor> {
         self.dynamic_unary(input, UnaryOp::Neg)
     }
 
-    /// Squares one bounded dynamic F32 value through its exact runtime buffer.
+    /// Squares one floating dynamic value through its exact runtime buffer.
     pub fn dynamic_square(&mut self, input: &DynamicTensor) -> Result<DynamicTensor> {
         self.dynamic_unary(input, UnaryOp::Square)
     }
 
-    /// Adds one static F32 scalar to every bounded dynamic F32 value.
+    /// Adds one checked static scalar using source dtype promotion.
     pub fn dynamic_add_scalar(
         &mut self,
         input: &DynamicTensor,
@@ -476,7 +491,7 @@ impl CpuSession {
         self.dynamic_scalar_binary(input, scalar, BinaryOp::Add)
     }
 
-    /// Subtracts one static F32 scalar from every bounded dynamic F32 value.
+    /// Subtracts one checked static scalar using source dtype promotion.
     pub fn dynamic_sub_scalar(
         &mut self,
         input: &DynamicTensor,
@@ -485,7 +500,7 @@ impl CpuSession {
         self.dynamic_scalar_binary(input, scalar, BinaryOp::Sub)
     }
 
-    /// Multiplies every bounded dynamic F32 value by one static F32 scalar.
+    /// Multiplies by one checked static scalar using source dtype promotion.
     pub fn dynamic_mul_scalar(
         &mut self,
         input: &DynamicTensor,
@@ -494,14 +509,41 @@ impl CpuSession {
         self.dynamic_scalar_binary(input, scalar, BinaryOp::Mul)
     }
 
-    /// Reduces a bounded dynamic F32 value to its exact F32 sum scalar.
+    /// Adds two dynamic values with the same runtime shape/count provenance.
+    pub fn dynamic_add(
+        &mut self,
+        lhs: &DynamicTensor,
+        rhs: &DynamicTensor,
+    ) -> Result<DynamicTensor> {
+        self.dynamic_tensor_binary(lhs, rhs, BinaryOp::Add)
+    }
+
+    /// Subtracts same-cardinality dynamic values pointwise.
+    pub fn dynamic_sub(
+        &mut self,
+        lhs: &DynamicTensor,
+        rhs: &DynamicTensor,
+    ) -> Result<DynamicTensor> {
+        self.dynamic_tensor_binary(lhs, rhs, BinaryOp::Sub)
+    }
+
+    /// Multiplies same-cardinality dynamic values pointwise.
+    pub fn dynamic_mul(
+        &mut self,
+        lhs: &DynamicTensor,
+        rhs: &DynamicTensor,
+    ) -> Result<DynamicTensor> {
+        self.dynamic_tensor_binary(lhs, rhs, BinaryOp::Mul)
+    }
+
+    /// Reduces a dynamic value to its exact typed sum scalar.
     pub fn dynamic_sum(&mut self, input: &DynamicTensor) -> Result<DynamicTensor> {
         let input = self.dynamic_node(input)?;
         let node = self.graph.dynamic_sum(input)?;
         self.dynamic_handle(node)
     }
 
-    /// Reduces a bounded dynamic F32 value to its exact F32 mean scalar.
+    /// Reduces a dynamic value to its exact source-policy mean scalar.
     pub fn dynamic_mean(&mut self, input: &DynamicTensor) -> Result<DynamicTensor> {
         let input = self.dynamic_node(input)?;
         let node = self.graph.dynamic_mean(input)?;
@@ -629,7 +671,7 @@ impl CpuSession {
         self.handle(output)
     }
 
-    /// Realizes one bounded exact-cardinality result through the CPU oracle.
+    /// Realizes one exact-cardinality result through the CPU oracle.
     pub fn realize_dynamic(&self, tensor: &DynamicTensor) -> Result<TensorData> {
         Ok(CpuBackend
             .execute_dynamic(&self.graph, self.dynamic_node(tensor)?, &self.bindings)?
@@ -820,10 +862,12 @@ impl CpuSession {
     }
 
     fn dynamic_handle(&self, node: DynamicNodeId) -> Result<DynamicTensor> {
+        let dynamic = self.graph.dynamic_node(node)?;
         Ok(DynamicTensor {
             session: self.graph.id(),
             node,
-            dtype: self.graph.dynamic_node(node)?.dtype,
+            dtype: dynamic.dtype,
+            shape: dynamic.output,
         })
     }
 
@@ -845,19 +889,26 @@ impl CpuSession {
     ) -> Result<DynamicTensor> {
         let input = self.dynamic_node(input)?;
         let scalar = self.node(scalar)?;
-        let dtype = self.graph.dtype(scalar)?;
-        if dtype != DType::F32 {
-            return Err(Error::InvalidElementwiseDType {
-                op: "dynamic_scalar_binary",
-                actual: dtype,
-            });
-        }
         if self.graph.shape(scalar)?.numel()? != 1 {
             return Err(Error::InvalidIndex);
         }
         let node =
             self.graph
                 .dynamic_binary(input, DynamicInput::StaticScalar(scalar), operation)?;
+        self.dynamic_handle(node)
+    }
+
+    fn dynamic_tensor_binary(
+        &mut self,
+        lhs: &DynamicTensor,
+        rhs: &DynamicTensor,
+        operation: BinaryOp,
+    ) -> Result<DynamicTensor> {
+        let lhs = self.dynamic_node(lhs)?;
+        let rhs = self.dynamic_node(rhs)?;
+        let node = self
+            .graph
+            .dynamic_binary(lhs, DynamicInput::Dynamic(rhs), operation)?;
         self.dynamic_handle(node)
     }
 }
@@ -990,5 +1041,56 @@ mod literal_tests {
         );
         drop(writer);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dynamic_session_nonzero_exposes_exact_provenance_and_rejects_foreign_handles() {
+        let mut session = CpuSession::new();
+        let input = session.variable([3], [0.0, 2.0, 4.0]).unwrap();
+        let output = session.nonzero_dynamic(&input).unwrap();
+        assert!(matches!(
+            output.shape_expression(),
+            crate::DynamicOutputShape::CountRows { width: 1, .. }
+        ));
+        let realized = session.realize_dynamic(&output).unwrap();
+        assert_eq!(realized.shape(), &Shape::from([2, 1]));
+        assert_eq!(realized.dtype(), DType::I32);
+        assert_eq!(realized.to_vec_f64(), vec![1.0, 2.0]);
+
+        let foreign = CpuSession::new();
+        assert!(matches!(
+            foreign.realize_dynamic(&output),
+            Err(Error::SessionHandleMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn dynamic_session_composes_shared_provenance_and_rejects_other_roots() {
+        let mut session = CpuSession::new();
+        let input = session.variable([3], [1.0, -2.0, 3.0]).unwrap();
+        let mask = session
+            .tensor_with_dtype(
+                [3],
+                DType::Bool,
+                [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+            )
+            .unwrap();
+        let selected = session.masked_select_dynamic(&input, &mask).unwrap();
+        let negated = session.dynamic_neg(&selected).unwrap();
+        let squared = session.dynamic_square(&selected).unwrap();
+        let combined = session.dynamic_add(&negated, &squared).unwrap();
+        assert_eq!(
+            session.realize_dynamic(&combined).unwrap().to_vec_f64(),
+            vec![0.0, 6.0]
+        );
+
+        let unrelated = session.masked_select_dynamic(&input, &mask).unwrap();
+        assert!(session.dynamic_add(&selected, &unrelated).is_err());
+
+        let mut foreign = CpuSession::new();
+        assert!(matches!(
+            foreign.dynamic_neg(&selected),
+            Err(Error::SessionHandleMismatch { .. })
+        ));
     }
 }

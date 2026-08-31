@@ -28,7 +28,7 @@ pub use dynamic::{
     DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan, DynamicAllocationTarget,
     DynamicBinding, DynamicCountStage, DynamicInput, DynamicNodeId, DynamicOutputShape,
 };
-pub(crate) use dynamic::{DynamicNode, DynamicOp};
+pub(crate) use dynamic::{DynamicNode, DynamicOperation, dynamic_reduction_dtypes};
 pub(crate) use elementwise::{logsigmoid_plan, source_lub, source_weak_scalar_dtype};
 pub(crate) use graph::Node;
 pub use graph::{
