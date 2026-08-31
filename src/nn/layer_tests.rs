@@ -346,8 +346,7 @@ fn transpose_conv2d_preflights_geometry_and_input_before_parameter_binding() {
             4,
             [3, 2],
             crate::ConvTranspose2dOptions {
-                stride: [1, 1],
-                output_padding: [1, 0],
+                groups: 3,
                 ..crate::ConvTranspose2dOptions::default()
             },
             true,
@@ -355,6 +354,26 @@ fn transpose_conv2d_preflights_geometry_and_input_before_parameter_binding() {
         )
         .is_err()
     );
+
+    // Unlike PyTorch, checked-in tinygrad folds output padding into the
+    // transformed ordinary-convolution pad without requiring it to be less
+    // than stride.
+    let admitted = ConvTranspose2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::ConvTranspose2dOptions {
+            stride: [1, 1],
+            output_padding: [1, 0],
+            ..crate::ConvTranspose2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .unwrap();
+    assert_eq!(admitted.weight.shape().unwrap().dims(), &[2, 4, 3, 2]);
+    assert!(graph.parameter_bindings().is_empty());
 
     let layer = ConvTranspose2d::new(
         &mut graph,

@@ -145,7 +145,7 @@ pub use ir::{
     PadMode, Pool2dOptions, PoolOptions, PrefixScanKind, PrefixScanOutput, RandomKind,
     RandomStream, ReduceKind, ReductionDType, ReshapeExtent, RollDims, RollShifts, ShrinkRange,
     Slice, SortOutput, SpatialWindow, SpatialWindowError, SplitSections, SplitSizes,
-    StaticIndexUpdateWrt, UnaryOp, UnflattenExtent, VarianceCorrection,
+    StaticIndexUpdateWrt, TransposedConvolutionSpec, UnaryOp, UnflattenExtent, VarianceCorrection,
 };
 pub use ir::{ScatterMode, ScatterReduceKind, ScatterSource};
 pub use kernel::{
