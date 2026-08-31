@@ -280,7 +280,19 @@ impl CpuJitBackend {
                 buffers.push(JitBuffer::zeroed(desc.dtype, desc.elements, true));
             } else {
                 let value = values.tensor(desc.id, "prepared schedule")?;
-                buffers.push(JitBuffer::from_tensor(value, false));
+                let binding = item
+                    .ordered_inputs()
+                    .iter()
+                    .find(|binding| binding.desc.id == desc.id)
+                    .ok_or_else(|| {
+                        JitBackendError::Binding(format!(
+                            "prepared schedule input {} has no binding",
+                            desc.id
+                        ))
+                    })?;
+                let logical = crate::engine::direct_matmul_input(item, binding, value)
+                    .map_err(JitBackendError::Binding)?;
+                buffers.push(JitBuffer::from_tensor(logical.as_ref(), false));
             }
         }
         if prepared.kernel.abi().quantized_buffers.is_empty() {

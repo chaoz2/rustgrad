@@ -2333,13 +2333,8 @@ impl Graph {
         let axis = self.prefix_scan_axis(input, source.shape.rank(), axis)?;
         let shape = source.shape.clone();
         let input_dtype = source.dtype;
-        let dtype = match kind {
-            PrefixScanKind::Sum if !input_dtype.is_float() => sum_dtype(input_dtype),
-            PrefixScanKind::Sum
-            | PrefixScanKind::Product
-            | PrefixScanKind::Max
-            | PrefixScanKind::Min => input_dtype,
-        };
+        let dtype = prefix_scan_output_dtype(input_dtype, kind, PrefixScanOutput::Values)
+            .expect("value prefix scans have an output dtype");
         let elements = shape.numel()?;
         elements
             .checked_mul(input_dtype.itemsize())
@@ -2387,13 +2382,17 @@ impl Graph {
         let source = self.node(input)?;
         let axis = self.prefix_scan_axis(input, source.shape.rank(), axis)?;
         let shape = source.shape.clone();
-        let dtype = source.dtype;
+        let input_dtype = source.dtype;
+        let values_dtype = prefix_scan_output_dtype(input_dtype, kind, PrefixScanOutput::Values)
+            .expect("extrema values have an output dtype");
+        let indices_dtype = prefix_scan_output_dtype(input_dtype, kind, PrefixScanOutput::Indices)
+            .expect("extrema indices have an output dtype");
         let elements = shape.numel()?;
         elements
-            .checked_mul(dtype.itemsize())
+            .checked_mul(values_dtype.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         elements
-            .checked_mul(DType::I32.itemsize())
+            .checked_mul(indices_dtype.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         let values = self.push(
             Op::PrefixScan {
@@ -2403,7 +2402,7 @@ impl Graph {
                 output: PrefixScanOutput::Values,
             },
             shape.clone(),
-            dtype,
+            values_dtype,
         );
         let indices = self.push(
             Op::PrefixScan {
@@ -2413,7 +2412,7 @@ impl Graph {
                 output: PrefixScanOutput::Indices,
             },
             shape,
-            DType::I32,
+            indices_dtype,
         );
         Ok((values, indices))
     }
@@ -4905,9 +4904,9 @@ impl Graph {
     ) -> Result<NodeId> {
         let lhs_shape = self.node(lhs)?.shape.clone();
         let rhs_shape = self.node(rhs)?.shape.clone();
-        let output = matmul_shape(&lhs_shape, &rhs_shape).ok_or(Error::InvalidMatmul {
-            lhs: lhs_shape,
-            rhs: rhs_shape,
+        let output = matmul_shape(&lhs_shape, &rhs_shape).ok_or_else(|| Error::InvalidMatmul {
+            lhs: lhs_shape.clone(),
+            rhs: rhs_shape.clone(),
         })?;
         if self.node(upstream)?.shape != output {
             return Err(Error::ShapeMismatch {
@@ -4919,6 +4918,36 @@ impl Graph {
         let target = if lhs_gradient { lhs } else { rhs };
         let shape = self.node(target)?.shape.clone();
         let dtype = self.node(target)?.dtype;
+        // The ordinary rank-two floating case has an exact composition in the
+        // executable Graph vocabulary. Keep generalized vector/batched and
+        // mixed-dtype coordinate maps on the dedicated MatmulGrad operation,
+        // but let static compiled training capture the common matrix gradient
+        // without inventing a second interpreter-only boundary.
+        if lhs_shape.rank() == 2
+            && rhs_shape.rank() == 2
+            && self.node(upstream)?.dtype == dtype
+            && self.node(lhs)?.dtype == dtype
+            && self.node(rhs)?.dtype == dtype
+            && dtype.is_float()
+        {
+            let mut candidate = self.clone();
+            let gradient = if lhs_gradient {
+                let transposed = candidate.permute(rhs, [1, 0])?;
+                candidate.matmul(upstream, transposed)?
+            } else {
+                let transposed = candidate.permute(lhs, [1, 0])?;
+                candidate.matmul(transposed, upstream)?
+            };
+            if candidate.shape(gradient)? != &shape || candidate.dtype(gradient)? != dtype {
+                return Err(Error::ShapeMismatch {
+                    op: "rank-two matmul gradient",
+                    lhs: candidate.shape(gradient)?.clone(),
+                    rhs: shape,
+                });
+            }
+            *self = candidate;
+            return Ok(gradient);
+        }
         Ok(self.push(
             Op::MatmulGrad {
                 upstream,

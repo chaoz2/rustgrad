@@ -959,7 +959,15 @@ pub(crate) fn replay_interpreter_items(
     }
     let mut values = initial_values(capture, provided)?;
     for item in &capture.items {
-        let value = interpret_item(capture, item, &values)?;
+        let value = interpret_item(capture, item, &values).map_err(|error| match error {
+            ReplayError::Execute(reason) => ReplayError::Execute(format!(
+                "item {} output {} operation {:?}: {reason}",
+                item.id,
+                item.primary_output().id,
+                item.kernel.operation()
+            )),
+            other => other,
+        })?;
         values.insert_tensor(item.primary_output().id, value);
     }
     Ok(values)
@@ -1093,9 +1101,31 @@ fn interpret_item(
             .execute(&operands)
             .map_err(|error| ReplayError::Execute(error.to_string()));
     }
+    if let crate::Operation::PrefixScan(plan) = item.kernel.operation() {
+        let input = values.tensor(plan.input.index() as u64, "prefix scan input")?;
+        if input.shape() != &plan.input_shape {
+            return Err(ReplayError::Descriptor(format!(
+                "prefix scan input {} has shape {}, expected {}",
+                plan.input,
+                input.shape(),
+                plan.input_shape
+            )));
+        }
+        return crate::backend::execute_prefix_scan(
+            input,
+            plan.axis,
+            plan.kind,
+            plan.output,
+            plan.dtype,
+        )
+        .map_err(|error| ReplayError::Execute(error.to_string()));
+    }
     let mut bindings = KernelBindings::default();
     for binding in item.ordered_inputs() {
         let value = values.tensor(binding.desc.id, "kernel input")?.clone();
+        let value = super::direct_matmul_input(item, binding, &value)
+            .map_err(ReplayError::Execute)?
+            .into_owned();
         let role = if capture.constants.contains_key(&binding.desc.id) {
             BufferRole::Constant
         } else {
@@ -1104,7 +1134,7 @@ fn interpret_item(
         let desc = KernelBufferDesc::concrete(
             binding.desc.id,
             role,
-            binding.desc.shape.clone(),
+            value.shape().clone(),
             binding.desc.dtype,
             false,
         )
@@ -1150,6 +1180,161 @@ mod tests {
             .unwrap()
             .outputs
             .remove(0)
+    }
+
+    #[test]
+    fn captured_raw_matmul_resolves_a_transposed_consumer_view_once() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2, 3], DType::F32);
+        let rhs_base = graph.input_dtype("rhs", [2, 3], DType::F32);
+        let rhs = graph.permute(rhs_base, [1, 0]).unwrap();
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let schedule = crate::schedule_many(&graph, &[output]).unwrap();
+        let capture = CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        let mut item = capture
+            .items
+            .iter()
+            .find(|item| matches!(item.kernel.operation(), crate::Operation::Matmul(_)))
+            .unwrap()
+            .clone();
+        let plan = match item.kernel.operation() {
+            crate::Operation::Matmul(crate::MatmulValue::Serial(plan)) => plan.as_ref(),
+            crate::Operation::Matmul(crate::MatmulValue::Tiled(payload)) => &payload.matmul,
+            crate::Operation::Matmul(crate::MatmulValue::TensorCore(payload)) => &payload.matmul,
+            _ => unreachable!(),
+        };
+        assert_eq!(plan.rhs, rhs);
+        let view = crate::rangeify::static_view(&graph, rhs).unwrap().view;
+        assert_eq!(view.source_shape, Shape::from([2, 3]));
+        assert_eq!(view.logical_shape, Shape::from([3, 2]));
+        for desc in &mut item.inputs {
+            if desc.id == rhs.index() as u64 {
+                desc.shape = view.source_shape.clone();
+                desc.view = Some(view.clone());
+            }
+        }
+        for binding in &mut item.input_bindings {
+            if binding.desc.id == rhs.index() as u64 {
+                binding.desc.shape = view.source_shape.clone();
+                binding.desc.view = Some(view.clone());
+            }
+        }
+        item.validate_input_bindings().unwrap();
+
+        let lhs_value = TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let rhs_value = TensorData::new([2, 3], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
+        let generic_view_item = capture
+            .items
+            .iter()
+            .find(|candidate| {
+                !matches!(candidate.kernel.operation(), crate::Operation::Matmul(_))
+                    && candidate
+                        .input_bindings
+                        .iter()
+                        .any(|binding| binding.desc.view.is_some())
+            })
+            .unwrap();
+        let generic_view_binding = generic_view_item
+            .input_bindings
+            .iter()
+            .find(|binding| binding.desc.view.is_some())
+            .unwrap();
+        assert!(matches!(
+            crate::engine::direct_matmul_input(
+                generic_view_item,
+                generic_view_binding,
+                &rhs_value,
+            )
+            .unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let mut values = ReplayValues::default();
+        values.insert_tensor(lhs.index() as u64, lhs_value.clone());
+        values.insert_tensor(rhs.index() as u64, rhs_value.clone());
+        let actual = interpret_item(&capture, &item, &values).unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("lhs".into(), lhs_value), ("rhs".into(), rhs_value)]),
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn captured_prefix_scan_executes_its_materialized_computed_input_graph_free() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::I16);
+        let bias =
+            graph.constant(TensorData::from_scalars([], DType::I16, [Scalar::I(1)]).unwrap());
+        let shifted = graph.binary(crate::BinaryOp::Add, input, bias).unwrap();
+        let output = graph.cumsum(shifted, 0).unwrap();
+        let capture = captured(&graph, &[output]);
+        let scan_item = capture
+            .items
+            .iter()
+            .find(|item| matches!(item.kernel.operation(), crate::Operation::PrefixScan(_)))
+            .unwrap();
+        let scan_input = match scan_item.kernel.operation() {
+            crate::Operation::PrefixScan(plan) => plan.input,
+            _ => unreachable!(),
+        };
+        assert!(scan_item.dependencies.iter().any(|dependency| {
+            capture.items[*dependency as usize].primary_output().id == scan_input.index() as u64
+        }));
+
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::from_scalars([2], DType::I16, [Scalar::I(1), Scalar::I(2)]).unwrap(),
+        )]);
+        let actual = CapturedReplayExecutor::default()
+            .replay(&capture, &bindings, CapturedReplayOptions::default())
+            .unwrap()
+            .outputs
+            .remove(0);
+        assert_eq!(actual.shape(), &Shape::from([2]));
+        assert_eq!(actual.dtype(), DType::I32);
+        assert_eq!(actual.to_vec_f64(), vec![2.0, 5.0]);
+
+        let mut malformed = capture.clone();
+        let malformed_item = malformed
+            .items
+            .iter_mut()
+            .find(|item| matches!(item.kernel.operation(), crate::Operation::PrefixScan(_)))
+            .unwrap();
+        let mutate_desc = |desc: &mut crate::BufferDesc| {
+            if desc.id == scan_input.index() as u64 {
+                desc.dtype = DType::F32;
+                desc.bytes = desc.shape.numel().unwrap() * DType::F32.itemsize();
+                desc.alignment = DType::F32.itemsize();
+            }
+        };
+        for desc in &mut malformed_item.inputs {
+            mutate_desc(desc);
+        }
+        for binding in &mut malformed_item.input_bindings {
+            mutate_desc(&mut binding.desc);
+        }
+        assert!(matches!(
+            malformed_item.validate_input_bindings(),
+            Err(crate::ScheduleError::Binding(reason))
+                if reason == "prefix scan descriptor mismatch"
+        ));
+        assert!(matches!(malformed.to_bytes(), Err(ReplayError::Corrupt(_))));
+
+        let mut extrema_graph = Graph::new();
+        let extrema_input = extrema_graph.input_dtype("input", [2], DType::F32);
+        let (_, extrema_indices) = extrema_graph.cummax(extrema_input, 0).unwrap();
+        let extrema_capture = captured(&extrema_graph, &[extrema_indices]);
+        let extrema_item = extrema_capture
+            .items
+            .iter()
+            .find(|item| matches!(item.kernel.operation(), crate::Operation::PrefixScan(_)))
+            .unwrap();
+        assert_eq!(extrema_item.ordered_inputs()[0].desc.dtype, DType::F32);
+        assert_eq!(extrema_item.primary_output().dtype, DType::I32);
+        extrema_item.validate_input_bindings().unwrap();
     }
 
     #[test]

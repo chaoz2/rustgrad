@@ -101,6 +101,81 @@ pub struct NativeMixedReplayTrace {
     pub pure_item_cache_keys: Vec<u64>,
 }
 
+fn same_persistent_input_descriptor(lhs: &BufferDesc, rhs: &BufferDesc) -> bool {
+    lhs.id == rhs.id
+        && lhs.shape == rhs.shape
+        && lhs.dtype == rhs.dtype
+        && lhs.bytes == rhs.bytes
+        && lhs.alignment == rhs.alignment
+        && lhs.read_only == rhs.read_only
+}
+
+/// Binds each logical persistent Graph input exactly once. Individual
+/// consumers retain their own `BufferDesc::view` in the scheduled ABI, so a
+/// normal read and a transposed read of the same state legitimately have
+/// different consumer descriptors. Every physical field, the persistent
+/// identity, and the optional state-to-input view must still agree.
+fn bind_persistent_inputs(
+    capture_inputs: &[ReplayInput],
+    bindings: &[ScheduleStateBinding],
+    provided: &BTreeMap<String, crate::TensorData>,
+    mut resolve: impl FnMut(&ScheduleStateBinding) -> Result<crate::TensorData, ReplayError>,
+) -> Result<BTreeMap<String, crate::TensorData>, ReplayError> {
+    let mut inputs = provided.clone();
+    let mut injected =
+        BTreeMap::<NodeId, (BufferState, Option<crate::AffineView>, BufferDesc)>::new();
+    for binding in bindings {
+        let input = capture_inputs
+            .iter()
+            .find(|input| input.node == binding.input_node)
+            .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
+        if provided.contains_key(&input.name) {
+            return Err(ReplayError::Descriptor(
+                "external input shadows persistent state binding".into(),
+            ));
+        }
+        if !same_persistent_input_descriptor(&binding.desc, &input.desc) {
+            return Err(ReplayError::Corrupt(
+                "persistent state consumer has incompatible base descriptor".into(),
+            ));
+        }
+        if let Some((state, view, desc)) = injected.get(&binding.input_node) {
+            if state != &binding.state
+                || view != &binding.view
+                || !same_persistent_input_descriptor(desc, &binding.desc)
+            {
+                return Err(ReplayError::Corrupt(
+                    "persistent state input has conflicting consumer bindings".into(),
+                ));
+            }
+            continue;
+        }
+        let value = resolve(binding)?;
+        if value.shape() != &input.desc.shape
+            || value.dtype() != input.desc.dtype
+            || value.len().checked_mul(value.dtype().itemsize()) != Some(input.desc.bytes)
+        {
+            return Err(ReplayError::Descriptor(
+                "persistent state input descriptor mismatch".into(),
+            ));
+        }
+        if inputs.insert(input.name.clone(), value).is_some() {
+            return Err(ReplayError::Corrupt(
+                "persistent state input name is duplicated".into(),
+            ));
+        }
+        injected.insert(
+            binding.input_node,
+            (
+                binding.state.clone(),
+                binding.view.clone(),
+                binding.desc.clone(),
+            ),
+        );
+    }
+    Ok(inputs)
+}
+
 /// Validated, detached input binding for one mixed capture. It has no runtime
 /// lease and performs neither pure execution nor persistent mutation.
 #[allow(dead_code)]
@@ -126,44 +201,32 @@ impl<'a> BoundMixedCapture<'a> {
         provided: &BTreeMap<String, crate::TensorData>,
     ) -> Result<Self, ReplayError> {
         validate(capture, true)?;
-        let mut inputs = provided.clone();
-        for binding in &capture.state_bindings {
-            let input = capture
-                .schedule
-                .inputs
-                .iter()
-                .find(|x| x.node == binding.input_node)
-                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
-            if inputs.contains_key(&input.name) {
-                return Err(ReplayError::Descriptor(
-                    "external input shadows persistent state binding".into(),
-                ));
-            }
-            let start = starts
-                .get(&binding.state.buffer)
-                .ok_or_else(|| ReplayError::Missing(binding.state.buffer.to_string()))?;
-            let state = BufferState {
-                version: start
-                    .version
-                    .checked_add(binding.state.version)
-                    .ok_or_else(|| ReplayError::Corrupt("batch version overflow".into()))?,
-                ..binding.state.clone()
-            };
-            let value = candidates
-                .get(&state)
-                .ok_or_else(|| ReplayError::Missing("batch state candidate".into()))?;
-            let value = match &binding.view {
-                Some(view) => value.affine_read(view),
-                None => Ok(value.clone()),
-            }
-            .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
-            if value.shape() != &binding.desc.shape || value.dtype() != binding.desc.dtype {
-                return Err(ReplayError::Descriptor(
-                    "batch state input descriptor mismatch".into(),
-                ));
-            }
-            inputs.insert(input.name.clone(), value);
-        }
+        let inputs = bind_persistent_inputs(
+            &capture.schedule.inputs,
+            &capture.state_bindings,
+            provided,
+            |binding| {
+                let start = starts
+                    .get(&binding.state.buffer)
+                    .ok_or_else(|| ReplayError::Missing(binding.state.buffer.to_string()))?;
+                let state = BufferState {
+                    version: start
+                        .version
+                        .checked_add(binding.state.version)
+                        .ok_or_else(|| ReplayError::Corrupt("batch version overflow".into()))?,
+                    ..binding.state.clone()
+                };
+                let value = candidates
+                    .get(&state)
+                    .ok_or_else(|| ReplayError::Missing("batch state candidate".into()))?;
+                let value = match &binding.view {
+                    Some(view) => value.affine_read(view),
+                    None => Ok(value.clone()),
+                }
+                .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
+                Ok(value)
+            },
+        )?;
         Ok(Self {
             capture,
             inputs,
@@ -522,35 +585,23 @@ impl CapturedMixedSchedule {
             }
         }
         pure.identity = 0;
-        let mut inputs = provided.clone();
-        for binding in &self.state_bindings {
-            let input = self
-                .schedule
-                .inputs
-                .iter()
-                .find(|x| x.node == binding.input_node)
-                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
-            if inputs.contains_key(&input.name) {
-                return Err(ReplayError::Descriptor(
-                    "external input shadows persistent state binding".into(),
-                ));
-            }
-            let state = rebase(&binding.state)?;
-            let value = candidates
-                .get(&state)
-                .ok_or_else(|| ReplayError::Missing("batch state candidate".into()))?;
-            let value = match &binding.view {
-                Some(view) => value.affine_read(view),
-                None => Ok(value.clone()),
-            }
-            .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
-            if value.shape() != &binding.desc.shape || value.dtype() != binding.desc.dtype {
-                return Err(ReplayError::Descriptor(
-                    "batch state input descriptor mismatch".into(),
-                ));
-            }
-            inputs.insert(input.name.clone(), value);
-        }
+        let inputs = bind_persistent_inputs(
+            &self.schedule.inputs,
+            &self.state_bindings,
+            provided,
+            |binding| {
+                let state = rebase(&binding.state)?;
+                let value = candidates
+                    .get(&state)
+                    .ok_or_else(|| ReplayError::Missing("batch state candidate".into()))?;
+                let value = match &binding.view {
+                    Some(view) => value.affine_read(view),
+                    None => Ok(value.clone()),
+                }
+                .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
+                Ok(value)
+            },
+        )?;
         let values = match native {
             Some((executor, vectorized)) => {
                 super::captured_replay::replay_native_items(&pure, &inputs, executor, vectorized)?
@@ -816,37 +867,24 @@ impl CapturedMixedSchedule {
             .collect();
         pure_capture.identity = 0;
 
-        let mut inputs = provided.clone();
-        for binding in &self.state_bindings {
-            let input = self
-                .schedule
-                .inputs
-                .iter()
-                .find(|input| input.node == binding.input_node)
-                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
-            if provided.contains_key(&input.name) {
-                return Err(ReplayError::Descriptor(
-                    "external input shadows persistent state binding".into(),
-                ));
-            }
-            let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
-                ReplayError::Execute(format!("persistent state preflight: {error:?}"))
-            })?;
-            let value = match &binding.view {
-                Some(view) => snapshot.tensor().affine_read(view),
-                None => Ok(snapshot.tensor().clone()),
-            }
-            .map_err(|error| ReplayError::Descriptor(format!("persistent affine read: {error}")))?;
-            if value.shape() != &binding.desc.shape
-                || value.dtype() != binding.desc.dtype
-                || value.len().checked_mul(value.dtype().itemsize()) != Some(binding.desc.bytes)
-            {
-                return Err(ReplayError::Descriptor(
-                    "persistent state input descriptor mismatch".into(),
-                ));
-            }
-            inputs.insert(input.name.clone(), value);
-        }
+        let inputs = bind_persistent_inputs(
+            &self.schedule.inputs,
+            &self.state_bindings,
+            provided,
+            |binding| {
+                let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
+                    ReplayError::Execute(format!("persistent state preflight: {error:?}"))
+                })?;
+                let value = match &binding.view {
+                    Some(view) => snapshot.tensor().affine_read(view),
+                    None => Ok(snapshot.tensor().clone()),
+                }
+                .map_err(|error| {
+                    ReplayError::Descriptor(format!("persistent affine read: {error}"))
+                })?;
+                Ok(value)
+            },
+        )?;
         let values = super::captured_replay::replay_interpreter_items(&pure_capture, &inputs)?;
         let outputs = self
             .schedule
@@ -931,37 +969,24 @@ impl CapturedMixedSchedule {
             .map(|binding| binding.producer_output.id)
             .collect();
         pure_capture.identity = 0;
-        let mut inputs = provided.clone();
-        for binding in &self.state_bindings {
-            let input = self
-                .schedule
-                .inputs
-                .iter()
-                .find(|input| input.node == binding.input_node)
-                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
-            if provided.contains_key(&input.name) {
-                return Err(ReplayError::Descriptor(
-                    "external input shadows persistent state binding".into(),
-                ));
-            }
-            let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
-                ReplayError::Execute(format!("persistent state preflight: {error:?}"))
-            })?;
-            let value = match &binding.view {
-                Some(view) => snapshot.tensor().affine_read(view),
-                None => Ok(snapshot.tensor().clone()),
-            }
-            .map_err(|error| ReplayError::Descriptor(format!("persistent affine read: {error}")))?;
-            if value.shape() != &binding.desc.shape
-                || value.dtype() != binding.desc.dtype
-                || value.len().checked_mul(value.dtype().itemsize()) != Some(binding.desc.bytes)
-            {
-                return Err(ReplayError::Descriptor(
-                    "persistent state input descriptor mismatch".into(),
-                ));
-            }
-            inputs.insert(input.name.clone(), value);
-        }
+        let inputs = bind_persistent_inputs(
+            &self.schedule.inputs,
+            &self.state_bindings,
+            provided,
+            |binding| {
+                let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
+                    ReplayError::Execute(format!("persistent state preflight: {error:?}"))
+                })?;
+                let value = match &binding.view {
+                    Some(view) => snapshot.tensor().affine_read(view),
+                    None => Ok(snapshot.tensor().clone()),
+                }
+                .map_err(|error| {
+                    ReplayError::Descriptor(format!("persistent affine read: {error}"))
+                })?;
+                Ok(value)
+            },
+        )?;
         preflight_effect_states(self, &schedule, runtime)?;
         let values = super::captured_replay::replay_native_items(
             &pure_capture,
@@ -1435,9 +1460,80 @@ mod recurrent_tests {
     use super::*;
     use crate::{
         BinaryOp, DType, EffectGraph, EffectRuntime, Graph, ScheduleStateBinding,
-        ScheduleValueBinding, Storage, TensorData, bind_schedule_states, combine_mixed_schedules,
-        schedule, schedule_effects,
+        ScheduleValueBinding, Shape, Storage, TensorData, bind_schedule_states,
+        combine_mixed_schedules, schedule, schedule_effects,
     };
+
+    #[test]
+    fn one_persistent_snapshot_serves_normal_and_transposed_consumers() {
+        let input_node = NodeId::from_index(0);
+        let base_desc = BufferDesc {
+            id: input_node.index() as u64,
+            shape: Shape::from([2, 3]),
+            dtype: DType::F32,
+            bytes: 24,
+            alignment: 4,
+            read_only: true,
+            view: None,
+        };
+        let input = ReplayInput {
+            name: "state".into(),
+            node: input_node,
+            desc: base_desc.clone(),
+        };
+        let state = BufferState {
+            buffer: 17,
+            version: 0,
+            shape: Shape::from([2, 3]),
+            dtype: DType::F32,
+            bytes: 24,
+        };
+        let binding = |consumer_item, consumer_node, desc| ScheduleStateBinding {
+            state: state.clone(),
+            view: None,
+            consumer_item,
+            consumer_node,
+            input_node,
+            desc,
+            abi_index: 0,
+        };
+        let mut transposed_desc = base_desc.clone();
+        transposed_desc.view = Some(
+            crate::AffineView::identity(Shape::from([2, 3]))
+                .permute(&[1, 0])
+                .unwrap(),
+        );
+        let bindings = vec![
+            binding(0, NodeId::from_index(1), base_desc),
+            binding(1, NodeId::from_index(2), transposed_desc),
+        ];
+        let value = TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let inputs = bind_persistent_inputs(
+            std::slice::from_ref(&input),
+            &bindings,
+            &BTreeMap::new(),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(value.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(inputs.get("state"), Some(&value));
+
+        let mut conflicting = bindings;
+        conflicting[1].state.buffer = 18;
+        let error = bind_persistent_inputs(&[input], &conflicting, &BTreeMap::new(), |_| {
+            Ok(value.clone())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ReplayError::Corrupt(message)
+                if message == "persistent state input has conflicting consumer bindings"
+        ));
+    }
 
     fn fixture(buffer: u64) -> (CapturedMixedSchedule, EffectRuntime) {
         let mut graph = Graph::new();
