@@ -4,17 +4,17 @@
 
 pub mod plan;
 
-const PARITY: u32 = 0x1BD1_1BDA;
-const ROTATIONS: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
+pub(crate) const THREEFRY_PARITY: u32 = 0x1BD1_1BDA;
+pub(crate) const THREEFRY_ROTATIONS: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
 
 /// Evaluates the Random123/Threefry 2x32 permutation used by tinygrad.
 pub(crate) fn threefry2x32(key: [u32; 2], counter: [u32; 2]) -> [u32; 2] {
-    let keys = [key[0], key[1], key[0] ^ key[1] ^ PARITY];
+    let keys = [key[0], key[1], key[0] ^ key[1] ^ THREEFRY_PARITY];
     let mut x0 = counter[0].wrapping_add(keys[0]);
     let mut x1 = counter[1].wrapping_add(keys[1]);
     for round in 0..20 {
         x0 = x0.wrapping_add(x1);
-        x1 = x1.rotate_left(ROTATIONS[round % ROTATIONS.len()]) ^ x0;
+        x1 = x1.rotate_left(THREEFRY_ROTATIONS[round % THREEFRY_ROTATIONS.len()]) ^ x0;
         if round % 4 == 3 {
             let injection = round / 4 + 1;
             x0 = x0.wrapping_add(keys[injection % 3]);
