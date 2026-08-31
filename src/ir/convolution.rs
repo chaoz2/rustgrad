@@ -17,7 +17,7 @@ pub struct SpatialWindow {
     padding: Vec<(i64, i64)>,
 }
 
-/// Descriptor-only errors produced before a [`SpatialWindow`] exists.
+/// Descriptor-only errors produced while normalizing convolution geometry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpatialWindowError {
     RankMismatch,
@@ -124,10 +124,61 @@ impl ConvolutionSpec {
     }
 }
 
+/// Rank-generic source contract for transposed convolution.
+///
+/// The ordinary [`SpatialWindow`] owns the kernel, positive stride/dilation,
+/// and signed asymmetric source padding. `output_padding` is separately signed
+/// because tinygrad folds it into the trailing transformed convolution pad; it
+/// is not restricted to be smaller than stride. Groups are nonzero by type.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TransposedConvolutionSpec {
+    window: SpatialWindow,
+    output_padding: Vec<i64>,
+    groups: NonZeroUsize,
+}
+
+impl TransposedConvolutionSpec {
+    pub fn new(
+        window: SpatialWindow,
+        output_padding: impl Into<Vec<i64>>,
+        groups: NonZeroUsize,
+    ) -> std::result::Result<Self, SpatialWindowError> {
+        let output_padding = output_padding.into();
+        if output_padding.len() != window.rank() {
+            return Err(SpatialWindowError::RankMismatch);
+        }
+        Ok(Self {
+            window,
+            output_padding,
+            groups,
+        })
+    }
+
+    pub fn window(&self) -> &SpatialWindow {
+        &self.window
+    }
+
+    pub fn output_padding(&self) -> &[i64] {
+        &self.output_padding
+    }
+
+    pub fn groups(&self) -> NonZeroUsize {
+        self.groups
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ConvolutionPlan {
     spec: ConvolutionSpec,
     reduction: ReductionDType,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+#[derive(Clone, Debug)]
+struct TransposedConvolutionPlan {
+    spec: TransposedConvolutionSpec,
+    transformed_padding: Vec<(i64, i64)>,
     output_shape: Shape,
     output_dtype: DType,
 }
@@ -494,6 +545,212 @@ fn lower_convolution(
     }
 }
 
+fn checked_i64(value: i128, shape: &Shape) -> Result<i64> {
+    i64::try_from(value).map_err(|_| Error::ShapeOverflow(shape.clone()))
+}
+
+fn transposed_convolution_plan(
+    graph: &Graph,
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+    spec: TransposedConvolutionSpec,
+) -> Result<TransposedConvolutionPlan> {
+    let input_node = graph.node(input)?;
+    let weight_node = graph.node(weight)?;
+    let input_shape = input_node.shape.clone();
+    let weight_shape = weight_node.shape.clone();
+    let spatial_rank = spec.window.rank();
+    if input_shape.rank() != spatial_rank + 2 || weight_shape.rank() != input_shape.rank() {
+        return Err(invalid(
+            &input_shape,
+            &weight_shape,
+            "input and weight ranks must equal spatial rank plus two",
+        ));
+    }
+    if &weight_shape.dims()[2..] != spec.window.kernel() {
+        return Err(invalid(
+            &input_shape,
+            &weight_shape,
+            "weight kernel does not match spatial window",
+        ));
+    }
+    let groups = spec.groups.get();
+    let input_channels = input_shape.dims()[1];
+    if input_channels != weight_shape.dims()[0] || input_channels % groups != 0 {
+        return Err(invalid(
+            &input_shape,
+            &weight_shape,
+            "channel/group geometry",
+        ));
+    }
+    let output_channels = weight_shape.dims()[1]
+        .checked_mul(groups)
+        .ok_or_else(|| Error::ShapeOverflow(weight_shape.clone()))?;
+    if let Some(bias) = bias
+        && graph.node(bias)?.shape != Shape::from([output_channels])
+    {
+        return Err(invalid(
+            &input_shape,
+            &weight_shape,
+            "bias must be [output_channels]",
+        ));
+    }
+
+    let mut transformed_padding = Vec::with_capacity(spatial_rank);
+    let mut output_dims = vec![input_shape.dims()[0], output_channels];
+    for axis in 0..spatial_rank {
+        let kernel_span = (spec.window.kernel[axis] as i128 - 1)
+            .checked_mul(spec.window.dilation[axis] as i128)
+            .ok_or_else(|| Error::ShapeOverflow(weight_shape.clone()))?;
+        let (before, after) = spec.window.padding[axis];
+        let transformed_before = kernel_span
+            .checked_sub(before as i128)
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        let transformed_after = kernel_span
+            .checked_sub(after as i128)
+            .and_then(|value| value.checked_add(spec.output_padding[axis] as i128))
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        transformed_padding.push((
+            checked_i64(transformed_before, &input_shape)?,
+            checked_i64(transformed_after, &input_shape)?,
+        ));
+
+        let extent = input_shape.dims()[axis + 2];
+        let upsampled = extent
+            .checked_mul(spec.window.stride[axis])
+            .and_then(|value| value.checked_sub(spec.window.stride[axis] - 1))
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        let padded = signed_padded_extent(
+            upsampled,
+            transformed_padding[axis],
+            &input_shape,
+            &weight_shape,
+        )?;
+        let kernel_extent = spec.window.dilation[axis]
+            .checked_mul(spec.window.kernel[axis] - 1)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| Error::ShapeOverflow(weight_shape.clone()))?;
+        if padded < kernel_extent {
+            return Err(invalid(
+                &input_shape,
+                &weight_shape,
+                "kernel exceeds transformed padded input",
+            ));
+        }
+        output_dims.push(padded - kernel_extent + 1);
+    }
+    let output_shape = Shape::new(output_dims);
+    let product_dtype = source_lub(input_node.dtype, weight_node.dtype);
+    let mut output_dtype = ReductionDType::sum_default(product_dtype).output;
+    if let Some(bias) = bias {
+        output_dtype = source_lub(output_dtype, graph.dtype(bias)?);
+    }
+    checked_bytes(&input_shape, input_node.dtype)?;
+    checked_bytes(&weight_shape, weight_node.dtype)?;
+    checked_bytes(&output_shape, output_dtype)?;
+    Ok(TransposedConvolutionPlan {
+        spec,
+        transformed_padding,
+        output_shape,
+        output_dtype,
+    })
+}
+
+/// Inserts `stride - 1` source-typed zero lanes between adjacent spatial
+/// samples, matching tinygrad's reshape/pad/reshape/shrink construction.
+fn lower_transposed_stride(graph: &mut Graph, input: NodeId, stride: &[usize]) -> Result<NodeId> {
+    if stride.iter().all(|&value| value == 1) {
+        return Ok(input);
+    }
+    let source = graph.shape(input)?.clone();
+    let mut interleaved = source.dims()[..2].to_vec();
+    for &extent in &source.dims()[2..] {
+        interleaved.extend([extent, 1]);
+    }
+    let reshaped = graph.reshape(input, Shape::new(interleaved))?;
+    let mut padding = vec![(0, 0); 2];
+    for &step in stride {
+        let after = i64::try_from(step - 1).map_err(|_| Error::ShapeOverflow(source.clone()))?;
+        padding.extend([(0, 0), (0, after)]);
+    }
+    let padded = graph.pad_signed(reshaped, padding, Scalar::F(0.0))?;
+    let mut expanded = source.dims()[..2].to_vec();
+    for (&extent, &step) in source.dims()[2..].iter().zip(stride) {
+        expanded.push(
+            extent
+                .checked_mul(step)
+                .ok_or_else(|| Error::ShapeOverflow(source.clone()))?,
+        );
+    }
+    let expanded = graph.reshape(padded, Shape::new(expanded))?;
+    let mut bounds = source.dims()[..2]
+        .iter()
+        .map(|&extent| (0, extent))
+        .collect::<Vec<_>>();
+    for (&extent, &step) in source.dims()[2..].iter().zip(stride) {
+        let end = extent
+            .checked_mul(step)
+            .and_then(|value| value.checked_sub(step - 1))
+            .ok_or_else(|| Error::ShapeOverflow(source.clone()))?;
+        bounds.push((0, end));
+    }
+    graph.shrink(expanded, bounds)
+}
+
+fn lower_transposed_convolution(
+    graph: &mut Graph,
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+    plan: &TransposedConvolutionPlan,
+) -> Result<NodeId> {
+    let input_shape = graph.shape(input)?.clone();
+    let weight_shape = graph.shape(weight)?.clone();
+    let spatial_rank = plan.spec.window.rank();
+    let groups = plan.spec.groups.get();
+    let input_channels_per_group = input_shape.dims()[1] / groups;
+    let output_channels_per_group = weight_shape.dims()[1];
+    let output_channels = output_channels_per_group
+        .checked_mul(groups)
+        .ok_or_else(|| Error::ShapeOverflow(weight_shape.clone()))?;
+
+    let mut grouped_weight = vec![groups, input_channels_per_group, output_channels_per_group];
+    grouped_weight.extend_from_slice(plan.spec.window.kernel());
+    let weight = graph.reshape(weight, Shape::new(grouped_weight))?;
+    let mut order = vec![0, 2, 1];
+    order.extend(3..spatial_rank + 3);
+    let weight = graph.permute(weight, order)?;
+    let flip_axes = (3..spatial_rank + 3)
+        .map(|axis| isize::try_from(axis).map_err(|_| Error::ShapeOverflow(weight_shape.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    let weight = graph.flip(weight, flip_axes)?;
+    let mut transformed_weight = vec![output_channels, input_channels_per_group];
+    transformed_weight.extend_from_slice(plan.spec.window.kernel());
+    let weight = graph.reshape(weight, Shape::new(transformed_weight))?;
+
+    let input = lower_transposed_stride(graph, input, plan.spec.window.stride())?;
+    let window = SpatialWindow::new(
+        plan.spec.window.kernel().to_vec(),
+        vec![1; spatial_rank],
+        plan.spec.window.dilation().to_vec(),
+        plan.transformed_padding.clone(),
+    )
+    .map_err(|_| {
+        invalid(
+            &input_shape,
+            &weight_shape,
+            "invalid transformed spatial window",
+        )
+    })?;
+    graph.convolution(
+        input,
+        weight,
+        bias,
+        ConvolutionSpec::new(window, plan.spec.groups, None),
+    )
+}
+
 impl Graph {
     /// Rank-generic convolution lowered entirely through ordinary movement,
     /// multiplication, typed reduction, and optional bias addition nodes.
@@ -514,13 +771,33 @@ impl Graph {
         debug_assert_eq!(self.dtype(output).ok(), Some(plan.output_dtype));
         Ok(output)
     }
+
+    /// Rank-generic transposed convolution lowered through ordinary movement,
+    /// multiplication, typed reduction, and optional bias addition nodes.
+    pub fn transposed_convolution(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        spec: TransposedConvolutionSpec,
+    ) -> Result<NodeId> {
+        let plan = transposed_convolution_plan(self, input, weight, bias, spec)?;
+        let mut rehearsal = self.clone();
+        let rehearsed = lower_transposed_convolution(&mut rehearsal, input, weight, bias, &plan)?;
+        debug_assert_eq!(rehearsal.shape(rehearsed).ok(), Some(&plan.output_shape));
+        debug_assert_eq!(rehearsal.dtype(rehearsed).ok(), Some(plan.output_dtype));
+        let output = lower_transposed_convolution(self, input, weight, bias, &plan)?;
+        debug_assert_eq!(self.shape(output).ok(), Some(&plan.output_shape));
+        debug_assert_eq!(self.dtype(output).ok(), Some(plan.output_dtype));
+        Ok(output)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, Op, TensorData};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
         TensorData::new(shape, values.to_vec()).unwrap()
@@ -539,6 +816,22 @@ mod tests {
             NonZeroUsize::new(groups).unwrap(),
             dtype,
         )
+    }
+
+    fn transposed_spec(
+        kernel: &[usize],
+        stride: &[usize],
+        dilation: &[usize],
+        padding: &[(i64, i64)],
+        output_padding: &[i64],
+        groups: usize,
+    ) -> TransposedConvolutionSpec {
+        TransposedConvolutionSpec::new(
+            SpatialWindow::new(kernel, stride, dilation, padding).unwrap(),
+            output_padding,
+            NonZeroUsize::new(groups).unwrap(),
+        )
+        .unwrap()
     }
 
     fn execute(
@@ -814,6 +1107,320 @@ mod tests {
                 .unwrap();
             assert_sum_contract(&graph, output, accumulator, output_dtype);
         }
+    }
+
+    #[test]
+    fn transposed_convolution_values_cover_zero_one_two_and_three_spatial_ranks() {
+        assert_eq!(
+            TransposedConvolutionSpec::new(
+                SpatialWindow::new([1], [1], [1], [(0, 0)]).unwrap(),
+                [],
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            Err(SpatialWindowError::RankMismatch)
+        );
+
+        let mut zero = Graph::new();
+        let input = zero.input("input", [1, 2]);
+        let weight = zero.input("weight", [2, 2]);
+        let output = zero
+            .transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[], &[], &[], &[], &[], 1),
+            )
+            .unwrap();
+        assert_eq!(zero.shape(output).unwrap(), &Shape::from([1, 2]));
+        assert_eq!(
+            execute(
+                &zero,
+                output,
+                data([1, 2], &[1., 2.]),
+                data([2, 2], &[1., 2., 3., 4.]),
+                None,
+            ),
+            data([1, 2], &[7., 10.])
+        );
+
+        let mut one = Graph::new();
+        let input = one.input("input", [1, 1, 2]);
+        let weight = one.input("weight", [1, 1, 2]);
+        let output = one
+            .transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[2], &[2], &[1], &[(0, 0)], &[1], 1),
+            )
+            .unwrap();
+        assert_eq!(one.shape(output).unwrap(), &Shape::from([1, 1, 5]));
+        assert_eq!(
+            execute(
+                &one,
+                output,
+                data([1, 1, 2], &[1., 2.]),
+                data([1, 1, 2], &[1., 1.]),
+                None,
+            ),
+            data([1, 1, 5], &[1., 1., 2., 2., 0.])
+        );
+
+        let mut two = Graph::new();
+        let input = two.input("input", [1, 1, 2, 2]);
+        let weight = two.input("weight", [1, 1, 2, 2]);
+        let output = two
+            .transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[2, 2], &[1, 1], &[1, 1], &[(0, 0); 2], &[0, 0], 1),
+            )
+            .unwrap();
+        assert_eq!(two.shape(output).unwrap(), &Shape::from([1, 1, 3, 3]));
+        assert_eq!(
+            execute(
+                &two,
+                output,
+                data([1, 1, 2, 2], &[1., 2., 3., 4.]),
+                data([1, 1, 2, 2], &[1.; 4]),
+                None,
+            ),
+            data([1, 1, 3, 3], &[1., 3., 2., 4., 10., 6., 3., 7., 4.])
+        );
+
+        let mut three = Graph::new();
+        let input = three.input("input", [1, 1, 2, 2, 2]);
+        let weight = three.input("weight", [1, 1, 1, 1, 1]);
+        let output = three
+            .transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[1, 1, 1], &[1, 1, 1], &[1, 1, 1], &[(0, 0); 3], &[0; 3], 1),
+            )
+            .unwrap();
+        assert_eq!(three.shape(output).unwrap(), &Shape::from([1, 1, 2, 2, 2]));
+        assert_eq!(
+            execute(
+                &three,
+                output,
+                data([1, 1, 2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]),
+                data([1, 1, 1, 1, 1], &[2.]),
+                None,
+            ),
+            data([1, 1, 2, 2, 2], &[2., 4., 6., 8., 10., 12., 14., 16.])
+        );
+    }
+
+    #[test]
+    fn transposed_convolution_signed_geometry_groups_bias_and_dtype_are_source_derived() {
+        let mut geometry = Graph::new();
+        let input = geometry.input("input", [1, 1, 2, 3]);
+        let weight = geometry.input("weight", [1, 1, 2, 2]);
+        let output = geometry
+            .transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[2, 2], &[2, 1], &[1, 2], &[(-1, 0), (1, -1)], &[3, -1], 1),
+            )
+            .unwrap();
+        assert_eq!(geometry.shape(output).unwrap(), &Shape::from([1, 1, 8, 4]));
+
+        let mut grouped = Graph::new();
+        let input = grouped.input("input", [1, 2, 2]);
+        let weight = grouped.input("weight", [2, 1, 1]);
+        let bias = grouped.input("bias", [2]);
+        let output = grouped
+            .transposed_convolution(
+                input,
+                weight,
+                Some(bias),
+                transposed_spec(&[1], &[1], &[1], &[(0, 0)], &[0], 2),
+            )
+            .unwrap();
+        assert_eq!(
+            execute(
+                &grouped,
+                output,
+                data([1, 2, 2], &[1., 2., 3., 4.]),
+                data([2, 1, 1], &[2., 3.]),
+                Some(data([2], &[1., -1.])),
+            ),
+            data([1, 2, 2], &[3., 5., 8., 11.])
+        );
+
+        for (dtype, accumulator, output_dtype) in [
+            (DType::I8, DType::I32, DType::I32),
+            (DType::F16, DType::F32, DType::F16),
+            (DType::BF16, DType::F32, DType::BF16),
+            (DType::F64, DType::F64, DType::F64),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [1, 1, 2], dtype);
+            let weight = graph.input_dtype("weight", [1, 1, 1], dtype);
+            let output = graph
+                .transposed_convolution(
+                    input,
+                    weight,
+                    None,
+                    transposed_spec(&[1], &[1], &[1], &[(0, 0)], &[0], 1),
+                )
+                .unwrap();
+            assert_sum_contract(&graph, output, accumulator, output_dtype);
+        }
+    }
+
+    #[test]
+    fn transposed_convolution_is_atomic_compositional_and_higher_order_differentiable() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 1, 2]);
+        let weight = graph.input("weight", [1, 1, 2]);
+        let output = graph
+            .transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[2], &[2], &[1], &[(0, 0)], &[1], 1),
+            )
+            .unwrap();
+        assert!((0..graph.node_count()).all(|index| {
+            !matches!(
+                graph.op(NodeId::from_index(index)).unwrap(),
+                Op::ConvTranspose2d { .. }
+                    | Op::ConvTranspose2dGrad { .. }
+                    | Op::ConvTranspose2dGradVjp { .. }
+            )
+        }));
+        let squared = graph.square(output).unwrap();
+        let loss = graph.sum_all(squared).unwrap();
+        let first = graph.grad(loss, input).unwrap();
+        let second_loss = graph.sum_all(first).unwrap();
+        let second = graph.grad(second_loss, input).unwrap();
+        assert_eq!(graph.shape(second).unwrap(), &Shape::from([1, 1, 2]));
+
+        let mut invalid = Graph::new();
+        let input = invalid.input("input", [1, 2, 3]);
+        let weight = invalid.input("weight", [1, 1, 2]);
+        let before = invalid.node_count();
+        assert!(matches!(
+            invalid.transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[2], &[1], &[1], &[(0, 0)], &[0], 1),
+            ),
+            Err(Error::InvalidConvolution {
+                reason: "channel/group geometry",
+                ..
+            })
+        ));
+        assert_eq!(invalid.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [1, 1, usize::MAX]);
+        let weight = overflow.input("weight", [1, 1, 1]);
+        let before = overflow.node_count();
+        assert!(matches!(
+            overflow.transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[1], &[2], &[1], &[(0, 0)], &[0], 1),
+            ),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), before);
+
+        let mut zero_batch = Graph::new();
+        let input = zero_batch.input("input", [0, 1, 2]);
+        let weight = zero_batch.input("weight", [1, 1, 1]);
+        let output = zero_batch
+            .transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[1], &[1], &[1], &[(0, 0)], &[0], 1),
+            )
+            .unwrap();
+        assert_eq!(zero_batch.shape(output).unwrap(), &Shape::from([0, 1, 2]));
+
+        // As in tinygrad's checked-in `_pool`, an effective kernel cannot be
+        // formed from an unpadded zero spatial axis. Rejection is descriptor
+        // only and therefore publishes no partial stride/window chain.
+        let mut zero_spatial = Graph::new();
+        let input = zero_spatial.input("input", [1, 1, 0]);
+        let weight = zero_spatial.input("weight", [1, 1, 1]);
+        let before = zero_spatial.node_count();
+        assert!(matches!(
+            zero_spatial.transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[1], &[1], &[1], &[(0, 0)], &[0], 1),
+            ),
+            Err(Error::InvalidConvolution {
+                reason: "kernel exceeds transformed padded input",
+                ..
+            })
+        ));
+        assert_eq!(zero_spatial.node_count(), before);
+    }
+
+    #[test]
+    fn transposed_convolution_schedule_capture_interpreter_and_strict_native_share_results() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 1, 2]);
+        let weight = graph.input("weight", [1, 1, 2]);
+        let output = graph
+            .transposed_convolution(
+                input,
+                weight,
+                None,
+                transposed_spec(&[2], &[2], &[1], &[(0, 0)], &[1], 1),
+            )
+            .unwrap();
+        let schedule = crate::schedule_many(&graph, &[output]).unwrap();
+        assert!(schedule.items.iter().all(|item| item.boundary.is_none()));
+        assert!(
+            schedule
+                .items
+                .iter()
+                .all(|item| { !matches!(item.kernel.operation(), crate::Operation::Conv2d(_)) })
+        );
+        assert!(
+            schedule
+                .items
+                .iter()
+                .all(|item| crate::CpuJit::render(&item.kernel).is_ok())
+        );
+        let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        let encoded = capture.to_bytes().unwrap();
+        let capture = crate::CapturedSchedule::from_bytes(&encoded).unwrap();
+        assert_eq!(capture.to_bytes().unwrap(), encoded);
+        let bindings = BTreeMap::from([
+            ("input".into(), data([1, 1, 2], &[1., 2.])),
+            ("weight".into(), data([1, 1, 2], &[1., 1.])),
+        ]);
+        let executor = crate::CapturedReplayExecutor::default();
+        let interpreter = executor
+            .replay(&capture, &bindings, crate::CapturedReplayOptions::default())
+            .unwrap();
+        let native = executor
+            .replay(
+                &capture,
+                &bindings,
+                crate::CapturedReplayOptions {
+                    backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            interpreter.outputs[0].storage(),
+            native.outputs[0].storage()
+        );
+        assert_eq!(native.outputs[0], data([1, 1, 5], &[1., 1., 2., 2., 0.]));
     }
 
     #[test]

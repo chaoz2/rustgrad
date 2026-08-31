@@ -589,9 +589,19 @@ fn convolution_graph_visualization_preserves_roles_geometry_and_derivatives() {
         padding: [1, 0, 2, 1],
         output_padding: [1, 1],
     };
-    let transpose = graph
-        .conv_transpose2d(transpose_input, transpose_weight, None, transpose_options)
-        .unwrap();
+    // Like the ordinary convolution fixture above, construct the legacy
+    // internal operation explicitly: public transpose convolution is now a
+    // source-literal movement/reduction composition.
+    let transpose = graph.push(
+        crate::Op::ConvTranspose2d {
+            input: transpose_input,
+            weight: transpose_weight,
+            bias: None,
+            options: transpose_options,
+        },
+        Shape::from([1, 2, 6, 9]),
+        DType::F32,
+    );
     let transpose_upstream = graph.input("transpose_upstream", [1, 2, 6, 9]);
     let transpose_gradient = graph
         .conv_transpose2d_grad(

@@ -7071,7 +7071,7 @@ mod tests {
     }
 
     #[test]
-    fn transpose_conv1d_lowers_through_the_2d_oracle() {
+    fn transpose_conv1d_lowers_through_the_rank_generic_core() {
         let mut graph = Graph::new();
         let x = graph.input("x", [1, 1, 2]);
         let w = graph.input("w", [1, 1, 2]);

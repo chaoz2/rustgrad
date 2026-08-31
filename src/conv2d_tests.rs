@@ -394,6 +394,44 @@ fn transpose_conv1d_preflights_delegated_geometry_before_reshaping() {
 }
 
 #[test]
+fn transpose_conv2d_adapter_preserves_typed_errors_and_source_output_padding_admission() {
+    let mut malformed = Graph::new();
+    let input = malformed.input("x", [1, 2, 2, 2]);
+    let weight = malformed.input("w", [1, 1, 1, 1]);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.conv_transpose2d(
+            input,
+            weight,
+            None,
+            crate::ConvTranspose2dOptions::default(),
+        ),
+        Err(Error::InvalidConv2d {
+            reason: "channel/group geometry",
+            ..
+        })
+    ));
+    assert_eq!(malformed.node_count(), before);
+
+    let mut graph = Graph::new();
+    let input = graph.input("x", [1, 1, 1, 1]);
+    let weight = graph.input("w", [1, 1, 1, 1]);
+    let output = graph
+        .conv_transpose2d(
+            input,
+            weight,
+            None,
+            crate::ConvTranspose2dOptions {
+                stride: [1, 1],
+                output_padding: [1, 2],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::from([1, 1, 2, 3]));
+}
+
+#[test]
 fn conv2d_zero_batch_and_spatial_contract() {
     let mut graph = Graph::new();
     let x = graph.input("x", [0, 1, 2, 2]);

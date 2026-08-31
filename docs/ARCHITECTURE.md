@@ -682,19 +682,23 @@ for ordinary `Sequential` or invent a global training flag.
 `nn/activation.rs` owns the state-free `ReLU` leaf, which delegates only to
 `Graph::relu`; it contributes no traversal state and lets ordinary
 `Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
-`ir/convolution.rs` owns one validated `SpatialWindow` and `ConvolutionSpec`,
-then lowers every new rank-generic forward convolution through ordinary movement,
-promotion, multiplication, typed reduction, and bias operations. `Graph::conv2d`
-is a syntax adapter rather than a second semantic node. No new public forward
-graph emits the old first-class Conv2d operation, but its graph encode, CPU
-oracle, autograd, scheduler, and visualization paths remain internal
-compatibility seams; StaticConv2d and RGUA v10 remain decodable and replayable.
+`ir/convolution.rs` owns one validated `SpatialWindow`, `ConvolutionSpec`, and
+`TransposedConvolutionSpec`. Ordinary convolution lowers through movement,
+promotion, multiplication, typed reduction, and bias operations. Transposed
+convolution first reshapes/transposes/flips grouped weights, inserts source-typed
+stride zeros, transforms signed asymmetric padding plus signed output padding,
+and then calls that same ordinary core. `Graph::conv2d`, `conv_transpose1d`, and
+`conv_transpose2d` are syntax adapters rather than additional semantic nodes.
+No new public forward graph emits the old first-class Conv2d or ConvTranspose2d
+operation, but their graph encode, CPU oracle, autograd, scheduler, and
+visualization paths remain internal compatibility seams; StaticConv2d and RGUA
+v10 remain decodable and replayable.
 `nn/conv.rs` owns graph-free `Conv2d` construction plus its static one-input
 forward adapter; `nn/pool.rs` owns the matching `AvgPool2d`, `AdaptiveAvgPool2d`,
-and `MaxPool2d` adapters. `ConvTranspose2d` likewise owns a graph-independent
-constructor and delegates only to the existing static NCHW transpose-convolution
-Graph contract; `ConvTranspose1d` does the same through its existing NCL-to-2D
-Graph lowering; and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
+and `MaxPool2d` adapters. `ConvTranspose2d` and `ConvTranspose1d` likewise own
+graph-independent constructors and delegate their configured NCHW/NCL forwards
+to the rank-generic compositional transpose-convolution contract; and
+`nn/shape.rs` owns checked static `Flatten`. Together they cover the one
 verified CIFAR classifier chain. `nn/norm.rs` additionally gives `LayerNorm`, `LayerNorm2d`,
 `GroupNorm`, `InstanceNorm`, and `RMSNorm` graph-independent construction and their existing checked one-input
 Graph forwards; `LayerNorm2d` preserves the exact NCHW-to-NHWC-to-LayerNorm-to-NCHW composition,

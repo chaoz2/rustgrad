@@ -197,8 +197,6 @@ impl ConvTranspose2d {
             || options.dilation.contains(&0)
             || in_channels % options.groups != 0
             || out_channels % options.groups != 0
-            || options.output_padding[0] >= options.stride[0]
-            || options.output_padding[1] >= options.stride[1]
         {
             return Err(Error::InvalidConv2d {
                 input: Shape::new([0; 4]),
@@ -273,7 +271,7 @@ impl ModuleForward for ConvTranspose2d {
     }
 }
 
-/// Tinygrad-layout IOK transpose convolution lowered through the 2D core.
+/// Tinygrad-layout IOK transpose convolution adapter over the rank-generic core.
 pub struct ConvTranspose1d {
     pub weight: Parameter,
     pub bias: Option<Parameter>,
@@ -324,7 +322,6 @@ impl ConvTranspose1d {
             || options.dilation == 0
             || in_channels % options.groups != 0
             || out_channels % options.groups != 0
-            || options.output_padding >= options.stride
         {
             return Err(Error::InvalidConv2d {
                 input: Shape::new([0; 4]),

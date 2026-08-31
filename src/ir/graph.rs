@@ -4676,34 +4676,65 @@ impl Graph {
         bias: Option<NodeId>,
         options: ConvTranspose2dOptions,
     ) -> Result<NodeId> {
-        let x = self.node(input)?;
-        let w = self.node(weight)?;
-        let shape = conv_transpose2d_shape(&x.shape, &w.shape, options)?;
-        if let Some(b) = bias
-            && self.node(b)?.shape != Shape::from([shape.dims()[1]])
-        {
+        let input_shape = self.shape(input)?.clone();
+        let weight_shape = self.shape(weight)?.clone();
+        if input_shape.rank() != 4 || weight_shape.rank() != 4 {
             return Err(Error::InvalidConv2d {
-                input: x.shape.clone(),
-                weight: w.shape.clone(),
-                reason: "bias must be [output_channels]",
+                input: input_shape,
+                weight: weight_shape,
+                reason: "input and weight must be rank 4",
             });
         }
-        let mut dtype = x.dtype.promote(w.dtype);
-        if let Some(b) = bias {
-            dtype = dtype.promote(self.node(b)?.dtype);
-        }
-        Ok(self.push(
-            Op::ConvTranspose2d {
-                input,
-                weight,
-                bias,
-                options,
-            },
-            shape,
-            dtype,
-        ))
+        let groups =
+            std::num::NonZeroUsize::new(options.groups).ok_or_else(|| Error::InvalidConv2d {
+                input: input_shape.clone(),
+                weight: weight_shape.clone(),
+                reason: "invalid transpose convolution geometry",
+            })?;
+        let padding = options
+            .padding
+            .into_iter()
+            .map(|value| {
+                i64::try_from(value).map_err(|_| Error::ShapeOverflow(input_shape.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_padding = options
+            .output_padding
+            .into_iter()
+            .map(|value| {
+                i64::try_from(value).map_err(|_| Error::ShapeOverflow(input_shape.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let window = SpatialWindow::new(
+            weight_shape.dims()[2..].to_vec(),
+            options.stride,
+            options.dilation,
+            [(padding[0], padding[1]), (padding[2], padding[3])],
+        )
+        .map_err(|_| Error::InvalidConv2d {
+            input: input_shape.clone(),
+            weight: weight_shape.clone(),
+            reason: "invalid transpose convolution geometry",
+        })?;
+        let spec =
+            TransposedConvolutionSpec::new(window, output_padding, groups).map_err(|_| {
+                Error::InvalidConv2d {
+                    input: input_shape.clone(),
+                    weight: weight_shape.clone(),
+                    reason: "invalid transpose convolution geometry",
+                }
+            })?;
+        self.transposed_convolution(input, weight, bias, spec)
+            .map_err(|error| match error {
+                Error::InvalidConvolution { reason, .. } => Error::InvalidConv2d {
+                    input: input_shape,
+                    weight: weight_shape,
+                    reason,
+                },
+                error => error,
+            })
     }
-    /// Lowers NCL/IOK transpose convolution through the singleton-height 2D core.
+    /// NCL/IOK syntax adapter over the rank-generic compositional core.
     pub fn conv_transpose1d(
         &mut self,
         input: NodeId,
@@ -4711,44 +4742,58 @@ impl Graph {
         bias: Option<NodeId>,
         options: ConvTranspose1dOptions,
     ) -> Result<NodeId> {
-        let x = self.node(input)?.shape.clone();
-        let w = self.node(weight)?.shape.clone();
-        if x.rank() != 3
-            || w.rank() != 3
-            || options.stride == 0
-            || options.dilation == 0
-            || options.output_padding >= options.stride
-        {
+        let input_shape = self.shape(input)?.clone();
+        let weight_shape = self.shape(weight)?.clone();
+        if input_shape.rank() != 3 || weight_shape.rank() != 3 {
             return Err(Error::InvalidConv2d {
-                input: x.clone(),
-                weight: w.clone(),
+                input: input_shape,
+                weight: weight_shape,
                 reason: "invalid 1d transpose convolution geometry",
             });
         }
-        let x4_shape = Shape::new([x.dims()[0], x.dims()[1], 1, x.dims()[2]]);
-        let w4_shape = Shape::new([w.dims()[0], w.dims()[1], 1, w.dims()[2]]);
-        let options_2d = ConvTranspose2dOptions {
-            groups: options.groups,
-            stride: [1, options.stride],
-            dilation: [1, options.dilation],
-            padding: [0, 0, options.padding[0], options.padding[1]],
-            output_padding: [0, options.output_padding],
-        };
-        let output_2d = conv_transpose2d_shape(&x4_shape, &w4_shape, options_2d)?;
-        if let Some(bias) = bias
-            && self.node(bias)?.shape != Shape::from([output_2d.dims()[1]])
-        {
-            return Err(Error::InvalidConv2d {
-                input: x.clone(),
-                weight: w.clone(),
-                reason: "bias must be [output_channels]",
-            });
-        }
-        let x4 = self.reshape(input, x4_shape)?;
-        let w4 = self.reshape(weight, w4_shape)?;
-        let y4 = self.conv_transpose2d(x4, w4, bias, options_2d)?;
-        let y = self.node(y4)?.shape.clone();
-        self.reshape(y4, Shape::new([y.dims()[0], y.dims()[1], y.dims()[3]]))
+        let groups =
+            std::num::NonZeroUsize::new(options.groups).ok_or_else(|| Error::InvalidConv2d {
+                input: input_shape.clone(),
+                weight: weight_shape.clone(),
+                reason: "invalid transpose convolution geometry",
+            })?;
+        let padding = options
+            .padding
+            .into_iter()
+            .map(|value| {
+                i64::try_from(value).map_err(|_| Error::ShapeOverflow(input_shape.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_padding = i64::try_from(options.output_padding)
+            .map_err(|_| Error::ShapeOverflow(input_shape.clone()))?;
+        let window = SpatialWindow::new(
+            weight_shape.dims()[2..].to_vec(),
+            [options.stride],
+            [options.dilation],
+            [(padding[0], padding[1])],
+        )
+        .map_err(|_| Error::InvalidConv2d {
+            input: input_shape.clone(),
+            weight: weight_shape.clone(),
+            reason: "invalid transpose convolution geometry",
+        })?;
+        let spec =
+            TransposedConvolutionSpec::new(window, [output_padding], groups).map_err(|_| {
+                Error::InvalidConv2d {
+                    input: input_shape.clone(),
+                    weight: weight_shape.clone(),
+                    reason: "invalid transpose convolution geometry",
+                }
+            })?;
+        self.transposed_convolution(input, weight, bias, spec)
+            .map_err(|error| match error {
+                Error::InvalidConvolution { reason, .. } => Error::InvalidConv2d {
+                    input: input_shape,
+                    weight: weight_shape,
+                    reason,
+                },
+                error => error,
+            })
     }
     pub(crate) fn conv_transpose2d_grad(
         &mut self,
