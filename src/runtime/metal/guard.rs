@@ -1,10 +1,13 @@
 //! Dependency-ordered MSL emission for guarded integer DAGs.
 use super::{
     MetalError,
-    renderer::{MetalViewAccess, broadcast_offset, metal_storage_type},
+    renderer::{MetalScalarDialect, MetalViewAccess, broadcast_offset, metal_storage_type},
     transaction::{GuardedIntegerOp, MetalTransactionAbi},
 };
-use crate::{DType, IndexValue, LiteralValue, Operation, UOp};
+use crate::{
+    DType, IndexValue, LiteralValue, Operation, UOp,
+    runtime::scalar_lane::{emit_scalar_lane, project_scalar_lane},
+};
 use std::collections::BTreeMap;
 
 pub(super) fn emit_transactional(
@@ -65,8 +68,12 @@ impl Emitter<'_> {
             }
             Operation::Cast => {
                 let source = self.node(&node.sources()[0], indent)?;
-                let source_dtype = node.sources()[0].ty().unwrap().scalar;
-                let value = cast_expression(source_dtype, dtype, &source)?;
+                let value = self.pure_expression(node, vec![source])?;
+                self.assign_if_ok(indent, dtype, &name, &value);
+            }
+            Operation::GraphUnary(_) => {
+                let source = self.node(&node.sources()[0], indent)?;
+                let value = self.pure_expression(node, vec![source])?;
                 self.assign_if_ok(indent, dtype, &name, &value);
             }
             Operation::GraphBinary(op) => {
@@ -95,28 +102,16 @@ impl Emitter<'_> {
                     self.lines.push(format!("{indent}  }}"));
                     self.lines.push(format!("{indent}}}"));
                 } else {
-                    let value = plain_binary(*op, dtype, &lhs, &rhs)?;
+                    let value = self.pure_expression(node, vec![lhs, rhs])?;
                     self.lines
                         .push(format!("{indent}if (rg_ok) {name} = {value};"));
                 }
             }
-            Operation::GraphCompare(op) => {
+            Operation::GraphCompare(_) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 let rhs = self.node(&node.sources()[1], indent)?;
-                let operator = match op {
-                    crate::CompareOp::Eq => "==",
-                    crate::CompareOp::Ne => "!=",
-                    crate::CompareOp::Lt => "<",
-                    crate::CompareOp::Le => "<=",
-                    crate::CompareOp::Gt => ">",
-                    crate::CompareOp::Ge => ">=",
-                };
-                self.assign_if_ok(
-                    indent,
-                    DType::Bool,
-                    &name,
-                    &format!("(uchar)(({lhs}) {operator} ({rhs}))"),
-                );
+                let value = self.pure_expression(node, vec![lhs, rhs])?;
+                self.assign_if_ok(indent, DType::Bool, &name, &value);
             }
             Operation::GraphLogical(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
@@ -169,6 +164,15 @@ impl Emitter<'_> {
             }
         }
         Ok(name)
+    }
+
+    fn pure_expression(&self, node: &UOp, sources: Vec<String>) -> Result<String, MetalError> {
+        let instruction = project_scalar_lane(node, &sources)
+            .map_err(MetalError::Unsupported)?
+            .ok_or_else(|| {
+                MetalError::Unsupported(format!("transactional expression {:?}", node.operation()))
+            })?;
+        emit_scalar_lane(&MetalScalarDialect, &instruction).map_err(MetalError::Unsupported)
     }
 
     fn assign_if_ok(&mut self, indent: &str, dtype: DType, name: &str, value: &str) {
@@ -248,45 +252,6 @@ fn scalar_literal(node: &UOp, dtype: DType) -> Result<String, MetalError> {
         _ => Err(MetalError::Unsupported(
             "transactional scalar literal/type mismatch".into(),
         )),
-    }
-}
-
-fn cast_expression(source: DType, target: DType, value: &str) -> Result<String, MetalError> {
-    match (source, target) {
-        (source, target) if source == target => Ok(value.into()),
-        (DType::Bool, DType::I32) => Ok(format!("(int)({value})")),
-        (DType::Bool, DType::U32) => Ok(format!("(uint)({value})")),
-        (DType::I32 | DType::U32, DType::Bool) => Ok(format!("(uchar)(({value}) != 0)")),
-        (DType::I32, DType::U32) => Ok(format!("as_type<uint>({value})")),
-        (DType::U32, DType::I32) => Ok(format!("as_type<int>({value})")),
-        _ => Err(MetalError::Unsupported(
-            "transactional cast is outside the exact subset".into(),
-        )),
-    }
-}
-
-fn plain_binary(
-    op: crate::BinaryOp,
-    dtype: DType,
-    lhs: &str,
-    rhs: &str,
-) -> Result<String, MetalError> {
-    match (op, dtype) {
-        (crate::BinaryOp::Add, DType::I32) => Ok(format!(
-            "as_type<int>(as_type<uint>({lhs}) + as_type<uint>({rhs}))"
-        )),
-        (crate::BinaryOp::Sub, DType::I32) => Ok(format!(
-            "as_type<int>(as_type<uint>({lhs}) - as_type<uint>({rhs}))"
-        )),
-        (crate::BinaryOp::Mul, DType::I32) => Ok(format!(
-            "as_type<int>(as_type<uint>({lhs}) * as_type<uint>({rhs}))"
-        )),
-        (crate::BinaryOp::Add, DType::U32) => Ok(format!("(({lhs}) + ({rhs}))")),
-        (crate::BinaryOp::Sub, DType::U32) => Ok(format!("(({lhs}) - ({rhs}))")),
-        (crate::BinaryOp::Mul, DType::U32) => Ok(format!("(({lhs}) * ({rhs}))")),
-        _ => Err(MetalError::Unsupported(format!(
-            "binary {op:?} for {dtype:?} is outside the transactional subset"
-        ))),
     }
 }
 

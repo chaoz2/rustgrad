@@ -5,4 +5,5 @@ pub mod mapped_mut;
 pub mod metal;
 pub mod null;
 pub mod opencl;
+pub(crate) mod scalar_lane;
 pub mod webgpu;

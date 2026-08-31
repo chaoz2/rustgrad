@@ -1,10 +1,12 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
+use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CapturedMixedBatch,
-    CapturedReplayExecutor, CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
-    KernelBindings, KernelBufferDesc, LiteralValue, NodeId, Operation, ReduceKind, Scalar, Shape,
-    Slice, Storage, TensorData, UOp, UType, ViewMap, schedule,
+    CapturedReplayExecutor, CompareOp, CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph,
+    IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, LiteralValue, NodeId, Operation,
+    ReduceKind, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UOp, UType, ViewMap,
+    schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawAdapter, RawBuffer, RawCommand,
@@ -2118,15 +2120,17 @@ fn narrow_capability_packing_cache_and_pre_submission_rejections_are_exact() {
     queue.read(output_buffer, 0, &mut bytes).unwrap();
     assert_eq!(bytes, [0x5a; 6]);
 
-    let mut guarded = Graph::new();
-    let values = guarded.input_dtype("values", [3], DType::F16);
-    let divisors = guarded.input_dtype("divisors", [3], DType::F16);
-    let divided = guarded.binary(BinaryOp::Div, values, divisors).unwrap();
-    let guarded_item = &schedule(&guarded, divided).unwrap().items[0];
-    assert!(matches!(
-        WgslRenderer::new(4, capabilities()).unwrap().render(&guarded_item.kernel),
-        Err(WebGpuError::Unsupported(reason)) if reason.contains("requires I32 or U32")
-    ));
+    let mut ordinary = Graph::new();
+    let values = ordinary.input_dtype("values", [3], DType::F32);
+    let divisors = ordinary.input_dtype("divisors", [3], DType::F32);
+    let divided = ordinary.binary(BinaryOp::Div, values, divisors).unwrap();
+    let item = &schedule(&ordinary, divided).unwrap().items[0];
+    let rendered = WgslRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    assert!(rendered.transaction.is_none());
+    assert!(rendered.source.contains(" / "));
 }
 
 #[test]
@@ -2289,6 +2293,175 @@ fn renderer_identity_and_unsupported_work_are_pre_submission() {
     assert!(matches!(
         WgslRenderer::new(4, too_few).unwrap().render(&item.kernel),
         Err(WebGpuError::Unsupported(reason)) if reason.contains("storage-buffer limit")
+    ));
+}
+
+#[test]
+fn shared_scalar_lane_intrinsics_division_bitwise_and_narrow_commit_render_structurally() {
+    let renderer = WgslRenderer::new(4, capabilities()).unwrap();
+    let dialect = renderer::WgslScalarDialect;
+    let typed = |register: &str, dtype| TypedValue {
+        register: register.to_string(),
+        ty: UType::scalar(dtype),
+    };
+    let mixed_bitwise = LaneInstruction::GraphBinary {
+        output: typed("out", DType::I32),
+        lhs: typed("lhs", DType::Bool),
+        rhs: typed("rhs", DType::I32),
+        op: BinaryOp::BitOr,
+    };
+    let mixed_add = LaneInstruction::GraphBinary {
+        output: typed("out", DType::F32),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::F32),
+        op: BinaryOp::Add,
+    };
+    let mixed_compare = LaneInstruction::Compare {
+        output: typed("out", DType::Bool),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::F32),
+        op: CompareOp::Lt,
+    };
+    let bitwise = emit_scalar_lane(&dialect, &mixed_bitwise).unwrap();
+    let add = emit_scalar_lane(&dialect, &mixed_add).unwrap();
+    let compare_error = emit_scalar_lane(&dialect, &mixed_compare).unwrap_err();
+    assert!(bitwise.contains("select(0i, 1i, lhs)") && bitwise.contains(" | "));
+    assert!(add.contains("f32(lhs)") && add.contains(" + "));
+    assert!(compare_error.contains("compare dtype"));
+
+    for dtype in [DType::F16, DType::BF16, DType::F32] {
+        for (name, operation) in [
+            ("sqrt", crate::UnaryOp::Sqrt),
+            ("exp2", crate::UnaryOp::Exp2),
+            ("log2", crate::UnaryOp::Log2),
+            ("sin", crate::UnaryOp::Sin),
+            ("trunc", crate::UnaryOp::Trunc),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let output = match operation {
+                crate::UnaryOp::Sqrt => graph.sqrt(input),
+                crate::UnaryOp::Exp2 => graph.exp2(input),
+                crate::UnaryOp::Log2 => graph.log2(input),
+                crate::UnaryOp::Sin => graph.sin(input),
+                crate::UnaryOp::Trunc => graph.trunc(input),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let scheduled = schedule(&graph, output).unwrap();
+            let item = scheduled
+                .items
+                .iter()
+                .find(|item| item.node == output)
+                .unwrap();
+            let rendered = renderer.render(&item.kernel).unwrap();
+            let intrinsic = format!("{name}(");
+            assert!(
+                rendered.source.contains(intrinsic.as_str()),
+                "{dtype:?} {operation:?}"
+            );
+            assert!(rendered.source.contains(WGSL_RENDERER_VERSION));
+            if dtype == DType::F16 {
+                assert!(rendered.source.matches("rg_f32_to_f16").count() >= 2);
+            }
+            if dtype == DType::BF16 {
+                assert!(rendered.source.matches("rg_f32_to_bf16").count() >= 2);
+            }
+        }
+    }
+
+    for dtype in [DType::I32, DType::U32] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let output = graph.sin(input).unwrap();
+        let scheduled = schedule(&graph, output).unwrap();
+        let item = scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert!(rendered.source.contains("sin(f32("), "{dtype:?}");
+    }
+
+    let mut graph = Graph::new();
+    let narrow = graph.input_dtype("narrow", [2], DType::F16);
+    let exp = graph.exp2(narrow).unwrap();
+    let chained = graph.log2(exp).unwrap();
+    let scheduled = schedule(&graph, chained).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == chained)
+        .unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert!(rendered.source.matches("rg_f32_to_f16").count() >= 3);
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::F32);
+    let rhs = graph.input_dtype("rhs", [2], DType::F32);
+    let output = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(
+        renderer
+            .render(&item.kernel)
+            .unwrap()
+            .source
+            .contains(" / ")
+    );
+
+    for dtype in [DType::Bool, DType::I32, DType::U32] {
+        for op in [BinaryOp::BitAnd, BinaryOp::BitOr, BinaryOp::BitXor] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2], dtype);
+            let rhs = graph.input_dtype("rhs", [2], dtype);
+            let output = graph.binary(op, lhs, rhs).unwrap();
+            let scheduled = schedule(&graph, output).unwrap();
+            let item = scheduled
+                .items
+                .iter()
+                .find(|item| item.node == output)
+                .unwrap();
+            renderer.render(&item.kernel).unwrap();
+        }
+    }
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let rhs = graph.input_dtype("rhs", [2], DType::I32);
+    let divided = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
+    let output = graph.neg(divided).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    let guarded = renderer.render(&item.kernel).unwrap();
+    assert_eq!(guarded.transaction.as_ref().unwrap().guards.len(), 1);
+    assert!(guarded.source.contains("if (rg_ok)"));
+    assert!(
+        guarded.source.find("atomicMin(&rg_status.value").unwrap()
+            < guarded.source.rfind("0u -").unwrap()
+    );
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F64);
+    let output = graph.sqrt(input).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(WebGpuError::Unsupported(_))
     ));
 }
 

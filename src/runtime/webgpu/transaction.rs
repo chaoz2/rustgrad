@@ -99,9 +99,7 @@ impl WebGpuTransactionAbi {
                 .ok_or_else(|| WebGpuError::Unsupported("untyped guarded expression".into()))?
                 .scalar;
             if !matches!(dtype, DType::I32 | DType::U32) {
-                return Err(WebGpuError::Unsupported(format!(
-                    "guarded {operation:?} requires I32 or U32, got {dtype:?}"
-                )));
+                continue;
             }
             let id = u32::try_from(guards.len()).map_err(|_| WebGpuError::Overflow)?;
             let rhs = node

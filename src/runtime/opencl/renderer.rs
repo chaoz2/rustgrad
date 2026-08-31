@@ -9,6 +9,9 @@ use super::{
 };
 use crate::{
     AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+    runtime::scalar_lane::{
+        ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
@@ -16,7 +19,7 @@ use std::{
     sync::Arc,
 };
 
-pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v4";
+pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v6";
 pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -126,6 +129,8 @@ impl OpenClRenderer {
                 "prefix scans and sort pairs are CPU-oracle only".into(),
             ));
         }
+        root.validate()
+            .map_err(|error| OpenClError::Unsupported(error.to_string()))?;
         let nodes = root
             .topological()
             .map_err(|error| OpenClError::Unsupported(error.to_string()))?;
@@ -464,6 +469,127 @@ fn expression_type(dtype: DType) -> &'static str {
     }
 }
 
+pub(super) struct OpenClScalarDialect {
+    pub(super) capabilities: OpenClCapabilities,
+}
+
+impl dialect_seal::Sealed for OpenClScalarDialect {}
+
+impl ScalarLaneDialect for OpenClScalarDialect {
+    fn name(&self) -> &'static str {
+        "OpenCL"
+    }
+
+    fn supports_value(&self, dtype: DType) -> bool {
+        supported_storage(dtype, self.capabilities).is_ok()
+    }
+
+    fn cast(&self, source: DType, target: DType, value: &str) -> Result<String, String> {
+        let result = match (source, target) {
+            (source, target) if source == target => value.into(),
+            (DType::Bool, target) if self.supports_value(target) => {
+                format!("(({})({value}))", cl_type(target))
+            }
+            (source, DType::Bool) if self.supports_value(source) => {
+                format!("((uchar)(({value}) != ({})0))", expression_type(source))
+            }
+            (DType::I32, DType::U32) => format!("as_uint({value})"),
+            (DType::U32, DType::I32) => format!("as_int({value})"),
+            (DType::I64, DType::U64) => format!("as_ulong({value})"),
+            (DType::U64, DType::I64) => format!("as_long({value})"),
+            (DType::I32 | DType::U32 | DType::I64 | DType::U64, DType::F32) => {
+                format!("((float)({value}))")
+            }
+            (DType::F32, DType::F64) => format!("((double)({value}))"),
+            (DType::F64, DType::F32) => format!("((float)({value}))"),
+            (source, target)
+                if narrow::is_narrow(target)
+                    && matches!(source, DType::F16 | DType::BF16 | DType::F32 | DType::F64) =>
+            {
+                narrow::quantize(target, value).expect("target is a narrow float")
+            }
+            (source, DType::F32) if narrow::is_narrow(source) => {
+                format!("((float)({value}))")
+            }
+            (source, DType::F64) if narrow::is_narrow(source) => value.into(),
+            _ => return Err("cast is outside the exact OpenCL subset".into()),
+        };
+        Ok(result)
+    }
+
+    fn finish_float(&self, dtype: DType, value: String) -> Result<String, String> {
+        Ok(narrow::quantize(dtype, &value).unwrap_or(value))
+    }
+
+    fn signed_infix(
+        &self,
+        dtype: DType,
+        operator: &'static str,
+        lhs: &str,
+        rhs: &str,
+    ) -> Result<String, String> {
+        match dtype {
+            DType::I32 => Ok(format!("as_int(as_uint({lhs}) {operator} as_uint({rhs}))")),
+            DType::I64 => Ok(format!(
+                "as_long(as_ulong({lhs}) {operator} as_ulong({rhs}))"
+            )),
+            _ => Err("OpenCL signed wrapping requires I32 or I64".into()),
+        }
+    }
+
+    fn signed_neg(&self, dtype: DType, value: &str) -> Result<String, String> {
+        match dtype {
+            DType::I32 => Ok(format!("as_int((uint)0u - as_uint({value}))")),
+            DType::I64 => Ok(format!("as_long((ulong)0ul - as_ulong({value}))")),
+            _ => Err("OpenCL signed negation requires I32 or I64".into()),
+        }
+    }
+
+    fn unsigned_neg(&self, dtype: DType, value: &str) -> Result<String, String> {
+        match dtype {
+            DType::U32 => Ok(format!("((uint)0u - ({value}))")),
+            DType::U64 => Ok(format!("((ulong)0ul - ({value}))")),
+            _ => Err("OpenCL unsigned negation requires U32 or U64".into()),
+        }
+    }
+
+    fn signed_abs(&self, dtype: DType, value: &str) -> Result<String, String> {
+        match dtype {
+            DType::I32 => Ok(format!(
+                "as_int(({value}) < 0 ? ((uint)0u - as_uint({value})) : as_uint({value}))"
+            )),
+            DType::I64 => Ok(format!(
+                "as_long(({value}) < 0 ? ((ulong)0ul - as_ulong({value})) : as_ulong({value}))"
+            )),
+            _ => Err("OpenCL signed absolute value requires I32 or I64".into()),
+        }
+    }
+
+    fn float_abs(&self, value: &str) -> String {
+        format!("fabs({value})")
+    }
+
+    fn bool_value(&self, expression: String) -> String {
+        format!("((uchar)({expression}))")
+    }
+
+    fn select(&self, condition: &str, on_true: &str, on_false: &str) -> String {
+        format!("(({condition}) ? ({on_true}) : ({on_false}))")
+    }
+
+    fn call_intrinsic(&self, canonical_name: &'static str, value: &str) -> String {
+        format!("{canonical_name}({value})")
+    }
+
+    fn float_one(&self, dtype: DType) -> Result<&'static str, String> {
+        match dtype {
+            DType::F32 => Ok("1.0f"),
+            DType::F16 | DType::BF16 | DType::F64 => Ok("1.0"),
+            _ => Err("OpenCL reciprocal requires floating dtype".into()),
+        }
+    }
+}
+
 fn encode_store(dtype: DType, value: impl AsRef<str>) -> String {
     narrow::encode(dtype, value.as_ref()).unwrap_or_else(|| value.as_ref().into())
 }
@@ -644,160 +770,17 @@ fn emit_expr(
             let raw = format!("b{position}[{offset}]");
             Ok(narrow::decode(dtype, &raw).unwrap_or(raw))
         }
-        Operation::Cast => {
-            let value = child(0, source_map, lines)?;
-            match (node.sources()[0].ty().map(|ty| ty.scalar), dtype) {
-                (Some(source), target) if source == target => Ok(value),
-                (Some(DType::Bool), target) => Ok(format!("(({})({value}))", cl_type(target))),
-                (Some(source), DType::Bool) => Ok(format!(
-                    "((uchar)(({value}) != ({})0))",
-                    expression_type(source)
-                )),
-                (Some(DType::I32), DType::U32) => Ok(format!("as_uint({value})")),
-                (Some(DType::U32), DType::I32) => Ok(format!("as_int({value})")),
-                (Some(DType::I64), DType::U64) => Ok(format!("as_ulong({value})")),
-                (Some(DType::U64), DType::I64) => Ok(format!("as_long({value})")),
-                (Some(DType::I32), DType::F32) => Ok(format!("((float)({value}))")),
-                (Some(DType::U32), DType::F32) => Ok(format!("((float)({value}))")),
-                (Some(DType::I64), DType::F32) => Ok(format!("((float)({value}))")),
-                (Some(DType::U64), DType::F32) => Ok(format!("((float)({value}))")),
-                (Some(DType::F32), DType::F64) => Ok(format!("((double)({value}))")),
-                (Some(DType::F64), DType::F32) => Ok(format!("((float)({value}))")),
-                (Some(source), target)
-                    if narrow::is_narrow(target)
-                        && matches!(source, DType::F16 | DType::BF16 | DType::F32 | DType::F64) =>
-                {
-                    Ok(narrow::quantize(target, value).expect("target is a narrow float"))
-                }
-                (Some(source), DType::F32) if narrow::is_narrow(source) => {
-                    Ok(format!("((float)({value}))"))
-                }
-                (Some(source), DType::F64) if narrow::is_narrow(source) => Ok(value),
-                _ => Err(OpenClError::Unsupported(
-                    "cast is outside the exact OpenCL subset".into(),
-                )),
+        other => {
+            let mut sources = Vec::with_capacity(node.sources().len());
+            for slot in 0..node.sources().len() {
+                sources.push(child(slot, source_map, lines)?);
             }
+            let instruction = project_scalar_lane(node, &sources)
+                .map_err(OpenClError::Unsupported)?
+                .ok_or_else(|| OpenClError::Unsupported(format!("{other:?}")))?;
+            emit_scalar_lane(&OpenClScalarDialect { capabilities }, &instruction)
+                .map_err(OpenClError::Unsupported)
         }
-        Operation::GraphUnary(op) => {
-            let value = child(0, source_map, lines)?;
-            match (op, dtype) {
-                (crate::UnaryOp::Neg, DType::F16 | DType::BF16 | DType::F32 | DType::F64) => {
-                    Ok(format!("(-({value}))"))
-                }
-                (crate::UnaryOp::Abs, DType::F16 | DType::BF16 | DType::F32 | DType::F64) => {
-                    Ok(format!("fabs({value})"))
-                }
-                (crate::UnaryOp::Neg, DType::I32) => {
-                    Ok(format!("as_int((uint)0u - as_uint({value}))"))
-                }
-                (crate::UnaryOp::Neg, DType::I64) => {
-                    Ok(format!("as_long((ulong)0ul - as_ulong({value}))"))
-                }
-                (crate::UnaryOp::Reciprocal, DType::F16 | DType::BF16 | DType::F32) => {
-                    let result = format!("(1.0f / ({value}))");
-                    Ok(narrow::quantize(dtype, &result).unwrap_or(result))
-                }
-                (crate::UnaryOp::Reciprocal, DType::F64) => Ok(format!("(1.0 / ({value}))")),
-                _ => Err(OpenClError::Unsupported(format!(
-                    "unary {op:?} for {dtype:?}"
-                ))),
-            }
-        }
-        Operation::GraphBinary(op) => {
-            let lhs = child(0, source_map, lines)?;
-            let rhs = child(1, source_map, lines)?;
-            emit_binary(*op, dtype, &lhs, &rhs)
-        }
-        Operation::GraphCompare(op) => {
-            let lhs = child(0, source_map, lines)?;
-            let rhs = child(1, source_map, lines)?;
-            let operator = match op {
-                crate::CompareOp::Eq => "==",
-                crate::CompareOp::Ne => "!=",
-                crate::CompareOp::Lt => "<",
-                crate::CompareOp::Le => "<=",
-                crate::CompareOp::Gt => ">",
-                crate::CompareOp::Ge => ">=",
-            };
-            Ok(format!("((uchar)(({lhs}) {operator} ({rhs})))"))
-        }
-        Operation::GraphLogical(op) => {
-            let lhs = child(0, source_map, lines)?;
-            Ok(match op {
-                crate::LogicalOp::Not => format!("((uchar)!({lhs}))"),
-                crate::LogicalOp::And => {
-                    let rhs = child(1, source_map, lines)?;
-                    format!("((uchar)(({lhs}) && ({rhs})))")
-                }
-                crate::LogicalOp::Or => {
-                    let rhs = child(1, source_map, lines)?;
-                    format!("((uchar)(({lhs}) || ({rhs})))")
-                }
-            })
-        }
-        Operation::Ternary(crate::uop::Ternary::Where) => {
-            let condition = child(0, source_map, lines)?;
-            let yes = child(1, source_map, lines)?;
-            let no = child(2, source_map, lines)?;
-            Ok(format!("(({condition}) ? ({yes}) : ({no}))"))
-        }
-        other => Err(OpenClError::Unsupported(format!("{other:?}"))),
-    }
-}
-
-pub(super) fn emit_binary(
-    op: crate::BinaryOp,
-    dtype: DType,
-    lhs: &str,
-    rhs: &str,
-) -> Result<String, OpenClError> {
-    use crate::BinaryOp::{Add, Div, Mul, Sub};
-    match (op, dtype) {
-        (Add | Sub | Mul | Div, DType::F16 | DType::BF16 | DType::F32 | DType::F64) => {
-            let operator = match op {
-                Add => "+",
-                Sub => "-",
-                Mul => "*",
-                Div => "/",
-                _ => unreachable!(),
-            };
-            Ok(format!("(({lhs}) {operator} ({rhs}))"))
-        }
-        (Add, DType::Bool) => Ok(format!("((uchar)(({lhs}) || ({rhs})))")),
-        (Sub, DType::Bool) => Ok(format!("((uchar)(({lhs}) != ({rhs})))")),
-        (Mul, DType::Bool) => Ok(format!("((uchar)(({lhs}) && ({rhs})))")),
-        (Add | Sub | Mul, DType::U32 | DType::U64) => {
-            let operator = match op {
-                Add => "+",
-                Sub => "-",
-                Mul => "*",
-                _ => unreachable!(),
-            };
-            Ok(format!("(({lhs}) {operator} ({rhs}))"))
-        }
-        (Add | Sub | Mul, DType::I32) => {
-            let operator = match op {
-                Add => "+",
-                Sub => "-",
-                Mul => "*",
-                _ => unreachable!(),
-            };
-            Ok(format!("as_int(as_uint({lhs}) {operator} as_uint({rhs}))"))
-        }
-        (Add | Sub | Mul, DType::I64) => {
-            let operator = match op {
-                Add => "+",
-                Sub => "-",
-                Mul => "*",
-                _ => unreachable!(),
-            };
-            Ok(format!(
-                "as_long(as_ulong({lhs}) {operator} as_ulong({rhs}))"
-            ))
-        }
-        _ => Err(OpenClError::Unsupported(format!(
-            "binary {op:?} for {dtype:?}; guarded integer div/mod/shift have no status ABI"
-        ))),
     }
 }
 
@@ -875,7 +858,7 @@ fn emit_reduction(
         reduction.input_offset_expression()?
     ));
     let expression = if let Some(transaction) = transaction {
-        emit_transactional_reduction(value, transaction, ids, source_map, lines)?
+        emit_transactional_reduction(value, transaction, ids, source_map, lines, capabilities)?
     } else {
         emit_expr(value, ids, source_map, lines, "src_gid", capabilities)?
     };

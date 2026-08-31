@@ -1,9 +1,11 @@
+use super::renderer::{OPENCL_ABI_VERSION, OPENCL_RENDERER_VERSION, OpenClScalarDialect};
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
+use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
-    AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CpuBackend, DType, Graph,
-    IndexValue, KernelBindings, KernelBufferDesc, Operation, Scalar, Shape, TensorData, UOp, UType,
-    schedule,
+    AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CompareOp, CpuBackend, DType, Graph,
+    IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, Operation, Scalar, Shape,
+    TensorData, TypedValue, UOp, UType, schedule,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -1811,6 +1813,197 @@ fn renderer_rejects_unsupported_work_before_icd_calls() {
 }
 
 #[test]
+fn shared_scalar_lane_intrinsics_bitwise_and_capabilities_render_structurally() {
+    let renderer = OpenClRenderer::with_capabilities(4, OpenClCapabilities::FULL).unwrap();
+    let dialect = OpenClScalarDialect {
+        capabilities: OpenClCapabilities::FULL,
+    };
+    let typed = |register: &str, dtype| TypedValue {
+        register: register.to_string(),
+        ty: UType::scalar(dtype),
+    };
+    let mixed_bitwise = LaneInstruction::GraphBinary {
+        output: typed("out", DType::I32),
+        lhs: typed("lhs", DType::Bool),
+        rhs: typed("rhs", DType::I32),
+        op: BinaryOp::BitOr,
+    };
+    let mixed_add = LaneInstruction::GraphBinary {
+        output: typed("out", DType::F32),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::F32),
+        op: BinaryOp::Add,
+    };
+    let mixed_compare = LaneInstruction::Compare {
+        output: typed("out", DType::Bool),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::F32),
+        op: CompareOp::Lt,
+    };
+    let bitwise = emit_scalar_lane(&dialect, &mixed_bitwise).unwrap();
+    let add = emit_scalar_lane(&dialect, &mixed_add).unwrap();
+    let compare_error = emit_scalar_lane(&dialect, &mixed_compare).unwrap_err();
+    assert!(bitwise.contains("((int)(lhs))") && bitwise.contains(" | "));
+    assert!(add.contains("((float)(lhs))") && add.contains(" + "));
+    assert!(compare_error.contains("compare dtype"));
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        for (name, operation) in [
+            ("sqrt", crate::UnaryOp::Sqrt),
+            ("exp2", crate::UnaryOp::Exp2),
+            ("log2", crate::UnaryOp::Log2),
+            ("sin", crate::UnaryOp::Sin),
+            ("trunc", crate::UnaryOp::Trunc),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let output = match operation {
+                crate::UnaryOp::Sqrt => graph.sqrt(input),
+                crate::UnaryOp::Exp2 => graph.exp2(input),
+                crate::UnaryOp::Log2 => graph.log2(input),
+                crate::UnaryOp::Sin => graph.sin(input),
+                crate::UnaryOp::Trunc => graph.trunc(input),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let scheduled = schedule(&graph, output).unwrap();
+            let item = scheduled
+                .items
+                .iter()
+                .find(|item| item.node == output)
+                .unwrap();
+            let rendered = renderer.render(&item.kernel).unwrap();
+            let intrinsic = format!("{name}(");
+            assert!(
+                rendered.source.contains(intrinsic.as_str()),
+                "{dtype:?} {operation:?}"
+            );
+            assert!(rendered.source.contains(OPENCL_RENDERER_VERSION));
+            if dtype == DType::F16 {
+                assert!(rendered.source.matches("rg_f32_to_f16").count() >= 2);
+            }
+            if dtype == DType::BF16 {
+                assert!(rendered.source.matches("rg_f32_to_bf16").count() >= 2);
+            }
+        }
+    }
+
+    for dtype in [DType::I32, DType::U32, DType::I64, DType::U64] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let output = graph.sin(input).unwrap();
+        let scheduled = schedule(&graph, output).unwrap();
+        let item = scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert!(rendered.source.contains("sin(((float)("), "{dtype:?}");
+    }
+
+    let mut graph = Graph::new();
+    let narrow = graph.input_dtype("narrow", [2], DType::BF16);
+    let exp = graph.exp2(narrow).unwrap();
+    let chained = graph.log2(exp).unwrap();
+    let scheduled = schedule(&graph, chained).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == chained)
+        .unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert!(rendered.source.matches("rg_f32_to_bf16").count() >= 3);
+
+    for dtype in [DType::Bool, DType::I32, DType::U32, DType::I64, DType::U64] {
+        for op in [BinaryOp::BitAnd, BinaryOp::BitOr, BinaryOp::BitXor] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2], dtype);
+            let rhs = graph.input_dtype("rhs", [2], dtype);
+            let output = graph.binary(op, lhs, rhs).unwrap();
+            let scheduled = schedule(&graph, output).unwrap();
+            let item = scheduled
+                .items
+                .iter()
+                .find(|item| item.node == output)
+                .unwrap();
+            renderer.render(&item.kernel).unwrap();
+        }
+    }
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let rhs = graph.input_dtype("rhs", [2], DType::I32);
+    let divided = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
+    let output = graph.neg(divided).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    let guarded = renderer.render(&item.kernel).unwrap();
+    assert_eq!(guarded.transaction.as_ref().unwrap().guards.len(), 1);
+    assert!(guarded.source.contains("if (rg_ok)"));
+    assert!(
+        guarded.source.find("atomic_min(rg_status").unwrap()
+            < guarded.source.rfind("0u -").unwrap()
+    );
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F64);
+    let output = graph.sqrt(input).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(matches!(
+        OpenClRenderer::default().render(&item.kernel),
+        Err(OpenClError::Unsupported(_))
+    ));
+
+    let valid_store = item
+        .kernel
+        .sources()
+        .iter()
+        .find(|node| matches!(node.operation(), Operation::Store))
+        .unwrap();
+    let valid_value = &valid_store.sources()[1];
+    let malformed_value = UOp::from_operation(
+        valid_value.operation().clone(),
+        valid_value.ty(),
+        vec![
+            valid_value.sources()[0].clone(),
+            valid_value.sources()[0].clone(),
+        ],
+    );
+    let malformed_store = UOp::from_operation(
+        Operation::Store,
+        None,
+        vec![valid_store.sources()[0].clone(), malformed_value],
+    );
+    let malformed = UOp::sink(
+        item.kernel
+            .sources()
+            .iter()
+            .map(|node| {
+                if matches!(node.operation(), Operation::Store) {
+                    malformed_store.clone()
+                } else {
+                    node.clone()
+                }
+            })
+            .collect(),
+    );
+    assert!(matches!(
+        renderer.render(&malformed),
+        Err(OpenClError::Unsupported(_))
+    ));
+}
+
+#[test]
 fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [4], DType::I32);
@@ -1823,7 +2016,8 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
     assert_eq!(transaction.guards.len(), 1);
     assert_eq!(transaction.guards[0].operation, GuardedIntegerOp::FloorDiv);
     assert!(rendered.source.contains("atomic_min(rg_status"));
-    assert!(rendered.source.contains("rustgrad-opencl-static-v4 ABI 4"));
+    let version = format!("{OPENCL_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}");
+    assert!(rendered.source.contains(version.as_str()));
 
     let mock = Arc::new(MockDispatch::default());
     let (context, queue) = setup(mock.clone());

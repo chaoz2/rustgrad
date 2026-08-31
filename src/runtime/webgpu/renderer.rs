@@ -7,6 +7,9 @@ use super::{
 };
 use crate::{
     AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+    runtime::scalar_lane::{
+        ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
@@ -15,7 +18,7 @@ use std::{
 };
 
 /// Deterministic renderer/source identity.
-pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v3";
+pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v5";
 /// Ordered storage-plus-extent bind-group ABI version.
 pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
@@ -561,6 +564,98 @@ fn wgsl_storage_decl(dtype: DType, mutable: bool) -> &'static str {
     }
 }
 
+pub(super) struct WgslScalarDialect;
+
+impl dialect_seal::Sealed for WgslScalarDialect {}
+
+impl ScalarLaneDialect for WgslScalarDialect {
+    fn name(&self) -> &'static str {
+        "WGSL"
+    }
+
+    fn supports_value(&self, dtype: DType) -> bool {
+        supported_storage(dtype).is_ok()
+    }
+
+    fn cast(&self, source: DType, target: DType, value: &str) -> Result<String, String> {
+        emit_cast(source, target, value).map_err(|error| error.to_string())
+    }
+
+    fn finish_float(&self, dtype: DType, value: String) -> Result<String, String> {
+        Ok(narrow::quantize(dtype, &value).unwrap_or(value))
+    }
+
+    fn signed_infix(
+        &self,
+        dtype: DType,
+        operator: &'static str,
+        lhs: &str,
+        rhs: &str,
+    ) -> Result<String, String> {
+        if dtype == DType::I32 {
+            Ok(format!(
+                "bitcast<i32>(bitcast<u32>({lhs}) {operator} bitcast<u32>({rhs}))"
+            ))
+        } else {
+            Err("WGSL signed wrapping requires I32".into())
+        }
+    }
+
+    fn signed_neg(&self, dtype: DType, value: &str) -> Result<String, String> {
+        if dtype == DType::I32 {
+            Ok(format!("bitcast<i32>(0u - bitcast<u32>({value}))"))
+        } else {
+            Err("WGSL signed negation requires I32".into())
+        }
+    }
+
+    fn unsigned_neg(&self, dtype: DType, value: &str) -> Result<String, String> {
+        if dtype == DType::U32 {
+            Ok(format!("(0u - ({value}))"))
+        } else {
+            Err("WGSL unsigned negation requires U32".into())
+        }
+    }
+
+    fn signed_abs(&self, dtype: DType, value: &str) -> Result<String, String> {
+        if dtype == DType::I32 {
+            Ok(format!(
+                "select(bitcast<i32>(0u - bitcast<u32>({value})), ({value}), ({value}) >= 0i)"
+            ))
+        } else {
+            Err("WGSL signed absolute value requires I32".into())
+        }
+    }
+
+    fn float_abs(&self, value: &str) -> String {
+        format!("abs({value})")
+    }
+
+    fn bool_value(&self, expression: String) -> String {
+        format!("({expression})")
+    }
+
+    fn select(&self, condition: &str, on_true: &str, on_false: &str) -> String {
+        format!("select(({on_false}), ({on_true}), ({condition}))")
+    }
+
+    fn compare_operand(&self, dtype: DType, value: &str) -> String {
+        ordered_compare_operand(dtype, value)
+    }
+
+    fn call_intrinsic(&self, canonical_name: &'static str, value: &str) -> String {
+        format!("{canonical_name}({value})")
+    }
+
+    fn float_one(&self, dtype: DType) -> Result<&'static str, String> {
+        if matches!(dtype, DType::F16 | DType::BF16 | DType::F32) {
+            Ok("1.0")
+        } else {
+            Err("WGSL reciprocal requires floating dtype".into())
+        }
+    }
+}
+
 fn emit_expr(
     node: &UOp,
     ids: &BTreeMap<u64, usize>,
@@ -657,121 +752,16 @@ fn emit_expr(
                 Ok(format!("b{position}[{offset}]"))
             }
         }
-        Operation::Cast => {
-            let value = child(0, source_map, lines)?;
-            let source = node.sources()[0]
-                .ty()
-                .ok_or_else(|| WebGpuError::Unsupported("untyped cast source".into()))?
-                .scalar;
-            emit_cast(source, dtype, &value)
-        }
-        Operation::GraphUnary(op) => {
-            let value = child(0, source_map, lines)?;
-            let expression = match (op, dtype) {
-                (crate::UnaryOp::Neg, DType::F16 | DType::BF16 | DType::F32) => {
-                    format!("(-({value}))")
-                }
-                (crate::UnaryOp::Neg, DType::I32) => {
-                    format!("bitcast<i32>(0u - bitcast<u32>({value}))")
-                }
-                (crate::UnaryOp::Neg, DType::U32) => format!("(0u - ({value}))"),
-                (crate::UnaryOp::Neg, DType::Bool) => format!("!({value})"),
-                (crate::UnaryOp::Abs, DType::F16 | DType::BF16 | DType::F32) => {
-                    format!("abs({value})")
-                }
-                (crate::UnaryOp::Abs, DType::I32) => format!(
-                    "select(bitcast<i32>(0u - bitcast<u32>({value})), ({value}), ({value}) >= 0i)"
-                ),
-                (crate::UnaryOp::Abs, DType::U32 | DType::Bool) => value,
-                (crate::UnaryOp::Reciprocal, DType::F16 | DType::BF16 | DType::F32) => {
-                    format!("(1.0 / ({value}))")
-                }
-                _ => {
-                    return Err(WebGpuError::Unsupported(format!(
-                        "unary {op:?} for {dtype:?}"
-                    )));
-                }
-            };
-            Ok(narrow::quantize(dtype, &expression).unwrap_or(expression))
-        }
-        Operation::GraphBinary(op) => {
-            let lhs = child(0, source_map, lines)?;
-            let rhs = child(1, source_map, lines)?;
-            emit_binary(*op, dtype, &lhs, &rhs)
-        }
-        Operation::Binary(op) => {
-            let lhs = child(0, source_map, lines)?;
-            let rhs = child(1, source_map, lines)?;
-            use crate::uop::Binary::{Add, Eq, Le, Lt, Mul, Sub};
-            match op {
-                Add => emit_binary(crate::BinaryOp::Add, dtype, &lhs, &rhs),
-                Sub => emit_binary(crate::BinaryOp::Sub, dtype, &lhs, &rhs),
-                Mul => emit_binary(crate::BinaryOp::Mul, dtype, &lhs, &rhs),
-                Eq => Ok(format!("(({lhs}) == ({rhs}))")),
-                Lt | Le => {
-                    let operand_dtype = node.sources()[0]
-                        .ty()
-                        .ok_or_else(|| WebGpuError::Unsupported("untyped compare source".into()))?
-                        .scalar;
-                    let lhs = ordered_compare_operand(operand_dtype, &lhs);
-                    let rhs = ordered_compare_operand(operand_dtype, &rhs);
-                    let operator = if matches!(op, Lt) { "<" } else { "<=" };
-                    Ok(format!("(({lhs}) {operator} ({rhs}))"))
-                }
-                _ => Err(WebGpuError::Unsupported(format!(
-                    "core binary {op:?} is outside the WGSL subset"
-                ))),
+        other => {
+            let mut sources = Vec::with_capacity(node.sources().len());
+            for slot in 0..node.sources().len() {
+                sources.push(child(slot, source_map, lines)?);
             }
+            let instruction = project_scalar_lane(node, &sources)
+                .map_err(WebGpuError::Unsupported)?
+                .ok_or_else(|| WebGpuError::Unsupported(format!("{other:?}")))?;
+            emit_scalar_lane(&WgslScalarDialect, &instruction).map_err(WebGpuError::Unsupported)
         }
-        Operation::GraphCompare(op) => {
-            let lhs = child(0, source_map, lines)?;
-            let rhs = child(1, source_map, lines)?;
-            let operand_dtype = node.sources()[0]
-                .ty()
-                .ok_or_else(|| WebGpuError::Unsupported("untyped compare source".into()))?
-                .scalar;
-            let operator = match op {
-                crate::CompareOp::Eq => "==",
-                crate::CompareOp::Ne => "!=",
-                crate::CompareOp::Lt => "<",
-                crate::CompareOp::Le => "<=",
-                crate::CompareOp::Gt => ">",
-                crate::CompareOp::Ge => ">=",
-            };
-            let lhs = if matches!(op, crate::CompareOp::Eq | crate::CompareOp::Ne) {
-                lhs
-            } else {
-                ordered_compare_operand(operand_dtype, &lhs)
-            };
-            let rhs = if matches!(op, crate::CompareOp::Eq | crate::CompareOp::Ne) {
-                rhs
-            } else {
-                ordered_compare_operand(operand_dtype, &rhs)
-            };
-            Ok(format!("(({lhs}) {operator} ({rhs}))"))
-        }
-        Operation::GraphLogical(op) => {
-            let lhs = child(0, source_map, lines)?;
-            Ok(match op {
-                crate::LogicalOp::Not => format!("!({lhs})"),
-                crate::LogicalOp::And => {
-                    let rhs = child(1, source_map, lines)?;
-                    format!("(({lhs}) && ({rhs}))")
-                }
-                crate::LogicalOp::Or => {
-                    let rhs = child(1, source_map, lines)?;
-                    format!("(({lhs}) || ({rhs}))")
-                }
-            })
-        }
-        Operation::Ternary(crate::uop::Ternary::Where) => {
-            let condition = child(0, source_map, lines)?;
-            let yes = child(1, source_map, lines)?;
-            let no = child(2, source_map, lines)?;
-            let selected = format!("select(({no}), ({yes}), ({condition}))");
-            Ok(narrow::quantize(dtype, &selected).unwrap_or(selected))
-        }
-        other => Err(WebGpuError::Unsupported(format!("{other:?}"))),
     }
 }
 
@@ -811,43 +801,6 @@ pub(super) fn ordered_compare_operand(dtype: DType, value: &str) -> String {
     } else {
         value.into()
     }
-}
-
-fn emit_binary(
-    op: crate::BinaryOp,
-    dtype: DType,
-    lhs: &str,
-    rhs: &str,
-) -> Result<String, WebGpuError> {
-    use crate::BinaryOp::{Add, Mul, Sub};
-    let operator = match op {
-        Add => "+",
-        Sub => "-",
-        Mul => "*",
-        _ => {
-            return Err(WebGpuError::Unsupported(format!(
-                "binary {op:?} for {dtype:?} is outside the WGSL subset"
-            )));
-        }
-    };
-    let value = match dtype {
-        DType::F16 | DType::BF16 | DType::F32 | DType::U32 => {
-            format!("(({lhs}) {operator} ({rhs}))")
-        }
-        DType::I32 => format!("bitcast<i32>(bitcast<u32>({lhs}) {operator} bitcast<u32>({rhs}))"),
-        DType::Bool => match op {
-            Add => format!("(({lhs}) || ({rhs}))"),
-            Sub => format!("(({lhs}) != ({rhs}))"),
-            Mul => format!("(({lhs}) && ({rhs}))"),
-            _ => unreachable!(),
-        },
-        _ => {
-            return Err(WebGpuError::Unsupported(format!(
-                "binary {op:?} for {dtype:?} is outside the WGSL subset"
-            )));
-        }
-    };
-    Ok(narrow::quantize(dtype, &value).unwrap_or(value))
 }
 
 #[derive(Clone, Debug)]
