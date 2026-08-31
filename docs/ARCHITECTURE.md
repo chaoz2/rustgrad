@@ -378,6 +378,18 @@ promotion. `VectorProgram` maps the same `LaneInstruction` enum onto validated
 physical registers. It owns one lane width plus scalar-tail identity instead of
 cloning masks or semantic payloads into each instruction; CPU JIT validates and
 keys this form before portable rendering.
+
+The static OpenCL, Metal, and WebGPU renderers project each validated pure UOp
+node through that same `LaneInstruction<R>` semantic boundary. One shared,
+exhaustive scalar-lane emitter consumes the enum's structurally fixed arity,
+owns `GraphBinary` operand promotion, and keeps heterogeneous `GraphCompare`
+fail-closed until its exact mixed signed/unsigned and float/integer ordering has
+a portable representation. Bitcast, memory, and control remain fail-closed;
+sealed backend dialects own only target syntax, storage commitment, capability
+checks, and signed-wrap spelling. Guarded integer renderers reuse the same
+projection for pure subexpressions while retaining backend-local lazy branch
+and first-fault status ordering. This avoids a second renderer operation taxonomy without
+changing artifact or storage ABIs.
 B1/B2 CPU JIT consumes eligible VectorProgram instructions directly in physical-register order.
 Enabled vector mains must be lane-aligned, permit at most one partial tail, and
 derive one deterministic program tail mask; disabled plans retain zero vector

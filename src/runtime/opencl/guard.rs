@@ -1,11 +1,14 @@
 //! Dependency-ordered OpenCL C emission for transactional elementwise DAGs.
 use super::{
     OpenClCapabilities, OpenClError, narrow,
-    renderer::{broadcast_offset, cl_type, emit_binary, guarded_value},
+    renderer::{OpenClScalarDialect, broadcast_offset, cl_type, guarded_value},
     transaction::OpenClTransactionAbi,
     view::OpenClViewAccess,
 };
-use crate::{DType, IndexValue, LiteralValue, Operation, UOp};
+use crate::{
+    DType, IndexValue, LiteralValue, Operation, UOp,
+    runtime::scalar_lane::{emit_scalar_lane, project_scalar_lane},
+};
 use std::collections::BTreeMap;
 
 pub(super) fn emit_transactional(
@@ -14,10 +17,21 @@ pub(super) fn emit_transactional(
     ids: &BTreeMap<u64, usize>,
     source_map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
-    _capabilities: OpenClCapabilities,
+    capabilities: OpenClCapabilities,
 ) -> Result<String, OpenClError> {
     lines.push("  uchar rg_ok = (uchar)1u;".into());
-    emit_at(root, transaction, ids, source_map, lines, "gid", "  ")
+    emit_at(
+        root,
+        EmitContext {
+            transaction,
+            ids,
+            source_map,
+            lines,
+            capabilities,
+        },
+        "gid",
+        "  ",
+    )
 }
 
 pub(super) fn emit_transactional_reduction(
@@ -26,19 +40,43 @@ pub(super) fn emit_transactional_reduction(
     ids: &BTreeMap<u64, usize>,
     source_map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
+    capabilities: OpenClCapabilities,
 ) -> Result<String, OpenClError> {
-    emit_at(root, transaction, ids, source_map, lines, "src_gid", "    ")
+    emit_at(
+        root,
+        EmitContext {
+            transaction,
+            ids,
+            source_map,
+            lines,
+            capabilities,
+        },
+        "src_gid",
+        "    ",
+    )
+}
+
+struct EmitContext<'a> {
+    transaction: &'a OpenClTransactionAbi,
+    ids: &'a BTreeMap<u64, usize>,
+    source_map: &'a mut BTreeMap<usize, usize>,
+    lines: &'a mut Vec<String>,
+    capabilities: OpenClCapabilities,
 }
 
 fn emit_at(
     root: &UOp,
-    transaction: &OpenClTransactionAbi,
-    ids: &BTreeMap<u64, usize>,
-    source_map: &mut BTreeMap<usize, usize>,
-    lines: &mut Vec<String>,
+    context: EmitContext<'_>,
     linear: &str,
     indent: &str,
 ) -> Result<String, OpenClError> {
+    let EmitContext {
+        transaction,
+        ids,
+        source_map,
+        lines,
+        capabilities,
+    } = context;
     let mut emitter = Emitter {
         transaction,
         guard_ids: transaction.guard_ids(),
@@ -47,6 +85,7 @@ fn emit_at(
         lines,
         next_value: 0,
         linear,
+        capabilities,
     };
     emitter.node(root, indent)
 }
@@ -59,6 +98,7 @@ struct Emitter<'a> {
     lines: &'a mut Vec<String>,
     next_value: usize,
     linear: &'a str,
+    capabilities: OpenClCapabilities,
 }
 
 impl Emitter<'_> {
@@ -87,13 +127,12 @@ impl Emitter<'_> {
             }
             Operation::Cast => {
                 let source = self.node(&node.sources()[0], indent)?;
-                let source_dtype = node.sources()[0].ty().unwrap().scalar;
-                let value = cast_expression(source_dtype, dtype, &source)?;
+                let value = self.pure_expression(node, vec![source])?;
                 self.assign_if_ok(indent, dtype, &name, &value);
             }
-            Operation::GraphUnary(op) => {
+            Operation::GraphUnary(_) => {
                 let source = self.node(&node.sources()[0], indent)?;
-                let value = unary_expression(*op, dtype, &source)?;
+                let value = self.pure_expression(node, vec![source])?;
                 self.assign_if_ok(indent, dtype, &name, &value);
             }
             Operation::GraphBinary(op) => {
@@ -123,28 +162,16 @@ impl Emitter<'_> {
                     self.lines.push(format!("{indent}  }}"));
                     self.lines.push(format!("{indent}}}"));
                 } else {
-                    let value = emit_binary(*op, dtype, &lhs, &rhs)?;
+                    let value = self.pure_expression(node, vec![lhs, rhs])?;
                     self.lines
                         .push(format!("{indent}if (rg_ok) {name} = {value};"));
                 }
             }
-            Operation::GraphCompare(op) => {
+            Operation::GraphCompare(_) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
                 let rhs = self.node(&node.sources()[1], indent)?;
-                let operator = match op {
-                    crate::CompareOp::Eq => "==",
-                    crate::CompareOp::Ne => "!=",
-                    crate::CompareOp::Lt => "<",
-                    crate::CompareOp::Le => "<=",
-                    crate::CompareOp::Gt => ">",
-                    crate::CompareOp::Ge => ">=",
-                };
-                self.assign_if_ok(
-                    indent,
-                    DType::Bool,
-                    &name,
-                    &format!("((uchar)(({lhs}) {operator} ({rhs})))"),
-                );
+                let value = self.pure_expression(node, vec![lhs, rhs])?;
+                self.assign_if_ok(indent, DType::Bool, &name, &value);
             }
             Operation::GraphLogical(op) => {
                 let lhs = self.node(&node.sources()[0], indent)?;
@@ -197,6 +224,21 @@ impl Emitter<'_> {
             }
         }
         Ok(name)
+    }
+
+    fn pure_expression(&self, node: &UOp, sources: Vec<String>) -> Result<String, OpenClError> {
+        let instruction = project_scalar_lane(node, &sources)
+            .map_err(OpenClError::Unsupported)?
+            .ok_or_else(|| {
+                OpenClError::Unsupported(format!("transactional expression {:?}", node.operation()))
+            })?;
+        emit_scalar_lane(
+            &OpenClScalarDialect {
+                capabilities: self.capabilities,
+            },
+            &instruction,
+        )
+        .map_err(OpenClError::Unsupported)
     }
 
     fn assign_if_ok(&mut self, indent: &str, dtype: DType, name: &str, value: &str) {
@@ -296,34 +338,6 @@ fn scalar_literal(node: &UOp, dtype: DType) -> Result<String, OpenClError> {
         }
         _ => Err(OpenClError::Unsupported(
             "transactional scalar literal/type mismatch".into(),
-        )),
-    }
-}
-
-fn cast_expression(source: DType, target: DType, value: &str) -> Result<String, OpenClError> {
-    match (source, target) {
-        (source, target) if source == target => Ok(value.into()),
-        (DType::Bool, target) => Ok(format!("(({})({value}))", cl_type(target))),
-        (source, DType::Bool) => Ok(format!(
-            "((uchar)(({value}) != ({})0))",
-            expression_type(source)
-        )),
-        (DType::I32, DType::U32) => Ok(format!("as_uint({value})")),
-        (DType::U32, DType::I32) => Ok(format!("as_int({value})")),
-        (DType::I64, DType::U64) => Ok(format!("as_ulong({value})")),
-        (DType::U64, DType::I64) => Ok(format!("as_long({value})")),
-        _ => Err(OpenClError::Unsupported(
-            "transactional cast is outside the exact subset".into(),
-        )),
-    }
-}
-
-fn unary_expression(op: crate::UnaryOp, dtype: DType, value: &str) -> Result<String, OpenClError> {
-    match (op, dtype) {
-        (crate::UnaryOp::Neg, DType::I32) => Ok(format!("as_int((uint)0u - as_uint({value}))")),
-        (crate::UnaryOp::Neg, DType::I64) => Ok(format!("as_long((ulong)0ul - as_ulong({value}))")),
-        _ => Err(OpenClError::Unsupported(
-            "transactional unary is outside the exact subset".into(),
         )),
     }
 }

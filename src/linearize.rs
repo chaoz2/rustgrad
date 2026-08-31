@@ -1030,36 +1030,32 @@ fn producer_order(node: &UOp, seen: &mut BTreeSet<String>, output: &mut Vec<UOp>
     }
 }
 
-fn lane_instructions(nodes: &[UOp]) -> Result<LaneProjection, LinearizeError> {
-    let mut ids = BTreeMap::new();
-    for (index, node) in nodes.iter().enumerate() {
-        ids.entry(format!("{node:?}")).or_insert(index as u32);
-    }
-    let mut instructions = Vec::with_capacity(nodes.len());
-    let mut control_operations = Vec::new();
-    let mut unsupported_operations = Vec::new();
-    for (index, node) in nodes.iter().enumerate() {
-        let source = |slot: usize| {
+pub(crate) fn project_lane_instruction(
+    node: &UOp,
+    output_register: u32,
+    mut source_register: impl FnMut(usize, &UOp) -> Result<u32, LinearizeError>,
+) -> Result<Option<LaneInstruction<u32>>, LinearizeError> {
+    let source =
+        |slot: usize,
+         source_register: &mut dyn FnMut(usize, &UOp) -> Result<u32, LinearizeError>| {
             let source = node.sources().get(slot).ok_or_else(|| {
                 LinearizeError::Invalid(format!("{:?} missing source {slot}", node.operation()))
             })?;
-            let register = ids.get(&format!("{source:?}")).copied().ok_or_else(|| {
-                LinearizeError::Invalid(format!(
-                    "{:?} source {slot} is unordered",
-                    node.operation()
-                ))
-            })?;
-            Ok((source, register))
+            Ok((source, source_register(slot, source)?))
         };
-        let typed_source = |slot: usize| {
-            let (source, register) = source(slot)?;
+    let typed_source =
+        |slot: usize,
+         source_register: &mut dyn FnMut(usize, &UOp) -> Result<u32, LinearizeError>| {
+            let (source, register) = source(slot, source_register)?;
             Ok(TypedValue {
                 register,
                 ty: source.ty().ok_or(LinearizeError::Untyped)?,
             })
         };
-        let address_source = |slot: usize| {
-            let (source, register) = source(slot)?;
+    let address_source =
+        |slot: usize,
+         source_register: &mut dyn FnMut(usize, &UOp) -> Result<u32, LinearizeError>| {
+            let (source, register) = source(slot, source_register)?;
             let value = match source.operation() {
                 Operation::DefineGlobal(value)
                 | Operation::DefineLocal(value)
@@ -1076,8 +1072,10 @@ fn lane_instructions(nodes: &[UOp]) -> Result<LaneProjection, LinearizeError> {
             }
             Ok(AddressRef { register, value })
         };
-        let index_source = |slot: usize| {
-            let (source, register) = source(slot)?;
+    let index_source =
+        |slot: usize,
+         source_register: &mut dyn FnMut(usize, &UOp) -> Result<u32, LinearizeError>| {
+            let (source, register) = source(slot, source_register)?;
             let Operation::Index(value) = source.operation() else {
                 return Err(LinearizeError::Invalid(format!(
                     "{:?} source {slot} is not an index",
@@ -1090,145 +1088,166 @@ fn lane_instructions(nodes: &[UOp]) -> Result<LaneProjection, LinearizeError> {
                 element: source.ty().ok_or(LinearizeError::Untyped)?,
             })
         };
-        let output = || {
-            Ok(TypedValue {
-                register: index as u32,
-                ty: node.ty().ok_or(LinearizeError::Untyped)?,
-            })
-        };
-        let instruction = match node.operation() {
-            Operation::Const(value) => LaneInstruction::Constant {
-                output: output()?,
-                value: value.clone(),
-                vector: false,
-            },
-            Operation::VConst(value) => LaneInstruction::Constant {
-                output: output()?,
-                value: value.clone(),
-                vector: true,
-            },
-            Operation::DefineGlobal(value)
-            | Operation::DefineLocal(value)
-            | Operation::DefineRegister(value) => {
-                if node.ty() != Some(value.element) {
-                    return Err(LinearizeError::Untyped);
-                }
-                LaneInstruction::Address {
-                    output: AddressRef {
-                        register: index as u32,
-                        value: value.clone(),
-                    },
-                }
+    let output = || {
+        Ok(TypedValue {
+            register: output_register,
+            ty: node.ty().ok_or(LinearizeError::Untyped)?,
+        })
+    };
+    let instruction = match node.operation() {
+        Operation::Const(value) => LaneInstruction::Constant {
+            output: output()?,
+            value: value.clone(),
+            vector: false,
+        },
+        Operation::VConst(value) => LaneInstruction::Constant {
+            output: output()?,
+            value: value.clone(),
+            vector: true,
+        },
+        Operation::DefineGlobal(value)
+        | Operation::DefineLocal(value)
+        | Operation::DefineRegister(value) => {
+            if node.ty() != Some(value.element) {
+                return Err(LinearizeError::Untyped);
             }
-            Operation::Range(axis) => LaneInstruction::Range {
-                output: output()?,
-                bound: typed_source(0)?,
-                axis: *axis,
-            },
-            Operation::Index(value) => LaneInstruction::Index {
-                output: IndexRef {
-                    register: index as u32,
+            LaneInstruction::Address {
+                output: AddressRef {
+                    register: output_register,
                     value: value.clone(),
-                    element: node.ty().ok_or(LinearizeError::Untyped)?,
                 },
-                address: address_source(0)?,
-                offset: typed_source(1)?,
+            }
+        }
+        Operation::Range(axis) => LaneInstruction::Range {
+            output: output()?,
+            bound: typed_source(0, &mut source_register)?,
+            axis: *axis,
+        },
+        Operation::Index(value) => LaneInstruction::Index {
+            output: IndexRef {
+                register: output_register,
+                value: value.clone(),
+                element: node.ty().ok_or(LinearizeError::Untyped)?,
             },
-            Operation::Load => LaneInstruction::Load {
-                output: output()?,
-                index: index_source(0)?,
-            },
-            Operation::Cast => LaneInstruction::Cast {
-                output: output()?,
-                input: typed_source(0)?,
-            },
-            Operation::Bitcast => LaneInstruction::Bitcast {
-                output: output()?,
-                input: typed_source(0)?,
-            },
-            Operation::Unary(op) => LaneInstruction::CoreUnary {
-                output: output()?,
-                input: typed_source(0)?,
-                op: *op,
-            },
-            Operation::GraphUnary(op) => LaneInstruction::GraphUnary {
-                output: output()?,
-                input: typed_source(0)?,
-                op: *op,
-            },
-            Operation::Binary(crate::uop::Binary::Eq) => LaneInstruction::CoreEq {
-                output: output()?,
-                lhs: typed_source(0)?,
-                rhs: typed_source(1)?,
-            },
-            Operation::Binary(crate::uop::Binary::Lt) => LaneInstruction::CoreLt {
-                output: output()?,
-                lhs: typed_source(0)?,
-                rhs: typed_source(1)?,
-            },
-            Operation::Binary(crate::uop::Binary::Le) => LaneInstruction::CoreLe {
-                output: output()?,
-                lhs: typed_source(0)?,
-                rhs: typed_source(1)?,
-            },
-            Operation::Binary(op) => LaneInstruction::CoreBinary {
-                output: output()?,
-                lhs: typed_source(0)?,
-                rhs: typed_source(1)?,
-                op: *op,
-            },
-            Operation::GraphBinary(op) => LaneInstruction::GraphBinary {
-                output: output()?,
-                lhs: typed_source(0)?,
-                rhs: typed_source(1)?,
-                op: *op,
-            },
-            Operation::GraphLogical(crate::LogicalOp::Not) => LaneInstruction::LogicalNot {
-                output: output()?,
-                input: typed_source(0)?,
-            },
-            Operation::GraphLogical(crate::LogicalOp::And) => LaneInstruction::LogicalAnd {
-                output: output()?,
-                lhs: typed_source(0)?,
-                rhs: typed_source(1)?,
-            },
-            Operation::GraphLogical(crate::LogicalOp::Or) => LaneInstruction::LogicalOr {
-                output: output()?,
-                lhs: typed_source(0)?,
-                rhs: typed_source(1)?,
-            },
-            Operation::GraphCompare(op) => LaneInstruction::Compare {
-                output: output()?,
-                lhs: typed_source(0)?,
-                rhs: typed_source(1)?,
-                op: *op,
-            },
-            Operation::Ternary(crate::uop::Ternary::Where) => LaneInstruction::Select {
-                output: output()?,
-                condition: typed_source(0)?,
-                on_true: typed_source(1)?,
-                on_false: typed_source(2)?,
-            },
-            Operation::Store => LaneInstruction::Store {
-                index: index_source(0)?,
-                value: typed_source(1)?,
-            },
-            Operation::EndRange | Operation::Sink => {
+            address: address_source(0, &mut source_register)?,
+            offset: typed_source(1, &mut source_register)?,
+        },
+        Operation::Load => LaneInstruction::Load {
+            output: output()?,
+            index: index_source(0, &mut source_register)?,
+        },
+        Operation::Cast => LaneInstruction::Cast {
+            output: output()?,
+            input: typed_source(0, &mut source_register)?,
+        },
+        Operation::Bitcast => LaneInstruction::Bitcast {
+            output: output()?,
+            input: typed_source(0, &mut source_register)?,
+        },
+        Operation::Unary(op) => LaneInstruction::CoreUnary {
+            output: output()?,
+            input: typed_source(0, &mut source_register)?,
+            op: *op,
+        },
+        Operation::GraphUnary(op) => LaneInstruction::GraphUnary {
+            output: output()?,
+            input: typed_source(0, &mut source_register)?,
+            op: *op,
+        },
+        Operation::Binary(crate::uop::Binary::Eq) => LaneInstruction::CoreEq {
+            output: output()?,
+            lhs: typed_source(0, &mut source_register)?,
+            rhs: typed_source(1, &mut source_register)?,
+        },
+        Operation::Binary(crate::uop::Binary::Lt) => LaneInstruction::CoreLt {
+            output: output()?,
+            lhs: typed_source(0, &mut source_register)?,
+            rhs: typed_source(1, &mut source_register)?,
+        },
+        Operation::Binary(crate::uop::Binary::Le) => LaneInstruction::CoreLe {
+            output: output()?,
+            lhs: typed_source(0, &mut source_register)?,
+            rhs: typed_source(1, &mut source_register)?,
+        },
+        Operation::Binary(op) => LaneInstruction::CoreBinary {
+            output: output()?,
+            lhs: typed_source(0, &mut source_register)?,
+            rhs: typed_source(1, &mut source_register)?,
+            op: *op,
+        },
+        Operation::GraphBinary(op) => LaneInstruction::GraphBinary {
+            output: output()?,
+            lhs: typed_source(0, &mut source_register)?,
+            rhs: typed_source(1, &mut source_register)?,
+            op: *op,
+        },
+        Operation::GraphLogical(crate::LogicalOp::Not) => LaneInstruction::LogicalNot {
+            output: output()?,
+            input: typed_source(0, &mut source_register)?,
+        },
+        Operation::GraphLogical(crate::LogicalOp::And) => LaneInstruction::LogicalAnd {
+            output: output()?,
+            lhs: typed_source(0, &mut source_register)?,
+            rhs: typed_source(1, &mut source_register)?,
+        },
+        Operation::GraphLogical(crate::LogicalOp::Or) => LaneInstruction::LogicalOr {
+            output: output()?,
+            lhs: typed_source(0, &mut source_register)?,
+            rhs: typed_source(1, &mut source_register)?,
+        },
+        Operation::GraphCompare(op) => LaneInstruction::Compare {
+            output: output()?,
+            lhs: typed_source(0, &mut source_register)?,
+            rhs: typed_source(1, &mut source_register)?,
+            op: *op,
+        },
+        Operation::Ternary(crate::uop::Ternary::Where) => LaneInstruction::Select {
+            output: output()?,
+            condition: typed_source(0, &mut source_register)?,
+            on_true: typed_source(1, &mut source_register)?,
+            on_false: typed_source(2, &mut source_register)?,
+        },
+        Operation::Store => LaneInstruction::Store {
+            index: index_source(0, &mut source_register)?,
+            value: typed_source(1, &mut source_register)?,
+        },
+        _ => return Ok(None),
+    };
+    instruction.validate()?;
+    Ok(Some(instruction))
+}
+
+fn lane_instructions(nodes: &[UOp]) -> Result<LaneProjection, LinearizeError> {
+    let mut ids = BTreeMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        ids.entry(format!("{node:?}")).or_insert(index as u32);
+    }
+    let mut instructions = Vec::with_capacity(nodes.len());
+    let mut control_operations = Vec::new();
+    let mut unsupported_operations = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let instruction = project_lane_instruction(node, index as u32, |slot, source| {
+            ids.get(&format!("{source:?}")).copied().ok_or_else(|| {
+                LinearizeError::Invalid(format!(
+                    "{:?} source {slot} is unordered",
+                    node.operation()
+                ))
+            })
+        })?;
+        let Some(instruction) = instruction else {
+            if matches!(node.operation(), Operation::EndRange | Operation::Sink) {
                 control_operations.push(LaneSourceRecord {
                     index: index as u32,
                     operation: node.operation().clone(),
                 });
                 continue;
             }
-            operation => {
-                unsupported_operations.push(LaneSourceRecord {
-                    index: index as u32,
-                    operation: operation.clone(),
-                });
-                continue;
-            }
+            unsupported_operations.push(LaneSourceRecord {
+                index: index as u32,
+                operation: node.operation().clone(),
+            });
+            continue;
         };
-        instruction.validate()?;
         instructions.push(LaneProgramInstruction {
             index: index as u32,
             instruction,

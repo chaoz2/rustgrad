@@ -4,6 +4,9 @@ use super::{
 };
 use crate::{
     AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+    runtime::scalar_lane::{
+        ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
@@ -11,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v2";
+pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v4";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -361,6 +364,115 @@ pub(super) fn metal_storage_type(dtype: DType) -> &'static str {
     }
 }
 
+pub(super) struct MetalScalarDialect;
+
+impl dialect_seal::Sealed for MetalScalarDialect {}
+
+impl ScalarLaneDialect for MetalScalarDialect {
+    fn name(&self) -> &'static str {
+        "Metal"
+    }
+
+    fn supports_value(&self, dtype: DType) -> bool {
+        supported_storage(dtype).is_ok()
+    }
+
+    fn cast(&self, source: DType, target: DType, value: &str) -> Result<String, String> {
+        Ok(match (source, target) {
+            (DType::F32, DType::F32) | (DType::Bool, DType::Bool) => value.into(),
+            (DType::Bool, DType::F32) => format!("(float)({value} != 0)"),
+            (DType::F32, DType::Bool) => format!("(uchar)({value} != 0.0f)"),
+            (DType::Bool, DType::I32) => format!("(int)({value})"),
+            (DType::Bool, DType::U32) => format!("(uint)({value})"),
+            (DType::I32 | DType::U32, DType::Bool) => {
+                format!("(uchar)(({value}) != 0)")
+            }
+            (DType::I32, DType::U32) => format!("as_type<uint>({value})"),
+            (DType::U32, DType::I32) => format!("as_type<int>({value})"),
+            (DType::I32 | DType::U32, DType::F32) => format!("(float)({value})"),
+            _ => return Err("cast is outside the exact Metal subset".into()),
+        })
+    }
+
+    fn finish_float(&self, dtype: DType, value: String) -> Result<String, String> {
+        if dtype == DType::F32 {
+            Ok(value)
+        } else {
+            Err("Metal scalar float expression requires F32".into())
+        }
+    }
+
+    fn signed_infix(
+        &self,
+        dtype: DType,
+        operator: &'static str,
+        lhs: &str,
+        rhs: &str,
+    ) -> Result<String, String> {
+        if dtype == DType::I32 {
+            Ok(format!(
+                "as_type<int>(as_type<uint>({lhs}) {operator} as_type<uint>({rhs}))"
+            ))
+        } else {
+            Err("Metal signed wrapping requires I32".into())
+        }
+    }
+
+    fn signed_neg(&self, dtype: DType, value: &str) -> Result<String, String> {
+        if dtype == DType::I32 {
+            Ok(format!("as_type<int>((uint)0u - as_type<uint>({value}))"))
+        } else {
+            Err("Metal signed negation requires I32".into())
+        }
+    }
+
+    fn unsigned_neg(&self, dtype: DType, value: &str) -> Result<String, String> {
+        if dtype == DType::U32 {
+            Ok(format!("((uint)0u - ({value}))"))
+        } else {
+            Err("Metal unsigned negation requires U32".into())
+        }
+    }
+
+    fn signed_abs(&self, dtype: DType, value: &str) -> Result<String, String> {
+        if dtype == DType::I32 {
+            Ok(format!(
+                "select(as_type<int>((uint)0u - as_type<uint>({value})), ({value}), ({value}) >= 0)"
+            ))
+        } else {
+            Err("Metal signed absolute value requires I32".into())
+        }
+    }
+
+    fn float_abs(&self, value: &str) -> String {
+        format!("fabs({value})")
+    }
+
+    fn bool_value(&self, expression: String) -> String {
+        format!("(uchar)({expression})")
+    }
+
+    fn select(&self, condition: &str, on_true: &str, on_false: &str) -> String {
+        format!("(({condition}) ? ({on_true}) : ({on_false}))")
+    }
+
+    fn call_intrinsic(&self, canonical_name: &'static str, value: &str) -> String {
+        if canonical_name == "sin" {
+            format!("precise::sin({value})")
+        } else {
+            format!("{canonical_name}({value})")
+        }
+    }
+
+    fn float_one(&self, dtype: DType) -> Result<&'static str, String> {
+        if dtype == DType::F32 {
+            Ok("1.0f")
+        } else {
+            Err("Metal reciprocal requires F32".into())
+        }
+    }
+}
+
 fn emit_expr(
     node: &UOp,
     ids: &BTreeMap<u64, usize>,
@@ -439,148 +551,16 @@ fn emit_expr(
             };
             Ok(format!("b{position}[{offset}]"))
         }
-        Operation::Cast => {
-            let value = child(0, source_map, lines)?;
-            let source = node.sources()[0]
-                .ty()
-                .ok_or_else(|| MetalError::Unsupported("untyped cast source".into()))?
-                .scalar;
-            match (source, dtype) {
-                (DType::F32, DType::F32) | (DType::Bool, DType::Bool) => Ok(value),
-                (DType::Bool, DType::F32) => Ok(format!("(float)({value} != 0)")),
-                (DType::F32, DType::Bool) => Ok(format!("(uchar)({value} != 0.0f)")),
-                (DType::Bool, DType::I32) => Ok(format!("(int)({value})")),
-                (DType::Bool, DType::U32) => Ok(format!("(uint)({value})")),
-                (DType::I32 | DType::U32, DType::Bool) => Ok(format!("(uchar)(({value}) != 0)")),
-                (DType::I32, DType::U32) => Ok(format!("as_type<uint>({value})")),
-                (DType::U32, DType::I32) => Ok(format!("as_type<int>({value})")),
-                (DType::I32 | DType::U32, DType::F32) => Ok(format!("(float)({value})")),
-                _ => Err(MetalError::Unsupported(
-                    "cast is outside the exact Metal subset".into(),
-                )),
+        other => {
+            let mut sources = Vec::with_capacity(node.sources().len());
+            for slot in 0..node.sources().len() {
+                sources.push(child(slot, source_map, lines)?);
             }
+            let instruction = project_scalar_lane(node, &sources)
+                .map_err(MetalError::Unsupported)?
+                .ok_or_else(|| MetalError::Unsupported(format!("{other:?}")))?;
+            emit_scalar_lane(&MetalScalarDialect, &instruction).map_err(MetalError::Unsupported)
         }
-        Operation::GraphUnary(op) => {
-            let value = child(0, source_map, lines)?;
-            match (op, dtype) {
-                (crate::UnaryOp::Neg, DType::F32) => Ok(format!("(-({value}))")),
-                (crate::UnaryOp::Neg, DType::I32) => {
-                    Ok(format!("as_type<int>((uint)0u - as_type<uint>({value}))"))
-                }
-                (crate::UnaryOp::Neg, DType::U32) => Ok(format!("((uint)0u - ({value}))")),
-                (crate::UnaryOp::Abs, DType::F32) => Ok(format!("fabs({value})")),
-                (crate::UnaryOp::Abs, DType::I32) => Ok(format!(
-                    "select(as_type<int>((uint)0u - as_type<uint>({value})), ({value}), ({value}) >= 0)"
-                )),
-                (crate::UnaryOp::Abs, DType::U32 | DType::Bool) => Ok(value),
-                (crate::UnaryOp::Neg, DType::Bool) => Ok(format!("(uchar)!({value})")),
-                (crate::UnaryOp::Reciprocal, DType::F32) => Ok(format!("(1.0f / ({value}))")),
-                _ => Err(MetalError::Unsupported(format!(
-                    "unary {op:?} for {dtype:?}"
-                ))),
-            }
-        }
-        Operation::GraphBinary(op) => {
-            let lhs = child(0, source_map, lines)?;
-            let rhs = child(1, source_map, lines)?;
-            emit_binary(*op, dtype, &lhs, &rhs)
-        }
-        Operation::Binary(op) => {
-            let lhs = child(0, source_map, lines)?;
-            let rhs = child(1, source_map, lines)?;
-            use crate::uop::Binary::{Add, Eq, Le, Lt, Mul, Sub};
-            match op {
-                Add => emit_binary(crate::BinaryOp::Add, dtype, &lhs, &rhs),
-                Sub => emit_binary(crate::BinaryOp::Sub, dtype, &lhs, &rhs),
-                Mul => emit_binary(crate::BinaryOp::Mul, dtype, &lhs, &rhs),
-                Eq => Ok(format!("(uchar)(({lhs}) == ({rhs}))")),
-                Lt => Ok(format!("(uchar)(({lhs}) < ({rhs}))")),
-                Le => Ok(format!("(uchar)(({lhs}) <= ({rhs}))")),
-                _ => Err(MetalError::Unsupported(format!(
-                    "core binary {op:?} is outside the Metal subset"
-                ))),
-            }
-        }
-        Operation::GraphCompare(op) => {
-            let lhs = child(0, source_map, lines)?;
-            let rhs = child(1, source_map, lines)?;
-            let operator = match op {
-                crate::CompareOp::Eq => "==",
-                crate::CompareOp::Ne => "!=",
-                crate::CompareOp::Lt => "<",
-                crate::CompareOp::Le => "<=",
-                crate::CompareOp::Gt => ">",
-                crate::CompareOp::Ge => ">=",
-            };
-            Ok(format!("(uchar)(({lhs}) {operator} ({rhs}))"))
-        }
-        Operation::GraphLogical(op) => {
-            let lhs = child(0, source_map, lines)?;
-            Ok(match op {
-                crate::LogicalOp::Not => format!("(uchar)!({lhs})"),
-                crate::LogicalOp::And => {
-                    let rhs = child(1, source_map, lines)?;
-                    format!("(uchar)(({lhs}) && ({rhs}))")
-                }
-                crate::LogicalOp::Or => {
-                    let rhs = child(1, source_map, lines)?;
-                    format!("(uchar)(({lhs}) || ({rhs}))")
-                }
-            })
-        }
-        Operation::Ternary(crate::uop::Ternary::Where) => {
-            let condition = child(0, source_map, lines)?;
-            let yes = child(1, source_map, lines)?;
-            let no = child(2, source_map, lines)?;
-            Ok(format!("(({condition}) ? ({yes}) : ({no}))"))
-        }
-        other => Err(MetalError::Unsupported(format!("{other:?}"))),
-    }
-}
-
-fn emit_binary(
-    op: crate::BinaryOp,
-    dtype: DType,
-    lhs: &str,
-    rhs: &str,
-) -> Result<String, MetalError> {
-    use crate::BinaryOp::{Add, Mul, Sub};
-    match (op, dtype) {
-        (Add | Sub | Mul, DType::F32) => {
-            let operator = match op {
-                Add => "+",
-                Sub => "-",
-                Mul => "*",
-                _ => unreachable!(),
-            };
-            Ok(format!("(({lhs}) {operator} ({rhs}))"))
-        }
-        (Add | Sub | Mul, DType::I32) => {
-            let operator = match op {
-                Add => "+",
-                Sub => "-",
-                Mul => "*",
-                _ => unreachable!(),
-            };
-            Ok(format!(
-                "as_type<int>(as_type<uint>({lhs}) {operator} as_type<uint>({rhs}))"
-            ))
-        }
-        (Add | Sub | Mul, DType::U32) => {
-            let operator = match op {
-                Add => "+",
-                Sub => "-",
-                Mul => "*",
-                _ => unreachable!(),
-            };
-            Ok(format!("(({lhs}) {operator} ({rhs}))"))
-        }
-        (Add, DType::Bool) => Ok(format!("(uchar)(({lhs}) || ({rhs}))")),
-        (Sub, DType::Bool) => Ok(format!("(uchar)(({lhs}) != ({rhs}))")),
-        (Mul, DType::Bool) => Ok(format!("(uchar)(({lhs}) && ({rhs}))")),
-        _ => Err(MetalError::Unsupported(format!(
-            "binary {op:?} for {dtype:?} is outside the Metal subset"
-        ))),
     }
 }
 

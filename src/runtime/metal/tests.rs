@@ -1,10 +1,11 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
+use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
-    Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend,
-    CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue, KernelBindings,
-    KernelBufferDesc, NodeId, Operation, ReduceKind, Scalar, Shape, Slice, Storage, TensorData,
-    schedule,
+    Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CompareOp,
+    CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
+    KernelBindings, KernelBufferDesc, LaneInstruction, NodeId, Operation, ReduceKind, Scalar,
+    Shape, Slice, Storage, TensorData, TypedValue, UType, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -1529,6 +1530,157 @@ fn renderer_identity_and_unsupported_boundaries_are_pre_submission() {
         .unwrap();
     assert_ne!(divided.cache_key, floored.cache_key);
     assert_ne!(divided.transaction, floored.transaction);
+}
+
+#[test]
+fn shared_scalar_lane_intrinsics_division_and_bitwise_render_structurally() {
+    let renderer = MetalRenderer::new(4, capabilities()).unwrap();
+    let dialect = renderer::MetalScalarDialect;
+    let typed = |register: &str, dtype| TypedValue {
+        register: register.to_string(),
+        ty: UType::scalar(dtype),
+    };
+    let mixed_bitwise = LaneInstruction::GraphBinary {
+        output: typed("out", DType::I32),
+        lhs: typed("lhs", DType::Bool),
+        rhs: typed("rhs", DType::I32),
+        op: BinaryOp::BitOr,
+    };
+    let mixed_add = LaneInstruction::GraphBinary {
+        output: typed("out", DType::F32),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::F32),
+        op: BinaryOp::Add,
+    };
+    let mixed_compare = LaneInstruction::Compare {
+        output: typed("out", DType::Bool),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::F32),
+        op: CompareOp::Lt,
+    };
+    let bitwise = emit_scalar_lane(&dialect, &mixed_bitwise).unwrap();
+    let add = emit_scalar_lane(&dialect, &mixed_add).unwrap();
+    let compare_error = emit_scalar_lane(&dialect, &mixed_compare).unwrap_err();
+    assert!(bitwise.contains("(int)(lhs)") && bitwise.contains(" | "));
+    assert!(add.contains("(float)(lhs)") && add.contains(" + "));
+    assert!(compare_error.contains("compare dtype"));
+
+    for (name, operation) in [
+        ("sqrt", crate::UnaryOp::Sqrt),
+        ("exp2", crate::UnaryOp::Exp2),
+        ("log2", crate::UnaryOp::Log2),
+        ("precise::sin", crate::UnaryOp::Sin),
+        ("trunc", crate::UnaryOp::Trunc),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let output = match operation {
+            crate::UnaryOp::Sqrt => graph.sqrt(input),
+            crate::UnaryOp::Exp2 => graph.exp2(input),
+            crate::UnaryOp::Log2 => graph.log2(input),
+            crate::UnaryOp::Sin => graph.sin(input),
+            crate::UnaryOp::Trunc => graph.trunc(input),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        let scheduled = schedule(&graph, output).unwrap();
+        let item = scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        let intrinsic = format!("{name}(");
+        assert!(
+            rendered.source.contains(intrinsic.as_str()),
+            "{operation:?}"
+        );
+        assert!(rendered.source.contains(METAL_RENDERER_VERSION));
+    }
+
+    for dtype in [DType::I32, DType::U32] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let output = graph.sin(input).unwrap();
+        let scheduled = schedule(&graph, output).unwrap();
+        let item = scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert!(
+            rendered.source.contains("precise::sin((float)("),
+            "{dtype:?}"
+        );
+    }
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::F32);
+    let rhs = graph.input_dtype("rhs", [2], DType::F32);
+    let output = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(
+        renderer
+            .render(&item.kernel)
+            .unwrap()
+            .source
+            .contains(" / ")
+    );
+
+    for dtype in [DType::Bool, DType::I32, DType::U32] {
+        for op in [BinaryOp::BitAnd, BinaryOp::BitOr, BinaryOp::BitXor] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2], dtype);
+            let rhs = graph.input_dtype("rhs", [2], dtype);
+            let output = graph.binary(op, lhs, rhs).unwrap();
+            let scheduled = schedule(&graph, output).unwrap();
+            let item = scheduled
+                .items
+                .iter()
+                .find(|item| item.node == output)
+                .unwrap();
+            renderer.render(&item.kernel).unwrap();
+        }
+    }
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let rhs = graph.input_dtype("rhs", [2], DType::I32);
+    let divided = graph.binary(BinaryOp::Div, lhs, rhs).unwrap();
+    let output = graph.neg(divided).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    let guarded = renderer.render(&item.kernel).unwrap();
+    assert_eq!(guarded.transaction.as_ref().unwrap().guards.len(), 1);
+    assert!(guarded.source.contains("if (rg_ok)"));
+    assert!(
+        guarded.source.find("atomic_fetch_min_explicit").unwrap()
+            < guarded.source.rfind("0u -").unwrap()
+    );
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F64);
+    let output = graph.sqrt(input).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(MetalError::Unsupported(_))
+    ));
 }
 
 #[test]
