@@ -1263,6 +1263,72 @@ mod tests {
     }
 
     #[test]
+    fn captured_contiguous_roundtrips_interpreter_and_dependent_native_execution() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let permuted = graph.permute(input, [1, 0]).unwrap();
+        let output = graph.contiguous(permuted).unwrap();
+        let capture = captured(&graph, &[output]);
+        assert_eq!(capture.items.len(), 2);
+        assert!(matches!(
+            capture.items[1].kernel.operation(),
+            crate::Operation::Movement(crate::MovementValue::Plan(plan))
+                if matches!(&plan.kind, crate::MovementKernelKind::Contiguous { .. })
+        ));
+        assert_eq!(capture.items[1].dependencies, [capture.items[0].id]);
+
+        let value = TensorData::from_storage(
+            [2, 2],
+            Storage::F32(vec![
+                f32::from_bits(0x8000_0000),
+                f32::from_bits(0x7fc0_0123),
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ]),
+        )
+        .unwrap();
+        let provided = BTreeMap::from([("input".into(), value)]);
+        let executor = CapturedReplayExecutor::default();
+        let interpreted = executor
+            .replay(
+                &capture,
+                &provided,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::Interpreter,
+                },
+            )
+            .unwrap();
+        let native = executor
+            .replay(
+                &capture,
+                &provided,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        let raw = |data: &TensorData| match data.storage() {
+            Storage::F32(values) => values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            _ => unreachable!("F32 contiguous fixture"),
+        };
+        assert_eq!(
+            raw(&interpreted.outputs[0]),
+            [0x8000_0000, 0x7f80_0000, 0x7fc0_0123, 0xff80_0000]
+        );
+        assert_eq!(raw(&native.outputs[0]), raw(&interpreted.outputs[0]));
+        assert!(
+            native
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
+    }
+
+    #[test]
     fn captured_prefix_scan_executes_its_materialized_computed_input_graph_free() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2], DType::I16);
