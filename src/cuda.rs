@@ -11,6 +11,7 @@ use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample
 use serde::{Deserialize, Serialize};
 
 use std::{
+    any::Any,
     collections::HashMap,
     ffi::{CStr, CString, c_char, c_int, c_uint, c_void},
     fmt,
@@ -20,7 +21,7 @@ use std::{
     ptr,
     rc::Rc,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -1126,6 +1127,9 @@ impl PrimaryContext {
     pub fn device(&self) -> DeviceId {
         self.0.device
     }
+    pub(crate) fn supports_graphs(&self) -> bool {
+        self.0.driver.0.dispatch.supports_graphs()
+    }
     /// Stable, crate-private owner identity used to partition concurrent JIT caches.
     pub(crate) fn identity(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
@@ -1159,6 +1163,7 @@ impl PrimaryContext {
             ptr,
             capacity: bytes.get(),
             generation: std::sync::atomic::AtomicU64::new(0),
+            quarantined: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         })
     }
@@ -2279,7 +2284,14 @@ struct PrimaryPoolState {
     reserved: usize,
     peak: usize,
     peak_blocks: usize,
-    closed: bool,
+    pending_allocations: usize,
+    lifecycle: PrimaryPoolLifecycle,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimaryPoolLifecycle {
+    Open,
+    Closing,
+    Closed,
 }
 struct DeferredPrimaryBlock {
     block: Arc<PrimaryBlock>,
@@ -2288,14 +2300,81 @@ struct DeferredPrimaryBlock {
 }
 /// A primary-context-only physical allocation.  Unlike `DeviceBuffer`, this
 /// can never contain the mixed, thread-affine `Owner` enum.  It is retained by
-/// `Arc` so a future deferred-completion registry can own it independently of
-/// a logical lease.
+/// `Arc` so deferred completion and permanent quarantine can own it
+/// independently of a logical lease.
 pub struct PrimaryBlock {
     primary: PrimaryContext,
     ptr: CuDevicePtr,
     capacity: usize,
     generation: std::sync::atomic::AtomicU64,
+    quarantined: AtomicBool,
     closed: AtomicBool,
+}
+
+/// Process-reachable ownership for primary-context resources whose completion
+/// or destruction state is unknowable. These values must never be destroyed or
+/// reused, but retaining them behind a static root keeps that safety boundary
+/// visible to leak detectors instead of creating unreachable allocations.
+#[allow(dead_code)] // fields intentionally exist only to retain uncertain owners.
+enum PrimaryQuarantine {
+    Blocks(Vec<Arc<PrimaryBlock>>),
+    Shared {
+        raw: usize,
+        primary: PrimaryContext,
+        keepalives: Vec<Arc<dyn Any + Send + Sync>>,
+    },
+    GraphExec {
+        raw: usize,
+        primary: PrimaryContext,
+        keepalives: Vec<Arc<dyn Any + Send + Sync>>,
+    },
+    Stream {
+        raw: usize,
+        primary: PrimaryContext,
+    },
+}
+
+static PRIMARY_QUARANTINE: OnceLock<Mutex<Vec<PrimaryQuarantine>>> = OnceLock::new();
+
+fn retain_primary_quarantine(resource: PrimaryQuarantine) {
+    PRIMARY_QUARANTINE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(resource);
+}
+
+fn retain_primary_blocks(blocks: Vec<Arc<PrimaryBlock>>) {
+    if blocks.is_empty() {
+        return;
+    }
+    let mut quarantine = PRIMARY_QUARANTINE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let unique = blocks
+        .into_iter()
+        .filter(|block| {
+            !quarantine.iter().any(|resource| match resource {
+                PrimaryQuarantine::Blocks(retained) => {
+                    retained.iter().any(|old| Arc::ptr_eq(old, block))
+                }
+                _ => false,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !unique.is_empty() {
+        quarantine.push(PrimaryQuarantine::Blocks(unique));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn primary_quarantine_len() -> usize {
+    PRIMARY_QUARANTINE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
 }
 impl Drop for PrimaryBlock {
     fn drop(&mut self) {
@@ -2324,7 +2403,8 @@ impl PrimaryCudaAllocator {
                 reserved: 0,
                 peak: 0,
                 peak_blocks: 0,
-                closed: false,
+                pending_allocations: 0,
+                lifecycle: PrimaryPoolLifecycle::Open,
             }),
         })
     }
@@ -2447,7 +2527,7 @@ impl PrimaryCudaAllocator {
             if ready
                 .iter()
                 .any(|&(wanted, generation)| wanted == key && generation == entry.generation)
-                && !state.closed
+                && state.lifecycle != PrimaryPoolLifecycle::Closed
                 && entry.block.generation.load(Ordering::Acquire) == entry.generation
             {
                 state.deferred_bytes -= entry.block.capacity;
@@ -2473,9 +2553,13 @@ impl PrimaryCudaAllocator {
         let capacity = size_class(requested)?;
         let block = {
             let mut state = self.state.lock().expect("primary allocator mutex poisoned");
-            if state.closed {
+            if state.lifecycle != PrimaryPoolLifecycle::Open {
                 return Err(CudaError::Closed("primary allocator"));
             }
+            state.pending_allocations = state
+                .pending_allocations
+                .checked_add(1)
+                .ok_or(CudaError::Overflow)?;
             let block = state
                 .cached
                 .range_mut(capacity..)
@@ -2488,24 +2572,39 @@ impl PrimaryCudaAllocator {
         };
         let reused = block.is_some();
         let block = if let Some(block) = block {
-            block
+            Ok(block)
         } else {
             match self
                 .primary
                 .allocate_primary_block(NonZeroUsize::new(capacity).expect("nonzero class"))
             {
-                Ok(block) => Arc::new(block),
+                Ok(block) => Ok(Arc::new(block)),
                 Err(error) if is_oom(&error) => {
-                    self.trim()?; // detach/free outside the pool lock, then retry once.
-                    Arc::new(self.primary.allocate_primary_block(
-                        NonZeroUsize::new(capacity).expect("nonzero class"),
-                    )?)
+                    // Detach/free outside the pool lock, then retry once.
+                    self.trim().and_then(|()| {
+                        self.primary
+                            .allocate_primary_block(
+                                NonZeroUsize::new(capacity).expect("nonzero class"),
+                            )
+                            .map(Arc::new)
+                    })
                 }
-                Err(error) => return Err(error),
+                Err(error) => Err(error),
+            }
+        };
+        let block = match block {
+            Ok(block) => block,
+            Err(error) => {
+                self.state
+                    .lock()
+                    .expect("primary allocator mutex poisoned")
+                    .pending_allocations -= 1;
+                return Err(error);
             }
         };
         let mut state = self.state.lock().expect("primary allocator mutex poisoned");
-        // A concurrent close may only detach cached blocks; a live allocation remains valid.
+        debug_assert_eq!(state.lifecycle, PrimaryPoolLifecycle::Open);
+        state.pending_allocations -= 1;
         state.in_use = state
             .in_use
             .checked_add(requested)
@@ -2540,31 +2639,82 @@ impl PrimaryCudaAllocator {
         drop(detached); // Driver frees occur after releasing the mutex.
         Ok(())
     }
+    fn drain_quarantined_blocks(&self) {
+        let blocks = {
+            let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+            let blocks = std::mem::take(&mut state.quarantined);
+            let bytes = blocks.iter().map(|block| block.capacity).sum::<usize>();
+            state.reserved = state
+                .reserved
+                .checked_sub(bytes)
+                .expect("quarantined blocks belong to allocator inventory");
+            blocks
+        };
+        retain_primary_blocks(blocks);
+    }
+    fn drain_uncertain_blocks_after_wait_failure(&self) {
+        let blocks = {
+            let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+            let mut blocks = std::mem::take(&mut state.quarantined);
+            blocks.extend(
+                std::mem::take(&mut state.deferred)
+                    .into_iter()
+                    .map(|entry| entry.block),
+            );
+            let bytes = blocks.iter().map(|block| block.capacity).sum::<usize>();
+            state.deferred_bytes = 0;
+            state.reserved = state
+                .reserved
+                .checked_sub(bytes)
+                .expect("uncertain blocks belong to allocator inventory");
+            for block in &blocks {
+                block.quarantined.store(true, Ordering::Release);
+            }
+            blocks
+        };
+        retain_primary_blocks(blocks);
+    }
     pub fn close(&self) -> Result<(), CudaError> {
         {
-            let state = self.state.lock().expect("primary allocator mutex poisoned");
-            if state.closed {
-                return Ok(());
+            let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+            match state.lifecycle {
+                PrimaryPoolLifecycle::Closed => return Ok(()),
+                PrimaryPoolLifecycle::Closing => {
+                    return Err(CudaError::InvalidArgument(
+                        "primary allocator close is already in progress",
+                    ));
+                }
+                PrimaryPoolLifecycle::Open => {}
             }
+            if state.in_use_blocks != 0 || state.pending_allocations != 0 {
+                return Err(CudaError::InvalidArgument(
+                    "primary allocator has live leases",
+                ));
+            }
+            state.lifecycle = PrimaryPoolLifecycle::Closing;
         }
-        self.wait_deferred()?;
+        // Quarantined blocks are already known unsafe to free or reuse. Move
+        // them out of allocator inventory before the first fallible Driver
+        // wait; the block-local marker keeps any outstanding lease from
+        // returning the same allocation to this pool.
+        self.drain_quarantined_blocks();
+        if let Err(error) = self.wait_deferred() {
+            // A failed wait makes every deferred block permanently uncertain.
+            // Remove them from allocator state before returning so a later
+            // successful wait cannot promote and reuse them.
+            self.drain_uncertain_blocks_after_wait_failure();
+            self.state
+                .lock()
+                .expect("primary allocator mutex poisoned")
+                .lifecycle = PrimaryPoolLifecycle::Open;
+            return Err(error);
+        }
         self.state
             .lock()
             .expect("primary allocator mutex poisoned")
-            .closed = true;
+            .lifecycle = PrimaryPoolLifecycle::Closed;
+        self.drain_quarantined_blocks();
         self.trim()?;
-        // A record+sync failure has no completion proof.  Preserve the blocks
-        // rather than free/reuse potentially in-flight device memory.
-        let quarantined = std::mem::take(
-            &mut self
-                .state
-                .lock()
-                .expect("primary allocator mutex poisoned")
-                .quarantined,
-        );
-        for block in quarantined {
-            std::mem::forget(block);
-        }
         Ok(())
     }
 }
@@ -2787,14 +2937,28 @@ impl PrimaryBufferLease {
     }
     pub(crate) fn quarantine(&self) {
         if let Some(block) = self.block.as_ref() {
-            let mut state = self
-                .allocator
-                .state
-                .lock()
-                .expect("primary allocator mutex poisoned");
-            // Marked by generation: return_block will transfer it to this list.
-            if !state.quarantined.iter().any(|old| Arc::ptr_eq(old, block)) {
-                state.quarantined.push(block.clone());
+            if block.quarantined.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let retain_directly = {
+                let mut state = self
+                    .allocator
+                    .state
+                    .lock()
+                    .expect("primary allocator mutex poisoned");
+                if state.lifecycle == PrimaryPoolLifecycle::Closed {
+                    state.reserved = state
+                        .reserved
+                        .checked_sub(block.capacity)
+                        .expect("quarantined block belongs to allocator inventory");
+                    true
+                } else {
+                    state.quarantined.push(block.clone());
+                    false
+                }
+            };
+            if retain_directly {
+                retain_primary_blocks(vec![block.clone()]);
             }
         }
     }
@@ -2802,17 +2966,6 @@ impl PrimaryBufferLease {
         let Some(block) = self.block.take() else {
             return;
         };
-        if self
-            .allocator
-            .state
-            .lock()
-            .expect("primary allocator mutex poisoned")
-            .quarantined
-            .iter()
-            .any(|old| Arc::ptr_eq(old, &block))
-        {
-            return;
-        }
         let mut state = self
             .allocator
             .state
@@ -2820,16 +2973,27 @@ impl PrimaryBufferLease {
             .expect("primary allocator mutex poisoned");
         state.in_use -= self.bytes;
         state.in_use_blocks -= 1;
+        if block.quarantined.load(Ordering::Acquire) {
+            return;
+        }
         let fences = std::mem::take(
             &mut *self
                 .fences
                 .lock()
                 .expect("primary lease fence mutex poisoned"),
         );
-        if state.closed {
+        if state.lifecycle != PrimaryPoolLifecycle::Open {
             state.reserved -= block.capacity;
+            let uncertain = !fences.is_empty();
+            if uncertain {
+                block.quarantined.store(true, Ordering::Release);
+            }
             drop(state);
-            drop(block);
+            if uncertain {
+                retain_primary_blocks(vec![block]);
+            } else {
+                drop(block);
+            }
             return;
         }
         if fences.is_empty() {
@@ -3533,7 +3697,26 @@ enum CaptureResource<'a> {
     Buffer(&'a DeviceBuffer),
     View(BufferView<'a>),
     Pinned(&'a PinnedHostBuffer),
+    Shared(Arc<dyn Any + Send + Sync>),
 }
+
+fn take_shared_capture_resources(
+    resources: &mut Vec<CaptureResource<'_>>,
+) -> Option<Vec<Arc<dyn Any + Send + Sync>>> {
+    resources
+        .iter()
+        .all(|resource| matches!(resource, CaptureResource::Shared(_)))
+        .then(|| {
+            std::mem::take(resources)
+                .into_iter()
+                .map(|resource| match resource {
+                    CaptureResource::Shared(resource) => resource,
+                    _ => unreachable!("borrowed capture resource rejected above"),
+                })
+                .collect()
+        })
+}
+
 pub struct CudaGraph<'a> {
     owner: Owner,
     raw: CuGraph,
@@ -3546,6 +3729,13 @@ pub struct GraphExec<'a> {
     #[allow(dead_code)] // keeps all captured resources alive through graph-exec drop.
     retained: Vec<CaptureResource<'a>>,
     closed: AtomicBool,
+}
+/// Primary-context graph executable whose captured pointers are kept alive by
+/// shared Rust owners rather than self-referential borrows.
+pub(crate) struct PrimaryGraphExec {
+    primary: PrimaryContext,
+    raw: Option<CuGraphExec>,
+    keepalives: Vec<Arc<dyn Any + Send + Sync>>,
 }
 impl<'a> Capture<'a> {
     /// Retains the logical view itself, so the originating lease cannot be
@@ -3580,11 +3770,28 @@ impl<'a> Capture<'a> {
         self.retained.push(CaptureResource::Pinned(pinned));
         Ok(())
     }
+    pub(crate) fn retain_shared<T>(&mut self, resource: Arc<T>) -> Result<(), CudaError>
+    where
+        T: Any + Send + Sync,
+    {
+        if !self.active {
+            return Err(CudaError::Closed("capture"));
+        }
+        self.retained.push(CaptureResource::Shared(resource));
+        Ok(())
+    }
+    pub(crate) fn active_stream(&mut self) -> Result<&Stream, CudaError> {
+        if !self.active {
+            return Err(CudaError::Closed("capture"));
+        }
+        Ok(self.stream)
+    }
     pub fn finish(mut self) -> Result<CudaGraph<'a>, CudaError> {
         if !self.active {
             return Err(CudaError::Closed("capture"));
         }
         let mut raw = ptr::null_mut();
+        let _guard = self.stream.owner.current()?;
         check(
             self.stream.owner.dispatch(),
             self.stream
@@ -3592,13 +3799,13 @@ impl<'a> Capture<'a> {
                 .dispatch()
                 .stream_end_capture(self.stream.raw, &mut raw),
         )?;
+        self.active = false;
         // CUDA success without a graph handle is not a usable capture. Reject
         // it before constructing an RAII owner that could later pass a null
         // handle back into the Driver.
         if raw.is_null() {
             return Err(CudaError::InvalidArgument("capture returned null graph"));
         }
-        self.active = false;
         Ok(CudaGraph {
             owner: self.stream.owner.clone(),
             raw,
@@ -3610,15 +3817,41 @@ impl<'a> Capture<'a> {
 impl Drop for Capture<'_> {
     fn drop(&mut self) {
         if self.active {
+            let Ok(_guard) = self.stream.owner.current() else {
+                self.retain_shared_after_failed_cleanup(ptr::null_mut());
+                return;
+            };
             let mut graph = ptr::null_mut();
-            let _ = self
+            let ended = self
                 .stream
                 .owner
                 .dispatch()
                 .stream_end_capture(self.stream.raw, &mut graph);
-            if !graph.is_null() {
-                let _ = self.stream.owner.dispatch().graph_destroy(graph);
+            let cleanup_failed = ended != CUDA_SUCCESS
+                || (!graph.is_null()
+                    && self.stream.owner.dispatch().graph_destroy(graph) != CUDA_SUCCESS);
+            drop(_guard);
+            if cleanup_failed {
+                self.retain_shared_after_failed_cleanup(graph);
             }
+        }
+    }
+}
+impl Capture<'_> {
+    fn retain_shared_after_failed_cleanup(&mut self, raw: CuGraph) {
+        let Some(keepalives) = take_shared_capture_resources(&mut self.retained) else {
+            return;
+        };
+        if let Owner::Primary(primary) = &self.stream.owner {
+            retain_primary_quarantine(PrimaryQuarantine::Shared {
+                raw: raw as usize,
+                primary: primary.clone(),
+                keepalives,
+            });
+        } else {
+            // Thread-affine owners cannot enter the process-wide Send registry.
+            std::mem::forget(keepalives);
+            std::mem::forget(self.stream.owner.clone());
         }
     }
 }
@@ -3627,6 +3860,59 @@ impl<'a> CudaGraph<'a> {
         if self.closed.load(Ordering::Acquire) {
             return Err(CudaError::Closed("graph"));
         }
+        let mut raw = ptr::null_mut();
+        let _guard = self.owner.current()?;
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().graph_instantiate(&mut raw, self.raw),
+        )?;
+        if raw.is_null() {
+            return Err(CudaError::InvalidArgument(
+                "instantiate returned null graph exec",
+            ));
+        }
+        // Own the raw executable immediately. If destroying the source graph
+        // fails, this pending guard destroys the executable before the graph
+        // and its retained borrows leave scope.
+        let mut exec = GraphExec {
+            owner: self.owner.clone(),
+            raw,
+            retained: Vec::new(),
+            closed: AtomicBool::new(false),
+        };
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().graph_destroy(self.raw),
+        )?;
+        self.closed.store(true, Ordering::Release);
+        exec.retained = std::mem::take(&mut self.retained);
+        Ok(exec)
+    }
+
+    pub(crate) fn instantiate_primary_owned(self) -> Result<PrimaryGraphExec, CudaError> {
+        let Owner::Primary(primary) = &self.owner else {
+            return Err(CudaError::InvalidArgument(
+                "owned graph execution requires a primary context",
+            ));
+        };
+        if self
+            .retained
+            .iter()
+            .any(|resource| !matches!(resource, CaptureResource::Shared(_)))
+        {
+            return Err(CudaError::InvalidArgument(
+                "owned graph execution requires shared capture resources",
+            ));
+        }
+        let keepalives = self
+            .retained
+            .iter()
+            .map(|resource| match resource {
+                CaptureResource::Shared(resource) => resource.clone(),
+                _ => unreachable!("borrowed resources rejected above"),
+            })
+            .collect();
+        let _guard = primary.enter()?;
         let mut raw = ptr::null_mut();
         check(
             self.owner.dispatch(),
@@ -3637,24 +3923,40 @@ impl<'a> CudaGraph<'a> {
                 "instantiate returned null graph exec",
             ));
         }
-        let destroyed = check(
+        let exec = PrimaryGraphExec {
+            primary: primary.clone(),
+            raw: Some(raw),
+            keepalives,
+        };
+        check(
             self.owner.dispatch(),
             self.owner.dispatch().graph_destroy(self.raw),
-        );
+        )?;
         self.closed.store(true, Ordering::Release);
-        destroyed?;
-        Ok(GraphExec {
-            owner: self.owner.clone(),
-            raw,
-            retained: std::mem::take(&mut self.retained),
-            closed: AtomicBool::new(false),
-        })
+        Ok(exec)
     }
 }
 impl Drop for CudaGraph<'_> {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            let _ = self.owner.dispatch().graph_destroy(self.raw);
+        if !self.closed.load(Ordering::Acquire) {
+            let destroyed = self
+                .owner
+                .current()
+                .is_ok_and(|_guard| self.owner.dispatch().graph_destroy(self.raw) == CUDA_SUCCESS);
+            if destroyed {
+                self.closed.store(true, Ordering::Release);
+            } else if let Some(keepalives) = take_shared_capture_resources(&mut self.retained) {
+                if let Owner::Primary(primary) = &self.owner {
+                    retain_primary_quarantine(PrimaryQuarantine::Shared {
+                        raw: self.raw as usize,
+                        primary: primary.clone(),
+                        keepalives,
+                    });
+                } else {
+                    std::mem::forget(keepalives);
+                    std::mem::forget(self.owner.clone());
+                }
+            }
         }
     }
 }
@@ -3666,25 +3968,77 @@ impl<'a> GraphExec<'a> {
         if !self.owner.same(&stream.owner) {
             return Err(CudaError::ContextMismatch);
         }
+        let _guard = self.owner.current()?;
         check(
             self.owner.dispatch(),
             self.owner.dispatch().graph_launch(self.raw, stream.raw),
         )
     }
     pub fn close(&self) -> Result<(), CudaError> {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.closed.load(Ordering::Acquire) {
             return Err(CudaError::Closed("graph exec"));
         }
+        let _guard = self.owner.current()?;
         check(
             self.owner.dispatch(),
             self.owner.dispatch().graph_exec_destroy(self.raw),
-        )
+        )?;
+        self.closed.store(true, Ordering::Release);
+        Ok(())
     }
 }
 impl Drop for GraphExec<'_> {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            let _ = self.owner.dispatch().graph_exec_destroy(self.raw);
+        if !self.closed.load(Ordering::Acquire)
+            && let Ok(_guard) = self.owner.current()
+            && self.owner.dispatch().graph_exec_destroy(self.raw) == CUDA_SUCCESS
+        {
+            self.closed.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl PrimaryGraphExec {
+    pub(crate) fn launch(&self, stream: &Stream) -> Result<(), CudaError> {
+        if !stream.belongs_to_primary(&self.primary) {
+            return Err(CudaError::ContextMismatch);
+        }
+        let raw = self.raw.ok_or(CudaError::Closed("graph exec"))?;
+        let _guard = self.primary.enter()?;
+        let dispatch = self.primary.0.driver.0.dispatch.as_ref();
+        check(dispatch, dispatch.graph_launch(raw, stream.raw))
+    }
+
+    pub(crate) fn close(&mut self) -> Result<(), CudaError> {
+        let Some(handle) = self.raw else {
+            return Ok(());
+        };
+        let _guard = self.primary.enter()?;
+        let dispatch = self.primary.0.driver.0.dispatch.as_ref();
+        check(dispatch, dispatch.graph_exec_destroy(handle))?;
+        self.raw = None;
+        self.keepalives.clear();
+        Ok(())
+    }
+
+    /// Deliberately retains the raw executable and every captured owner after
+    /// completion becomes unknowable. Reusing or destroying these handles
+    /// would risk releasing pointers still visible to the Driver.
+    pub(crate) fn abandon_uncertain(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            retain_primary_quarantine(PrimaryQuarantine::GraphExec {
+                raw: raw as usize,
+                primary: self.primary.clone(),
+                keepalives: std::mem::take(&mut self.keepalives),
+            });
+        }
+    }
+}
+
+impl Drop for PrimaryGraphExec {
+    fn drop(&mut self) {
+        if self.raw.is_some() && self.close().is_err() {
+            self.abandon_uncertain();
         }
     }
 }
@@ -3695,6 +4049,19 @@ pub struct Stream {
     closed: AtomicBool,
 }
 impl Stream {
+    pub(crate) fn abandon_uncertain(&mut self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            if let Owner::Primary(primary) = &self.owner {
+                retain_primary_quarantine(PrimaryQuarantine::Stream {
+                    raw: self.raw as usize,
+                    primary: primary.clone(),
+                });
+            } else {
+                std::mem::forget(self.owner.clone());
+            }
+        }
+    }
+
     fn same_view_owner(&self, owner: ViewOwner<'_>) -> bool {
         ViewOwner::Mixed(&self.owner).same(owner)
     }
@@ -3734,6 +4101,7 @@ impl Stream {
         if !self.owner.dispatch().supports_graphs() {
             return Err(CudaError::MissingSymbol("cuStreamBeginCapture"));
         }
+        let _guard = self.owner.current()?;
         check(
             self.owner.dispatch(),
             self.owner.dispatch().stream_begin_capture(self.raw, 0),
@@ -5095,6 +5463,12 @@ pub(crate) mod tests {
         dtype: crate::DType,
         abi_version: u32,
     }
+    #[derive(Clone)]
+    struct MockGraphLaunch {
+        owner: PrimaryOwner,
+        function: usize,
+        words: Vec<u64>,
+    }
 
     pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
@@ -5106,6 +5480,9 @@ pub(crate) mod tests {
         host_allocations: Mutex<HashMap<usize, Box<[u8]>>>,
         collective_adds: Mutex<HashMap<(usize, usize), MockCollectiveAdd>>,
         generic_kernels: Mutex<HashMap<(usize, usize), Arc<crate::ptx::GenericKernelSemantics>>>,
+        captured_graph_launches: Mutex<Vec<MockGraphLaunch>>,
+        graphs: Mutex<HashMap<usize, Vec<MockGraphLaunch>>>,
+        graph_execs: Mutex<HashMap<usize, Vec<MockGraphLaunch>>>,
         link_states: Mutex<HashSet<usize>>,
         link_input_types: Mutex<Vec<CuJitInputType>>,
         link_add_gate: Mutex<Option<(bool, bool)>>,
@@ -5118,11 +5495,19 @@ pub(crate) mod tests {
         next_function: AtomicUsize,
         last_function: AtomicUsize,
         next_link_state: AtomicUsize,
+        next_graph: AtomicUsize,
+        next_graph_exec: AtomicUsize,
         launch_result: AtomicI32,
         launch_fail_after: AtomicUsize,
         launch_fail_result: AtomicI32,
         generic_launch_after: AtomicUsize,
         generic_launch_result: AtomicI32,
+        graph_launch_after: AtomicUsize,
+        graph_launch_result: AtomicI32,
+        graph_destroy_after: AtomicUsize,
+        graph_destroy_result: AtomicI32,
+        graph_exec_destroy_after: AtomicUsize,
+        graph_exec_destroy_result: AtomicI32,
         generic_sync_after: AtomicUsize,
         generic_sync_result: AtomicI32,
         fail_alloc: AtomicBool,
@@ -5141,6 +5526,8 @@ pub(crate) mod tests {
         null_function: AtomicBool,
         capture_active: AtomicBool,
         capture_null_graph: AtomicBool,
+        capture_end_after: AtomicUsize,
+        capture_end_result: AtomicI32,
         instantiate_null_exec: AtomicBool,
         elapsed_supported: AtomicBool,
         elapsed_result: AtomicI32,
@@ -5153,11 +5540,14 @@ pub(crate) mod tests {
         peer_fail_result: AtomicI32,
         dtod_fail_after: AtomicUsize,
         dtod_fail_result: AtomicI32,
+        dtoh_fail_after: AtomicUsize,
+        dtoh_fail_result: AtomicI32,
         peer_enable_result: AtomicI32,
         peer_enable_fail_after: AtomicUsize,
         peer_enable_fail_result: AtomicI32,
         peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
+        event_sync_result: AtomicI32,
         stream_wait_result: AtomicI32,
         stream_sync_result: AtomicI32,
         stream_sync_fail_after: AtomicUsize,
@@ -5180,6 +5570,9 @@ pub(crate) mod tests {
                 host_allocations: Mutex::new(HashMap::new()),
                 collective_adds: Mutex::new(HashMap::new()),
                 generic_kernels: Mutex::new(HashMap::new()),
+                captured_graph_launches: Mutex::new(Vec::new()),
+                graphs: Mutex::new(HashMap::new()),
+                graph_execs: Mutex::new(HashMap::new()),
                 link_states: Mutex::new(HashSet::new()),
                 link_input_types: Mutex::new(vec![]),
                 link_add_gate: Mutex::new(None),
@@ -5192,11 +5585,19 @@ pub(crate) mod tests {
                 next_function: AtomicUsize::new(0x55),
                 last_function: AtomicUsize::new(0),
                 next_link_state: AtomicUsize::new(0x66),
+                next_graph: AtomicUsize::new(0x99),
+                next_graph_exec: AtomicUsize::new(0xaa),
                 launch_result: AtomicI32::new(0),
                 launch_fail_after: AtomicUsize::new(usize::MAX),
                 launch_fail_result: AtomicI32::new(0),
                 generic_launch_after: AtomicUsize::new(usize::MAX),
                 generic_launch_result: AtomicI32::new(0),
+                graph_launch_after: AtomicUsize::new(usize::MAX),
+                graph_launch_result: AtomicI32::new(0),
+                graph_destroy_after: AtomicUsize::new(usize::MAX),
+                graph_destroy_result: AtomicI32::new(0),
+                graph_exec_destroy_after: AtomicUsize::new(usize::MAX),
+                graph_exec_destroy_result: AtomicI32::new(0),
                 generic_sync_after: AtomicUsize::new(usize::MAX),
                 generic_sync_result: AtomicI32::new(0),
                 fail_alloc: AtomicBool::new(false),
@@ -5215,6 +5616,8 @@ pub(crate) mod tests {
                 null_function: AtomicBool::new(false),
                 capture_active: AtomicBool::new(false),
                 capture_null_graph: AtomicBool::new(false),
+                capture_end_after: AtomicUsize::new(usize::MAX),
+                capture_end_result: AtomicI32::new(0),
                 instantiate_null_exec: AtomicBool::new(false),
                 elapsed_supported: AtomicBool::new(false),
                 elapsed_result: AtomicI32::new(0),
@@ -5227,11 +5630,14 @@ pub(crate) mod tests {
                 peer_fail_result: AtomicI32::new(0),
                 dtod_fail_after: AtomicUsize::new(usize::MAX),
                 dtod_fail_result: AtomicI32::new(0),
+                dtoh_fail_after: AtomicUsize::new(usize::MAX),
+                dtoh_fail_result: AtomicI32::new(0),
                 peer_enable_result: AtomicI32::new(0),
                 peer_enable_fail_after: AtomicUsize::new(usize::MAX),
                 peer_enable_fail_result: AtomicI32::new(0),
                 peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
+                event_sync_result: AtomicI32::new(0),
                 stream_wait_result: AtomicI32::new(0),
                 stream_sync_result: AtomicI32::new(0),
                 stream_sync_fail_after: AtomicUsize::new(usize::MAX),
@@ -5803,6 +6209,26 @@ pub(crate) mod tests {
             self.generic_launch_after
                 .store(successful_calls, Ordering::Release);
         }
+        pub(crate) fn fail_graph_launch_after(&self, successful_calls: usize, result: CuResult) {
+            self.graph_launch_result.store(result, Ordering::Release);
+            self.graph_launch_after
+                .store(successful_calls, Ordering::Release);
+        }
+        pub(crate) fn fail_graph_destroy_after(&self, successful_calls: usize, result: CuResult) {
+            self.graph_destroy_result.store(result, Ordering::Release);
+            self.graph_destroy_after
+                .store(successful_calls, Ordering::Release);
+        }
+        pub(crate) fn fail_graph_exec_destroy_after(
+            &self,
+            successful_calls: usize,
+            result: CuResult,
+        ) {
+            self.graph_exec_destroy_result
+                .store(result, Ordering::Release);
+            self.graph_exec_destroy_after
+                .store(successful_calls, Ordering::Release);
+        }
         pub(crate) fn fail_generic_kernel_sync_after(
             &self,
             successful_calls: usize,
@@ -5895,6 +6321,11 @@ pub(crate) mod tests {
             self.dtod_fail_after
                 .store(successful_calls, Ordering::Release);
         }
+        pub(crate) fn fail_dtoh_after(&self, successful_calls: usize, result: CuResult) {
+            self.dtoh_fail_result.store(result, Ordering::Release);
+            self.dtoh_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
         pub(crate) fn set_peer_enable_result(&self, result: CuResult) {
             self.peer_enable_result.store(result, Ordering::Release);
         }
@@ -5909,6 +6340,14 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_event_record_result(&self, result: CuResult) {
             self.event_record_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_event_sync_result(&self, result: CuResult) {
+            self.event_sync_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn fail_capture_end_after(&self, successful_calls: usize, result: CuResult) {
+            self.capture_end_result.store(result, Ordering::Release);
+            self.capture_end_after
+                .store(successful_calls, Ordering::Release);
         }
         /// Configures the mock `cuStreamWaitEvent` result without changing
         /// event ownership or readiness. A failed wait never establishes a
@@ -6186,6 +6625,11 @@ pub(crate) mod tests {
         }
         fn memcpy_dtoh(&self, dst: *mut c_void, src: CuDevicePtr, bytes: usize) -> CuResult {
             self.call("dtoh");
+            if let Some(result) =
+                Self::one_shot_failure(&self.dtoh_fail_after, &self.dtoh_fail_result)
+            {
+                return result;
+            }
             self.current_primary().map_or(CUDA_SUCCESS, |owner| {
                 self.copy_to_host(dst, owner, src, bytes)
             })
@@ -6296,6 +6740,11 @@ pub(crate) mod tests {
             _: CuStream,
         ) -> CuResult {
             self.call("dtoh_async");
+            if let Some(result) =
+                Self::one_shot_failure(&self.dtoh_fail_after, &self.dtoh_fail_result)
+            {
+                return result;
+            }
             self.current_primary().map_or(CUDA_SUCCESS, |owner| {
                 self.copy_to_host(dst, owner, src, bytes)
             })
@@ -6350,42 +6799,125 @@ pub(crate) mod tests {
         }
         fn stream_begin_capture(&self, _: CuStream, _: c_uint) -> CuResult {
             self.call("capture_begin");
+            if self.current_primary().is_none() {
+                return Self::INVALID_MEMORY;
+            }
             if self.capture_active.swap(true, Ordering::AcqRel) {
                 2
             } else {
+                self.captured_graph_launches.lock().unwrap().clear();
                 0
             }
         }
         fn stream_end_capture(&self, _: CuStream, out: &mut CuGraph) -> CuResult {
             self.call("capture_end");
+            if self.current_primary().is_none() {
+                return Self::INVALID_MEMORY;
+            }
+            if let Some(result) =
+                Self::one_shot_failure(&self.capture_end_after, &self.capture_end_result)
+            {
+                return result;
+            }
             self.capture_active.store(false, Ordering::Release);
             *out = if self.capture_null_graph.load(Ordering::Acquire) {
                 ptr::null_mut()
             } else {
-                0x99usize as CuGraph
+                let raw = self.next_graph.fetch_add(1, Ordering::AcqRel);
+                self.graphs.lock().unwrap().insert(
+                    raw,
+                    std::mem::take(&mut *self.captured_graph_launches.lock().unwrap()),
+                );
+                raw as CuGraph
             };
             0
         }
-        fn graph_instantiate(&self, out: &mut CuGraphExec, _: CuGraph) -> CuResult {
+        fn graph_instantiate(&self, out: &mut CuGraphExec, graph: CuGraph) -> CuResult {
             self.call("graph_instantiate");
+            if self.current_primary().is_none() {
+                return Self::INVALID_MEMORY;
+            }
             *out = if self.instantiate_null_exec.load(Ordering::Acquire) {
                 ptr::null_mut()
             } else {
-                0xaausize as CuGraphExec
+                let raw = self.next_graph_exec.fetch_add(1, Ordering::AcqRel);
+                let Some(launches) = self.graphs.lock().unwrap().get(&(graph as usize)).cloned()
+                else {
+                    return Self::INVALID_MEMORY;
+                };
+                self.graph_execs.lock().unwrap().insert(raw, launches);
+                raw as CuGraphExec
             };
             0
         }
-        fn graph_launch(&self, _: CuGraphExec, _: CuStream) -> CuResult {
+        fn graph_launch(&self, exec: CuGraphExec, _: CuStream) -> CuResult {
             self.call("graph_launch");
-            0
+            if self.current_primary().is_none() {
+                return Self::INVALID_MEMORY;
+            }
+            if let Some(result) =
+                Self::one_shot_failure(&self.graph_launch_after, &self.graph_launch_result)
+            {
+                return result;
+            }
+            let Some(launches) = self
+                .graph_execs
+                .lock()
+                .unwrap()
+                .get(&(exec as usize))
+                .cloned()
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            for launch in launches {
+                let mut words = launch.words;
+                let mut args = words
+                    .iter_mut()
+                    .map(|word| (word as *mut u64).cast())
+                    .collect::<Vec<_>>();
+                let result = self.generic_kernel_launch(
+                    launch.owner,
+                    launch.function as CuFunction,
+                    args.as_mut_ptr(),
+                );
+                if result != CUDA_SUCCESS {
+                    return result;
+                }
+            }
+            CUDA_SUCCESS
         }
-        fn graph_destroy(&self, _: CuGraph) -> CuResult {
+        fn graph_destroy(&self, graph: CuGraph) -> CuResult {
             self.call("graph_destroy");
-            0
+            if self.current_primary().is_none() {
+                return Self::INVALID_MEMORY;
+            }
+            if let Some(result) =
+                Self::one_shot_failure(&self.graph_destroy_after, &self.graph_destroy_result)
+            {
+                return result;
+            }
+            self.graphs
+                .lock()
+                .unwrap()
+                .remove(&(graph as usize))
+                .map_or(Self::INVALID_MEMORY, |_| CUDA_SUCCESS)
         }
-        fn graph_exec_destroy(&self, _: CuGraphExec) -> CuResult {
+        fn graph_exec_destroy(&self, exec: CuGraphExec) -> CuResult {
             self.call("graph_exec_destroy");
-            0
+            if self.current_primary().is_none() {
+                return Self::INVALID_MEMORY;
+            }
+            if let Some(result) = Self::one_shot_failure(
+                &self.graph_exec_destroy_after,
+                &self.graph_exec_destroy_result,
+            ) {
+                return result;
+            }
+            self.graph_execs
+                .lock()
+                .unwrap()
+                .remove(&(exec as usize))
+                .map_or(Self::INVALID_MEMORY, |_| CUDA_SUCCESS)
         }
         fn stream_create(&self, out: &mut CuStream, _: c_uint) -> CuResult {
             self.call("stream_create");
@@ -6447,7 +6979,7 @@ pub(crate) mod tests {
         }
         fn event_sync(&self, _: CuEvent) -> CuResult {
             self.call("event_sync");
-            0
+            self.event_sync_result.load(Ordering::Acquire)
         }
         fn stream_wait_event(&self, _: CuStream, _: CuEvent, _: c_uint) -> CuResult {
             self.call("stream_wait");
@@ -6644,6 +7176,37 @@ pub(crate) mod tests {
                     Self::one_shot_failure(&self.generic_launch_after, &self.generic_launch_result)
                 {
                     return result;
+                }
+                if self.capture_active.load(Ordering::Acquire) {
+                    let buffer_count = self
+                        .generic_kernels
+                        .lock()
+                        .unwrap()
+                        .get(&(owner.identity, function as usize))
+                        .map(|semantics| semantics.buffers.len())
+                        .unwrap_or(0);
+                    if args.is_null() {
+                        return Self::INVALID_MEMORY;
+                    }
+                    let mut words = Vec::with_capacity(buffer_count + 1);
+                    unsafe {
+                        for index in 0..=buffer_count {
+                            let word = *args.add(index);
+                            if word.is_null() {
+                                return Self::INVALID_MEMORY;
+                            }
+                            words.push(*(word as *const u64));
+                        }
+                    }
+                    self.captured_graph_launches
+                        .lock()
+                        .unwrap()
+                        .push(MockGraphLaunch {
+                            owner,
+                            function: function as usize,
+                            words,
+                        });
+                    return CUDA_SUCCESS;
                 }
                 return self.generic_kernel_launch(owner, function, args);
             }
@@ -7317,6 +7880,76 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn primary_close_retains_quarantine_before_failed_deferred_wait() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let allocator = primary.allocator();
+        let stream = primary.stream().unwrap();
+
+        let quarantined = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let quarantined_ptr = quarantined.block.as_ref().unwrap().ptr;
+        quarantined.quarantine();
+        drop(quarantined);
+
+        let deferred = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let deferred_ptr = deferred.block.as_ref().unwrap().ptr;
+        let fence = Arc::new(primary.event_fence().unwrap());
+        fence.record(&stream).unwrap();
+        deferred.attach_fence(fence).unwrap();
+        assert_eq!(allocator.stats().quarantined_blocks, 1);
+        assert_eq!(allocator.stats().deferred_blocks, 0);
+
+        let quarantine_before = primary_quarantine_len();
+        let frees_before = mock
+            .calls()
+            .iter()
+            .filter(|call| **call == "mem_free")
+            .count();
+        assert!(matches!(
+            allocator.close(),
+            Err(CudaError::InvalidArgument(
+                "primary allocator has live leases"
+            ))
+        ));
+        assert_eq!(primary_quarantine_len(), quarantine_before);
+        assert_eq!(allocator.stats().quarantined_blocks, 1);
+        assert_eq!(allocator.stats().deferred_blocks, 0);
+
+        drop(deferred);
+        assert_eq!(allocator.stats().deferred_blocks, 1);
+        mock.set_event_sync_result(2);
+        assert!(allocator.close().is_err());
+        assert!(primary_quarantine_len() > quarantine_before);
+        assert_eq!(allocator.stats().quarantined_blocks, 0);
+        assert_eq!(allocator.stats().deferred_blocks, 0);
+        assert_eq!(allocator.reserved_bytes(), 0);
+
+        mock.set_event_sync_result(0);
+        let fresh = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let fresh_ptr = fresh.block.as_ref().unwrap().ptr;
+        assert_ne!(fresh_ptr, quarantined_ptr);
+        assert_ne!(fresh_ptr, deferred_ptr);
+        fresh.quarantine();
+        drop(fresh);
+        allocator.close().unwrap();
+        assert_eq!(allocator.reserved_bytes(), 0);
+        drop(allocator);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "mem_free")
+                .count(),
+            frees_before,
+            "uncertain blocks remain process-reachable and are never freed"
+        );
+    }
+
+    #[test]
     fn primary_pool_stats_are_handle_scoped_and_track_transitions() {
         let mock = Arc::new(Mock::default());
         let driver = Driver::from_dispatch(mock).unwrap();
@@ -7795,6 +8428,10 @@ pub(crate) mod tests {
         ));
         let calls = mock.calls();
         assert!(calls.contains(&"capture_end"));
+        assert_eq!(
+            calls.iter().filter(|call| **call == "capture_end").count(),
+            1
+        );
         assert!(!calls.contains(&"graph_destroy"));
         mock.capture_null_graph.store(false, Ordering::Release);
         let graph = stream.begin_capture().unwrap().finish().unwrap();
@@ -7808,6 +8445,114 @@ pub(crate) mod tests {
         let calls = mock.calls();
         assert!(!calls.contains(&"graph_launch"));
         assert!(!calls.contains(&"graph_exec_destroy"));
+    }
+
+    #[test]
+    fn abandoned_owned_capture_retains_shared_resources_when_end_fails() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let stream = primary.stream().unwrap();
+        let shared = Arc::new(());
+        let weak = Arc::downgrade(&shared);
+        let mut capture = stream.begin_capture().unwrap();
+        capture.retain_shared(shared.clone()).unwrap();
+        drop(shared);
+        mock.fail_capture_end_after(0, 1);
+        drop(capture);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "capture_end")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn graph_instantiate_destroy_failure_cleans_pending_exec_then_retries_graph() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let stream = primary.stream().unwrap();
+        let graph = stream.begin_capture().unwrap().finish().unwrap();
+        mock.fail_graph_destroy_after(0, 1);
+        assert!(graph.instantiate().is_err());
+        let calls = mock.calls();
+        let instantiate = calls
+            .iter()
+            .position(|call| *call == "graph_instantiate")
+            .unwrap();
+        let first_graph_destroy = calls
+            .iter()
+            .position(|call| *call == "graph_destroy")
+            .unwrap();
+        let exec_destroy = calls
+            .iter()
+            .position(|call| *call == "graph_exec_destroy")
+            .unwrap();
+        let final_graph_destroy = calls
+            .iter()
+            .rposition(|call| *call == "graph_destroy")
+            .unwrap();
+        assert!(instantiate < first_graph_destroy);
+        assert!(first_graph_destroy < exec_destroy);
+        assert!(exec_destroy < final_graph_destroy);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == "graph_destroy")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn graph_exec_close_is_retryable_and_destroys_before_retained_resources() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let stream = primary.stream().unwrap();
+        let buffer = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let mut capture = stream.begin_capture().unwrap();
+        capture.retain_buffer(&buffer).unwrap();
+        let graph = capture.finish().unwrap();
+        let exec = graph.instantiate().unwrap();
+        mock.fail_graph_exec_destroy_after(0, 1);
+        assert!(exec.close().is_err());
+        assert_eq!(mock.live_allocation_count(primary.owner()), 1);
+        exec.close().unwrap();
+        drop(exec);
+        drop(buffer);
+        assert_eq!(mock.live_allocation_count(primary.owner()), 0);
+        let calls = mock.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == "graph_exec_destroy")
+                .count(),
+            2
+        );
+        assert!(
+            calls
+                .iter()
+                .rposition(|call| *call == "graph_exec_destroy")
+                .unwrap()
+                < calls.iter().rposition(|call| *call == "free").unwrap()
+        );
     }
 
     #[test]

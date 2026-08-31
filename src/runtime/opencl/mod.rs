@@ -23,6 +23,7 @@ pub use dispatch::{
     BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClCapabilities, RawBuffer, RawContext,
     RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue,
 };
+pub(crate) use prepared::OpenClPrefixPlan;
 pub use prepared::PreparedOpenClPrefix;
 pub use renderer::{OpenClBufferAbi, OpenClRenderer, RenderedOpenCl};
 pub use resource::{

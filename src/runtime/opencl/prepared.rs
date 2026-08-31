@@ -7,8 +7,8 @@ use crate::{DType, ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
 use crate::runtime::static_schedule::{
-    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticRendered, StaticRenderedBuffer,
-    bind_rendered_buffers,
+    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticPlanAdapter, StaticRendered,
+    StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
 };
 
 struct OpenClStaticAdapter {
@@ -30,12 +30,9 @@ impl OpenClStaticAdapter {
 
 impl Sealed for OpenClStaticAdapter {}
 
-impl StaticDeviceAdapter for OpenClStaticAdapter {
+impl StaticPlanAdapter for OpenClStaticAdapter {
     type Error = OpenClError;
     type Rendered = super::RenderedOpenCl;
-    type Kernel = Rc<OpenClKernel>;
-    type Buffer = OpenClBuffer;
-    type Queue = OpenClQueue;
 
     fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
         let rendered = self.renderer.render(&item.kernel)?;
@@ -74,6 +71,13 @@ impl StaticDeviceAdapter for OpenClStaticAdapter {
     fn overflow() -> Self::Error {
         OpenClError::Overflow
     }
+}
+
+impl StaticDeviceAdapter for OpenClStaticAdapter {
+    type Kernel = Rc<OpenClKernel>;
+    type Buffer = OpenClBuffer;
+    type Queue = OpenClQueue;
+
     fn prepare_zero_extent(&self) -> bool {
         true
     }
@@ -123,6 +127,27 @@ impl StaticDeviceAdapter for OpenClStaticAdapter {
 }
 
 /// A fully validated pure prefix whose logical intermediates remain device-resident.
+pub(crate) struct OpenClPrefixPlan {
+    plan: StaticSchedulePlan<super::RenderedOpenCl>,
+    renderer: OpenClRenderer,
+}
+
+impl OpenClPrefixPlan {
+    pub(crate) fn plan_for_outputs(
+        context: OpenClContext,
+        items: &[ScheduleItem],
+        retained: &[u64],
+        renderer: OpenClRenderer,
+    ) -> Result<Self, OpenClError> {
+        let adapter = OpenClStaticAdapter::new(context, renderer);
+        Ok(Self {
+            plan: StaticSchedulePlan::build(&adapter, items, Some(retained))?,
+            renderer,
+        })
+    }
+}
+
+/// A fully validated pure prefix whose logical intermediates remain device-resident.
 pub struct PreparedOpenClPrefix {
     inner: PreparedStaticSchedule<OpenClStaticAdapter>,
 }
@@ -141,17 +166,14 @@ impl PreparedOpenClPrefix {
         })
     }
 
-    pub(crate) fn prepare_for_outputs(
+    pub(crate) fn from_plan(
         context: OpenClContext,
-        items: &[ScheduleItem],
-        retained: &[u64],
-        renderer: OpenClRenderer,
+        plan: OpenClPrefixPlan,
     ) -> Result<Self, OpenClError> {
         Ok(Self {
-            inner: PreparedStaticSchedule::prepare_for_outputs(
-                OpenClStaticAdapter::new(context, renderer),
-                items,
-                retained,
+            inner: PreparedStaticSchedule::from_plan(
+                OpenClStaticAdapter::new(context, plan.renderer),
+                plan.plan,
             )?,
         })
     }

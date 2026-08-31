@@ -1,6 +1,6 @@
 //! Strict hybrid WebGPU replay: retained pure prefixes, host-atomic effects.
 use super::{CapturedMixedBatch, backend};
-use crate::runtime::webgpu::{PreparedWebGpuPrefix, WebGpuDevice, WgslRenderer};
+use crate::runtime::webgpu::{PreparedWebGpuPrefix, WebGpuDevice, WebGpuPrefixPlan, WgslRenderer};
 use crate::{EffectBatchStep, EffectRuntime, ReplayError, ScheduleItem, TensorData};
 use std::collections::BTreeMap;
 
@@ -25,14 +25,15 @@ struct WebGpuBackend {
 }
 
 impl backend::PreparedBackend for WebGpuBackend {
+    type Plan = WebGpuPrefixPlan;
     type Prepared = PreparedWebGpuPrefix;
 
-    fn prepare(
+    fn plan(
         &self,
         items: &[ScheduleItem],
         retained_outputs: &[u64],
-    ) -> Result<Self::Prepared, ReplayError> {
-        PreparedWebGpuPrefix::prepare_for_outputs(
+    ) -> Result<Self::Plan, ReplayError> {
+        WebGpuPrefixPlan::plan_for_outputs(
             self.device.clone(),
             items,
             retained_outputs,
@@ -41,9 +42,14 @@ impl backend::PreparedBackend for WebGpuBackend {
         .map_err(|error| ReplayError::Execute(format!("WebGPU prepare: {error:?}")))
     }
 
+    fn prepare(&self, plan: Self::Plan) -> Result<Self::Prepared, ReplayError> {
+        PreparedWebGpuPrefix::from_plan(self.device.clone(), plan)
+            .map_err(|error| ReplayError::Execute(format!("WebGPU prepare: {error:?}")))
+    }
+
     fn execute(
         &self,
-        prepared: &Self::Prepared,
+        prepared: &mut Self::Prepared,
         values: &mut BTreeMap<u64, TensorData>,
     ) -> Result<(), ReplayError> {
         prepared

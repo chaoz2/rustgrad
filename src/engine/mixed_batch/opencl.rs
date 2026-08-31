@@ -1,6 +1,8 @@
 //! Strict hybrid OpenCL replay: device pure prefixes, host atomic effects.
 use super::{CapturedMixedBatch, backend};
-use crate::runtime::opencl::{OpenClContext, OpenClRenderer, PreparedOpenClPrefix};
+use crate::runtime::opencl::{
+    OpenClContext, OpenClPrefixPlan, OpenClRenderer, PreparedOpenClPrefix,
+};
 use crate::{EffectBatchStep, EffectRuntime, ReplayError, ScheduleItem, TensorData};
 use std::collections::BTreeMap;
 
@@ -20,13 +22,14 @@ struct OpenClBackend {
     renderer: OpenClRenderer,
 }
 impl backend::PreparedBackend for OpenClBackend {
+    type Plan = OpenClPrefixPlan;
     type Prepared = PreparedOpenClPrefix;
-    fn prepare(
+    fn plan(
         &self,
         items: &[ScheduleItem],
         retained_outputs: &[u64],
-    ) -> Result<Self::Prepared, ReplayError> {
-        PreparedOpenClPrefix::prepare_for_outputs(
+    ) -> Result<Self::Plan, ReplayError> {
+        OpenClPrefixPlan::plan_for_outputs(
             self.context.clone(),
             items,
             retained_outputs,
@@ -34,9 +37,13 @@ impl backend::PreparedBackend for OpenClBackend {
         )
         .map_err(|e| ReplayError::Execute(format!("OpenCL prepare: {e:?}")))
     }
+    fn prepare(&self, plan: Self::Plan) -> Result<Self::Prepared, ReplayError> {
+        PreparedOpenClPrefix::from_plan(self.context.clone(), plan)
+            .map_err(|e| ReplayError::Execute(format!("OpenCL prepare: {e:?}")))
+    }
     fn execute(
         &self,
-        prepared: &Self::Prepared,
+        prepared: &mut Self::Prepared,
         values: &mut BTreeMap<u64, TensorData>,
     ) -> Result<(), ReplayError> {
         prepared

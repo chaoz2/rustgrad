@@ -6,8 +6,8 @@ use crate::{DType, ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
 use crate::runtime::static_schedule::{
-    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticRendered, StaticRenderedBuffer,
-    bind_rendered_buffers,
+    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticPlanAdapter, StaticRendered,
+    StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
 };
 
 struct WebGpuStaticAdapter {
@@ -29,12 +29,9 @@ impl WebGpuStaticAdapter {
 
 impl Sealed for WebGpuStaticAdapter {}
 
-impl StaticDeviceAdapter for WebGpuStaticAdapter {
+impl StaticPlanAdapter for WebGpuStaticAdapter {
     type Error = WebGpuError;
     type Rendered = super::RenderedWgsl;
-    type Kernel = Rc<WebGpuPipeline>;
-    type Buffer = WebGpuBuffer;
-    type Queue = WebGpuQueue;
 
     fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
         let rendered = self.renderer.render(&item.kernel)?;
@@ -73,6 +70,13 @@ impl StaticDeviceAdapter for WebGpuStaticAdapter {
     fn overflow() -> Self::Error {
         WebGpuError::Overflow
     }
+}
+
+impl StaticDeviceAdapter for WebGpuStaticAdapter {
+    type Kernel = Rc<WebGpuPipeline>;
+    type Buffer = WebGpuBuffer;
+    type Queue = WebGpuQueue;
+
     fn prepare_zero_extent(&self) -> bool {
         true
     }
@@ -121,6 +125,27 @@ impl StaticDeviceAdapter for WebGpuStaticAdapter {
 }
 
 /// A fully validated pure prefix whose logical intermediates remain device-resident.
+pub(crate) struct WebGpuPrefixPlan {
+    plan: StaticSchedulePlan<super::RenderedWgsl>,
+    renderer: WgslRenderer,
+}
+
+impl WebGpuPrefixPlan {
+    pub(crate) fn plan_for_outputs(
+        device: WebGpuDevice,
+        items: &[ScheduleItem],
+        retained: &[u64],
+        renderer: WgslRenderer,
+    ) -> Result<Self, WebGpuError> {
+        let adapter = WebGpuStaticAdapter::new(device, renderer.clone());
+        Ok(Self {
+            plan: StaticSchedulePlan::build(&adapter, items, Some(retained))?,
+            renderer,
+        })
+    }
+}
+
+/// A fully validated pure prefix whose logical intermediates remain device-resident.
 pub struct PreparedWebGpuPrefix {
     inner: PreparedStaticSchedule<WebGpuStaticAdapter>,
 }
@@ -139,17 +164,14 @@ impl PreparedWebGpuPrefix {
         })
     }
 
-    pub(crate) fn prepare_for_outputs(
+    pub(crate) fn from_plan(
         device: WebGpuDevice,
-        items: &[ScheduleItem],
-        retained: &[u64],
-        renderer: WgslRenderer,
+        plan: WebGpuPrefixPlan,
     ) -> Result<Self, WebGpuError> {
         Ok(Self {
-            inner: PreparedStaticSchedule::prepare_for_outputs(
-                WebGpuStaticAdapter::new(device, renderer),
-                items,
-                retained,
+            inner: PreparedStaticSchedule::from_plan(
+                WebGpuStaticAdapter::new(device, plan.renderer),
+                plan.plan,
             )?,
         })
     }
