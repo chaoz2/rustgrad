@@ -7,8 +7,8 @@ use crate::{DType, ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
 use crate::runtime::static_schedule::{
-    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticRendered, StaticRenderedBuffer,
-    StaticSchedulePlan, bind_rendered_buffers,
+    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticPlanAdapter, StaticRendered,
+    StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -44,12 +44,9 @@ impl MetalStaticAdapter {
 
 impl Sealed for MetalStaticAdapter {}
 
-impl StaticDeviceAdapter for MetalStaticAdapter {
+impl StaticPlanAdapter for MetalStaticAdapter {
     type Error = MetalError;
     type Rendered = super::RenderedMetal;
-    type Kernel = Rc<MetalPipeline>;
-    type Buffer = MetalBuffer;
-    type Queue = MetalCommandQueue;
 
     fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
         let rendered = self.renderer.render(&item.kernel)?;
@@ -88,6 +85,13 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
     fn overflow() -> Self::Error {
         MetalError::Overflow
     }
+}
+
+impl StaticDeviceAdapter for MetalStaticAdapter {
+    type Kernel = Rc<MetalPipeline>;
+    type Buffer = MetalBuffer;
+    type Queue = MetalCommandQueue;
+
     fn prepare_zero_extent(&self) -> bool {
         false
     }
@@ -183,16 +187,6 @@ impl PreparedMetalPrefix {
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
         let plan = MetalPrefixPlan::plan(items, renderer)?;
-        Self::from_plan(device, plan)
-    }
-
-    pub(crate) fn prepare_for_outputs(
-        device: MetalDevice,
-        items: &[ScheduleItem],
-        retained: &[u64],
-        renderer: MetalRenderer,
-    ) -> Result<Self, MetalError> {
-        let plan = MetalPrefixPlan::plan_for_outputs(items, retained, renderer)?;
         Self::from_plan(device, plan)
     }
 

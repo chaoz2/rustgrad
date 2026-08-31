@@ -203,6 +203,7 @@ pub use ptx::{
     PrimaryLinkedRenderedKernel, PrimaryLinkedRenderedKernelCache, PrimaryPtxKernel, PtxBinding,
     PtxCache, PtxError, PtxKernel, PtxLaunchGeometry, PtxRenderer, RenderedPtx,
 };
+pub use runtime::cuda_graph::{CudaGraphPrefixPlan, PreparedCudaGraphPrefix};
 pub use runtime::mapped::{MappedBackingId, MappedTensor, MappedTensorError, MappedTensorPolicy};
 pub use runtime::mapped_mut::{MutableMappedFile, MutableMappedFileError};
 pub use safetensors::{

@@ -1,6 +1,6 @@
 //! Strict hybrid Metal replay: retained Metal pure prefixes, host-atomic effects.
 use super::{CapturedMixedBatch, backend};
-use crate::runtime::metal::{MetalDevice, MetalRenderer, PreparedMetalPrefix};
+use crate::runtime::metal::{MetalDevice, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix};
 use crate::{EffectBatchStep, EffectRuntime, ReplayError, ScheduleItem, TensorData};
 use std::collections::BTreeMap;
 
@@ -20,23 +20,23 @@ struct MetalBackend {
     renderer: MetalRenderer,
 }
 impl backend::PreparedBackend for MetalBackend {
+    type Plan = MetalPrefixPlan;
     type Prepared = PreparedMetalPrefix;
-    fn prepare(
+    fn plan(
         &self,
         items: &[ScheduleItem],
         retained_outputs: &[u64],
-    ) -> Result<Self::Prepared, ReplayError> {
-        PreparedMetalPrefix::prepare_for_outputs(
-            self.device.clone(),
-            items,
-            retained_outputs,
-            self.renderer.clone(),
-        )
-        .map_err(|e| ReplayError::Execute(format!("Metal prepare: {e:?}")))
+    ) -> Result<Self::Plan, ReplayError> {
+        MetalPrefixPlan::plan_for_outputs(items, retained_outputs, self.renderer.clone())
+            .map_err(|e| ReplayError::Execute(format!("Metal prepare: {e:?}")))
+    }
+    fn prepare(&self, plan: Self::Plan) -> Result<Self::Prepared, ReplayError> {
+        PreparedMetalPrefix::from_plan(self.device.clone(), plan)
+            .map_err(|e| ReplayError::Execute(format!("Metal prepare: {e:?}")))
     }
     fn execute(
         &self,
-        prepared: &Self::Prepared,
+        prepared: &mut Self::Prepared,
         values: &mut BTreeMap<u64, TensorData>,
     ) -> Result<(), ReplayError> {
         prepared

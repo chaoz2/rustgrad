@@ -2,7 +2,7 @@
 //!
 //! Renderers remain the owners of operation support. This module owns only the
 //! buffer residency and side-effect boundary common to the prepared OpenCL,
-//! Metal, and WebGPU paths.
+//! Metal, WebGPU, and fixed-schema CUDA graph paths.
 
 use crate::{DType, Operation, ScheduleItem, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,7 +130,7 @@ pub(crate) struct StaticBufferPlan {
     pub(crate) producer: Option<usize>,
 }
 
-struct StaticItemPlan<R> {
+pub(crate) struct StaticItemPlan<R> {
     rendered: R,
     cache_key: String,
     extent: usize,
@@ -147,19 +147,25 @@ pub(crate) struct StaticSchedulePlan<R> {
     retained_outputs: Vec<u64>,
 }
 
-/// Coarse backend resource seam. Operation dispatch deliberately remains in
-/// each existing renderer rather than being reconstructed here.
-pub(crate) trait StaticDeviceAdapter: sealed::Sealed + Sized {
+/// Pure renderer/planner seam shared by ordinary device execution and CUDA
+/// whole-prefix graph capture.
+pub(crate) trait StaticPlanAdapter: sealed::Sealed + Sized {
     type Error;
     type Rendered;
-    type Kernel;
-    type Buffer;
-    type Queue;
 
     fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error>;
     fn invalid_binding(reason: String) -> Self::Error;
     fn unsupported(reason: String) -> Self::Error;
     fn overflow() -> Self::Error;
+}
+
+/// Coarse backend resource seam. Operation dispatch deliberately remains in
+/// each existing renderer rather than being reconstructed here.
+pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
+    type Kernel;
+    type Buffer;
+    type Queue;
+
     /// Preserves the backend's established whole-item zero-domain preparation
     /// policy, including compilation, allocation, and queue participation.
     fn prepare_zero_extent(&self) -> bool;
@@ -191,13 +197,33 @@ pub(crate) trait StaticDeviceAdapter: sealed::Sealed + Sized {
 pub(crate) use sealed::Sealed;
 
 impl<R> StaticSchedulePlan<R> {
+    pub(crate) fn items(&self) -> impl ExactSizeIterator<Item = &StaticItemPlan<R>> {
+        self.items.iter()
+    }
+
+    pub(crate) fn buffers(&self) -> &BTreeMap<u64, StaticBufferPlan> {
+        &self.buffers
+    }
+
+    pub(crate) fn buffer_order(&self) -> &[u64] {
+        &self.buffer_order
+    }
+
+    pub(crate) fn external_inputs(&self) -> &[u64] {
+        &self.external_inputs
+    }
+
+    pub(crate) fn retained_outputs(&self) -> &[u64] {
+        &self.retained_outputs
+    }
+
     pub(crate) fn build<A>(
         adapter: &A,
         items: &[ScheduleItem],
         retained: Option<&[u64]>,
     ) -> Result<Self, A::Error>
     where
-        A: StaticDeviceAdapter<Rendered = R>,
+        A: StaticPlanAdapter<Rendered = R>,
     {
         let mut planned = Vec::with_capacity(items.len());
         let mut buffers = BTreeMap::<u64, StaticBufferPlan>::new();
@@ -404,6 +430,20 @@ impl<R> StaticSchedulePlan<R> {
     }
 }
 
+impl<R> StaticItemPlan<R> {
+    pub(crate) fn rendered(&self) -> &R {
+        &self.rendered
+    }
+
+    pub(crate) fn extent(&self) -> usize {
+        self.extent
+    }
+
+    pub(crate) fn buffer_ids(&self) -> &[u64] {
+        &self.buffer_ids
+    }
+}
+
 struct PreparedStaticItem<K> {
     kernel: Option<K>,
     cache_key: Option<String>,
@@ -429,7 +469,8 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         Self::from_plan(adapter, plan)
     }
 
-    pub(crate) fn prepare_for_outputs(
+    #[cfg(test)]
+    fn prepare_for_outputs(
         adapter: A,
         items: &[ScheduleItem],
         retained: &[u64],
@@ -588,7 +629,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
     }
 }
 
-fn validate_prefix<A: StaticDeviceAdapter>(items: &[ScheduleItem]) -> Result<(), A::Error> {
+fn validate_prefix<A: StaticPlanAdapter>(items: &[ScheduleItem]) -> Result<(), A::Error> {
     let count = items.len() as u64;
     let mut expected_consumers = BTreeMap::<u64, Vec<u64>>::new();
     for (position, item) in items.iter().enumerate() {
@@ -662,12 +703,9 @@ mod tests {
     struct FakeBuffer(RefCell<Vec<u8>>);
 
     impl Sealed for FakeAdapter {}
-    impl StaticDeviceAdapter for FakeAdapter {
+    impl StaticPlanAdapter for FakeAdapter {
         type Error = String;
         type Rendered = FakeRendered;
-        type Kernel = FakeKernel;
-        type Buffer = FakeBuffer;
-        type Queue = FakeQueue;
 
         fn render(
             &self,
@@ -699,6 +737,12 @@ mod tests {
         fn overflow() -> Self::Error {
             "overflow".into()
         }
+    }
+    impl StaticDeviceAdapter for FakeAdapter {
+        type Kernel = FakeKernel;
+        type Buffer = FakeBuffer;
+        type Queue = FakeQueue;
+
         fn prepare_zero_extent(&self) -> bool {
             false
         }

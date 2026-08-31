@@ -1,4 +1,5 @@
 //! Concrete runtime resources with backend-specific capability boundaries.
+pub mod cuda_graph;
 pub mod file;
 pub mod mapped;
 pub mod mapped_mut;

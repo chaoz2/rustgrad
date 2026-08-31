@@ -9,8 +9,8 @@
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
-    AddressSpace, AddressValue, BufferView, CudaError, DType, Function, IndexValue, LaunchConfig,
-    LiteralValue, MatmulValue, Operation, ReductionValue, Shape, Stream, UOp, UType,
+    AddressSpace, AddressValue, BufferView, Capture, CudaError, DType, Function, IndexValue,
+    LaunchConfig, LiteralValue, MatmulValue, Operation, ReductionValue, Shape, Stream, UOp, UType,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -6331,6 +6331,31 @@ impl PrimaryPtxKernel {
         bindings: &[PtxBinding<'_>],
         synchronize: bool,
     ) -> Result<(), PtxError> {
+        if !self.enqueue(stream, bindings)? {
+            return Ok(());
+        }
+        self.attach_primary_completion(stream, bindings)?;
+        if synchronize {
+            stream.synchronize_generic_kernel_completion()?;
+        }
+        Ok(())
+    }
+
+    /// Enqueues one already validated fixed-pointer launch while a CUDA stream
+    /// capture is active. Completion belongs to the resulting graph replay,
+    /// so this deliberately does not record a per-kernel fence.
+    pub(crate) fn enqueue_captured(
+        &self,
+        capture: &mut Capture<'_>,
+        bindings: &[PtxBinding<'_>],
+    ) -> Result<(), PtxError> {
+        self.enqueue(capture.active_stream()?, bindings).map(|_| ())
+    }
+
+    /// Returns whether a kernel launch was submitted. Zero-extent kernels
+    /// preserve validation of the context and binding inventory while issuing
+    /// no launch, completion fence, or synchronization.
+    fn enqueue(&self, stream: &Stream, bindings: &[PtxBinding<'_>]) -> Result<bool, PtxError> {
         if !self.module.belongs_to_primary(&self.primary)
             || !stream.belongs_to_primary(&self.primary)
         {
@@ -6340,7 +6365,7 @@ impl PrimaryPtxKernel {
             return Err(PtxError::InvalidBinding("wrong buffer count".into()));
         }
         if self.rendered.extent == 0 {
-            return Ok(());
+            return Ok(false);
         }
         let mut words = Vec::with_capacity(bindings.len() + 1);
         for (index, (want, got)) in self.rendered.buffers.iter().zip(bindings).enumerate() {
@@ -6373,11 +6398,7 @@ impl PrimaryPtxKernel {
             stream,
             &mut args,
         )?;
-        self.attach_primary_completion(stream, bindings)?;
-        if synchronize {
-            stream.synchronize_generic_kernel_completion()?;
-        }
-        Ok(())
+        Ok(true)
     }
     fn attach_primary_completion(
         &self,
@@ -8105,6 +8126,38 @@ mod tests {
                 assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name} {kind:?}");
             }
         }
+    }
+
+    #[test]
+    fn nonzero_primary_lease_launch_records_completion() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&kernel(DType::F32))
+            .unwrap();
+        let kernel = ConcurrentPtxCache::new()
+            .get_or_load(&primary, rendered, 32)
+            .unwrap();
+        let pool = primary.allocator();
+        let lease = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        kernel
+            .launch(
+                &stream,
+                &[PtxBinding {
+                    buffer: lease.view().unwrap(),
+                    dtype: DType::F32,
+                    mutable: true,
+                }],
+                true,
+            )
+            .unwrap();
+        let calls = mock.calls();
+        assert!(calls.contains(&"event_create"));
+        assert!(calls.contains(&"event_record"));
+        assert!(calls.contains(&"stream_sync"));
     }
 
     #[test]

@@ -7,15 +7,17 @@ use crate::{
 use std::collections::BTreeMap;
 
 pub(super) trait PreparedBackend {
+    type Plan;
     type Prepared;
-    fn prepare(
+    fn plan(
         &self,
         items: &[ScheduleItem],
         retained_outputs: &[u64],
-    ) -> Result<Self::Prepared, ReplayError>;
+    ) -> Result<Self::Plan, ReplayError>;
+    fn prepare(&self, plan: Self::Plan) -> Result<Self::Prepared, ReplayError>;
     fn execute(
         &self,
-        prepared: &Self::Prepared,
+        prepared: &mut Self::Prepared,
         values: &mut BTreeMap<u64, TensorData>,
     ) -> Result<(), ReplayError>;
     fn keys(&self, prepared: &Self::Prepared) -> Vec<String>;
@@ -75,7 +77,9 @@ pub(super) fn replay<B: PreparedBackend>(
             provided,
         )?);
     }
-    let prepared = bound
+    // Purely validate every prefix before the first cache, queue, allocation,
+    // module, or capture operation is permitted for any prefix in the batch.
+    let plans = bound
         .iter()
         .map(|capture| {
             let split = capture
@@ -94,15 +98,19 @@ pub(super) fn replay<B: PreparedBackend>(
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            backend.prepare(
+            backend.plan(
                 &capture.capture().schedule.items[..split],
                 &retained_outputs,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut prepared = plans
+        .into_iter()
+        .map(|plan| backend.prepare(plan))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut entries: Vec<EffectBatchEntry> = Vec::new();
     let mut keys = Vec::new();
-    for (capture, prefix) in bound.iter().zip(&prepared) {
+    for (capture, prefix) in bound.iter().zip(&mut prepared) {
         let mut values = capture.capture().schedule.constants.clone();
         for input in &capture.capture().schedule.inputs {
             values.insert(

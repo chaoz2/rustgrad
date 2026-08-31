@@ -1121,9 +1121,26 @@ need error visibility must call `wait`; no live-CUDA validation is claimed.
 session. Callers explicitly retain buffers and pinned allocations used by the
 captured work; the resulting graph-exec borrows them for its full lifetime and
 validates the replay stream owner. Capture abandonment ends and destroys any
-returned graph best-effort. This is a static capture foundation only: parameter
-updates, capture invalidation diagnostics, and live-driver validation remain
-open.
+returned graph best-effort. The fixed-schema prepared-prefix path instead
+retains shared leases and kernels in an owned, non-self-referential graph exec.
+It first applies the shared pure static-schedule plan, allocates one stable
+lease per nonzero graph-ABI logical buffer, captures every nonzero PTX kernel without
+per-kernel fences, uploads external values before one graph launch, records one
+reusable completion fence, and downloads only exact requested outputs after
+that fence completes. Decoding precedes host-map publication. A launch whose
+completion cannot be established poisons the prepared executor and quarantines
+its leases; settled submission and read failures leave host outputs untouched
+and remain retryable. The all-zero path creates no CUDA graph or resources.
+
+The mixed-batch coordinator plans every prefix before any backend starts
+resource preparation, so a malformed later prefix cannot leave an earlier CUDA
+capture or accelerator program behind. CUDA graph replay remains limited to a
+fixed pointer/shape/dtype schema, one primary context, kernel-only pure static
+prefixes, and explicit retained outputs. Graph updates, effects, guarded or
+quantized execution, dynamic schemas, multi-device capture, capture
+invalidation diagnostics, and live-driver validation remain open. The public
+borrowed graph-exec foundation retains its low-level best-effort destruction
+contract; the owned prepared path is the lifetime-safe surface.
 
 ## CUDA profiling foundation
 
