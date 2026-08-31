@@ -1,13 +1,14 @@
 //! Transactional realization of the explicit pure-value to effect-state edge.
-use crate::{EffectGraph, EffectRuntime, Graph, Op, Schedule, TensorData};
+use super::persistent_inputs::bind_persistent_inputs;
+use crate::{EffectGraph, EffectRuntime, Graph, Op, ReplayInput, Schedule, TensorData};
 use std::collections::{BTreeMap, HashMap};
 
 /// Realizes pure producers into owned temporary values, then commits all
 /// affected persistent states through one `EffectRuntime` transaction.
 ///
-/// Only interpreter execution is accepted here. Native/device execution and
-/// state-to-pure reads stay explicit unsupported boundaries until their full
-/// lifetime and ABI contracts exist.
+/// Only interpreter execution is accepted here. Persistent state-to-pure
+/// reads are bound once per logical Graph input before pure execution;
+/// native/device execution remains an explicit unsupported boundary.
 pub fn realize_mixed_effects(
     runtime: &mut EffectRuntime,
     graph: &Graph,
@@ -61,7 +62,7 @@ pub fn realize_mixed_effects(
         value_bindings: vec![],
         state_bindings: vec![],
     };
-    let mut pure_inputs = inputs.clone();
+    let mut state_inputs = BTreeMap::new();
     for binding in &schedule.state_bindings {
         let Op::Input { name } = graph
             .op(binding.input_node)
@@ -71,32 +72,42 @@ pub fn realize_mixed_effects(
                 "state binding input is not graph input".into(),
             ));
         };
-        let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
-            super::RealizationError::Execution(format!("persistent state read: {error:?}"))
-        })?;
-        let injected = match &binding.view {
-            Some(view) => snapshot.tensor().affine_read(view),
-            None => Ok(snapshot.tensor().clone()),
-        }
-        .map_err(|error| {
-            super::RealizationError::Execution(format!("persistent state affine read: {error:?}"))
-        })?;
-        let bytes = injected
-            .len()
-            .checked_mul(injected.dtype().itemsize())
-            .ok_or_else(|| {
-                super::RealizationError::Execution("persistent state bytes overflow".into())
-            })?;
-        if injected.shape() != &binding.desc.shape
-            || injected.dtype() != binding.desc.dtype
-            || bytes != binding.desc.bytes
-        {
-            return Err(super::RealizationError::Schedule(
-                "persistent state injection descriptor mismatch".into(),
-            ));
-        }
-        pure_inputs.insert(name.clone(), injected);
+        state_inputs
+            .entry(binding.input_node)
+            .or_insert_with(|| ReplayInput {
+                name: name.clone(),
+                node: binding.input_node,
+                desc: binding.desc.clone(),
+            });
     }
+    let state_inputs = state_inputs.into_values().collect::<Vec<_>>();
+    let provided = inputs
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let pure_inputs = bind_persistent_inputs(
+        &state_inputs,
+        &schedule.state_bindings,
+        &provided,
+        |binding| {
+            let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
+                super::RealizationError::Execution(format!("persistent state read: {error:?}"))
+            })?;
+            match &binding.view {
+                Some(view) => snapshot.tensor().affine_read(view),
+                None => Ok(snapshot.tensor().clone()),
+            }
+            .map_err(|error| {
+                super::RealizationError::Execution(format!(
+                    "persistent state affine read: {error:?}"
+                ))
+            })
+        },
+        |reason| super::RealizationError::Schedule(reason.into()),
+        |reason| super::RealizationError::Schedule(reason.into()),
+    )?
+    .into_iter()
+    .collect::<HashMap<_, _>>();
     let realized = super::realize_with_options(
         graph,
         &pure,
@@ -151,9 +162,104 @@ mod tests {
     use super::*;
     use crate::schedule::{ScheduleStateBinding, bind_schedule_states};
     use crate::{
-        AffineView, BinaryOp, DType, EffectGraph, ScheduleValueBinding, Shape, Storage,
-        combine_mixed_schedules, schedule, schedule_effects,
+        AffineView, BinaryOp, BufferState, DType, EffectGraph, ScheduleValueBinding, Shape,
+        Storage, combine_mixed_schedules, schedule, schedule_effects, schedule_many,
     };
+
+    fn normal_and_transposed_state_fixture() -> (
+        Graph,
+        EffectGraph,
+        Schedule,
+        EffectRuntime,
+        BufferState,
+        BufferState,
+    ) {
+        let mut graph = Graph::new();
+        let state_input = graph.input_dtype("state", [2, 3], DType::F32);
+        let normal = graph.neg(state_input).unwrap();
+        let transposed_view = graph.permute(state_input, [1, 0]).unwrap();
+        let transposed = graph.neg(transposed_view).unwrap();
+        let pure = schedule_many(&graph, &[normal, transposed]).unwrap();
+        let persistent = BufferState {
+            buffer: 17,
+            version: 0,
+            shape: Shape::from([2, 3]),
+            dtype: DType::F32,
+            bytes: 24,
+        };
+        let mut state_bindings = Vec::new();
+        for item in &pure.items {
+            for input in &item.input_bindings {
+                if input.input_node == state_input {
+                    state_bindings.push(ScheduleStateBinding {
+                        state: persistent.clone(),
+                        view: None,
+                        consumer_item: item.id,
+                        consumer_node: item.node,
+                        input_node: state_input,
+                        desc: input.desc.clone(),
+                        abi_index: input.abi_index,
+                    });
+                }
+            }
+        }
+        assert_eq!(state_bindings.len(), 2);
+        assert_ne!(state_bindings[0].desc.view, state_bindings[1].desc.view);
+        let pure = bind_schedule_states(pure, state_bindings).unwrap();
+        let producer_item = pure
+            .items
+            .iter()
+            .position(|item| item.node == transposed)
+            .unwrap();
+        let producer_output = pure.items[producer_item].primary_output().clone();
+
+        let mut effects = EffectGraph::default();
+        let target = effects
+            .insert(
+                100,
+                TensorData::from_storage([3, 2], Storage::F32(vec![0.; 6])).unwrap(),
+            )
+            .unwrap();
+        let source = effects
+            .insert(
+                transposed.index() as u64,
+                TensorData::from_storage([3, 2], Storage::F32(vec![0.; 6])).unwrap(),
+            )
+            .unwrap();
+        let next = effects.assign(&target, &source).unwrap();
+        let effect = schedule_effects(&effects).unwrap();
+        let binding = ScheduleValueBinding {
+            producer_item: producer_item as u64,
+            producer_node: transposed,
+            producer_output,
+            abi_index: 0,
+            effect_item: 0,
+            source_position: 0,
+        };
+        let mixed = combine_mixed_schedules(pure, effect, vec![binding]).unwrap();
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(
+                persistent.buffer,
+                TensorData::from_storage([2, 3], Storage::F32(vec![1., 2., 3., 4., 5., 6.]))
+                    .unwrap(),
+            )
+            .unwrap();
+        runtime
+            .register(
+                target.state().buffer,
+                TensorData::from_storage([3, 2], Storage::F32(vec![0.; 6])).unwrap(),
+            )
+            .unwrap();
+        (
+            graph,
+            effects,
+            mixed,
+            runtime,
+            persistent,
+            next.state().clone(),
+        )
+    }
 
     #[test]
     fn add_is_staged_then_committed_as_one_persistent_transaction() {
@@ -353,5 +459,105 @@ mod tests {
             runtime.snapshot(next.state()).unwrap().tensor().storage(),
             &Storage::F32(vec![14., 23., 32., 41.])
         );
+    }
+
+    #[test]
+    fn one_state_input_serves_normal_and_transposed_pure_consumers() {
+        let (graph, effects, mixed, mut runtime, persistent, next) =
+            normal_and_transposed_state_fixture();
+        realize_mixed_effects(
+            &mut runtime,
+            &graph,
+            &effects,
+            &mixed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.snapshot(&persistent).unwrap().tensor().storage(),
+            &Storage::F32(vec![1., 2., 3., 4., 5., 6.])
+        );
+        assert_eq!(
+            runtime.snapshot(&next).unwrap().tensor().storage(),
+            &Storage::F32(vec![-1., -4., -2., -5., -3., -6.])
+        );
+    }
+
+    #[test]
+    fn conflicting_state_consumers_fail_before_pure_execution_or_commit() {
+        let (graph, effects, mut mixed, mut runtime, persistent, next) =
+            normal_and_transposed_state_fixture();
+        mixed.state_bindings[1].state.buffer = 18;
+        let error = realize_mixed_effects(
+            &mut runtime,
+            &graph,
+            &effects,
+            &mixed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::super::RealizationError::Schedule(message)
+                if message == "persistent state input has conflicting consumer bindings"
+        ));
+        assert_eq!(
+            runtime.snapshot(&persistent).unwrap().tensor().storage(),
+            &Storage::F32(vec![1., 2., 3., 4., 5., 6.])
+        );
+        assert!(runtime.snapshot(&next).is_err());
+
+        let (graph, effects, mut mixed, mut runtime, persistent, next) =
+            normal_and_transposed_state_fixture();
+        mixed.state_bindings[1].view = Some(AffineView::identity(Shape::from([2, 3])));
+        let error = realize_mixed_effects(
+            &mut runtime,
+            &graph,
+            &effects,
+            &mixed,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::super::RealizationError::Schedule(message)
+                if message == "persistent state input has conflicting consumer bindings"
+        ));
+        assert_eq!(
+            runtime.snapshot(&persistent).unwrap().tensor().storage(),
+            &Storage::F32(vec![1., 2., 3., 4., 5., 6.])
+        );
+        assert!(runtime.snapshot(&next).is_err());
+    }
+
+    #[test]
+    fn external_input_cannot_shadow_persistent_state_binding() {
+        let (graph, effects, mixed, mut runtime, persistent, next) =
+            normal_and_transposed_state_fixture();
+        let error = realize_mixed_effects(
+            &mut runtime,
+            &graph,
+            &effects,
+            &mixed,
+            &HashMap::from([(
+                "state".into(),
+                TensorData::from_storage([2, 3], Storage::F32(vec![9.; 6])).unwrap(),
+            )]),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::super::RealizationError::Schedule(message)
+                if message == "external input shadows persistent state binding"
+        ));
+        assert_eq!(
+            runtime.snapshot(&persistent).unwrap().tensor().storage(),
+            &Storage::F32(vec![1., 2., 3., 4., 5., 6.])
+        );
+        assert!(runtime.snapshot(&next).is_err());
     }
 }

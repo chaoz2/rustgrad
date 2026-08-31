@@ -2,6 +2,7 @@
 //!
 //! This type intentionally owns only logical schedule/state metadata. Runtime
 //! leases, slot generations, pointers, and current bytes remain caller-owned.
+use super::persistent_inputs::bind_persistent_inputs;
 use crate::uop::artifact::{ArtifactError, Reader, Writer, checksum};
 use crate::{
     BufferDesc, BufferState, CapturedSchedule, EffectPayload, MixedStateRebinding, NodeId,
@@ -101,81 +102,6 @@ pub struct NativeMixedReplayTrace {
     pub pure_item_cache_keys: Vec<u64>,
 }
 
-fn same_persistent_input_descriptor(lhs: &BufferDesc, rhs: &BufferDesc) -> bool {
-    lhs.id == rhs.id
-        && lhs.shape == rhs.shape
-        && lhs.dtype == rhs.dtype
-        && lhs.bytes == rhs.bytes
-        && lhs.alignment == rhs.alignment
-        && lhs.read_only == rhs.read_only
-}
-
-/// Binds each logical persistent Graph input exactly once. Individual
-/// consumers retain their own `BufferDesc::view` in the scheduled ABI, so a
-/// normal read and a transposed read of the same state legitimately have
-/// different consumer descriptors. Every physical field, the persistent
-/// identity, and the optional state-to-input view must still agree.
-fn bind_persistent_inputs(
-    capture_inputs: &[ReplayInput],
-    bindings: &[ScheduleStateBinding],
-    provided: &BTreeMap<String, crate::TensorData>,
-    mut resolve: impl FnMut(&ScheduleStateBinding) -> Result<crate::TensorData, ReplayError>,
-) -> Result<BTreeMap<String, crate::TensorData>, ReplayError> {
-    let mut inputs = provided.clone();
-    let mut injected =
-        BTreeMap::<NodeId, (BufferState, Option<crate::AffineView>, BufferDesc)>::new();
-    for binding in bindings {
-        let input = capture_inputs
-            .iter()
-            .find(|input| input.node == binding.input_node)
-            .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
-        if provided.contains_key(&input.name) {
-            return Err(ReplayError::Descriptor(
-                "external input shadows persistent state binding".into(),
-            ));
-        }
-        if !same_persistent_input_descriptor(&binding.desc, &input.desc) {
-            return Err(ReplayError::Corrupt(
-                "persistent state consumer has incompatible base descriptor".into(),
-            ));
-        }
-        if let Some((state, view, desc)) = injected.get(&binding.input_node) {
-            if state != &binding.state
-                || view != &binding.view
-                || !same_persistent_input_descriptor(desc, &binding.desc)
-            {
-                return Err(ReplayError::Corrupt(
-                    "persistent state input has conflicting consumer bindings".into(),
-                ));
-            }
-            continue;
-        }
-        let value = resolve(binding)?;
-        if value.shape() != &input.desc.shape
-            || value.dtype() != input.desc.dtype
-            || value.len().checked_mul(value.dtype().itemsize()) != Some(input.desc.bytes)
-        {
-            return Err(ReplayError::Descriptor(
-                "persistent state input descriptor mismatch".into(),
-            ));
-        }
-        if inputs.insert(input.name.clone(), value).is_some() {
-            return Err(ReplayError::Corrupt(
-                "persistent state input name is duplicated".into(),
-            ));
-        }
-        injected.insert(
-            binding.input_node,
-            (
-                binding.state.clone(),
-                binding.view.clone(),
-                binding.desc.clone(),
-            ),
-        );
-    }
-    Ok(inputs)
-}
-
 /// Validated, detached input binding for one mixed capture. It has no runtime
 /// lease and performs neither pure execution nor persistent mutation.
 #[allow(dead_code)]
@@ -226,6 +152,8 @@ impl<'a> BoundMixedCapture<'a> {
                 .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
                 Ok(value)
             },
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
         )?;
         Ok(Self {
             capture,
@@ -601,6 +529,8 @@ impl CapturedMixedSchedule {
                 .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
                 Ok(value)
             },
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
         )?;
         let values = match native {
             Some((executor, vectorized)) => {
@@ -884,6 +814,8 @@ impl CapturedMixedSchedule {
                 })?;
                 Ok(value)
             },
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
         )?;
         let values = super::captured_replay::replay_interpreter_items(&pure_capture, &inputs)?;
         let outputs = self
@@ -986,6 +918,8 @@ impl CapturedMixedSchedule {
                 })?;
                 Ok(value)
             },
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
         )?;
         preflight_effect_states(self, &schedule, runtime)?;
         let values = super::captured_replay::replay_native_items(
@@ -1517,22 +1451,93 @@ mod recurrent_tests {
                 calls.set(calls.get() + 1);
                 Ok(value.clone())
             },
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
         )
         .unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(inputs.get("state"), Some(&value));
 
-        let mut conflicting = bindings;
+        let mut conflicting = bindings.clone();
         conflicting[1].state.buffer = 18;
-        let error = bind_persistent_inputs(&[input], &conflicting, &BTreeMap::new(), |_| {
-            Ok(value.clone())
-        })
+        calls.set(0);
+        let error = bind_persistent_inputs(
+            std::slice::from_ref(&input),
+            &conflicting,
+            &BTreeMap::new(),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(value.clone())
+            },
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
+        )
         .unwrap_err();
         assert!(matches!(
             error,
             ReplayError::Corrupt(message)
                 if message == "persistent state input has conflicting consumer bindings"
         ));
+        assert_eq!(calls.get(), 1);
+
+        let mut conflicting = bindings.clone();
+        conflicting[1].view = Some(crate::AffineView::identity(Shape::from([2, 3])));
+        let error = bind_persistent_inputs(
+            std::slice::from_ref(&input),
+            &conflicting,
+            &BTreeMap::new(),
+            |_| Ok(value.clone()),
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ReplayError::Corrupt(message)
+                if message == "persistent state input has conflicting consumer bindings"
+        ));
+
+        let mut incompatible = bindings.clone();
+        incompatible[1].desc.alignment = 8;
+        calls.set(0);
+        let error = bind_persistent_inputs(
+            std::slice::from_ref(&input),
+            &incompatible,
+            &BTreeMap::new(),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(value.clone())
+            },
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ReplayError::Corrupt(message)
+                if message == "persistent state consumer has incompatible base descriptor"
+        ));
+        assert_eq!(calls.get(), 1);
+
+        calls.set(0);
+        let error = bind_persistent_inputs(
+            &[input],
+            &bindings,
+            &BTreeMap::from([("state".into(), value.clone())]),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(value.clone())
+            },
+            |reason| ReplayError::Corrupt(reason.into()),
+            |reason| ReplayError::Descriptor(reason.into()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ReplayError::Descriptor(message)
+                if message == "external input shadows persistent state binding"
+        ));
+        assert_eq!(calls.get(), 0);
     }
 
     fn fixture(buffer: u64) -> (CapturedMixedSchedule, EffectRuntime) {
