@@ -504,9 +504,18 @@ artifact, runs its supported pure prefix through the existing native JIT cache,
 and commits only detached outputs through that same transaction. Its stable
 trace identity binds RGSM contents, ABI sidecars, pure cache keys, renderer
 target, and vector policy—never leases, slots, generations, pointers, or
-current bytes. Unsupported native pure items remain fail-closed; the separately
-bounded mixed-batch adapters below are the only device-prefix path. Read-only
-runtime statistics expose
+current bytes. `MixedReplayCursor` adds an in-memory interpreter-only recurrent
+frontier for one exact RGSM identity. It contains only the canonical logical
+buffer/version descriptors required by persistent reads and writes. Each step
+uses those versions to snapshot detached candidates, preserves the requested
+pure outputs, stages all effect successors through the existing mixed-batch
+seam, and advances the cursor only after the one `EffectRuntime` commit
+succeeds. Wrong-capture, incomplete, stale-runtime, descriptor, input-shadowing,
+execution, and injected failures leave both runtime and cursor unchanged. The
+cursor is not serialized, adds no RGSM/RGMB wire fields, and has no native or
+device replay claim. Unsupported native pure items remain fail-closed; the
+separately bounded mixed-batch adapters below are the only device-prefix path.
+Read-only runtime statistics expose
 lease/view/sentinel liveness but never backing capacity or pointers.
 Capture/artifact and autograd entry points reject effects explicitly. Affine
 aliases, HostSlotPool alias-version liveness integration, device effects, effect

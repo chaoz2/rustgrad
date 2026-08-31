@@ -41,6 +41,55 @@ pub struct MixedReplayResult {
     pub native_trace: Option<NativeMixedReplayTrace>,
 }
 
+/// Logical persistent-state frontier for recurrent replay of one exact mixed
+/// capture. The cursor owns only buffer/version tensor descriptors; runtime
+/// slots, host pointers, storage generations, and tensor bytes remain owned by
+/// [`crate::EffectRuntime`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MixedReplayCursor {
+    capture_identity: u64,
+    frontier: Vec<BufferState>,
+}
+
+impl MixedReplayCursor {
+    /// Creates the initial cursor for `capture`. `frontier` must be the exact
+    /// canonical version-zero state set required by its persistent reads and
+    /// writes. Use [`CapturedMixedSchedule::initial_recurrent_cursor`] when the
+    /// capture-declared frontier is desired directly.
+    pub fn new(
+        capture: &CapturedMixedSchedule,
+        frontier: impl IntoIterator<Item = BufferState>,
+    ) -> Result<Self, ReplayError> {
+        validate(capture, true)?;
+        let expected = recurrent_initial_frontier(capture)?;
+        let frontier = canonical_frontier(frontier)?;
+        if frontier != expected {
+            return Err(ReplayError::Descriptor(
+                "recurrent cursor initial state frontier mismatch".into(),
+            ));
+        }
+        Ok(Self {
+            capture_identity: identity(capture)?,
+            frontier,
+        })
+    }
+
+    /// Stable logical RGSM identity accepted by this cursor.
+    pub fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+
+    /// Canonical buffer-ordered persistent descriptors at the next replay.
+    pub fn frontier(&self) -> &[BufferState] {
+        &self.frontier
+    }
+}
+
+struct StagedMixedReplay {
+    entry: crate::EffectBatchEntry,
+    outputs: Vec<crate::TensorData>,
+}
+
 /// Stable logical identity of a strict-native mixed replay. The native JIT
 /// retains ownership of compiled-item reuse; this trace binds that reuse to
 /// the decoded RGSM schema without creating a second cache.
@@ -349,6 +398,56 @@ impl CapturedMixedSchedule {
         self.states.iter().filter(|state| state.version == 0)
     }
 
+    /// Creates the canonical version-zero cursor for repeated interpreter
+    /// replay. Only persistent states actually required by this capture enter
+    /// the frontier; pure value bindings never manufacture runtime buffers.
+    pub fn initial_recurrent_cursor(&self) -> Result<MixedReplayCursor, ReplayError> {
+        MixedReplayCursor::new(self, recurrent_initial_frontier(self)?)
+    }
+
+    /// Replays one recurrent interpreter step against `cursor`'s exact logical
+    /// state frontier. Pure outputs and all effect candidates are detached
+    /// before the one [`crate::EffectRuntime`] batch commit. The cursor advances
+    /// only after that commit succeeds, so every validation, execution, or
+    /// injected failure leaves both runtime state and cursor unchanged.
+    pub fn replay_recurrent(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        cursor: &mut MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        injected_failure: Option<u64>,
+    ) -> Result<MixedReplayResult, ReplayError> {
+        validate(self, true)?;
+        validate_recurrent_cursor(self, cursor)?;
+
+        let starts = recurrent_rebase_starts(self, cursor)?;
+        let mut candidates = BTreeMap::new();
+        for state in &cursor.frontier {
+            let value = runtime
+                .snapshot(state)
+                .map_err(|error| ReplayError::Execute(format!("recurrent preflight: {error:?}")))?
+                .tensor()
+                .clone();
+            candidates.insert(state.clone(), value);
+        }
+
+        let staged = self.stage(&mut candidates, starts, provided, None, true)?;
+        let batch = crate::EffectBatch::new(vec![staged.entry])
+            .map_err(|error| ReplayError::Execute(format!("recurrent stage: {error:?}")))?;
+        let next_frontier = recurrent_advanced_frontier(&cursor.frontier, &batch)?;
+        let injected_failure =
+            injected_failure.map(|step| crate::EffectBatchStep { entry: 0, step });
+        let committed = runtime
+            .execute_batch(&batch, injected_failure)
+            .map_err(|error| ReplayError::Execute(format!("recurrent commit: {error:?}")))?;
+        cursor.frontier = next_frontier;
+        Ok(MixedReplayResult {
+            outputs: staged.outputs,
+            committed,
+            native_trace: None,
+        })
+    }
+
     /// Stages this capture against caller-owned detached candidates. This is
     /// deliberately the shared batch seam: it never observes a runtime lease
     /// and never commits a persistent write.
@@ -358,7 +457,7 @@ impl CapturedMixedSchedule {
         starts: BTreeMap<u64, BufferState>,
         provided: &BTreeMap<String, crate::TensorData>,
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
-        self.stage(candidates, starts, provided, None)
+        Ok(self.stage(candidates, starts, provided, None, false)?.entry)
     }
 
     fn stage(
@@ -367,7 +466,8 @@ impl CapturedMixedSchedule {
         starts: BTreeMap<u64, BufferState>,
         provided: &BTreeMap<String, crate::TensorData>,
         native: Option<(&super::captured_replay::CapturedReplayExecutor, bool)>,
-    ) -> Result<crate::EffectBatchEntry, ReplayError> {
+        preserve_requested: bool,
+    ) -> Result<StagedMixedReplay, ReplayError> {
         validate(self, true)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
@@ -414,6 +514,13 @@ impl CapturedMixedSchedule {
             .iter()
             .map(|b| b.producer_output.id)
             .collect();
+        if preserve_requested {
+            for requested in &self.schedule.requested {
+                if !pure.requested.contains(requested) {
+                    pure.requested.push(*requested);
+                }
+            }
+        }
         pure.identity = 0;
         let mut inputs = provided.clone();
         for binding in &self.state_bindings {
@@ -450,7 +557,17 @@ impl CapturedMixedSchedule {
             }
             None => super::captured_replay::replay_interpreter_items(&pure, &inputs)?,
         };
-        self.stage_values(candidates, starts, values)
+        let outputs = if preserve_requested {
+            self.schedule
+                .requested
+                .iter()
+                .map(|id| values.tensor(*id, "requested mixed output").cloned())
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let entry = self.stage_values(candidates, starts, values)?;
+        Ok(StagedMixedReplay { entry, outputs })
     }
 
     pub(crate) fn stage_values(
@@ -1127,6 +1244,441 @@ fn preflight_effect_states(
         })?;
     }
     Ok(())
+}
+
+fn canonical_frontier(
+    states: impl IntoIterator<Item = BufferState>,
+) -> Result<Vec<BufferState>, ReplayError> {
+    let mut frontier = BTreeMap::new();
+    for state in states {
+        crate::effects::validate_buffer_state(&state)
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let buffer = state.buffer;
+        if frontier.insert(buffer, state).is_some() {
+            return Err(ReplayError::Descriptor(format!(
+                "duplicate recurrent cursor buffer {buffer}"
+            )));
+        }
+    }
+    Ok(frontier.into_values().collect())
+}
+
+fn recurrent_initial_frontier(
+    capture: &CapturedMixedSchedule,
+) -> Result<Vec<BufferState>, ReplayError> {
+    let schedule = Schedule {
+        items: capture.schedule.items.clone(),
+        value_bindings: capture.value_bindings.clone(),
+        state_bindings: capture.state_bindings.clone(),
+    };
+    let plan = effect_plan(&schedule)?;
+    let pure_source_steps = capture
+        .value_bindings
+        .iter()
+        .map(|binding| {
+            effect_payload(&schedule.items[binding.effect_item as usize])
+                .map(|payload| payload.step)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut required = capture
+        .state_bindings
+        .iter()
+        .map(|binding| binding.state.buffer)
+        .collect::<BTreeSet<_>>();
+    for step in &plan.steps {
+        required.insert(step.write.buffer);
+        required.insert(step.reads[0].buffer);
+        if !pure_source_steps.contains(&step.id) {
+            required.insert(step.reads[1].buffer);
+        }
+    }
+
+    let mut frontier = Vec::with_capacity(required.len());
+    for buffer in required {
+        let initial = capture
+            .states
+            .iter()
+            .find(|state| state.buffer == buffer && state.version == 0)
+            .ok_or_else(|| ReplayError::Corrupt(format!("missing initial state {buffer}")))?;
+        if capture.states.iter().any(|state| {
+            state.buffer == buffer
+                && (state.shape != initial.shape
+                    || state.dtype != initial.dtype
+                    || state.bytes != initial.bytes)
+        }) {
+            return Err(ReplayError::Corrupt(format!(
+                "recurrent state descriptor drift for buffer {buffer}"
+            )));
+        }
+        frontier.push(initial.clone());
+    }
+    canonical_frontier(frontier)
+}
+
+fn validate_recurrent_cursor(
+    capture: &CapturedMixedSchedule,
+    cursor: &MixedReplayCursor,
+) -> Result<(), ReplayError> {
+    if cursor.capture_identity != identity(capture)? {
+        return Err(ReplayError::Descriptor(
+            "recurrent cursor belongs to a different mixed capture".into(),
+        ));
+    }
+    let expected = recurrent_initial_frontier(capture)?;
+    if cursor.frontier.len() != expected.len() {
+        return Err(ReplayError::Descriptor(
+            "recurrent cursor state frontier is incomplete".into(),
+        ));
+    }
+    for (actual, initial) in cursor.frontier.iter().zip(expected) {
+        if actual.buffer != initial.buffer
+            || actual.version < initial.version
+            || actual.shape != initial.shape
+            || actual.dtype != initial.dtype
+            || actual.bytes != initial.bytes
+        {
+            return Err(ReplayError::Descriptor(
+                "recurrent cursor state descriptor mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recurrent_rebase_starts(
+    capture: &CapturedMixedSchedule,
+    cursor: &MixedReplayCursor,
+) -> Result<BTreeMap<u64, BufferState>, ReplayError> {
+    let mut starts = cursor
+        .frontier
+        .iter()
+        .cloned()
+        .map(|state| (state.buffer, state))
+        .collect::<BTreeMap<_, _>>();
+    let mut steps = BTreeSet::new();
+    for binding in &capture.value_bindings {
+        let payload = effect_payload(&capture.schedule.items[binding.effect_item as usize])?;
+        if !steps.insert(payload.step) {
+            return Err(ReplayError::Corrupt(format!(
+                "duplicate recurrent pure source for effect step {}",
+                payload.step
+            )));
+        }
+        let source = capture
+            .states
+            .iter()
+            .find(|state| state.buffer == payload.source.buffer && state.version == 0)
+            .ok_or_else(|| {
+                ReplayError::Corrupt(format!(
+                    "missing recurrent pure-source descriptor {}",
+                    payload.source.buffer
+                ))
+            })?
+            .clone();
+        if payload.source.version != 0
+            || source.shape != payload.source.shape
+            || source.dtype != payload.source.dtype
+            || source.bytes != payload.source.bytes
+        {
+            return Err(ReplayError::Corrupt(format!(
+                "recurrent pure-source descriptor mismatch for buffer {}",
+                payload.source.buffer
+            )));
+        }
+        match starts.get(&source.buffer) {
+            Some(previous) if previous != &source => {
+                return Err(ReplayError::Corrupt(format!(
+                    "recurrent rebase descriptor conflict for buffer {}",
+                    source.buffer
+                )));
+            }
+            Some(_) => {}
+            None => {
+                starts.insert(source.buffer, source);
+            }
+        }
+    }
+    Ok(starts)
+}
+
+fn recurrent_advanced_frontier(
+    current: &[BufferState],
+    batch: &crate::EffectBatch,
+) -> Result<Vec<BufferState>, ReplayError> {
+    let mut next = current
+        .iter()
+        .cloned()
+        .map(|state| (state.buffer, state))
+        .collect::<BTreeMap<_, _>>();
+    for rebased in batch
+        .rebased_steps()
+        .map_err(|error| ReplayError::Execute(format!("recurrent stage: {error:?}")))?
+    {
+        let initial = next
+            .get(&rebased.step.write.buffer)
+            .ok_or_else(|| ReplayError::Corrupt("recurrent write has no frontier state".into()))?;
+        if rebased.step.write.shape != initial.shape
+            || rebased.step.write.dtype != initial.dtype
+            || rebased.step.write.bytes != initial.bytes
+        {
+            return Err(ReplayError::Descriptor(
+                "recurrent write descriptor mismatch".into(),
+            ));
+        }
+        next.insert(rebased.step.write.buffer, rebased.step.write);
+    }
+    canonical_frontier(next.into_values())
+}
+
+#[cfg(test)]
+mod recurrent_tests {
+    use super::*;
+    use crate::{
+        BinaryOp, DType, EffectGraph, EffectRuntime, Graph, ScheduleStateBinding,
+        ScheduleValueBinding, Storage, TensorData, bind_schedule_states, combine_mixed_schedules,
+        schedule, schedule_effects,
+    };
+
+    fn fixture(buffer: u64) -> (CapturedMixedSchedule, EffectRuntime) {
+        let mut graph = Graph::new();
+        let state = graph.input_dtype("state", [2], DType::F32);
+        let delta = graph.input_dtype("delta", [2], DType::F32);
+        let sum = graph.binary(BinaryOp::Add, state, delta).unwrap();
+        let pure = schedule(&graph, sum).unwrap();
+        let mut captured = CapturedSchedule::capture(&graph, &pure, &[sum]).unwrap();
+        let state_input = pure.items[0]
+            .input_bindings
+            .iter()
+            .find(|binding| binding.input_node == state)
+            .unwrap()
+            .clone();
+
+        let mut effects = EffectGraph::default();
+        let target = effects
+            .insert(
+                buffer,
+                TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+            )
+            .unwrap();
+        let source = effects
+            .insert(
+                sum.index() as u64,
+                TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+            )
+            .unwrap();
+        let next = effects.assign(&target, &source).unwrap();
+        let pure = bind_schedule_states(
+            pure,
+            vec![ScheduleStateBinding {
+                state: target.state().clone(),
+                view: None,
+                consumer_item: 0,
+                consumer_node: sum,
+                input_node: state,
+                desc: state_input.desc,
+                abi_index: state_input.abi_index,
+            }],
+        )
+        .unwrap();
+        let binding = ScheduleValueBinding {
+            producer_item: 0,
+            producer_node: sum,
+            producer_output: pure.items[0].primary_output().clone(),
+            abi_index: 0,
+            effect_item: 0,
+            source_position: 0,
+        };
+        let mixed =
+            combine_mixed_schedules(pure, schedule_effects(&effects).unwrap(), vec![binding])
+                .unwrap();
+        captured.items = mixed.items.clone();
+        let captured = CapturedMixedSchedule::from_parts(
+            captured,
+            &mixed,
+            vec![
+                target.state().clone(),
+                source.state().clone(),
+                next.state().clone(),
+            ],
+        )
+        .unwrap();
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(
+                buffer,
+                TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+            )
+            .unwrap();
+        (captured, runtime)
+    }
+
+    fn delta(value: f32) -> BTreeMap<String, TensorData> {
+        BTreeMap::from([(
+            "delta".into(),
+            TensorData::from_storage([2], Storage::F32(vec![value, value])).unwrap(),
+        )])
+    }
+
+    fn frontier_values(runtime: &EffectRuntime, cursor: &MixedReplayCursor) -> Vec<TensorData> {
+        cursor
+            .frontier()
+            .iter()
+            .map(|state| runtime.snapshot(state).unwrap().tensor().clone())
+            .collect()
+    }
+
+    #[test]
+    fn recurrent_replay_preserves_outputs_and_advances_one_logical_frontier() {
+        let (capture, mut runtime) = fixture(300);
+        let artifact = capture.to_bytes().unwrap();
+        let mut cursor = capture.initial_recurrent_cursor().unwrap();
+        let identity = cursor.capture_identity();
+        assert_eq!(cursor.frontier().len(), 1);
+        assert_eq!(cursor.frontier()[0].buffer, 300);
+        let pure_source =
+            effect_payload(&capture.schedule.items[capture.value_bindings[0].effect_item as usize])
+                .unwrap()
+                .source
+                .buffer;
+        assert!(
+            !cursor
+                .frontier()
+                .iter()
+                .any(|state| state.buffer == pure_source)
+        );
+
+        for (version, expected) in [(1, 1.0), (2, 2.0), (3, 3.0)] {
+            let replay = capture
+                .replay_recurrent(&mut runtime, &mut cursor, &delta(1.0), None)
+                .unwrap();
+            assert_eq!(cursor.capture_identity(), identity);
+            assert_eq!(cursor.frontier()[0].version, version);
+            assert_eq!(replay.committed, cursor.frontier());
+            assert_eq!(replay.outputs.len(), 1);
+            assert_eq!(
+                replay.outputs[0].storage(),
+                &Storage::F32(vec![expected, expected])
+            );
+            assert_eq!(
+                frontier_values(&runtime, &cursor)[0].storage(),
+                &Storage::F32(vec![expected, expected])
+            );
+        }
+        assert_eq!(capture.to_bytes().unwrap(), artifact);
+    }
+
+    #[test]
+    fn recurrent_cursor_rejects_wrong_incomplete_and_mismatched_frontiers() {
+        let (capture, _) = fixture(310);
+        let initial = capture.initial_recurrent_cursor().unwrap();
+        assert!(MixedReplayCursor::new(&capture, Vec::new()).is_err());
+        let mut wrong = initial.frontier()[0].clone();
+        wrong.shape = crate::Shape::from([1]);
+        wrong.bytes = DType::F32.itemsize();
+        assert!(MixedReplayCursor::new(&capture, [wrong]).is_err());
+
+        let (other, mut other_runtime) = fixture(311);
+        let mut foreign = initial.clone();
+        assert!(
+            other
+                .replay_recurrent(&mut other_runtime, &mut foreign, &delta(1.0), None)
+                .is_err()
+        );
+        assert_eq!(foreign, initial);
+        assert_eq!(
+            frontier_values(&other_runtime, &other.initial_recurrent_cursor().unwrap())[0]
+                .storage(),
+            &Storage::F32(vec![0.0, 0.0])
+        );
+
+        let (descriptor_capture, _) = fixture(312);
+        let descriptor_initial = descriptor_capture.initial_recurrent_cursor().unwrap();
+        let mut descriptor_cursor = descriptor_initial.clone();
+        let mut descriptor_runtime = EffectRuntime::new();
+        descriptor_runtime
+            .register(
+                312,
+                TensorData::from_storage([1], Storage::F32(vec![7.0])).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            descriptor_capture
+                .replay_recurrent(
+                    &mut descriptor_runtime,
+                    &mut descriptor_cursor,
+                    &delta(1.0),
+                    None,
+                )
+                .is_err()
+        );
+        assert_eq!(descriptor_cursor, descriptor_initial);
+        assert_eq!(
+            descriptor_runtime
+                .snapshot(&BufferState {
+                    buffer: 312,
+                    version: 0,
+                    shape: crate::Shape::from([1]),
+                    dtype: DType::F32,
+                    bytes: DType::F32.itemsize(),
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::F32(vec![7.0])
+        );
+    }
+
+    #[test]
+    fn recurrent_failures_leave_runtime_and_cursor_unchanged() {
+        let (capture, mut runtime) = fixture(320);
+        let initial = capture.initial_recurrent_cursor().unwrap();
+        let initial_values = frontier_values(&runtime, &initial);
+
+        let mut shadowed = initial.clone();
+        let mut inputs = delta(1.0);
+        inputs.insert(
+            "state".into(),
+            TensorData::from_storage([2], Storage::F32(vec![9.0, 9.0])).unwrap(),
+        );
+        assert!(
+            capture
+                .replay_recurrent(&mut runtime, &mut shadowed, &inputs, None)
+                .is_err()
+        );
+        assert_eq!(shadowed, initial);
+        assert_eq!(frontier_values(&runtime, &initial), initial_values);
+
+        let mut injected = initial.clone();
+        assert!(
+            capture
+                .replay_recurrent(&mut runtime, &mut injected, &delta(1.0), Some(0))
+                .is_err()
+        );
+        assert_eq!(injected, initial);
+        assert_eq!(frontier_values(&runtime, &initial), initial_values);
+
+        let mut current = initial.clone();
+        capture
+            .replay_recurrent(&mut runtime, &mut current, &delta(1.0), None)
+            .unwrap();
+        let version_one = frontier_values(&runtime, &current);
+        let mut stale = initial.clone();
+        assert!(
+            capture
+                .replay_recurrent(&mut runtime, &mut stale, &delta(1.0), None)
+                .is_err()
+        );
+        assert_eq!(stale, initial);
+        assert_eq!(frontier_values(&runtime, &current), version_one);
+
+        let mut absent = capture.initial_recurrent_cursor().unwrap();
+        assert!(
+            capture
+                .replay_recurrent(&mut EffectRuntime::new(), &mut absent, &delta(1.0), None)
+                .is_err()
+        );
+        assert_eq!(absent, initial);
+    }
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
