@@ -4,7 +4,7 @@ use crate::TensorData;
 use crate::host_buffer::{
     HostBufferDesc, HostBufferError, HostBufferLease, HostPoolStats, HostSlotPool,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -333,7 +333,29 @@ impl EffectRuntime {
         let mut snapshots = BTreeMap::new();
         let mut produced = BTreeMap::<u64, BufferState>::new();
         for entry in &batch.entries {
+            let overridden_sources = entry
+                .plan
+                .steps
+                .iter()
+                .filter(|step| entry.sources.contains_key(&step.id))
+                .map(|step| step.reads[1].buffer)
+                .collect::<BTreeSet<_>>();
+            let persistent = entry
+                .plan
+                .steps
+                .iter()
+                .flat_map(|step| {
+                    let mut buffers = vec![step.write.buffer, step.reads[0].buffer];
+                    if !entry.sources.contains_key(&step.id) {
+                        buffers.push(step.reads[1].buffer);
+                    }
+                    buffers
+                })
+                .collect::<BTreeSet<_>>();
             for (buffer, start) in &entry.starts {
+                if overridden_sources.contains(buffer) && !persistent.contains(buffer) {
+                    continue;
+                }
                 if let Some(previous) = produced.get(buffer) {
                     if previous != start {
                         return Err(RuntimeError::StaleState {
@@ -815,6 +837,68 @@ mod tests {
                 .tensor()
                 .storage(),
             &Storage::I32(vec![9, 9])
+        );
+    }
+
+    #[test]
+    fn batch_source_override_does_not_require_a_runtime_source_buffer() {
+        let mut graph = EffectGraph::default();
+        let target = graph
+            .insert(10, data([2], Storage::I32(vec![1, 2])))
+            .unwrap();
+        let source = graph.insert(20, data([1], Storage::I32(vec![0]))).unwrap();
+        let next = graph.assign(&target, &source).unwrap();
+        let mut runtime = EffectRuntime::new();
+        let target = runtime
+            .register(10, data([2], Storage::I32(vec![1, 2])))
+            .unwrap();
+        let batch = EffectBatch::new(vec![super::super::EffectBatchEntry {
+            plan: graph.plan(),
+            starts: BTreeMap::from([(10, target), (20, source.state().clone())]),
+            sources: BTreeMap::from([(0, data([1], Storage::I32(vec![7])))]),
+        }])
+        .unwrap();
+
+        let committed = runtime.execute_batch(&batch, None).unwrap();
+        assert_eq!(committed, vec![next.state().clone()]);
+        assert_eq!(
+            runtime.snapshot(next.state()).unwrap().tensor().storage(),
+            &Storage::I32(vec![7, 7])
+        );
+    }
+
+    #[test]
+    fn overridden_source_is_still_validated_when_it_is_a_persistent_target() {
+        let mut graph = EffectGraph::default();
+        let target = graph
+            .insert(30, data([2], Storage::I32(vec![1, 2])))
+            .unwrap();
+        graph.assign(&target, &target).unwrap();
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(30, data([2], Storage::I32(vec![1, 2])))
+            .unwrap();
+        let stale = BufferState {
+            version: 1,
+            ..target.state().clone()
+        };
+        let batch = EffectBatch::new(vec![super::super::EffectBatchEntry {
+            plan: graph.plan(),
+            starts: BTreeMap::from([(30, stale)]),
+            sources: BTreeMap::from([(0, data([2], Storage::I32(vec![9, 9])))]),
+        }])
+        .unwrap();
+
+        assert!(matches!(
+            runtime.execute_batch(&batch, None),
+            Err(RuntimeError::StaleState {
+                buffer: 30,
+                version: 1,
+            })
+        ));
+        assert_eq!(
+            runtime.snapshot(target.state()).unwrap().tensor().storage(),
+            &Storage::I32(vec![1, 2])
         );
     }
 

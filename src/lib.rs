@@ -108,7 +108,9 @@ pub use engine::mixed_batch::{
     CapturedMixedBatch, CapturedMixedStateBundle, InstantiatedMixedBatch, MixedBatchArtifactError,
     MixedStateBundleError, NativeMixedBatchResult, NativeMixedBatchTrace, PortableMixedState,
 };
-pub use engine::mixed_capture::{CapturedMixedSchedule, MixedReplayResult, NativeMixedReplayTrace};
+pub use engine::mixed_capture::{
+    CapturedMixedSchedule, MixedReplayCursor, MixedReplayResult, NativeMixedReplayTrace,
+};
 pub use engine::mixed_rebinding::MixedStateRebinding;
 pub use engine::{
     CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
