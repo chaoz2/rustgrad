@@ -646,6 +646,33 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    if let crate::Operation::PrefixScan(plan) = kernel.operation() {
+        let desc = inputs
+            .iter()
+            .find(|desc| desc.id == plan.input.index() as u64)
+            .cloned()
+            .ok_or_else(|| ScheduleError::Binding("prefix scan input is absent".into()))?;
+        let expected_dtype =
+            crate::ir::prefix_scan_output_dtype(desc.dtype, plan.kind, plan.output);
+        if desc.shape != plan.input_shape
+            || !desc.read_only
+            || desc.view.is_some()
+            || output.shape != plan.output_shape
+            || output.dtype != plan.dtype
+            || expected_dtype != Some(plan.dtype)
+            || output.read_only
+            || output.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "prefix scan descriptor mismatch".into(),
+            ));
+        }
+        return Ok(vec![ScheduleInputBinding {
+            input_node: plan.input,
+            desc,
+            abi_index: 0,
+        }]);
+    }
     if let crate::Operation::TensorGuard(crate::TensorGuardValue {
         input,
         input_shape,
@@ -849,8 +876,12 @@ fn input_bindings(
             } else {
                 (&plan.rhs_shape, plan.rhs_dtype)
             };
-            if &desc.shape != shape || desc.dtype != dtype || !desc.read_only || desc.view.is_some()
-            {
+            let logical_shape = desc
+                .view
+                .as_ref()
+                .map(|view| &view.logical_shape)
+                .unwrap_or(&desc.shape);
+            if logical_shape != shape || desc.dtype != dtype || !desc.read_only {
                 return Err(ScheduleError::Binding(format!(
                     "matmul input buffer {buffer} descriptor mismatch"
                 )));
@@ -1317,6 +1348,22 @@ fn schedule_many_with_external(
             )
         })
         .collect::<BTreeSet<_>>();
+    // Prefix-scan payloads likewise name one dense logical input directly;
+    // unlike an elementwise Store DAG they cannot reconstruct a computed
+    // operand from its leaves during graph-free captured replay.
+    let prefix_scan_operands = needed
+        .iter()
+        .filter_map(|index| match graph.op(NodeId::from_index(*index)) {
+            Ok(Op::PrefixScan { input, .. }) => Some(input.index()),
+            _ => None,
+        })
+        .filter(|index| {
+            !matches!(
+                graph.op(NodeId::from_index(*index)),
+                Ok(Op::Input { .. } | Op::Constant(_))
+            )
+        })
+        .collect::<BTreeSet<_>>();
     // Materializing movement kernels consume dense direct operands. Any
     // computed operand, including a source-backed view, therefore becomes its
     // own producer item instead of being silently replaced by its leaves.
@@ -1386,6 +1433,7 @@ fn schedule_many_with_external(
                 )
                 && (requested.contains(index)
                     || matmul_operands.contains(index)
+                    || prefix_scan_operands.contains(index)
                     || movement_operands.contains(index)
                     || computed_view_sources.contains(index)
                     || (consumers[*index] > 1

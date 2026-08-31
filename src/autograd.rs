@@ -1488,6 +1488,33 @@ impl Graph {
     fn unbroadcast(&mut self, gradient: NodeId, shape: Shape) -> Result<NodeId> {
         if self.node(gradient)?.shape == shape {
             Ok(gradient)
+        } else if self.node(gradient)?.dtype == DType::F32 {
+            // A concrete F32 sum-to is exactly a keepdim sum over leading and
+            // singleton target axes followed by a reshape. Keep the dedicated
+            // SumTo node for other storage contracts, whose accumulation may
+            // intentionally differ, while making the common training VJP an
+            // executable ordinary schedule rather than a CPU-only graph op.
+            let source = self.node(gradient)?.shape.clone();
+            let padding = source.rank() - shape.rank();
+            let mut axes = (0..padding)
+                .map(|axis| isize::try_from(axis).map_err(|_| Error::ShapeOverflow(source.clone())))
+                .collect::<Result<Vec<_>>>()?;
+            axes.extend(
+                shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(target_axis, target_dim)| {
+                        let source_axis = target_axis + padding;
+                        (*target_dim == 1 && source.dims()[source_axis] != 1).then_some(source_axis)
+                    })
+                    .map(|axis| {
+                        isize::try_from(axis).map_err(|_| Error::ShapeOverflow(source.clone()))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            let reduced = self.reduce(gradient, crate::ReduceKind::Sum, Some(axes), true)?;
+            self.reshape(reduced, shape)
         } else {
             self.sum_to(gradient, shape)
         }

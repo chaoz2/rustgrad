@@ -230,7 +230,9 @@ impl Backend for CpuBackend {
                     axis,
                     kind,
                     output,
-                } => prefix_scan(&values[input.index()], *axis, *kind, *output, node.dtype)?,
+                } => {
+                    execute_prefix_scan(&values[input.index()], *axis, *kind, *output, node.dtype)?
+                }
                 Op::ArgReduce {
                     input,
                     max,
@@ -1823,7 +1825,7 @@ fn reduce(
 
 /// Inclusive row-major prefix operation. `axis` is normalized by Graph;
 /// zero extents therefore have no reads and retain their original static shape.
-fn prefix_scan(
+pub(crate) fn execute_prefix_scan(
     input: &TensorData,
     axis: usize,
     kind: crate::PrefixScanKind,

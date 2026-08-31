@@ -542,6 +542,38 @@ pub fn realize_graph_with_options(
     realize_with_options(graph, &schedule, requested, inputs, options)
 }
 
+fn is_direct_matmul(item: &crate::ScheduleItem) -> bool {
+    matches!(
+        item.kernel.operation(),
+        crate::Operation::Matmul(
+            crate::MatmulValue::Serial(_)
+                | crate::MatmulValue::Tiled(_)
+                | crate::MatmulValue::TensorCore(_)
+        )
+    )
+}
+
+/// Direct plan executors consume logical tensors rather than UOp address
+/// expressions. Resolve their consumer-local affine input view here; generic
+/// UOp items must retain the physical tensor because their IndexValue::View
+/// applies the same mapping during lane evaluation.
+pub(crate) fn direct_matmul_input<'a>(
+    item: &crate::ScheduleItem,
+    binding: &crate::ScheduleInputBinding,
+    value: &'a TensorData,
+) -> Result<std::borrow::Cow<'a, TensorData>, String> {
+    if !is_direct_matmul(item) {
+        return Ok(std::borrow::Cow::Borrowed(value));
+    }
+    match &binding.desc.view {
+        Some(view) => value
+            .affine_read(view)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|error| error.to_string()),
+        None => Ok(std::borrow::Cow::Borrowed(value)),
+    }
+}
+
 fn interpret_item(
     graph: &Graph,
     item: &crate::ScheduleItem,
@@ -601,13 +633,14 @@ fn interpret_item(
                 _ => return Err(format!("missing materialized buffer {}", desc.id)),
             }
         };
+        let value = direct_matmul_input(item, binding, &value)?.into_owned();
         let role = if matches!(graph.op(id), Ok(Op::Constant(_))) {
             BufferRole::Constant
         } else {
             BufferRole::Input
         };
         let kernel_desc =
-            KernelBufferDesc::concrete(desc.id, role, desc.shape.clone(), desc.dtype, false)
+            KernelBufferDesc::concrete(desc.id, role, value.shape().clone(), desc.dtype, false)
                 .map_err(|e| e.to_string())?;
         bindings
             .insert(&kernel_desc, value)

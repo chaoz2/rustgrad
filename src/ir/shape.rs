@@ -413,6 +413,35 @@ pub(crate) fn sum_dtype(dtype: DType) -> DType {
     }
 }
 
+pub(crate) fn prefix_scan_output_dtype(
+    input: DType,
+    kind: crate::PrefixScanKind,
+    output: crate::PrefixScanOutput,
+) -> Option<DType> {
+    match (kind, output) {
+        (crate::PrefixScanKind::Sum, crate::PrefixScanOutput::Values) => {
+            Some(if input.is_float() {
+                input
+            } else {
+                sum_dtype(input)
+            })
+        }
+        (crate::PrefixScanKind::Product, crate::PrefixScanOutput::Values)
+        | (
+            crate::PrefixScanKind::Max | crate::PrefixScanKind::Min,
+            crate::PrefixScanOutput::Values,
+        ) => Some(input),
+        (
+            crate::PrefixScanKind::Max | crate::PrefixScanKind::Min,
+            crate::PrefixScanOutput::Indices,
+        ) => Some(DType::I32),
+        (
+            crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product,
+            crate::PrefixScanOutput::Indices,
+        ) => None,
+    }
+}
+
 #[cfg(test)]
 mod sum_dtype_tests {
     use super::*;

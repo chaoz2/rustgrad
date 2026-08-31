@@ -221,13 +221,14 @@ pub use schedule::{
     schedule_effects, schedule_many, schedule_with_external_materializations,
 };
 pub use session::{
-    BinaryClassificationSummary, ClassificationSummary, CpuBinaryModuleTrainer,
+    BinaryClassificationSummary, ClassificationSummary, CompiledMomentumSgdConfig,
+    CompiledMomentumSgdStepResult, CpuBinaryModuleTrainer, CpuCompiledMomentumSgd,
     CpuModeModuleTrainer, CpuModuleTrainer, CpuSession, DynamicTensor, MetalSessionResult,
     MetalSessionTrace, ModuleBinaryCrossEntropy, ModuleCrossEntropy, ModuleInferenceResult,
     ModuleStepResult, NativeModuleExecutionReport, NativeModuleInferenceResult,
     NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult, SessionDevice, Tensor,
-    infer_module_cpu, infer_module_native_cpu, infer_module_native_cpu_with_report,
-    summarize_binary_classification, summarize_classification,
+    TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
+    infer_module_native_cpu_with_report, summarize_binary_classification, summarize_classification,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
