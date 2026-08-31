@@ -1,5 +1,5 @@
-//! Immutable CPU-JIT contract for the deliberately narrow static 1x1 NCHW
-//! convolution used by the public configured-CIFAR module workflow.
+//! Immutable CPU-JIT contract retained for legacy RGUA v10 static 1x1 NCHW
+//! convolution decode and replay.
 
 use crate::{DType, Graph, NodeId, Op, Shape, TensorData};
 use std::{
@@ -8,9 +8,10 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-/// A validated, serial 1x1 F32 NCHW convolution. This is intentionally not a
-/// general convolution plan: every omitted geometry remains a scheduler/native
-/// preflight error rather than acquiring accidental semantics.
+/// A validated, serial legacy 1x1 F32 NCHW convolution. New public forward
+/// graphs use compositional rank-generic convolution; every omitted legacy
+/// geometry remains a scheduler/native preflight error rather than acquiring
+/// accidental semantics.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StaticConv2dPlan {
     pub input: NodeId,
@@ -268,7 +269,22 @@ mod tests {
         let input = graph.input_dtype("input", [1, 3, 2, 2], dtype);
         let weight = graph.input_dtype("weight", [2, 3, 1, 1], dtype);
         let bias = graph.input_dtype("bias", [2], dtype);
-        let output = graph.conv2d(input, weight, Some(bias), options).unwrap();
+        let output_shape = crate::ir::conv2d_shape(
+            graph.shape(input).unwrap(),
+            graph.shape(weight).unwrap(),
+            options,
+        )
+        .unwrap();
+        let output = graph.push(
+            crate::Op::Conv2d {
+                input,
+                weight,
+                bias: Some(bias),
+                options,
+            },
+            output_shape,
+            dtype,
+        );
         (graph, input, weight, bias, output)
     }
 
@@ -330,17 +346,19 @@ mod tests {
         let mut grouped = Graph::new();
         let input = grouped.input_dtype("input", [1, 2, 2, 2], DType::F32);
         let weight = grouped.input_dtype("weight", [2, 1, 1, 1], DType::F32);
-        let output = grouped
-            .conv2d(
+        let output = grouped.push(
+            crate::Op::Conv2d {
                 input,
                 weight,
-                None,
-                Conv2dOptions {
+                bias: None,
+                options: Conv2dOptions {
                     groups: 2,
                     ..Conv2dOptions::default()
                 },
-            )
-            .unwrap();
+            },
+            Shape::from([1, 2, 2, 2]),
+            DType::F32,
+        );
         assert!(
             StaticConv2dPlan::from_graph(&grouped, output).is_err(),
             "groups"

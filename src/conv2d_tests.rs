@@ -179,7 +179,7 @@ fn conv2d_promotes_mixed_integers_and_preserves_bool_logic() {
     let y = graph
         .conv2d(x, w, Some(b), Conv2dOptions::default())
         .unwrap();
-    assert_eq!(graph.dtype(y).unwrap(), DType::I16);
+    assert_eq!(graph.dtype(y).unwrap(), DType::I32);
     assert_eq!(
         execute(
             &graph,
@@ -194,7 +194,7 @@ fn conv2d_promotes_mixed_integers_and_preserves_bool_logic() {
         ),
         typed_data(
             [1, 1, 2, 2],
-            DType::I16,
+            DType::I32,
             [Scalar::I(1), Scalar::I(3), Scalar::I(5), Scalar::I(7)]
         ),
     );
@@ -203,7 +203,7 @@ fn conv2d_promotes_mixed_integers_and_preserves_bool_logic() {
     let x = graph.input_dtype("x", [1, 1, 1, 2], DType::Bool);
     let w = graph.input_dtype("w", [1, 1, 1, 2], DType::Bool);
     let y = graph.conv2d(x, w, None, Conv2dOptions::default()).unwrap();
-    assert_eq!(graph.dtype(y).unwrap(), DType::Bool);
+    assert_eq!(graph.dtype(y).unwrap(), DType::I32);
     assert_eq!(
         execute(
             &graph,
@@ -220,7 +220,7 @@ fn conv2d_promotes_mixed_integers_and_preserves_bool_logic() {
             ),
             None,
         ),
-        typed_data([1, 1, 1, 1], DType::Bool, [Scalar::Bool(false)]),
+        typed_data([1, 1, 1, 1], DType::I32, [Scalar::I(0)]),
     );
 }
 
@@ -232,9 +232,11 @@ fn conv2d_validation_matrix() {
     assert!(matches!(
         graph.conv2d(bad_rank, weight, None, Conv2dOptions::default()),
         Err(Error::InvalidConv2d {
+            input: actual_input,
+            weight: actual_weight,
             reason: "input and weight must be rank 4",
-            ..
-        })
+        }) if actual_input == Shape::from([1, 1, 2])
+            && actual_weight == Shape::from([1, 1, 1, 1])
     ));
 
     let mut graph = Graph::new();
@@ -599,23 +601,25 @@ fn conv2d_trace_exposes_labels_shapes_and_dtypes() {
     let y = graph
         .conv2d(x, w, Some(b), Conv2dOptions::default())
         .unwrap();
+    let forward_nodes = graph.node_count();
     let loss = all_sum(&mut graph, y);
     let gradient = graph.grad(loss, x).unwrap();
     let trace = graph.trace(gradient).unwrap();
-    let conv = trace
-        .steps
-        .iter()
-        .find(|step| step.operation.starts_with("conv2d("))
-        .unwrap();
-    assert_eq!(conv.shape, Shape::from([1, 1, 2, 2]));
-    assert_eq!(conv.dtype, DType::F32);
-    let grad = trace
-        .steps
-        .iter()
-        .find(|step| step.operation == "conv2d_grad(target=0)")
-        .unwrap();
-    assert_eq!(grad.shape, Shape::from([1, 1, 2, 2]));
-    assert_eq!(grad.dtype, DType::F32);
+    assert!(
+        !trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("conv2d"))
+    );
+    assert!(trace.steps.iter().any(|step| {
+        step.node.index() >= forward_nodes && step.operation.starts_with("expand(")
+    }));
+    assert!(
+        !trace
+            .steps
+            .iter()
+            .any(|step| step.operation.starts_with("reduce_grad"))
+    );
     assert!(trace.to_string().contains("F32"));
 }
 

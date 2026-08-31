@@ -4,6 +4,7 @@
 //! live in [`graph`], and pure checked shape propagation lives in [`shape`].
 
 mod attention;
+mod convolution;
 mod creation;
 mod dynamic;
 mod elementwise;
@@ -22,6 +23,7 @@ mod source_gather;
 mod types;
 
 pub(crate) use attention::validate_log_softmax_plan;
+pub use convolution::{ConvolutionSpec, SpatialWindow, SpatialWindowError};
 pub use creation::PendingRandomReservation;
 pub(crate) use creation::{one_hot_bool_plan, one_hot_plan};
 pub use dynamic::{

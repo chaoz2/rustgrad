@@ -311,9 +311,9 @@ pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<
     Ok(kernel)
 }
 
-/// Lowers only the workflow-scoped, validated static F32 NCHW 1x1 Conv2d
-/// semantic. Broader graph Conv2d nodes fail here before scheduling can create
-/// a callable ABI.
+/// Lowers only the legacy RGUA v10 validated static F32 NCHW 1x1 Conv2d
+/// semantic. New public convolution graphs are compositional; broader legacy
+/// nodes fail here before scheduling can create a callable ABI.
 pub fn lower_graph_static_conv2d(
     graph: &Graph,
     output: NodeId,

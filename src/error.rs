@@ -230,6 +230,12 @@ pub enum Error {
         weight: Shape,
         reason: &'static str,
     },
+    /// Rank-neutral static convolution geometry or dtype contract failure.
+    InvalidConvolution {
+        input: Shape,
+        weight: Shape,
+        reason: &'static str,
+    },
     InvalidExpand {
         from: Shape,
         to: Shape,
@@ -494,6 +500,14 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "invalid conv2d ({reason}): input {input}, weight {weight}"
+            ),
+            Self::InvalidConvolution {
+                input,
+                weight,
+                reason,
+            } => write!(
+                f,
+                "invalid convolution ({reason}): input {input}, weight {weight}"
             ),
             Self::InvalidExpand { from, to } => write!(f, "cannot expand {from} to {to}"),
             Self::InvalidSumTo { from, to } => write!(f, "cannot reduce {from} to {to}"),

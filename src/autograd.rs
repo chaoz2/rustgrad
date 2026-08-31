@@ -1874,7 +1874,7 @@ mod tests {
         let gx = graph.grad(loss, x).unwrap();
         let gw = graph.grad(loss, w).unwrap();
         let gb = graph.grad(loss, b).unwrap();
-        assert!(graph.trace(gx).unwrap().to_string().contains("conv2d_grad"));
+        assert!(!graph.trace(gx).unwrap().to_string().contains("conv2d_grad"));
         let inputs = HashMap::from([
             (
                 "x".into(),
@@ -3105,11 +3105,11 @@ mod tests {
             data([1, 1, 1, 1], &[160.])
         );
         assert!(
-            graph
+            !graph
                 .trace(hvp)
                 .unwrap()
                 .to_string()
-                .contains("conv2d_grad_vjp")
+                .contains("conv2d_grad")
         );
     }
 }
