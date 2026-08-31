@@ -335,21 +335,26 @@ preparation and invocation; replay never reconstructs a Graph.
 
 Late `LinearKernel` construction validates a typed portable contiguous
 elementwise lane plan before C rendering. Its immutable `LinearProgram` records
-producer-first instructions, virtual definitions/uses, lane/tail metadata, live
-intervals, and deterministic scalar/vector register assignment. A backend-neutral
+producer-first generic `LaneInstruction<R>` values, exact virtual
+definitions/uses, program-wide lane/tail metadata, live intervals, and
+deterministic scalar/vector register assignment. Fixed-arity variants own typed
+value/address/index operands; stores have no result, and unsupported UOps plus
+range/sink delimiters remain exact indexed source records rather than fake lane
+instructions. A backend-neutral
 `MemorySpacePlan` consumes those assignments, validates global/register/private/
 shared identities, byte/alignment/lifetime aliases, and uniform workgroup
 barriers. Eligible homogeneous F32 matrix matmul additionally derives two
 shared tile promotions and its accumulator/register/barrier lifetimes from the
 selected `TiledMatmulPlan`; elementwise kernels still choose no shared
-promotion. `VectorProgram` is the backend-neutral physical-register instruction
-view (splat/address/index/load/cast/ALU/compare/select/store/control) with
-explicit lane mask and scalar-tail identity; CPU JIT validates and keys this
-form before portable rendering.
+promotion. `VectorProgram` maps the same `LaneInstruction` enum onto validated
+physical registers. It owns one lane width plus scalar-tail identity instead of
+cloning masks or semantic payloads into each instruction; CPU JIT validates and
+keys this form before portable rendering.
 B1/B2 CPU JIT consumes eligible VectorProgram instructions directly in physical-register order.
 Enabled vector mains must be lane-aligned, permit at most one partial tail, and
-give every instruction that same deterministic tail mask; disabled plans retain
-zero vector main elements. Malformed lane control rejects before native source
+derive one deterministic program tail mask; disabled plans retain zero vector
+main elements and no executable vector instructions. Malformed lane control,
+reaching-definition metadata, or physical register lifetime rejects before native source
 generation or cache work.
 Alongside F32/F64/bool constants, loads, neg/abs, add/sub/mul, F32/F64 `log2`, compare/select, casts, and stores,
 B2 has defined unsigned-intermediate wrapping for stored integer widths, exact Bool logical-not and
@@ -1110,9 +1115,17 @@ semantically invalid address graph cannot enter late linearization.
 This is an intentional pre-1.0 Rust source migration. `UOp::from_operation`
 is the typed constructor and `UOp::operation()` exposes the borrowed enum.
 There is no legacy opcode/argument constructor or projection that could
-recreate an invalid combination. `LinearPayload` likewise stores one typed
-`operation` instead of duplicate kind and argument fields. Downstream code
-matches `Operation` directly; only the private artifact codec translates it to
+recreate an invalid combination. Late scalar/vector planning similarly uses one
+generic `LaneInstruction<R>` whose variants own their exact fixed-arity typed
+operands and optional result. Value, address and index roles are explicit;
+stores have no result; casts and bitcasts, unary and binary logical operations,
+and core comparisons remain distinct variants. Virtual and allocated programs
+share that semantic enum through fallible operand mapping instead of parallel
+kind/payload taxonomies. A single descriptor-sequence validator checks ordered
+definitions, exact reaching metadata, lane widths and live physical bindings.
+Unsupported source UOps are retained as exact indexed `Operation` records on a
+disabled program, where scalar fallback can inspect them without manufacturing
+a lane instruction. Only the private artifact codec translates `Operation` to
 stable wire tags.
 
 The direct enum does not replace semantic boundaries. Detailed type/control
@@ -1140,7 +1153,7 @@ The current exhaustive-switch inventory is intentional and reviewable:
 | `schedule` lowering | materialization, dependencies, and fusion roots | canonical planning boundary; keep exhaustive |
 | `viz` | operation-specific names and retained payload fields | match `Operation` directly; keep presentation metadata local |
 | CPU/PTX/device renderers | backend capability and source emission | canonical backend boundaries; keep exhaustive and fail closed |
-| linear/vector instruction mapping | scalar versus vector instruction families | highest-priority follow-up after proving a shared typed contract |
+| linear/vector instruction mapping | exact lane semantics, virtual-to-physical mapping, and portable-vector admission | one generic payload-bearing instruction enum plus shared descriptor validation; backend capability remains local and fail closed |
 
 Future scheduling will turn validated effect/control UOps into kernel bodies;
 renderers will consume that scheduled form. Rewrites only touch pure nodes and

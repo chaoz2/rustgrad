@@ -950,6 +950,56 @@ fn reduction_movement_and_late_kernel_plans_are_inspectable() {
 }
 
 #[test]
+fn vector_viz_uses_the_latest_reaching_physical_definition() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", Shape::from([17]));
+    let mut output = input;
+    for _ in 0..8 {
+        output = graph.neg(output).unwrap();
+    }
+    let source = crate::lower_graph_elementwise(&graph, output).unwrap();
+    let linear = LinearKernel::from_uop(&source).unwrap();
+    let spaces = MemorySpacePlan::from_linear(&linear).unwrap();
+    let vector = VectorProgram::from_linear(&linear, &spaces).unwrap();
+    let key = |operand: &crate::VectorOperand| (operand.physical, operand.vector, operand.dtype);
+    let mut latest = std::collections::BTreeMap::new();
+    let mut definitions = std::collections::BTreeMap::<_, usize>::new();
+    let mut expected = None;
+    for instruction in &vector.instructions {
+        let view = instruction.instruction.view();
+        for (slot, input) in view.inputs().enumerate() {
+            let input_key = key(input);
+            if definitions.get(&input_key).copied().unwrap_or(0) > 1 {
+                expected = latest
+                    .get(&input_key)
+                    .copied()
+                    .map(|producer| (producer, instruction.index, slot));
+                break;
+            }
+        }
+        if expected.is_some() {
+            break;
+        }
+        if let Some(output) = view.output() {
+            let output_key = key(output);
+            *definitions.entry(output_key).or_default() += 1;
+            latest.insert(output_key, instruction.index);
+        }
+    }
+    let (producer, consumer, slot) = expected.expect("test chain must reuse a physical register");
+    let model = vector_viz(&vector, &spaces).unwrap();
+    let expected_from = format!("v{producer}");
+    let expected_to = format!("v{consumer}");
+    let expected_slot = slot.to_string();
+    assert!(model.edges().iter().any(|edge| {
+        edge.from() == expected_from.as_str()
+            && edge.to() == expected_to.as_str()
+            && edge.kind() == "value"
+            && edge.label() == expected_slot.as_str()
+    }));
+}
+
+#[test]
 fn affine_view_bindings_render_physical_and_logical_addressing() {
     let mut graph = Graph::new();
     let source = graph.input("source", [4, 1]);

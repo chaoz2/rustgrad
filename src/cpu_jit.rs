@@ -25,7 +25,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v28";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v29";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -1848,24 +1848,9 @@ fn vector_reg(
     op: &crate::VectorOperand,
     names: &BTreeMap<(u32, DType), String>,
 ) -> Result<String, JitError> {
-    match op {
-        crate::VectorOperand::Register {
-            physical, dtype, ..
-        } => names.get(&(*physical, *dtype)).cloned().ok_or_else(|| {
-            JitError::Unsupported(format!("B1 use before physical register r{physical}"))
-        }),
-        crate::VectorOperand::Global { .. } => {
-            Err(JitError::Unsupported("global operand used as value".into()))
-        }
-    }
-}
-fn vector_dtype(op: &crate::VectorOperand) -> Result<DType, JitError> {
-    match op {
-        crate::VectorOperand::Register { dtype, .. } => Ok(*dtype),
-        crate::VectorOperand::Global { .. } => {
-            Err(JitError::Unsupported("global operand type".into()))
-        }
-    }
+    names.get(&(op.physical, op.dtype)).cloned().ok_or_else(|| {
+        JitError::Unsupported(format!("B1 use before physical register r{}", op.physical))
+    })
 }
 fn unsigned_ctype(dtype: DType) -> Result<&'static str, JitError> {
     match dtype {
@@ -1986,45 +1971,34 @@ fn emit_vector_insts(
 ) -> Result<(), JitError> {
     let mut names = BTreeMap::new();
     for inst in &program.instructions {
-        let dst = inst
-            .dst
-            .as_ref()
-            .map(|op| match op {
-                crate::VectorOperand::Register {
-                    physical, dtype, ..
-                } => Ok(format!("r{}_{}_{}", physical, ctype(*dtype), inst.index)),
-                crate::VectorOperand::Global { .. } => {
-                    Err(JitError::Unsupported("global destination".into()))
-                }
-            })
-            .transpose()?;
-        let dst_ty = inst.dst.as_ref().map(vector_dtype).transpose()?;
+        let view = inst.instruction.view();
+        let dst = view
+            .output()
+            .map(|op| format!("r{}_{}_{}", op.physical, ctype(op.dtype), inst.index));
+        let dst_ty = view.output().map(|operand| operand.dtype);
         let input = |n: usize| {
-            inst.inputs
-                .get(n)
+            view.inputs()
+                .nth(n)
                 .ok_or_else(|| {
                     JitError::Unsupported(format!("B1 instruction {} missing operand", inst.index))
                 })
                 .and_then(|op| vector_reg(op, &names))
         };
-        match &inst.kind {
-            crate::VectorInstKind::Splat => {
+        match &inst.instruction {
+            crate::LaneInstruction::Constant { value, .. } => {
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 splat without destination".into()))?;
-                let (ty, literal) = match &inst.payload.operation {
-                    Operation::Const(LiteralValue::Scalar { dtype, bits })
-                    | Operation::VConst(LiteralValue::Scalar { dtype, bits }) => {
+                let (ty, literal) = match value {
+                    LiteralValue::Scalar { dtype, bits } => {
                         (dst_ty.unwrap_or(*dtype), literal_expr(*dtype, *bits))
                     }
-                    Operation::Const(LiteralValue::Int(value))
-                    | Operation::VConst(LiteralValue::Int(value)) => (
+                    LiteralValue::Int(value) => (
                         dst_ty.ok_or_else(|| {
                             JitError::Unsupported("portable constant type".into())
                         })?,
                         format!("{value}LL"),
                     ),
-                    _ => return Err(JitError::Unsupported("B1 constant payload".into())),
                 };
                 lines.push(format!(
                     "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
@@ -2036,7 +2010,9 @@ fn emit_vector_insts(
                     literal
                 ));
             }
-            crate::VectorInstKind::Address | crate::VectorInstKind::Index => {
+            crate::LaneInstruction::Address { .. }
+            | crate::LaneInstruction::Range { .. }
+            | crate::LaneInstruction::Index { .. } => {
                 if let Some(d) = dst.clone() {
                     lines.push(format!(
                         "    size_t {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={}+l;",
@@ -2048,19 +2024,20 @@ fn emit_vector_insts(
                     ));
                 }
             }
-            crate::VectorInstKind::Load { buffer } => {
+            crate::LaneInstruction::Load { index: source, .. } => {
+                let buffer = source.buffer();
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 load without destination".into()))?;
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable untyped load".into()))?;
                 let slot = ids
-                    .get(buffer)
+                    .get(&buffer)
                     .ok_or_else(|| JitError::Unsupported("B1 load unknown buffer".into()))?;
                 let scalar = abi
                     .buffers
                     .iter()
-                    .find(|b| b.id == *buffer)
+                    .find(|b| b.id == buffer)
                     .is_some_and(|b| b.elements == 1);
                 let index = if scalar {
                     "0".to_owned()
@@ -2070,7 +2047,7 @@ fn emit_vector_insts(
                 let storage = abi
                     .buffers
                     .iter()
-                    .find(|b| b.id == *buffer)
+                    .find(|b| b.id == buffer)
                     .ok_or_else(|| JitError::Unsupported("portable load ABI".into()))?
                     .dtype;
                 let load = match storage {
@@ -2093,36 +2070,33 @@ fn emit_vector_insts(
                     rhs
                 ));
             }
-            crate::VectorInstKind::Unary => {
+            crate::LaneInstruction::GraphUnary { op, .. } => {
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 unary destination".into()))?;
                 let a = input(0)?;
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable unary type".into()))?;
-                let expr = match &inst.payload.operation {
-                    crate::Operation::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
+                let expr = match op {
+                    crate::UnaryOp::Neg if ty == DType::Bool => {
                         format!("!{}[l]", a)
                     }
-                    crate::Operation::GraphUnary(crate::UnaryOp::Neg) if ty.is_float() => {
+                    crate::UnaryOp::Neg if ty.is_float() => {
                         format!("-{}[l]", a)
                     }
-                    crate::Operation::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
-                        format!("!{}[l]", a)
-                    }
-                    crate::Operation::GraphUnary(crate::UnaryOp::Abs) if ty.is_float() => {
+                    crate::UnaryOp::Abs if ty.is_float() => {
                         format!("fabs({}[l])", a)
                     }
-                    crate::Operation::GraphUnary(crate::UnaryOp::Abs)
+                    crate::UnaryOp::Abs
                         if ty == DType::Bool
                             || matches!(ty.category(), crate::DTypeCategory::Unsigned) =>
                     {
                         format!("{}[l]", a)
                     }
-                    crate::Operation::GraphUnary(crate::UnaryOp::Neg) => {
+                    crate::UnaryOp::Neg => {
                         wrap_expr(ty, format!("0-({}){}[l]", unsigned_ctype(ty)?, a))?
                     }
-                    crate::Operation::GraphUnary(crate::UnaryOp::Abs)
+                    crate::UnaryOp::Abs
                         if matches!(ty.category(), crate::DTypeCategory::Signed) =>
                     {
                         wrap_expr(
@@ -2149,16 +2123,13 @@ fn emit_vector_insts(
                     expr
                 ));
             }
-            crate::VectorInstKind::Binary => {
+            crate::LaneInstruction::GraphBinary { op, .. } => {
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 binary destination".into()))?;
                 let (a, b) = (input(0)?, input(1)?);
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable binary type".into()))?;
-                let crate::Operation::GraphBinary(op) = &inst.payload.operation else {
-                    return Err(JitError::Unsupported("portable binary opcode".into()));
-                };
                 let expr = vector_binary_expr(ty, *op, &a, &b, &format!("{base}+l"))?;
                 lines.push(format!(
                     "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
@@ -2170,19 +2141,18 @@ fn emit_vector_insts(
                     expr
                 ));
             }
-            crate::VectorInstKind::Compare => {
+            crate::LaneInstruction::Compare { op, .. } => {
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 compare destination".into()))?;
                 let (a, b) = (input(0)?, input(1)?);
-                let op = match &inst.payload.operation {
-                    crate::Operation::GraphCompare(crate::CompareOp::Eq) => "==",
-                    crate::Operation::GraphCompare(crate::CompareOp::Ne) => "!=",
-                    crate::Operation::GraphCompare(crate::CompareOp::Lt) => "<",
-                    crate::Operation::GraphCompare(crate::CompareOp::Le) => "<=",
-                    crate::Operation::GraphCompare(crate::CompareOp::Gt) => ">",
-                    crate::Operation::GraphCompare(crate::CompareOp::Ge) => ">=",
-                    _ => return Err(JitError::Unsupported("portable compare opcode".into())),
+                let op = match op {
+                    crate::CompareOp::Eq => "==",
+                    crate::CompareOp::Ne => "!=",
+                    crate::CompareOp::Lt => "<",
+                    crate::CompareOp::Le => "<=",
+                    crate::CompareOp::Gt => ">",
+                    crate::CompareOp::Ge => ">=",
                 };
                 lines.push(format!(
                     "    uint8_t {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=({}[l]{}{}[l]);",
@@ -2195,7 +2165,7 @@ fn emit_vector_insts(
                     b
                 ));
             }
-            crate::VectorInstKind::Select => {
+            crate::LaneInstruction::Select { .. } => {
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 select destination".into()))?;
@@ -2215,7 +2185,7 @@ fn emit_vector_insts(
                     b
                 ));
             }
-            crate::VectorInstKind::Cast => {
+            crate::LaneInstruction::Cast { .. } => {
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 cast destination".into()))?;
@@ -2237,15 +2207,16 @@ fn emit_vector_insts(
                     value
                 ));
             }
-            crate::VectorInstKind::Store { buffer } => {
-                let value = input(1).or_else(|_| input(0))?;
+            crate::LaneInstruction::Store { index, .. } => {
+                let buffer = index.buffer();
+                let value = input(1)?;
                 let slot = ids
-                    .get(buffer)
+                    .get(&buffer)
                     .ok_or_else(|| JitError::Unsupported("B1 store unknown buffer".into()))?;
                 let ty = abi
                     .buffers
                     .iter()
-                    .find(|b| b.id == *buffer)
+                    .find(|b| b.id == buffer)
                     .ok_or_else(|| JitError::Unsupported("portable store ABI".into()))?
                     .dtype;
                 let stored = match ty {
@@ -2262,22 +2233,26 @@ fn emit_vector_insts(
                     stored
                 ));
             }
-            crate::VectorInstKind::Control => {
-                if let Some(d) = dst.clone() {
-                    lines.push(format!(
-                        "    size_t {d}[{}]; for(size_t l=0;l<{}u;l++) {d}[l]={base}+l;",
-                        usize::from(program.lanes),
-                        active
-                    ));
-                }
+            crate::LaneInstruction::Bitcast { .. } => {
+                return Err(JitError::Unsupported("portable bitcast opcode".into()));
+            }
+            crate::LaneInstruction::CoreUnary { .. }
+            | crate::LaneInstruction::CoreBinary { .. }
+            | crate::LaneInstruction::CoreEq { .. }
+            | crate::LaneInstruction::CoreLt { .. }
+            | crate::LaneInstruction::CoreLe { .. }
+            | crate::LaneInstruction::LogicalNot { .. }
+            | crate::LaneInstruction::LogicalAnd { .. }
+            | crate::LaneInstruction::LogicalOr { .. } => {
+                return Err(JitError::Unsupported("portable lane opcode".into()));
             }
         }
         if let (
-            Some(crate::VectorOperand::Register {
+            Some(crate::VectorOperand {
                 physical, dtype, ..
             }),
             Some(name),
-        ) = (&inst.dst, dst)
+        ) = (view.output(), dst)
         {
             names.insert((*physical, *dtype), name);
         }
@@ -3622,7 +3597,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v28");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v29");
 
         let execute = |graph: &Graph,
                        output,
@@ -3790,7 +3765,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v28");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v29");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -5518,6 +5493,9 @@ mod tests {
         let kernel = crate::lower_graph_reduction(&g, sum).unwrap();
         let rendered = CpuJit::render(&kernel).unwrap();
         assert!(rendered.source.contains("rg_acc"));
+        let vector_requested = CpuJit::render_vectorized(&kernel).unwrap();
+        assert!(vector_requested.source.contains("rg_acc"));
+        assert!(!vector_requested.source.contains("B2 VectorProgram"));
         let jit = CpuJit::compile(&kernel).unwrap();
         let mut input = JitBuffer::zeroed(DType::F32, 6, false);
         for (bytes, value) in input
