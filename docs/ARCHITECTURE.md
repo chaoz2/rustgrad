@@ -1173,6 +1173,10 @@ complete name-to-value map, applies checked arithmetic and every guard, and
 rebuilds a concrete schedule directly from the retained UOp DAG; it never
 reconstructs the source Graph. Canonically ID-ordered binding values participate
 in the concrete artifact identity and process-local specialization/JIT cache keys.
+Specialization changes descriptor geometry, not scalar algebra: eligible newly
+captured elementwise kernels were already normalized before publication, while
+a decoded historical artifact keeps its original UOp structure for
+byte-compatible schema validation.
 
 ## Universal UOp boundary
 
@@ -1193,6 +1197,18 @@ purity, interpretation, schedules, and renderers match it explicitly where
 their semantic policies differ. Artifact encoding alone projects operations to
 a private wire opcode and payload; the existing numeric tags and version gates
 are unchanged and cannot leak back into the DAG.
+
+Eligible pure elementwise schedules run typed UPat rules bottom-up immediately
+after kernel lowering. The memoized walk preserves shared DAG nodes, revisits a
+replacement until stable, and rejects a cycle or bounded-step exhaustion before
+view descriptors, ordered input bindings, dependencies, cache identity, or
+capture state can be published. Its constant rules delegate numeric semantics
+to the portable interpreter and admit only exact Bool/integer operations,
+homogeneous Bool/integral comparisons, Bool logic, same-type casts, and constant
+Bool selection. Floating identities and reassociation remain deliberately
+unfolded because signed zero, NaN ordering, and payload behavior are observable.
+Conditional control, guards, reductions, effects, and artifact decoding stay
+outside this normalization boundary.
 
 Validation also binds address semantics to the defining operation:
 `DefineGlobal`, `DefineLocal`, and `DefineRegister` require the matching embedded

@@ -667,6 +667,8 @@ pub enum UOpError {
     ControlMismatch,
     UnclosedControl,
     EffectRewrite,
+    RewriteCycle,
+    RewriteStepLimit,
 }
 impl fmt::Display for UOpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1172,57 +1174,119 @@ pub fn rewrite(
     rules: &mut [RewriteRule],
     walk: Walk,
 ) -> Result<(UOp, RewriteTrace), UOpError> {
+    const STEP_LIMIT: usize = 128;
+
     rules.sort_by_key(|r| r.priority);
     let mut trace = RewriteTrace { rules: vec![] };
     let mut memo = BTreeMap::new();
+    let mut active = BTreeSet::new();
     fn go(
         n: &UOp,
         r: &[RewriteRule],
         w: Walk,
         m: &mut BTreeMap<UOp, UOp>,
+        active: &mut BTreeSet<UOp>,
         t: &mut RewriteTrace,
     ) -> Result<UOp, UOpError> {
         if let Some(x) = m.get(n) {
             return Ok(x.clone());
         }
-        let mut x = n.clone();
-        if w == Walk::BottomUp {
-            x = UOp::from_operation(
-                x.operation().clone(),
-                x.ty(),
-                x.sources()
-                    .iter()
-                    .map(|s| go(s, r, w, m, t))
-                    .collect::<Result<_, _>>()?,
-            )
+        if !active.insert(n.clone()) {
+            return Err(UOpError::RewriteCycle);
         }
-        for rule in r {
-            if let Some(c) = rule.pattern.matches(&x)
-                && let Some(next) = (rule.apply)(&c, &x)
-            {
-                if !x.is_pure() || !next.is_pure() {
-                    return Err(UOpError::EffectRewrite);
+
+        let mut x = n.clone();
+        let mut seen = BTreeSet::new();
+        for _ in 0..STEP_LIMIT {
+            if !seen.insert(x.clone()) {
+                active.remove(n);
+                return Err(UOpError::RewriteCycle);
+            }
+            let before = x.clone();
+            if w == Walk::BottomUp {
+                let sources = x
+                    .sources()
+                    .iter()
+                    .map(|source| go(source, r, w, m, active, t))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if sources.as_slice() != x.sources() {
+                    x = UOp::from_operation(x.operation().clone(), x.ty(), sources);
                 }
-                t.rules.push(rule.name);
-                x = next;
-                break;
+            }
+
+            for rule in r {
+                if let Some(captures) = rule.pattern.matches(&x)
+                    && let Some(next) = (rule.apply)(&captures, &x)
+                    && next != x
+                {
+                    if !x.is_pure() || !next.is_pure() {
+                        active.remove(n);
+                        return Err(UOpError::EffectRewrite);
+                    }
+                    t.rules.push(rule.name);
+                    x = next;
+                    break;
+                }
+            }
+
+            if w == Walk::TopDown {
+                let sources = x
+                    .sources()
+                    .iter()
+                    .map(|source| go(source, r, w, m, active, t))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if sources.as_slice() != x.sources() {
+                    x = UOp::from_operation(x.operation().clone(), x.ty(), sources);
+                }
+            }
+
+            if x == before {
+                active.remove(n);
+                m.insert(n.clone(), x.clone());
+                return Ok(x);
             }
         }
-        if w == Walk::TopDown {
-            x = UOp::from_operation(
-                x.operation().clone(),
-                x.ty(),
-                x.sources()
-                    .iter()
-                    .map(|s| go(s, r, w, m, t))
-                    .collect::<Result<_, _>>()?,
-            )
-        }
-        m.insert(n.clone(), x.clone());
-        Ok(x)
+        active.remove(n);
+        Err(UOpError::RewriteStepLimit)
     }
-    let x = go(root, rules, walk, &mut memo, &mut trace)?;
+    let x = go(root, rules, walk, &mut memo, &mut active, &mut trace)?;
     Ok((x, trace))
+}
+
+/// Produces the canonical pure scalar subexpressions used by schedule ABI and
+/// cache construction. Artifact decoding deliberately does not call this:
+/// historical encoded UOp tables retain their exact node and byte identity.
+pub(crate) fn normalize_kernel(root: &UOp) -> Result<UOp, UOpError> {
+    root.validate()?;
+    let nodes = root.topological()?;
+    if !matches!(root.operation(), Operation::Sink)
+        || nodes.iter().any(|node| {
+            matches!(
+                node.operation(),
+                Operation::If
+                    | Operation::EndIf
+                    | Operation::EffectStore(_)
+                    | Operation::After(_)
+                    | Operation::Barrier
+            )
+        })
+    {
+        return Err(UOpError::EffectRewrite);
+    }
+    if nodes.iter().any(|node| {
+        matches!(
+            node.operation(),
+            Operation::ReduceInit(_)
+                | Operation::ReduceAccumulate
+                | Operation::ReduceFinalize
+                | Operation::TensorGuard(_)
+        )
+    }) {
+        return Ok(root.clone());
+    }
+    let (normalized, _) = rewrite(root, &mut builtin_rules(), Walk::BottomUp)?;
+    normalized.validate()?;
+    Ok(normalized)
 }
 
 /// Returns whether `literal` is an exact raw scalar identity for the result
@@ -1235,11 +1299,15 @@ fn exact_integral_literal(operation: &UOp, literal: &UOp, bits: u64) -> bool {
     if !(ty.scalar.is_integer() || ty.scalar == DType::Bool) || literal.ty() != Some(ty) {
         return false;
     }
-    matches!(
-        literal.operation(),
-        Operation::Const(LiteralValue::Scalar { dtype, bits: raw })
-            if *dtype == ty.scalar && *raw == bits
-    )
+    match literal.operation() {
+        Operation::Const(LiteralValue::Scalar { dtype, bits: raw }) => {
+            *dtype == ty.scalar && *raw == bits
+        }
+        Operation::Const(LiteralValue::Int(value)) => {
+            (*value == 0 && bits == 0) || (*value == 1 && bits == 1)
+        }
+        _ => false,
+    }
 }
 
 fn exact_bool_literal(literal: &UOp, value: bool) -> bool {
@@ -1256,12 +1324,186 @@ fn is_const_operation(operation: &Operation) -> bool {
     matches!(operation, Operation::Const(_))
 }
 
+fn is_add_operation(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Binary(Binary::Add) | Operation::GraphBinary(crate::BinaryOp::Add)
+    )
+}
+
+fn is_mul_operation(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Binary(Binary::Mul) | Operation::GraphBinary(crate::BinaryOp::Mul)
+    )
+}
+
+fn is_sub_operation(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Binary(Binary::Sub) | Operation::GraphBinary(crate::BinaryOp::Sub)
+    )
+}
+
+fn is_graph_unary_operation(operation: &Operation) -> bool {
+    matches!(operation, Operation::GraphUnary(_))
+}
+
+fn is_graph_binary_operation(operation: &Operation) -> bool {
+    matches!(operation, Operation::GraphBinary(_))
+}
+
+fn is_graph_compare_operation(operation: &Operation) -> bool {
+    matches!(operation, Operation::GraphCompare(_))
+}
+
+fn exact_storage_carrier(dtype: DType) -> Option<DType> {
+    match dtype.itemsize() {
+        1 => Some(DType::U8),
+        2 => Some(DType::U16),
+        4 => Some(DType::U32),
+        8 => Some(DType::U64),
+        _ => None,
+    }
+}
+
+fn storage_scalar_literal(node: &UOp) -> Option<(DType, crate::Scalar)> {
+    let ty = node.ty()?;
+    if ty.lanes != 1 || (!ty.scalar.is_integer() && ty.scalar != DType::Bool) {
+        return None;
+    }
+    let Operation::Const(LiteralValue::Scalar { dtype, bits }) = node.operation() else {
+        return None;
+    };
+    if *dtype != ty.scalar || !scalar_literal_is_valid(Some(ty), *dtype, *bits) {
+        return None;
+    }
+    let carrier = exact_storage_carrier(*dtype)?;
+    let value = carrier
+        .bitcast_scalar(crate::Scalar::U(*bits), *dtype)
+        .ok()?;
+    Some((*dtype, value))
+}
+
+fn scalar_literal(dtype: DType, value: crate::Scalar) -> Option<UOp> {
+    if !dtype.is_integer() && dtype != DType::Bool {
+        return None;
+    }
+    let carrier = exact_storage_carrier(dtype)?;
+    let value = dtype.commit_scalar(value);
+    let bits = dtype.bitcast_scalar(value, carrier).ok()?.as_u64();
+    Some(UOp::scalar_constant(dtype, bits, UType::scalar(dtype)))
+}
+
+fn fold_integral_unary(captures: &Captures, node: &UOp) -> Option<UOp> {
+    let Operation::GraphUnary(operation) = node.operation() else {
+        return None;
+    };
+    let (dtype, value) = storage_scalar_literal(captures.get("x")?)?;
+    let output = node.ty()?;
+    if output.lanes != 1
+        || !graph_unary_type_is_valid(*operation, Some(UType::scalar(dtype)), Some(output))
+    {
+        return None;
+    }
+    if !matches!(
+        operation,
+        crate::UnaryOp::Neg
+            | crate::UnaryOp::Abs
+            | crate::UnaryOp::Relu
+            | crate::UnaryOp::Step
+            | crate::UnaryOp::Square
+            | crate::UnaryOp::Floor
+            | crate::UnaryOp::Ceil
+            | crate::UnaryOp::Trunc
+            | crate::UnaryOp::Round
+            | crate::UnaryOp::Sign
+            | crate::UnaryOp::IsNan
+            | crate::UnaryOp::IsInf
+            | crate::UnaryOp::IsFinite
+    ) {
+        return None;
+    }
+    let value = crate::kernel::evaluate_constant_unary(value, dtype, *operation).ok()?;
+    scalar_literal(output.scalar, value)
+}
+
+fn fold_integral_binary(captures: &Captures, node: &UOp) -> Option<UOp> {
+    let Operation::GraphBinary(operation) = node.operation() else {
+        return None;
+    };
+    let (lhs_dtype, lhs) = storage_scalar_literal(captures.get("lhs")?)?;
+    let (rhs_dtype, rhs) = storage_scalar_literal(captures.get("rhs")?)?;
+    let output = node.ty()?;
+    if output.lanes != 1
+        || lhs_dtype != output.scalar
+        || rhs_dtype != output.scalar
+        || (!output.scalar.is_integer() && output.scalar != DType::Bool)
+    {
+        return None;
+    }
+    if !matches!(
+        operation,
+        crate::BinaryOp::Add
+            | crate::BinaryOp::Sub
+            | crate::BinaryOp::Mul
+            | crate::BinaryOp::Maximum
+            | crate::BinaryOp::Minimum
+            | crate::BinaryOp::BitAnd
+            | crate::BinaryOp::BitOr
+            | crate::BinaryOp::BitXor
+    ) {
+        return None;
+    }
+    let value =
+        crate::kernel::evaluate_constant_binary(lhs, rhs, output.scalar, *operation).ok()?;
+    scalar_literal(output.scalar, value)
+}
+
+fn fold_integral_compare(captures: &Captures, node: &UOp) -> Option<UOp> {
+    let Operation::GraphCompare(operation) = node.operation() else {
+        return None;
+    };
+    let (lhs_dtype, lhs) = storage_scalar_literal(captures.get("lhs")?)?;
+    let (rhs_dtype, rhs) = storage_scalar_literal(captures.get("rhs")?)?;
+    if lhs_dtype != rhs_dtype || node.ty() != Some(UType::scalar(DType::Bool)) {
+        return None;
+    }
+    let value = crate::kernel::evaluate_constant_compare(lhs, rhs, *operation);
+    scalar_literal(DType::Bool, crate::Scalar::Bool(value))
+}
+
+fn fold_bool_logical(captures: &Captures, node: &UOp) -> Option<UOp> {
+    let Operation::GraphLogical(operation) = node.operation() else {
+        return None;
+    };
+    let (lhs_dtype, lhs) = storage_scalar_literal(captures.get("lhs")?)?;
+    if lhs_dtype != DType::Bool || node.ty() != Some(UType::scalar(DType::Bool)) {
+        return None;
+    }
+    let rhs = match operation {
+        crate::LogicalOp::Not => None,
+        crate::LogicalOp::And | crate::LogicalOp::Or => {
+            let (dtype, value) = storage_scalar_literal(captures.get("rhs")?)?;
+            if dtype != DType::Bool {
+                return None;
+            }
+            Some(value)
+        }
+    };
+    let value = crate::kernel::evaluate_constant_logical(lhs, *operation, || {
+        rhs.ok_or(crate::Error::InvalidIndex)
+    })
+    .ok()?;
+    scalar_literal(DType::Bool, value)
+}
+
 pub fn builtin_rules() -> Vec<RewriteRule> {
     vec![
         RewriteRule {
             name: "add-zero",
             priority: 0,
-            pattern: UPat::op(Operation::Binary(Binary::Add))
+            pattern: UPat::operation_predicate(is_add_operation)
                 .sources(vec![UPat::any().named("x"), UPat::any().named("zero")]),
             apply: |c, n| {
                 let x = c.get("x")?;
@@ -1276,7 +1518,7 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "add-zero-left",
             priority: 1,
-            pattern: UPat::op(Operation::Binary(Binary::Add))
+            pattern: UPat::operation_predicate(is_add_operation)
                 .sources(vec![UPat::any().named("zero"), UPat::any().named("x")]),
             apply: |c, n| {
                 let x = c.get("x")?;
@@ -1291,7 +1533,7 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "add-zero-untyped-int",
             priority: 2,
-            pattern: UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+            pattern: UPat::operation_predicate(is_add_operation).sources(vec![
                 UPat::any().named("x"),
                 UPat::op(Operation::Const(LiteralValue::Int(0))),
             ]),
@@ -1325,7 +1567,7 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-add-zero-right",
             priority: 3,
-            pattern: UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+            pattern: UPat::operation_predicate(is_add_operation).sources(vec![
                 UPat::any().named("x"),
                 UPat::operation_predicate(is_const_operation).named("zero"),
             ]),
@@ -1341,7 +1583,7 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-add-zero-left",
             priority: 4,
-            pattern: UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+            pattern: UPat::operation_predicate(is_add_operation).sources(vec![
                 UPat::operation_predicate(is_const_operation).named("zero"),
                 UPat::any().named("x"),
             ]),
@@ -1357,15 +1599,50 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-mul-one",
             priority: 5,
-            pattern: UPat::op(Operation::Binary(Binary::Mul)).sources(vec![
+            pattern: UPat::operation_predicate(is_mul_operation).sources(vec![
                 UPat::any().named("x"),
                 UPat::operation_predicate(is_const_operation).named("one"),
             ]),
             apply: |c, operation| {
                 c.get("x")
-                    .filter(|_| {
-                        c.get("one")
-                            .is_some_and(|one| exact_integral_literal(operation, one, 1))
+                    .filter(|x| {
+                        x.ty() == operation.ty()
+                            && c.get("one")
+                                .is_some_and(|one| exact_integral_literal(operation, one, 1))
+                    })
+                    .cloned()
+            },
+        },
+        RewriteRule {
+            name: "typed-mul-one-left",
+            priority: 5,
+            pattern: UPat::operation_predicate(is_mul_operation).sources(vec![
+                UPat::operation_predicate(is_const_operation).named("one"),
+                UPat::any().named("x"),
+            ]),
+            apply: |c, operation| {
+                c.get("x")
+                    .filter(|x| {
+                        x.ty() == operation.ty()
+                            && c.get("one")
+                                .is_some_and(|one| exact_integral_literal(operation, one, 1))
+                    })
+                    .cloned()
+            },
+        },
+        RewriteRule {
+            name: "typed-sub-zero",
+            priority: 5,
+            pattern: UPat::operation_predicate(is_sub_operation).sources(vec![
+                UPat::any().named("x"),
+                UPat::operation_predicate(is_const_operation).named("zero"),
+            ]),
+            apply: |c, operation| {
+                c.get("x")
+                    .filter(|x| {
+                        x.ty() == operation.ty()
+                            && c.get("zero")
+                                .is_some_and(|zero| exact_integral_literal(operation, zero, 0))
                     })
                     .cloned()
             },
@@ -1388,6 +1665,48 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
                     None
                 }
             },
+        },
+        RewriteRule {
+            name: "fold-integral-unary",
+            priority: 7,
+            pattern: UPat::operation_predicate(is_graph_unary_operation)
+                .sources(vec![UPat::any().named("x")]),
+            apply: fold_integral_unary,
+        },
+        RewriteRule {
+            name: "fold-integral-binary",
+            priority: 7,
+            pattern: UPat::operation_predicate(is_graph_binary_operation)
+                .sources(vec![UPat::any().named("lhs"), UPat::any().named("rhs")]),
+            apply: fold_integral_binary,
+        },
+        RewriteRule {
+            name: "fold-integral-compare",
+            priority: 7,
+            pattern: UPat::operation_predicate(is_graph_compare_operation)
+                .sources(vec![UPat::any().named("lhs"), UPat::any().named("rhs")]),
+            apply: fold_integral_compare,
+        },
+        RewriteRule {
+            name: "fold-bool-logical-not",
+            priority: 7,
+            pattern: UPat::op(Operation::GraphLogical(crate::LogicalOp::Not))
+                .sources(vec![UPat::any().named("lhs")]),
+            apply: fold_bool_logical,
+        },
+        RewriteRule {
+            name: "fold-bool-logical-and",
+            priority: 7,
+            pattern: UPat::op(Operation::GraphLogical(crate::LogicalOp::And))
+                .sources(vec![UPat::any().named("lhs"), UPat::any().named("rhs")]),
+            apply: fold_bool_logical,
+        },
+        RewriteRule {
+            name: "fold-bool-logical-or",
+            priority: 7,
+            pattern: UPat::op(Operation::GraphLogical(crate::LogicalOp::Or))
+                .sources(vec![UPat::any().named("lhs"), UPat::any().named("rhs")]),
+            apply: fold_bool_logical,
         },
     ]
 }
