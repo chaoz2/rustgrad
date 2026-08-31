@@ -4,7 +4,7 @@ use crate::{
     TensorData,
 };
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 fn bool_data(shape: impl Into<Shape>, values: impl IntoIterator<Item = bool>) -> TensorData {
@@ -12143,6 +12143,336 @@ fn tinygrad_usum_and_uprod_preserve_source_lub_and_are_atomic() {
         Err(Error::ShapeOverflow(_))
     ));
     assert_eq!(overflow.node_count(), before);
+}
+
+#[test]
+fn live_threefry_matches_source_vectors_and_captured_graph_structure() {
+    let mut graph = Graph::new();
+    let counter = graph.input_dtype("counter", [10], DType::U64);
+    let key = graph.input_dtype("key", [], DType::U64);
+    let output = graph.threefry(counter, key).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([10]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::U64);
+    assert!(!graph.requires_grad(output).unwrap());
+    assert!(matches!(
+        graph.op(output).unwrap(),
+        Op::Binary {
+            op: BinaryOp::BitOr,
+            ..
+        }
+    ));
+    assert!(
+        !(0..graph.node_count())
+            .any(|index| matches!(graph.op(NodeId(index)).unwrap(), Op::Random { .. }))
+    );
+    let mut u32_constants = 0;
+    let mut u64_constants = 0;
+    let mut u32_adds = 0;
+    let mut u32_xors = 0;
+    let mut u32_left_shifts = 0;
+    let mut u32_right_shifts = 0;
+    let mut u64_left_shifts = 0;
+    let mut u64_right_shifts = 0;
+    let mut u64_ors = 0;
+    for index in 0..graph.node_count() {
+        let node = NodeId(index);
+        match (graph.op(node).unwrap(), graph.dtype(node).unwrap()) {
+            (Op::Constant(_), DType::U32) => u32_constants += 1,
+            (Op::Constant(_), DType::U64) => u64_constants += 1,
+            (
+                Op::Binary {
+                    op: BinaryOp::Add, ..
+                },
+                DType::U32,
+            ) => u32_adds += 1,
+            (
+                Op::Binary {
+                    op: BinaryOp::BitXor,
+                    ..
+                },
+                DType::U32,
+            ) => u32_xors += 1,
+            (
+                Op::Binary {
+                    op: BinaryOp::Shl, ..
+                },
+                DType::U32,
+            ) => u32_left_shifts += 1,
+            (
+                Op::Binary {
+                    op: BinaryOp::Shr, ..
+                },
+                DType::U32,
+            ) => u32_right_shifts += 1,
+            (
+                Op::Binary {
+                    op: BinaryOp::Shl, ..
+                },
+                DType::U64,
+            ) => u64_left_shifts += 1,
+            (
+                Op::Binary {
+                    op: BinaryOp::Shr, ..
+                },
+                DType::U64,
+            ) => u64_right_shifts += 1,
+            (
+                Op::Binary {
+                    op: BinaryOp::BitOr,
+                    ..
+                },
+                DType::U64,
+            ) => u64_ors += 1,
+            (Op::Binary { .. }, DType::U64) => panic!("unexpected U64 Threefry intermediate"),
+            _ => {}
+        }
+    }
+    // One U32 parity, both halves of eight rotations, and five injection
+    // counts are retained literals. The sole U64 literal is the pack/split
+    // width. Each rotate is two shifts plus source-literal wrapping Add; the
+    // fifteen extra Adds are the three separate additions per key injection.
+    assert_eq!((u32_constants, u64_constants), (22, 1));
+    assert_eq!(u32_adds, 57);
+    assert_eq!(u32_xors, 22);
+    assert_eq!((u32_left_shifts, u32_right_shifts), (20, 20));
+    assert_eq!((u64_left_shifts, u64_right_shifts, u64_ors), (1, 2, 1));
+    assert!(matches!(
+        graph.grad(output, counter),
+        Err(Error::NonDifferentiableTarget(node)) if node == output
+    ));
+
+    let packed_counters = (0_u32..10)
+        .map(|index| (u64::from(index + 10) << 32) | u64::from(index))
+        .collect::<Vec<_>>();
+    let packed_key = u64::from(1337_u32) << 32;
+    let counter_data = TensorData::from_storage([10], Storage::U64(packed_counters)).unwrap();
+    let key_data = TensorData::from_storage([], Storage::U64(vec![packed_key])).unwrap();
+    let result = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([
+                ("counter".into(), counter_data.clone()),
+                ("key".into(), key_data.clone()),
+            ]),
+        )
+        .unwrap();
+    let Storage::U64(packed) = result.storage() else {
+        panic!("threefry output storage")
+    };
+    assert_eq!(
+        packed,
+        &[
+            0xd342_182a_846d_667f,
+            0x559e_be96_686f_0b31,
+            0x8155_69fc_26f7_5b74,
+            0x9930_336f_7546_32c9,
+            0x8e49_076a_5329_2542,
+            0xdb3f_7af6_e4e8_37a8,
+            0xad8c_faff_80b5_0445,
+            0x1809_0571_23f8_ce0b,
+            0x98a3_a5c6_c5db_260e,
+            0x64df_5db2_c880_8773,
+        ]
+    );
+    let lows = packed.iter().map(|value| *value as u32);
+    let highs = packed.iter().map(|value| (*value >> 32) as u32);
+    assert_eq!(
+        lows.chain(highs).collect::<Vec<_>>(),
+        [
+            2221762175, 1752107825, 653745012, 1967534793, 1395205442, 3840423848, 2159346757,
+            603508235, 3319473678, 3363866483, 3544324138, 1436466838, 2169858556, 2570072943,
+            2387150698, 3678370550, 2911697663, 403244401, 2560861638, 1692360114,
+        ]
+    );
+
+    let scheduled = crate::schedule(&graph, output).unwrap();
+    assert!(!scheduled.items.is_empty());
+    assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
+    assert!(scheduled.items.iter().all(|item| {
+        item.kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .all(|node| !matches!(node.operation(), crate::Operation::Random(_)))
+    }));
+    let kernel = &scheduled.items.last().unwrap().kernel;
+    assert!(matches!(
+        crate::ptx::PtxRenderer::new(80).unwrap().render(kernel),
+        Err(crate::ptx::PtxError::Unsupported(_))
+    ));
+    let metal = crate::runtime::metal::MetalRenderer::new(
+        8,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: 1 << 20,
+            unified_memory: true,
+            family: "ThreefryBoundary".into(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        metal.render(kernel),
+        Err(crate::runtime::metal::MetalError::Unsupported(_))
+    ));
+    let wgsl = crate::runtime::webgpu::WgslRenderer::new(
+        8,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: 1 << 20,
+            max_storage_buffers_per_shader_stage: 8,
+            max_compute_workgroup_size_x: 256,
+            max_compute_workgroups_per_dimension: 65_535,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        wgsl.render(kernel),
+        Err(crate::runtime::webgpu::WebGpuError::Unsupported(_))
+    ));
+    // These are generic typed renderer gates. Their separate zero-input
+    // Random emitters are not evidence for this dependency-bearing graph.
+    let captured = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let encoded = captured.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&encoded).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), encoded);
+    let replay_inputs =
+        BTreeMap::from([("counter".into(), counter_data), ("key".into(), key_data)]);
+    let executor = crate::CapturedReplayExecutor::default();
+    let interpreted = executor
+        .replay(
+            &decoded,
+            &replay_inputs,
+            crate::CapturedReplayOptions::default(),
+        )
+        .unwrap();
+    let native = executor
+        .replay(
+            &decoded,
+            &replay_inputs,
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(interpreted.outputs[0].storage(), result.storage());
+    assert_eq!(native.outputs[0].storage(), result.storage());
+    assert!(!native.trace.items.is_empty());
+    assert!(
+        native
+            .trace
+            .items
+            .iter()
+            .all(|item| item.backend == crate::ItemBackend::NativeJit)
+    );
+}
+
+#[test]
+fn live_threefry_broadcasts_scalar_empty_and_rectangular_u64_operands() {
+    let mut graph = Graph::new();
+    let counter = graph.input_dtype("counter", [2, 1], DType::U64);
+    let key = graph.input_dtype("key", [1, 3], DType::U64);
+    let output = graph.threefry(counter, key).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+    let counters = [[1_u32, 7_u32], [u32::MAX, 13_u32]];
+    let keys = [[0_u32, 1337_u32], [5_u32, 9_u32], [u32::MAX, 1_u32]];
+    let pack = |words: [u32; 2]| (u64::from(words[1]) << 32) | u64::from(words[0]);
+    let realized = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([
+                (
+                    "counter".into(),
+                    TensorData::from_storage(
+                        [2, 1],
+                        Storage::U64(counters.into_iter().map(pack).collect()),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "key".into(),
+                    TensorData::from_storage(
+                        [1, 3],
+                        Storage::U64(keys.into_iter().map(pack).collect()),
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    let expected = counters
+        .into_iter()
+        .flat_map(|counter| {
+            keys.into_iter()
+                .map(move |key| pack(crate::random::threefry2x32(key, counter)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(realized.storage(), &Storage::U64(expected));
+
+    let mut scalar = Graph::new();
+    let counter = scalar.input_dtype("counter", [], DType::U64);
+    let key = scalar.input_dtype("key", [], DType::U64);
+    let output = scalar.threefry(counter, key).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+
+    let mut empty = Graph::new();
+    let counter = empty.input_dtype("counter", [0, 3], DType::U64);
+    let key = empty.input_dtype("key", [1, 3], DType::U64);
+    let output = empty.threefry(counter, key).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+}
+
+#[test]
+fn live_threefry_rejects_invalid_descriptors_without_publication() {
+    let mut unknown = Graph::new();
+    let counter = unknown.input_dtype("counter", [2], DType::U64);
+    let before = unknown.node_count();
+    assert!(matches!(
+        unknown.threefry(counter, NodeId(usize::MAX)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(unknown.node_count(), before);
+
+    let mut dtype = Graph::new();
+    let counter = dtype.input_dtype("counter", [2], DType::U64);
+    let key = dtype.input_dtype("key", [2], DType::I64);
+    let before = dtype.node_count();
+    assert!(matches!(
+        dtype.threefry(counter, key),
+        Err(Error::InvalidElementwiseDType {
+            op: "threefry",
+            actual: DType::I64
+        })
+    ));
+    assert_eq!(dtype.node_count(), before);
+
+    let mut mismatch = Graph::new();
+    let counter = mismatch.input_dtype("counter", [2], DType::U64);
+    let key = mismatch.input_dtype("key", [3], DType::U64);
+    let before = mismatch.node_count();
+    assert!(mismatch.threefry(counter, key).is_err());
+    assert_eq!(mismatch.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let counter = overflow.input_dtype("counter", [usize::MAX, 2], DType::U64);
+    let key = overflow.input_dtype("key", [], DType::U64);
+    let before = overflow.node_count();
+    assert!(matches!(
+        overflow.threefry(counter, key),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(overflow.node_count(), before);
+
+    let mut output_overflow = Graph::new();
+    let counter = output_overflow.input_dtype("counter", [usize::MAX / 16, 1], DType::U64);
+    let key = output_overflow.input_dtype("key", [1, 32], DType::U64);
+    let before = output_overflow.node_count();
+    assert!(matches!(
+        output_overflow.threefry(counter, key),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(output_overflow.node_count(), before);
 }
 
 #[test]

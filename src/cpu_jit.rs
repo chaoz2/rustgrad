@@ -25,7 +25,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v29";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v30";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -2755,7 +2755,7 @@ fn emit(
                 }
                 crate::BinaryOp::Shl if !ty.is_float() => {
                     return Ok(format!(
-                        "(({})rg_shl((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
+                        "(({})rg_shl((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure))",
                         ctype(ty),
                         ty.bits()
                     ));
@@ -2769,7 +2769,7 @@ fn emit(
                         ));
                     }
                     return Ok(format!(
-                        "(({})rg_shr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
+                        "(({})rg_shr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure))",
                         ctype(ty),
                         ty.bits()
                     ));
@@ -3597,7 +3597,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v29");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v30");
 
         let execute = |graph: &Graph,
                        output,
@@ -3765,7 +3765,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v29");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v30");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -6216,6 +6216,64 @@ mod tests {
             ),
             Err(JitError::InvalidShift { index: 1 })
         );
+    }
+
+    #[test]
+    fn scalar_unsigned_shifts_are_balanced_and_match_cpu_oracle() {
+        for (dtype, values, counts) in [
+            (
+                DType::U32,
+                TensorData::from_storage([3], Storage::U32(vec![1, 0x8000_0000, u32::MAX]))
+                    .unwrap(),
+                TensorData::from_storage([3], Storage::U32(vec![1, 4, 31])).unwrap(),
+            ),
+            (
+                DType::U64,
+                TensorData::from_storage(
+                    [3],
+                    Storage::U64(vec![1, 0x8000_0000_0000_0000, u64::MAX]),
+                )
+                .unwrap(),
+                TensorData::from_storage([3], Storage::U64(vec![1, 4, 63])).unwrap(),
+            ),
+        ] {
+            for (op, helper) in [
+                (crate::BinaryOp::Shl, "rg_shl"),
+                (crate::BinaryOp::Shr, "rg_shr"),
+            ] {
+                let mut graph = Graph::new();
+                let input = graph.input_dtype("input", Shape::from([3]), dtype);
+                let count = graph.input_dtype("count", Shape::from([3]), dtype);
+                let output = graph.binary(op, input, count).unwrap();
+                let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+                let rendered = CpuJit::render(&uop).unwrap();
+                assert!(rendered.source.contains(helper), "{dtype:?} {op:?}");
+                assert!(
+                    rendered.source.contains("rg_i,failure))"),
+                    "{dtype:?} {op:?}"
+                );
+
+                let expected = CpuBackend
+                    .execute(
+                        &graph,
+                        output,
+                        &HashMap::from([
+                            ("input".into(), values.clone()),
+                            ("count".into(), counts.clone()),
+                        ]),
+                    )
+                    .unwrap();
+                let native = CpuJit::compile(&uop).unwrap();
+                let mut buffers = [
+                    JitBuffer::from_tensor(&values, false),
+                    JitBuffer::from_tensor(&counts, false),
+                    JitBuffer::zeroed(dtype, 3, true),
+                ];
+                native.call(&mut buffers, &[]).unwrap();
+                let actual = buffers[2].clone().into_tensor(Shape::from([3])).unwrap();
+                assert_eq!(actual.storage(), expected.storage(), "{dtype:?} {op:?}");
+            }
+        }
     }
 
     #[test]
