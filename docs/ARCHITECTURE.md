@@ -1190,6 +1190,19 @@ complete name-to-value map, applies checked arithmetic and every guard, and
 rebuilds a concrete schedule directly from the retained UOp DAG; it never
 reconstructs the source Graph. Canonically ID-ordered binding values participate
 in the concrete artifact identity and process-local specialization/JIT cache keys.
+Materializing Pad, Concat, Gather, Scatter, Contiguous, and equal-itemsize
+Bitcast kernels reuse the same artifact output domain: specialization replaces
+only their authenticated operand/output shapes, then derives a fresh plan cache
+key and invokes `MovementKernelPlan::validate`. Schema construction and decoded
+artifact validation call the same plan-driven symbolic geometry function, so a
+template-valid shape cannot conceal an invalid in-range specialization. Gather
+and Scatter variable extents require a conservative all-domain inequality proof;
+the source reshape/expand-to-Gather embedding composition consequently replays
+variable token counts through dense materialized Gather operands without
+rebuilding a Graph. Computed affine
+copies need separately authenticated symbolic view metadata, and shape-changing
+bitcasts need byte-divisibility proofs, so both remain fail-closed rather than
+overloading the source-backed UOp view table.
 Specialization changes descriptor geometry, not scalar algebra: eligible newly
 captured elementwise kernels were already normalized before publication, while
 a decoded historical artifact keeps its original UOp structure for

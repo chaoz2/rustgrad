@@ -445,11 +445,17 @@ pub(crate) fn derive_view(
     }
 }
 
-pub(crate) fn candidates(shapes: impl Iterator<Item = SymbolicShape>) -> Vec<SymbolicExpr> {
+pub(crate) fn candidates(
+    shapes: impl Iterator<Item = SymbolicShape>,
+) -> Result<Vec<SymbolicExpr>, ReplayError> {
     let mut candidates = BTreeSet::new();
     for shape in shapes {
         for dim in shape.dims() {
-            let expression = dim.expression().clone();
+            let expression = dim
+                .expression()
+                .simplify()
+                .map_err(symbolic_error)?
+                .expression;
             if !expression.variables().is_empty() {
                 candidates.insert(expression.clone());
             }
@@ -457,13 +463,17 @@ pub(crate) fn candidates(shapes: impl Iterator<Item = SymbolicShape>) -> Vec<Sym
                 candidates.insert(SymbolicExpr::Var(variable));
             }
         }
-        if let Ok(elements) = shape.numel()
-            && !elements.variables().is_empty()
-        {
+        let elements = shape
+            .numel()
+            .map_err(symbolic_error)?
+            .simplify()
+            .map_err(symbolic_error)?
+            .expression;
+        if !elements.variables().is_empty() {
             candidates.insert(elements);
         }
     }
-    candidates.into_iter().collect()
+    Ok(candidates.into_iter().collect())
 }
 
 fn lift_shape(

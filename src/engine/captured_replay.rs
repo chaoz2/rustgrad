@@ -3590,4 +3590,370 @@ mod tests {
             Err(ReplayError::Unsupported(_))
         ));
     }
+
+    struct SymbolicMovementFamily {
+        graph: Graph,
+        outputs: [crate::NodeId; 6],
+        inputs: [crate::NodeId; 4],
+        bindings: BTreeMap<String, TensorData>,
+    }
+
+    fn symbolic_movement_family(rows: usize) -> SymbolicMovementFamily {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [rows, 3], DType::F32);
+        let tail = graph.input_dtype("tail", [rows, 1], DType::F32);
+        let index = graph.input_dtype("index", [rows, 2], DType::I32);
+        let updates = graph.input_dtype("updates", [rows, 2], DType::F32);
+        let padded = graph.pad(input, [(0, 0), (1, 1)], Scalar::F(-1.0)).unwrap();
+        let concatenated = graph.concat([input, tail], 1).unwrap();
+        let gathered = graph.gather(input, index, 1).unwrap();
+        let scattered = graph.scatter_add(input, index, updates, 1).unwrap();
+        let contiguous_source = graph.neg(input).unwrap();
+        let contiguous = graph.contiguous(contiguous_source).unwrap();
+        let bitcast = graph.bitcast(input, DType::I32).unwrap();
+        let input_values = (0..rows)
+            .flat_map(|row| (0..3).map(move |column| (row * 10 + column) as f32))
+            .collect::<Vec<_>>();
+        let tail_values = (0..rows).map(|row| 50.0 + row as f32).collect::<Vec<_>>();
+        let index_values = (0..rows).flat_map(|_| [1i32, 1]).collect::<Vec<_>>();
+        let update_values = (0..rows)
+            .flat_map(|row| [100.0 + row as f32, 200.0 + row as f32])
+            .collect::<Vec<_>>();
+        SymbolicMovementFamily {
+            graph,
+            outputs: [
+                padded,
+                concatenated,
+                gathered,
+                scattered,
+                contiguous,
+                bitcast,
+            ],
+            inputs: [input, tail, index, updates],
+            bindings: BTreeMap::from([
+                (
+                    "input".into(),
+                    TensorData::new([rows, 3], input_values).unwrap(),
+                ),
+                (
+                    "tail".into(),
+                    TensorData::new([rows, 1], tail_values).unwrap(),
+                ),
+                (
+                    "index".into(),
+                    TensorData::from_storage([rows, 2], Storage::I32(index_values)).unwrap(),
+                ),
+                (
+                    "updates".into(),
+                    TensorData::new([rows, 2], update_values).unwrap(),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn symbolic_movement_plans_specialize_without_graph_reconstruction() {
+        let rows = crate::SymbolicExpr::variable("rows", 0, 8).unwrap();
+        let template = symbolic_movement_family(2);
+        let schedule = crate::schedule_many(&template.graph, &template.outputs).unwrap();
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([
+            (
+                template.inputs[0],
+                crate::SymbolicShape::new(vec![rows.clone().into(), 3usize.into()]),
+            ),
+            (
+                template.inputs[1],
+                crate::SymbolicShape::new(vec![rows.clone().into(), 1usize.into()]),
+            ),
+            (
+                template.inputs[2],
+                crate::SymbolicShape::new(vec![rows.clone().into(), 2usize.into()]),
+            ),
+            (
+                template.inputs[3],
+                crate::SymbolicShape::new(vec![rows.into(), 2usize.into()]),
+            ),
+        ]));
+        let capture = CapturedSchedule::capture_symbolic(
+            &template.graph,
+            &schedule,
+            &template.outputs,
+            &spec,
+            &BTreeMap::from([("rows".into(), 2)]),
+        )
+        .unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let capture = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(bytes, capture.to_bytes().unwrap());
+
+        let mut malformed_plan = capture
+            .items
+            .iter()
+            .find_map(|item| match item.kernel.operation() {
+                crate::Operation::Movement(crate::MovementValue::Plan(plan)) => {
+                    Some((**plan).clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        malformed_plan.cache_key ^= 1;
+        assert!(malformed_plan.validate().is_err());
+
+        let mut tampered_schema = capture.clone();
+        let schema = tampered_schema.symbolic.as_mut().unwrap();
+        let input_buffer = template.inputs[0].index() as u64;
+        let row_dimension = schema.buffer_shapes[&input_buffer].dims()[0].clone();
+        schema.buffer_shapes.insert(
+            input_buffer,
+            crate::SymbolicShape::new(vec![row_dimension, 4usize.into()]),
+        );
+        tampered_schema.identity = 0;
+        tampered_schema.identity = crate::schedule::artifact::identity(&tampered_schema).unwrap();
+        assert!(tampered_schema.to_bytes().is_err());
+
+        let executor = CapturedReplayExecutor::default();
+        let mut identities = BTreeSet::new();
+        for rows in [0usize, 1, 2, 8] {
+            let oracle = symbolic_movement_family(rows);
+            let symbols = BTreeMap::from([("rows".into(), rows as i64)]);
+            let specialized = executor.specialize(&capture, &symbols).unwrap();
+            let mut movement_items = 0;
+            for item in &specialized.capture().items {
+                let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+                    item.kernel.operation()
+                else {
+                    continue;
+                };
+                movement_items += 1;
+                plan.validate().unwrap();
+                assert_eq!(plan.output_shape, item.primary_output().shape);
+                assert!(
+                    plan.input_operands()
+                        .iter()
+                        .all(|operand| item.inputs.iter().any(|input| {
+                            input.id == operand.node.index() as u64 && input.shape == operand.shape
+                        }))
+                );
+            }
+            assert_eq!(movement_items, 6);
+            identities.insert(specialized.trace().concrete_identity);
+            let replayed = executor
+                .replay_symbolic(
+                    &capture,
+                    &symbols,
+                    &oracle.bindings,
+                    CapturedReplayOptions::default(),
+                )
+                .unwrap();
+            let oracle_bindings = oracle.bindings.into_iter().collect::<HashMap<_, _>>();
+            for (actual, output) in replayed.outputs.iter().zip(oracle.outputs) {
+                let expected = CpuBackend
+                    .execute(&oracle.graph, output, &oracle_bindings)
+                    .unwrap();
+                assert_eq!(actual.shape(), expected.shape(), "rows={rows}");
+                assert_eq!(actual.storage(), expected.storage(), "rows={rows}");
+            }
+        }
+        assert_eq!(identities.len(), 4);
+
+        let mut invalid = symbolic_movement_family(1).bindings;
+        invalid.insert(
+            "index".into(),
+            TensorData::from_storage([1, 2], Storage::I32(vec![3, 0])).unwrap(),
+        );
+        assert!(matches!(
+            CapturedReplayExecutor::default().replay_symbolic(
+                &capture,
+                &BTreeMap::from([("rows".into(), 1)]),
+                &invalid,
+                CapturedReplayOptions::default(),
+            ),
+            Err(ReplayError::Execute(_))
+        ));
+    }
+
+    struct SymbolicEmbeddingFamily {
+        graph: Graph,
+        output: crate::NodeId,
+        index: crate::NodeId,
+        bindings: BTreeMap<String, TensorData>,
+    }
+
+    fn symbolic_embedding_family(tokens: usize) -> SymbolicEmbeddingFamily {
+        let mut graph = Graph::new();
+        let weight = graph.input_dtype("weight", [5, 3], DType::F32);
+        let index_node = graph.input_dtype("index", [tokens], DType::I32);
+        let expanded = graph.reshape(index_node, [tokens, 1]).unwrap();
+        let expanded = graph.expand(expanded, [tokens, 3]).unwrap();
+        let gathered = graph.gather(weight, expanded, 0).unwrap();
+        let output = graph.reshape(gathered, [tokens, 3]).unwrap();
+        let weight = TensorData::new(
+            [5, 3],
+            (0..15).map(|value| value as f32).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let index = TensorData::from_storage(
+            [tokens],
+            Storage::I32((0..tokens).map(|token| (token % 5) as i32).collect()),
+        )
+        .unwrap();
+        SymbolicEmbeddingFamily {
+            graph,
+            output,
+            index: index_node,
+            bindings: BTreeMap::from([("weight".into(), weight), ("index".into(), index)]),
+        }
+    }
+
+    #[test]
+    fn symbolic_embedding_gather_replays_variable_token_counts() {
+        let tokens = crate::SymbolicExpr::variable("tokens", 0, 8).unwrap();
+        let template = symbolic_embedding_family(2);
+        let schedule = crate::schedule(&template.graph, template.output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &template.graph,
+            &schedule,
+            &[template.output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                template.index,
+                crate::SymbolicShape::new(vec![tokens.into()]),
+            )])),
+            &BTreeMap::from([("tokens".into(), 2)]),
+        )
+        .unwrap();
+        let capture = CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+        for tokens in [0usize, 1, 2, 8] {
+            let oracle = symbolic_embedding_family(tokens);
+            let actual = CapturedReplayExecutor::default()
+                .replay_symbolic(
+                    &capture,
+                    &BTreeMap::from([("tokens".into(), tokens as i64)]),
+                    &oracle.bindings,
+                    CapturedReplayOptions::default(),
+                )
+                .unwrap_or_else(|error| panic!("tokens={tokens}: {error:?}"))
+                .outputs
+                .remove(0);
+            let expected = CpuBackend
+                .execute(
+                    &oracle.graph,
+                    oracle.output,
+                    &oracle.bindings.into_iter().collect::<HashMap<_, _>>(),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "tokens={tokens}");
+        }
+    }
+
+    #[test]
+    fn symbolic_movement_fails_closed_when_shape_metadata_is_insufficient() {
+        let rows = crate::SymbolicExpr::variable("rows", 0, 8).unwrap();
+
+        let mut affine = Graph::new();
+        let input = affine.input_dtype("input", [2, 3], DType::F32);
+        let computed = affine.square(input).unwrap();
+        let output = affine.permute(computed, [1, 0]).unwrap();
+        let schedule = crate::schedule(&affine, output).unwrap();
+        assert!(matches!(
+            CapturedSchedule::capture_symbolic(
+                &affine,
+                &schedule,
+                &[output],
+                &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                    input,
+                    crate::SymbolicShape::new(vec![rows.clone().into(), 3usize.into()]),
+                )])),
+                &BTreeMap::from([("rows".into(), 2)]),
+            ),
+            Err(ReplayError::Unsupported(_))
+        ));
+
+        let mut bitcast = Graph::new();
+        let input = bitcast.input_dtype("input", [2, 1], DType::F32);
+        let output = bitcast.bitcast(input, DType::U8).unwrap();
+        let schedule = crate::schedule(&bitcast, output).unwrap();
+        assert!(matches!(
+            CapturedSchedule::capture_symbolic(
+                &bitcast,
+                &schedule,
+                &[output],
+                &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                    input,
+                    crate::SymbolicShape::new(vec![rows.into(), 1usize.into()]),
+                )])),
+                &BTreeMap::from([("rows".into(), 2)]),
+            ),
+            Err(ReplayError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn symbolic_gather_requires_an_all_domain_extent_proof() {
+        let rows = crate::SymbolicExpr::variable("rows", 0, 8).unwrap();
+        let mut correlated = Graph::new();
+        let input = correlated.input_dtype("input", [3, 3], DType::F32);
+        let index = correlated.input_dtype("index", [2, 2], DType::I32);
+        let output = correlated.gather(input, index, 1).unwrap();
+        let schedule = crate::schedule(&correlated, output).unwrap();
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([
+            (
+                input,
+                crate::SymbolicShape::new(vec![
+                    (rows.clone() + crate::SymbolicExpr::constant(1)).into(),
+                    3usize.into(),
+                ]),
+            ),
+            (
+                index,
+                crate::SymbolicShape::new(vec![rows.clone().into(), 2usize.into()]),
+            ),
+        ]));
+        let capture = CapturedSchedule::capture_symbolic(
+            &correlated,
+            &schedule,
+            &[output],
+            &spec,
+            &BTreeMap::from([("rows".into(), 2)]),
+        )
+        .unwrap();
+
+        let mut tampered = capture.clone();
+        tampered.symbolic.as_mut().unwrap().buffer_shapes.insert(
+            input.index() as u64,
+            crate::SymbolicShape::new(vec![3usize.into(), 3usize.into()]),
+        );
+        tampered.identity = 0;
+        tampered.identity = crate::schedule::artifact::identity(&tampered).unwrap();
+        assert_eq!(
+            crate::schedule::artifact::identity(&tampered).unwrap(),
+            tampered.identity
+        );
+        assert!(crate::schedule::artifact::validate_capture(&tampered).is_err());
+
+        let mut unproven = Graph::new();
+        let input = unproven.input_dtype("input", [3, 3], DType::F32);
+        let index = unproven.input_dtype("index", [2, 2], DType::I32);
+        let output = unproven.gather(input, index, 1).unwrap();
+        let schedule = crate::schedule(&unproven, output).unwrap();
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([
+            (
+                input,
+                crate::SymbolicShape::new(vec![3usize.into(), 3usize.into()]),
+            ),
+            (
+                index,
+                crate::SymbolicShape::new(vec![rows.into(), 2usize.into()]),
+            ),
+        ]));
+        assert!(matches!(
+            CapturedSchedule::capture_symbolic(
+                &unproven,
+                &schedule,
+                &[output],
+                &spec,
+                &BTreeMap::from([("rows".into(), 2)]),
+            ),
+            Err(ReplayError::Unsupported(_))
+        ));
+    }
 }
