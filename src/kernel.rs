@@ -1304,22 +1304,18 @@ fn eval(
             })))
         }
         Operation::GraphLogical(op) => {
-            let a = eval(&n.sources()[0], bindings, linear, plan)?
-                .scalar()
-                .as_bool();
-            Ok(FusedValue::Scalar(Scalar::Bool(match op {
-                LogicalOp::Not => !a,
-                LogicalOp::And => {
-                    a && eval(&n.sources()[1], bindings, linear, plan)?
-                        .scalar()
-                        .as_bool()
-                }
-                LogicalOp::Or => {
-                    a || eval(&n.sources()[1], bindings, linear, plan)?
-                        .scalar()
-                        .as_bool()
-                }
-            })))
+            let lhs = eval(&n.sources()[0], bindings, linear, plan)?.scalar();
+            Ok(FusedValue::Scalar(evaluate_constant_logical(
+                lhs,
+                *op,
+                || {
+                    n.sources()
+                        .get(1)
+                        .ok_or(Error::InvalidIndex)
+                        .and_then(|rhs| eval(rhs, bindings, linear, plan))
+                        .map(FusedValue::scalar)
+                },
+            )?))
         }
         Operation::Ternary(crate::uop::Ternary::Where) => {
             if eval(&n.sources()[0], bindings, linear, plan)?
@@ -1743,6 +1739,48 @@ fn compare(a: Scalar, b: Scalar, op: CompareOp) -> bool {
         CompareOp::Gt => ordering == Some(Ordering::Greater),
         CompareOp::Ge => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
     }
+}
+
+/// Shared exact scalar semantics for compile-time evaluation. Callers select
+/// the operations that are safe to fold; this seam only prevents the
+/// optimizer and interpreter from growing independent numeric evaluators.
+pub(crate) fn evaluate_constant_unary(
+    value: Scalar,
+    dtype: DType,
+    operation: UnaryOp,
+) -> Result<Scalar> {
+    unary(value, dtype, operation)
+}
+
+pub(crate) fn evaluate_constant_binary(
+    lhs: Scalar,
+    rhs: Scalar,
+    dtype: DType,
+    operation: BinaryOp,
+) -> Result<Scalar> {
+    binary(lhs, rhs, dtype, operation)
+}
+
+pub(crate) fn evaluate_constant_compare(lhs: Scalar, rhs: Scalar, operation: CompareOp) -> bool {
+    compare(lhs, rhs, operation)
+}
+
+pub(crate) fn evaluate_constant_logical<F>(
+    lhs: Scalar,
+    operation: LogicalOp,
+    rhs: F,
+) -> Result<Scalar>
+where
+    F: FnOnce() -> Result<Scalar>,
+{
+    let lhs = lhs.as_bool();
+    Ok(Scalar::Bool(match operation {
+        LogicalOp::Not => !lhs,
+        LogicalOp::And if !lhs => false,
+        LogicalOp::Or if lhs => true,
+        LogicalOp::And => rhs()?.as_bool(),
+        LogicalOp::Or => rhs()?.as_bool(),
+    }))
 }
 
 fn compare_float8(a: f64, b: f64, op: CompareOp) -> bool {

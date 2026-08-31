@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:af2a2f53f8b034fe",
+  "source_fingerprint": "fnv1a64:2244aa1e811febc6",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -324,7 +324,7 @@
       "subject": "Pattern matching and deterministic rewriting",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Symbolic and UOp typed deterministic match/rewrite drivers record traces; phase-one UPat supports exact typed operation sets, operation predicates, dtypes, source patterns and named captures. Full tinygrad UPat varargs, predicates and compiler-pattern IR remain."
+        "Acceptance requirement": "Symbolic and UOp typed deterministic match/rewrite drivers record traces. The UOp driver memoizes a bottom-up shared-DAG walk, revisits replacements to convergence, and rejects cycles or bounded-step exhaustion. Every eligible new pure elementwise scheduled kernel normalizes immediately after lowering and before view extraction, ordered input bindings, dependencies, cache identity, or capture publication; symbolic specialization only changes descriptor geometry, and historical artifact decode/replay retains its encoded UOp structure. UPat supports exact typed operation sets, operation predicates, dtypes, source patterns and named captures. Full tinygrad UPat varargs, predicates and compiler-pattern IR remain."
       }
     },
     {
@@ -333,7 +333,7 @@
       "subject": "Constant folding and algebraic simplification",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Constant/identity folding, associative canonicalization, bound-proved comparisons and boolean normalization are tested; tinygrad's modular-congruence and transcendental rewrite suites remain."
+        "Acceptance requirement": "Scheduled normalization uses the interpreter's shared scalar evaluator to fold only exact Bool/integer `GraphUnary`/`GraphBinary` constants, homogeneous Bool/integral `GraphCompare`, Bool `GraphLogical`, same-type `Cast`, constant-Bool `Where`, and exact Bool/integer zero/one identities. Floating arithmetic identities/reassociation, division/remainder, transcendentals, loads/stores/addresses, conditional control/guards, reductions/effects, and backend approximations remain unchanged and fail closed; tinygrad's modular-congruence and broader transcendental rewrite suites remain."
       }
     },
     {

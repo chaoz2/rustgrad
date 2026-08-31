@@ -1676,6 +1676,11 @@ fn schedule_many_with_external(
             } else {
                 UOp::sink(vec![])
             };
+        let kernel = if boundary.is_none() && matches!(kernel.operation(), crate::Operation::Sink) {
+            crate::uop::normalize_kernel(&kernel).map_err(ScheduleError::UOp)?
+        } else {
+            kernel
+        };
         for value in kernel.topological().map_err(ScheduleError::UOp)? {
             if let crate::Operation::Index(crate::IndexValue::View { buffer, view, .. }) =
                 value.operation()
@@ -1848,6 +1853,11 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
         } else {
             UOp::sink(vec![])
         };
+    let kernel = if boundary.is_none() && matches!(kernel.operation(), crate::Operation::Sink) {
+        crate::uop::normalize_kernel(&kernel).map_err(ScheduleError::UOp)?
+    } else {
+        kernel
+    };
     for node in kernel.topological().map_err(ScheduleError::UOp)? {
         if let crate::Operation::Index(crate::IndexValue::View { buffer, view, .. }) =
             node.operation()

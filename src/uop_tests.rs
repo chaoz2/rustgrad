@@ -156,6 +156,201 @@ fn upat_rewrites_are_prioritized_shared_and_pure() {
         uop::rewrite(&root, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
     assert_eq!(trace.rules, vec!["add-zero"]);
     assert_eq!(rewritten.sources()[0], rewritten.sources()[1]);
+    assert!(rewritten.sources()[0].shares_node_with(&rewritten.sources()[1]));
+}
+
+#[test]
+fn scheduled_normalization_converges_across_replacement_chains() {
+    let two = UOp::scalar_constant(DType::I32, 2, i32t());
+    let three = UOp::scalar_constant(DType::I32, 3, i32t());
+    let sum = UOp::from_operation(
+        Operation::GraphBinary(crate::BinaryOp::Add),
+        Some(i32t()),
+        vec![two, three],
+    );
+    let negated = UOp::from_operation(
+        Operation::GraphUnary(crate::UnaryOp::Neg),
+        Some(i32t()),
+        vec![sum],
+    );
+    let one = UOp::scalar_constant(DType::I32, 1, i32t());
+    let root = UOp::from_operation(
+        Operation::GraphBinary(crate::BinaryOp::Mul),
+        Some(i32t()),
+        vec![negated, one],
+    );
+    root.validate().unwrap();
+
+    let (normalized, trace) =
+        uop::rewrite(&root, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(
+        trace.rules,
+        vec![
+            "fold-integral-binary",
+            "fold-integral-unary",
+            "typed-mul-one"
+        ]
+    );
+    assert!(matches!(
+        normalized.operation(),
+        Operation::Const(LiteralValue::Scalar {
+            dtype: DType::I32,
+            bits: 0xffff_fffb,
+        })
+    ));
+    let sink = UOp::sink(vec![root]);
+    assert_eq!(
+        uop::normalize_kernel(&sink).unwrap().sources()[0],
+        normalized
+    );
+}
+
+#[test]
+fn comparison_and_where_normalization_revisits_the_replacement() {
+    let four = UOp::scalar_constant(DType::U64, 4, UType::scalar(DType::U64));
+    let condition = UOp::from_operation(
+        Operation::GraphCompare(crate::CompareOp::Eq),
+        Some(UType::scalar(DType::Bool)),
+        vec![four.clone(), four],
+    );
+    let on_true = UOp::scalar_constant(DType::I32, 7, i32t());
+    let on_false = UOp::scalar_constant(DType::I32, 9, i32t());
+    let root = UOp::from_operation(
+        Operation::Ternary(Ternary::Where),
+        Some(i32t()),
+        vec![condition, on_true.clone(), on_false],
+    );
+    root.validate().unwrap();
+
+    let (normalized, trace) =
+        uop::rewrite(&root, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(
+        trace.rules,
+        vec!["fold-integral-compare", "typed-where-const"]
+    );
+    assert_eq!(normalized, on_true);
+}
+
+#[test]
+fn bool_logical_and_same_cast_folds_preserve_typed_storage() {
+    let false_ = UOp::scalar_constant(DType::Bool, 0, UType::scalar(DType::Bool));
+    let not = UOp::from_operation(
+        Operation::GraphLogical(crate::LogicalOp::Not),
+        Some(UType::scalar(DType::Bool)),
+        vec![false_],
+    );
+    let true_ = UOp::scalar_constant(DType::Bool, 1, UType::scalar(DType::Bool));
+    let and = UOp::from_operation(
+        Operation::GraphLogical(crate::LogicalOp::And),
+        Some(UType::scalar(DType::Bool)),
+        vec![not, true_],
+    );
+    let nan = UOp::scalar_constant(DType::F32, 0x7fc0_1234, f32t());
+    let cast = UOp::from_operation(Operation::Cast, Some(f32t()), vec![nan.clone()]);
+    let sink = UOp::sink(vec![and, cast]);
+    let normalized = uop::normalize_kernel(&sink).unwrap();
+    assert!(matches!(
+        normalized.sources()[0].operation(),
+        Operation::Const(LiteralValue::Scalar {
+            dtype: DType::Bool,
+            bits: 1,
+        })
+    ));
+    assert_eq!(normalized.sources()[1], nan);
+
+    let malformed = UOp::from_operation(
+        Operation::GraphLogical(crate::LogicalOp::Not),
+        Some(UType::scalar(DType::Bool)),
+        vec![UOp::scalar_constant(DType::I32, 1, i32t())],
+    );
+    let (unchanged, trace) =
+        uop::rewrite(&malformed, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert!(trace.rules.is_empty());
+    assert_eq!(unchanged, malformed);
+
+    let malformed_rhs = UOp::from_operation(
+        Operation::GraphLogical(crate::LogicalOp::And),
+        Some(UType::scalar(DType::Bool)),
+        vec![
+            UOp::scalar_constant(DType::Bool, 0, UType::scalar(DType::Bool)),
+            UOp::scalar_constant(DType::I32, 1, i32t()),
+        ],
+    );
+    let (unchanged, trace) =
+        uop::rewrite(&malformed_rhs, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert!(trace.rules.is_empty());
+    assert_eq!(unchanged, malformed_rhs);
+}
+
+#[test]
+fn rewrite_rejects_rule_cycles_and_step_exhaustion_without_mutating_the_root() {
+    fn int_literal(operation: &Operation) -> bool {
+        matches!(operation, Operation::Const(LiteralValue::Int(_)))
+    }
+    fn increment(_: &uop::Captures, node: &UOp) -> Option<UOp> {
+        let Operation::Const(LiteralValue::Int(value)) = node.operation() else {
+            return None;
+        };
+        Some(UOp::constant(value.checked_add(1)?, node.ty()?))
+    }
+
+    let root = UOp::constant(0, i32t());
+    let mut cycle = vec![
+        uop::RewriteRule {
+            name: "zero-to-one",
+            priority: 0,
+            pattern: UPat::op(Operation::Const(LiteralValue::Int(0))),
+            apply: |_, node| Some(UOp::constant(1, node.ty()?)),
+        },
+        uop::RewriteRule {
+            name: "one-to-zero",
+            priority: 1,
+            pattern: UPat::op(Operation::Const(LiteralValue::Int(1))),
+            apply: |_, node| Some(UOp::constant(0, node.ty()?)),
+        },
+    ];
+    assert!(matches!(
+        uop::rewrite(&root, &mut cycle, Walk::BottomUp),
+        Err(crate::UOpError::RewriteCycle)
+    ));
+    assert!(matches!(
+        root.operation(),
+        Operation::Const(LiteralValue::Int(0))
+    ));
+
+    let mut unbounded = vec![uop::RewriteRule {
+        name: "increment",
+        priority: 0,
+        pattern: UPat::operation_predicate(int_literal),
+        apply: increment,
+    }];
+    assert!(matches!(
+        uop::rewrite(&root, &mut unbounded, Walk::BottomUp),
+        Err(crate::UOpError::RewriteStepLimit)
+    ));
+    assert!(matches!(
+        root.operation(),
+        Operation::Const(LiteralValue::Int(0))
+    ));
+}
+
+#[test]
+fn artifact_decode_preserves_historical_unnormalized_uops() {
+    let root = UOp::from_operation(
+        Operation::GraphBinary(crate::BinaryOp::Add),
+        Some(i32t()),
+        vec![
+            UOp::scalar_constant(DType::I32, 7, i32t()),
+            UOp::scalar_constant(DType::I32, 0, i32t()),
+        ],
+    );
+    root.validate().unwrap();
+    let encoded = uop::artifact::encode(&root).unwrap();
+    let decoded = uop::artifact::decode(&encoded).unwrap();
+    assert_eq!(decoded, root);
+    assert!(matches!(decoded.operation(), Operation::GraphBinary(_)));
+    let normalized = uop::normalize_kernel(&UOp::sink(vec![decoded.clone()])).unwrap();
+    assert_ne!(normalized.sources()[0], decoded);
 }
 
 #[test]
@@ -180,6 +375,39 @@ fn raw_scalar_identity_rewrite_is_type_checked_and_preserves_signed_zero() {
         uop::rewrite(&preserved, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
     assert!(trace.rules.is_empty());
     assert_eq!(unchanged, preserved);
+
+    for bits in [0x8000_0000_u64, 0x7fc0_1234] {
+        let value = UOp::scalar_constant(DType::F32, bits, f32t());
+        let zero = UOp::scalar_constant(DType::F32, 0, f32t());
+        let graph_add = UOp::from_operation(
+            Operation::GraphBinary(crate::BinaryOp::Add),
+            Some(f32t()),
+            vec![value, zero],
+        );
+        graph_add.validate().unwrap();
+        let normalized = uop::normalize_kernel(&UOp::sink(vec![graph_add.clone()])).unwrap();
+        assert_eq!(normalized.sources()[0], graph_add);
+    }
+}
+
+#[test]
+fn scheduled_normalization_rejects_effect_and_conditional_roots_without_rewriting() {
+    let value = UOp::scalar_constant(DType::I32, 7, i32t());
+    let zero = UOp::scalar_constant(DType::I32, 0, i32t());
+    let foldable = UOp::from_operation(
+        Operation::GraphBinary(crate::BinaryOp::Add),
+        Some(i32t()),
+        vec![value, zero],
+    );
+    let condition = UOp::scalar_constant(DType::Bool, 1, UType::scalar(DType::Bool));
+    let if_ = UOp::from_operation(Operation::If, None, vec![condition]);
+    let end_if = UOp::from_operation(Operation::EndIf, None, vec![if_]);
+    let root = UOp::sink(vec![foldable.clone(), end_if.clone()]);
+    assert!(matches!(
+        uop::normalize_kernel(&root),
+        Err(crate::UOpError::EffectRewrite)
+    ));
+    assert_eq!(root.sources(), &[foldable, end_if]);
 }
 
 #[test]
@@ -381,6 +609,66 @@ fn typed_scalar_rewrite_leaves_fixed_schedule_cache_identity_stable() {
     let first = crate::schedule(&graph, output).unwrap();
     let second = crate::schedule(&graph, output).unwrap();
     assert_eq!(first.items[0].cache_key, second.items[0].cache_key);
+    assert_eq!(first.items[0].kernel, second.items[0].kernel);
+    assert_eq!(
+        first.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![x]
+    );
+    assert!(first.items[0].dependencies.is_empty());
+    assert!(
+        first.items[0]
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .all(|node| !matches!(node.operation(), Operation::GraphBinary(_)))
+    );
+
+    let raw = crate::kernel::lower_graph_elementwise(&graph, output).unwrap();
+    assert!(raw.topological().unwrap().len() > first.items[0].kernel.topological().unwrap().len());
+    let capture = crate::CapturedSchedule::capture(&graph, &first, &[output]).unwrap();
+    let encoded = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&encoded).unwrap();
+    assert_eq!(decoded.items[0].kernel, first.items[0].kernel);
+    assert_eq!(decoded.identity, capture.identity);
+
+    let bindings = std::collections::HashMap::from([(
+        "x".into(),
+        TensorData::scalar_with_dtype(crate::Scalar::I(-17), DType::I32),
+    )]);
+    let interpreted = crate::realize_with_options(
+        &graph,
+        &first,
+        &[output],
+        &bindings,
+        crate::RealizationOptions {
+            backend: crate::RealizationPolicy::Interpreter,
+            memory_reuse: crate::MemoryReuse::Disabled,
+        },
+    )
+    .unwrap();
+    let native = crate::realize_with_options(
+        &graph,
+        &first,
+        &[output],
+        &bindings,
+        crate::RealizationOptions {
+            backend: crate::RealizationPolicy::CpuJit {
+                fallback_to_interpreter: false,
+            },
+            memory_reuse: crate::MemoryReuse::Disabled,
+        },
+    )
+    .unwrap();
+    assert_eq!(interpreted.outputs[0].to_vec_f64(), vec![-17.0]);
+    assert_eq!(
+        native.outputs[0].storage(),
+        interpreted.outputs[0].storage()
+    );
 
     let lowered = uop::lower_graph_scalar(&graph, output).unwrap();
     let (rewritten, trace) =

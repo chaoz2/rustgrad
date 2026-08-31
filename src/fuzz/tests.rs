@@ -1493,7 +1493,7 @@ fn cast_cases_cover_the_safe_full_concrete_dtype_matrix_without_undefined_c_cast
                     .iter()
                     .filter(|node| matches!(node.operation(), Operation::Cast))
                     .count(),
-                1,
+                usize::from(from != to),
             );
             let captured =
                 CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
@@ -4035,6 +4035,7 @@ fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
             &TensorData::from_storage([2], Storage::Bool(vec![false, true])).unwrap(),
         ),
     ] {
+        let input_dtype = input.dtype;
         let case = FuzzCase::LogicalNot { input };
         let built = case.build().unwrap();
         let Op::Compare {
@@ -4062,10 +4063,13 @@ fn logical_not_cases_round_trip_minimize_and_capture_source_composition() {
         let scheduled = schedule(&built.graph, built.output).unwrap();
         let assert_kernel = |kernel: &crate::UOp| {
             let nodes = kernel.topological().unwrap();
-            assert!(nodes.iter().any(|node| {
-                matches!(node.operation(), Operation::Cast)
-                    && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
-            }));
+            assert_eq!(
+                nodes.iter().any(|node| {
+                    matches!(node.operation(), Operation::Cast)
+                        && node.ty().is_some_and(|ty| ty.scalar == DType::Bool)
+                }),
+                input_dtype != DType::Bool
+            );
             assert!(nodes.iter().any(|node| {
                 matches!(node.operation(), Operation::GraphCompare(CompareOp::Ne))
             }));
@@ -4758,7 +4762,7 @@ fn unary_cases_cover_every_concrete_dtype_and_public_bool_negation() {
             let topological = kernel.topological().unwrap();
             if dtype == DType::Bool && op == FuzzUnaryOp::Neg {
                 assert!(
-                    topological
+                    !topological
                         .iter()
                         .any(|node| matches!(node.operation(), Operation::Cast))
                 );
