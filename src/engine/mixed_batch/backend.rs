@@ -8,7 +8,11 @@ use std::collections::BTreeMap;
 
 pub(super) trait PreparedBackend {
     type Prepared;
-    fn prepare(&self, items: &[ScheduleItem]) -> Result<Self::Prepared, ReplayError>;
+    fn prepare(
+        &self,
+        items: &[ScheduleItem],
+        retained_outputs: &[u64],
+    ) -> Result<Self::Prepared, ReplayError>;
     fn execute(
         &self,
         prepared: &Self::Prepared,
@@ -81,7 +85,19 @@ pub(super) fn replay<B: PreparedBackend>(
                 .iter()
                 .position(crate::ScheduleItem::is_effect)
                 .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
-            backend.prepare(&capture.capture().schedule.items[..split])
+            let retained_outputs = capture
+                .capture()
+                .value_bindings
+                .iter()
+                .filter(|binding| binding.producer_item < split as u64)
+                .map(|binding| binding.producer_output.id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            backend.prepare(
+                &capture.capture().schedule.items[..split],
+                &retained_outputs,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut entries: Vec<EffectBatchEntry> = Vec::new();

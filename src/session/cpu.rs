@@ -694,11 +694,11 @@ impl CpuSession {
         }
         let capabilities = device.info().capabilities.clone();
         let (schedule, values) = self.metal_schedule_values(tensor)?;
-        let plan = MetalPrefixPlan::plan(&schedule.items, renderer).map_err(|e| {
-            Error::SessionTraining {
-                reason: format!("Metal preflight: {e}"),
-            }
-        })?;
+        let plan =
+            MetalPrefixPlan::plan_for_outputs(&schedule.items, &[node.index() as u64], renderer)
+                .map_err(|e| Error::SessionTraining {
+                    reason: format!("Metal preflight: {e}"),
+                })?;
         let planned_item_ids = schedule.items.iter().map(|item| item.id).collect();
         if tensor.shape.numel().map_err(|_| Error::InvalidIndex)? == 0 {
             let trace = MetalSessionTrace::new(

@@ -21,9 +21,18 @@ struct OpenClBackend {
 }
 impl backend::PreparedBackend for OpenClBackend {
     type Prepared = PreparedOpenClPrefix;
-    fn prepare(&self, items: &[ScheduleItem]) -> Result<Self::Prepared, ReplayError> {
-        PreparedOpenClPrefix::prepare(self.context.clone(), items, self.renderer)
-            .map_err(|e| ReplayError::Execute(format!("OpenCL prepare: {e:?}")))
+    fn prepare(
+        &self,
+        items: &[ScheduleItem],
+        retained_outputs: &[u64],
+    ) -> Result<Self::Prepared, ReplayError> {
+        PreparedOpenClPrefix::prepare_for_outputs(
+            self.context.clone(),
+            items,
+            retained_outputs,
+            self.renderer,
+        )
+        .map_err(|e| ReplayError::Execute(format!("OpenCL prepare: {e:?}")))
     }
     fn execute(
         &self,

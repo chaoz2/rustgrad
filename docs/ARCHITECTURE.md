@@ -436,6 +436,20 @@ validate uniqueness, view consistency, output exclusion, and completeness. CPU
 interpreter/JIT and PTX can validate the same map without changing their ordered
 pointer-slice ABI.
 
+Prepared OpenCL, Metal, and WebGPU pure prefixes then project those validated
+bindings into one crate-private static residency plan. The plan renders and
+validates the complete prefix plus its canonical physical buffer inventory
+before queue, cache, compilation, or allocation work. Execution uploads each
+external logical buffer once, retains producer outputs on device across ordered
+consumers (whose affine views remain renderer-local addressing metadata), and
+downloads only the exact caller-retained outputs; mixed execution supplies its
+value-binding outputs while compatibility prepared-prefix APIs retain every
+item output. Host outputs are decoded completely before publication, so
+launch/read failures expose no partial result and a retry starts from fresh
+external uploads. Backend resource types, zero-domain cache policy, renderer
+source/cache keys, and RGSA/RGSM bytes remain outside and unchanged by this
+derived runtime plan.
+
 `schedule_with_external_materializations(graph, outputs, materialized)` is the
 explicit opt-in for a caller-owned computed buffer such as a redistribution
 destination. It validates reachability and rejects outputs, inputs, constants,

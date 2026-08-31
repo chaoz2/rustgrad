@@ -21,9 +21,18 @@ struct MetalBackend {
 }
 impl backend::PreparedBackend for MetalBackend {
     type Prepared = PreparedMetalPrefix;
-    fn prepare(&self, items: &[ScheduleItem]) -> Result<Self::Prepared, ReplayError> {
-        PreparedMetalPrefix::prepare(self.device.clone(), items, self.renderer.clone())
-            .map_err(|e| ReplayError::Execute(format!("Metal prepare: {e:?}")))
+    fn prepare(
+        &self,
+        items: &[ScheduleItem],
+        retained_outputs: &[u64],
+    ) -> Result<Self::Prepared, ReplayError> {
+        PreparedMetalPrefix::prepare_for_outputs(
+            self.device.clone(),
+            items,
+            retained_outputs,
+            self.renderer.clone(),
+        )
+        .map_err(|e| ReplayError::Execute(format!("Metal prepare: {e:?}")))
     }
     fn execute(
         &self,

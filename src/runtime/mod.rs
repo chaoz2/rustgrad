@@ -6,4 +6,5 @@ pub mod metal;
 pub mod null;
 pub mod opencl;
 pub(crate) mod scalar_lane;
+pub(crate) mod static_schedule;
 pub mod webgpu;

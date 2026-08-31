@@ -222,7 +222,14 @@ struct CudaBackend {
 }
 impl backend::PreparedBackend for CudaBackend {
     type Prepared = PreparedCudaPrefix;
-    fn prepare(&self, items: &[ScheduleItem]) -> Result<Self::Prepared, ReplayError> {
+    fn prepare(
+        &self,
+        items: &[ScheduleItem],
+        _retained_outputs: &[u64],
+    ) -> Result<Self::Prepared, ReplayError> {
+        // CUDA/PTX remains on its legacy per-item materialization path. Exact
+        // retained-output residency is deliberately confined to the shared
+        // OpenCL/Metal/WebGPU static executor in this change.
         PreparedCudaPrefix::prepare(self.primary.clone(), items, self.renderer, &self.cache)
             .map_err(|e| ReplayError::Execute(format!("CUDA prepare: {e}")))
     }

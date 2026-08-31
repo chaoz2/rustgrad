@@ -3,79 +3,177 @@ use super::{
     MetalBuffer, MetalCache, MetalCommandQueue, MetalDevice, MetalError, MetalPipeline,
     MetalRenderer,
 };
-use crate::{ScheduleItem, TensorData};
+use crate::{DType, ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
-/// A fully rendered, validated, compiled, and allocated pure prefix. Preparing
-/// it has no command submission side effect; execution retains the semantic
-/// Metal pipeline rather than consulting the CPU backend.
-pub struct PreparedMetalPrefix {
-    queue: Option<MetalCommandQueue>,
-    cache: MetalCache,
-    items: Vec<PreparedMetalItem>,
+use crate::runtime::static_schedule::{
+    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticRendered, StaticRenderedBuffer,
+    StaticSchedulePlan, bind_rendered_buffers,
+};
+
+struct MetalStaticAdapter {
+    device: Option<MetalDevice>,
+    renderer: MetalRenderer,
+    cache: Option<MetalCache>,
 }
 
-/// Fully rendered pure prefix before any Metal resource is created.
+impl MetalStaticAdapter {
+    fn planner(renderer: MetalRenderer) -> Self {
+        Self {
+            device: None,
+            renderer,
+            cache: None,
+        }
+    }
+
+    fn runtime(device: MetalDevice, renderer: MetalRenderer) -> Self {
+        let cache = device.cache();
+        Self {
+            device: Some(device),
+            renderer,
+            cache: Some(cache),
+        }
+    }
+
+    fn device(&self) -> Result<&MetalDevice, MetalError> {
+        self.device
+            .as_ref()
+            .ok_or_else(|| MetalError::InvalidBinding("Metal plan has no device".into()))
+    }
+}
+
+impl Sealed for MetalStaticAdapter {}
+
+impl StaticDeviceAdapter for MetalStaticAdapter {
+    type Error = MetalError;
+    type Rendered = super::RenderedMetal;
+    type Kernel = Rc<MetalPipeline>;
+    type Buffer = MetalBuffer;
+    type Queue = MetalCommandQueue;
+
+    fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
+        let rendered = self.renderer.render(&item.kernel)?;
+        rendered.validate_schedule_bindings(item.ordered_inputs())?;
+        if rendered.transaction.is_some() {
+            return Err(MetalError::Unsupported(
+                "guarded Metal prefixes require a staged candidate ABI".into(),
+            ));
+        }
+        let buffers = bind_rendered_buffers(
+            item,
+            rendered.buffers.iter().map(|abi| StaticRenderedBuffer {
+                id: abi.id,
+                dtype: abi.dtype,
+                source_shape: abi.source_shape.clone(),
+                elements: abi.elements,
+                mutable: abi.mutable,
+            }),
+            MetalError::InvalidBinding,
+            || MetalError::Overflow,
+        )?;
+        Ok(StaticRendered {
+            cache_key: rendered.cache_key.clone(),
+            extent: rendered.extent,
+            buffers,
+            artifact: rendered,
+        })
+    }
+
+    fn invalid_binding(reason: String) -> Self::Error {
+        MetalError::InvalidBinding(reason)
+    }
+    fn unsupported(reason: String) -> Self::Error {
+        MetalError::Unsupported(reason)
+    }
+    fn overflow() -> Self::Error {
+        MetalError::Overflow
+    }
+    fn prepare_zero_extent(&self) -> bool {
+        false
+    }
+    fn compile(&self, rendered: &Self::Rendered) -> Result<Self::Kernel, Self::Error> {
+        self.cache
+            .as_ref()
+            .ok_or_else(|| MetalError::InvalidBinding("Metal plan has no cache".into()))?
+            .load(rendered)
+    }
+    fn compiled_cache_key(&self, kernel: &Self::Kernel) -> String {
+        kernel.rendered().cache_key.clone()
+    }
+    fn allocate(&self, elements: usize, dtype: DType) -> Result<Self::Buffer, Self::Error> {
+        self.device()?.allocate_typed(elements, dtype)
+    }
+    fn create_queue(&self) -> Result<Self::Queue, Self::Error> {
+        self.device()?.create_queue()
+    }
+    fn write(
+        &self,
+        queue: &Self::Queue,
+        buffer: &Self::Buffer,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        queue.write(buffer, 0, bytes)
+    }
+    fn launch_and_wait(
+        &self,
+        queue: &Self::Queue,
+        kernel: &Self::Kernel,
+        buffers: &[&Self::Buffer],
+    ) -> Result<(), Self::Error> {
+        if let Some(command) = kernel.launch(queue, buffers, self.renderer.local_size)? {
+            command.collect()?;
+        }
+        Ok(())
+    }
+    fn read(
+        &self,
+        queue: &Self::Queue,
+        buffer: &Self::Buffer,
+        bytes: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        queue.read(buffer, 0, bytes)
+    }
+    fn cache_len(&self) -> usize {
+        self.cache.as_ref().map_or(0, MetalCache::len)
+    }
+}
+
+/// A fully rendered, validated pure prefix before any Metal resource is created.
 pub struct MetalPrefixPlan {
-    items: Vec<PlannedMetalItem>,
-}
-
-enum PlannedMetalItem {
-    Kernel(Box<super::RenderedMetal>),
-    /// A validated pure item whose result has no logical storage. It retains
-    /// descriptor identity but never needs a pipeline, buffer, or command.
-    ZeroDomain(Box<ScheduleItem>),
-}
-
-enum PreparedMetalItem {
-    Kernel(Rc<MetalPipeline>, Vec<MetalBuffer>),
-    ZeroDomain(Box<ScheduleItem>),
+    plan: StaticSchedulePlan<super::RenderedMetal>,
+    renderer: MetalRenderer,
 }
 
 impl MetalPrefixPlan {
-    /// Performs deterministic renderer and ABI validation only.
+    /// Performs deterministic renderer, schedule, and physical-buffer validation only.
     pub fn plan(items: &[ScheduleItem], renderer: MetalRenderer) -> Result<Self, MetalError> {
-        let mut planned = Vec::with_capacity(items.len());
-        for item in items {
-            if item.boundary.is_some()
-                || item.is_effect()
-                || !item.quantized_input_bindings.is_empty()
-                || !item.outputs.is_single()
-            {
-                return Err(MetalError::Unsupported(
-                    "pure prefix item is outside Metal static execution".into(),
-                ));
-            }
-            let rendered = renderer.render(&item.kernel)?;
-            rendered.validate_schedule_bindings(item.ordered_inputs())?;
-            if rendered.transaction.is_some() {
-                return Err(MetalError::Unsupported(
-                    "guarded Metal prefixes require a staged candidate ABI".into(),
-                ));
-            }
-            if item
-                .primary_output()
-                .shape
-                .numel()
-                .map_err(|_| MetalError::Overflow)?
-                == 0
-            {
-                planned.push(PlannedMetalItem::ZeroDomain(Box::new(item.clone())));
-            } else {
-                planned.push(PlannedMetalItem::Kernel(Box::new(rendered)));
-            }
-        }
-        Ok(Self { items: planned })
+        let adapter = MetalStaticAdapter::planner(renderer.clone());
+        Ok(Self {
+            plan: StaticSchedulePlan::build(&adapter, items, None)?,
+            renderer,
+        })
     }
+
+    pub(crate) fn plan_for_outputs(
+        items: &[ScheduleItem],
+        retained: &[u64],
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
+        let adapter = MetalStaticAdapter::planner(renderer.clone());
+        Ok(Self {
+            plan: StaticSchedulePlan::build(&adapter, items, Some(retained))?,
+            renderer,
+        })
+    }
+
     pub fn cache_keys(&self) -> Vec<String> {
-        self.items
-            .iter()
-            .filter_map(|item| match item {
-                PlannedMetalItem::Kernel(rendered) => Some(rendered.cache_key.clone()),
-                PlannedMetalItem::ZeroDomain(_) => None,
-            })
-            .collect()
+        self.plan.compiled_cache_keys()
     }
+}
+
+/// A fully validated pure prefix whose logical intermediates remain device-resident.
+pub struct PreparedMetalPrefix {
+    inner: PreparedStaticSchedule<MetalStaticAdapter>,
 }
 
 impl PreparedMetalPrefix {
@@ -84,128 +182,36 @@ impl PreparedMetalPrefix {
         items: &[ScheduleItem],
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
-        if items
-            .iter()
-            .any(|item| matches!(item.kernel.operation(), crate::Operation::TensorGuard(_)))
-        {
-            return Err(MetalError::Unsupported(
-                "tensor guard is CPU-interpreter only".into(),
-            ));
-        }
         let plan = MetalPrefixPlan::plan(items, renderer)?;
         Self::from_plan(device, plan)
     }
-    /// Allocates and compiles a previously validated plan.
+
+    pub(crate) fn prepare_for_outputs(
+        device: MetalDevice,
+        items: &[ScheduleItem],
+        retained: &[u64],
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
+        let plan = MetalPrefixPlan::plan_for_outputs(items, retained, renderer)?;
+        Self::from_plan(device, plan)
+    }
+
     pub fn from_plan(device: MetalDevice, plan: MetalPrefixPlan) -> Result<Self, MetalError> {
-        let cache = device.cache();
-        let queue = if plan
-            .items
-            .iter()
-            .any(|item| matches!(item, PlannedMetalItem::Kernel(..)))
-        {
-            Some(device.create_queue()?)
-        } else {
-            None
-        };
-        let mut prepared = Vec::with_capacity(plan.items.len());
-        for item in plan.items {
-            match item {
-                PlannedMetalItem::Kernel(rendered) => {
-                    let pipeline = cache.load(&rendered)?;
-                    let buffers = pipeline
-                        .rendered()
-                        .buffers
-                        .iter()
-                        .map(|abi| device.allocate_typed(abi.elements, abi.dtype))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    prepared.push(PreparedMetalItem::Kernel(pipeline, buffers));
-                }
-                PlannedMetalItem::ZeroDomain(item) => {
-                    prepared.push(PreparedMetalItem::ZeroDomain(item));
-                }
-            }
-        }
         Ok(Self {
-            queue,
-            cache,
-            items: prepared,
+            inner: PreparedStaticSchedule::from_plan(
+                MetalStaticAdapter::runtime(device, plan.renderer),
+                plan.plan,
+            )?,
         })
     }
+
     pub fn cache_len(&self) -> usize {
-        self.cache.len()
+        self.inner.cache_len()
     }
     pub fn kernel_cache_keys(&self) -> Vec<String> {
-        self.items
-            .iter()
-            .filter_map(|item| match item {
-                PreparedMetalItem::Kernel(pipeline, _) => {
-                    Some(pipeline.rendered().cache_key.clone())
-                }
-                PreparedMetalItem::ZeroDomain(_) => None,
-            })
-            .collect()
+        self.inner.compiled_cache_keys()
     }
     pub fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), MetalError> {
-        for item in &self.items {
-            let (pipeline, buffers) = match item {
-                PreparedMetalItem::Kernel(pipeline, buffers) => (pipeline, buffers),
-                PreparedMetalItem::ZeroDomain(item) => {
-                    values.insert(
-                        item.primary_output().id,
-                        TensorData::zeros_with_dtype(
-                            item.primary_output().shape.clone(),
-                            item.primary_output().dtype,
-                        )
-                        .map_err(|_| MetalError::InvalidBinding("zero-domain output".into()))?,
-                    );
-                    continue;
-                }
-            };
-            let queue = self.queue.as_ref().ok_or_else(|| {
-                MetalError::InvalidBinding("kernel prefix has no command queue".into())
-            })?;
-            for (abi, buffer) in pipeline.rendered().buffers.iter().zip(buffers) {
-                if !abi.mutable {
-                    let value = values.get(&abi.id).ok_or_else(|| {
-                        MetalError::InvalidBinding(format!("missing prefix input {}", abi.id))
-                    })?;
-                    queue.write(
-                        buffer,
-                        0,
-                        &value
-                            .to_le_bytes()
-                            .map_err(|_| MetalError::InvalidBinding("input bytes".into()))?,
-                    )?;
-                }
-            }
-            if let Some(command) = pipeline.launch(queue, &buffers.iter().collect::<Vec<_>>(), 1)? {
-                command.collect()?;
-            }
-            let output = pipeline
-                .rendered()
-                .buffers
-                .last()
-                .ok_or_else(|| MetalError::InvalidBinding("missing output".into()))?;
-            let mut bytes = vec![
-                0;
-                output
-                    .elements
-                    .checked_mul(output.dtype.itemsize())
-                    .ok_or(MetalError::Overflow)?
-            ];
-            queue.read(
-                buffers
-                    .last()
-                    .ok_or_else(|| MetalError::InvalidBinding("missing output buffer".into()))?,
-                0,
-                &mut bytes,
-            )?;
-            values.insert(
-                output.id,
-                TensorData::from_le_bytes(output.source_shape.clone(), output.dtype, &bytes)
-                    .map_err(|_| MetalError::InvalidBinding("output bytes".into()))?,
-            );
-        }
-        Ok(())
+        self.inner.execute(values)
     }
 }

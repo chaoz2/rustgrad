@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:9bc17e789637d6e4",
+  "source_fingerprint": "fnv1a64:af2a2f53f8b034fe",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -369,7 +369,7 @@
       "subject": "Portable captured mixed batches",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`RGMB` is a bounded, checksummed, deterministic ordered envelope of canonical RGSM entries. Decoding validates every embedded RGSM and the recomputed logical batch identity before interpreter or strict-native in-memory replay. `RGBS` packages exact version-zero raw `TensorData` beside byte-identical RGMB; its bounded decode validates the state frontier before a caller-selected validated total/bijective `MixedStateRebinding` atomically registers a fresh host `EffectRuntime`. The resulting bundle replays through interpreter, strict native, or the retained PTX semantic mock without state-byte migration or destination/runtime-resource serialization. A backend-neutral prepared-prefix coordinator drives OpenCL, Metal, WebGPU, and CUDA/PTX adapters, executing detached prefixes before one host transaction commits effects. There is no CPU fallback, device-resident persistent state, compiled-resource serialization, arbitrary historical/process-memory checkpointing, or live CUDA/toolkit mixed-batch evidence. F16/BF16 packed writes, F64/I64/U64, raw narrow indexed-duplicate source coverage, invalid/incompatible rebinding schemas, mutation autograd/live-use rules, and unsupported UOps remain gaps."
+        "Acceptance requirement": "`RGMB` is a bounded, checksummed, deterministic ordered envelope of canonical RGSM entries. Decoding validates every embedded RGSM and the recomputed logical batch identity before interpreter or strict-native in-memory replay. `RGBS` packages exact version-zero raw `TensorData` beside byte-identical RGMB; its bounded decode validates the state frontier before a caller-selected validated total/bijective `MixedStateRebinding` atomically registers a fresh host `EffectRuntime`. The resulting bundle replays through interpreter, strict native, or the retained PTX semantic mock without state-byte migration or destination/runtime-resource serialization. OpenCL, Metal, and WebGPU prepared pure prefixes share one crate-private static schedule plan/executor: the complete schedule, rendered ABI, and canonical logical-buffer graph preflight before resource work; external values upload once, producer intermediates remain device-resident across branches and affine consumers, and retained outputs download once before atomic detached host publication. Public compatibility entry points retain every item output, while mixed replay retains only exact value-binding producers. Existing renderer source/cache and RGSA/RGSM artifact identities are unchanged, and backend-specific zero-domain cache policy is retained. The mixed coordinator still drives CUDA/PTX separately before one host transaction commits effects. Effects, guarded transactions, quantized/multi-device items, cross-execution device-resident persistent state, physical-buffer reuse, compiled-resource serialization, arbitrary historical/process-memory checkpointing, and live CUDA/toolkit mixed-batch evidence remain outside this static executor. F16/BF16 packed writes, F64/I64/U64, raw narrow indexed-duplicate source coverage, invalid/incompatible rebinding schemas, mutation autograd/live-use rules, and unsupported UOps remain gaps."
       }
     },
     {
