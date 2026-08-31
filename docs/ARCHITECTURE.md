@@ -220,12 +220,19 @@ movement reverse edges without another indexing substrate.
 `ir::dynamic` owns a separate typed dynamic-cardinality arena. Dynamic inputs
 are either graph-owned dynamic values or validated scalar static nodes; they
 never acquire a sentinel static `Shape`. CPU realization memoizes this arena
-within one request. The current composable forward surface is rank-one float
-unary/binary arithmetic after dynamic selection, with scalar static operands
-and same-cardinality dynamic operands. The supported F32 `Neg`/`Square` and
-`Add`/`Sub`/`Mul` subset has a CPU-only first-order VJP back through
-masked-select scatter. General dynamic broadcasting, higher order, and every
-device boundary remain explicit follow-up work.
+within one request. `DynamicOutputShape` retains the exact count-producing node
+and its scalar, one-dimensional, or row-coordinate expression. Pointwise
+`Neg`/`Square` and `Add`/`Sub`/`Mul` compose arbitrary topological branches
+when dynamic operands share that count provenance; scalar reductions remain
+ordinary composable values in the runtime DAG. General dynamic broadcasting,
+higher order, and every device boundary remain explicit follow-up work.
+
+The 0.1 runtime-cardinality API intentionally replaced the former rank-only
+shape constructor and side binding projection. `DynamicOutputShape` is now the
+direct `Scalar`/`Count1d`/`CountRows` expression enum, `DynamicCountStage` owns
+its bindings, and allocation-plan validation accepts the canonical ordered
+binding slice. This keeps unresolved shapes and stage/binding drift
+unrepresentable rather than preserving a parallel legacy projection.
 
 `EffectGraph::static_index_assign` is the explicit pure-plan-to-effect bridge.
 It embeds the normalized `StaticIndexPlan` in the typed STORE/AFTER payload;
@@ -255,31 +262,52 @@ no NodeIds in effects and is not a VJP, capture, native, or device path.
 
 `ir::dynamic` keeps data-dependent extents separate from static graph nodes.
 `DynamicAllocationPlan` is the graph-owned exact count/allocation contract for
-CPU `masked_select_dynamic`: it has no sentinel capacity or placeholder.
-`MixedSchedule` retains fixed schedule identities and adds typed runtime
-count, allocation, materialization, lifetime, and consumer-binding records;
-it is not a second planner or executor. CPU realization validates a concrete
-ranked `engine::RuntimeShape` before exposing owned storage. The only lowered
-runtime chain is `masked_select_dynamic`, optionally F32 `Neg` or `Square`,
-then one F32 `Add`/`Sub`/`Mul` against a checked static scalar, or a fixed
-scalar `Sum` or `Mean`; each unary or binary result has a distinct exact
-allocation and ordered runtime/static ABI bindings. Other dynamic
-producers/consumers, dynamic-to-dynamic binary composition, capture,
-artifacts, replay, native JIT, and device lowering reject rather than falling
-back.
+CPU `nonzero` and `masked_select_dynamic`: the count-stage enum owns its typed
+bindings and has no side projection, sentinel capacity, or placeholder.
+`RuntimeSchedule` is one validated topological instruction DAG. Count,
+allocation-resource, materialization, unary, binary, and reduction variants
+own their operands and results; `RuntimeValueDesc` distinguishes dynamic
+buffers from fixed scalar results without colliding raw IDs. Allocation does
+not produce a tensor value, and validation requires exactly one allocation and
+one later value producer per runtime buffer, exact descriptor/count identity,
+and canonical dependency edges. `nonzero` materializes row-major
+`[count, rank]` coordinates in I32 unless a source dimension's maximum
+coordinate exceeds I32, then I64, including scalar and zero-domain shapes.
+The fixed-size form validates maximum coordinates through the final I64 value
+before publication and plans coordinate ranges by length; zero-domain inputs
+therefore use a descriptor-only scalar expansion and need neither dense fill
+storage nor a narrowed or wrapped exclusive range endpoint.
+Shared-count dynamic branches,
+checked static scalars, and fixed `Sum`/`Mean` results compose through the same
+DAG. Both reductions carry the canonical `ReductionDType`: narrow floats and
+small integers accumulate at the source-policy width, then cast once to the
+public output dtype. CPU realization validates a concrete ranked
+`engine::RuntimeShape` before
+exposing owned storage.
+
+Runtime allocation lifetimes are checked sizing/liveness metadata. The CPU
+executor currently owns independent `TensorData` values and neither releases
+nor reuses storage from those records. Capture, artifacts, replay, native JIT,
+PTX, and device lowering reject rather than falling back; the fixed
+`ScheduleItem` and RGSA/RGSM artifact ABIs are unchanged.
 
 Dynamic `Sum` retains the existing CPU first-order loss executor, which carries
 validated runtime upstream shapes and returns a gradient in the requested
-static source shape. Dynamic `Mean` is forward-only; neither it nor the new
-runtime schedule participates in `Graph::grad` or general dynamic autograd.
+static source shape. Its local cotangents cross admitted derived static graph
+boundaries through an explicit cloned-graph `grad_with` seed, including the
+masked value expression and derived scalar operands. Dynamic `Mean` is
+forward-only; neither it nor the new runtime schedule participates in
+`Graph::grad` or general dynamic autograd.
 
-`CpuSession` exposes this same exact ABI without exporting graph-local dynamic
-IDs: `masked_select_dynamic` creates a session-owned F32 `DynamicTensor`, and
-only F32 `Neg`/`Square`, a checked static-scalar `Add`/`Sub`/`Mul`, fixed
-scalar `Sum`/forward-only `Mean`, and CPU realization accept it. Handles are
-session-identified like static session tensors. This is a public workflow
-facade over the existing plan, not a new runtime, planner, capture surface, or
-dynamic session/device generalization.
+`CpuSession` exposes this same exact ABI without mutable or raw arena-index
+access: `DynamicTensor::shape_expression` carries an opaque graph-local count
+provenance token, and every operation validates session ownership.
+`nonzero_dynamic` and `masked_select_dynamic` create session-owned handles;
+pointwise branches,
+checked static scalars, fixed scalar `Sum`/forward-only `Mean`, and CPU
+realization accept them. Handles are session-identified like static session
+tensors. This is a public workflow facade over the existing plan, not a
+capture surface or dynamic device generalization.
 
 ## tinygrad-to-RustGrad mapping
 

@@ -1,16 +1,16 @@
 use super::Backend;
 use super::float8_reduce;
-use crate::engine::dynamic::MixedMaterializationMap;
+use crate::engine::dynamic::RuntimeMaterializationMap;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
-use crate::ir::{DynamicAllocationTarget, DynamicInput, DynamicNodeId, DynamicOp};
+use crate::ir::{DynamicInput, DynamicNodeId, DynamicOperation};
 use crate::schedule::dynamic::{
-    MixedSchedule, ScheduledOutputDesc, schedule_dynamic, schedule_dynamic_binary,
-    schedule_dynamic_unary,
+    RuntimeBufferDesc, RuntimeCount, RuntimeCountId, RuntimeInstruction, RuntimeSchedule,
+    RuntimeValueDesc, RuntimeValueSource, schedule_dynamic,
 };
 use crate::{
-    BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, Result, Scalar,
-    Shape, SortOutput, Storage, TensorData, UnaryOp,
+    BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, ReduceKind,
+    Result, Scalar, Shape, SortOutput, Storage, TensorData, UnaryOp,
     ir::{RandomKind, RandomStream, normalized_slice},
 };
 use std::collections::HashMap;
@@ -615,215 +615,194 @@ impl CpuBackend {
         output: DynamicNodeId,
         inputs: &HashMap<String, TensorData>,
     ) -> Result<TensorData> {
-        self.dynamic_value_memo(graph, output, inputs, &mut HashMap::new())
+        let schedule = schedule_dynamic(graph, output).map_err(dynamic_schedule_error)?;
+        self.execute_runtime_schedule(graph, &schedule, inputs)
     }
-    fn dynamic_value_memo(
+
+    fn execute_runtime_schedule(
         &self,
         graph: &Graph,
-        output: DynamicNodeId,
+        schedule: &RuntimeSchedule,
         inputs: &HashMap<String, TensorData>,
-        memo: &mut HashMap<DynamicNodeId, TensorData>,
     ) -> Result<TensorData> {
-        if let Some(value) = memo.get(&output) {
-            return Ok(value.clone());
-        }
-        let value = match graph.dynamic_node(output)?.op {
-            DynamicOp::Nonzero { input } => nonzero(&self.execute(graph, input, inputs)?),
-            DynamicOp::MaskedSelect { input, mask } => {
-                let schedule =
-                    schedule_dynamic(graph, output).map_err(|error| Error::DynamicAllocation {
-                        reason: error.to_string(),
-                    })?;
-                schedule
-                    .runtime()
-                    .plan()
-                    .validate_target(DynamicAllocationTarget::CpuInterpreter)
-                    .map_err(|error| Error::DynamicAllocation {
-                        reason: error.to_string(),
-                    })?;
-                let input_value = self.execute(graph, input, inputs)?;
-                let mask_value = self.execute(graph, mask, inputs)?;
-                dynamic_masked_select(&schedule, &input_value, &mask_value)
-            }
-            DynamicOp::Sum { input } => match &graph.dynamic_node(input)?.op {
-                DynamicOp::MaskedSelect {
-                    input: source,
-                    mask,
-                } => {
-                    let schedule = crate::schedule::dynamic::schedule_dynamic_sum(graph, output)
-                        .map_err(|error| Error::DynamicAllocation {
-                            reason: error.to_string(),
-                        })?;
-                    dynamic_masked_select_to_reduction(
-                        &schedule,
-                        &self.execute(graph, *source, inputs)?,
-                        &self.execute(graph, *mask, inputs)?,
-                        None,
-                        crate::ReduceKind::Sum,
-                    )
-                }
-                DynamicOp::Unary {
-                    input: selected, ..
-                } => {
-                    let DynamicOp::MaskedSelect {
-                        input: source,
-                        mask,
-                    } = &graph.dynamic_node(*selected)?.op
-                    else {
-                        return Err(Error::DynamicAllocation {
-                            reason: "unsupported dynamic sum runtime producer".into(),
-                        });
-                    };
-                    let schedule = crate::schedule::dynamic::schedule_dynamic_sum(graph, output)
-                        .map_err(|error| Error::DynamicAllocation {
-                            reason: error.to_string(),
-                        })?;
-                    dynamic_masked_select_to_reduction(
-                        &schedule,
-                        &self.execute(graph, *source, inputs)?,
-                        &self.execute(graph, *mask, inputs)?,
-                        None,
-                        crate::ReduceKind::Sum,
-                    )
-                }
-                _ => dynamic_sum(&self.dynamic_value_memo(graph, input, inputs, memo)?),
-            },
-            DynamicOp::Mean { input } => {
-                let (source, mask, static_scalar) = match &graph.dynamic_node(input)?.op {
-                    DynamicOp::MaskedSelect {
-                        input: source,
-                        mask,
-                    } => (*source, *mask, None),
-                    DynamicOp::Unary {
-                        input: selected, ..
-                    } => {
-                        let DynamicOp::MaskedSelect {
-                            input: source,
-                            mask,
-                        } = &graph.dynamic_node(*selected)?.op
-                        else {
-                            return Err(Error::DynamicAllocation {
-                                reason: "unsupported dynamic mean runtime producer".into(),
-                            });
-                        };
-                        (*source, *mask, None)
-                    }
-                    DynamicOp::Binary {
-                        lhs: crate::DynamicInput::Dynamic(selected),
-                        rhs: crate::DynamicInput::StaticScalar(static_scalar),
-                        ..
-                    } => {
-                        let selected = match &graph.dynamic_node(*selected)?.op {
-                            DynamicOp::MaskedSelect {
-                                input: source,
-                                mask,
-                            } => (*source, *mask),
-                            DynamicOp::Unary {
-                                input: selected, ..
-                            } => {
-                                let DynamicOp::MaskedSelect {
-                                    input: source,
-                                    mask,
-                                } = &graph.dynamic_node(*selected)?.op
-                                else {
-                                    return Err(Error::DynamicAllocation {
-                                        reason: "unsupported dynamic mean runtime producer".into(),
-                                    });
-                                };
-                                (*source, *mask)
-                            }
-                            _ => {
-                                return Err(Error::DynamicAllocation {
-                                    reason: "unsupported dynamic mean runtime producer".into(),
-                                });
-                            }
-                        };
-                        (selected.0, selected.1, Some(*static_scalar))
-                    }
-                    _ => {
-                        return Err(Error::DynamicAllocation {
-                            reason: "unsupported dynamic mean runtime producer".into(),
-                        });
-                    }
-                };
-                let schedule = crate::schedule::dynamic::schedule_dynamic_mean(graph, output)
-                    .map_err(|error| Error::DynamicAllocation {
-                        reason: error.to_string(),
-                    })?;
-                let static_value = static_scalar
-                    .map(|node| self.execute(graph, node, inputs))
-                    .transpose()?;
-                dynamic_masked_select_to_reduction(
-                    &schedule,
-                    &self.execute(graph, source, inputs)?,
-                    &self.execute(graph, mask, inputs)?,
-                    static_scalar.zip(static_value.as_ref()),
-                    crate::ReduceKind::Mean,
-                )
-            }
-            DynamicOp::Unary { op, input } => {
-                if let DynamicOp::MaskedSelect {
-                    input: source,
-                    mask,
-                } = &graph.dynamic_node(input)?.op
-                {
-                    let schedule = schedule_dynamic_unary(graph, output).map_err(|error| {
+        schedule.validate().map_err(dynamic_schedule_error)?;
+        let mut counts = HashMap::<RuntimeCountId, usize>::new();
+        let mut values = HashMap::<RuntimeValueDesc, TensorData>::new();
+        let mut allocations =
+            RuntimeMaterializationMap::new(schedule).map_err(dynamic_materialization_error)?;
+        for item in &schedule.items {
+            let instruction = &item.instruction;
+            match instruction {
+                RuntimeInstruction::Count { plan, output } => {
+                    let realized = plan
+                        .bindings()
+                        .iter()
+                        .map(|binding| self.execute(graph, binding.node, inputs))
+                        .collect::<Result<Vec<_>>>()?;
+                    let binding_refs = realized.iter().collect::<Vec<_>>();
+                    plan.validate_bindings(&binding_refs).map_err(|error| {
                         Error::DynamicAllocation {
                             reason: error.to_string(),
                         }
                     })?;
-                    let input_value = self.execute(graph, *source, inputs)?;
-                    let mask_value = self.execute(graph, *mask, inputs)?;
-                    dynamic_masked_select_unary(&schedule, &input_value, &mask_value, op)
-                } else {
-                    unary(
-                        &self.dynamic_value_memo(graph, input, inputs, memo)?,
-                        op,
-                        graph.dynamic_node(output)?.dtype,
-                    )
+                    let count = match plan.count_stage() {
+                        crate::DynamicCountStage::Nonzero { .. } => (0..realized[0].len())
+                            .filter(|index| realized[0].scalar_at(*index).as_bool())
+                            .count(),
+                        crate::DynamicCountStage::MaskedSelect { .. } => {
+                            masked_positions(&realized[0], &realized[1])?.len()
+                        }
+                    };
+                    counts.insert(*output, count);
+                }
+                RuntimeInstruction::Allocate { output } => {
+                    let count = RuntimeCount {
+                        id: output.count,
+                        value: runtime_count(&counts, output)?,
+                    };
+                    allocations
+                        .allocate(schedule, output, count)
+                        .map_err(dynamic_materialization_error)?;
+                }
+                RuntimeInstruction::MaterializeNonzero { input, output } => {
+                    let source = self.execute(graph, input.node, inputs)?;
+                    let value = nonzero(&source, output.dtype)?;
+                    validate_runtime_value(
+                        &allocations,
+                        &RuntimeValueDesc::Dynamic(output.clone()),
+                        &value,
+                    )?;
+                    values.insert(RuntimeValueDesc::Dynamic(output.clone()), value);
+                }
+                RuntimeInstruction::MaterializeMaskedSelect {
+                    input,
+                    mask,
+                    output,
+                } => {
+                    let source = self.execute(graph, input.node, inputs)?;
+                    let mask = self.execute(graph, mask.node, inputs)?;
+                    let positions = masked_positions(&source, &mask)?;
+                    let allocation = allocations
+                        .allocation(output)
+                        .map_err(dynamic_materialization_error)?;
+                    let value = TensorData::from_scalars(
+                        allocation.shape.clone(),
+                        allocation.dtype,
+                        positions
+                            .into_iter()
+                            .map(|position| source.scalar_at(position)),
+                    )?;
+                    validate_runtime_value(
+                        &allocations,
+                        &RuntimeValueDesc::Dynamic(output.clone()),
+                        &value,
+                    )?;
+                    values.insert(RuntimeValueDesc::Dynamic(output.clone()), value);
+                }
+                RuntimeInstruction::Unary {
+                    op, input, output, ..
+                } => {
+                    let source = runtime_value(&values, input)?;
+                    let value = unary(source, *op, output.dtype())?;
+                    validate_runtime_value(&allocations, output, &value)?;
+                    values.insert(output.clone(), value);
+                }
+                RuntimeInstruction::Binary {
+                    op,
+                    lhs,
+                    rhs,
+                    output,
+                    ..
+                } => {
+                    let lhs = self.runtime_operand(graph, lhs, inputs, &values)?;
+                    let rhs = self.runtime_operand(graph, rhs, inputs, &values)?;
+                    let output_shape = match output {
+                        RuntimeValueDesc::Dynamic(output) => allocations
+                            .allocation(output)
+                            .map_err(dynamic_materialization_error)?
+                            .shape
+                            .clone(),
+                        RuntimeValueDesc::Fixed(output) => output.shape.clone(),
+                    };
+                    let value =
+                        dynamic_binary_shaped(&lhs, &rhs, &output_shape, output.dtype(), *op)?;
+                    validate_runtime_value(&allocations, output, &value)?;
+                    values.insert(output.clone(), value);
+                }
+                RuntimeInstruction::Reduce {
+                    op,
+                    dtypes,
+                    input,
+                    output,
+                    ..
+                } => {
+                    let source = runtime_value(&values, input)?;
+                    let axes = (0..source.shape().rank()).collect::<Vec<_>>();
+                    let accumulated = source.cast(dtypes.accumulator);
+                    let sum = reduce(
+                        &accumulated,
+                        ReduceKind::Sum,
+                        &axes,
+                        false,
+                        dtypes.accumulator,
+                    )?;
+                    let value = match op {
+                        ReduceKind::Sum => sum.cast(dtypes.output),
+                        ReduceKind::Mean => {
+                            let work_dtype = if dtypes.accumulator.is_float() {
+                                dtypes.accumulator
+                            } else {
+                                dtypes.output
+                            };
+                            let numerator = sum.cast(work_dtype).scalar_at(0).as_f64();
+                            let mean = if source.is_empty() {
+                                f64::NAN
+                            } else {
+                                numerator / source.len() as f64
+                            };
+                            TensorData::scalar_with_dtype(Scalar::F(mean), work_dtype)
+                                .cast(dtypes.output)
+                        }
+                        _ => {
+                            return Err(Error::DynamicAllocation {
+                                reason: "unsupported dynamic reduction".into(),
+                            });
+                        }
+                    };
+                    if value.shape() != &output.shape || value.dtype() != output.dtype {
+                        return Err(Error::DynamicAllocation {
+                            reason: "dynamic reduction result descriptor mismatch".into(),
+                        });
+                    }
+                    values.insert(RuntimeValueDesc::Fixed(output.clone()), value);
                 }
             }
-            DynamicOp::Binary { op, lhs, rhs } => match (lhs, rhs) {
-                (DynamicInput::Dynamic(source), DynamicInput::StaticScalar(static_scalar)) => {
-                    let source_node = graph.dynamic_node(source)?;
-                    let source_bindings = match &source_node.op {
-                        DynamicOp::MaskedSelect { input, mask } => Some((*input, *mask)),
-                        DynamicOp::Unary {
-                            input: selected, ..
-                        } => match &graph.dynamic_node(*selected)?.op {
-                            DynamicOp::MaskedSelect { input, mask } => Some((*input, *mask)),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some((input, mask)) = source_bindings {
-                        let schedule = schedule_dynamic_binary(graph, output).map_err(|error| {
-                            Error::DynamicAllocation {
-                                reason: error.to_string(),
-                            }
-                        })?;
-                        dynamic_masked_select_binary(
-                            &schedule,
-                            &self.execute(graph, input, inputs)?,
-                            &self.execute(graph, mask, inputs)?,
-                            static_scalar,
-                            &self.execute(graph, static_scalar, inputs)?,
-                        )
-                    } else {
-                        let lhs = dynamic_operand(self, graph, lhs, inputs, memo)?;
-                        let rhs = dynamic_operand(self, graph, rhs, inputs, memo)?;
-                        dynamic_binary(&lhs, &rhs, graph.dynamic_node(output)?.dtype, op)
-                    }
+        }
+        runtime_value(&values, &schedule.output).cloned()
+    }
+
+    fn runtime_operand(
+        &self,
+        graph: &Graph,
+        source: &RuntimeValueSource,
+        inputs: &HashMap<String, TensorData>,
+        values: &HashMap<RuntimeValueDesc, TensorData>,
+    ) -> Result<TensorData> {
+        match source {
+            RuntimeValueSource::Produced(descriptor) => runtime_value(values, descriptor).cloned(),
+            RuntimeValueSource::StaticScalar(binding) => {
+                let value = self.execute(graph, binding.node, inputs)?;
+                if value.shape() != &binding.descriptor.shape
+                    || value.dtype() != binding.descriptor.dtype
+                    || value.len() != 1
+                {
+                    return Err(Error::DynamicAllocation {
+                        reason: "dynamic static scalar descriptor mismatch".into(),
+                    });
                 }
-                _ => {
-                    let lhs = dynamic_operand(self, graph, lhs, inputs, memo)?;
-                    let rhs = dynamic_operand(self, graph, rhs, inputs, memo)?;
-                    dynamic_binary(&lhs, &rhs, graph.dynamic_node(output)?.dtype, op)
-                }
-            },
-        }?;
-        memo.insert(output, value.clone());
-        Ok(value)
+                Ok(value)
+            }
+        }
     }
 
     fn dynamic_vjp(
@@ -834,8 +813,8 @@ impl CpuBackend {
         wrt: NodeId,
         inputs: &HashMap<String, TensorData>,
     ) -> Result<TensorData> {
-        match graph.dynamic_node(output)?.op {
-            DynamicOp::Sum { input } => {
+        match graph.dynamic_node(output)?.operation.clone() {
+            DynamicOperation::Sum { input } => {
                 let value = self.dynamic_value(graph, input, inputs)?;
                 if upstream.shape().numel()? != 1 || upstream.dtype() != value.dtype() {
                     return Err(Error::InvalidIndex);
@@ -847,18 +826,25 @@ impl CpuBackend {
                 )?;
                 self.dynamic_vjp(graph, input, &expanded, wrt, inputs)
             }
-            DynamicOp::Mean { .. } => Err(Error::NonDifferentiableIndexing(
+            DynamicOperation::Mean { .. } => Err(Error::NonDifferentiableIndexing(
                 "dynamic mean autograd is not implemented",
             )),
-            DynamicOp::MaskedSelect { input, mask } if input == wrt => {
+            DynamicOperation::MaskedSelect { input, mask }
+                if graph.backward_slice_contains(input, wrt)? =>
+            {
                 let source = self.execute(graph, input, inputs)?;
                 if !source.dtype().is_float() {
                     return Err(Error::NonDifferentiableTarget(input));
                 }
-                dynamic_masked_select_vjp(&source, &self.execute(graph, mask, inputs)?, upstream)
+                let local = dynamic_masked_select_vjp(
+                    &source,
+                    &self.execute(graph, mask, inputs)?,
+                    upstream,
+                )?;
+                self.static_boundary_vjp(graph, input, wrt, &local, inputs)
             }
-            DynamicOp::MaskedSelect { .. } => Err(Error::NonDifferentiableTarget(wrt)),
-            DynamicOp::Unary { op, input } => {
+            DynamicOperation::MaskedSelect { .. } => Err(Error::NonDifferentiableTarget(wrt)),
+            DynamicOperation::Unary { op, input } => {
                 let value = self.dynamic_value(graph, input, inputs)?;
                 let local = match op {
                     UnaryOp::Neg => TensorData::from_scalars(
@@ -880,9 +866,9 @@ impl CpuBackend {
                 let chained = dynamic_binary(upstream, &local, value.dtype(), BinaryOp::Mul)?;
                 self.dynamic_vjp(graph, input, &chained, wrt, inputs)
             }
-            DynamicOp::Binary { op, lhs, rhs } => {
-                let lhs_value = dynamic_operand(self, graph, lhs, inputs, &mut HashMap::new())?;
-                let rhs_value = dynamic_operand(self, graph, rhs, inputs, &mut HashMap::new())?;
+            DynamicOperation::Binary { op, lhs, rhs } => {
+                let lhs_value = self.dynamic_input_value(graph, lhs, inputs)?;
+                let rhs_value = self.dynamic_input_value(graph, rhs, inputs)?;
                 let mut result = None;
                 for (operand, local) in [
                     (
@@ -915,11 +901,18 @@ impl CpuBackend {
                                 upstream.dtype(),
                                 (0..upstream.len()).map(|i| upstream.scalar_at(i)),
                             )?),
-                            BinaryOp::Sub => Some(TensorData::from_scalars(
-                                upstream.shape().clone(),
-                                upstream.dtype(),
-                                (0..upstream.len()).map(|_| Scalar::F(-1.0)),
-                            )?),
+                            BinaryOp::Sub => {
+                                let negative_one = TensorData::scalar_with_dtype(
+                                    Scalar::F(-1.0),
+                                    upstream.dtype(),
+                                );
+                                Some(dynamic_binary(
+                                    upstream,
+                                    &negative_one,
+                                    upstream.dtype(),
+                                    BinaryOp::Mul,
+                                )?)
+                            }
                             BinaryOp::Mul => Some(dynamic_binary(
                                 upstream,
                                 &lhs_value,
@@ -930,8 +923,48 @@ impl CpuBackend {
                         },
                     ),
                 ] {
-                    if let (DynamicInput::Dynamic(id), Some(local)) = (operand, local) {
-                        let grad = self.dynamic_vjp(graph, id, &local, wrt, inputs)?;
+                    if let Some(local) = local {
+                        if !Self::dynamic_input_depends_on(graph, operand, wrt)? {
+                            continue;
+                        }
+                        let grad = match operand {
+                            DynamicInput::Dynamic(id) => {
+                                let dtype = graph.dynamic_node(id)?.dtype;
+                                let is_scalar = matches!(
+                                    graph.dynamic_node(id)?.output,
+                                    crate::DynamicOutputShape::Scalar
+                                );
+                                let local = if is_scalar && local.shape().rank() != 0 {
+                                    reduce(
+                                        &local,
+                                        ReduceKind::Sum,
+                                        &(0..local.shape().rank()).collect::<Vec<_>>(),
+                                        false,
+                                        local.dtype(),
+                                    )?
+                                } else {
+                                    local
+                                };
+                                self.dynamic_vjp(graph, id, &local.cast(dtype), wrt, inputs)?
+                            }
+                            DynamicInput::StaticScalar(id) => {
+                                let dtype = graph.dtype(id)?;
+                                let local = local.cast(dtype);
+                                let reduced = reduce(
+                                    &local,
+                                    ReduceKind::Sum,
+                                    &(0..local.shape().rank()).collect::<Vec<_>>(),
+                                    false,
+                                    dtype,
+                                )?;
+                                let local = TensorData::from_scalars(
+                                    graph.shape(id)?.clone(),
+                                    dtype,
+                                    [reduced.scalar_at(0)],
+                                )?;
+                                self.static_boundary_vjp(graph, id, wrt, &local, inputs)?
+                            }
+                        };
                         result = Some(match result {
                             None => grad,
                             Some(old) => dynamic_binary(&old, &grad, old.dtype(), BinaryOp::Add)?,
@@ -940,8 +973,70 @@ impl CpuBackend {
                 }
                 result.ok_or(Error::NonDifferentiableTarget(wrt))
             }
-            DynamicOp::Nonzero { .. } => Err(Error::NonDifferentiableIndexing("dynamic nonzero")),
+            DynamicOperation::Nonzero { .. } => {
+                Err(Error::NonDifferentiableIndexing("dynamic nonzero"))
+            }
         }
+    }
+
+    fn dynamic_input_value(
+        &self,
+        graph: &Graph,
+        input: DynamicInput,
+        bindings: &HashMap<String, TensorData>,
+    ) -> Result<TensorData> {
+        match input {
+            DynamicInput::Dynamic(id) => self.dynamic_value(graph, id, bindings),
+            DynamicInput::StaticScalar(id) => self.execute(graph, id, bindings),
+        }
+    }
+
+    fn dynamic_input_depends_on(graph: &Graph, input: DynamicInput, wrt: NodeId) -> Result<bool> {
+        match input {
+            DynamicInput::StaticScalar(node) => graph.backward_slice_contains(node, wrt),
+            DynamicInput::Dynamic(node) => Self::dynamic_depends_on(graph, node, wrt),
+        }
+    }
+
+    fn dynamic_depends_on(graph: &Graph, output: DynamicNodeId, wrt: NodeId) -> Result<bool> {
+        match &graph.dynamic_node(output)?.operation {
+            DynamicOperation::Nonzero { .. } => Ok(false),
+            DynamicOperation::MaskedSelect { input, .. } => {
+                graph.backward_slice_contains(*input, wrt)
+            }
+            DynamicOperation::Unary { input, .. }
+            | DynamicOperation::Sum { input }
+            | DynamicOperation::Mean { input } => Self::dynamic_depends_on(graph, *input, wrt),
+            DynamicOperation::Binary { lhs, rhs, .. } => {
+                Ok(Self::dynamic_input_depends_on(graph, *lhs, wrt)?
+                    || Self::dynamic_input_depends_on(graph, *rhs, wrt)?)
+            }
+        }
+    }
+
+    fn static_boundary_vjp(
+        &self,
+        graph: &Graph,
+        boundary: NodeId,
+        wrt: NodeId,
+        upstream: &TensorData,
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<TensorData> {
+        let shape = graph.shape(boundary)?.clone();
+        let dtype = graph.dtype(boundary)?;
+        if upstream.shape() != &shape || upstream.dtype() != dtype {
+            return Err(Error::InvalidIndex);
+        }
+        if boundary == wrt {
+            return Ok(upstream.clone());
+        }
+        if !graph.backward_slice_contains(boundary, wrt)? {
+            return Err(Error::NonDifferentiableTarget(wrt));
+        }
+        let mut derivative_graph = graph.clone();
+        let seed = derivative_graph.constant(upstream.clone());
+        let gradient = derivative_graph.grad_with(boundary, wrt, Some(seed), false)?;
+        self.execute(&derivative_graph, gradient, inputs)
     }
 
     /// First-order VJP executor for a realized dynamic masked selection.
@@ -954,7 +1049,7 @@ impl CpuBackend {
         inputs: &HashMap<String, TensorData>,
     ) -> Result<TensorData> {
         let node = graph.dynamic_node(output)?;
-        let DynamicOp::MaskedSelect { input, mask } = node.op else {
+        let DynamicOperation::MaskedSelect { input, mask } = node.operation.clone() else {
             return Err(Error::NonDifferentiableIndexing("dynamic nonzero"));
         };
         let input = self.execute(graph, input, inputs)?;
@@ -966,6 +1061,63 @@ impl CpuBackend {
         let mask = self.execute(graph, mask, inputs)?;
         dynamic_masked_select_vjp(&input, &mask, upstream)
     }
+}
+
+fn dynamic_schedule_error(error: impl std::fmt::Display) -> Error {
+    Error::DynamicAllocation {
+        reason: error.to_string(),
+    }
+}
+
+fn dynamic_materialization_error(error: impl std::fmt::Display) -> Error {
+    Error::DynamicAllocation {
+        reason: error.to_string(),
+    }
+}
+
+fn runtime_count(
+    counts: &HashMap<RuntimeCountId, usize>,
+    descriptor: &RuntimeBufferDesc,
+) -> Result<usize> {
+    counts
+        .get(&descriptor.count)
+        .copied()
+        .ok_or_else(|| Error::DynamicAllocation {
+            reason: "runtime buffer count was not produced".into(),
+        })
+}
+
+fn runtime_value<'a>(
+    values: &'a HashMap<RuntimeValueDesc, TensorData>,
+    descriptor: &RuntimeValueDesc,
+) -> Result<&'a TensorData> {
+    values
+        .get(descriptor)
+        .ok_or_else(|| Error::DynamicAllocation {
+            reason: "runtime buffer value was not produced".into(),
+        })
+}
+
+fn validate_runtime_value(
+    allocations: &RuntimeMaterializationMap,
+    descriptor: &RuntimeValueDesc,
+    value: &TensorData,
+) -> Result<()> {
+    let (shape, dtype) = match descriptor {
+        RuntimeValueDesc::Dynamic(descriptor) => {
+            let allocation = allocations
+                .allocation(descriptor)
+                .map_err(dynamic_materialization_error)?;
+            (&allocation.shape, allocation.dtype)
+        }
+        RuntimeValueDesc::Fixed(descriptor) => (&descriptor.shape, descriptor.dtype),
+    };
+    if value.shape() != shape || value.dtype() != dtype {
+        return Err(Error::DynamicAllocation {
+            reason: "runtime value does not match exact allocation".into(),
+        });
+    }
+    Ok(())
 }
 
 fn binary(
@@ -2888,509 +3040,6 @@ fn masked_positions(input: &TensorData, mask: &TensorData) -> Result<Vec<usize>>
     Ok(positions)
 }
 
-fn dynamic_masked_select(
-    schedule: &MixedSchedule,
-    input: &TensorData,
-    mask: &TensorData,
-) -> Result<TensorData> {
-    schedule
-        .runtime()
-        .plan()
-        .validate_target(DynamicAllocationTarget::CpuInterpreter)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    schedule
-        .runtime()
-        .plan()
-        .validate_bindings(input, mask)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let positions = masked_positions(input, mask)?;
-    let mut materializations =
-        MixedMaterializationMap::new(schedule).map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let allocation_item = schedule
-        .items
-        .iter()
-        .find(|item| {
-            matches!(
-                item.kind,
-                crate::schedule::dynamic::MixedScheduleItemKind::MaterializeMaskedSelect
-            )
-        })
-        .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no materialization item".into(),
-        })?;
-    let runtime_output = schedule
-        .runtime_output(allocation_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    materializations
-        .allocate_after_count(schedule, positions.len())
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let allocation = materializations
-        .allocation_for_consumer(schedule, allocation_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    if allocation.dtype != runtime_output.dtype || allocation.shape.rank() != runtime_output.rank {
-        return Err(Error::DynamicAllocation {
-            reason: "runtime allocation does not match mixed output descriptor".into(),
-        });
-    }
-    let values = positions
-        .into_iter()
-        .map(|position| input.scalar_at(position));
-    TensorData::from_scalars(allocation.shape.clone(), allocation.dtype, values)
-}
-
-/// Executes the bounded count→allocate→materialize→allocate→unary chain.
-/// The two descriptors are allocated separately before either result is
-/// materialized, so the source can remain live through the unary consumer.
-fn dynamic_masked_select_unary(
-    schedule: &MixedSchedule,
-    input: &TensorData,
-    mask: &TensorData,
-    op: UnaryOp,
-) -> Result<TensorData> {
-    schedule
-        .runtime()
-        .plan()
-        .validate_target(DynamicAllocationTarget::CpuInterpreter)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    schedule
-        .runtime()
-        .plan()
-        .validate_bindings(input, mask)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let positions = masked_positions(input, mask)?;
-    let mut materializations =
-        MixedMaterializationMap::new(schedule).map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let source_item = schedule
-        .items
-        .iter()
-        .find(|item| {
-            matches!(
-                item.kind,
-                crate::schedule::dynamic::MixedScheduleItemKind::MaterializeMaskedSelect
-            )
-        })
-        .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no masked-select materialization".into(),
-        })?;
-    let unary_item = schedule
-        .items
-        .iter()
-        .find(|item| {
-            matches!(
-                item.kind,
-                crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { .. }
-            )
-        })
-        .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no dynamic unary item".into(),
-        })?;
-    let source_descriptor =
-        schedule
-            .runtime_output(source_item.id)
-            .map_err(|error| Error::DynamicAllocation {
-                reason: error.to_string(),
-            })?;
-    let unary_descriptor =
-        schedule
-            .runtime_output(unary_item.id)
-            .map_err(|error| Error::DynamicAllocation {
-                reason: error.to_string(),
-            })?;
-    materializations
-        .allocate_after_count(schedule, positions.len())
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let source_allocation = materializations
-        .allocation_for_consumer(schedule, source_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    if source_allocation.dtype != source_descriptor.dtype
-        || source_allocation.shape.rank() != source_descriptor.rank
-    {
-        return Err(Error::DynamicAllocation {
-            reason: "runtime source allocation does not match descriptor".into(),
-        });
-    }
-    let selected = TensorData::from_scalars(
-        source_allocation.shape.clone(),
-        source_allocation.dtype,
-        positions
-            .into_iter()
-            .map(|position| input.scalar_at(position)),
-    )?;
-    materializations
-        .allocate_item_output_after_count(schedule, unary_item.id, selected.len())
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let output_allocation = materializations
-        .allocation_for_item_output(schedule, unary_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    if output_allocation.dtype != unary_descriptor.dtype
-        || output_allocation.shape.rank() != unary_descriptor.rank
-    {
-        return Err(Error::DynamicAllocation {
-            reason: "runtime unary allocation does not match descriptor".into(),
-        });
-    }
-    let result = unary(&selected, op, unary_descriptor.dtype)?;
-    if result.shape() != &output_allocation.shape || result.dtype() != output_allocation.dtype {
-        return Err(Error::DynamicAllocation {
-            reason: "dynamic unary result does not match exact output allocation".into(),
-        });
-    }
-    Ok(result)
-}
-
-/// Executes the bounded exact dynamic binary chain. The static scalar is
-/// validated from the ordered mixed binding before either runtime allocation
-/// is materialized; both runtime buffers remain distinct through the binary.
-fn dynamic_masked_select_binary(
-    schedule: &MixedSchedule,
-    input: &TensorData,
-    mask: &TensorData,
-    static_node: NodeId,
-    static_scalar: &TensorData,
-) -> Result<TensorData> {
-    schedule
-        .runtime()
-        .plan()
-        .validate_target(DynamicAllocationTarget::CpuInterpreter)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    schedule
-        .runtime()
-        .plan()
-        .validate_bindings(input, mask)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let binary_item = schedule
-        .items
-        .iter()
-        .find(|item| {
-            matches!(
-                item.kind,
-                crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { .. }
-            )
-        })
-        .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no dynamic binary item".into(),
-        })?;
-    let static_value_binding = schedule
-        .runtime_bindings
-        .iter()
-        .find(|binding| binding.consumer_item == binary_item.id && binding.abi_index == 1)
-        .ok_or_else(|| Error::DynamicAllocation {
-            reason: "dynamic binary static ABI binding is absent".into(),
-        })?;
-    let crate::schedule::dynamic::RuntimeValueSource::StaticScalar(static_binding) =
-        &static_value_binding.source
-    else {
-        return Err(Error::DynamicAllocation {
-            reason: "dynamic binary static ABI binding has runtime source".into(),
-        });
-    };
-    if static_binding.node != static_node
-        || static_scalar.shape() != &static_binding.descriptor.shape
-        || static_scalar.dtype() != static_binding.descriptor.dtype
-        || static_scalar.len() != 1
-    {
-        return Err(Error::DynamicAllocation {
-            reason: "dynamic binary static scalar descriptor mismatch".into(),
-        });
-    }
-    let positions = masked_positions(input, mask)?;
-    let mut materializations =
-        MixedMaterializationMap::new(schedule).map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let source_item = schedule
-        .items
-        .iter()
-        .find(|item| {
-            matches!(
-                item.kind,
-                crate::schedule::dynamic::MixedScheduleItemKind::MaterializeMaskedSelect
-            )
-        })
-        .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no masked-select materialization".into(),
-        })?;
-    materializations
-        .allocate_after_count(schedule, positions.len())
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let source_allocation = materializations
-        .allocation_for_consumer(schedule, source_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let mut value = TensorData::from_scalars(
-        source_allocation.shape.clone(),
-        source_allocation.dtype,
-        positions
-            .into_iter()
-            .map(|position| input.scalar_at(position)),
-    )?;
-    if let Some(unary_item) = schedule.items.iter().find(|item| {
-        matches!(
-            item.kind,
-            crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { .. }
-        )
-    }) {
-        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { op } = &unary_item.kind
-        else {
-            unreachable!("dynamic unary item kind was checked")
-        };
-        materializations
-            .allocate_item_output_after_count(schedule, unary_item.id, value.len())
-            .map_err(|error| Error::DynamicAllocation {
-                reason: error.to_string(),
-            })?;
-        let allocation = materializations
-            .allocation_for_item_output(schedule, unary_item.id)
-            .map_err(|error| Error::DynamicAllocation {
-                reason: error.to_string(),
-            })?;
-        value = unary(&value, *op, allocation.dtype)?;
-        if value.shape() != &allocation.shape || value.dtype() != allocation.dtype {
-            return Err(Error::DynamicAllocation {
-                reason: "dynamic unary result does not match exact output allocation".into(),
-            });
-        }
-    }
-    materializations
-        .allocate_item_output_after_count(schedule, binary_item.id, value.len())
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let allocation = materializations
-        .allocation_for_item_output(schedule, binary_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { op } = &binary_item.kind
-    else {
-        unreachable!("dynamic binary item kind was checked")
-    };
-    let result = dynamic_binary(&value, static_scalar, allocation.dtype, *op)?;
-    if result.shape() != &allocation.shape || result.dtype() != allocation.dtype {
-        return Err(Error::DynamicAllocation {
-            reason: "dynamic binary result does not match exact output allocation".into(),
-        });
-    }
-    Ok(result)
-}
-
-/// Materializes the validated runtime chain once, then consumes its final
-/// runtime buffer through the sole permitted fixed scalar reduction bridge.
-fn dynamic_masked_select_to_reduction(
-    schedule: &MixedSchedule,
-    input: &TensorData,
-    mask: &TensorData,
-    static_scalar: Option<(NodeId, &TensorData)>,
-    kind: crate::ReduceKind,
-) -> Result<TensorData> {
-    schedule
-        .runtime()
-        .plan()
-        .validate_target(DynamicAllocationTarget::CpuInterpreter)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    schedule
-        .runtime()
-        .plan()
-        .validate_bindings(input, mask)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let positions = masked_positions(input, mask)?;
-    let mut materializations =
-        MixedMaterializationMap::new(schedule).map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let source_item = schedule
-        .items
-        .iter()
-        .find(|item| {
-            matches!(
-                item.kind,
-                crate::schedule::dynamic::MixedScheduleItemKind::MaterializeMaskedSelect
-            )
-        })
-        .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no masked-select materialization".into(),
-        })?;
-    materializations
-        .allocate_after_count(schedule, positions.len())
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let source_allocation = materializations
-        .allocation_for_consumer(schedule, source_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let mut value = TensorData::from_scalars(
-        source_allocation.shape.clone(),
-        source_allocation.dtype,
-        positions
-            .into_iter()
-            .map(|position| input.scalar_at(position)),
-    )?;
-    if let Some(unary_item) = schedule.items.iter().find(|item| {
-        matches!(
-            item.kind,
-            crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { .. }
-        )
-    }) {
-        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { op } = &unary_item.kind
-        else {
-            unreachable!("dynamic unary item kind was checked")
-        };
-        materializations
-            .allocate_item_output_after_count(schedule, unary_item.id, value.len())
-            .map_err(|error| Error::DynamicAllocation {
-                reason: error.to_string(),
-            })?;
-        let allocation = materializations
-            .allocation_for_item_output(schedule, unary_item.id)
-            .map_err(|error| Error::DynamicAllocation {
-                reason: error.to_string(),
-            })?;
-        value = unary(&value, *op, allocation.dtype)?;
-        if value.shape() != &allocation.shape || value.dtype() != allocation.dtype {
-            return Err(Error::DynamicAllocation {
-                reason: "dynamic unary result does not match exact output allocation".into(),
-            });
-        }
-    }
-    if let Some(binary_item) = schedule.items.iter().find(|item| {
-        matches!(
-            item.kind,
-            crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { .. }
-        )
-    }) {
-        let (static_node, static_value) =
-            static_scalar.ok_or_else(|| Error::DynamicAllocation {
-                reason: "dynamic reduction binary static scalar is absent".into(),
-            })?;
-        let binding = schedule
-            .runtime_bindings
-            .iter()
-            .find(|binding| binding.consumer_item == binary_item.id && binding.abi_index == 1)
-            .ok_or_else(|| Error::DynamicAllocation {
-                reason: "dynamic reduction binary static ABI binding is absent".into(),
-            })?;
-        let crate::schedule::dynamic::RuntimeValueSource::StaticScalar(expected) = &binding.source
-        else {
-            return Err(Error::DynamicAllocation {
-                reason: "dynamic reduction binary static ABI binding has runtime source".into(),
-            });
-        };
-        if expected.node != static_node
-            || static_value.shape() != &expected.descriptor.shape
-            || static_value.dtype() != expected.descriptor.dtype
-            || static_value.len() != 1
-        {
-            return Err(Error::DynamicAllocation {
-                reason: "dynamic reduction binary static scalar descriptor mismatch".into(),
-            });
-        }
-        materializations
-            .allocate_item_output_after_count(schedule, binary_item.id, value.len())
-            .map_err(|error| Error::DynamicAllocation {
-                reason: error.to_string(),
-            })?;
-        let allocation = materializations
-            .allocation_for_item_output(schedule, binary_item.id)
-            .map_err(|error| Error::DynamicAllocation {
-                reason: error.to_string(),
-            })?;
-        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { op } =
-            &binary_item.kind
-        else {
-            unreachable!("dynamic binary item kind was checked")
-        };
-        value = dynamic_binary(&value, static_value, allocation.dtype, *op)?;
-        if value.shape() != &allocation.shape || value.dtype() != allocation.dtype {
-            return Err(Error::DynamicAllocation {
-                reason: "dynamic binary result does not match exact output allocation".into(),
-            });
-        }
-    }
-    let reduction_item = schedule
-        .items
-        .iter()
-        .find(|item| {
-            matches!(
-                item.kind,
-                crate::schedule::dynamic::MixedScheduleItemKind::DynamicReduceSum
-                    | crate::schedule::dynamic::MixedScheduleItemKind::DynamicReduceMean
-            )
-        })
-        .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no dynamic reduction item".into(),
-        })?;
-    materializations
-        .allocation_for_consumer(schedule, reduction_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
-    let ScheduledOutputDesc::Fixed(output) = &reduction_item.output else {
-        return Err(Error::DynamicAllocation {
-            reason: "dynamic reduction item lacks a fixed scalar descriptor".into(),
-        });
-    };
-    if !matches!(
-        (kind, &reduction_item.kind),
-        (
-            crate::ReduceKind::Sum,
-            crate::schedule::dynamic::MixedScheduleItemKind::DynamicReduceSum
-        ) | (
-            crate::ReduceKind::Mean,
-            crate::schedule::dynamic::MixedScheduleItemKind::DynamicReduceMean
-        )
-    ) {
-        return Err(Error::DynamicAllocation {
-            reason: "dynamic reduction operation does not match typed schedule item".into(),
-        });
-    }
-    let result = reduce(&value, kind, &[0], false, output.dtype)?;
-    if result.shape() != &output.shape || result.dtype() != output.dtype {
-        return Err(Error::DynamicAllocation {
-            reason: "dynamic reduction result does not match fixed descriptor".into(),
-        });
-    }
-    Ok(result)
-}
-
 fn dynamic_masked_select_vjp(
     input: &TensorData,
     mask: &TensorData,
@@ -3412,25 +3061,6 @@ fn dynamic_masked_select_vjp(
     TensorData::from_scalars(input.shape().clone(), input.dtype(), output)
 }
 
-fn dynamic_sum(input: &TensorData) -> Result<TensorData> {
-    let value = (0..input.len()).fold(Scalar::I(0), |sum, index| {
-        binary_scalar(sum, input.scalar_at(index), input.dtype(), BinaryOp::Add)
-    });
-    TensorData::from_scalars([], input.dtype(), [value])
-}
-
-fn dynamic_operand(
-    backend: &CpuBackend,
-    graph: &Graph,
-    input: DynamicInput,
-    bindings: &HashMap<String, TensorData>,
-    memo: &mut HashMap<DynamicNodeId, TensorData>,
-) -> Result<TensorData> {
-    match input {
-        DynamicInput::Dynamic(id) => backend.dynamic_value_memo(graph, id, bindings, memo),
-        DynamicInput::StaticScalar(id) => backend.execute(graph, id, bindings),
-    }
-}
 fn dynamic_binary(
     lhs: &TensorData,
     rhs: &TensorData,
@@ -3461,20 +3091,46 @@ fn dynamic_binary(
     )
 }
 
-fn nonzero(input: &TensorData) -> Result<TensorData> {
+fn dynamic_binary_shaped(
+    lhs: &TensorData,
+    rhs: &TensorData,
+    output_shape: &Shape,
+    dtype: DType,
+    op: BinaryOp,
+) -> Result<TensorData> {
+    let len = output_shape.numel()?;
+    if !((lhs.len() == len || lhs.len() == 1) && (rhs.len() == len || rhs.len() == 1)) {
+        return Err(Error::InvalidIndex);
+    }
+    TensorData::from_scalars(
+        output_shape.clone(),
+        dtype,
+        (0..len).map(|index| {
+            binary_scalar(
+                lhs.scalar_at(if lhs.len() == 1 { 0 } else { index }),
+                rhs.scalar_at(if rhs.len() == 1 { 0 } else { index }),
+                dtype,
+                op,
+            )
+        }),
+    )
+}
+
+fn nonzero(input: &TensorData, dtype: DType) -> Result<TensorData> {
     let index = DenseIndex::new(input.shape().clone())?;
-    let mut coordinates = Vec::new();
+    let mut values = Vec::new();
+    let mut count = 0usize;
     for linear in 0..index.len() {
         if input.scalar_at(linear).as_bool() {
-            coordinates.push(index.coords(linear)?);
+            count = count.checked_add(1).ok_or(Error::InvalidIndex)?;
+            for coordinate in index.coords(linear)? {
+                values.push(Scalar::I(
+                    i64::try_from(coordinate).map_err(|_| Error::InvalidIndex)?,
+                ));
+            }
         }
     }
-    let count = coordinates.len();
-    let values = coordinates
-        .into_iter()
-        .flatten()
-        .map(|value| Scalar::I(value as i64));
-    TensorData::from_scalars([count, input.shape().rank()], DType::I64, values)
+    TensorData::from_scalars([count, input.shape().rank()], dtype, values)
 }
 
 fn einsum(
@@ -7705,6 +7361,41 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_integer_and_bool_mean_divide_after_widened_sum() {
+        for (dtype, values) in [
+            (DType::Bool, vec![Scalar::Bool(false), Scalar::Bool(true)]),
+            (DType::I8, vec![Scalar::I(0), Scalar::I(1)]),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let mask = graph.input_dtype("mask", [2], DType::Bool);
+            let selected = graph.masked_select_dynamic(input, mask).unwrap();
+            let mean = graph.dynamic_mean(selected).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "input".into(),
+                    TensorData::from_scalars([2], dtype, values).unwrap(),
+                ),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(true)],
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            let output = CpuBackend
+                .execute_dynamic(&graph, mean, &inputs)
+                .unwrap()
+                .output;
+            assert_eq!(output.dtype(), DType::F32, "{dtype:?}");
+            assert_eq!(output.to_vec_f64(), vec![0.5], "{dtype:?}");
+        }
+    }
+
+    #[test]
     fn masked_select_dynamic_unary_sum_preserves_canonical_reduction_values() {
         let mut graph = Graph::new();
         let x = graph.input("x", [3]);
@@ -7772,5 +7463,232 @@ mod tests {
         let y = other.input("y", [1]);
         let foreign = other.nonzero(y).unwrap();
         assert!(graph.dynamic_sum(foreign).is_err());
+    }
+
+    #[test]
+    fn scheduled_nonzero_preserves_exact_source_geometry_and_dtype() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::F32);
+        let output = graph.nonzero(input).unwrap();
+        let inputs = HashMap::from([("x".into(), data([2, 3], &[0., 2., 0., 4., 5., 0.]))]);
+        let value = CpuBackend
+            .execute_dynamic(&graph, output, &inputs)
+            .unwrap()
+            .output;
+        assert_eq!(value.shape(), &Shape::from([3, 2]));
+        assert_eq!(value.dtype(), DType::I32);
+        assert_eq!(value.to_vec_f64(), vec![0., 1., 1., 0., 1., 1.]);
+
+        for (truthy, expected) in [(false, Shape::from([0, 0])), (true, Shape::from([1, 0]))] {
+            let mut scalar_graph = Graph::new();
+            let scalar = scalar_graph.input("scalar", []);
+            let nonzero = scalar_graph.nonzero(scalar).unwrap();
+            let bindings = HashMap::from([(
+                "scalar".into(),
+                TensorData::scalar(if truthy { 1.0 } else { 0.0 }),
+            )]);
+            assert_eq!(
+                CpuBackend
+                    .execute_dynamic(&scalar_graph, nonzero, &bindings)
+                    .unwrap()
+                    .output
+                    .shape(),
+                &expected
+            );
+        }
+
+        let mut empty_graph = Graph::new();
+        let empty = empty_graph.input("empty", [2, 0, 3]);
+        let nonzero = empty_graph.nonzero(empty).unwrap();
+        let bindings = HashMap::from([("empty".into(), data([2, 0, 3], &[]))]);
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic(&empty_graph, nonzero, &bindings)
+                .unwrap()
+                .output
+                .shape(),
+            &Shape::from([0, 3])
+        );
+
+        let mut wide_graph = Graph::new();
+        let wide = wide_graph.input("wide", [i32::MAX as usize + 1, 0]);
+        let nonzero = wide_graph.nonzero(wide).unwrap();
+        let bindings = HashMap::from([("wide".into(), data([i32::MAX as usize + 1, 0], &[]))]);
+        let value = CpuBackend
+            .execute_dynamic(&wide_graph, nonzero, &bindings)
+            .unwrap()
+            .output;
+        assert_eq!(value.shape(), &Shape::from([0, 2]));
+        assert_eq!(value.dtype(), DType::I32);
+
+        let mut wider_graph = Graph::new();
+        let wider = wider_graph.input("wider", [i32::MAX as usize + 2, 0]);
+        let nonzero = wider_graph.nonzero(wider).unwrap();
+        let bindings = HashMap::from([("wider".into(), data([i32::MAX as usize + 2, 0], &[]))]);
+        let value = CpuBackend
+            .execute_dynamic(&wider_graph, nonzero, &bindings)
+            .unwrap()
+            .output;
+        assert_eq!(value.shape(), &Shape::from([0, 2]));
+        assert_eq!(value.dtype(), DType::I64);
+    }
+
+    #[test]
+    fn runtime_dag_composes_branches_fixed_reductions_and_sub_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [3]);
+        let mask = graph.input_dtype("mask", [3], DType::Bool);
+        let selected = graph.masked_select_dynamic(input, mask).unwrap();
+        let neg = graph.dynamic_unary(selected, UnaryOp::Neg).unwrap();
+        let square = graph.dynamic_unary(selected, UnaryOp::Square).unwrap();
+        let combined = graph
+            .dynamic_binary(neg, DynamicInput::Dynamic(square), BinaryOp::Sub)
+            .unwrap();
+        let sum = graph.dynamic_sum(combined).unwrap();
+        let negated_sum = graph.dynamic_unary(sum, UnaryOp::Neg).unwrap();
+        let broadcast = graph
+            .dynamic_binary(negated_sum, DynamicInput::Dynamic(selected), BinaryOp::Add)
+            .unwrap();
+        let loss = graph.dynamic_sum(broadcast).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([3], &[2., 7., 3.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic(&graph, loss, &inputs)
+                .unwrap()
+                .output
+                .shape(),
+            &Shape::from([])
+        );
+        let gradient = CpuBackend
+            .execute_dynamic_gradient(&graph, loss, input, &inputs)
+            .unwrap()
+            .gradient;
+        assert_eq!(gradient.shape(), &Shape::from([3]));
+        assert_eq!(gradient.to_vec_f64(), vec![11., 0., 15.]);
+    }
+
+    #[test]
+    fn dynamic_binary_rejects_unrelated_count_provenance() {
+        let mut graph = Graph::new();
+        let lhs = graph.input("lhs", [2]);
+        let rhs = graph.input("rhs", [2]);
+        let lhs_mask = graph.input_dtype("lhs_mask", [2], DType::Bool);
+        let rhs_mask = graph.input_dtype("rhs_mask", [2], DType::Bool);
+        let lhs = graph.masked_select_dynamic(lhs, lhs_mask).unwrap();
+        let rhs = graph.masked_select_dynamic(rhs, rhs_mask).unwrap();
+        assert!(
+            graph
+                .dynamic_binary(lhs, DynamicInput::Dynamic(rhs), BinaryOp::Add)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn dynamic_vjp_filters_unrelated_branches_and_preserves_scalar_source_shape() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [3]);
+        let mask = graph.input_dtype("mask", [3], DType::Bool);
+        let scalar = graph.input("scale", [1, 1]);
+        let selected = graph.masked_select_dynamic(input, mask).unwrap();
+        let scaled = graph
+            .dynamic_binary(selected, DynamicInput::StaticScalar(scalar), BinaryOp::Mul)
+            .unwrap();
+        let loss = graph.dynamic_sum(scaled).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([3], &[2., 7., 3.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+            ("scale".into(), data([1, 1], &[4.])),
+        ]);
+        let gradient = CpuBackend
+            .execute_dynamic_gradient(&graph, loss, scalar, &inputs)
+            .unwrap()
+            .gradient;
+        assert_eq!(gradient.shape(), &Shape::from([1, 1]));
+        assert_eq!(gradient.to_vec_f64(), vec![5.]);
+
+        let one_inputs = HashMap::from([
+            ("x".into(), data([3], &[2., 7., 3.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(false)],
+                )
+                .unwrap(),
+            ),
+            ("scale".into(), data([1, 1], &[4.])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic_gradient(&graph, loss, input, &one_inputs)
+                .unwrap()
+                .gradient
+                .to_vec_f64(),
+            vec![4., 0., 0.]
+        );
+    }
+
+    #[test]
+    fn dynamic_vjp_crosses_derived_static_input_and_scalar_boundaries() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [3]);
+        let mask = graph.input_dtype("mask", [3], DType::Bool);
+        let scale = graph.input("scale", [1, 1]);
+        let two = graph.constant(TensorData::scalar(2.0));
+        let derived_input = graph.mul(input, two).unwrap();
+        let derived_scale = graph.square(scale).unwrap();
+        let selected = graph.masked_select_dynamic(derived_input, mask).unwrap();
+        let scaled = graph
+            .dynamic_binary(
+                selected,
+                DynamicInput::StaticScalar(derived_scale),
+                BinaryOp::Mul,
+            )
+            .unwrap();
+        let loss = graph.dynamic_sum(scaled).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([3], &[2., 7., 3.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+            ("scale".into(), data([1, 1], &[2.])),
+        ]);
+        let input_gradient = CpuBackend
+            .execute_dynamic_gradient(&graph, loss, input, &inputs)
+            .unwrap()
+            .gradient;
+        assert_eq!(input_gradient.to_vec_f64(), vec![8., 0., 8.]);
+        let scale_gradient = CpuBackend
+            .execute_dynamic_gradient(&graph, loss, scale, &inputs)
+            .unwrap()
+            .gradient;
+        assert_eq!(scale_gradient.shape(), &Shape::from([1, 1]));
+        assert_eq!(scale_gradient.to_vec_f64(), vec![40.]);
     }
 }

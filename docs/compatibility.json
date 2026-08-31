@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:eb97b8483a9145b7",
+  "source_fingerprint": "fnv1a64:19fb60deaa772873",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -252,7 +252,7 @@
       "subject": "Mask, pad, concat, stack and split",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Constant typed padding, multi-input concat with promotion, and fixed-size `masked_select(size, fill)` remain compatible. Its static reverse edge broadcasts/flattens the boolean mask, uses `PrefixScan` ranks only as nondifferentiable control indices, safely gathers explicit upstream cotangents for retained row-major lanes, and zeros padded, truncated, and false lanes; the mask and size have no gradient. The typed dynamic-result CPU oracle realizes `nonzero` and unbounded `masked_select_dynamic`, including checked bool-mask broadcasting and exact runtime shapes. `CpuSession` exposes the exact F32 masked-select route through an owned `DynamicTensor`: optional F32 `Neg`/`Square`, one checked static F32 scalar `Add`/`Sub`/`Mul`, and scalar `Sum`/forward-only `Mean` return detached CPU results. `DynamicAllocationPlan` and the canonical typed `MixedSchedule` retain exact runtime allocations, ordered bindings, lifetimes, and no placeholder capacity. Dynamic-to-dynamic binary composition, higher order, dynamic-session/dynamic-mean autograd, general dynamic Graph composition/`Graph::grad`, non-scalar broadcast, generic runtime-to-fixed consumers, capture/artifact/replay/native JIT/PTX/device lowering remain explicit boundaries. Stack and split remain."
+        "Acceptance requirement": "Constant typed padding, multi-input concat with promotion, and fixed-size `masked_select(size, fill)` remain compatible. Its static reverse edge broadcasts/flattens the Bool mask, routes retained row-major cotangents, and zeros padded, truncated, and false lanes. Dynamic results use one graph-owned `DynamicOperation` arena with exact `DynamicOutputShape` count provenance and one `RuntimeSchedule` instruction DAG: count, allocation-resource, materialization, pointwise, and reduction variants own their operands and outputs without parallel kind/binding projections. CPU realization supports row-major `nonzero` with exact `[count, rank]` geometry and I32 coordinates until the maximum coordinate exceeds I32, then I64; unbounded `masked_select_dynamic`; arbitrary `Neg`/`Square` and `Add`/`Sub`/`Mul` chains over shared-count values or checked static scalars; and composable fixed scalar `Sum`/forward-only `Mean` with canonical accumulation/output pairs. First-order CPU VJP covers derived masked-selection float expressions and participating derived static scalars with exact source shapes. The intentional 0.1 API uses direct `DynamicOutputShape::{Scalar, Count1d, CountRows}`, count stages that own their bindings, and ordered-slice binding validation; the unresolved rank-only constructor and side binding projection are removed. Descriptor, count, producer, dependency, allocation, schedule identity, and sizing/liveness metadata are validated before execution; CPU values remain independent owned `TensorData`, so lifetime records do not claim storage reuse. General `Graph::grad`, higher order and mean autograd, non-scalar or unrelated-count broadcasting, capture/artifact/replay, native JIT, PTX, and device lowering remain fail-closed. Stack and split remain."
       }
     },
     {
