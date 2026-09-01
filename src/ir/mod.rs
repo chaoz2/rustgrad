@@ -33,7 +33,9 @@ pub use dynamic::{
     DynamicBinding, DynamicCountStage, DynamicInput, DynamicNodeId, DynamicOutputShape,
     DynamicVjpPlan,
 };
-pub(crate) use dynamic::{DynamicNode, DynamicOperation, dynamic_reduction_dtypes};
+pub(crate) use dynamic::{
+    DynamicMeanVjpRule, DynamicNode, DynamicOperation, dynamic_reduction_dtypes,
+};
 pub(crate) use elementwise::{logsigmoid_plan, source_lub, source_weak_scalar_dtype};
 pub(crate) use graph::Node;
 pub use graph::{
