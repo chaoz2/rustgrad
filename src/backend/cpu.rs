@@ -550,6 +550,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
             | Op::Compare { .. }
             | Op::Logical { .. }
             | Op::Reduce { .. }
+            | Op::PrefixScan { .. }
             | Op::Reshape { .. }
             | Op::Permute { .. }
             | Op::Expand { .. }
@@ -1868,12 +1869,8 @@ pub(crate) fn execute_prefix_scan(
         .iter()
         .try_fold(1usize, |n, dim| n.checked_mul(*dim))
         .ok_or_else(|| Error::ShapeOverflow(input.shape().clone()))?;
-    let identity = match kind {
-        crate::PrefixScanKind::Sum => Scalar::I(0),
-        crate::PrefixScanKind::Product => Scalar::I(1),
-        crate::PrefixScanKind::Max => Scalar::F(f64::NEG_INFINITY),
-        crate::PrefixScanKind::Min => Scalar::F(f64::INFINITY),
-    };
+    let work_dtype = crate::prefix_scan_native::work_dtype(input.dtype(), kind, output_dtype);
+    let identity = crate::prefix_scan_native::scan_identity(input.dtype(), work_dtype, kind);
     let op = match kind {
         crate::PrefixScanKind::Sum => BinaryOp::Add,
         crate::PrefixScanKind::Product => BinaryOp::Mul,
@@ -1885,25 +1882,16 @@ pub(crate) fn execute_prefix_scan(
     for outer_index in 0..outer {
         for inner_index in 0..inner {
             let mut accumulator = identity;
-            let mut index_accumulator = 0i64;
+            let mut index_accumulator = axis_len;
             for coordinate in 0..axis_len {
                 let offset = (outer_index * axis_len + coordinate) * inner + inner_index;
                 let next = input.scalar_at(offset);
-                let wins_or_ties = match kind {
-                    crate::PrefixScanKind::Max => {
-                        !next.as_f64().is_nan() && next.as_f64() >= accumulator.as_f64()
-                    }
-                    crate::PrefixScanKind::Min => {
-                        !next.as_f64().is_nan() && next.as_f64() <= accumulator.as_f64()
-                    }
-                    crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => false,
-                };
                 let strictly_wins = match kind {
                     crate::PrefixScanKind::Max => {
-                        !next.as_f64().is_nan() && next.as_f64() > accumulator.as_f64()
+                        extrema_is_better(input.dtype(), true, next, accumulator)
                     }
                     crate::PrefixScanKind::Min => {
-                        !next.as_f64().is_nan() && next.as_f64() < accumulator.as_f64()
+                        extrema_is_better(input.dtype(), false, next, accumulator)
                     }
                     crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => false,
                 };
@@ -1913,13 +1901,26 @@ pub(crate) fn execute_prefix_scan(
                 ) {
                     if strictly_wins { next } else { accumulator }
                 } else {
-                    binary_scalar(accumulator, next, output_dtype, op)
+                    commit_prefix_scalar(
+                        binary_scalar(accumulator, next, work_dtype, op),
+                        work_dtype,
+                    )?
                 };
-                if wins_or_ties {
-                    index_accumulator = coordinate as i64;
+                if output == crate::PrefixScanOutput::Indices {
+                    let candidate_matches_value = !next.as_f64().is_nan()
+                        && extrema_is_equal(input.dtype(), next, accumulator);
+                    index_accumulator = crate::prefix_scan_native::first_match_index(
+                        index_accumulator,
+                        axis_len,
+                        coordinate,
+                        strictly_wins,
+                        candidate_matches_value,
+                    );
                 }
                 out[offset] = accumulator;
-                indices[offset] = Scalar::I(index_accumulator);
+                if output == crate::PrefixScanOutput::Indices {
+                    indices[offset] = Scalar::I(index_accumulator as i64);
+                }
             }
         }
     }
@@ -2242,6 +2243,22 @@ fn extrema_is_better(dtype: DType, max: bool, candidate: Scalar, best: Scalar) -
     } else {
         ordering == Some(Ordering::Less)
     }
+}
+
+fn extrema_is_equal(dtype: DType, lhs: Scalar, rhs: Scalar) -> bool {
+    if dtype.is_float() {
+        lhs.as_f64() == rhs.as_f64()
+    } else if matches!(dtype.category(), crate::DTypeCategory::Unsigned) {
+        lhs.as_u64() == rhs.as_u64()
+    } else if dtype == DType::Bool {
+        lhs.as_bool() == rhs.as_bool()
+    } else {
+        lhs.as_i64() == rhs.as_i64()
+    }
+}
+
+fn commit_prefix_scalar(value: Scalar, dtype: DType) -> Result<Scalar> {
+    Ok(TensorData::from_scalars([], dtype, [value])?.scalar_at(0))
 }
 
 fn tinygrad_sort_padding(dtype: DType, descending: bool) -> Scalar {

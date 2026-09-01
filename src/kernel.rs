@@ -597,6 +597,7 @@ pub fn lower_graph_prefix_scan(
     Ok(UOp::from_operation(
         Operation::PrefixScan(PrefixScanValue {
             input: *input,
+            destination: output,
             input_shape: graph
                 .shape(*input)
                 .map_err(|_| UOpError::UseBeforeDefinition)?
@@ -608,6 +609,9 @@ pub fn lower_graph_prefix_scan(
             axis: *axis,
             kind: *kind,
             output: *scan_output,
+            input_dtype: graph
+                .dtype(*input)
+                .map_err(|_| UOpError::UseBeforeDefinition)?,
             dtype: graph
                 .dtype(output)
                 .map_err(|_| UOpError::UseBeforeDefinition)?,
@@ -872,8 +876,8 @@ pub fn execute_elementwise(
 }
 
 /// Executes an already-lowered pure kernel UOp with checked owned bindings.
-/// Movement roots delegate to their canonical immutable plan; ordinary fused
-/// roots retain the elementwise evaluator below. This is crate-private so
+/// Operation-scoped roots delegate to their canonical immutable plans;
+/// ordinary fused roots retain the elementwise evaluator below. This is crate-private so
 /// CUDA's test mock can use the same independent semantic oracle without
 /// making host materialization part of a runtime path.
 pub(crate) fn execute_lowered_elementwise(
@@ -899,6 +903,18 @@ pub(crate) fn execute_lowered_elementwise(
     }
     if let Operation::Random(plan) = kernel.operation() {
         return plan.execute();
+    }
+    if let Operation::PrefixScan(plan) = kernel.operation() {
+        let input = bindings
+            .get(plan.input.index() as u64)
+            .ok_or(Error::InvalidIndex)?;
+        return crate::backend::execute_prefix_scan(
+            input,
+            plan.axis,
+            plan.kind,
+            plan.output,
+            plan.dtype,
+        );
     }
     let matmul = match kernel.operation() {
         Operation::Matmul(MatmulValue::Serial(plan)) => Some(plan.as_ref()),

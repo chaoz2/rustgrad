@@ -931,18 +931,23 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
         }
         Operation::PrefixScan(value) => {
             let PrefixScanValue {
+                input,
+                destination,
                 input_shape,
                 output_shape,
                 axis,
                 kind,
                 output,
+                input_dtype,
                 dtype,
                 ..
             } = value;
             if input_shape != output_shape
+                || input == destination
                 || (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
                 || (*kind == crate::PrefixScanKind::Sum && *dtype == DType::Bool)
+                || crate::ir::prefix_scan_output_dtype(*input_dtype, *kind, *output) != Some(*dtype)
                 || (matches!(
                     kind,
                     crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product

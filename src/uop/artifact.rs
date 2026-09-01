@@ -17,10 +17,11 @@ use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
 /// v14 adds the prefix-scan output selector; v16 adds the coupled Sort pair;
-/// v17 adds the CPU-static TensorGuard validation boundary.
+/// v17 adds the CPU-static TensorGuard validation boundary; v18 makes the
+/// prefix-scan source/result buffer ABI and source dtype self-contained.
 /// v15 is retained as the first internal mixed-schedule envelope.
-const VERSION: u8 = 17;
-const EFFECT_VERSION: u8 = 17;
+const VERSION: u8 = 18;
+const EFFECT_VERSION: u8 = 18;
 const PREVIOUS_EFFECT_VERSION: u8 = 15;
 const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
@@ -128,11 +129,13 @@ enum WireArg {
     Random(Box<crate::random::plan::RandomKernelPlan>),
     PrefixScan {
         input: NodeId,
+        destination: NodeId,
         input_shape: Shape,
         output_shape: Shape,
         axis: usize,
         kind: crate::PrefixScanKind,
         output: crate::PrefixScanOutput,
+        input_dtype: DType,
         dtype: DType,
     },
     Sort {
@@ -217,11 +220,13 @@ fn operation_to_wire(operation: &Operation) -> (WireOpcode, WireArg) {
             WireOpcode::PrefixScan,
             WireArg::PrefixScan {
                 input: value.input,
+                destination: value.destination,
                 input_shape: value.input_shape.clone(),
                 output_shape: value.output_shape.clone(),
                 axis: value.axis,
                 kind: value.kind,
                 output: value.output,
+                input_dtype: value.input_dtype,
                 dtype: value.dtype,
             },
         ),
@@ -398,20 +403,24 @@ fn operation_from_wire(opcode: WireOpcode, arg: WireArg) -> Result<Operation, Ar
             WireOpcode::PrefixScan,
             WireArg::PrefixScan {
                 input,
+                destination,
                 input_shape,
                 output_shape,
                 axis,
                 kind,
                 output,
+                input_dtype,
                 dtype,
             },
         ) => Operation::PrefixScan(PrefixScanValue {
             input,
+            destination,
             input_shape,
             output_shape,
             axis,
             kind,
             output,
+            input_dtype,
             dtype,
         }),
         (
@@ -626,6 +635,8 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             | 12
             | LEGACY_EFFECT_VERSION
             | PREVIOUS_EFFECT_VERSION
+            | 16
+            | 17
             | VERSION
     ) {
         return Err(ArtifactError::Format("version"));
@@ -781,19 +792,24 @@ fn validate_fields(
             .validate()
             .map_err(|_| ArtifactError::Format("random plan"))?,
         WireArg::PrefixScan {
+            input,
+            destination,
             input_shape,
             output_shape,
             axis,
             kind,
             output,
+            input_dtype,
             dtype,
             ..
         } => {
             checked_shape(input_shape)?;
-            if input_shape != output_shape
+            if input == destination
+                || input_shape != output_shape
                 || (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
                 || (*kind == crate::PrefixScanKind::Sum && *dtype == DType::Bool)
+                || crate::ir::prefix_scan_output_dtype(*input_dtype, *kind, *output) != Some(*dtype)
                 || (matches!(
                     kind,
                     crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product
@@ -1296,20 +1312,24 @@ fn write_arg(w: &mut Writer, arg: &WireArg, effects: bool) -> Result<(), Artifac
         }
         WireArg::PrefixScan {
             input,
+            destination,
             input_shape,
             output_shape,
             axis,
             kind,
             output,
+            input_dtype,
             dtype,
         } => {
             w.u8(20)?;
             w.u64(input.index() as u64)?;
+            w.u64(destination.index() as u64)?;
             write_shape(w, input_shape)?;
             write_shape(w, output_shape)?;
             w.usize(*axis)?;
             w.u8(tag_prefix_scan(*kind))?;
             w.u8(tag_prefix_scan_output(*output))?;
+            w.u8(dtype_tag(*input_dtype))?;
             w.u8(dtype_tag(*dtype))
         }
         WireArg::Sort {
@@ -1447,25 +1467,28 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<WireArg, ArtifactError> {
             version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION,
         )?)),
         19 if version >= 10 => WireArg::Conv2d(Box::new(read_static_conv2d(r)?)),
-        20 if version >= 11 => WireArg::PrefixScan {
+        20 if version >= 18 => WireArg::PrefixScan {
             input: crate::NodeId::from_index(
-                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("prefix scan node"))?,
+                usize::try_from(r.u64()?)
+                    .map_err(|_| ArtifactError::Format("prefix scan input"))?,
+            ),
+            destination: crate::NodeId::from_index(
+                usize::try_from(r.u64()?)
+                    .map_err(|_| ArtifactError::Format("prefix scan destination"))?,
             ),
             input_shape: read_shape(r)?,
             output_shape: read_shape(r)?,
             axis: r.usize()?,
-            kind: if version >= 12 {
-                enum_prefix_scan(r.u8()?)?
-            } else {
-                crate::PrefixScanKind::Sum
-            },
-            output: if version >= 14 {
-                enum_prefix_scan_output(r.u8()?)?
-            } else {
-                crate::PrefixScanOutput::Values
-            },
+            kind: enum_prefix_scan(r.u8()?)?,
+            output: enum_prefix_scan_output(r.u8()?)?,
+            input_dtype: dtype(r.u8()?)?,
             dtype: dtype(r.u8()?)?,
         },
+        20 if version >= 11 => {
+            return Err(ArtifactError::Format(
+                "legacy prefix scan lacks source/result ABI",
+            ));
+        }
         21 if version >= 16 => WireArg::Sort {
             input: crate::NodeId::from_index(
                 usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("sort input"))?,
@@ -2898,6 +2921,29 @@ mod tests {
         let end = legacy.len();
         legacy[end - 4..].copy_from_slice(&sum.to_le_bytes());
         assert!(decode(&legacy).is_err());
+    }
+
+    #[test]
+    fn prefix_scan_v18_owns_source_result_abi_and_legacy_payloads_fail_closed() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::I16);
+        let output = graph.cumsum(input, 1).unwrap();
+        let scan = crate::lower_graph_prefix_scan(&graph, output).unwrap();
+        let bytes = encode(&scan).unwrap();
+        assert_eq!(bytes[4], VERSION);
+        assert_eq!(decode(&bytes).unwrap(), scan);
+
+        let mut legacy = bytes;
+        legacy[4] = 17;
+        let body_len = legacy.len() - 4;
+        let sum = checksum(&legacy[..body_len]);
+        legacy[body_len..].copy_from_slice(&sum.to_le_bytes());
+        assert!(matches!(
+            decode(&legacy),
+            Err(ArtifactError::Format(
+                "legacy prefix scan lacks source/result ABI"
+            ))
+        ));
     }
     #[test]
     fn shared_sources_remain_shared() {

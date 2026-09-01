@@ -2315,12 +2315,12 @@ impl Graph {
         self.prefix_scan(input, axis, PrefixScanKind::Product)
     }
 
-    /// Inclusive cumulative maxima and the last matching I32 index per prefix.
+    /// Inclusive cumulative maxima and the first matching I32 index per prefix.
     pub fn cummax(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
         self.prefix_extrema(input, axis, PrefixScanKind::Max)
     }
 
-    /// Inclusive cumulative minima and the last matching I32 index per prefix.
+    /// Inclusive cumulative minima and the first matching I32 index per prefix.
     pub fn cummin(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
         self.prefix_extrema(input, axis, PrefixScanKind::Min)
     }

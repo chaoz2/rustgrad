@@ -417,11 +417,15 @@ F32/F64 `exp2` follows the same strict native-renderer path and cache identity;
 F16/BF16 and Float8 `exp2` remain outside the native contract.
 
 `Graph::cumsum` and `Graph::cumprod` share a typed static `PrefixScan` schedule
-materialization with an explicit normalized axis, Sum/Product kind, and exact
-input/output descriptor in its UOp and RGUA artifact payload. The CPU oracle
-owns inclusive scan execution and cache identity; scalar and zero-extent shapes
-remain exact. Sums use their existing promotion contract while products retain
-source dtype, including Bool. Floating `cumsum` reverse mode composes existing
+materialization with an explicit normalized axis, Sum/Product kind, source and
+destination identities, and exact source/result dtypes in UOp/RGUA v18. One
+checked `NativePrefixScanPlan` derives the row/axis/inner domain and the work
+dtype for the CPU oracle, scalar CPU-JIT, and PTX instead of duplicating a scan
+operation taxonomy. Scalar and zero-extent shapes remain exact. F32 Sum commits
+each recurrence in F32; F16/BF16/Float8 Sum works in F32 and casts each prefix
+result to source storage, while Product/extrema commit source-width arithmetic.
+Integer Sum retains its public promotion contract and Product retains source
+dtype, including Bool. Floating `cumsum` reverse mode composes existing
 signed-axis reverse views around another sum scan, and floating `cumprod` uses
 the existing zero-aware scan composition. Floating cumulative-extrema values
 move the normalized axis last and build one prefix/equality winner matrix from
@@ -431,12 +435,26 @@ ties; NaN follows the same equality/count route. Both the winner-count and
 final contribution reductions retain the upstream storage dtype. These paths
 retain graph-on-graph seed edges, while non-floating and Float8 scans reject
 before derivative graph mutation.
-`Graph::cummax` and `Graph::cummin` use the same CPU-static `PrefixScan` path to
-return values plus I32 last-matching-prefix indices, with left-biased NaN and
-signed-zero ties. Their index outputs remain explicitly nondifferentiable; all
-PrefixScan forms remain fail-closed for JIT and device lowering.
-This is deliberately not a CPU-JIT, PTX, OpenCL, Metal,
-WebGPU, dynamic, parallel, or generic replay contract. The fixed-size
+`Graph::cummax` and `Graph::cummin` use the same typed path to return values plus
+I32 first-matching-prefix indices. Index state begins at the axis-length
+sentinel, moves on a strict winner, otherwise records only the first source lane
+equal to the current cumulative value, and therefore preserves zero's first
+sign. Extrema values begin at the dtype identity and retain that identity for an
+unordered lane, so a leading NaN leaves the index sentinel until a later strict
+winner; a source lane equal to the retained identity still records its index.
+The identity is committed through the source dtype before recurrence, including
+Float8 infinity-to-NaN formats. Rank-zero scans bypass recurrence and preserve
+the source value's raw bits when storage is unchanged; widened Sum casts the
+single source value once, while the index result is I32 zero.
+Their index outputs remain explicitly
+nondifferentiable. Scalar CPU-JIT covers all concrete storage dtypes and both
+value/index results through captured replay. PTX v29 uses the same plan and a
+two-buffer ABI for Bool/I32/U32/F32, assigning one thread to each independent
+row/inner lane and scanning the selected axis serially; the CUDA semantic mock
+compares exact value/index bytes with the CPU oracle. OpenCL, Metal, WebGPU,
+other PTX dtypes, dynamic domains, and parallel scan algorithms remain
+fail-closed. Legacy PrefixScan RGUA v11--v17 payloads also fail closed because
+they cannot prove source dtype or destination identity. The fixed-size
 `MaskedSelect` reverse edge alone
 reuses its boolean prefix ranks as nondifferentiable control/index values to
 gather explicit upstream cotangents into retained row-major source lanes;

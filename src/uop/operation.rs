@@ -64,11 +64,13 @@ pub enum MovementValue {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PrefixScanValue {
     pub input: NodeId,
+    pub destination: NodeId,
     pub input_shape: Shape,
     pub output_shape: Shape,
     pub axis: usize,
     pub kind: crate::PrefixScanKind,
     pub output: crate::PrefixScanOutput,
+    pub input_dtype: DType,
     pub dtype: DType,
 }
 
