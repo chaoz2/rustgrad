@@ -217,7 +217,7 @@ impl WgslRenderer {
             Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
         ) {
             return Err(WebGpuError::Unsupported(
-                "prefix scans and sort pairs are CPU-oracle only".into(),
+                "prefix scans, sort pairs, and tensor guards are outside WebGPU lowering".into(),
             ));
         }
         root.validate()

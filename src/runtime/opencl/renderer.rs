@@ -126,7 +126,7 @@ impl OpenClRenderer {
             Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
         ) {
             return Err(OpenClError::Unsupported(
-                "prefix scans and sort pairs are CPU-oracle only".into(),
+                "prefix scans, sort pairs, and tensor guards are outside OpenCL lowering".into(),
             ));
         }
         root.validate()

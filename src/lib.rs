@@ -301,6 +301,7 @@ mod dot_tests;
 mod einsum_tests;
 #[cfg(test)]
 mod multinomial_tests;
+mod prefix_scan_native;
 #[cfg(test)]
 mod prefix_scan_tests;
 #[cfg(test)]

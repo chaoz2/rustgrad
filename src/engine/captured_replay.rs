@@ -1570,6 +1570,26 @@ mod tests {
         assert_eq!(actual.shape(), &Shape::from([2]));
         assert_eq!(actual.dtype(), DType::I32);
         assert_eq!(actual.to_vec_f64(), vec![2.0, 5.0]);
+        let native = CapturedReplayExecutor::default()
+            .replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(native.outputs[0].storage(), &Storage::I32(vec![2, 5]));
+        assert_eq!(
+            native
+                .trace
+                .items
+                .iter()
+                .find(|trace| trace.item == scan_item.id)
+                .unwrap()
+                .backend,
+            ItemBackend::NativeJit
+        );
 
         let mut malformed = capture.clone();
         let malformed_item = malformed
@@ -1609,6 +1629,147 @@ mod tests {
         assert_eq!(extrema_item.ordered_inputs()[0].desc.dtype, DType::F32);
         assert_eq!(extrema_item.primary_output().dtype, DType::I32);
         extrema_item.validate_input_bindings().unwrap();
+        let extrema_native = CapturedReplayExecutor::default()
+            .replay(
+                &extrema_capture,
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::from_storage([2], Storage::F32(vec![-0.0, 0.0])).unwrap(),
+                )]),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            extrema_native.outputs[0].storage(),
+            &Storage::I32(vec![0, 0])
+        );
+        assert_eq!(
+            extrema_native.trace.items[0].backend,
+            ItemBackend::NativeJit
+        );
+
+        let mut boolean_graph = Graph::new();
+        let boolean_input = boolean_graph.input_dtype("input", [5], DType::Bool);
+        let (maximum, maximum_indices) = boolean_graph.cummax(boolean_input, 0).unwrap();
+        let (minimum, minimum_indices) = boolean_graph.cummin(boolean_input, 0).unwrap();
+        let boolean_capture = captured(
+            &boolean_graph,
+            &[maximum, maximum_indices, minimum, minimum_indices],
+        );
+        let boolean_bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::from_storage([5], Storage::Bool(vec![false, false, true, true, false]))
+                .unwrap(),
+        )]);
+        let expected = [
+            Storage::Bool(vec![false, false, true, true, true]),
+            Storage::I32(vec![0, 0, 2, 2, 2]),
+            Storage::Bool(vec![false, false, false, false, false]),
+            Storage::I32(vec![0, 0, 0, 0, 0]),
+        ];
+        for backend in [
+            CapturedBackendPolicy::Interpreter,
+            CapturedBackendPolicy::NativeJit { vectorized: false },
+        ] {
+            let replay = CapturedReplayExecutor::default()
+                .replay(
+                    &boolean_capture,
+                    &boolean_bindings,
+                    CapturedReplayOptions { backend },
+                )
+                .unwrap();
+            let actual = replay
+                .outputs
+                .iter()
+                .map(|output| output.storage().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(actual.as_slice(), expected.as_slice());
+            if matches!(backend, CapturedBackendPolicy::NativeJit { .. }) {
+                assert!(
+                    replay
+                        .trace
+                        .items
+                        .iter()
+                        .all(|trace| trace.backend == ItemBackend::NativeJit)
+                );
+            }
+        }
+
+        let mut scalar_graph = Graph::new();
+        let scalar_input = scalar_graph.input_dtype("input", [], DType::F32);
+        let scalar_sum = scalar_graph.cumsum(scalar_input, 0).unwrap();
+        let scalar_product = scalar_graph.cumprod(scalar_input, 0).unwrap();
+        let (scalar_maximum, scalar_maximum_indices) =
+            scalar_graph.cummax(scalar_input, 0).unwrap();
+        let (scalar_minimum, scalar_minimum_indices) =
+            scalar_graph.cummin(scalar_input, 0).unwrap();
+        let scalar_capture = captured(
+            &scalar_graph,
+            &[
+                scalar_sum,
+                scalar_product,
+                scalar_maximum,
+                scalar_minimum,
+                scalar_maximum_indices,
+                scalar_minimum_indices,
+            ],
+        );
+        let scalar_bits = 0x7fc0_1234;
+        let scalar_replay = CapturedReplayExecutor::default()
+            .replay(
+                &scalar_capture,
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::from_storage([], Storage::F32(vec![f32::from_bits(scalar_bits)]))
+                        .unwrap(),
+                )]),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        for output in &scalar_replay.outputs[..4] {
+            let Storage::F32(values) = output.storage() else {
+                panic!("scalar F32 scan value storage")
+            };
+            assert_eq!(values[0].to_bits(), scalar_bits);
+        }
+        assert_eq!(scalar_replay.outputs[4].storage(), &Storage::I32(vec![0]));
+        assert_eq!(scalar_replay.outputs[5].storage(), &Storage::I32(vec![0]));
+        assert!(
+            scalar_replay
+                .trace
+                .items
+                .iter()
+                .all(|trace| trace.backend == ItemBackend::NativeJit)
+        );
+
+        let mut width_graph = Graph::new();
+        let width_input = width_graph.input_dtype("input", [3], DType::F32);
+        let width_output = width_graph.cumsum(width_input, 0).unwrap();
+        let width_capture = captured(&width_graph, &[width_output]);
+        let width_native = CapturedReplayExecutor::default()
+            .replay(
+                &width_capture,
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::from_storage(
+                        [3],
+                        Storage::F32(vec![16_777_216.0, 1.0, -16_777_216.0]),
+                    )
+                    .unwrap(),
+                )]),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            width_native.outputs[0].storage(),
+            &Storage::F32(vec![16_777_216.0, 16_777_216.0, 0.0])
+        );
     }
 
     #[test]

@@ -655,9 +655,11 @@ fn input_bindings(
         let expected_dtype =
             crate::ir::prefix_scan_output_dtype(desc.dtype, plan.kind, plan.output);
         if desc.shape != plan.input_shape
+            || desc.dtype != plan.input_dtype
             || !desc.read_only
             || desc.view.is_some()
             || output.shape != plan.output_shape
+            || output.id != plan.destination.index() as u64
             || output.dtype != plan.dtype
             || expected_dtype != Some(plan.dtype)
             || output.read_only

@@ -25,8 +25,10 @@ mod matmul;
 #[cfg(test)]
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
+#[path = "ptx_prefix_scan.rs"]
+mod prefix_scan;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v28";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v29";
 /// Separate identity for raw storage-width computed affine materialization.
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 pub const PTX_ABI_VERSION: u32 = 1;
@@ -189,6 +191,30 @@ impl RenderedPtx {
                 ));
             }
         }
+        if let Some(KernelSemanticProgram::UOp(program)) = &self.semantic_program
+            && let Operation::PrefixScan(value) = program.operation()
+        {
+            let plan = crate::prefix_scan_native::NativePrefixScanPlan::new(value)
+                .map_err(|reason| PtxError::InvalidBinding(reason.into()))?;
+            if self.launch != PtxLaunchGeometry::Linear
+                || self.extent != plan.work_items()
+                || self.buffers.len() != 2
+                || self.buffers[0].id != plan.input
+                || self.buffers[0].dtype != plan.input_dtype
+                || self.buffers[0].source_shape != value.input_shape
+                || self.buffers[0].elements != plan.elements
+                || self.buffers[0].mutable
+                || self.buffers[1].id != plan.output
+                || self.buffers[1].dtype != plan.output_dtype
+                || self.buffers[1].source_shape != value.output_shape
+                || self.buffers[1].elements != plan.elements
+                || !self.buffers[1].mutable
+            {
+                return Err(PtxError::InvalidBinding(
+                    "prefix-scan PTX launch disagrees with its typed plan".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -228,6 +254,13 @@ impl RenderedPtx {
             Some(KernelSemanticProgram::TensorCoreMatmul(_)) => 16,
             Some(KernelSemanticProgram::UOp(program)) => match program.operation() {
                 Operation::Movement(MovementValue::Plan(plan)) => plan.dtype.itemsize(),
+                Operation::PrefixScan(value) => {
+                    if index == 0 {
+                        value.input_dtype.itemsize()
+                    } else {
+                        value.dtype.itemsize()
+                    }
+                }
                 _ => 1,
             },
             _ => 1,
@@ -571,12 +604,17 @@ fn render(
     if let Operation::Random(plan) = root.operation() {
         return render_random(renderer, root, plan);
     }
+    if let Operation::PrefixScan(value) = root.operation() {
+        root.validate()
+            .map_err(|error| PtxError::Unsupported(error.to_string()))?;
+        return prefix_scan::render(renderer, root, value);
+    }
     if matches!(
         root.operation(),
-        Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
+        Operation::Sort(_) | Operation::TensorGuard(_)
     ) {
         return Err(PtxError::Unsupported(
-            "prefix scans and sort pairs are outside the PTX lowering subset".into(),
+            "sort pairs and tensor guards are outside the PTX lowering subset".into(),
         ));
     }
     if let Operation::Matmul(value) = root.operation() {
@@ -6017,7 +6055,7 @@ fn view_offset(view: &crate::uop::AffineView) -> Result<Vec<String>, PtxError> {
     }
     Ok(lines)
 }
-fn stable_key(value: &impl std::hash::Hash) -> String {
+pub(super) fn stable_key(value: &impl std::hash::Hash) -> String {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut h);
@@ -7216,6 +7254,75 @@ mod tests {
                 .flat_map(u32::to_le_bytes)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn prefix_scan_ptx_mock_executes_values_and_indices_without_host_round_trip() {
+        use std::num::NonZeroUsize;
+
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let cache = ConcurrentPtxCache::new();
+        for indices in [false, true] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [2, 3], DType::I32);
+            let output = if indices {
+                graph.cummax(input, 1).unwrap().1
+            } else {
+                graph.cumsum(input, 1).unwrap()
+            };
+            let tensor = TensorData::from_scalars(
+                [2, 3],
+                DType::I32,
+                [1, 3, 3, -2, 4, 1].into_iter().map(Scalar::I),
+            )
+            .unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("x".into(), tensor.clone())]),
+                )
+                .unwrap();
+            let item = crate::schedule(&graph, output)
+                .unwrap()
+                .items
+                .pop()
+                .unwrap();
+            let rendered = PtxRenderer::new(80).unwrap().render(&item.kernel).unwrap();
+            rendered
+                .validate_schedule_bindings(item.ordered_inputs())
+                .unwrap();
+            let input_lease = primary
+                .allocate(NonZeroUsize::new(tensor.to_le_bytes().unwrap().len()).unwrap())
+                .unwrap();
+            let output_lease = primary
+                .allocate(NonZeroUsize::new(expected.to_le_bytes().unwrap().len()).unwrap())
+                .unwrap();
+            input_lease
+                .view()
+                .copy_from(0, &tensor.to_le_bytes().unwrap())
+                .unwrap();
+            let kernel = cache.get_or_load(&primary, rendered.clone(), 32).unwrap();
+            let bindings = rendered
+                .buffers
+                .iter()
+                .map(|abi| PtxBinding {
+                    buffer: if abi.mutable {
+                        output_lease.view()
+                    } else {
+                        input_lease.view()
+                    },
+                    dtype: abi.dtype,
+                    mutable: abi.mutable,
+                })
+                .collect::<Vec<_>>();
+            kernel.launch(&stream, &bindings, true).unwrap();
+            let mut actual = vec![0; expected.to_le_bytes().unwrap().len()];
+            output_lease.view().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected.to_le_bytes().unwrap());
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v30";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v31";
 const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
@@ -586,12 +586,21 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     if matches!(
         root.operation(),
-        Operation::Matmul(_) | Operation::Conv2d(_) | Operation::Movement(_) | Operation::Random(_)
+        Operation::Matmul(_)
+            | Operation::Conv2d(_)
+            | Operation::Movement(_)
+            | Operation::Random(_)
+            | Operation::PrefixScan(_)
     ) {
         return Ok(VectorPlan {
             lanes: 1,
             enabled: false,
-            reason: "static contraction uses scalar lanes".into(),
+            reason: if matches!(root.operation(), Operation::PrefixScan(_)) {
+                "prefix scan uses a serial axis loop"
+            } else {
+                "static contraction uses scalar lanes"
+            }
+            .into(),
         });
     }
     let linear = crate::LinearKernel::from_uop(root)
@@ -606,6 +615,11 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     })
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
+    if let Operation::PrefixScan(value) = root.operation() {
+        root.validate()
+            .map_err(|error| JitError::Unsupported(error.to_string()))?;
+        return render_prefix_scan(value);
+    }
     if let Operation::Random(plan) = root.operation() {
         return random::render(plan);
     }
@@ -861,15 +875,6 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "#include <string.h>".into(),
         "#include <limits.h>".into(),
         format!("/* {RENDERER_VERSION} C11 ABI v2; vector lanes={} ({}) linear={linear_key:?} */", plan.lanes, plan.reason),
-        "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
-        "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff; r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
-        "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
-        "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
-        // mode: 0=E4M3, 1=E5M2, 2=FNUZ. This is the exact inverse of
-        // Float8Format::decode: FNUZ reserves 0x80 as NaN, E5M2 reserves the
-        // terminal exponent for infinity/NaN, and E4M3 reserves only its
-        // terminal mantissa. ldexp keeps subnormal and normal powers exact.
-        "static double rg_f8_decode(uint8_t x,int bias,unsigned mb,unsigned mode){unsigned em=(1u<<(7u-mb))-1u,mm=(1u<<mb)-1u,e=(x>>mb)&em,m=x&mm,s=x>>7;if(mode==2u&&x==0x80u)return NAN;if((x&0x7fu)==0u)return s?-0.0:0.0;if(mode!=2u&&e==em){if(mode==1u){double v=m?NAN:INFINITY;return s?-v:v;}if(m==mm)return NAN;}double v=e?ldexp(1.0+(double)m/(double)(mm+1u),(int)e-bias):ldexp((double)m/(double)(mm+1u),1-bias);return s?-v:v;}".into(),
         "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
         "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
@@ -884,6 +889,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         if plan.enabled { format!("  for (size_t rg_base = 0; rg_base + {}u <= {extent}u; rg_base += {}u) {{ for (size_t rg_lane = 0; rg_lane < {}u; ++rg_lane) {{ size_t rg_i = rg_base + rg_lane;", plan.lanes, plan.lanes, plan.lanes) } else { format!("  for (size_t rg_i = 0; rg_i < {extent}u; ++rg_i) {{") },
     ];
+    lines.splice(6..6, scalar_storage_helpers(false));
     if needs_f8_encode {
         let kernel_index = lines
             .iter()
@@ -893,7 +899,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             kernel_index,
             // Exact Float8Format::encode mirror. The thresholds are f64
             // payload bits, so conversion is independent of long-double ABI.
-            "static uint8_t rg_f8_encode(double x,int bias,unsigned sb,unsigned mode,uint64_t min_half,uint64_t overflow,uint8_t max_normal,uint64_t min_normal){if(mode==2u&&!isfinite(x))return 0x80u;if(mode==2u&&x==0.0)return 0u;uint8_t sign=signbit(x)?0x80u:0u;if(mode==0u&&!isfinite(x))return sign?0xffu:0x7fu;if(mode==1u&&!isfinite(x))return(uint8_t)(sign|(isinf(x)?0x7cu:0x7fu));union{double f;uint64_t u;}v={x};uint64_t bits=v.u,abs=bits&UINT64_C(0x7fffffffffffffff),mask=(UINT64_C(1)<<(sb-1u))-1u,mantissa=(bits>>(53u-sb))&mask,half=UINT64_C(1)<<(52u-sb),result;int exponent=(int)((bits>>52)&0x7ffu)-1023+bias;if(abs<=min_half)result=0;else if(abs>overflow)result=max_normal;else if(abs>=min_normal){result=((uint64_t)exponent<<(sb-1u))|mantissa;uint64_t round_bits=bits&((half<<1u)-1u);if(round_bits>half||(round_bits==half&&(mantissa&1u)))result++;}else{unsigned shift=(unsigned)(1-exponent);mantissa|=UINT64_C(1)<<(sb-1u);result=mantissa>>shift;uint64_t h=half<<shift,round_bits=(bits|(UINT64_C(1)<<52))&((h<<1u)-1u);if(round_bits>h||(round_bits==h&&(result&1u)))result++;}if(mode==2u&&result==0)return 0;return(uint8_t)(result|sign);}".into(),
+            scalar_float8_encode_helper(),
         );
     }
     if needs_erf {
@@ -963,6 +969,301 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         abi,
         cache_key,
     })
+}
+
+fn render_prefix_scan(value: &crate::PrefixScanValue) -> Result<RenderedC, JitError> {
+    let plan = crate::prefix_scan_native::NativePrefixScanPlan::new(value)
+        .map_err(|reason| JitError::Unsupported(reason.into()))?;
+    let buffers = vec![
+        BufferAbi {
+            id: plan.input,
+            dtype: plan.input_dtype,
+            elements: plan.elements,
+            mutable: false,
+        },
+        BufferAbi {
+            id: plan.output,
+            dtype: plan.output_dtype,
+            elements: plan.elements,
+            mutable: true,
+        },
+    ];
+    let abi = KernelAbi {
+        version: ABI_VERSION,
+        pointer_order: vec![KernelPointerAbi::Dense(0), KernelPointerAbi::Dense(1)],
+        buffers,
+        quantized_buffers: Vec::new(),
+        symbol_count: 0,
+    };
+    let input_raw = format!(
+        "((const {}*)buffers[0])[rg_offset]",
+        ctype(plan.input_dtype)
+    );
+    let next = scan_decode_expr(plan.input_dtype, &input_raw);
+    let acc_type = scan_accumulator_type(plan.work_dtype);
+    let identity = scan_identity(&plan)?;
+    let update = scan_update_expr(plan.kind, plan.work_dtype, "rg_acc", &next)?;
+    let stored = if plan.result == crate::PrefixScanOutput::Values {
+        scan_store_expr(plan.output_dtype, "rg_acc")
+    } else {
+        "((int32_t)rg_index)".into()
+    };
+    let strictly_wins = scan_strictly_wins_expr(plan.kind, plan.input_dtype, "rg_acc", &next);
+    let candidate_matches = if plan.result == crate::PrefixScanOutput::Indices {
+        scan_candidate_matches_expr(plan.kind, plan.input_dtype, "rg_acc", &next)
+    } else {
+        None
+    };
+    let mut lines = vec![
+        "#include <stdint.h>".into(),
+        "#include <stddef.h>".into(),
+        "#include <math.h>".into(),
+        "#include <string.h>".into(),
+        "#include <limits.h>".into(),
+        format!(
+            "/* {RENDERER_VERSION} prefix-scan {:?} axis={} source={:?} result={:?} */",
+            plan.kind, plan.axis, plan.input_dtype, plan.output_dtype
+        ),
+        "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
+        "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
+    ];
+    lines.splice(6..6, scalar_storage_helpers(true));
+    if plan.scalar_identity {
+        let input_raw = format!("((const {}*)buffers[0])[0]", ctype(plan.input_dtype));
+        if plan.result == crate::PrefixScanOutput::Values && plan.input_dtype == plan.output_dtype {
+            lines.push(format!(
+                "  memcpy(buffers[1], buffers[0], {}u);",
+                plan.input_dtype.itemsize()
+            ));
+        } else {
+            let stored = if plan.result == crate::PrefixScanOutput::Indices {
+                "((int32_t)0)".into()
+            } else {
+                scan_store_expr(
+                    plan.output_dtype,
+                    &scan_decode_expr(plan.input_dtype, &input_raw),
+                )
+            };
+            lines.push(format!(
+                "  (({}*)buffers[1])[0] = {stored};",
+                ctype(plan.output_dtype)
+            ));
+        }
+    } else if plan.work_items() != 0 {
+        lines.extend([
+            format!(
+                "  for (size_t rg_row=0; rg_row<{}u; ++rg_row) {{",
+                plan.rows
+            ),
+            format!(
+                "    for (size_t rg_inner=0; rg_inner<{}u; ++rg_inner) {{",
+                plan.inner
+            ),
+            format!("      {acc_type} rg_acc = {identity};"),
+            format!(
+                "      int32_t rg_index = {};",
+                if candidate_matches.is_some() {
+                    plan.index_sentinel
+                } else {
+                    0
+                }
+            ),
+            format!(
+                "      for (size_t rg_axis=0; rg_axis<{}u; ++rg_axis) {{",
+                plan.axis_len
+            ),
+            format!(
+                "        size_t rg_offset=(rg_row*{}u+rg_axis)*{}u+rg_inner;",
+                plan.axis_len, plan.inner
+            ),
+            strictly_wins
+                .map(|expression| format!("        int rg_strict = {expression};"))
+                .unwrap_or_else(|| "        /* arithmetic scan has no index state */".into()),
+            format!(
+                "        rg_acc = {};",
+                scan_commit_expr(plan.work_dtype, &update)
+            ),
+            candidate_matches
+                .map(|expression| {
+                    format!(
+                        "        if (rg_strict || (rg_index == {} && ({expression}))) rg_index=(int32_t)rg_axis;",
+                        plan.index_sentinel
+                    )
+                })
+                .unwrap_or_else(|| "        /* arithmetic scan has no match state */".into()),
+            format!(
+                "        (({}*)buffers[1])[rg_offset] = {stored};",
+                ctype(plan.output_dtype)
+            ),
+            "      }".into(),
+            "    }".into(),
+            "  }".into(),
+        ]);
+    }
+    lines.push("  return 0;".into());
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = native_cache_key("prefix-scan", &source);
+    Ok(RenderedC {
+        source,
+        source_map: BTreeMap::new(),
+        abi,
+        cache_key,
+    })
+}
+
+/// Shared exact storage codecs for ordinary scalar kernels and operation-
+/// scoped scans. Keeping one source fragment prevents renderer/cache drift.
+fn scalar_storage_helpers(include_float8_encode: bool) -> Vec<String> {
+    let mut helpers = vec![
+        "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
+        "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff;r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
+        "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
+        "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
+        "static double rg_f8_decode(uint8_t x,int bias,unsigned mb,unsigned mode){unsigned em=(1u<<(7u-mb))-1u,mm=(1u<<mb)-1u,e=(x>>mb)&em,m=x&mm,s=x>>7;if(mode==2u&&x==0x80u)return NAN;if((x&0x7fu)==0u)return s?-0.0:0.0;if(mode!=2u&&e==em){if(mode==1u){double v=m?NAN:INFINITY;return s?-v:v;}if(m==mm)return NAN;}double v=e?ldexp(1.0+(double)m/(double)(mm+1u),(int)e-bias):ldexp((double)m/(double)(mm+1u),1-bias);return s?-v:v;}".into(),
+    ];
+    if include_float8_encode {
+        helpers.push(scalar_float8_encode_helper());
+    }
+    helpers
+}
+
+fn scalar_float8_encode_helper() -> String {
+    "static uint8_t rg_f8_encode(double x,int bias,unsigned sb,unsigned mode,uint64_t min_half,uint64_t overflow,uint8_t max_normal,uint64_t min_normal){if(mode==2u&&!isfinite(x))return 0x80u;if(mode==2u&&x==0.0)return 0u;uint8_t sign=signbit(x)?0x80u:0u;if(mode==0u&&!isfinite(x))return sign?0xffu:0x7fu;if(mode==1u&&!isfinite(x))return(uint8_t)(sign|(isinf(x)?0x7cu:0x7fu));union{double f;uint64_t u;}v={x};uint64_t bits=v.u,abs=bits&UINT64_C(0x7fffffffffffffff),mask=(UINT64_C(1)<<(sb-1u))-1u,mantissa=(bits>>(53u-sb))&mask,half=UINT64_C(1)<<(52u-sb),result;int exponent=(int)((bits>>52)&0x7ffu)-1023+bias;if(abs<=min_half)result=0;else if(abs>overflow)result=max_normal;else if(abs>=min_normal){result=((uint64_t)exponent<<(sb-1u))|mantissa;uint64_t round_bits=bits&((half<<1u)-1u);if(round_bits>half||(round_bits==half&&(mantissa&1u)))result++;}else{unsigned shift=(unsigned)(1-exponent);mantissa|=UINT64_C(1)<<(sb-1u);result=mantissa>>shift;uint64_t h=half<<shift,round_bits=(bits|(UINT64_C(1)<<52))&((h<<1u)-1u);if(round_bits>h||(round_bits==h&&(result&1u)))result++;}if(mode==2u&&result==0)return 0;return(uint8_t)(result|sign);}".into()
+}
+
+fn scan_accumulator_type(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F64 => "double",
+        dtype if dtype.is_float() => "float",
+        _ => ctype(dtype),
+    }
+}
+
+fn scan_identity(
+    plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+) -> Result<String, JitError> {
+    Ok(match plan.identity() {
+        crate::Scalar::Bool(value) => u8::from(value).to_string(),
+        crate::Scalar::I(i64::MIN) => "INT64_MIN".into(),
+        crate::Scalar::I(value) => value.to_string(),
+        crate::Scalar::U(value) => format!("UINT64_C({value})"),
+        crate::Scalar::F(value) if value.is_nan() => {
+            "((union{uint32_t u;float f;}){.u=0x7fc00000u}.f)".into()
+        }
+        crate::Scalar::F(value) if value == f64::NEG_INFINITY => "-INFINITY".into(),
+        crate::Scalar::F(value) if value == f64::INFINITY => "INFINITY".into(),
+        crate::Scalar::F(0.0) => "0.0".into(),
+        crate::Scalar::F(1.0) => "1.0".into(),
+        crate::Scalar::F(_) => {
+            return Err(JitError::Unsupported("prefix scan identity scalar".into()));
+        }
+    })
+}
+
+fn scan_decode_expr(dtype: DType, raw: &str) -> String {
+    match dtype {
+        DType::F16 => format!("rg_f16_to_f32({raw})"),
+        DType::BF16 => format!("rg_bf16_to_f32({raw})"),
+        dtype if dtype.is_float8() => {
+            float8_decode_expr(dtype, raw).expect("guarded Float8 scan source")
+        }
+        _ => raw.into(),
+    }
+}
+
+fn scan_store_expr(dtype: DType, value: &str) -> String {
+    match dtype {
+        DType::F16 => format!("rg_f32_to_f16((float)({value}))"),
+        DType::BF16 => format!("rg_f32_to_bf16((float)({value}))"),
+        dtype if dtype.is_float8() => {
+            float8_encode_expr(dtype, value).expect("guarded Float8 scan result")
+        }
+        _ => format!("(({})({value}))", ctype(dtype)),
+    }
+}
+
+fn scan_commit_expr(dtype: DType, value: &str) -> String {
+    match dtype {
+        DType::F32 => format!("((float)({value}))"),
+        DType::F16 => format!("rg_f16_to_f32(rg_f32_to_f16((float)({value})))"),
+        DType::BF16 => format!("rg_bf16_to_f32(rg_f32_to_bf16((float)({value})))"),
+        dtype if dtype.is_float8() => {
+            let encoded = float8_encode_expr(dtype, value).expect("guarded Float8 scan work");
+            float8_decode_expr(dtype, &encoded).expect("guarded Float8 scan work")
+        }
+        _ => value.into(),
+    }
+}
+
+fn scan_strictly_wins_expr(
+    kind: crate::PrefixScanKind,
+    dtype: DType,
+    accumulator: &str,
+    next: &str,
+) -> Option<String> {
+    let comparison = match kind {
+        crate::PrefixScanKind::Max => ">",
+        crate::PrefixScanKind::Min => "<",
+        crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => return None,
+    };
+    Some(if dtype.is_float() {
+        format!("!isnan((double)({next})) && (double)({next}) {comparison} ({accumulator})")
+    } else {
+        format!("({next}) {comparison} ({accumulator})")
+    })
+}
+
+fn scan_candidate_matches_expr(
+    kind: crate::PrefixScanKind,
+    dtype: DType,
+    accumulator: &str,
+    next: &str,
+) -> Option<String> {
+    if !matches!(
+        kind,
+        crate::PrefixScanKind::Max | crate::PrefixScanKind::Min
+    ) {
+        return None;
+    }
+    Some(if dtype.is_float() {
+        format!("!isnan((double)({next})) && (double)({next}) == ({accumulator})")
+    } else {
+        format!("({next}) == ({accumulator})")
+    })
+}
+
+fn scan_update_expr(
+    kind: crate::PrefixScanKind,
+    dtype: DType,
+    accumulator: &str,
+    next: &str,
+) -> Result<String, JitError> {
+    use crate::PrefixScanKind::{Max, Min, Product, Sum};
+    if matches!(kind, Max | Min) {
+        let work = scan_accumulator_type(dtype);
+        return Ok(format!("(rg_strict ? ({work})({next}) : ({accumulator}))"));
+    }
+    if dtype == DType::Bool {
+        return Ok(match kind {
+            Product => format!("((uint8_t)(({accumulator}) && ({next})))"),
+            Sum => return Err(JitError::Unsupported("Bool sum result is invalid".into())),
+            Max | Min => unreachable!("handled above"),
+        });
+    }
+    let operator = if kind == Product { "*" } else { "+" };
+    if dtype.is_float() {
+        let work = scan_accumulator_type(dtype);
+        Ok(format!(
+            "(({work})({accumulator}) {operator} ({work})({next}))"
+        ))
+    } else {
+        let unsigned = unsigned_ctype(dtype)?;
+        wrap_expr(
+            dtype,
+            format!("(({unsigned})({accumulator})) {operator} (({unsigned})({next}))"),
+        )
+    }
 }
 
 fn render_static_conv2d(plan: &crate::StaticConv2dPlan) -> Result<RenderedC, JitError> {
@@ -3644,7 +3945,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v30");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v31");
 
         let execute = |graph: &Graph,
                        output,
@@ -3812,7 +4113,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v30");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v31");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
