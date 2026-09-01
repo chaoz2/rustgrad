@@ -502,20 +502,20 @@ fn reduction_derivative_graph_visualization_preserves_axes_and_sum_to_target() {
 }
 
 #[test]
-fn matmul_grad_graph_visualization_preserves_batched_vector_and_vjp_roles() {
+fn narrow_matmul_grad_graph_visualization_preserves_batched_vector_and_vjp_roles() {
     let mut graph = Graph::new();
-    let lhs = graph.input("lhs", [2, 1, 3, 4]);
-    let rhs = graph.input("rhs", [1, 5, 4, 6]);
-    let upstream = graph.input("upstream", [2, 5, 3, 6]);
+    let lhs = graph.input_dtype("lhs", [2, 1, 3, 4], DType::F16);
+    let rhs = graph.input_dtype("rhs", [1, 5, 4, 6], DType::F16);
+    let upstream = graph.input_dtype("upstream", [2, 5, 3, 6], DType::F16);
     let gradient = graph.matmul_grad(upstream, lhs, rhs, true).unwrap();
-    let cotangent = graph.input("cotangent", [2, 1, 3, 4]);
+    let cotangent = graph.input_dtype("cotangent", [2, 1, 3, 4], DType::F16);
     let vjp = graph
         .matmul_grad_vjp(cotangent, upstream, lhs, rhs, true, 2)
         .unwrap();
 
-    let vector = graph.input("vector", [4]);
-    let matrix = graph.input("matrix", [2, 4, 3]);
-    let vector_upstream = graph.input("vector_upstream", [2, 3]);
+    let vector = graph.input_dtype("vector", [4], DType::F16);
+    let matrix = graph.input_dtype("matrix", [2, 4, 3], DType::F16);
+    let vector_upstream = graph.input_dtype("vector_upstream", [2, 3], DType::F16);
     let vector_gradient = graph
         .matmul_grad(vector_upstream, vector, matrix, false)
         .unwrap();

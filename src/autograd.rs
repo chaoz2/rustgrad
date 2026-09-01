@@ -1711,7 +1711,7 @@ impl Graph {
         Ok(())
     }
 
-    fn unbroadcast(&mut self, gradient: NodeId, shape: Shape) -> Result<NodeId> {
+    pub(crate) fn unbroadcast(&mut self, gradient: NodeId, shape: Shape) -> Result<NodeId> {
         let (source, dtype) = {
             let gradient = self.node(gradient)?;
             (gradient.shape.clone(), gradient.dtype)
@@ -2427,13 +2427,10 @@ mod tests {
         let loss = graph.sum(product, 0).unwrap();
         let vector_grad = graph.grad(loss, vector).unwrap();
         let matrix_grad = graph.grad(loss, matrix).unwrap();
-        assert!(
-            graph
-                .trace(vector_grad)
-                .unwrap()
-                .to_string()
-                .contains("matmul_lhs_grad")
-        );
+        assert!((0..graph.node_count()).map(NodeId).all(|node| !matches!(
+            graph.op(node).unwrap(),
+            Op::MatmulGrad { .. } | Op::MatmulGradVjp { .. }
+        )));
         let inputs = HashMap::from([
             (
                 "vector".into(),
@@ -2452,6 +2449,241 @@ mod tests {
             CpuBackend.execute(&graph, matrix_grad, &inputs).unwrap(),
             TensorData::new([3, 2], vec![1., 1., 2., 2., 3., 3.]).unwrap()
         );
+    }
+
+    #[test]
+    fn generalized_matmul_vjp_handles_broadcast_batches_and_duplicate_roles() {
+        let mut vectors = Graph::new();
+        let left = vectors.input("left", [3]);
+        let right = vectors.input("right", [3]);
+        let dot = vectors.matmul(left, right).unwrap();
+        let gradients = vectors.gradient_default(dot, &[left, right]).unwrap();
+        let bindings = HashMap::from([
+            ("left".into(), data([3], &[2., 3., 5.])),
+            ("right".into(), data([3], &[7., 11., 13.])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&vectors, gradients[0], &bindings)
+                .unwrap(),
+            data([3], &[7., 11., 13.])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&vectors, gradients[1], &bindings)
+                .unwrap(),
+            data([3], &[2., 3., 5.])
+        );
+
+        let mut matrix_vector = Graph::new();
+        let matrix = matrix_vector.input("matrix", [2, 3]);
+        let vector = matrix_vector.input("vector", [3]);
+        let product = matrix_vector.matmul(matrix, vector).unwrap();
+        let loss = matrix_vector.sum_all(product).unwrap();
+        let gradients = matrix_vector
+            .gradient_default(loss, &[matrix, vector])
+            .unwrap();
+        let bindings = HashMap::from([
+            ("matrix".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            ("vector".into(), data([3], &[7., 11., 13.])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&matrix_vector, gradients[0], &bindings)
+                .unwrap(),
+            data([2, 3], &[7., 11., 13., 7., 11., 13.])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&matrix_vector, gradients[1], &bindings)
+                .unwrap(),
+            data([3], &[5., 7., 9.])
+        );
+
+        let mut graph = Graph::new();
+        let lhs = graph.input("lhs", [2, 1, 2, 3]);
+        let rhs = graph.input("rhs", [1, 2, 3, 2]);
+        let product = graph.matmul(lhs, rhs).unwrap();
+        let loss = graph.sum_all(product).unwrap();
+        let gradients = graph.gradient_default(loss, &[lhs, rhs]).unwrap();
+        assert_eq!(
+            graph.shape(gradients[0]).unwrap(),
+            &Shape::from([2, 1, 2, 3])
+        );
+        assert_eq!(
+            graph.shape(gradients[1]).unwrap(),
+            &Shape::from([1, 2, 3, 2])
+        );
+        assert!((0..graph.node_count()).map(NodeId).all(|node| !matches!(
+            graph.op(node).unwrap(),
+            Op::MatmulGrad { .. } | Op::MatmulGradVjp { .. }
+        )));
+
+        let bindings = HashMap::from([
+            (
+                "lhs".into(),
+                data(
+                    [2, 1, 2, 3],
+                    &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+                ),
+            ),
+            (
+                "rhs".into(),
+                data(
+                    [1, 2, 3, 2],
+                    &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+                ),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradients[0], &bindings).unwrap(),
+            data(
+                [2, 1, 2, 3],
+                &[18., 26., 34., 18., 26., 34., 18., 26., 34., 18., 26., 34.],
+            )
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradients[1], &bindings).unwrap(),
+            data(
+                [1, 2, 3, 2],
+                &[22., 22., 26., 26., 30., 30., 22., 22., 26., 26., 30., 30.],
+            )
+        );
+
+        let mut shared = Graph::new();
+        let x = shared.input("x", [2, 2]);
+        let square = shared.matmul(x, x).unwrap();
+        let loss = shared.sum_all(square).unwrap();
+        let gradient = shared.gradient_default(loss, &[x, x]).unwrap();
+        assert_eq!(gradient[0], gradient[1], "duplicate targets must alias");
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &shared,
+                    gradient[0],
+                    &HashMap::from([("x".into(), data([2, 2], &[1., 2., 3., 4.]))]),
+                )
+                .unwrap(),
+            data([2, 2], &[7., 11., 9., 13.])
+        );
+    }
+
+    #[test]
+    fn generalized_matmul_vjp_is_target_sliced_higher_order_and_zero_safe() {
+        let mut graph = Graph::new();
+        let vector = graph.input_dtype("vector", [3], DType::F64);
+        let matrix = graph.input_dtype("matrix", [3, 2], DType::F64);
+        let product = graph.matmul(vector, matrix).unwrap();
+        let loss = graph.sum_all(product).unwrap();
+        let before = graph.node_count();
+        let vector_gradient = graph.gradient_default(loss, &[vector]).unwrap()[0];
+        assert_eq!(
+            (before..graph.node_count())
+                .map(NodeId)
+                .filter(|node| matches!(
+                    graph.op(*node).unwrap(),
+                    Op::Binary {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "only the requested local Matmul edge is constructed"
+        );
+        let first_sum = graph.sum_all(vector_gradient).unwrap();
+        let second = graph.grad(first_sum, matrix).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    second,
+                    &HashMap::from([
+                        ("vector".into(), data_f64([3], &[2., 3., 5.])),
+                        ("matrix".into(), data_f64([3, 2], &[1., 2., 3., 4., 5., 6.]),),
+                    ]),
+                )
+                .unwrap(),
+            data_f64([3, 2], &[1., 1., 1., 1., 1., 1.])
+        );
+
+        let mut zero = Graph::new();
+        let lhs = zero.input("lhs", [2, 0]);
+        let rhs = zero.input("rhs", [0, 3]);
+        let output = zero.matmul(lhs, rhs).unwrap();
+        let loss = zero.sum_all(output).unwrap();
+        let gradients = zero.gradient_default(loss, &[lhs, rhs]).unwrap();
+        let bindings = HashMap::from([
+            ("lhs".into(), data([2, 0], &[])),
+            ("rhs".into(), data([0, 3], &[])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&zero, gradients[0], &bindings).unwrap(),
+            data([2, 0], &[])
+        );
+        assert_eq!(
+            CpuBackend.execute(&zero, gradients[1], &bindings).unwrap(),
+            data([0, 3], &[])
+        );
+    }
+
+    #[test]
+    fn generalized_matmul_vjp_preflights_atomically_and_preserves_narrow_fallback() {
+        let mut malformed = Graph::new();
+        let lhs = malformed.input("lhs", [2, 3]);
+        let rhs = malformed.input("rhs", [3, 4]);
+        let upstream = malformed.input("upstream", [2, 3]);
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.matmul_grad(upstream, lhs, rhs, true),
+            Err(Error::ShapeMismatch {
+                op: "matmul gradient",
+                ..
+            })
+        ));
+        assert_eq!(malformed.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let lhs = overflow.input_dtype("lhs", [usize::MAX, 1], DType::F64);
+        let rhs = overflow.input_dtype("rhs", [1, 2], DType::F64);
+        let upstream = overflow.input_dtype("upstream", [usize::MAX, 2], DType::F64);
+        let before = overflow.node_count();
+        assert!(matches!(
+            overflow.matmul_grad(upstream, lhs, rhs, true),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), before);
+
+        let mut narrow = Graph::new();
+        let lhs = narrow.input_dtype("lhs", [2, 2], DType::F16);
+        let rhs = narrow.input_dtype("rhs", [2, 2], DType::F16);
+        let upstream = narrow.input_dtype("upstream", [2, 2], DType::F16);
+        let gradient = narrow.matmul_grad(upstream, lhs, rhs, true).unwrap();
+        assert!(matches!(
+            narrow.op(gradient).unwrap(),
+            Op::MatmulGrad { .. }
+        ));
+
+        let mut mixed = Graph::new();
+        let lhs = mixed.input_dtype("lhs", [2, 2], DType::F32);
+        let rhs = mixed.input_dtype("rhs", [2, 2], DType::F64);
+        let upstream = mixed.input_dtype("upstream", [2, 2], DType::F64);
+        let lhs_gradient = mixed.matmul_grad(upstream, lhs, rhs, true).unwrap();
+        let rhs_gradient = mixed.matmul_grad(upstream, lhs, rhs, false).unwrap();
+        assert!(matches!(
+            mixed.op(lhs_gradient).unwrap(),
+            Op::MatmulGrad {
+                lhs_gradient: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mixed.op(rhs_gradient).unwrap(),
+            Op::MatmulGrad {
+                lhs_gradient: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2746,36 +2978,62 @@ mod tests {
         let lhs = graph.input("lhs", [2, 3]);
         let rhs = graph.input("rhs", [3, 2]);
         let product = graph.matmul(lhs, rhs).unwrap();
-        let product_loss = graph.sum_all(product).unwrap();
+        let cotangent = graph.input("cotangent", [2, 2]);
         let before = graph.node_count();
-        let lhs_gradient = graph.grad(product_loss, lhs).unwrap();
-        // The ordinary homogeneous rank-two case decomposes the local VJP
-        // into existing Matmul/Permute primitives. Inspect its actual value
-        // edges: the requested lhs derivative depends on the cotangent and
-        // transposed rhs, never on the original lhs or an eagerly built rhs
-        // derivative branch.
-        let Op::Matmul {
-            lhs: upstream,
-            rhs: transposed_rhs,
-        } = graph.op(lhs_gradient).unwrap()
+        let lhs_gradient = graph
+            .grad_with(product, lhs, Some(cotangent), true)
+            .unwrap();
+        // The requested lhs role is one reshape/transpose/Mul/typed-Sum
+        // composition. It consumes the exact cotangent and rhs, but never the
+        // differentiated lhs that only the unrequested rhs role would need.
+        let Op::Reshape { input: reduced, .. } = graph.op(lhs_gradient).unwrap() else {
+            panic!("the lhs gradient must restore the original lhs descriptor")
+        };
+        let Op::Reduce {
+            input: local_product,
+            kind: crate::ReduceKind::Sum,
+            axes,
+            keepdim: true,
+            accumulator: DType::F32,
+        } = graph.op(*reduced).unwrap()
         else {
-            unreachable!()
+            panic!("the broadcast batch axis must use one typed Sum")
         };
-        let Op::Permute { input, axes } = graph.op(*transposed_rhs).unwrap() else {
-            unreachable!()
-        };
-        assert_eq!(*input, rhs);
-        assert_eq!(axes.as_slice(), &[1, 0]);
-        assert_eq!(
-            graph.op(lhs_gradient).unwrap().backward_inputs(),
-            vec![*upstream, *transposed_rhs],
-            "the original differentiated lhs is not a second-order value edge"
+        assert_eq!(axes, &[1]);
+        assert!(matches!(
+            graph.op(*local_product).unwrap(),
+            Op::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+        assert_eq!(graph.dtype(*reduced).unwrap(), DType::F32);
+        assert!(
+            graph
+                .backward_slice_contains(lhs_gradient, cotangent)
+                .unwrap()
         );
         assert!(!graph.backward_slice_contains(lhs_gradient, lhs).unwrap());
         assert!(graph.backward_slice_contains(lhs_gradient, rhs).unwrap());
-        assert!((before..graph.node_count()).map(NodeId).all(|node| {
-            !matches!(graph.op(node).unwrap(), Op::Permute { input, .. } if *input == lhs)
-        }));
+        assert_eq!(
+            (before..graph.node_count())
+                .map(NodeId)
+                .filter(|node| matches!(
+                    graph.op(*node).unwrap(),
+                    Op::Binary {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the unrequested rhs-gradient role must not be built"
+        );
+        assert!(
+            (before..graph.node_count())
+                .map(NodeId)
+                .all(|node| !graph.backward_slice_contains(node, lhs).unwrap())
+        );
 
         let repeated = graph.select(condition, x, x).unwrap();
         let repeated_loss = graph.sum_all(repeated).unwrap();
@@ -4217,7 +4475,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_dot_hessian_vector_product_uses_generalized_matmul_vjp() {
+    fn vector_dot_hessian_vector_product_uses_compositional_matmul_vjp() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);
         let y = graph.input("y", [2]);
@@ -4239,11 +4497,11 @@ mod tests {
             data([2], &[4., 2.])
         );
         assert!(
-            graph
+            !graph
                 .trace(hvp)
                 .unwrap()
                 .to_string()
-                .contains("matmul_grad_vjp")
+                .contains("matmul_grad")
         );
     }
 

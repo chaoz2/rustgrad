@@ -5503,29 +5503,51 @@ impl Graph {
         let target = if lhs_gradient { lhs } else { rhs };
         let shape = self.node(target)?.shape.clone();
         let dtype = self.node(target)?.dtype;
-        // The ordinary rank-two floating case has an exact composition in the
-        // executable Graph vocabulary. Keep generalized vector/batched and
-        // mixed-dtype coordinate maps on the dedicated MatmulGrad operation,
-        // but let static compiled training capture the common matrix gradient
-        // without inventing a second interpreter-only boundary.
-        if lhs_shape.rank() == 2
-            && rhs_shape.rank() == 2
-            && self.node(upstream)?.dtype == dtype
+        // Homogeneous F32/F64 raw Matmul has the same reshape/transpose,
+        // product, and contraction geometry as the source Dot composition.
+        // Build the requested local edge from those already scheduleable
+        // primitives, then apply reverse mode's one canonical typed
+        // unbroadcast projection. Narrow and mixed storage retain the
+        // dedicated coordinate-map operation because changing their
+        // recurrence/rounding boundary is not an equivalent lowering.
+        if self.node(upstream)?.dtype == dtype
             && self.node(lhs)?.dtype == dtype
             && self.node(rhs)?.dtype == dtype
-            && dtype.is_float()
+            && matches!(dtype, DType::F32 | DType::F64)
         {
             let mut candidate = self.clone();
+            let plan = source_dot_plan(&candidate, lhs, rhs, None)?;
+            if plan.output_shape != output
+                || plan.operand_dtype != dtype
+                || plan.sum_dtypes != ReductionDType::new(dtype, dtype)
+            {
+                return Err(Error::InvalidElementwiseDType {
+                    op: "raw matmul gradient composition",
+                    actual: dtype,
+                });
+            }
+            let mut expanded_upstream_shape = plan.output_shape.dims().to_vec();
+            expanded_upstream_shape.push(1);
+            let expanded_upstream =
+                candidate.reshape(upstream, Shape::new(expanded_upstream_shape))?;
+            let expanded_upstream =
+                candidate.expand(expanded_upstream, plan.product_shape.clone())?;
             let gradient = if lhs_gradient {
-                let transposed = candidate.permute(rhs, [1, 0])?;
-                candidate.matmul(upstream, transposed)?
+                let aligned_rhs = candidate.reshape(rhs, plan.rhs_reshape.clone())?;
+                let aligned_rhs = candidate.transpose(aligned_rhs, -1, plan.rhs_axis)?;
+                let local = candidate.mul(expanded_upstream, aligned_rhs)?;
+                let local = candidate.unbroadcast(local, plan.lhs_shape)?;
+                candidate.reshape(local, lhs_shape.clone())?
             } else {
-                let transposed = candidate.permute(lhs, [1, 0])?;
-                candidate.matmul(transposed, upstream)?
+                let aligned_lhs = candidate.reshape(lhs, plan.lhs_shape)?;
+                let local = candidate.mul(expanded_upstream, aligned_lhs)?;
+                let local = candidate.unbroadcast(local, plan.rhs_shape)?;
+                let local = candidate.transpose(local, -1, plan.rhs_axis)?;
+                candidate.reshape(local, rhs_shape.clone())?
             };
             if candidate.shape(gradient)? != &shape || candidate.dtype(gradient)? != dtype {
                 return Err(Error::ShapeMismatch {
-                    op: "rank-two matmul gradient",
+                    op: "raw matmul gradient composition",
                     lhs: candidate.shape(gradient)?.clone(),
                     rhs: shape,
                 });

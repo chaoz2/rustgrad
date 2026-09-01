@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:0d99f8c6cfa6032d",
+  "source_fingerprint": "fnv1a64:00d057d070d39fdd",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -396,7 +396,7 @@
       "subject": "Matmul/conv/attention gradients",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Generalized `MatmulGradVjp`, normalized-plan `EinsumGradVjp`, `Conv2dGradVjp`, and `ConvTranspose2dGradVjp` provide inspectable second-order VJPs for their corresponding value contractions. Convolution VJPs reuse grouped stride/dilation/padding coordinate maps; transpose convolution includes output padding and 1D inherits the singleton-height lowering. Pooling is compositional: average pooling differentiates normally and max pooling inherits the explicit tie/NaN `ReduceGradVjp` contract. Compositional attention paths backpropagate through query/key/value and are covered by finite fixtures."
+        "Acceptance requirement": "Homogeneous F32/F64 raw Matmul vector, matrix, and right-broadcast batch VJPs reuse the checked `SourceDotPlan` geometry and lower only each requested operand role through reshape/transpose/expand/Mul plus typed unbroadcast. These derivatives are ordinary scheduleable graphs with memory-plan, capture, interpreter, and strict-native coverage; duplicate operands accumulate both roles, zero geometry is retained, and higher order composes through the same primitives. No operation, UOp, artifact tag, or cache version changes. Narrow and mixed raw Matmul deliberately retain the dedicated `MatmulGrad`/`MatmulGradVjp` coordinate-map fallback so their storage-width recurrence is unchanged. Normalized-plan `EinsumGradVjp`, `Conv2dGradVjp`, and `ConvTranspose2dGradVjp` provide inspectable second-order VJPs for their corresponding value contractions. Convolution VJPs reuse grouped stride/dilation/padding coordinate maps; transpose convolution includes output padding and 1D inherits the singleton-height lowering. Pooling is compositional: average pooling differentiates normally and max pooling inherits the explicit tie/NaN `ReduceGradVjp` contract. Compositional attention paths backpropagate through query/key/value, and grouped-query attention gradients now validate as a boundary-free owned schedule in addition to finite fixtures."
       }
     },
     {

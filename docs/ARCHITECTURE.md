@@ -1728,13 +1728,18 @@ preflight/staged-cache semantics before appending the user/assistant pair.
 `examples/llama_chat.rs` is the bounded public two-turn local-GGUF entrypoint;
 it adds no second model, tokenizer, cache, or generation runtime.
 
-Generalized contractions retain their normalized index descriptions in the
-graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the
-first reverse node, while `EinsumGradVjp` retains the original `EinsumPlan`.
-Both are inspectable trace operations and accumulate broadcast/diagonal
-coordinates exactly; they avoid eager host-side derivative tensors. They are
-second-order closures, not a claim of arbitrary-order indexed contraction:
-their VJPs remain a deliberate future primitive.
+Generalized contractions retain their normalized geometry in the graph.
+Homogeneous F32/F64 raw Matmul reverse edges reuse `SourceDotPlan`: vector,
+matrix, and right-broadcast batch adjoints are expressed as checked
+reshape/transpose/expand/Mul/typed-unbroadcast compositions, so ordinary
+static scheduling, capture, memory planning, and native lowering own the
+complete derivative. Only the requested operand role is constructed, and a
+private clone commits atomically after the final descriptor check. Narrow and
+mixed raw Matmul retain the dedicated `MatmulGrad`/`MatmulGradVjp` coordinate
+map because replacing their storage-width recurrence would change rounding.
+`EinsumGradVjp` likewise retains the original `EinsumPlan`. Those dedicated
+maps are inspectable second-order closures, not a claim of arbitrary-order
+indexed contraction; their VJPs remain a deliberate future primitive.
 
 `ReduceGradVjp` similarly retains normalized axes and `keepdim`. Its product
 rule uses the same zero-count branch contract as the first reverse node; max
