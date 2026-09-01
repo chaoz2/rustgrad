@@ -9,6 +9,7 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct LogicalBufferDesc {
     pub bytes: usize,
+    pub physical_bytes: usize,
     pub dtype: Option<DType>,
 }
 
@@ -18,15 +19,18 @@ pub(super) struct PhysicalBuffer {
 }
 
 impl PhysicalBuffer {
-    pub fn allocate(context: Rc<ContextInner>, bytes: usize) -> Result<Rc<Self>, OpenClError> {
+    pub fn allocate(
+        context: Rc<ContextInner>,
+        physical_bytes: usize,
+    ) -> Result<Rc<Self>, OpenClError> {
         context.live()?;
-        let raw = if bytes == 0 {
+        let raw = if physical_bytes == 0 {
             None
         } else {
             Some(
                 context
                     .dispatch
-                    .buffer_create(context.raw, bytes, context.owner)?,
+                    .buffer_create(context.raw, physical_bytes, context.owner)?,
             )
         };
         Ok(Rc::new(Self { context, raw }))
@@ -103,11 +107,29 @@ impl OpenClBuffer {
         bytes: usize,
         dtype: Option<DType>,
     ) -> Result<Self, OpenClError> {
-        let physical = PhysicalBuffer::allocate(context.clone(), bytes)?;
+        Self::allocate_with_handle(context, bytes, dtype, false)
+    }
+
+    pub(super) fn allocate_with_handle(
+        context: Rc<ContextInner>,
+        bytes: usize,
+        dtype: Option<DType>,
+        requires_native_handle: bool,
+    ) -> Result<Self, OpenClError> {
+        let physical_bytes = if bytes == 0 && requires_native_handle {
+            4
+        } else {
+            bytes
+        };
+        let physical = PhysicalBuffer::allocate(context.clone(), physical_bytes)?;
         Ok(Self {
             inner: Rc::new(LogicalBuffer {
                 context,
-                desc: LogicalBufferDesc { bytes, dtype },
+                desc: LogicalBufferDesc {
+                    bytes,
+                    physical_bytes,
+                    dtype,
+                },
                 visible: RefCell::new(VisibleGeneration {
                     generation: 1,
                     physical,
@@ -167,7 +189,7 @@ impl OpenClBuffer {
     }
 
     pub(super) fn candidate(&self) -> Result<Rc<PhysicalBuffer>, OpenClError> {
-        PhysicalBuffer::allocate(self.inner.context.clone(), self.inner.desc.bytes)
+        PhysicalBuffer::allocate(self.inner.context.clone(), self.inner.desc.physical_bytes)
     }
 
     pub(super) fn commit_candidate(

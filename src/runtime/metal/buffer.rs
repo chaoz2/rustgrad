@@ -9,6 +9,7 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BufferDesc {
     bytes: usize,
+    physical_bytes: usize,
     dtype: Option<DType>,
 }
 
@@ -77,19 +78,33 @@ impl MetalBuffer {
         bytes: usize,
         dtype: Option<DType>,
     ) -> Result<Self, MetalError> {
+        Self::allocate_with_handle(device, bytes, dtype, false)
+    }
+
+    pub(super) fn allocate_with_handle(
+        device: Rc<DeviceInner>,
+        bytes: usize,
+        dtype: Option<DType>,
+        requires_native_handle: bool,
+    ) -> Result<Self, MetalError> {
         device.live()?;
-        if bytes > device.info.capabilities.max_buffer_length {
+        let physical_bytes = if bytes == 0 && requires_native_handle {
+            4
+        } else {
+            bytes
+        };
+        if physical_bytes > device.info.capabilities.max_buffer_length {
             return Err(MetalError::InvalidArgument(
                 "buffer exceeds device maximum length",
             ));
         }
-        let raw = if bytes == 0 {
+        let raw = if physical_bytes == 0 {
             None
         } else {
             Some(
                 device
                     .dispatch
-                    .buffer_create(device.raw, bytes, device.owner)?,
+                    .buffer_create(device.raw, physical_bytes, device.owner)?,
             )
         };
         let physical = Rc::new(PhysicalBuffer {
@@ -103,7 +118,11 @@ impl MetalBuffer {
                     physical,
                     generation: 1,
                 }),
-                desc: BufferDesc { bytes, dtype },
+                desc: BufferDesc {
+                    bytes,
+                    physical_bytes,
+                    dtype,
+                },
                 closed: Cell::new(false),
             }),
         })
@@ -114,7 +133,8 @@ impl MetalBuffer {
         self.inner.desc.bytes
     }
 
-    /// Reports whether the logical buffer has zero bytes and no native object.
+    /// Reports whether the logical buffer has zero addressable bytes. A private
+    /// ABI sentinel may still own a native object.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -168,12 +188,12 @@ impl MetalBuffer {
 
     pub(super) fn candidate(&self) -> Result<Rc<PhysicalBuffer>, MetalError> {
         self.inner.device.live()?;
-        let raw = if self.is_empty() {
+        let raw = if self.inner.desc.physical_bytes == 0 {
             None
         } else {
             Some(self.inner.device.dispatch.buffer_create(
                 self.inner.device.raw,
-                self.len(),
+                self.inner.desc.physical_bytes,
                 self.inner.device.owner,
             )?)
         };

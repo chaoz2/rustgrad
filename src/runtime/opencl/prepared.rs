@@ -3,12 +3,12 @@ use super::{
     OpenClBuffer, OpenClCache, OpenClContext, OpenClError, OpenClKernel, OpenClQueue,
     OpenClRenderer,
 };
-use crate::{DType, ScheduleItem, TensorData};
+use crate::{ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
 use crate::runtime::static_schedule::{
-    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticPlanAdapter, StaticRendered,
-    StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
+    PreparedStaticSchedule, Sealed, StaticBufferAllocation, StaticDeviceAdapter, StaticPlanAdapter,
+    StaticRendered, StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
 };
 
 struct OpenClStaticAdapter {
@@ -88,8 +88,8 @@ impl StaticDeviceAdapter for OpenClStaticAdapter {
     fn compiled_cache_key(&self, kernel: &Self::Kernel) -> String {
         kernel.cache_key().to_owned()
     }
-    fn allocate(&self, elements: usize, dtype: DType) -> Result<Self::Buffer, Self::Error> {
-        self.context.allocate_typed(elements, dtype)
+    fn allocate(&self, request: StaticBufferAllocation) -> Result<Self::Buffer, Self::Error> {
+        self.context.allocate_static(request)
     }
     fn create_queue(&self) -> Result<Self::Queue, Self::Error> {
         self.context.create_queue()

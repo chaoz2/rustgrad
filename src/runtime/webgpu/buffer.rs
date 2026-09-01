@@ -82,8 +82,21 @@ impl WebGpuBuffer {
         logical_bytes: usize,
         dtype: Option<DType>,
     ) -> Result<Self, WebGpuError> {
+        Self::allocate_with_handle(device, logical_bytes, dtype, false)
+    }
+
+    pub(super) fn allocate_with_handle(
+        device: Rc<DeviceInner>,
+        logical_bytes: usize,
+        dtype: Option<DType>,
+        requires_native_handle: bool,
+    ) -> Result<Self, WebGpuError> {
         device.live()?;
-        let physical_bytes = logical_bytes.checked_add(3).ok_or(WebGpuError::Overflow)? / 4 * 4;
+        let physical_bytes = if logical_bytes == 0 && requires_native_handle {
+            4
+        } else {
+            logical_bytes.checked_add(3).ok_or(WebGpuError::Overflow)? / 4 * 4
+        };
         if physical_bytes > device.info.capabilities.max_buffer_size {
             return Err(WebGpuError::InvalidArgument(
                 "buffer exceeds adapter maximum size",

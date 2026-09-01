@@ -275,6 +275,28 @@ impl WebGpuDevice {
         WebGpuBuffer::allocate(self.inner.clone(), bytes, Some(dtype))
     }
 
+    pub(crate) fn allocate_static(
+        &self,
+        request: crate::runtime::static_schedule::StaticBufferAllocation,
+    ) -> Result<WebGpuBuffer, WebGpuError> {
+        if request.bytes
+            != request
+                .elements
+                .checked_mul(request.dtype.itemsize())
+                .ok_or(WebGpuError::Overflow)?
+        {
+            return Err(WebGpuError::InvalidBinding(
+                "static allocation descriptor mismatch".into(),
+            ));
+        }
+        WebGpuBuffer::allocate_with_handle(
+            self.inner.clone(),
+            request.bytes,
+            Some(request.dtype),
+            request.requires_native_handle,
+        )
+    }
+
     /// Compiles one validated immutable WGSL artifact.
     pub fn compile(&self, rendered: &RenderedWgsl) -> Result<WebGpuShader, WebGpuError> {
         self.inner.live()?;

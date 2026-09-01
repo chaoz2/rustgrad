@@ -183,6 +183,28 @@ impl OpenClContext {
         OpenClBuffer::allocate(self.inner.clone(), bytes, Some(dtype))
     }
 
+    pub(crate) fn allocate_static(
+        &self,
+        request: crate::runtime::static_schedule::StaticBufferAllocation,
+    ) -> Result<OpenClBuffer, OpenClError> {
+        if request.bytes
+            != request
+                .elements
+                .checked_mul(request.dtype.itemsize())
+                .ok_or(OpenClError::Overflow)?
+        {
+            return Err(OpenClError::InvalidBinding(
+                "static allocation descriptor mismatch".into(),
+            ));
+        }
+        OpenClBuffer::allocate_with_handle(
+            self.inner.clone(),
+            request.bytes,
+            Some(request.dtype),
+            request.requires_native_handle,
+        )
+    }
+
     pub fn cache(&self) -> OpenClCache {
         OpenClCache {
             context: self.clone(),

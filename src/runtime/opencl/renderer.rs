@@ -25,6 +25,8 @@ use std::{
 pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v8";
 pub const OPENCL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-opencl-raw-copy-v1";
 pub const OPENCL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-opencl-static-position-v1";
+pub const OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
+    "rustgrad-opencl-portable-f32-matmul-v1";
 pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -57,6 +59,14 @@ impl RenderedOpenCl {
         &self,
         bindings: &[ScheduleInputBinding],
     ) -> Result<(), OpenClError> {
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Matmul(value) = root.operation()
+        {
+            crate::matmul::PortableF32Matmul::new(value)
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+        }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(OpenClError::InvalidBinding(
                 "schedule/OpenCL input count mismatch".into(),
@@ -123,6 +133,9 @@ impl OpenClRenderer {
     }
 
     pub fn render(&self, root: &UOp) -> Result<RenderedOpenCl, OpenClError> {
+        if let Operation::Matmul(value) = root.operation() {
+            return render_portable_f32_matmul(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -477,6 +490,156 @@ impl OpenClRenderer {
             ))),
         })
     }
+}
+
+fn render_portable_f32_matmul(
+    renderer: &OpenClRenderer,
+    root: &UOp,
+    value: &crate::MatmulValue,
+) -> Result<RenderedOpenCl, OpenClError> {
+    root.validate()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let portable = crate::matmul::PortableF32Matmul::new(value).map_err(|error| match error {
+        crate::matmul::PortableF32MatmulError::Unsupported(reason) => {
+            OpenClError::Unsupported(reason.into())
+        }
+        crate::matmul::PortableF32MatmulError::Overflow => OpenClError::Overflow,
+        other => OpenClError::InvalidBinding(other.to_string()),
+    })?;
+    let plan = portable.plan();
+    let mut buffers = Vec::with_capacity(3);
+    let mut schedule_inputs = Vec::with_capacity(2);
+    for input in portable.inputs() {
+        let elements = input.shape.numel().map_err(|_| OpenClError::Overflow)?;
+        let abi = OpenClBufferAbi {
+            id: input.node.index() as u64,
+            dtype: DType::F32,
+            source_shape: input.shape.clone(),
+            elements,
+            mutable: false,
+            view: None,
+        };
+        schedule_inputs.push(abi.clone());
+        buffers.push(abi);
+    }
+    let output = OpenClBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: DType::F32,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.extent(),
+        mutable: true,
+        view: None,
+    };
+    buffers.push(output);
+    let positions = buffers
+        .iter()
+        .enumerate()
+        .map(|(position, abi)| (abi.id, position))
+        .collect::<BTreeMap<_, _>>();
+    let lhs_position = positions[&(plan.lhs.index() as u64)];
+    let rhs_position = positions[&(plan.rhs.index() as u64)];
+    let output_position = buffers.len() - 1;
+    let entry = format!("rg_opencl_matmul_f32_{}", plan.cache_key);
+    let mut lines = vec![
+        format!("// {OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
+        "#pragma OPENCL FP_CONTRACT OFF".into(),
+        format!("__kernel void {entry}("),
+    ];
+    for (position, _) in buffers[..output_position].iter().enumerate() {
+        lines.push(format!("    __global const float* b{position},"));
+    }
+    lines.extend([
+        format!("    __global float* b{output_position},"),
+        "    ulong extent) {".into(),
+        "  const ulong gid = (ulong)get_global_id(0);".into(),
+        "  if (gid >= extent) return;".into(),
+        "  ulong rg_q = gid;".into(),
+        "  ulong rg_col = 0ul;".into(),
+        "  ulong rg_row = 0ul;".into(),
+    ]);
+    if !plan.rhs_vector && plan.n != 0 {
+        lines.push(format!(
+            "  rg_col = rg_q % (ulong){}ul; rg_q /= (ulong){}ul;",
+            plan.n, plan.n
+        ));
+    }
+    if !plan.lhs_vector && plan.m != 0 {
+        lines.push(format!(
+            "  rg_row = rg_q % (ulong){}ul; rg_q /= (ulong){}ul;",
+            plan.m, plan.m
+        ));
+    }
+    lines.push("  const ulong rg_batch = rg_q;".into());
+    for (name, axes) in [
+        ("rg_lbatch", portable.lhs_batch_axes()),
+        ("rg_rbatch", portable.rhs_batch_axes()),
+    ] {
+        lines.push(format!("  ulong {name} = 0ul;"));
+        if portable.extent() != 0 {
+            for axis in axes {
+                lines.push(format!(
+                    "  {name} += ((rg_batch / (ulong){}ul) % (ulong){}ul) * (ulong){}ul;",
+                    axis.divisor, axis.dimension, axis.input_stride
+                ));
+            }
+        }
+    }
+    lines.extend([
+        "  float rg_acc = 0.0f;".into(),
+        format!(
+            "  for (ulong rg_k = 0ul; rg_k < (ulong){}ul; ++rg_k) {{",
+            plan.k
+        ),
+    ]);
+    let lhs_offset = if plan.lhs_vector {
+        "rg_k".into()
+    } else {
+        format!(
+            "((rg_lbatch * (ulong){}ul + rg_row) * (ulong){}ul + rg_k)",
+            plan.m, plan.k
+        )
+    };
+    let rhs_offset = if plan.rhs_vector {
+        "rg_k".into()
+    } else {
+        format!(
+            "((rg_rbatch * (ulong){}ul + rg_k) * (ulong){}ul + rg_col)",
+            plan.k, plan.n
+        )
+    };
+    lines.extend([
+        format!(
+            "    const float rg_product = b{lhs_position}[{lhs_offset}] * b{rhs_position}[{rhs_offset}];"
+        ),
+        "    rg_acc = rg_acc + rg_product;".into(),
+        "  }".into(),
+        format!("  b{output_position}[gid] = rg_acc;"),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
+        OPENCL_ABI_VERSION,
+        renderer.local_size,
+        renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedOpenCl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.extent(),
+        entry,
+        cache_key,
+        required_capabilities: OpenClCapabilities::CORE_32,
+        transaction: None,
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
 }
 
 fn render_raw_copy(

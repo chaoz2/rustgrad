@@ -425,6 +425,21 @@ checks, and signed-wrap spelling. Guarded integer renderers reuse the same
 projection for pure subexpressions while retaining backend-local lazy branch
 and first-fault status ordering. This avoids a second renderer operation taxonomy without
 changing artifact or storage ABIs.
+
+Dense homogeneous F32 matmul is a separate operation-scoped projection rather
+than three renderer-local semantic trees. `PortableF32Matmul` authenticates a
+Serial or selected Tiled payload, proves the deduplicated dense pointer ABI and
+right-aligned broadcast address terms, and exposes only immutable geometry for
+OpenCL C, MSL, and WGSL syntax emission. Each output lane performs a serial K
+walk with an F32 product followed by an F32 running-sum update. A nonempty K=0
+launch retains its logical zero-byte operands while the shared prepared-static
+allocator supplies private four-byte native handles; the kernel performs no
+read and writes positive zero. Whole-output zero domains still submit no
+launch. TensorCore, Quantized, and affine-view forms plus unspecialized symbolic
+capture/device replay fail closed.
+Renderer-specific source/cache versions distinguish the new compiled kernels;
+RGUA, schedule, capture, and artifact encodings are unchanged. PTX retains its
+existing independent serial/tiled/tensor-core lowering and correction boundary.
 B1/B2 CPU JIT consumes eligible VectorProgram instructions directly in physical-register order.
 Enabled vector mains must be lane-aligned, permit at most one partial tail, and
 derive one deterministic program tail mask; disabled plans retain zero vector

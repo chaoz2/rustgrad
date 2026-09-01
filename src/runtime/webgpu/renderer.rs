@@ -22,6 +22,7 @@ use std::{
 pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v7";
 pub const WGSL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-wgsl-raw-copy-v1";
 pub const WGSL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-wgsl-static-position-v1";
+pub const WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-f32-matmul-v1";
 /// Ordered storage-plus-extent bind-group ABI version.
 pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
@@ -52,7 +53,9 @@ impl WgslBufferAbi {
             .ok_or(WebGpuError::Overflow)
     }
 
-    /// Native storage size after WebGPU's required four-byte rounding.
+    /// Public ABI storage size after WebGPU's required four-byte rounding.
+    /// Prepared prefixes may privately back a logical zero with one word when
+    /// a nonempty launch still requires a native binding.
     pub fn physical_bytes(&self) -> Result<usize, WebGpuError> {
         let logical = self.logical_bytes()?;
         Ok(logical.checked_add(3).ok_or(WebGpuError::Overflow)? / 4 * 4)
@@ -90,6 +93,14 @@ impl RenderedWgsl {
         &self,
         bindings: &[ScheduleInputBinding],
     ) -> Result<(), WebGpuError> {
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Matmul(value) = root.operation()
+        {
+            crate::matmul::PortableF32Matmul::new(value)
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(WebGpuError::InvalidBinding(
                 "schedule/WebGPU input count mismatch".into(),
@@ -114,6 +125,25 @@ impl RenderedWgsl {
     }
 
     pub(super) fn validate_artifact(&self) -> Result<(), WebGpuError> {
+        let portable_matmul = match self.semantic_program.as_ref() {
+            super::dispatch::KernelSemanticProgram::UOp(root)
+                if matches!(root.operation(), Operation::Matmul(_)) =>
+            {
+                let Operation::Matmul(value) = root.operation() else {
+                    unreachable!("guarded above")
+                };
+                Some(
+                    crate::matmul::PortableF32Matmul::new(value).map_err(|error| match error {
+                        crate::matmul::PortableF32MatmulError::Unsupported(reason) => {
+                            WebGpuError::Unsupported(reason.into())
+                        }
+                        crate::matmul::PortableF32MatmulError::Overflow => WebGpuError::Overflow,
+                        other => WebGpuError::InvalidBinding(other.to_string()),
+                    })?,
+                )
+            }
+            _ => None,
+        };
         let raw_movement = match self.semantic_program.as_ref() {
             super::dispatch::KernelSemanticProgram::UOp(root)
                 if matches!(root.operation(), Operation::Movement(_)) =>
@@ -172,9 +202,15 @@ impl RenderedWgsl {
                 .source_shape
                 .numel()
                 .map_err(|_| WebGpuError::Overflow)?;
+            let physical_bytes =
+                if portable_matmul.is_some() && self.extent != 0 && buffer.elements == 0 {
+                    DType::F32.itemsize()
+                } else {
+                    buffer.physical_bytes()?
+                };
             if source_elements != buffer.elements
                 || !ids.insert(buffer.id)
-                || buffer.physical_bytes()? > self.capabilities.max_buffer_size
+                || physical_bytes > self.capabilities.max_buffer_size
             {
                 return Err(WebGpuError::InvalidBinding(
                     "artifact buffer storage metadata mismatch".into(),
@@ -199,6 +235,47 @@ impl RenderedWgsl {
             return Err(WebGpuError::InvalidBinding(
                 "artifact output extent mismatch".into(),
             ));
+        }
+        if let Some(portable) = portable_matmul {
+            let plan = portable.plan();
+            let inputs = portable.inputs();
+            if self.transaction.is_some()
+                || self.schedule_inputs.len() != inputs.len()
+                || self.buffers.len() != inputs.len() + 1
+            {
+                return Err(WebGpuError::InvalidBinding(
+                    "WGSL matmul pointer count mismatch".into(),
+                ));
+            }
+            for (position, input) in inputs.iter().enumerate() {
+                let elements = input.shape.numel().map_err(|_| WebGpuError::Overflow)?;
+                let abi = &self.buffers[position];
+                if abi.id != input.node.index() as u64
+                    || abi.dtype != DType::F32
+                    || abi.source_shape != *input.shape
+                    || abi.elements != elements
+                    || abi.mutable
+                    || abi.view.is_some()
+                    || &self.schedule_inputs[position] != abi
+                {
+                    return Err(WebGpuError::InvalidBinding(
+                        "WGSL matmul input ABI mismatch".into(),
+                    ));
+                }
+            }
+            let output = self.buffers.last().expect("checked nonempty above");
+            if output.id != plan.output.index() as u64
+                || output.dtype != DType::F32
+                || output.source_shape != plan.output_shape
+                || output.elements != portable.extent()
+                || !output.mutable
+                || output.view.is_some()
+            {
+                return Err(WebGpuError::InvalidBinding(
+                    "WGSL matmul output ABI mismatch".into(),
+                ));
+            }
+            return Ok(());
         }
         if let Some(plan) = raw_movement {
             let inputs = plan.input_operands();
@@ -277,6 +354,9 @@ impl WgslRenderer {
 
     /// Lowers a validated scheduled UOp without executing or allocating.
     pub fn render(&self, root: &UOp) -> Result<RenderedWgsl, WebGpuError> {
+        if let Operation::Matmul(value) = root.operation() {
+            return render_portable_f32_matmul(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -653,6 +733,198 @@ impl WgslRenderer {
             ))),
         })
     }
+}
+
+fn render_portable_f32_matmul(
+    renderer: &WgslRenderer,
+    root: &UOp,
+    value: &crate::MatmulValue,
+) -> Result<RenderedWgsl, WebGpuError> {
+    root.validate()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let portable = crate::matmul::PortableF32Matmul::new(value).map_err(|error| match error {
+        crate::matmul::PortableF32MatmulError::Unsupported(reason) => {
+            WebGpuError::Unsupported(reason.into())
+        }
+        crate::matmul::PortableF32MatmulError::Overflow => WebGpuError::Overflow,
+        other => WebGpuError::InvalidBinding(other.to_string()),
+    })?;
+    let plan = portable.plan();
+    let extent = u32::try_from(portable.extent()).map_err(|_| {
+        WebGpuError::Unsupported("portable matmul extent exceeds u32 indexing".into())
+    })?;
+    for value in [
+        portable.lhs_elements(),
+        portable.rhs_elements(),
+        plan.m,
+        plan.n,
+        plan.k,
+    ] {
+        u32::try_from(value).map_err(|_| {
+            WebGpuError::Unsupported("portable matmul address exceeds u32 indexing".into())
+        })?;
+    }
+    for axis in portable
+        .lhs_batch_axes()
+        .iter()
+        .chain(portable.rhs_batch_axes())
+    {
+        for value in [axis.divisor, axis.dimension, axis.input_stride] {
+            u32::try_from(value).map_err(|_| {
+                WebGpuError::Unsupported("portable matmul batch address exceeds u32".into())
+            })?;
+        }
+    }
+    let mut buffers = Vec::with_capacity(3);
+    let mut schedule_inputs = Vec::with_capacity(2);
+    for input in portable.inputs() {
+        let elements = input.shape.numel().map_err(|_| WebGpuError::Overflow)?;
+        let abi = WgslBufferAbi {
+            id: input.node.index() as u64,
+            dtype: DType::F32,
+            source_shape: input.shape.clone(),
+            elements,
+            mutable: false,
+            view: None,
+        };
+        schedule_inputs.push(abi.clone());
+        buffers.push(abi);
+    }
+    buffers.push(WgslBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: DType::F32,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.extent(),
+        mutable: true,
+        view: None,
+    });
+    if buffers.len() > renderer.capabilities.max_storage_buffers_per_shader_stage as usize {
+        return Err(WebGpuError::Unsupported(
+            "portable matmul bindings exceed adapter limit".into(),
+        ));
+    }
+    for buffer in &buffers {
+        let physical_bytes = if portable.extent() != 0 && buffer.elements == 0 {
+            DType::F32.itemsize()
+        } else {
+            buffer.physical_bytes()?
+        };
+        if physical_bytes > renderer.capabilities.max_buffer_size {
+            return Err(WebGpuError::Unsupported(
+                "portable matmul binding exceeds adapter buffer limit".into(),
+            ));
+        }
+    }
+    let positions = buffers
+        .iter()
+        .enumerate()
+        .map(|(position, abi)| (abi.id, position))
+        .collect::<BTreeMap<_, _>>();
+    let lhs_position = positions[&(plan.lhs.index() as u64)];
+    let rhs_position = positions[&(plan.rhs.index() as u64)];
+    let output_position = buffers.len() - 1;
+    let entry = format!("rg_wgsl_matmul_f32_{}", plan.cache_key);
+    let mut lines = vec![format!(
+        "// {WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION}"
+    )];
+    for (position, _) in buffers[..output_position].iter().enumerate() {
+        lines.push(format!(
+            "@group(0) @binding({position}) var<storage, read> b{position}: array<f32>;"
+        ));
+    }
+    lines.extend([
+        format!(
+            "@group(0) @binding({output_position}) var<storage, read_write> b{output_position}: array<f32>;"
+        ),
+        "struct RustGradExtent { value: u32, };".into(),
+        format!(
+            "@group(0) @binding({}) var<uniform> rg_extent: RustGradExtent;",
+            buffers.len()
+        ),
+        format!("@compute @workgroup_size({}, 1, 1)", renderer.local_size),
+        format!("fn {entry}(@builtin(global_invocation_id) rg_global: vec3<u32>) {{"),
+        "  let gid: u32 = rg_global.x;".into(),
+        "  if (gid >= rg_extent.value) { return; }".into(),
+        "  var rg_q: u32 = gid;".into(),
+        "  var rg_col: u32 = 0u;".into(),
+        "  var rg_row: u32 = 0u;".into(),
+    ]);
+    if !plan.rhs_vector && plan.n != 0 {
+        lines.push(format!(
+            "  rg_col = rg_q % {}u; rg_q = rg_q / {}u;",
+            plan.n, plan.n
+        ));
+    }
+    if !plan.lhs_vector && plan.m != 0 {
+        lines.push(format!(
+            "  rg_row = rg_q % {}u; rg_q = rg_q / {}u;",
+            plan.m, plan.m
+        ));
+    }
+    lines.push("  let rg_batch: u32 = rg_q;".into());
+    for (name, axes) in [
+        ("rg_lbatch", portable.lhs_batch_axes()),
+        ("rg_rbatch", portable.rhs_batch_axes()),
+    ] {
+        lines.push(format!("  var {name}: u32 = 0u;"));
+        if extent != 0 {
+            for axis in axes {
+                lines.push(format!(
+                    "  {name} = {name} + ((rg_batch / {}u) % {}u) * {}u;",
+                    axis.divisor, axis.dimension, axis.input_stride
+                ));
+            }
+        }
+    }
+    let lhs_offset = if plan.lhs_vector {
+        "rg_k".into()
+    } else {
+        format!("((rg_lbatch * {}u + rg_row) * {}u + rg_k)", plan.m, plan.k)
+    };
+    let rhs_offset = if plan.rhs_vector {
+        "rg_k".into()
+    } else {
+        format!("((rg_rbatch * {}u + rg_k) * {}u + rg_col)", plan.k, plan.n)
+    };
+    lines.extend([
+        "  var rg_acc: f32 = 0.0;".into(),
+        format!("  for (var rg_k: u32 = 0u; rg_k < {}u; rg_k = rg_k + 1u) {{", plan.k),
+        format!(
+            "    let rg_product: f32 = b{lhs_position}[{lhs_offset}] * b{rhs_position}[{rhs_offset}];"
+        ),
+        "    rg_acc = rg_acc + rg_product;".into(),
+        "  }".into(),
+        format!("  b{output_position}[gid] = rg_acc;"),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
+        WEBGPU_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.value(),
+        extent,
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedWgsl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.extent(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        local_size: renderer.local_size,
+        transaction: None,
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    };
+    rendered.validate_artifact()?;
+    Ok(rendered)
 }
 
 fn render_raw_copy(

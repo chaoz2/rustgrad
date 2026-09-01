@@ -2,12 +2,12 @@
 use super::{
     WebGpuBuffer, WebGpuCache, WebGpuDevice, WebGpuError, WebGpuPipeline, WebGpuQueue, WgslRenderer,
 };
-use crate::{DType, ScheduleItem, TensorData};
+use crate::{ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
 use crate::runtime::static_schedule::{
-    PreparedStaticSchedule, Sealed, StaticDeviceAdapter, StaticPlanAdapter, StaticRendered,
-    StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
+    PreparedStaticSchedule, Sealed, StaticBufferAllocation, StaticDeviceAdapter, StaticPlanAdapter,
+    StaticRendered, StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
 };
 
 struct WebGpuStaticAdapter {
@@ -86,8 +86,8 @@ impl StaticDeviceAdapter for WebGpuStaticAdapter {
     fn compiled_cache_key(&self, kernel: &Self::Kernel) -> String {
         kernel.rendered().cache_key.clone()
     }
-    fn allocate(&self, elements: usize, dtype: DType) -> Result<Self::Buffer, Self::Error> {
-        self.device.allocate_typed(elements, dtype)
+    fn allocate(&self, request: StaticBufferAllocation) -> Result<Self::Buffer, Self::Error> {
+        self.device.allocate_static(request)
     }
     fn create_queue(&self) -> Result<Self::Queue, Self::Error> {
         self.device.create_queue()

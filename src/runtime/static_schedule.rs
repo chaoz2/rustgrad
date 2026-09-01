@@ -38,6 +38,18 @@ pub(crate) struct StaticRenderedBuffer {
     pub(crate) mutable: bool,
 }
 
+/// Logical allocation metadata plus the native-handle requirement derived
+/// from the complete rendered prefix. A zero-byte buffer keeps its logical
+/// descriptor while receiving a private physical sentinel only when a
+/// nonempty kernel launch includes that pointer in its ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StaticBufferAllocation {
+    pub(crate) elements: usize,
+    pub(crate) bytes: usize,
+    pub(crate) dtype: DType,
+    pub(crate) requires_native_handle: bool,
+}
+
 /// Binds the renderer's exact pointer subset/order to schedule-owned physical
 /// descriptors. Consumer-local affine addressing remains in the renderer.
 pub(crate) fn bind_rendered_buffers<E>(
@@ -171,7 +183,7 @@ pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
     fn prepare_zero_extent(&self) -> bool;
     fn compile(&self, rendered: &Self::Rendered) -> Result<Self::Kernel, Self::Error>;
     fn compiled_cache_key(&self, kernel: &Self::Kernel) -> String;
-    fn allocate(&self, elements: usize, dtype: DType) -> Result<Self::Buffer, Self::Error>;
+    fn allocate(&self, request: StaticBufferAllocation) -> Result<Self::Buffer, Self::Error>;
     fn create_queue(&self) -> Result<Self::Queue, Self::Error>;
     fn write(
         &self,
@@ -503,7 +515,15 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         }
         let allocated_ids = prepared_items
             .iter()
-            .filter(|item| item.kernel.is_some())
+            .filter(|item| item.extent != 0)
+            .flat_map(|item| item.buffer_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        // Compilation policy is intentionally neither logical allocation nor
+        // physical-handle policy: OpenCL/WebGPU compile zero-extent items, but
+        // those items retain the established no-native-buffer behavior.
+        let native_handle_ids = prepared_items
+            .iter()
+            .filter(|item| item.extent != 0)
             .flat_map(|item| item.buffer_ids.iter().copied())
             .collect::<BTreeSet<_>>();
         let mut buffers = BTreeMap::new();
@@ -513,11 +533,19 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             .filter(|id| allocated_ids.contains(*id))
         {
             let buffer = &plan.buffers[id];
-            buffers.insert(*id, adapter.allocate(buffer.elements, buffer.dtype)?);
+            buffers.insert(
+                *id,
+                adapter.allocate(StaticBufferAllocation {
+                    elements: buffer.elements,
+                    bytes: buffer.bytes,
+                    dtype: buffer.dtype,
+                    requires_native_handle: native_handle_ids.contains(id),
+                })?,
+            );
         }
         let queue = prepared_items
             .iter()
-            .any(|item| item.kernel.is_some())
+            .any(|item| item.extent != 0)
             .then(|| adapter.create_queue())
             .transpose()?;
         let compiled_cache_keys = prepared_items
@@ -547,11 +575,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
     pub(crate) fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), A::Error> {
         // Complete all host validation and allocation before the first driver call.
         let mut uploads = Vec::with_capacity(self.external_inputs.len());
-        for id in self
-            .external_inputs
-            .iter()
-            .filter(|id| self.buffers.contains_key(*id))
-        {
+        for id in &self.external_inputs {
             let plan = &self.buffer_plans[id];
             let value = values
                 .get(id)
@@ -569,7 +593,9 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     "prefix input {id} byte length mismatch"
                 )));
             }
-            uploads.push((*id, bytes));
+            if self.buffers.contains_key(id) {
+                uploads.push((*id, bytes));
+            }
         }
         let mut downloads = self
             .retained_outputs
@@ -582,13 +608,13 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 self.adapter.write(queue, &self.buffers[id], bytes)?;
             }
             for item in &self.items {
-                let Some(kernel) = item.kernel.as_ref() else {
-                    if item.extent != 0 {
-                        return Err(A::invalid_binding(
-                            "nonzero item has no compiled kernel".into(),
-                        ));
-                    }
+                if item.extent == 0 {
                     continue;
+                }
+                let Some(kernel) = item.kernel.as_ref() else {
+                    return Err(A::invalid_binding(
+                        "nonzero item has no compiled kernel".into(),
+                    ));
                 };
                 let bindings = item
                     .buffer_ids
@@ -693,6 +719,7 @@ mod tests {
         read: usize,
         fail_launch_after: Option<usize>,
         fail_read_after: Option<usize>,
+        allocations: Vec<StaticBufferAllocation>,
     }
 
     #[derive(Clone)]
@@ -753,11 +780,15 @@ mod tests {
         fn compiled_cache_key(&self, _: &Self::Kernel) -> String {
             "fake-compiled".into()
         }
-        fn allocate(&self, elements: usize, dtype: DType) -> Result<Self::Buffer, Self::Error> {
-            self.0.borrow_mut().allocate += 1;
+        fn allocate(&self, request: StaticBufferAllocation) -> Result<Self::Buffer, Self::Error> {
+            let mut calls = self.0.borrow_mut();
+            calls.allocate += 1;
+            calls.allocations.push(request);
+            drop(calls);
             Ok(FakeBuffer(RefCell::new(vec![
                 0;
-                elements * dtype.itemsize()
+                request.elements
+                    * request.dtype.itemsize()
             ])))
         }
         fn create_queue(&self) -> Result<Self::Queue, Self::Error> {
@@ -1090,5 +1121,106 @@ mod tests {
             (0, 0, 0, 0, 0, 0)
         );
         assert_eq!(values[&(output.index() as u64)].shape(), &Shape::from([0]));
+    }
+
+    #[test]
+    fn populated_zero_contraction_requests_only_private_zero_input_handles() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2, 0], DType::F32);
+        let rhs = graph.input_dtype("rhs", [0, 3], DType::F32);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let prepared = PreparedStaticSchedule::prepare_for_outputs(
+            FakeAdapter(calls.clone()),
+            &schedule.items,
+            &[output.index() as u64],
+        )
+        .unwrap();
+        let requests = calls.borrow().allocations.clone();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.bytes == 0 && request.requires_native_handle)
+                .count(),
+            2
+        );
+        assert!(requests.iter().any(|request| {
+            request.bytes == 6 * DType::F32.itemsize() && request.requires_native_handle
+        }));
+        drop(prepared);
+
+        let mut empty = Graph::new();
+        let lhs = empty.input_dtype("lhs", [0, 4], DType::F32);
+        let rhs = empty.input_dtype("rhs", [4, 3], DType::F32);
+        let output = empty.matmul(lhs, rhs).unwrap();
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let prepared = PreparedStaticSchedule::prepare_for_outputs(
+            FakeAdapter(calls.clone()),
+            &crate::schedule(&empty, output).unwrap().items,
+            &[output.index() as u64],
+        )
+        .unwrap();
+        assert!(calls.borrow().allocations.is_empty());
+        drop(prepared);
+    }
+
+    #[test]
+    fn zero_output_validates_all_logical_inputs_without_driver_or_publication() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [0, 4], DType::F32);
+        let rhs = graph.input_dtype("rhs", [4, 3], DType::F32);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let prepared = PreparedStaticSchedule::prepare_for_outputs(
+            FakeAdapter(calls.clone()),
+            &schedule.items,
+            &[output.index() as u64],
+        )
+        .unwrap();
+
+        let mut missing = BTreeMap::new();
+        let before = missing.clone();
+        assert!(
+            prepared
+                .execute(&mut missing)
+                .unwrap_err()
+                .contains("missing prefix input")
+        );
+        assert_eq!(missing, before);
+
+        let mut wrong = BTreeMap::from([
+            (
+                lhs.index() as u64,
+                TensorData::from_storage([0, 5], Storage::F32(Vec::new())).unwrap(),
+            ),
+            (
+                rhs.index() as u64,
+                TensorData::from_storage([4, 3], Storage::F32(vec![1.0; 12])).unwrap(),
+            ),
+        ]);
+        let before = wrong.clone();
+        assert!(
+            prepared
+                .execute(&mut wrong)
+                .unwrap_err()
+                .contains("descriptor mismatch")
+        );
+        assert_eq!(wrong, before);
+        assert!(!wrong.contains_key(&(output.index() as u64)));
+
+        let calls = calls.borrow();
+        assert_eq!(
+            (
+                calls.allocate,
+                calls.queue,
+                calls.write,
+                calls.launch,
+                calls.read
+            ),
+            (0, 0, 0, 0, 0)
+        );
     }
 }

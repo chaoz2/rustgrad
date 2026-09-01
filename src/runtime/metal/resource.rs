@@ -181,6 +181,28 @@ impl MetalDevice {
         MetalBuffer::allocate(self.inner.clone(), bytes, Some(dtype))
     }
 
+    pub(crate) fn allocate_static(
+        &self,
+        request: crate::runtime::static_schedule::StaticBufferAllocation,
+    ) -> Result<MetalBuffer, MetalError> {
+        if request.bytes
+            != request
+                .elements
+                .checked_mul(request.dtype.itemsize())
+                .ok_or(MetalError::Overflow)?
+        {
+            return Err(MetalError::InvalidBinding(
+                "static allocation descriptor mismatch".into(),
+            ));
+        }
+        MetalBuffer::allocate_with_handle(
+            self.inner.clone(),
+            request.bytes,
+            Some(request.dtype),
+            request.requires_native_handle,
+        )
+    }
+
     /// Compiles an already validated render artifact and preserves bounded
     /// native diagnostics as [`MetalError::Build`].
     pub fn compile(&self, rendered: &RenderedMetal) -> Result<MetalLibrary, MetalError> {

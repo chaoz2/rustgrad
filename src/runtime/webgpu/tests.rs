@@ -1,4 +1,7 @@
-use super::renderer::{WGSL_RAW_COPY_RENDERER_VERSION, WGSL_STATIC_POSITION_RENDERER_VERSION};
+use super::renderer::{
+    WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION, WGSL_RAW_COPY_RENDERER_VERSION,
+    WGSL_STATIC_POSITION_RENDERER_VERSION,
+};
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;
@@ -18,6 +21,151 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
+
+#[test]
+fn portable_f32_matmul_wgsl_renders_shared_geometry_and_executes_zero_k() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 2, 3], DType::F32);
+    let rhs = graph.input_dtype("rhs", [1, 3, 2], DType::F32);
+    let output = graph.matmul(lhs, rhs).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let rendered = renderer.render(&scheduled.items[0].kernel).unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("let rg_product: f32"));
+    assert!(rendered.source.contains("rg_acc = rg_acc + rg_product"));
+
+    let mut aliased = Graph::new();
+    let input = aliased.input_dtype("input", [2, 2], DType::F32);
+    let output = aliased.matmul(input, input).unwrap();
+    let item = schedule(&aliased, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.buffers.len(), 2);
+
+    let mut cancellation = Graph::new();
+    let lhs = cancellation.input_dtype("lhs", [3], DType::F32);
+    let rhs = cancellation.input_dtype("rhs", [3], DType::F32);
+    let output = cancellation.matmul(lhs, rhs).unwrap();
+    let (actual, _) = execute_mock(
+        &cancellation,
+        output,
+        &HashMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_storage([3], Storage::F32(vec![16_777_216.0, 1.0, -16_777_216.0]))
+                    .unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_storage([3], Storage::F32(vec![1.0; 3])).unwrap(),
+            ),
+        ]),
+    );
+    assert_eq!(actual.storage(), &Storage::F32(vec![0.0]));
+
+    let mut zero = Graph::new();
+    let lhs = zero.input_dtype("lhs", [2, 0], DType::F32);
+    let rhs = zero.input_dtype("rhs", [0, 3], DType::F32);
+    let output = zero.matmul(lhs, rhs).unwrap();
+    let items = schedule(&zero, output).unwrap().items;
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let prefix = PreparedWebGpuPrefix::prepare(device, &items, renderer.clone()).unwrap();
+    let mut values = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([2, 0], Storage::F32(Vec::new())).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([0, 3], Storage::F32(Vec::new())).unwrap(),
+        ),
+    ]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![0.0; 6])
+    );
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_create:") && call.ends_with(":4"))
+            .count(),
+        2
+    );
+    drop(prefix);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_release:"))
+            .count(),
+        3
+    );
+
+    let mut empty = Graph::new();
+    let lhs = empty.input_dtype("lhs", [0, 4], DType::F32);
+    let rhs = empty.input_dtype("rhs", [4, 3], DType::F32);
+    let output = empty.matmul(lhs, rhs).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let prefix =
+        PreparedWebGpuPrefix::prepare(device, &schedule(&empty, output).unwrap().items, renderer)
+            .unwrap();
+    let before_invalid = mock.calls();
+    let mut missing = BTreeMap::new();
+    assert!(matches!(
+        prefix.execute(&mut missing),
+        Err(WebGpuError::InvalidBinding(reason)) if reason.contains("missing prefix input")
+    ));
+    assert!(!missing.contains_key(&(output.index() as u64)));
+    let mut wrong = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([0, 5], Storage::F32(Vec::new())).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([4, 3], Storage::F32(vec![1.0; 12])).unwrap(),
+        ),
+    ]);
+    let before_wrong = wrong.clone();
+    assert!(matches!(
+        prefix.execute(&mut wrong),
+        Err(WebGpuError::InvalidBinding(reason)) if reason.contains("descriptor mismatch")
+    ));
+    assert_eq!(wrong, before_wrong);
+    assert!(!wrong.contains_key(&(output.index() as u64)));
+    assert_eq!(mock.calls(), before_invalid);
+    let mut values = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([0, 4], Storage::F32(Vec::new())).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([4, 3], Storage::F32(vec![1.0; 12])).unwrap(),
+        ),
+    ]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(Vec::new())
+    );
+    assert!(!mock.calls().iter().any(|call| call.starts_with("launch:")));
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("buffer_create:"))
+    );
+}
 
 #[test]
 fn reduction_epilogue_renders_one_wgsl_kernel_with_committed_value() {
@@ -781,7 +929,12 @@ impl Dispatch for MockDispatch {
                 .buffers
                 .get(&(owner, raw.0))
                 .ok_or(WebGpuError::OwnerMismatch)?;
-            if bytes.len() != logical.div_ceil(4) * 4 {
+            let physical = if semantics.extent != 0 && logical == 0 {
+                DType::F32.itemsize()
+            } else {
+                logical.div_ceil(4) * 4
+            };
+            if bytes.len() != physical {
                 return Err(WebGpuError::InvalidBinding(format!(
                     "mock buffer {position} length mismatch"
                 )));
