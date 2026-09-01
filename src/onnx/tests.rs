@@ -4076,14 +4076,43 @@ fn cumsum_matches_tinygrad_static_axis_flags_and_pad_structure() {
         &[5., 3., 0., 11., 6., 0.]
     );
     // The literal source-exclusive form retains its Pad before Shrink and the
-    // prefix scan. Scheduling this computed-view chain currently fails closed.
+    // prefix scan. The computed view is materialized after its Pad producer.
     assert!(
         graph
             .nodes
             .iter()
             .any(|node| matches!(node.op, crate::Op::Pad { .. }))
     );
-    assert!(crate::schedule(&graph, reverse_exclusive).is_err());
+    let scheduled = crate::schedule(&graph, reverse_exclusive).unwrap();
+    scheduled.validate().unwrap();
+    let pad = scheduled
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kernel.operation(),
+                crate::Operation::Movement(crate::MovementValue::Plan(plan))
+                    if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
+            )
+        })
+        .unwrap();
+    let copied = scheduled
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kernel.operation(),
+                crate::Operation::Movement(crate::MovementValue::Plan(plan))
+                    if matches!(
+                        &plan.kind,
+                        crate::MovementKernelKind::AffineCopy { input, .. }
+                            if input.node == pad.node
+                    )
+            )
+        })
+        .unwrap();
+    assert!(copied.id > pad.id);
+    assert!(copied.dependencies.contains(&pad.id));
 
     // Sum defaults remain the public cumsum contract, including widened
     // small integers, narrow float accumulation with final narrowing, and

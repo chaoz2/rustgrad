@@ -26,6 +26,7 @@ mod random;
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
 pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v30";
+const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -1490,39 +1491,55 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
         "#include <stdint.h>".into(),
         "#include <stddef.h>".into(),
         "#include <string.h>".into(),
-        format!("/* {RENDERER_VERSION} movement plan={} */", plan.cache_key),
+        format!(
+            "/* {MOVEMENT_RENDERER_VERSION} movement plan={} */",
+            plan.cache_key
+        ),
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
     ];
     let output_ty = ctype(plan.dtype);
     match &plan.kind {
         crate::MovementKernelKind::AffineCopy { input, view } => {
             let output_len = elements(&plan.output_shape)?;
+            let normalized = view
+                .normalized_read()
+                .map_err(|_| JitError::Unsupported("affine-copy read map is invalid".into()))?;
             if output_len == 0 {
                 lines.push("  /* empty affine-copy domain */".into());
             } else {
+                let storage_width = plan.dtype.itemsize();
                 lines.push(format!(
-                    "  for (size_t rg_i=0; rg_i<{output_len}u; ++rg_i) {{ size_t rg_q=rg_i, rg_offset={}u;",
-                    usize::try_from(view.offset).map_err(|_| JitError::Unsupported(
-                        "affine-copy offset must be nonnegative".into()
-                    ))?
+                    "  for (size_t rg_i=0; rg_i<{output_len}u; ++rg_i) {{ size_t rg_q=rg_i, rg_offset=(size_t){}ULL;",
+                    normalized.offset
                 ));
                 for axis in (0..view.logical_shape.rank()).rev() {
                     let dim = view.logical_shape.dims()[axis];
-                    let stride = usize::try_from(view.strides[axis]).map_err(|_| {
-                        JitError::Unsupported("affine-copy stride must be nonnegative".into())
-                    })?;
                     if dim == 0 {
                         return Err(JitError::Unsupported(
                             "nonempty affine-copy cannot have a zero dimension".into(),
                         ));
                     }
+                    let addressing = normalized.axes[axis];
+                    if dim == 1 {
+                        continue;
+                    }
+                    if addressing.stride == 0 {
+                        lines.push(format!("    rg_q/={dim}u;"));
+                        continue;
+                    }
+                    let coordinate = if addressing.reversed {
+                        format!("({}ULL-rg_c{axis})", dim - 1)
+                    } else {
+                        format!("rg_c{axis}")
+                    };
                     lines.push(format!(
-                        "    size_t rg_c{axis}=rg_q%{dim}u; rg_q/={dim}u; rg_offset+=rg_c{axis}*{stride}u;"
+                        "    size_t rg_c{axis}=rg_q%{dim}u; rg_q/={dim}u; rg_offset+=(size_t){coordinate}*{}ULL;",
+                        addressing.stride
                     ));
                 }
                 lines.push(format!(
-                    "    (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[rg_offset];",
-                    ids[&(input.node.index() as u64)]
+                    "    memcpy(((uint8_t*)buffers[{output_slot}])+rg_i*{storage_width}u, ((const uint8_t*)buffers[{}])+rg_offset*{storage_width}u, {storage_width}u);",
+                    ids[&(input.node.index() as u64)],
                 ));
                 lines.push("  }".into());
             }
@@ -3254,6 +3271,7 @@ mod tests {
         let rendered = render_movement(&plan).unwrap();
 
         assert!(rendered.source.contains("for (size_t rg_i=0;"));
+        assert!(rendered.source.contains(MOVEMENT_RENDERER_VERSION));
         assert_eq!(
             rendered.source.bytes().filter(|byte| *byte == b'{').count(),
             rendered.source.bytes().filter(|byte| *byte == b'}').count()
@@ -3263,6 +3281,35 @@ mod tests {
                 .source
                 .ends_with("  return failure[1] ? (int)failure[1] : 0;\n}\n")
         );
+    }
+
+    #[test]
+    fn computed_affine_copy_renderer_uses_normalized_unsigned_raw_addressing() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let viewed = graph
+            .stride(
+                producer,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        let plan = crate::MovementKernelPlan::from_computed_affine_view(&graph, viewed).unwrap();
+        let rendered = render_movement(&plan).unwrap();
+        assert!(rendered.source.contains("rg_offset=(size_t)0ULL"));
+        assert!(
+            rendered
+                .source
+                .contains("rg_offset+=(size_t)(3ULL-rg_c0)*1ULL;")
+        );
+        assert!(rendered.source.contains(
+            "memcpy(((uint8_t*)buffers[1])+rg_i*4u, ((const uint8_t*)buffers[0])+rg_offset*4u, 4u);"
+        ));
+        assert!(rendered.source.contains(MOVEMENT_RENDERER_VERSION));
     }
 
     #[test]

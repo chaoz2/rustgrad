@@ -83,6 +83,18 @@ pub struct AffineView {
     pub offset: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NormalizedAffineRead {
+    pub offset: usize,
+    pub axes: Vec<NormalizedAffineReadAxis>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NormalizedAffineReadAxis {
+    pub stride: usize,
+    pub reversed: bool,
+}
+
 impl From<ViewMap> for AffineView {
     fn from(view: ViewMap) -> Self {
         Self {
@@ -284,29 +296,69 @@ impl AffineView {
     /// Validates a logical-to-physical read map. Broadcast dimensions may have
     /// a zero stride and therefore intentionally alias source elements.
     pub fn validate_read(&self) -> Result<(), UOpError> {
+        self.normalized_read().map(|_| ())
+    }
+
+    /// Converts a proved signed read map into nonnegative addressing metadata.
+    /// Negative axes reverse their logical coordinate around the last element;
+    /// singleton axes are discarded before magnitude conversion.
+    pub(crate) fn normalized_read(&self) -> Result<NormalizedAffineRead, UOpError> {
         if self.strides.len() != self.logical_shape.rank() {
             return Err(UOpError::InvalidIndex);
         }
-        let numel = self
+        let logical_numel = self
             .logical_shape
             .numel()
             .map_err(|_| UOpError::InvalidIndex)?;
-        if numel == 0 {
-            return Ok(());
-        }
-        let extent = i64::try_from(
-            self.source_shape
-                .numel()
-                .map_err(|_| UOpError::InvalidIndex)?,
-        )
-        .map_err(|_| UOpError::InvalidIndex)?;
-        for index in 0..numel {
-            let offset = self.element_offset(index)?;
-            if offset < 0 || offset >= extent {
+        let source_numel = self
+            .source_shape
+            .numel()
+            .map_err(|_| UOpError::InvalidIndex)?;
+        let mut minimum = i128::from(self.offset);
+        let mut span = 0i128;
+        let mut axes = Vec::with_capacity(self.strides.len());
+        for (&dimension, &stride) in self.logical_shape.dims().iter().zip(&self.strides) {
+            if dimension <= 1 {
+                axes.push(NormalizedAffineReadAxis {
+                    stride: 0,
+                    reversed: false,
+                });
+                continue;
+            }
+            let magnitude = i128::from(stride).abs();
+            let axis_span = i128::try_from(dimension - 1)
+                .map_err(|_| UOpError::InvalidIndex)?
+                .checked_mul(magnitude)
+                .ok_or(UOpError::InvalidIndex)?;
+            if axis_span > i128::from(i64::MAX) {
                 return Err(UOpError::InvalidIndex);
             }
+            let reversed = stride < 0;
+            if reversed {
+                minimum = minimum
+                    .checked_sub(axis_span)
+                    .ok_or(UOpError::InvalidIndex)?;
+            }
+            span = span.checked_add(axis_span).ok_or(UOpError::InvalidIndex)?;
+            axes.push(NormalizedAffineReadAxis {
+                stride: usize::try_from(magnitude).map_err(|_| UOpError::InvalidIndex)?,
+                reversed,
+            });
         }
-        Ok(())
+        let maximum = minimum.checked_add(span).ok_or(UOpError::InvalidIndex)?;
+        if minimum < 0
+            || minimum > i128::from(i64::MAX)
+            || maximum > i128::from(i64::MAX)
+            || (logical_numel != 0
+                && maximum >= i128::try_from(source_numel).map_err(|_| UOpError::InvalidIndex)?)
+        {
+            return Err(UOpError::InvalidIndex);
+        }
+        let _: usize = usize::try_from(maximum).map_err(|_| UOpError::InvalidIndex)?;
+        Ok(NormalizedAffineRead {
+            offset: usize::try_from(minimum).map_err(|_| UOpError::InvalidIndex)?,
+            axes,
+        })
     }
     /// Validates a writable affine target. Unlike reads, every logical lane
     /// must identify a distinct physical element so an effect has one meaning.
