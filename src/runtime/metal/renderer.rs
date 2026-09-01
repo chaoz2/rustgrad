@@ -18,6 +18,8 @@ use std::{
 pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v6";
 pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-metal-static-position-v1";
+pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
+    "rustgrad-metal-portable-f32-matmul-v1";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -66,6 +68,14 @@ impl RenderedMetal {
         &self,
         bindings: &[ScheduleInputBinding],
     ) -> Result<(), MetalError> {
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Matmul(value) = root.operation()
+        {
+            crate::matmul::PortableF32Matmul::new(value)
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(MetalError::InvalidBinding(
                 "schedule/Metal input count mismatch".into(),
@@ -117,6 +127,9 @@ impl MetalRenderer {
 
     /// Lowers a validated scheduled UOp into the exact static subset.
     pub fn render(&self, root: &UOp) -> Result<RenderedMetal, MetalError> {
+        if let Operation::Matmul(value) = root.operation() {
+            return render_portable_f32_matmul(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -412,6 +425,176 @@ impl MetalRenderer {
             ))),
         })
     }
+}
+
+fn render_portable_f32_matmul(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    value: &crate::MatmulValue,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let portable = crate::matmul::PortableF32Matmul::new(value).map_err(|error| match error {
+        crate::matmul::PortableF32MatmulError::Unsupported(reason) => {
+            MetalError::Unsupported(reason.into())
+        }
+        crate::matmul::PortableF32MatmulError::Overflow => MetalError::Overflow,
+        other => MetalError::InvalidBinding(other.to_string()),
+    })?;
+    if portable.extent() > u32::MAX as usize {
+        return Err(MetalError::Unsupported(
+            "portable matmul extent exceeds uint thread indexing".into(),
+        ));
+    }
+    let plan = portable.plan();
+    let mut buffers = Vec::with_capacity(3);
+    let mut schedule_inputs = Vec::with_capacity(2);
+    for input in portable.inputs() {
+        let elements = input.shape.numel().map_err(|_| MetalError::Overflow)?;
+        let abi = MetalBufferAbi {
+            id: input.node.index() as u64,
+            dtype: DType::F32,
+            source_shape: input.shape.clone(),
+            elements,
+            mutable: false,
+            view: None,
+        };
+        schedule_inputs.push(abi.clone());
+        buffers.push(abi);
+    }
+    buffers.push(MetalBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: DType::F32,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.extent(),
+        mutable: true,
+        view: None,
+    });
+    for buffer in &buffers {
+        let logical = buffer
+            .elements
+            .checked_mul(DType::F32.itemsize())
+            .ok_or(MetalError::Overflow)?;
+        let physical = if portable.extent() != 0 && logical == 0 {
+            DType::F32.itemsize()
+        } else {
+            logical
+        };
+        if physical > renderer.capabilities.max_buffer_length {
+            return Err(MetalError::Unsupported(
+                "portable matmul binding exceeds device buffer limit".into(),
+            ));
+        }
+    }
+    let positions = buffers
+        .iter()
+        .enumerate()
+        .map(|(position, abi)| (abi.id, position))
+        .collect::<BTreeMap<_, _>>();
+    let lhs_position = positions[&(plan.lhs.index() as u64)];
+    let rhs_position = positions[&(plan.rhs.index() as u64)];
+    let output_position = buffers.len() - 1;
+    let entry = format!("rg_metal_matmul_f32_{}", plan.cache_key);
+    let mut lines = vec![
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        "#pragma clang fp contract(off)".into(),
+        format!("// {METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        format!("kernel void {entry}("),
+    ];
+    for (position, _) in buffers[..output_position].iter().enumerate() {
+        lines.push(format!(
+            "    device const float* b{position} [[buffer({position})]],"
+        ));
+    }
+    lines.extend([
+        format!("    device float* b{output_position} [[buffer({output_position})]],"),
+        format!("    constant ulong& extent [[buffer({})]],", buffers.len()),
+        "    uint gid32 [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = (ulong)gid32;".into(),
+        "  if (gid >= extent) return;".into(),
+        "  ulong rg_q = gid;".into(),
+        "  ulong rg_col = 0ul;".into(),
+        "  ulong rg_row = 0ul;".into(),
+    ]);
+    if !plan.rhs_vector && plan.n != 0 {
+        lines.push(format!(
+            "  rg_col = rg_q % (ulong){}ul; rg_q /= (ulong){}ul;",
+            plan.n, plan.n
+        ));
+    }
+    if !plan.lhs_vector && plan.m != 0 {
+        lines.push(format!(
+            "  rg_row = rg_q % (ulong){}ul; rg_q /= (ulong){}ul;",
+            plan.m, plan.m
+        ));
+    }
+    lines.push("  const ulong rg_batch = rg_q;".into());
+    for (name, axes) in [
+        ("rg_lbatch", portable.lhs_batch_axes()),
+        ("rg_rbatch", portable.rhs_batch_axes()),
+    ] {
+        lines.push(format!("  ulong {name} = 0ul;"));
+        if portable.extent() != 0 {
+            for axis in axes {
+                lines.push(format!(
+                    "  {name} += ((rg_batch / (ulong){}ul) % (ulong){}ul) * (ulong){}ul;",
+                    axis.divisor, axis.dimension, axis.input_stride
+                ));
+            }
+        }
+    }
+    let lhs_offset = if plan.lhs_vector {
+        "rg_k".into()
+    } else {
+        format!(
+            "((rg_lbatch * (ulong){}ul + rg_row) * (ulong){}ul + rg_k)",
+            plan.m, plan.k
+        )
+    };
+    let rhs_offset = if plan.rhs_vector {
+        "rg_k".into()
+    } else {
+        format!(
+            "((rg_rbatch * (ulong){}ul + rg_k) * (ulong){}ul + rg_col)",
+            plan.k, plan.n
+        )
+    };
+    lines.extend([
+        "  float rg_acc = 0.0f;".into(),
+        format!("  for (ulong rg_k = 0ul; rg_k < (ulong){}ul; ++rg_k) {{", plan.k),
+        format!(
+            "    const float rg_product = b{lhs_position}[{lhs_offset}] * b{rhs_position}[{rhs_offset}];"
+        ),
+        "    rg_acc = rg_acc + rg_product;".into(),
+        "  }".into(),
+        format!("  b{output_position}[gid] = rg_acc;"),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.extent(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
 }
 
 fn render_raw_copy(

@@ -1,4 +1,7 @@
-use super::renderer::{METAL_RAW_COPY_RENDERER_VERSION, METAL_STATIC_POSITION_RENDERER_VERSION};
+use super::renderer::{
+    METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_RAW_COPY_RENDERER_VERSION,
+    METAL_STATIC_POSITION_RENDERER_VERSION,
+};
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;
@@ -17,6 +20,127 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
+
+#[test]
+fn portable_f32_matmul_metal_renders_shared_geometry_and_executes_zero_k() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 2, 3], DType::F32);
+    let rhs = graph.input_dtype("rhs", [1, 3, 2], DType::F32);
+    let output = graph.matmul(lhs, rhs).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let rendered = renderer.render(&scheduled.items[0].kernel).unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("#pragma clang fp contract(off)"));
+    assert!(rendered.source.contains("const float rg_product"));
+    assert!(rendered.source.contains("rg_acc = rg_acc + rg_product"));
+
+    let mut aliased = Graph::new();
+    let input = aliased.input_dtype("input", [2, 2], DType::F32);
+    let output = aliased.matmul(input, input).unwrap();
+    let item = schedule(&aliased, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.buffers.len(), 2);
+
+    let mut cancellation = Graph::new();
+    let lhs = cancellation.input_dtype("lhs", [3], DType::F32);
+    let rhs = cancellation.input_dtype("rhs", [3], DType::F32);
+    let output = cancellation.matmul(lhs, rhs).unwrap();
+    let (actual, _) = execute_mock(
+        &cancellation,
+        output,
+        &HashMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_storage([3], Storage::F32(vec![16_777_216.0, 1.0, -16_777_216.0]))
+                    .unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_storage([3], Storage::F32(vec![1.0; 3])).unwrap(),
+            ),
+        ]),
+    );
+    assert_eq!(actual.storage(), &Storage::F32(vec![0.0]));
+
+    let mut zero = Graph::new();
+    let lhs = zero.input_dtype("lhs", [2, 0], DType::F32);
+    let rhs = zero.input_dtype("rhs", [0, 3], DType::F32);
+    let output = zero.matmul(lhs, rhs).unwrap();
+    let items = schedule(&zero, output).unwrap().items;
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let prefix = PreparedMetalPrefix::prepare(device, &items, renderer.clone()).unwrap();
+    let mut values = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([2, 0], Storage::F32(Vec::new())).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([0, 3], Storage::F32(Vec::new())).unwrap(),
+        ),
+    ]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![0.0; 6])
+    );
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_create:") && call.ends_with(":4"))
+            .count(),
+        2
+    );
+    drop(prefix);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_release:"))
+            .count(),
+        3
+    );
+
+    let mut empty = Graph::new();
+    let lhs = empty.input_dtype("lhs", [0, 4], DType::F32);
+    let rhs = empty.input_dtype("rhs", [4, 3], DType::F32);
+    let output = empty.matmul(lhs, rhs).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let prefix =
+        PreparedMetalPrefix::prepare(device, &schedule(&empty, output).unwrap().items, renderer)
+            .unwrap();
+    let mut values = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([0, 4], Storage::F32(Vec::new())).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([4, 3], Storage::F32(vec![1.0; 12])).unwrap(),
+        ),
+    ]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(Vec::new())
+    );
+    assert!(!mock.calls().iter().any(|call| call.starts_with("launch:")));
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("buffer_create:"))
+    );
+}
 
 #[test]
 fn reduction_epilogue_renders_one_metal_kernel() {
@@ -738,21 +862,27 @@ impl Dispatch for MockDispatch {
         let mut bindings = KernelBindings::default();
         let mut output = None;
         for (position, (raw, abi)) in buffers.iter().zip(&semantics.buffers).enumerate() {
-            let expected = abi
+            let logical = abi
                 .elements
                 .checked_mul(abi.dtype.itemsize())
                 .ok_or(MetalError::Overflow)?;
+            let physical = if semantics.extent != 0 && logical == 0 {
+                DType::F32.itemsize()
+            } else {
+                logical
+            };
             let bytes = state
                 .buffers
                 .get(&(owner, raw.0))
                 .ok_or(MetalError::OwnerMismatch)?;
-            if bytes.len() != expected {
+            if bytes.len() != physical {
                 return Err(MetalError::InvalidBinding(format!(
                     "mock buffer {position} length mismatch"
                 )));
             }
-            let value = TensorData::from_le_bytes(abi.source_shape.clone(), abi.dtype, bytes)
-                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+            let value =
+                TensorData::from_le_bytes(abi.source_shape.clone(), abi.dtype, &bytes[..logical])
+                    .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
             let role = if abi.mutable {
                 BufferRole::Output
             } else {
@@ -770,7 +900,7 @@ impl Dispatch for MockDispatch {
                 .insert(&desc, value)
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
             if abi.mutable {
-                output = Some((*raw, expected));
+                output = Some((*raw, logical));
             }
         }
         if let Some(transaction) = transaction {
@@ -1035,8 +1165,12 @@ fn cpu_session_metal_zero_domain_preflights_without_resources() {
 #[test]
 fn cpu_session_metal_unsupported_preflight_has_no_resource_side_effect() {
     let mut session = CpuSession::new();
-    let input = session.variable([2], [1.0, -2.0]).unwrap();
-    let weight = session.tensor([2, 1], [1.0, 2.0]).unwrap();
+    let input = session
+        .variable_data(TensorData::from_storage([2], Storage::F64(vec![1.0, -2.0])).unwrap())
+        .unwrap();
+    let weight = session
+        .tensor_with_dtype([2, 1], DType::F64, [Scalar::F(1.0), Scalar::F(2.0)])
+        .unwrap();
     let output = session.matmul(&input, &weight).unwrap();
     let mock = Arc::new(MockDispatch::default());
     let device = test_device(mock.clone());

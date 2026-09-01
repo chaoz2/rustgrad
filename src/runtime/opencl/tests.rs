@@ -1,7 +1,281 @@
 use super::renderer::{
-    OPENCL_ABI_VERSION, OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
+    OPENCL_ABI_VERSION, OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
+    OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
     OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
 };
+
+#[test]
+fn portable_f32_matmul_opencl_renders_shared_geometry_and_executes_zero_k() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 2, 3], DType::F32);
+    let rhs = graph.input_dtype("rhs", [1, 3, 2], DType::F32);
+    let output = graph.matmul(lhs, rhs).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let rendered = renderer.render(&scheduled.items[0].kernel).unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("#pragma OPENCL FP_CONTRACT OFF"));
+    assert!(rendered.source.contains("const float rg_product"));
+    assert!(rendered.source.contains("rg_acc = rg_acc + rg_product"));
+    assert_eq!(rendered.buffers.len(), 3);
+
+    let mut aliased = Graph::new();
+    let input = aliased.input_dtype("input", [2, 2], DType::F32);
+    let output = aliased.matmul(input, input).unwrap();
+    let item = schedule(&aliased, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.buffers.len(), 2);
+
+    let mut cancellation = Graph::new();
+    let lhs = cancellation.input_dtype("lhs", [3], DType::F32);
+    let rhs = cancellation.input_dtype("rhs", [3], DType::F32);
+    let output = cancellation.matmul(lhs, rhs).unwrap();
+    let item = schedule(&cancellation, output)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    let (bytes, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([
+            (
+                lhs.index() as u64,
+                TensorData::from_storage([3], Storage::F32(vec![16_777_216.0, 1.0, -16_777_216.0]))
+                    .unwrap(),
+            ),
+            (
+                rhs.index() as u64,
+                TensorData::from_storage([3], Storage::F32(vec![1.0; 3])).unwrap(),
+            ),
+        ]),
+    );
+    assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()).to_bits(), 0);
+
+    let mut zero = Graph::new();
+    let lhs = zero.input_dtype("lhs", [2, 0], DType::F32);
+    let rhs = zero.input_dtype("rhs", [0, 3], DType::F32);
+    let output = zero.matmul(lhs, rhs).unwrap();
+    let items = schedule(&zero, output).unwrap().items;
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let prefix = PreparedOpenClPrefix::prepare(context, &items, renderer).unwrap();
+    let mut missing = BTreeMap::from([(
+        lhs.index() as u64,
+        TensorData::from_storage([2, 0], Storage::F32(Vec::new())).unwrap(),
+    )]);
+    let before_missing = mock.calls();
+    assert!(matches!(
+        prefix.execute(&mut missing),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("missing prefix input")
+    ));
+    assert_eq!(mock.calls(), before_missing);
+    let mut values = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([2, 0], Storage::F32(Vec::new())).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([0, 3], Storage::F32(Vec::new())).unwrap(),
+        ),
+    ]);
+    mock.set_launch_failure(-6);
+    assert!(matches!(
+        prefix.execute(&mut values),
+        Err(OpenClError::Driver {
+            operation: "launch",
+            code: -6
+        })
+    ));
+    assert!(!values.contains_key(&(output.index() as u64)));
+    mock.clear_failures();
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![0.0; 6])
+    );
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.ends_with(":4") && call.starts_with("buffer_create:"))
+            .count(),
+        2,
+        "each logical zero input receives one private launch sentinel"
+    );
+    drop(prefix);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_release:"))
+            .count(),
+        3
+    );
+
+    let mut empty = Graph::new();
+    let lhs = empty.input_dtype("lhs", [0, 4], DType::F32);
+    let rhs = empty.input_dtype("rhs", [4, 3], DType::F32);
+    let output = empty.matmul(lhs, rhs).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let prefix =
+        PreparedOpenClPrefix::prepare(context, &schedule(&empty, output).unwrap().items, renderer)
+            .unwrap();
+    let before_invalid = mock.calls();
+    let mut missing = BTreeMap::new();
+    assert!(matches!(
+        prefix.execute(&mut missing),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("missing prefix input")
+    ));
+    assert!(!missing.contains_key(&(output.index() as u64)));
+    let mut wrong = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([0, 5], Storage::F32(Vec::new())).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([4, 3], Storage::F32(vec![1.0; 12])).unwrap(),
+        ),
+    ]);
+    let before_wrong = wrong.clone();
+    assert!(matches!(
+        prefix.execute(&mut wrong),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("descriptor mismatch")
+    ));
+    assert_eq!(wrong, before_wrong);
+    assert!(!wrong.contains_key(&(output.index() as u64)));
+    assert_eq!(mock.calls(), before_invalid);
+    let mut values = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([0, 4], Storage::F32(Vec::new())).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([4, 3], Storage::F32(vec![1.0; 12])).unwrap(),
+        ),
+    ]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(Vec::new())
+    );
+    assert!(!mock.calls().iter().any(|call| call.starts_with("launch:")));
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("buffer_create:"))
+    );
+}
+
+#[test]
+fn portable_f32_matmul_opencl_capture_keeps_dependent_prefix_device_resident() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 2], DType::F32);
+    let rhs = graph.input_dtype("rhs", [2, 2], DType::F32);
+    let product = graph.matmul(lhs, rhs).unwrap();
+    let output = graph.square(product).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let plan = OpenClPrefixPlan::plan_for_outputs(
+        context.clone(),
+        &decoded.items,
+        &[output.index() as u64],
+        renderer,
+    )
+    .unwrap();
+    let prefix = PreparedOpenClPrefix::from_plan(context, plan).unwrap();
+    let before = mock.calls();
+    let mut values = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            TensorData::from_storage([2, 2], Storage::F32(vec![1.0, 2.0, 3.0, 4.0])).unwrap(),
+        ),
+        (
+            rhs.index() as u64,
+            TensorData::from_storage([2, 2], Storage::F32(vec![5.0, 6.0, 7.0, 8.0])).unwrap(),
+        ),
+    ]);
+    prefix.execute(&mut values).unwrap();
+    let calls = &mock.calls()[before.len()..];
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("write:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("launch:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1
+    );
+    assert!(!values.contains_key(&(product.index() as u64)));
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![361.0, 484.0, 1849.0, 2500.0])
+    );
+}
+
+#[test]
+fn portable_f32_matmul_opencl_rejects_payloads_and_bindings_before_resource_work() {
+    let renderer = OpenClRenderer::default();
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 3], DType::F32);
+    let rhs = graph.input_dtype("rhs", [3, 2], DType::F32);
+    let output = graph.matmul(lhs, rhs).unwrap();
+    let mut items = schedule(&graph, output).unwrap().items;
+    items[0].input_bindings[0].desc.bytes += DType::F32.itemsize();
+    let before = mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(context.clone(), &items, renderer),
+        Err(OpenClError::InvalidBinding(_))
+    ));
+    assert_eq!(mock.calls(), before);
+
+    let mut narrow = Graph::new();
+    let lhs = narrow.input_dtype("lhs", [16, 16], DType::F16);
+    let rhs = narrow.input_dtype("rhs", [16, 8], DType::F16);
+    let output = narrow.matmul(lhs, rhs).unwrap();
+    let owner = context.owner_id();
+    let before = mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(context, &schedule(&narrow, output).unwrap().items, renderer),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("tensor-core")
+    ));
+    let calls = mock.calls();
+    assert_eq!(
+        &calls[before.len()..],
+        &[format!("context_release:{owner}")]
+    );
+}
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;

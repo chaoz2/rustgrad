@@ -1,9 +1,11 @@
 //! Immutable static matmul contracts and backend-neutral tiled planning.
+mod portable;
 mod quantized;
 mod tensor_core;
 mod tile;
 
 use crate::{DType, Graph, NodeId, Op, Scalar, Shape, TensorData};
+pub(crate) use portable::{PortableF32Matmul, PortableF32MatmulError};
 pub use quantized::{QuantizedMatmulError, QuantizedMatmulOrientation, QuantizedMatmulPlan};
 use std::{
     collections::hash_map::DefaultHasher,
