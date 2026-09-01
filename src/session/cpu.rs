@@ -444,8 +444,9 @@ impl CpuSession {
     ///
     /// The dynamic value composes through this session's pointwise unary,
     /// same-provenance binary, checked scalar, reduction, and realization
-    /// methods. Capture, artifacts, native JIT, devices, general broadcasting,
-    /// and session-level dynamic reverse mode remain deliberately unavailable.
+    /// methods. Its exact-cardinality first-order VJP is exposed separately;
+    /// capture, artifacts, native JIT, devices, and general broadcasting remain
+    /// deliberately unavailable.
     pub fn masked_select_dynamic(
         &mut self,
         input: &Tensor,
@@ -676,6 +677,24 @@ impl CpuSession {
         Ok(CpuBackend
             .execute_dynamic(&self.graph, self.dynamic_node(tensor)?, &self.bindings)?
             .output)
+    }
+
+    /// Applies an exact realized upstream to one dynamic result and returns
+    /// the first-order VJP in the requested static source descriptor.
+    ///
+    /// The output's count provenance remains dynamic: `upstream` must match
+    /// the concrete result shape and dtype for this realization. Bool masks
+    /// are cardinality inputs only and never receive a gradient.
+    pub fn dynamic_vjp(
+        &self,
+        output: &DynamicTensor,
+        upstream: &TensorData,
+        target: &Tensor,
+    ) -> Result<TensorData> {
+        let output = self.dynamic_node(output)?;
+        let target = self.node(target)?;
+        let plan = self.graph.dynamic_vjp_plan(output, target)?;
+        CpuBackend.execute_dynamic_vjp(&self.graph, &plan, upstream, &self.bindings)
     }
 
     /// Strict static Metal realization. It preflights the complete schedule
@@ -1090,6 +1109,35 @@ mod literal_tests {
         let mut foreign = CpuSession::new();
         assert!(matches!(
             foreign.dynamic_neg(&selected),
+            Err(Error::SessionHandleMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn dynamic_session_vjp_preserves_runtime_compaction_and_static_target_shape() {
+        let mut session = CpuSession::new();
+        let input = session
+            .variable([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap();
+        let mask = session
+            .tensor_with_dtype(
+                [1, 3],
+                DType::Bool,
+                [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+            )
+            .unwrap();
+        let selected = session.masked_select_dynamic(&input, &mask).unwrap();
+        let upstream = TensorData::new([4], vec![10.0, 20.0, 30.0, 40.0]).unwrap();
+        let gradient = session.dynamic_vjp(&selected, &upstream, &input).unwrap();
+        assert_eq!(gradient.shape(), &Shape::from([2, 3]));
+        assert_eq!(
+            gradient.to_vec_f64(),
+            vec![10.0, 0.0, 20.0, 30.0, 0.0, 40.0]
+        );
+
+        let foreign = CpuSession::new();
+        assert!(matches!(
+            foreign.dynamic_vjp(&selected, &upstream, &input),
             Err(Error::SessionHandleMismatch { .. })
         ));
     }

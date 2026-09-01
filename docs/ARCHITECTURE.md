@@ -292,13 +292,20 @@ nor reuses storage from those records. Capture, artifacts, replay, native JIT,
 PTX, and device lowering reject rather than falling back; the fixed
 `ScheduleItem` and RGSA/RGSM artifact ABIs are unchanged.
 
-Dynamic `Sum` retains the existing CPU first-order loss executor, which carries
-validated runtime upstream shapes and returns a gradient in the requested
-static source shape. Its local cotangents cross admitted derived static graph
-boundaries through an explicit cloned-graph `grad_with` seed, including the
-masked value expression and derived scalar operands. Dynamic `Mean` is
-forward-only; neither it nor the new runtime schedule participates in
-`Graph::grad` or general dynamic autograd.
+`DynamicVjpPlan` is the read-only graph-owned reverse descriptor: it binds one
+dynamic output and its exact count-bearing shape/dtype to one fixed static
+target descriptor, validates the supported dynamic route, rehearses every
+participating static reverse boundary on a private graph clone, and
+excludes Bool mask/cardinality inputs before CPU work. The shared CPU executor
+requires an upstream with the exact realized output shape, then scatters its
+row-major lanes through broadcast masks into the static source shape. Dynamic
+`Sum` uses that same plan for its implicit one seed. Local cotangents cross
+admitted derived static graph boundaries through an explicit cloned-graph
+`grad_with` seed, including the masked value expression and derived scalar
+operands. Dynamic `Mean` is forward-only; matching the checked-in source's
+current forward-only `size=None` masked-select acceptance, neither this
+first-order host result nor the runtime schedule participates in `Graph::grad`
+or higher-order dynamic autograd.
 
 `CpuSession` exposes this same exact ABI without mutable or raw arena-index
 access: `DynamicTensor::shape_expression` carries an opaque graph-local count
@@ -306,9 +313,11 @@ provenance token, and every operation validates session ownership.
 `nonzero_dynamic` and `masked_select_dynamic` create session-owned handles;
 pointwise branches,
 checked static scalars, fixed scalar `Sum`/forward-only `Mean`, and CPU
-realization accept them. Handles are session-identified like static session
-tensors. This is a public workflow facade over the existing plan, not a
-capture surface or dynamic device generalization.
+realization accept them. `dynamic_vjp` takes exact realized upstream storage
+and returns the fixed target-shaped first-order cotangent. Handles are
+session-identified like static session tensors. This is a public workflow
+facade over the existing plans, not a capture surface or dynamic device
+generalization.
 
 ## tinygrad-to-RustGrad mapping
 

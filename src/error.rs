@@ -280,6 +280,11 @@ pub enum Error {
     DynamicAllocation {
         reason: String,
     },
+    /// A dynamic-result reverse plan or realized cotangent violated its exact
+    /// graph-owned descriptor contract.
+    DynamicVjp {
+        reason: &'static str,
+    },
     IndexOutOfBounds {
         axis: usize,
         index: i64,
@@ -548,6 +553,7 @@ impl fmt::Display for Error {
             Self::DynamicAllocation { reason } => {
                 write!(f, "dynamic allocation failed: {reason}")
             }
+            Self::DynamicVjp { reason } => write!(f, "dynamic VJP failed: {reason}"),
             Self::IndexOutOfBounds { axis, index, dim } => write!(
                 f,
                 "index {index} is out of bounds for axis {axis} with length {dim}"

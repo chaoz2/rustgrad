@@ -3,7 +3,7 @@ use super::float8_reduce;
 use crate::engine::dynamic::RuntimeMaterializationMap;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
-use crate::ir::{DynamicInput, DynamicNodeId, DynamicOperation};
+use crate::ir::{DynamicInput, DynamicNodeId, DynamicOperation, DynamicVjpPlan};
 use crate::schedule::dynamic::{
     RuntimeBufferDesc, RuntimeCount, RuntimeCountId, RuntimeInstruction, RuntimeSchedule,
     RuntimeValueDesc, RuntimeValueSource, schedule_dynamic,
@@ -599,16 +599,55 @@ impl CpuBackend {
         wrt: NodeId,
         inputs: &HashMap<String, TensorData>,
     ) -> Result<DynamicGradient> {
+        let plan = graph.dynamic_vjp_plan(loss, wrt)?;
         let realized = self.execute_dynamic(graph, loss, inputs)?;
         if realized.output.shape().numel()? != 1 || !realized.output.dtype().is_float() {
             return Err(Error::NonScalarLoss(realized.output.shape().clone()));
         }
-        let seed = TensorData::from_scalars([], realized.output.dtype(), [Scalar::F(1.0)])?;
-        let gradient = self.dynamic_vjp(graph, loss, &seed, wrt, inputs)?;
+        let seed = TensorData::from_scalars(
+            realized.output.shape().clone(),
+            realized.output.dtype(),
+            [Scalar::F(1.0)],
+        )?;
+        let gradient =
+            self.dynamic_vjp_from_realized(graph, &plan, &realized.output, &seed, inputs)?;
         Ok(DynamicGradient {
             loss: realized,
             gradient,
         })
+    }
+
+    /// Executes one preflighted first-order VJP from an exact-cardinality
+    /// dynamic result into its static target descriptor.
+    pub fn execute_dynamic_vjp(
+        &self,
+        graph: &Graph,
+        plan: &DynamicVjpPlan,
+        upstream: &TensorData,
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<TensorData> {
+        plan.validate_against(graph)?;
+        let realized = self.execute_dynamic(graph, plan.output(), inputs)?;
+        self.dynamic_vjp_from_realized(graph, plan, &realized.output, upstream, inputs)
+    }
+
+    fn dynamic_vjp_from_realized(
+        &self,
+        graph: &Graph,
+        plan: &DynamicVjpPlan,
+        output: &TensorData,
+        upstream: &TensorData,
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<TensorData> {
+        plan.validate_realized(output, upstream)?;
+        let gradient =
+            self.dynamic_vjp(graph, plan.output(), upstream, plan.target().node, inputs)?;
+        if gradient.shape() != &plan.target().shape || gradient.dtype() != plan.target().dtype {
+            return Err(Error::DynamicVjp {
+                reason: "gradient descriptor mismatch",
+            });
+        }
+        Ok(gradient)
     }
 
     fn dynamic_value(
@@ -996,23 +1035,7 @@ impl CpuBackend {
     fn dynamic_input_depends_on(graph: &Graph, input: DynamicInput, wrt: NodeId) -> Result<bool> {
         match input {
             DynamicInput::StaticScalar(node) => graph.backward_slice_contains(node, wrt),
-            DynamicInput::Dynamic(node) => Self::dynamic_depends_on(graph, node, wrt),
-        }
-    }
-
-    fn dynamic_depends_on(graph: &Graph, output: DynamicNodeId, wrt: NodeId) -> Result<bool> {
-        match &graph.dynamic_node(output)?.operation {
-            DynamicOperation::Nonzero { .. } => Ok(false),
-            DynamicOperation::MaskedSelect { input, .. } => {
-                graph.backward_slice_contains(*input, wrt)
-            }
-            DynamicOperation::Unary { input, .. }
-            | DynamicOperation::Sum { input }
-            | DynamicOperation::Mean { input } => Self::dynamic_depends_on(graph, *input, wrt),
-            DynamicOperation::Binary { lhs, rhs, .. } => {
-                Ok(Self::dynamic_input_depends_on(graph, *lhs, wrt)?
-                    || Self::dynamic_input_depends_on(graph, *rhs, wrt)?)
-            }
+            DynamicInput::Dynamic(node) => graph.dynamic_backward_slice_contains(node, wrt),
         }
     }
 
@@ -1051,17 +1074,11 @@ impl CpuBackend {
         inputs: &HashMap<String, TensorData>,
     ) -> Result<TensorData> {
         let node = graph.dynamic_node(output)?;
-        let DynamicOperation::MaskedSelect { input, mask } = node.operation.clone() else {
+        let DynamicOperation::MaskedSelect { input, .. } = &node.operation else {
             return Err(Error::NonDifferentiableIndexing("dynamic nonzero"));
         };
-        let input = self.execute(graph, input, inputs)?;
-        if !input.dtype().is_float() {
-            return Err(Error::NonDifferentiableIndexing(
-                "dynamic masked_select input",
-            ));
-        }
-        let mask = self.execute(graph, mask, inputs)?;
-        dynamic_masked_select_vjp(&input, &mask, upstream)
+        let plan = graph.dynamic_vjp_plan(output, *input)?;
+        self.execute_dynamic_vjp(graph, &plan, upstream, inputs)
     }
 }
 
@@ -7142,6 +7159,113 @@ mod tests {
             .unwrap();
         assert_eq!(result.loss.output.to_vec_f64(), vec![20.]);
         assert_eq!(result.gradient.to_vec_f64(), vec![4., 0., 12.]);
+    }
+
+    #[test]
+    fn dynamic_masked_select_vjp_uses_exact_compaction_descriptor() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let mask = graph.input_dtype("mask", [1, 3], DType::Bool);
+        let output = graph.masked_select_dynamic(input, mask).unwrap();
+        let plan = graph.dynamic_vjp_plan(output, input).unwrap();
+        let bindings = HashMap::from([
+            ("input".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [1, 3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let upstream = data([4], &[10., 20., 30., 40.]);
+        let gradient = CpuBackend
+            .execute_dynamic_vjp(&graph, &plan, &upstream, &bindings)
+            .unwrap();
+        assert_eq!(gradient.shape(), &Shape::from([2, 3]));
+        assert_eq!(gradient.to_vec_f64(), vec![10., 0., 20., 30., 0., 40.]);
+        assert!(matches!(
+            CpuBackend.execute_dynamic_vjp(&graph, &plan, &data([3], &[1., 2., 3.]), &bindings),
+            Err(Error::DynamicVjp {
+                reason: "upstream descriptor mismatch"
+            })
+        ));
+
+        for truthy in [false, true] {
+            let mut scalar_graph = Graph::new();
+            let input = scalar_graph.input("input", []);
+            let mask = scalar_graph.input_dtype("mask", [], DType::Bool);
+            let output = scalar_graph.masked_select_dynamic(input, mask).unwrap();
+            let plan = scalar_graph.dynamic_vjp_plan(output, input).unwrap();
+            let bindings = HashMap::from([
+                ("input".into(), TensorData::scalar(7.0)),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars([], DType::Bool, [Scalar::Bool(truthy)]).unwrap(),
+                ),
+            ]);
+            let upstream = TensorData::from_scalars(
+                [usize::from(truthy)],
+                DType::F32,
+                truthy.then_some(Scalar::F(9.0)),
+            )
+            .unwrap();
+            let gradient = CpuBackend
+                .execute_dynamic_vjp(&scalar_graph, &plan, &upstream, &bindings)
+                .unwrap();
+            assert_eq!(gradient.shape(), &Shape::from([]));
+            assert_eq!(gradient.to_vec_f64(), vec![if truthy { 9.0 } else { 0.0 }]);
+        }
+
+        let mut empty_graph = Graph::new();
+        let input = empty_graph.input("input", [0, 3]);
+        let mask = empty_graph.input_dtype("mask", [1, 3], DType::Bool);
+        let output = empty_graph.masked_select_dynamic(input, mask).unwrap();
+        let plan = empty_graph.dynamic_vjp_plan(output, input).unwrap();
+        let bindings = HashMap::from([
+            ("input".into(), data([0, 3], &[])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [1, 3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let gradient = CpuBackend
+            .execute_dynamic_vjp(
+                &empty_graph,
+                &plan,
+                &TensorData::from_scalars([0], DType::F32, []).unwrap(),
+                &bindings,
+            )
+            .unwrap();
+        assert_eq!(gradient.shape(), &Shape::from([0, 3]));
+        assert!(gradient.is_empty());
+    }
+
+    #[test]
+    fn dynamic_vjp_rejects_unsupported_static_boundary_before_realization() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let guarded = graph.tensor_guard_distribution(input, 1).unwrap();
+        let mask = graph.input_dtype("mask", [1, 3], DType::Bool);
+        let selected = graph.masked_select_dynamic(guarded, mask).unwrap();
+        let loss = graph.dynamic_sum(selected).unwrap();
+        let before_static = graph.node_count();
+        let before_dynamic = graph.dynamic_nodes.len();
+        assert!(matches!(
+            CpuBackend.execute_dynamic_gradient(&graph, loss, input, &HashMap::new()),
+            Err(Error::NonDifferentiableIndexing(
+                "tensor guard gradient is not represented"
+            ))
+        ));
+        assert_eq!(graph.node_count(), before_static);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
     }
 
     #[test]
