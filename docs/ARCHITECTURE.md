@@ -1205,10 +1205,11 @@ template-valid shape cannot conceal an invalid in-range specialization. Gather
 and Scatter variable extents require a conservative all-domain inequality proof;
 the source reshape/expand-to-Gather embedding composition consequently replays
 variable token counts through dense materialized Gather operands without
-rebuilding a Graph. Computed affine
-copies need separately authenticated symbolic view metadata, and shape-changing
-bitcasts need byte-divisibility proofs, so both remain fail-closed rather than
-overloading the source-backed UOp view table.
+rebuilding a Graph. A Contiguous plan over a source-backed affine view reuses
+that authenticated symbolic view metadata while keeping its input descriptor
+physical; computed affine copies still lack symbolic provenance, and
+shape-changing bitcasts still need byte-divisibility proofs, so both remain
+fail-closed.
 Specialization changes descriptor geometry, not scalar algebra: eligible newly
 captured elementwise kernels were already normalized before publication, while
 a decoded historical artifact keeps its original UOp structure for
@@ -1421,20 +1422,23 @@ complete planning before native execution.
 The same adapter also covers the released two-class configured CIFAR chain:
 static F32 NCHW/OIHW `Conv2d(3→2, 1×1, groups=1, unit stride/dilation, zero
 padding, optional bias) → ReLU → AdaptiveAvgPool2d(1,1) → Flatten → Linear(2→2)`.
-`MovementKernelPlan::AffineCopy` is the narrow pure static computed-view
-boundary: any exactly bounded affine read map from a computed producer is copied
-into fresh owned dense storage. Signed reverse and zero-stride broadcast reads
-are valid because source aliases never alias the output or each other as write
-targets. The interpreter and movement-v2 CPU renderer share that immutable plan;
-native addressing normalizes the proof to nonnegative indices and copies raw
-storage widths. A separate `rustgrad-ptx-affine-copy-v1` renderer consumes only
-that validated concrete plan, retains its exact two-buffer schedule ABI, and
-emits unsigned 64-bit address arithmetic plus raw 8/16/32/64-bit loads and
-stores. The fixed-schema CUDA graph executor therefore keeps the computed
-producer and affine materialization device-resident and downloads only the
-requested dense output. This path changes neither RGUA/RGSA movement bytes nor
-the generic elementwise PTX identity. Effectful, symbolic, non-affine,
-OpenCL/Metal/WebGPU, and live-CUDA routes remain fail-closed or unvalidated.
+`MovementKernelPlan::AffineCopy` is the narrow pure static affine-view boundary:
+any exactly bounded affine read map from a source or computed producer is copied
+into fresh owned dense storage. A Contiguous boundary selects this plan directly
+instead of publishing an intermediate view; ordinary dense producers retain the
+explicit copy plan. Signed reverse and zero-stride broadcast reads are valid
+because source aliases never alias the output or each other as write targets.
+The interpreter and movement-v2 CPU renderer share that immutable plan; native
+addressing normalizes the proof to nonnegative indices and copies raw storage
+widths. A separate `rustgrad-ptx-affine-copy-v1` renderer consumes only that
+validated concrete plan, retains its exact two-buffer schedule ABI, and emits
+unsigned 64-bit address arithmetic plus raw 8/16/32/64-bit loads and stores.
+The fixed-schema CUDA graph executor therefore keeps computed producers and
+affine materialization device-resident and downloads only requested dense
+outputs. This changes neither RGUA/RGSA movement bytes nor generic elementwise
+PTX identity. Symbolic specialization is retained only for source-backed
+Contiguous views; computed-symbolic, effectful, non-affine, OpenCL/Metal/WebGPU,
+and live-CUDA routes remain fail-closed or unvalidated.
 The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
 preflight/plan/execute path rather than adding a profiler or executor. Its
 immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`

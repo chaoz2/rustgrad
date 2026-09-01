@@ -12695,27 +12695,24 @@ fn tinygrad_contiguous_materializes_exact_values_and_preserves_buffer_identities
     );
 
     let scheduled = crate::schedule(&graph, contiguous).unwrap();
-    assert_eq!(scheduled.items.len(), 2);
-    assert_eq!(scheduled.items[1].dependencies, [scheduled.items[0].id]);
-    assert_eq!(scheduled.items[0].consumers, [scheduled.items[1].id]);
+    assert_eq!(scheduled.items.len(), 1);
+    assert!(scheduled.items[0].dependencies.is_empty());
     let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
-        scheduled.items.last().unwrap().kernel.operation()
+        scheduled.items[0].kernel.operation()
     else {
         panic!("contiguous must schedule as a movement copy")
     };
-    assert!(matches!(
-        &plan.kind,
-        crate::MovementKernelKind::Contiguous { input: operand }
-            if operand.node == transposed && operand.shape == Shape::new([3, 2])
-    ));
-    let mut missing_edge = scheduled.clone();
-    missing_edge.items[0].consumers.clear();
-    missing_edge.items[1].dependencies.clear();
-    assert!(matches!(
-        missing_edge.validate(),
-        Err(crate::ScheduleError::Binding(reason))
-            if reason == "scheduled input producer edge is absent"
-    ));
+    let crate::MovementKernelKind::AffineCopy {
+        input: operand,
+        view,
+    } = &plan.kind
+    else {
+        panic!("contiguous view must schedule as one affine copy")
+    };
+    assert_eq!(operand.node, input);
+    assert_eq!(operand.shape, Shape::new([2, 3]));
+    assert_eq!(view.logical_shape, Shape::new([3, 2]));
+    assert_eq!(view.strides, [1, 3]);
     let captured = crate::CapturedSchedule::capture(&graph, &scheduled, &[contiguous]).unwrap();
     let encoded = captured.to_bytes().unwrap();
     assert_eq!(
@@ -12754,25 +12751,36 @@ fn tinygrad_contiguous_materializes_exact_values_and_preserves_buffer_identities
 #[test]
 fn tinygrad_contiguous_backward_has_distinct_reverse_rule_and_atomic_admission() {
     let mut graph = Graph::new();
-    let input = graph.input_dtype_requires_grad("input", [2], DType::F32, true);
+    let input = graph.input_dtype_requires_grad("input", [2, 1], DType::F32, true);
     let squared = graph.square(input).unwrap();
     let boundary = graph.contiguous_backward(squared).unwrap();
     assert!(
         matches!(graph.op(boundary).unwrap(), Op::ContiguousBackward { input: source } if *source == squared)
     );
-    assert_eq!(graph.shape(boundary).unwrap(), &Shape::new([2]));
+    assert_eq!(graph.shape(boundary).unwrap(), &Shape::new([2, 1]));
     assert!(graph.requires_grad(boundary).unwrap());
 
-    let seed_input = graph.input_dtype_requires_grad("seed", [2], DType::F32, false);
-    let seed = graph.neg(seed_input).unwrap();
+    let seed_input = graph.input_dtype_requires_grad("seed", [1, 2], DType::F32, false);
+    let seed = graph.permute(seed_input, [1, 0]).unwrap();
     let before = graph.node_count();
     let gradient = graph.grad_with(boundary, input, Some(seed), true).unwrap();
-    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2]));
-    assert!(
-        graph.nodes[before..]
-            .iter()
-            .any(|node| matches!(node.op, Op::Contiguous { input: source } if source == seed))
-    );
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 1]));
+    let cotangent_copy = graph.nodes[before..]
+        .iter()
+        .position(|node| matches!(node.op, Op::Contiguous { input: source } if source == seed))
+        .map(|position| NodeId::from_index(before + position))
+        .expect("contiguous-backward cotangent copy");
+    let scheduled = crate::schedule(&graph, cotangent_copy).unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert!(matches!(
+        scheduled.items[0].kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(
+                &plan.kind,
+                crate::MovementKernelKind::AffineCopy { input, .. }
+                    if input.node == seed_input
+            )
+    ));
 
     let mut ordinary = Graph::new();
     let input = ordinary.input_dtype_requires_grad("input", [2], DType::F32, true);

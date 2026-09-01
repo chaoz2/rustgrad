@@ -17,8 +17,8 @@ pub struct MovementOperand {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MovementKernelKind {
-    /// A pure computed producer viewed through a static, injective,
-    /// non-negative affine map and copied into owned dense storage.
+    /// A source or pure computed producer viewed through a checked static
+    /// affine read map and copied into owned dense storage.
     AffineCopy {
         input: MovementOperand,
         view: AffineView,
@@ -191,6 +191,84 @@ impl MovementKernelPlan {
             dtype: graph
                 .dtype(output)
                 .map_err(|_| MovementPlanError::UnsupportedDType)?,
+            cache_key: 0,
+        };
+        plan.cache_key = plan.expected_cache_key();
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Selects the executable movement plan used by the schedule compiler.
+    ///
+    /// A contiguous boundary over an affine view writes that view directly
+    /// into the boundary's fresh dense output. Other contiguous inputs retain
+    /// the explicit dense-copy plan, including ordinary computed producers.
+    pub(crate) fn from_scheduled_graph(
+        graph: &Graph,
+        output: NodeId,
+    ) -> Result<Self, MovementPlanError> {
+        match Self::from_contiguous_affine_view(graph, output) {
+            Err(MovementPlanError::NotMovement) => Self::from_graph(graph, output),
+            result => result,
+        }
+    }
+
+    fn from_contiguous_affine_view(
+        graph: &Graph,
+        output: NodeId,
+    ) -> Result<Self, MovementPlanError> {
+        let input = match graph
+            .op(output)
+            .map_err(|_| MovementPlanError::InvalidGeometry)?
+        {
+            Op::Contiguous { input }
+                if matches!(
+                    graph.op(*input),
+                    Ok(Op::Shrink { .. }
+                        | Op::Reshape { .. }
+                        | Op::Permute { .. }
+                        | Op::Expand { .. }
+                        | Op::Stride { .. })
+                ) =>
+            {
+                *input
+            }
+            Op::Contiguous { .. } => return Err(MovementPlanError::NotMovement),
+            _ => return Err(MovementPlanError::NotMovement),
+        };
+        let rangeified = match crate::rangeify::static_view(graph, input) {
+            Ok(view) => view,
+            Err(crate::rangeify::RangeifyError::Invalid) => {
+                return Err(MovementPlanError::InvalidGeometry);
+            }
+            Err(crate::rangeify::RangeifyError::Unsupported(_)) => {
+                match crate::rangeify::computed_view(graph, input) {
+                    Ok(view) => view,
+                    Err(crate::rangeify::RangeifyError::Invalid) => {
+                        return Err(MovementPlanError::InvalidGeometry);
+                    }
+                    Err(crate::rangeify::RangeifyError::Unsupported(_)) => {
+                        return Err(MovementPlanError::NotMovement);
+                    }
+                }
+            }
+        };
+        let input = MovementOperand::from_graph(graph, rangeified.source)?;
+        let output_shape = graph
+            .shape(output)
+            .map_err(|_| MovementPlanError::InvalidGeometry)?
+            .clone();
+        let dtype = graph
+            .dtype(output)
+            .map_err(|_| MovementPlanError::UnsupportedDType)?;
+        let mut plan = Self {
+            kind: MovementKernelKind::AffineCopy {
+                input,
+                view: rangeified.view,
+            },
+            output,
+            output_shape,
+            dtype,
             cache_key: 0,
         };
         plan.cache_key = plan.expected_cache_key();
@@ -474,6 +552,34 @@ impl MovementKernelPlan {
         };
         let mut specialized = Self {
             kind,
+            output: self.output,
+            output_shape,
+            dtype: self.dtype,
+            cache_key: 0,
+        };
+        specialized.cache_key = specialized.expected_cache_key();
+        specialized.validate()?;
+        Ok(specialized)
+    }
+
+    pub(crate) fn specialize_affine_view(
+        &self,
+        input_shape: Shape,
+        output_shape: Shape,
+        view: AffineView,
+    ) -> Result<Self, MovementPlanError> {
+        let MovementKernelKind::AffineCopy { input, .. } = &self.kind else {
+            return Err(MovementPlanError::InvalidGeometry);
+        };
+        let mut specialized = Self {
+            kind: MovementKernelKind::AffineCopy {
+                input: MovementOperand {
+                    node: input.node,
+                    shape: input_shape,
+                    dtype: input.dtype,
+                },
+                view,
+            },
             output: self.output,
             output_shape,
             dtype: self.dtype,
@@ -1422,6 +1528,119 @@ mod tests {
             plan.execute(&[value]).unwrap().storage(),
             &Storage::I32(vec![16, 9, 4, 1])
         );
+    }
+
+    #[test]
+    fn scheduled_contiguous_uses_affine_sources_and_dense_computed_fallback() {
+        let mut source = Graph::new();
+        let input = source.input_dtype("input", [2, 3], DType::F32);
+        let view = source.permute(input, [1, 0]).unwrap();
+        let output = source.contiguous(view).unwrap();
+        let plan = MovementKernelPlan::from_scheduled_graph(&source, output).unwrap();
+        let MovementKernelKind::AffineCopy {
+            input: operand,
+            view,
+        } = &plan.kind
+        else {
+            panic!("source-backed contiguous affine copy")
+        };
+        assert_eq!(operand.node, input);
+        assert_eq!(view.logical_shape, Shape::from([3, 2]));
+        assert_eq!(view.strides, [1, 3]);
+
+        let mut expanded = Graph::new();
+        let input = expanded.input_dtype("input", [2, 1], DType::I32);
+        let view = expanded.expand(input, [2, 3]).unwrap();
+        let output = expanded.contiguous(view).unwrap();
+        let plan = MovementKernelPlan::from_scheduled_graph(&expanded, output).unwrap();
+        assert_eq!(
+            plan.execute(&[TensorData::from_storage([2, 1], Storage::I32(vec![7, 11])).unwrap()])
+                .unwrap()
+                .storage(),
+            &Storage::I32(vec![7, 7, 7, 11, 11, 11])
+        );
+
+        let mut reversed = Graph::new();
+        let input = reversed.input_dtype("input", [4], DType::I32);
+        let view = reversed
+            .stride(
+                input,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        let output = reversed.contiguous(view).unwrap();
+        let plan = MovementKernelPlan::from_scheduled_graph(&reversed, output).unwrap();
+        assert_eq!(
+            plan.execute(&[TensorData::from_storage([4], Storage::I32(vec![1, 2, 3, 4])).unwrap()])
+                .unwrap()
+                .storage(),
+            &Storage::I32(vec![4, 3, 2, 1])
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0, 3], DType::F32);
+        let view = empty.permute(input, [1, 0]).unwrap();
+        let output = empty.contiguous(view).unwrap();
+        let plan = MovementKernelPlan::from_scheduled_graph(&empty, output).unwrap();
+        assert_eq!(
+            plan.execute(&[TensorData::from_storage([0, 3], Storage::F32(vec![])).unwrap()])
+                .unwrap()
+                .shape(),
+            &Shape::from([3, 0])
+        );
+
+        let mut computed = Graph::new();
+        let input = computed.input_dtype("input", [2, 3], DType::F32);
+        let producer = computed.square(input).unwrap();
+        let view = computed.permute(producer, [1, 0]).unwrap();
+        let output = computed.contiguous(view).unwrap();
+        let plan = MovementKernelPlan::from_scheduled_graph(&computed, output).unwrap();
+        assert!(matches!(
+            &plan.kind,
+            MovementKernelKind::AffineCopy { input, view }
+                if input.node == producer
+                    && view.logical_shape == Shape::from([3, 2])
+                    && view.strides == [1, 3]
+        ));
+
+        let output = computed.contiguous(producer).unwrap();
+        let plan = MovementKernelPlan::from_scheduled_graph(&computed, output).unwrap();
+        assert!(matches!(
+            &plan.kind,
+            MovementKernelKind::Contiguous { input } if input.node == producer
+        ));
+
+        let mut non_affine = Graph::new();
+        let input = non_affine.input_dtype("input", [2, 3], DType::F32);
+        let permuted = non_affine.permute(input, [1, 0]).unwrap();
+        let reshaped = non_affine.reshape(permuted, [6]).unwrap();
+        let output = non_affine.contiguous(reshaped).unwrap();
+        let plan = MovementKernelPlan::from_scheduled_graph(&non_affine, output).unwrap();
+        assert!(matches!(
+            &plan.kind,
+            MovementKernelKind::Contiguous { input } if input.node == reshaped
+        ));
+
+        let mut malformed = Graph::new();
+        let input = malformed.input_dtype("input", [2, 3], DType::F32);
+        let view = malformed.permute(input, [1, 0]).unwrap();
+        let output = malformed.contiguous(view).unwrap();
+        malformed.nodes[view.index()].op = Op::Permute {
+            input,
+            axes: vec![0, 0],
+        };
+        assert_eq!(
+            MovementKernelPlan::from_scheduled_graph(&malformed, output),
+            Err(MovementPlanError::InvalidGeometry)
+        );
+        assert!(matches!(
+            crate::schedule(&malformed, output),
+            Err(crate::ScheduleError::Binding(_))
+        ));
     }
 
     #[test]

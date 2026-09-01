@@ -1392,13 +1392,19 @@ mod tests {
         let permuted = graph.permute(input, [1, 0]).unwrap();
         let output = graph.contiguous(permuted).unwrap();
         let capture = captured(&graph, &[output]);
-        assert_eq!(capture.items.len(), 2);
+        assert_eq!(capture.items.len(), 1);
         assert!(matches!(
-            capture.items[1].kernel.operation(),
+            capture.items[0].kernel.operation(),
             crate::Operation::Movement(crate::MovementValue::Plan(plan))
-                if matches!(&plan.kind, crate::MovementKernelKind::Contiguous { .. })
+                if matches!(
+                    &plan.kind,
+                    crate::MovementKernelKind::AffineCopy { input: operand, view }
+                        if operand.node == input
+                            && view.logical_shape == Shape::new([2, 2])
+                            && view.strides == [1, 2]
+                )
         ));
-        assert_eq!(capture.items[1].dependencies, [capture.items[0].id]);
+        assert!(capture.items[0].dependencies.is_empty());
 
         let value = TensorData::from_storage(
             [2, 2],
@@ -1448,6 +1454,85 @@ mod tests {
                 .items
                 .iter()
                 .all(|item| item.backend == ItemBackend::NativeJit)
+        );
+
+        let mut float8 = Graph::new();
+        let input = float8.input_dtype("input", [2, 2], DType::F8E4M3);
+        let viewed = float8.permute(input, [1, 0]).unwrap();
+        let output = float8.contiguous(viewed).unwrap();
+        let capture = captured(&float8, &[output]);
+        assert_eq!(capture.items.len(), 1);
+        let value = TensorData::from_storage(
+            [2, 2],
+            Storage::Float8(crate::Float8Storage::from_raw(
+                crate::Float8Format::E4M3,
+                vec![0x00, 0x80, 0x7f, 0xff],
+            )),
+        )
+        .unwrap();
+        let replay = executor
+            .replay(
+                &capture,
+                &BTreeMap::from([("input".into(), value)]),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        let Storage::Float8(value) = replay.outputs[0].storage() else {
+            panic!("Float8 contiguous affine output")
+        };
+        assert_eq!(value.as_raw(), [0x00, 0x7f, 0x80, 0xff]);
+
+        let mut computed = Graph::new();
+        let input = computed.input_dtype("input", [2, 1], DType::I32);
+        let producer = computed.square(input).unwrap();
+        let expanded = computed.expand(producer, [2, 3]).unwrap();
+        let output = computed.contiguous(expanded).unwrap();
+        let capture = captured(&computed, &[output]);
+        assert_eq!(capture.items.len(), 2);
+        let copy = capture
+            .items
+            .iter()
+            .find(|item| item.primary_output().id == output.index() as u64)
+            .unwrap();
+        let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = copy.kernel.operation()
+        else {
+            panic!("computed contiguous copy plan")
+        };
+        assert!(matches!(
+            &plan.kind,
+            crate::MovementKernelKind::AffineCopy { input: operand, view }
+                if operand.node == producer && view.strides == [1, 0]
+        ));
+        assert!(copy.dependencies.iter().any(|dependency| {
+            capture.items[*dependency as usize].primary_output().id == producer.index() as u64
+        }));
+        let mut missing_edge = capture.clone();
+        let copy_position = missing_edge
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == output.index() as u64)
+            .unwrap();
+        let dependency = missing_edge.items[copy_position].dependencies[0] as usize;
+        missing_edge.items[copy_position].dependencies.clear();
+        missing_edge.items[dependency].consumers.clear();
+        assert!(crate::schedule::artifact::validate_capture(&missing_edge).is_err());
+        let replay = executor
+            .replay(
+                &capture,
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::from_storage([2, 1], Storage::I32(vec![2, -3])).unwrap(),
+                )]),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            replay.outputs[0].storage(),
+            &Storage::I32(vec![4, 4, 4, 9, 9, 9])
         );
     }
 
@@ -3159,6 +3244,64 @@ mod tests {
         )
         .unwrap();
         (graph, output, BTreeMap::from([("input".into(), values)]))
+    }
+
+    #[test]
+    fn symbolic_source_view_contiguous_specializes_the_affine_copy_plan() {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let viewed = graph.permute(input, [1, 0]).unwrap();
+        let output = graph.contiguous(viewed).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                crate::SymbolicShape::new(vec![2usize.into(), extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 3)]),
+        )
+        .unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let capture = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(capture.to_bytes().unwrap(), bytes);
+
+        let executor = CapturedReplayExecutor::default();
+        let empty = executor
+            .replay_symbolic(
+                &capture,
+                &BTreeMap::from([("extent".into(), 0)]),
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::from_storage([2, 0], Storage::F32(vec![])).unwrap(),
+                )]),
+                CapturedReplayOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(empty.outputs[0].shape(), &Shape::new([0, 2]));
+
+        let rebound = executor
+            .replay_symbolic(
+                &capture,
+                &BTreeMap::from([("extent".into(), 4)]),
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::new([2, 4], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap(),
+                )]),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(rebound.outputs[0].shape(), &Shape::new([4, 2]));
+        assert_eq!(
+            rebound.outputs[0].values(),
+            &[1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0]
+        );
     }
 
     #[test]

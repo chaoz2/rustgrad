@@ -332,7 +332,7 @@ pub fn lower_graph_static_conv2d(
 /// Lowers one materializing concat/gather/scatter operation into its validated
 /// shared movement payload. Native renderers consume its ordered operand ABI.
 pub fn lower_graph_movement(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
-    let plan = crate::MovementKernelPlan::from_graph(graph, output)
+    let plan = crate::MovementKernelPlan::from_scheduled_graph(graph, output)
         .map_err(|_| UOpError::InvalidArgument)?;
     let dtype = plan.dtype;
     let kernel = UOp::from_operation(
