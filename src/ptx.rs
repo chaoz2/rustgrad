@@ -28,7 +28,7 @@ mod matmul_tests;
 #[path = "ptx_prefix_scan.rs"]
 mod prefix_scan;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v30";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v31";
 /// Separate identity for raw storage-width computed affine materialization.
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 pub const PTX_THREEFRY_RENDERER_VERSION: &str = "rustgrad-ptx-live-threefry-v1";
@@ -715,13 +715,13 @@ fn render(
         };
         storage_ok && typed_alu_ok
     });
+    let reduction = reduction_spec(store)?;
     let storage_mode = match scoped_storage_plan(store, renderer.sm) {
         Ok(mode) => mode,
-        Err(_) if generic_storage => None,
+        Err(_) if generic_storage || reduction.is_some() => None,
         Err(error) => return Err(error),
     };
     let mut abi = BTreeMap::new();
-    let reduction = reduction_spec(store)?;
     for node in &nodes {
         if let Some((buffer, elements, source_shape)) = match node.operation() {
             Operation::Index(IndexValue::Buffer {
@@ -793,7 +793,24 @@ fn render(
     }
     let entry = format!("rg_e{}_b{}", extent, buffers.len());
     if let Some(reduction) = reduction {
-        return render_reduction(renderer, store, &buffers, *out_id, *extent, reduction);
+        // Generic F32/F64/integer scalar emission already commits every typed
+        // UOp at its declared width. Scoped modes are needed only to decode a
+        // narrow finalized lane for one proven storage operation.
+        let epilogue_storage_mode =
+            if matches!(reduction.plan.output_dtype, DType::F16 | DType::BF16) {
+                storage_mode.or_else(|| reduction_epilogue_storage_mode(store))
+            } else {
+                None
+            };
+        return render_reduction(
+            renderer,
+            store,
+            &buffers,
+            *out_id,
+            *extent,
+            reduction,
+            epilogue_storage_mode,
+        );
     }
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
@@ -858,6 +875,7 @@ fn render(
             allow_reduction_narrow: false,
             storage_mode,
             allow_linked_f32_exp,
+            substitution: None,
         },
     )?;
     let out = buffers.iter().find(|b| b.id == *out_id).unwrap();
@@ -4512,10 +4530,11 @@ fn emit_select_predicate_value(
     }
 }
 #[derive(Clone, Copy)]
-struct EmitOptions {
+struct EmitOptions<'a> {
     allow_reduction_narrow: bool,
     storage_mode: Option<ScopedStorageMode>,
     allow_linked_f32_exp: bool,
+    substitution: Option<(&'a UOp, &'a str)>,
 }
 
 fn emit(
@@ -4524,13 +4543,19 @@ fn emit(
     lines: &mut Vec<String>,
     map: &mut BTreeMap<usize, usize>,
     linear: &str,
-    options: EmitOptions,
+    options: EmitOptions<'_>,
 ) -> Result<String, PtxError> {
     let EmitOptions {
         allow_reduction_narrow,
         storage_mode,
         allow_linked_f32_exp,
+        substitution,
     } = options;
+    if let Some((target, value)) = substitution
+        && n.shares_node_with(target)
+    {
+        return Ok(value.into());
+    }
     let id = map.len();
     map.insert(id, lines.len() + 1);
     let ty = n
@@ -4727,6 +4752,13 @@ fn emit(
             }
         }
         Operation::Cast
+            if n.sources()[0].ty() == n.ty()
+                && substitution
+                    .is_some_and(|(target, _)| n.sources()[0].shares_node_with(target)) =>
+        {
+            return child(0);
+        }
+        Operation::Cast
             if matches!(
                 storage_mode,
                 Some(
@@ -4805,6 +4837,45 @@ fn emit(
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
+            if allow_reduction_narrow
+                && storage_mode.is_none()
+                && *op == crate::UnaryOp::Reciprocal
+                && matches!(ty, DType::F32 | DType::F64)
+            {
+                if ty == DType::F32 {
+                    lines.push(format!("  cvt.rn.f64.f32 %fd31, {a};"));
+                    lines.push("  div.rn.f64 %fd31, 1.0, %fd31;".into());
+                    lines.push(format!("  cvt.rn.f32.f64 {dst}, %fd31;"));
+                } else {
+                    lines.push(format!("  div.rn.f64 {dst}, 1.0, {a};"));
+                }
+                return Ok(dst);
+            }
+            if allow_reduction_narrow
+                && storage_mode.is_none()
+                && *op == crate::UnaryOp::Sqrt
+                && matches!(ty, DType::F32 | DType::F64)
+            {
+                if ty == DType::F32 {
+                    lines.push(format!("  cvt.rn.f64.f32 %fd31, {a};"));
+                    lines.push("  sqrt.rn.f64 %fd31, %fd31;".into());
+                    lines.push(format!("  cvt.rn.f32.f64 {dst}, %fd31;"));
+                } else {
+                    lines.push(format!("  sqrt.rn.f64 {dst}, {a};"));
+                }
+                return Ok(dst);
+            }
+            if allow_reduction_narrow && storage_mode.is_none() && *op == crate::UnaryOp::IsInf {
+                let source_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped IsInf source".into()))?
+                    .scalar;
+                if ty != DType::Bool {
+                    return Err(PtxError::Unsupported("IsInf must produce Bool".into()));
+                }
+                emit_isinf_predicate(lines, &dst, a, source_dtype);
+                return Ok(dst);
+            }
             if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Sub) {
                 // The whole-root proof owns this exact `Add(lhs, Neg(rhs))`
                 // composition. The enclosing Add emits one typed Sub, so the
@@ -5616,10 +5687,7 @@ fn emit(
     Ok(dst)
 }
 
-struct ReductionSpec<'a> {
-    plan: crate::reduction_native::NativeReductionPlan,
-    value: &'a UOp,
-}
+type ReductionSpec<'a> = crate::reduction_native::NativeReductionKernel<'a>;
 
 #[derive(Clone, Copy)]
 enum ReductionAccumulator {
@@ -5744,6 +5812,46 @@ fn ptx_commit_narrow_accumulator(lines: &mut Vec<String>, dtype: DType) {
     }
 }
 
+/// Commits one numeric register through the declared storage dtype and
+/// returns both the decoded scalar seen by a following ALU node and the raw
+/// register suitable for a final store.
+fn ptx_commit_reduction_output(
+    lines: &mut Vec<String>,
+    dtype: DType,
+    value: &str,
+) -> (String, String) {
+    match dtype {
+        DType::F16 => {
+            lines.push(format!("  cvt.rn.f16.f32 %r60, {value};"));
+            lines.push("  cvt.f32.f16 %f70, %r60;".into());
+            ("%f70".into(), "%r60".into())
+        }
+        DType::BF16 => {
+            lines.push(format!("  mov.b32 %r60, {value};"));
+            lines.push("  and.b32 %r61, %r60, 0x7f800000;".into());
+            lines.push("  setp.eq.u32 %p6, %r61, 0x7f800000;".into());
+            lines.push("  and.b32 %r61, %r60, 0x007fffff;".into());
+            lines.push("  setp.ne.u32 %p7, %r61, 0;".into());
+            lines.push("  and.pred %p6, %p6, %p7;".into());
+            lines.push("  shr.u32 %r62, %r60, 16;".into());
+            lines.push("  and.b32 %r63, %r62, 0x7f;".into());
+            lines.push("  setp.eq.u32 %p7, %r63, 0;".into());
+            lines.push("  or.b32 %r63, %r62, 1;".into());
+            lines.push("  selp.b32 %r62, %r63, %r62, %p7;".into());
+            lines.push("  shr.u32 %r61, %r60, 16;".into());
+            lines.push("  and.b32 %r61, %r61, 1;".into());
+            lines.push("  add.u32 %r61, %r61, 0x7fff;".into());
+            lines.push("  add.u32 %r61, %r60, %r61;".into());
+            lines.push("  shr.u32 %r61, %r61, 16;".into());
+            lines.push("  selp.b32 %r60, %r62, %r61, %p6;".into());
+            lines.push("  shl.b32 %r61, %r60, 16;".into());
+            lines.push("  mov.b32 %f70, %r61;".into());
+            ("%f70".into(), "%r60".into())
+        }
+        _ => (value.into(), value.into()),
+    }
+}
+
 fn reduction_accumulator(dtype: DType) -> Result<ReductionAccumulator, PtxError> {
     match dtype {
         DType::F16 | DType::BF16 | DType::F32 => Ok(ReductionAccumulator::F32),
@@ -5762,16 +5870,80 @@ fn reduction_accumulator(dtype: DType) -> Result<ReductionAccumulator, PtxError>
 }
 
 fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
-    let Some(finalize) = store
-        .sources()
-        .get(1)
-        .filter(|node| matches!(node.operation(), Operation::ReduceFinalize))
-    else {
-        return Ok(None);
-    };
-    let (plan, value) = crate::reduction_native::NativeReductionPlan::from_finalize(finalize)
-        .map_err(|reason| PtxError::Unsupported(reason.into()))?;
-    Ok(Some(ReductionSpec { plan, value }))
+    crate::reduction_native::NativeReductionKernel::from_store(store)
+        .map_err(|reason| PtxError::Unsupported(reason.into()))
+}
+
+fn reduction_epilogue_storage_mode(store: &UOp) -> Option<ScopedStorageMode> {
+    let kernel = crate::reduction_native::NativeReductionKernel::from_store(store)
+        .ok()
+        .flatten()?;
+    kernel.has_epilogue().then_some(())?;
+    Some(match kernel.epilogue_root.operation() {
+        Operation::GraphUnary(crate::UnaryOp::Sign) => ScopedStorageMode::Sign,
+        Operation::GraphUnary(crate::UnaryOp::Neg) => ScopedStorageMode::Neg,
+        Operation::GraphUnary(crate::UnaryOp::Abs) => ScopedStorageMode::Abs,
+        Operation::GraphUnary(crate::UnaryOp::Reciprocal)
+            if kernel
+                .epilogue_root
+                .sources()
+                .first()
+                .is_some_and(|source| {
+                    matches!(
+                        source.operation(),
+                        Operation::GraphUnary(crate::UnaryOp::Sqrt)
+                    )
+                }) =>
+        {
+            ScopedStorageMode::Rsqrt
+        }
+        Operation::GraphUnary(crate::UnaryOp::Reciprocal) => ScopedStorageMode::Reciprocal,
+        Operation::GraphUnary(crate::UnaryOp::Sqrt) => ScopedStorageMode::Sqrt,
+        Operation::GraphUnary(crate::UnaryOp::IsInf) => ScopedStorageMode::IsInf,
+        Operation::GraphBinary(crate::BinaryOp::Add)
+            if kernel.epilogue_root.sources().get(1).is_some_and(|source| {
+                matches!(
+                    source.operation(),
+                    Operation::GraphUnary(crate::UnaryOp::Neg)
+                )
+            }) =>
+        {
+            ScopedStorageMode::Sub
+        }
+        Operation::GraphBinary(crate::BinaryOp::Add) => ScopedStorageMode::Add,
+        Operation::GraphBinary(crate::BinaryOp::Sub) => ScopedStorageMode::Sub,
+        Operation::GraphBinary(crate::BinaryOp::Mul)
+            if kernel.epilogue_root.sources().get(1).is_some_and(|source| {
+                matches!(
+                    source.operation(),
+                    Operation::GraphUnary(crate::UnaryOp::Sign)
+                )
+            }) =>
+        {
+            ScopedStorageMode::Abs
+        }
+        Operation::GraphBinary(crate::BinaryOp::Mul)
+            if kernel.epilogue_root.sources().get(1).is_some_and(|source| {
+                matches!(
+                    source.operation(),
+                    Operation::GraphUnary(crate::UnaryOp::Reciprocal)
+                )
+            }) =>
+        {
+            ScopedStorageMode::Div
+        }
+        Operation::GraphBinary(crate::BinaryOp::Mul) => ScopedStorageMode::Mul,
+        Operation::GraphBinary(crate::BinaryOp::Div) => ScopedStorageMode::Div,
+        Operation::GraphBinary(crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) => {
+            ScopedStorageMode::Extrema
+        }
+        Operation::GraphCompare(crate::CompareOp::Eq) => ScopedStorageMode::Eq,
+        Operation::GraphCompare(crate::CompareOp::Ne) => ScopedStorageMode::Ne,
+        Operation::GraphCompare(crate::CompareOp::Lt) => ScopedStorageMode::OrderedLt,
+        Operation::GraphLogical(crate::LogicalOp::Not) => ScopedStorageMode::LogicalNot,
+        Operation::Ternary(crate::uop::Ternary::Where) => ScopedStorageMode::Select,
+        _ => return None,
+    })
 }
 
 fn render_reduction(
@@ -5781,13 +5953,14 @@ fn render_reduction(
     out_id: u64,
     extent: usize,
     reduction: ReductionSpec<'_>,
+    storage_mode: Option<ScopedStorageMode>,
 ) -> Result<RenderedPtx, PtxError> {
     let out = buffers
         .iter()
         .find(|buffer| buffer.id == out_id)
         .ok_or_else(|| PtxError::Unsupported("reduction output missing ABI".into()))?;
     let plan = &reduction.plan;
-    if out.dtype != plan.output_dtype {
+    if out.dtype != reduction.output_dtype {
         return Err(PtxError::Unsupported(
             "reduction output ABI dtype is inconsistent".into(),
         ));
@@ -5876,7 +6049,7 @@ fn render_reduction(
             plan.geometry.keepdim,
         )?);
         let value = emit(
-            reduction.value,
+            reduction.producer,
             &ids,
             &mut lines,
             &mut map,
@@ -5885,6 +6058,7 @@ fn render_reduction(
                 allow_reduction_narrow: true,
                 storage_mode: None,
                 allow_linked_f32_exp: false,
+                substitution: None,
             },
         )?;
         let candidate = ptx_reduction_candidate(&mut lines, accumulator, value_dtype, &value)?;
@@ -6008,35 +6182,47 @@ fn render_reduction(
             ReductionAccumulator::I64 | ReductionAccumulator::U64 => "%rd60",
         }
     };
-    let result = match out.dtype {
-        DType::F16 => {
-            lines.push(format!("  cvt.rn.f16.f32 %r60, {result};"));
-            "%r60"
+    let (committed, stored) = ptx_commit_reduction_output(&mut lines, plan.output_dtype, result);
+    let result = if reduction.has_epilogue() {
+        if matches!(plan.output_dtype, DType::F16 | DType::BF16) && storage_mode.is_none() {
+            return Err(PtxError::Unsupported(
+                "narrow reduction epilogue lacks an exact PTX storage mode".into(),
+            ));
         }
-        DType::BF16 => {
-            // Preserve representable NaN sign/payload bits and force a low
-            // BF16 payload bit only when truncation would produce infinity.
-            // Non-NaNs retain the ordinary wrapping ties-to-even path.
-            lines.push(format!("  mov.b32 %r60, {result};"));
-            lines.push("  and.b32 %r61, %r60, 0x7f800000;".into());
-            lines.push("  setp.eq.u32 %p6, %r61, 0x7f800000;".into());
-            lines.push("  and.b32 %r61, %r60, 0x007fffff;".into());
-            lines.push("  setp.ne.u32 %p7, %r61, 0;".into());
-            lines.push("  and.pred %p6, %p6, %p7;".into());
-            lines.push("  shr.u32 %r62, %r60, 16;".into());
-            lines.push("  and.b32 %r63, %r62, 0x7f;".into());
-            lines.push("  setp.eq.u32 %p7, %r63, 0;".into());
-            lines.push("  or.b32 %r63, %r62, 1;".into());
-            lines.push("  selp.b32 %r62, %r63, %r62, %p7;".into());
-            lines.push("  shr.u32 %r61, %r60, 16;".into());
-            lines.push("  and.b32 %r61, %r61, 1;".into());
-            lines.push("  add.u32 %r61, %r61, 0x7fff;".into());
-            lines.push("  add.u32 %r61, %r60, %r61;".into());
-            lines.push("  shr.u32 %r61, %r61, 16;".into());
-            lines.push("  selp.b32 %r60, %r62, %r61, %p6;".into());
-            "%r60"
-        }
-        _ => result,
+        let substitution = if matches!(
+            storage_mode,
+            Some(
+                ScopedStorageMode::Neg
+                    | ScopedStorageMode::Abs
+                    | ScopedStorageMode::IsInf
+                    | ScopedStorageMode::IsFinite
+                    | ScopedStorageMode::Select
+                    | ScopedStorageMode::Relu
+                    | ScopedStorageMode::LeakyRelu
+                    | ScopedStorageMode::Extrema
+                    | ScopedStorageMode::Clamp
+            )
+        ) {
+            stored.as_str()
+        } else {
+            committed.as_str()
+        };
+        let expression = emit(
+            reduction.epilogue_root,
+            &ids,
+            &mut lines,
+            &mut map,
+            "%r3",
+            EmitOptions {
+                allow_reduction_narrow: true,
+                storage_mode,
+                allow_linked_f32_exp: false,
+                substitution: Some((reduction.finalize, substitution)),
+            },
+        )?;
+        narrow_storage_result(&mut lines, expression, out.dtype, storage_mode)
+    } else {
+        stored
     };
     let output_index = ids[&out_id] + 1;
     lines.push(format!(
@@ -7183,7 +7369,8 @@ impl PtxCache {
 mod tests {
     use super::*;
     use crate::{
-        Backend, CpuBackend, Driver, Graph, MovementKernelKind, Scalar, TensorData, UOp, UType,
+        Backend, CpuBackend, Driver, Graph, MovementKernelKind, Scalar, Storage, TensorData, UOp,
+        UType,
     };
     use std::{
         collections::HashMap,
@@ -7209,6 +7396,92 @@ mod tests {
             .unwrap()
             .retain_primary_context()
             .unwrap()
+    }
+
+    #[test]
+    fn reduction_epilogue_renders_one_ptx_kernel() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::F32);
+        let reduced = graph.sum(input, 1).unwrap();
+        let output = graph.relu(reduced).unwrap();
+        let scheduled = crate::schedule(&graph, output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&scheduled.items[0].kernel)
+            .unwrap();
+        assert!(rendered.source.contains("REDUCE:"));
+        assert!(rendered.source.contains("selp"));
+        assert!(
+            rendered
+                .buffers
+                .iter()
+                .all(|buffer| buffer.id != reduced.index() as u64)
+        );
+    }
+
+    #[test]
+    fn f32_multistep_reduction_epilogue_commits_every_ptx_alu_node() {
+        use std::num::NonZeroUsize;
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [1, 3], DType::F32);
+        let reduced = graph.sum(input, 1).unwrap();
+        let one = graph.constant(TensorData::scalar(1.0));
+        let three = graph.constant(TensorData::scalar(3.0));
+        let shifted = graph.add(reduced, one).unwrap();
+        let output = graph.mul(shifted, three).unwrap();
+        let scheduled = crate::schedule(&graph, output).unwrap();
+        assert_eq!(scheduled.items.len(), 1);
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&scheduled.items[0].kernel)
+            .unwrap();
+        assert!(rendered.source.contains("add.f32"));
+        assert!(rendered.source.contains("mul.f32"));
+        assert!(!rendered.source.contains("add.rn.f64"));
+        assert!(!rendered.source.contains("mul.rn.f64"));
+
+        let input_value =
+            TensorData::from_storage([1, 3], Storage::F32(vec![16_777_216.0, 1.0, -16_777_216.0]))
+                .unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("x".into(), input_value.clone())]),
+            )
+            .unwrap();
+        let bytes = input_value.to_le_bytes().unwrap();
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let input_lease = primary
+            .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+            .unwrap();
+        let output_lease = primary
+            .allocate(NonZeroUsize::new(expected.to_le_bytes().unwrap().len()).unwrap())
+            .unwrap();
+        input_lease.view().copy_from(0, &bytes).unwrap();
+        let kernel = ConcurrentPtxCache::new()
+            .get_or_load(&primary, rendered.clone(), 32)
+            .unwrap();
+        let bindings = rendered
+            .buffers
+            .iter()
+            .map(|abi| PtxBinding {
+                buffer: if abi.mutable {
+                    output_lease.view()
+                } else {
+                    input_lease.view()
+                },
+                dtype: abi.dtype,
+                mutable: abi.mutable,
+            })
+            .collect::<Vec<_>>();
+        kernel.launch(&stream, &bindings, true).unwrap();
+        let mut actual = vec![0; expected.to_le_bytes().unwrap().len()];
+        output_lease.view().copy_to(0, &mut actual).unwrap();
+        assert_eq!(actual, expected.to_le_bytes().unwrap());
     }
 
     fn computed_reverse_item(dtype: DType) -> crate::ScheduleItem {

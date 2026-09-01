@@ -18,6 +18,28 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[test]
+fn reduction_epilogue_renders_one_wgsl_kernel_with_committed_value() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", Shape::from([2, 3]), DType::F32);
+    let reduced = graph.sum(input, 1).unwrap();
+    let output = graph.relu(reduced).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let rendered = WgslRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&scheduled.items[0].kernel)
+        .unwrap();
+    assert!(rendered.source.contains("rg_acc"));
+    assert!(rendered.source.contains("select("));
+    assert!(
+        rendered
+            .buffers
+            .iter()
+            .all(|buffer| buffer.id != reduced.index() as u64)
+    );
+}
+
 #[derive(Default)]
 struct Failures {
     instance: Option<&'static str>,

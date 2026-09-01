@@ -943,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn realizes_reduction_boundary_without_recomputing_shared_producers() {
+    fn realizes_single_reduction_epilogue_without_intermediate_storage() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2, 3]), DType::F32);
         let y = graph.input_dtype("y", Shape::from([1, 3]), DType::F32);
@@ -974,8 +974,14 @@ mod tests {
             ),
         ]);
         let schedule = crate::schedule_many(&graph, &[output]).unwrap();
-        assert_eq!(schedule.items.len(), 2);
-        assert_eq!(schedule.items[1].dependencies, vec![schedule.items[0].id]);
+        assert_eq!(schedule.items.len(), 1);
+        assert!(schedule.items[0].dependencies.is_empty());
+        assert!(
+            schedule.items[0]
+                .inputs
+                .iter()
+                .all(|input| input.id != sum.index() as u64)
+        );
         let actual = realize(
             &graph,
             &schedule,
@@ -986,7 +992,7 @@ mod tests {
         .unwrap();
         let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
         assert_eq!(actual.outputs[0].storage(), expected.storage());
-        assert_eq!(actual.trace.items.len(), 2);
+        assert_eq!(actual.trace.items.len(), 1);
         assert!(
             actual
                 .trace
@@ -1331,9 +1337,13 @@ mod tests {
         let one = graph.constant(TensorData::scalar(1.0));
         let reduced = graph.add(first, one).unwrap();
         let branch = graph.neg(first).unwrap();
-        let later = graph
+        let later_reduction = graph
             .reduce(y, ReduceKind::Sum, Some(vec![1]), true)
             .unwrap();
+        // Keep this memory-planning fixture focused on two materialized
+        // lifetimes. The explicit copy is an observable boundary, so reduction
+        // epilogue fusion must not erase the temporary whose reuse is tested.
+        let later = graph.contiguous(later_reduction).unwrap();
         let partial = graph.add(reduced, branch).unwrap();
         let output = graph.add(partial, later).unwrap();
         let inputs = HashMap::from([
@@ -1359,7 +1369,13 @@ mod tests {
         ]);
         let requested = [branch, reduced, output];
         let schedule = crate::schedule_many(&graph, &requested).unwrap();
-        assert!(schedule.items.len() >= 5);
+        assert!(schedule.items.len() >= 4);
+        assert!(
+            schedule
+                .items
+                .iter()
+                .any(|item| item.node == later_reduction)
+        );
         let disabled = crate::MemoryPlan::from_schedule(&schedule, &requested, false).unwrap();
         let enabled = crate::MemoryPlan::from_schedule(&schedule, &requested, true).unwrap();
         assert!(enabled.peak_allocations < disabled.peak_allocations);

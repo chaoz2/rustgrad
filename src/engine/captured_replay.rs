@@ -1182,6 +1182,54 @@ mod tests {
             .remove(0)
     }
 
+    #[test]
+    fn captured_single_reduction_epilogue_replays_as_one_native_item() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let bias = graph.input("bias", [2]);
+        let reduced = graph.sum(input, 1).unwrap();
+        let shifted = graph.add(reduced, bias).unwrap();
+        let output = graph.relu(shifted).unwrap();
+        let capture = captured(&graph, &[output]);
+        assert_eq!(capture.items.len(), 1);
+        assert!(
+            capture.items[0]
+                .ordered_inputs()
+                .iter()
+                .all(|binding| binding.desc.id != reduced.index() as u64)
+        );
+
+        let input_value = TensorData::new([2, 3], vec![1.0, 2.0, 3.0, -4.0, 1.0, 2.0]).unwrap();
+        let bias_value = TensorData::new([2], vec![-7.0, 2.0]).unwrap();
+        let bindings = BTreeMap::from([
+            ("input".into(), input_value.clone()),
+            ("bias".into(), bias_value.clone()),
+        ]);
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("input".into(), input_value), ("bias".into(), bias_value)]),
+            )
+            .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let interpreted = executor
+            .replay(&capture, &bindings, CapturedReplayOptions::default())
+            .unwrap();
+        assert_eq!(interpreted.outputs[0].storage(), expected.storage());
+        let native = executor
+            .replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(native.outputs[0].storage(), expected.storage());
+        assert_eq!(native.trace.items[0].backend, ItemBackend::NativeJit);
+    }
+
     fn assert_computed_affine_replay(
         graph: &Graph,
         output: crate::NodeId,

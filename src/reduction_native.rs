@@ -1,5 +1,6 @@
 use crate::{
-    DType, Operation, ReduceKind, ReductionDType, ReductionPlan, ReductionValue, Scalar, Shape, UOp,
+    DType, IndexValue, Operation, ReduceKind, ReductionDType, ReductionPlan, ReductionValue,
+    Scalar, Shape, UOp,
 };
 
 /// One validated, backend-neutral reduction recurrence.
@@ -14,6 +15,80 @@ pub(crate) struct NativeReductionPlan {
     pub(crate) source_dtype: DType,
     pub(crate) accumulator_dtype: DType,
     pub(crate) output_dtype: DType,
+}
+
+/// One checked reduction recurrence and its optional scalar epilogue under a
+/// Store. The epilogue remains ordinary UOps; this view only identifies the
+/// exact committed ReduceFinalize value that renderers substitute.
+pub(crate) struct NativeReductionKernel<'a> {
+    pub(crate) plan: NativeReductionPlan,
+    pub(crate) producer: &'a UOp,
+    pub(crate) finalize: &'a UOp,
+    pub(crate) epilogue_root: &'a UOp,
+    pub(crate) output_dtype: DType,
+}
+
+impl<'a> NativeReductionKernel<'a> {
+    pub(crate) fn from_store(store: &'a UOp) -> Result<Option<Self>, &'static str> {
+        if !matches!(store.operation(), Operation::Store) || store.sources().len() != 2 {
+            return Err("native reduction kernel lacks Store");
+        }
+        let index = &store.sources()[0];
+        let epilogue_root = &store.sources()[1];
+        let mut finalizes = Vec::new();
+        fn collect<'a>(node: &'a UOp, finalizes: &mut Vec<&'a UOp>) {
+            if matches!(node.operation(), Operation::ReduceFinalize) {
+                if !finalizes
+                    .iter()
+                    .any(|finalize| node.shares_node_with(finalize))
+                {
+                    finalizes.push(node);
+                }
+                return;
+            }
+            for source in node.sources() {
+                collect(source, finalizes);
+            }
+        }
+        collect(epilogue_root, &mut finalizes);
+        let Some(finalize) = finalizes.first().copied() else {
+            return Ok(None);
+        };
+        if finalizes.len() != 1 {
+            return Err("native reduction kernel must contain exactly one ReduceFinalize");
+        }
+        let (plan, producer) = NativeReductionPlan::from_finalize(finalize)?;
+        let (output_shape, output_dtype) = match index.operation() {
+            Operation::Index(IndexValue::Buffer { output_shape, .. }) => (
+                output_shape,
+                index
+                    .ty()
+                    .ok_or("native reduction output index is untyped")?
+                    .scalar,
+            ),
+            _ => return Err("native reduction output requires a dense Buffer index"),
+        };
+        if &plan.geometry.output != output_shape
+            || epilogue_root
+                .ty()
+                .ok_or("native reduction epilogue is untyped")?
+                .scalar
+                != output_dtype
+        {
+            return Err("native reduction epilogue output descriptor is inconsistent");
+        }
+        Ok(Some(Self {
+            plan,
+            producer,
+            finalize,
+            epilogue_root,
+            output_dtype,
+        }))
+    }
+
+    pub(crate) fn has_epilogue(&self) -> bool {
+        !self.epilogue_root.shares_node_with(self.finalize)
+    }
 }
 
 impl NativeReductionPlan {

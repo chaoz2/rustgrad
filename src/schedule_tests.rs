@@ -607,6 +607,339 @@ fn sum_and_mean_schedule_to_accumulator_uops() {
 }
 
 #[test]
+fn single_reduction_epilogue_is_one_item_without_intermediate_storage() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::from([2, 3]));
+    let bias = graph.input("bias", Shape::from([2]));
+    let reduced = graph.sum(x, 1).unwrap();
+    let output = graph.add(reduced, bias).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let item = &scheduled.items[0];
+    assert!(item.boundary.is_none());
+    assert!(item.dependencies.is_empty());
+    assert_eq!(item.node, output);
+    assert!(
+        item.inputs
+            .iter()
+            .all(|input| input.id != reduced.index() as u64)
+    );
+    let store = item
+        .kernel
+        .sources()
+        .iter()
+        .find(|node| matches!(node.operation(), crate::Operation::Store))
+        .unwrap();
+    let kernel = crate::reduction_native::NativeReductionKernel::from_store(store)
+        .unwrap()
+        .unwrap();
+    assert!(kernel.has_epilogue());
+    assert_eq!(kernel.output_dtype, DType::F32);
+
+    let values = HashMap::from([
+        (
+            "x".into(),
+            TensorData::new(Shape::from([2, 3]), vec![1.0, 2.0, 3.0, -4.0, 1.0, 2.0]).unwrap(),
+        ),
+        (
+            "bias".into(),
+            TensorData::new(Shape::from([2]), vec![0.5, 2.0]).unwrap(),
+        ),
+    ]);
+    let result = CpuBackend.execute(&graph, output, &values).unwrap();
+    assert_eq!(result.storage(), &crate::Storage::F32(vec![6.5, 1.0]));
+}
+
+#[test]
+fn reduction_epilogue_fusion_respects_requested_shared_and_shape_boundaries() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::from([2, 3]));
+    let reduced = graph.sum(x, 1).unwrap();
+    let one = graph.constant(TensorData::new(Shape::new([]), vec![1.0]).unwrap());
+    let epilogue = graph.add(reduced, one).unwrap();
+
+    let requested = schedule_many(&graph, &[reduced, epilogue]).unwrap();
+    assert_eq!(requested.items.len(), 2);
+
+    let other = graph.mul(reduced, one).unwrap();
+    let shared = schedule_many(&graph, &[epilogue, other]).unwrap();
+    assert!(shared.items.iter().any(|item| item.node == reduced));
+
+    let two = graph.constant(TensorData::new(Shape::new([]), vec![2.0]).unwrap());
+    let outer = graph.mul(epilogue, two).unwrap();
+    let nearest = schedule_many(&graph, &[epilogue, outer]).unwrap();
+    assert_eq!(nearest.items.len(), 2);
+    let inner_item = nearest
+        .items
+        .iter()
+        .find(|item| item.node == epilogue)
+        .unwrap();
+    let outer_item = nearest
+        .items
+        .iter()
+        .find(|item| item.node == outer)
+        .unwrap();
+    assert!(
+        crate::reduction_native::NativeReductionKernel::from_store(
+            inner_item
+                .kernel
+                .sources()
+                .iter()
+                .find(|node| matches!(node.operation(), crate::Operation::Store))
+                .unwrap(),
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(outer_item.dependencies, vec![inner_item.id]);
+    assert!(
+        outer_item
+            .inputs
+            .iter()
+            .any(|input| input.id == epilogue.index() as u64)
+    );
+    let inputs = HashMap::from([(
+        "x".into(),
+        TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+    )]);
+    let realized = crate::realize(
+        &graph,
+        &nearest,
+        &[epilogue, outer],
+        &inputs,
+        crate::RealizationPolicy::Interpreter,
+    )
+    .unwrap();
+    assert_eq!(
+        realized.outputs[0].storage(),
+        &crate::Storage::F32(vec![7.0, 16.0])
+    );
+    assert_eq!(
+        realized.outputs[1].storage(),
+        &crate::Storage::F32(vec![14.0, 32.0])
+    );
+
+    let moved = graph.reshape(reduced, Shape::from([1, 2])).unwrap();
+    let mixed_use = schedule_many(&graph, &[epilogue, moved]).unwrap();
+    assert!(mixed_use.items.iter().any(|item| item.node == reduced));
+
+    let expanded = graph.expand(reduced, Shape::from([2, 2])).unwrap();
+    let shape_changing = schedule(&graph, expanded).unwrap();
+    assert!(shape_changing.items.iter().any(|item| item.node == reduced));
+
+    let second_reduction = graph.sum(epilogue, 0).unwrap();
+    let two_reductions = schedule(&graph, second_reduction).unwrap();
+    assert!(two_reductions.items.iter().any(|item| item.node == reduced));
+
+    let external =
+        schedule_with_external_materializations(&graph, &[epilogue], &[reduced]).unwrap();
+    assert!(
+        external.items.iter().any(|item| {
+            item.node == epilogue && item.external_materializations == vec![reduced]
+        })
+    );
+
+    let mut integer_graph = Graph::new();
+    let integers = integer_graph.input_dtype("integers", Shape::from([2, 3]), DType::I32);
+    let divisor = integer_graph.input_dtype("divisor", Shape::from([2]), DType::I32);
+    let integer_sum = integer_graph
+        .reduce_with_dtypes(
+            integers,
+            crate::ReduceKind::Sum,
+            Some(vec![1]),
+            false,
+            crate::ReductionDType::new(DType::I32, DType::I32),
+        )
+        .unwrap();
+    let faulting = integer_graph
+        .binary(crate::BinaryOp::Div, integer_sum, divisor)
+        .unwrap();
+    let faulting_schedule = schedule(&integer_graph, faulting).unwrap();
+    assert!(
+        faulting_schedule
+            .items
+            .iter()
+            .any(|item| item.node == integer_sum)
+    );
+
+    let mut narrow_graph = Graph::new();
+    let narrow = narrow_graph.input_dtype("narrow", [2, 3], DType::F16);
+    let narrow_sum = narrow_graph
+        .reduce_with_dtypes(
+            narrow,
+            crate::ReduceKind::Sum,
+            Some(vec![1]),
+            false,
+            crate::ReductionDType::new(DType::F16, DType::F16),
+        )
+        .unwrap();
+    let one = narrow_graph.constant(
+        TensorData::from_storage(Shape::new([]), crate::Storage::F16(vec![0x3c00])).unwrap(),
+    );
+    let sibling_input = narrow_graph.input_dtype("sibling", [2], DType::F16);
+    let sibling_sum = narrow_graph.add(sibling_input, sibling_input).unwrap();
+    let sibling = narrow_graph.mul(sibling_sum, one).unwrap();
+    let second = narrow_graph.add(narrow_sum, sibling).unwrap();
+    let narrow_schedule = schedule(&narrow_graph, second).unwrap();
+    assert!(
+        narrow_schedule
+            .items
+            .iter()
+            .any(|item| item.node == narrow_sum)
+    );
+    let narrow_inputs = HashMap::from([
+        (
+            "narrow".into(),
+            TensorData::from_storage(
+                [2, 3],
+                crate::Storage::F16(vec![0x6800, 0x3c00, 0xe800, 0x8000, 0, 0]),
+            )
+            .unwrap(),
+        ),
+        (
+            "sibling".into(),
+            TensorData::from_storage([2], crate::Storage::F16(vec![0x3c00, 0x8000])).unwrap(),
+        ),
+    ]);
+    let expected = CpuBackend
+        .execute(&narrow_graph, second, &narrow_inputs)
+        .unwrap();
+    let actual = crate::realize(
+        &narrow_graph,
+        &narrow_schedule,
+        &[second],
+        &narrow_inputs,
+        crate::RealizationPolicy::Interpreter,
+    )
+    .unwrap();
+    assert_eq!(actual.outputs[0].storage(), expected.storage());
+}
+
+#[test]
+fn shared_epilogue_owns_reduction_before_two_requested_siblings() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::from([2, 3]));
+    let reduced = graph.sum(x, 1).unwrap();
+    let one = graph.constant(TensorData::new(Shape::new([]), vec![1.0]).unwrap());
+    let shared = graph.add(reduced, one).unwrap();
+    let two = graph.constant(TensorData::new(Shape::new([]), vec![2.0]).unwrap());
+    let three = graph.constant(TensorData::new(Shape::new([]), vec![3.0]).unwrap());
+    let left = graph.mul(shared, two).unwrap();
+    let right = graph.mul(shared, three).unwrap();
+
+    let scheduled = schedule_many(&graph, &[left, right]).unwrap();
+    assert_eq!(scheduled.items.len(), 3);
+    assert!(!scheduled.items.iter().any(|item| item.node == reduced));
+    let shared_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == shared)
+        .unwrap();
+    assert!(
+        crate::reduction_native::NativeReductionKernel::from_store(
+            shared_item
+                .kernel
+                .sources()
+                .iter()
+                .find(|node| matches!(node.operation(), crate::Operation::Store))
+                .unwrap(),
+        )
+        .unwrap()
+        .is_some()
+    );
+    for output in [left, right] {
+        let item = scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap();
+        assert_eq!(item.dependencies, vec![shared_item.id]);
+        assert!(
+            item.inputs
+                .iter()
+                .any(|input| input.id == shared.index() as u64)
+        );
+        assert!(
+            item.inputs
+                .iter()
+                .all(|input| input.id != reduced.index() as u64)
+        );
+    }
+
+    let inputs = HashMap::from([(
+        "x".into(),
+        TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+    )]);
+    let realized = crate::realize(
+        &graph,
+        &scheduled,
+        &[left, right],
+        &inputs,
+        crate::RealizationPolicy::Interpreter,
+    )
+    .unwrap();
+    assert_eq!(
+        realized.outputs[0].storage(),
+        &crate::Storage::F32(vec![14.0, 32.0])
+    );
+    assert_eq!(
+        realized.outputs[1].storage(),
+        &crate::Storage::F32(vec![21.0, 48.0])
+    );
+}
+
+#[test]
+fn public_mean_and_min_compositions_keep_one_checked_reduction_kernel() {
+    let mut mean_graph = Graph::new();
+    let input = mean_graph.input("x", Shape::from([2, 3]));
+    let mean = mean_graph
+        .mean_with_axes(input, Some(vec![1]), false)
+        .unwrap();
+    let mean_schedule = schedule(&mean_graph, mean).unwrap();
+    assert_eq!(mean_schedule.items.len(), 1);
+    assert_eq!(
+        mean_schedule.items[0]
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .filter(|node| matches!(node.operation(), crate::Operation::ReduceFinalize))
+            .count(),
+        1
+    );
+    let values = HashMap::from([(
+        "x".into(),
+        TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+    )]);
+    assert_eq!(
+        CpuBackend
+            .execute(&mean_graph, mean, &values)
+            .unwrap()
+            .storage(),
+        &crate::Storage::F32(vec![2.0, 5.0])
+    );
+    let default_mean = mean_graph.mean_default(input).unwrap();
+    assert_eq!(schedule(&mean_graph, default_mean).unwrap().items.len(), 1);
+    let gradient = mean_graph.grad(default_mean, input).unwrap();
+    assert_eq!(
+        CpuBackend
+            .execute(&mean_graph, gradient, &values)
+            .unwrap()
+            .storage(),
+        &crate::Storage::F32(vec![1.0 / 6.0; 6])
+    );
+
+    let mut min_graph = Graph::new();
+    let input = min_graph.input("x", Shape::from([2, 3]));
+    let minimum = min_graph
+        .min_with_axes(input, Some(vec![1]), false)
+        .unwrap();
+    let min_schedule = schedule(&min_graph, minimum).unwrap();
+    assert_eq!(min_schedule.items.len(), 1);
+    min_schedule.items[0].kernel.validate().unwrap();
+}
+
+#[test]
 fn temporary_reuse_is_deterministic_and_never_overlaps_or_mismatches() {
     let a = buffer(10, 16, 4);
     let b = buffer(11, 16, 4);

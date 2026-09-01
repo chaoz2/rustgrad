@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v5";
+pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v6";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -268,23 +268,25 @@ impl MetalRenderer {
             .sources()
             .get(1)
             .ok_or_else(|| MetalError::Unsupported("store has no value".into()))?;
-        let reduction = matches!(value.operation(), Operation::ReduceFinalize)
-            .then(|| {
-                crate::reduction_native::NativeReductionPlan::from_finalize(value)
-                    .map(|(plan, _)| plan)
-                    .map_err(|reason| MetalError::Unsupported(reason.into()))
-            })
-            .transpose()?;
+        let reduction = crate::reduction_native::NativeReductionKernel::from_store(store)
+            .map_err(|reason| MetalError::Unsupported(reason.into()))?;
         let reduction_roots = nodes
             .iter()
             .filter(|node| matches!(node.operation(), Operation::ReduceFinalize))
-            .count();
+            .fold(Vec::<&UOp>::new(), |mut roots, node| {
+                if !roots.iter().any(|root| node.shares_node_with(root)) {
+                    roots.push(node);
+                }
+                roots
+            })
+            .len();
         if reduction_roots != usize::from(reduction.is_some()) {
             return Err(MetalError::Unsupported(
                 "reduction must be the sole stored value".into(),
             ));
         }
-        if let Some(plan) = &reduction {
+        if let Some(reduction) = &reduction {
+            let plan = &reduction.plan;
             for dtype in [plan.source_dtype, plan.accumulator_dtype, plan.output_dtype] {
                 supported_storage(dtype)?;
             }
@@ -321,15 +323,14 @@ impl MetalRenderer {
         lines.push("    uint gid [[thread_position_in_grid]]) {".into());
         lines.push("  if ((ulong)gid >= extent) return;".into());
         let mut source_map = BTreeMap::new();
-        let expression = if let Some(plan) = &reduction {
+        let expression = if let Some(reduction) = &reduction {
             if transaction.is_some() {
                 return Err(MetalError::Unsupported(
                     "guarded reduction producers are outside the exact Metal subset".into(),
                 ));
             }
             emit_metal_reduction(
-                plan,
-                value,
+                reduction,
                 output_position,
                 &ids,
                 &mut source_map,
@@ -395,15 +396,14 @@ impl MetalRenderer {
 }
 
 fn emit_metal_reduction(
-    plan: &crate::reduction_native::NativeReductionPlan,
-    finalize: &UOp,
+    reduction: &crate::reduction_native::NativeReductionKernel<'_>,
     output_position: usize,
     ids: &BTreeMap<u64, usize>,
     source_map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
 ) -> Result<(), MetalError> {
-    let (_, producer) = crate::reduction_native::NativeReductionPlan::from_finalize(finalize)
-        .map_err(|reason| MetalError::Unsupported(reason.into()))?;
+    let plan = &reduction.plan;
+    let producer = reduction.producer;
     let accumulator_type = metal_storage_type(plan.accumulator_dtype);
     let identity = metal_reduction_literal(plan.accumulator_dtype, plan.identity())?;
     lines.push(format!("  {accumulator_type} rg_acc = {identity};"));
@@ -492,9 +492,24 @@ fn emit_metal_reduction(
             lines.push(format!("  rg_acc = (float)(rg_acc / {divisor});"));
         }
     }
-    let stored = MetalScalarDialect
+    let finalized = MetalScalarDialect
         .cast(plan.accumulator_dtype, plan.output_dtype, "rg_acc")
         .map_err(MetalError::Unsupported)?;
+    let committed = MetalScalarDialect
+        .cast(plan.output_dtype, plan.output_dtype, &finalized)
+        .map_err(MetalError::Unsupported)?;
+    let stored = if reduction.has_epilogue() {
+        emit_expr_with_substitution(
+            reduction.epilogue_root,
+            ids,
+            source_map,
+            lines,
+            "(ulong)gid",
+            Some((reduction.finalize, committed.as_str())),
+        )?
+    } else {
+        committed
+    };
     lines.push(format!("  b{output_position}[gid] = {stored};"));
     Ok(())
 }
@@ -664,6 +679,22 @@ fn emit_expr(
     lines: &mut Vec<String>,
     linear: &str,
 ) -> Result<String, MetalError> {
+    emit_expr_with_substitution(node, ids, source_map, lines, linear, None)
+}
+
+fn emit_expr_with_substitution(
+    node: &UOp,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+    linear: &str,
+    substitution: Option<(&UOp, &str)>,
+) -> Result<String, MetalError> {
+    if let Some((target, value)) = substitution
+        && node.shares_node_with(target)
+    {
+        return Ok(value.into());
+    }
     let map_id = source_map.len();
     source_map.insert(map_id, lines.len() + 1);
     let dtype = node
@@ -671,13 +702,16 @@ fn emit_expr(
         .ok_or_else(|| MetalError::Unsupported(format!("untyped {:?}", node.operation())))?
         .scalar;
     supported_storage(dtype)?;
-    let child =
-        |position: usize, source_map: &mut BTreeMap<usize, usize>, lines: &mut Vec<String>| {
-            node.sources()
-                .get(position)
-                .ok_or_else(|| MetalError::Unsupported("missing expression operand".into()))
-                .and_then(|source| emit_expr(source, ids, source_map, lines, linear))
-        };
+    let child = |position: usize,
+                 source_map: &mut BTreeMap<usize, usize>,
+                 lines: &mut Vec<String>| {
+        node.sources()
+            .get(position)
+            .ok_or_else(|| MetalError::Unsupported("missing expression operand".into()))
+            .and_then(|source| {
+                emit_expr_with_substitution(source, ids, source_map, lines, linear, substitution)
+            })
+    };
     match node.operation() {
         Operation::Const(value) => match value {
             LiteralValue::Scalar {
