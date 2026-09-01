@@ -281,6 +281,35 @@ pub(crate) struct RawCopyAddress {
     pub(crate) axes: Vec<RawCopyAxis>,
 }
 
+/// Borrowed, fully checked projection of one injective static placement into a
+/// race-free output-driven kernel. Every output lane is written exactly once:
+/// it either names one source lane through `axes`, or receives raw zero bits.
+#[derive(Clone, Debug)]
+pub(crate) struct StaticPositionWrite<'a> {
+    plan: &'a MovementKernelPlan,
+    input: &'a MovementOperand,
+    axes: Vec<StaticPositionAxis>,
+    input_elements: usize,
+    input_bytes: usize,
+    elements: usize,
+    bytes: usize,
+}
+
+/// One checked row-major term in the inverse destination-to-source map.
+/// `first + quotient * spacing` is a mapped output coordinate; `reversed`
+/// converts that quotient back into the original source-axis coordinate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StaticPositionAxis {
+    pub(crate) output_axis: usize,
+    pub(crate) output_dimension: usize,
+    pub(crate) output_divisor: usize,
+    pub(crate) source_dimension: usize,
+    pub(crate) source_stride: usize,
+    pub(crate) first: usize,
+    pub(crate) spacing: usize,
+    pub(crate) reversed: bool,
+}
+
 impl<'a> RawCopyView<'a> {
     pub(crate) fn plan(self) -> &'a MovementKernelPlan {
         self.plan
@@ -344,6 +373,44 @@ impl<'a> RawCopyView<'a> {
     }
 
     pub(crate) fn width(self) -> usize {
+        self.plan.dtype.itemsize()
+    }
+}
+
+impl<'a> StaticPositionWrite<'a> {
+    pub(crate) fn plan(&self) -> &'a MovementKernelPlan {
+        self.plan
+    }
+
+    pub(crate) fn input(&self) -> &'a MovementOperand {
+        self.input
+    }
+
+    pub(crate) fn axes(&self) -> &[StaticPositionAxis] {
+        &self.axes
+    }
+
+    pub(crate) fn has_source(&self) -> bool {
+        self.input_elements != 0
+    }
+
+    pub(crate) fn input_elements(&self) -> usize {
+        self.input_elements
+    }
+
+    pub(crate) fn input_bytes(&self) -> usize {
+        self.input_bytes
+    }
+
+    pub(crate) fn elements(&self) -> usize {
+        self.elements
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn width(&self) -> usize {
         self.plan.dtype.itemsize()
     }
 }
@@ -444,6 +511,90 @@ impl MovementKernelPlan {
             plan: self,
             input,
             view,
+            input_elements,
+            input_bytes,
+            elements,
+            bytes,
+        }))
+    }
+
+    /// Returns the renderer-facing inverse placement after revalidating the
+    /// canonical plan. Geometry is normalized with checked wide arithmetic so
+    /// generated kernels need only unsigned division, remainder and multiply.
+    pub(crate) fn static_position_write(
+        &self,
+    ) -> Result<Option<StaticPositionWrite<'_>>, MovementPlanError> {
+        let MovementKernelKind::ScatterPositions {
+            input,
+            starts,
+            steps,
+        } = &self.kind
+        else {
+            return Ok(None);
+        };
+        self.validate()?;
+        let input_elements = input
+            .shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let input_bytes = input_elements
+            .checked_mul(input.dtype.itemsize())
+            .ok_or(MovementPlanError::Overflow)?;
+        let elements = self
+            .output_shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let bytes = elements
+            .checked_mul(self.dtype.itemsize())
+            .ok_or(MovementPlanError::Overflow)?;
+        let mut axes = Vec::with_capacity(input.shape.rank());
+        if input_elements != 0 {
+            let mut output_divisor = elements;
+            let mut source_stride = input_elements;
+            for axis in 0..input.shape.rank() {
+                let output_dimension = self.output_shape.dims()[axis];
+                let source_dimension = input.shape.dims()[axis];
+                output_divisor = output_divisor
+                    .checked_div(output_dimension)
+                    .ok_or(MovementPlanError::InvalidGeometry)?;
+                source_stride = source_stride
+                    .checked_div(source_dimension)
+                    .ok_or(MovementPlanError::InvalidGeometry)?;
+                let start = i128::from(starts[axis]);
+                let step = i128::from(steps[axis]);
+                let final_coordinate = start
+                    .checked_add(
+                        i128::try_from(source_dimension - 1)
+                            .map_err(|_| MovementPlanError::Overflow)?
+                            .checked_mul(step)
+                            .ok_or(MovementPlanError::Overflow)?,
+                    )
+                    .ok_or(MovementPlanError::Overflow)?;
+                let first = usize::try_from(start.min(final_coordinate))
+                    .map_err(|_| MovementPlanError::InvalidGeometry)?;
+                // A singleton axis maps only `first`. Canonical spacing one
+                // avoids taking abs(i64::MIN) for an irrelevant step.
+                let spacing = if source_dimension <= 1 {
+                    1
+                } else {
+                    usize::try_from(step.abs()).map_err(|_| MovementPlanError::Overflow)?
+                };
+                axes.push(StaticPositionAxis {
+                    output_axis: axis,
+                    output_dimension,
+                    output_divisor,
+                    source_dimension,
+                    source_stride,
+                    first,
+                    spacing,
+                    reversed: step < 0,
+                });
+            }
+        }
+        Ok(Some(StaticPositionWrite {
+            plan: self,
+            input,
+            axes,
             input_elements,
             input_bytes,
             elements,
@@ -2220,6 +2371,116 @@ mod tests {
         assert_eq!(singleton_view.offset, 1);
         assert_eq!(singleton_view.strides, [0]);
 
+        let mut projected_plan = MovementKernelPlan {
+            kind: MovementKernelKind::ScatterPositions {
+                input: MovementOperand {
+                    node: NodeId::from_index(0),
+                    shape: Shape::from([2, 2]),
+                    dtype: DType::U32,
+                },
+                starts: vec![3, 0],
+                steps: vec![-2, 2],
+            },
+            output: NodeId::from_index(1),
+            output_shape: Shape::from([4, 4]),
+            dtype: DType::U32,
+            cache_key: 0,
+        };
+        projected_plan.cache_key = projected_plan.expected_cache_key();
+        let projection = projected_plan.static_position_write().unwrap().unwrap();
+        assert_eq!(projection.input_elements(), 4);
+        assert_eq!(projection.elements(), 16);
+        assert_eq!(projection.input_bytes(), 16);
+        assert_eq!(projection.bytes(), 64);
+        assert_eq!(projection.width(), 4);
+        assert_eq!(projection.axes().len(), 2);
+        let mapped = (0..projection.elements())
+            .map(|gid| {
+                let mut source = 0usize;
+                for axis in projection.axes() {
+                    let coordinate = (gid / axis.output_divisor) % axis.output_dimension;
+                    let delta = coordinate.checked_sub(axis.first)?;
+                    if delta % axis.spacing != 0 {
+                        return None;
+                    }
+                    let quotient = delta / axis.spacing;
+                    if quotient >= axis.source_dimension {
+                        return None;
+                    }
+                    let coordinate = if axis.reversed {
+                        axis.source_dimension - 1 - quotient
+                    } else {
+                        quotient
+                    };
+                    source += coordinate * axis.source_stride;
+                }
+                Some(source)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped,
+            [
+                None,
+                None,
+                None,
+                None,
+                Some(2),
+                None,
+                Some(3),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(0),
+                None,
+                Some(1),
+                None,
+            ]
+        );
+
+        let mut singleton_plan = MovementKernelPlan {
+            kind: MovementKernelKind::ScatterPositions {
+                input: MovementOperand {
+                    node: NodeId::from_index(0),
+                    shape: Shape::from([1]),
+                    dtype: DType::U8,
+                },
+                starts: vec![1],
+                steps: vec![i64::MIN],
+            },
+            output: NodeId::from_index(1),
+            output_shape: Shape::from([2]),
+            dtype: DType::U8,
+            cache_key: 0,
+        };
+        singleton_plan.cache_key = singleton_plan.expected_cache_key();
+        let singleton_projection = singleton_plan.static_position_write().unwrap().unwrap();
+        assert_eq!(singleton_projection.axes()[0].first, 1);
+        assert_eq!(singleton_projection.axes()[0].spacing, 1);
+
+        let mut scalar_plan = MovementKernelPlan {
+            kind: MovementKernelKind::ScatterPositions {
+                input: MovementOperand {
+                    node: NodeId::from_index(0),
+                    shape: Shape::new([]),
+                    dtype: DType::F32,
+                },
+                starts: vec![],
+                steps: vec![],
+            },
+            output: NodeId::from_index(1),
+            output_shape: Shape::new([]),
+            dtype: DType::F32,
+            cache_key: 0,
+        };
+        scalar_plan.cache_key = scalar_plan.expected_cache_key();
+        let scalar_projection = scalar_plan.static_position_write().unwrap().unwrap();
+        assert!(scalar_projection.has_source());
+        assert!(scalar_projection.axes().is_empty());
+        assert_eq!(scalar_projection.input_elements(), 1);
+        assert_eq!(scalar_projection.elements(), 1);
+
         let mut empty_plan = MovementKernelPlan {
             kind: MovementKernelKind::ScatterPositions {
                 input: MovementOperand {
@@ -2236,6 +2497,9 @@ mod tests {
             cache_key: 0,
         };
         empty_plan.cache_key = empty_plan.expected_cache_key();
+        let empty_projection = empty_plan.static_position_write().unwrap().unwrap();
+        assert!(!empty_projection.has_source());
+        assert!(empty_projection.axes().is_empty());
         let value = TensorData::from_storage([0, 4], Storage::F32(vec![])).unwrap();
         assert_eq!(
             empty_plan.execute(&[value]).unwrap().shape(),

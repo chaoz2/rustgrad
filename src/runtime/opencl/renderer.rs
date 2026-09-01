@@ -24,6 +24,7 @@ use std::{
 
 pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v8";
 pub const OPENCL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-opencl-raw-copy-v1";
+pub const OPENCL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-opencl-static-position-v1";
 pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -124,6 +125,14 @@ impl OpenClRenderer {
     pub fn render(&self, root: &UOp) -> Result<RenderedOpenCl, OpenClError> {
         if let Operation::Movement(value) = root.operation() {
             return match value {
+                MovementValue::Plan(plan)
+                    if matches!(
+                        &plan.kind,
+                        crate::MovementKernelKind::ScatterPositions { .. }
+                    ) =>
+                {
+                    render_static_positions(self, root, plan)
+                }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
                 MovementValue::QuantizedRowGather(_) => Err(OpenClError::Unsupported(
                     "quantized movement is outside OpenCL contiguous-copy lowering".into(),
@@ -571,6 +580,138 @@ fn render_raw_copy(
         renderer.local_size,
         renderer.capabilities,
         copy.plan(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedOpenCl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        entry,
+        cache_key,
+        required_capabilities,
+        transaction: None,
+        schedule_inputs: vec![input_abi],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+fn render_static_positions(
+    renderer: &OpenClRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedOpenCl, OpenClError> {
+    root.validate()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let placement = plan
+        .static_position_write()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| OpenClError::InvalidBinding("missing static-position projection".into()))?;
+    let input = placement.input();
+    let extent = placement.elements();
+    let width = placement.width();
+    let raw_type = match width {
+        1 => "uchar",
+        2 => "ushort",
+        4 => "uint",
+        8 => "ulong",
+        _ => {
+            return Err(OpenClError::Unsupported(format!(
+                "static-position OpenCL storage width {width}"
+            )));
+        }
+    };
+    let required_capabilities = OpenClCapabilities {
+        int64: width == 8,
+        fp64: false,
+    };
+    if !renderer.capabilities.supports(required_capabilities) {
+        return Err(OpenClError::Unsupported(
+            "static-position OpenCL 64-bit storage requires 64-bit integer support".into(),
+        ));
+    }
+    debug_assert_eq!(placement.bytes(), extent * width);
+    let input_abi = OpenClBufferAbi {
+        id: input.node.index() as u64,
+        dtype: input.dtype,
+        source_shape: input.shape.clone(),
+        elements: placement.input_elements(),
+        mutable: false,
+        view: None,
+    };
+    let output_abi = OpenClBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: extent,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input_abi.clone(), output_abi];
+    let entry = format!("rg_opencl_static_position_w{width}");
+    let mut lines = vec![
+        format!("// {OPENCL_STATIC_POSITION_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
+        format!("__kernel void {entry}("),
+        format!("    __global const {raw_type}* b0,"),
+        format!("    __global {raw_type}* b1,"),
+        "    ulong extent) {".into(),
+        "  const ulong gid = (ulong)get_global_id(0);".into(),
+        "  if (gid >= extent) return;".into(),
+        "  int rg_mapped = 0;".into(),
+        "  ulong rg_source = 0ul;".into(),
+    ];
+    if placement.has_source() {
+        lines.push("  rg_mapped = 1;".into());
+        for axis in placement.axes() {
+            let name = axis.output_axis;
+            lines.push(format!(
+                "  ulong rg_coordinate_{name} = (gid / (ulong){}ul) % (ulong){}ul;",
+                axis.output_divisor, axis.output_dimension
+            ));
+            lines.push(format!(
+                "  ulong rg_delta_{name} = rg_coordinate_{name} >= (ulong){}ul ? rg_coordinate_{name} - (ulong){}ul : 0ul;",
+                axis.first, axis.first
+            ));
+            lines.push(format!(
+                "  ulong rg_quotient_{name} = rg_delta_{name} / (ulong){}ul;",
+                axis.spacing
+            ));
+            lines.push(format!(
+                "  if (rg_coordinate_{name} < (ulong){}ul || rg_delta_{name} % (ulong){}ul != 0ul || rg_quotient_{name} >= (ulong){}ul) rg_mapped = 0;",
+                axis.first, axis.spacing, axis.source_dimension
+            ));
+            lines.push(format!(
+                "  ulong rg_source_axis_{name} = rg_quotient_{name} < (ulong){}ul ? {} : 0ul;",
+                axis.source_dimension,
+                if axis.reversed {
+                    format!(
+                        "(ulong){}ul - rg_quotient_{name}",
+                        axis.source_dimension - 1
+                    )
+                } else {
+                    format!("rg_quotient_{name}")
+                }
+            ));
+            lines.push(format!(
+                "  rg_source += rg_source_axis_{name} * (ulong){}ul;",
+                axis.source_stride
+            ));
+        }
+    }
+    lines.push(format!("  {raw_type} rg_value = ({raw_type})0;"));
+    lines.push("  if (rg_mapped) rg_value = b0[rg_source];".into());
+    lines.push("  b1[gid] = rg_value;".into());
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        OPENCL_STATIC_POSITION_RENDERER_VERSION,
+        OPENCL_ABI_VERSION,
+        renderer.local_size,
+        renderer.capabilities,
+        placement.plan(),
         &source,
         &buffers,
     ));

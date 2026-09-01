@@ -1,6 +1,6 @@
 use super::renderer::{
     OPENCL_ABI_VERSION, OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
-    OpenClScalarDialect,
+    OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
 };
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
@@ -920,6 +920,60 @@ fn raw_movement_copy_opencl_uses_exact_affine_abi_and_preserves_storage_bits() {
             .collect::<Vec<_>>()
     );
     assert!(calls.iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn static_positions_opencl_zeroes_holes_and_preserves_raw_payloads() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let output = graph
+        .scatter_positions(input, Shape::from([5]), vec![4], vec![-2])
+        .unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(OPENCL_STATIC_POSITION_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("rg_delta_0 % (ulong)2ul"));
+    assert!(rendered.source.contains("rg_mapped = 0"));
+    assert_eq!(rendered.buffers[0].elements, 2);
+    assert_eq!(rendered.buffers[1].elements, 5);
+    let raw = [0x7fc1_2345_u32, 0x8000_0000];
+    let value = TensorData::from_storage(
+        [2],
+        Storage::F32(raw.into_iter().map(f32::from_bits).collect()),
+    )
+    .unwrap();
+    let (actual, calls) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(input.index() as u64, value)]),
+    );
+    assert_eq!(
+        actual,
+        [0, 0, raw[1], 0, raw[0]]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+    assert!(calls.iter().any(|call| call.starts_with("launch:")));
+
+    let mut wide = Graph::new();
+    let input = wide.input_dtype("input", [1], DType::U64);
+    let output = wide
+        .scatter_positions(input, Shape::from([2]), vec![1], vec![1])
+        .unwrap();
+    let item = schedule(&wide, output).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("64-bit integer")
+    ));
 }
 
 #[test]

@@ -33,6 +33,8 @@ pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v31";
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 /// Separate identity for dense raw storage-width materialization.
 pub const PTX_CONTIGUOUS_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-contiguous-copy-v1";
+/// Separate identity for output-driven raw static placement.
+pub const PTX_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-ptx-static-position-v1";
 pub const PTX_THREEFRY_RENDERER_VERSION: &str = "rustgrad-ptx-live-threefry-v1";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
@@ -170,10 +172,11 @@ impl RenderedPtx {
                 .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
             let input = match &plan.kind {
                 MovementKernelKind::AffineCopy { input, .. }
-                | MovementKernelKind::Contiguous { input } => input,
+                | MovementKernelKind::Contiguous { input }
+                | MovementKernelKind::ScatterPositions { input, .. } => input,
                 _ => {
                     return Err(PtxError::Unsupported(
-                        "only raw affine and contiguous copies have PTX movement lowering".into(),
+                        "movement plan is outside raw PTX lowering".into(),
                     ));
                 }
             };
@@ -631,6 +634,11 @@ fn render(
                 if matches!(&plan.kind, MovementKernelKind::Contiguous { .. }) =>
             {
                 render_contiguous_copy(renderer, root, plan)
+            }
+            MovementValue::Plan(plan)
+                if matches!(&plan.kind, MovementKernelKind::ScatterPositions { .. }) =>
+            {
+                render_static_positions(renderer, root, plan)
             }
             MovementValue::Plan(plan) => render_affine_copy(renderer, root, plan),
             MovementValue::QuantizedRowGather(_) => Err(PtxError::Unsupported(
@@ -1146,6 +1154,154 @@ fn render_affine_copy(
         PTX_ABI_VERSION,
         renderer.sm,
         plan,
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedPtx {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        cache_key,
+        entry,
+        launch: PtxLaunchGeometry::Linear,
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
+    };
+    rendered.validate()?;
+    Ok(rendered)
+}
+
+/// Renders one checked static placement as an output-driven raw-bit kernel.
+/// Every output lane owns its write, so holes become zero without a separate
+/// memset kernel and mapped lanes preserve their source storage payload.
+fn render_static_positions(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedPtx, PtxError> {
+    root.validate()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    let placement = plan
+        .static_position_write()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| PtxError::InvalidBinding("missing static-position projection".into()))?;
+    let input = placement.input();
+    let extent = placement.elements();
+    if extent > u32::MAX as usize {
+        return Err(PtxError::Unsupported(
+            "static-position PTX extent exceeds u32 thread indexing".into(),
+        ));
+    }
+    let width = placement.width();
+    let raw_type = match width {
+        1 => "u8",
+        2 => "u16",
+        4 => "u32",
+        8 => "u64",
+        _ => {
+            return Err(PtxError::Unsupported(format!(
+                "static-position PTX storage width {width}"
+            )));
+        }
+    };
+    debug_assert_eq!(placement.bytes(), extent * width);
+    let buffers = vec![
+        PtxBufferAbi {
+            id: input.node.index() as u64,
+            dtype: input.dtype,
+            source_shape: input.shape.clone(),
+            elements: placement.input_elements(),
+            mutable: false,
+        },
+        PtxBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: plan.dtype,
+            source_shape: plan.output_shape.clone(),
+            elements: extent,
+            mutable: true,
+        },
+    ];
+    let entry = format!("rg_static_position_w{width}_r{}", plan.output_shape.rank());
+    let value = if width == 8 { "%rd20" } else { "%r4" };
+    let mut lines = vec![
+        format!("// {PTX_STATIC_POSITION_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        String::new(),
+        format!(".visible .entry {entry}("),
+        "  .param .u64 p0,".into(),
+        "  .param .u64 p1,".into(),
+        "  .param .u64 extent".into(),
+        ")".into(),
+        "{".into(),
+        "  .reg .pred %p<4>;".into(),
+        "  .reg .b32 %r<8>;".into(),
+        "  .reg .b64 %rd<32>;".into(),
+        "  ld.param.u64 %rd10, [p0];".into(),
+        "  ld.param.u64 %rd11, [p1];".into(),
+        "  ld.param.u64 %rd0, [extent];".into(),
+        "  mov.u32 %r0, %ctaid.x;".into(),
+        "  mov.u32 %r1, %ntid.x;".into(),
+        "  mov.u32 %r2, %tid.x;".into(),
+        "  mad.lo.u32 %r3, %r0, %r1, %r2;".into(),
+        "  cvt.u64.u32 %rd3, %r3;".into(),
+        "  setp.ge.u64 %p0, %rd3, %rd0;".into(),
+        "  @%p0 bra DONE;".into(),
+    ];
+    if placement.has_source() {
+        lines.push("  mov.u64 %rd4, 0;".into());
+        for axis in placement.axes() {
+            lines.push(format!("  div.u64 %rd5, %rd3, {};", axis.output_divisor));
+            lines.push(format!("  rem.u64 %rd5, %rd5, {};", axis.output_dimension));
+            lines.push(format!("  setp.lt.u64 %p1, %rd5, {};", axis.first));
+            lines.push("  @%p1 bra ZERO;".into());
+            lines.push(format!("  sub.u64 %rd6, %rd5, {};", axis.first));
+            lines.push(format!("  rem.u64 %rd7, %rd6, {};", axis.spacing));
+            lines.push("  setp.ne.u64 %p1, %rd7, 0;".into());
+            lines.push("  @%p1 bra ZERO;".into());
+            lines.push(format!("  div.u64 %rd6, %rd6, {};", axis.spacing));
+            lines.push(format!(
+                "  setp.ge.u64 %p1, %rd6, {};",
+                axis.source_dimension
+            ));
+            lines.push("  @%p1 bra ZERO;".into());
+            if axis.reversed {
+                lines.push(format!(
+                    "  sub.u64 %rd6, {}, %rd6;",
+                    axis.source_dimension - 1
+                ));
+            }
+            lines.push(format!("  mul.lo.u64 %rd7, %rd6, {};", axis.source_stride));
+            lines.push("  add.u64 %rd4, %rd4, %rd7;".into());
+        }
+        lines.extend([
+            format!("  mul.lo.u64 %rd6, %rd4, {width};"),
+            "  add.u64 %rd6, %rd10, %rd6;".into(),
+            format!("  ld.global.{raw_type} {value}, [%rd6];"),
+            "  bra STORE;".into(),
+        ]);
+    }
+    lines.push("ZERO:".into());
+    lines.push(format!(
+        "  mov.{} {value}, 0;",
+        if width == 8 { "b64" } else { "b32" }
+    ));
+    lines.extend([
+        "STORE:".into(),
+        format!("  mul.lo.u64 %rd7, %rd3, {width};"),
+        "  add.u64 %rd7, %rd11, %rd7;".into(),
+        format!("  st.global.{raw_type} [%rd7], {value};"),
+        "DONE:".into(),
+        "  ret;".into(),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        PTX_STATIC_POSITION_RENDERER_VERSION,
+        PTX_ABI_VERSION,
+        renderer.sm,
+        placement.plan(),
         &source,
         &buffers,
     ));
@@ -7889,7 +8045,9 @@ mod tests {
     }
 
     #[test]
-    fn non_affine_copy_movement_plans_remain_fail_closed_in_ptx() {
+    fn static_positions_render_raw_output_driven_ptx_and_other_movement_stays_closed() {
+        use std::num::NonZeroUsize;
+
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2], DType::I32);
         let output = graph.pad(input, [(1, 1)], Scalar::I(0)).unwrap();
@@ -7905,17 +8063,150 @@ mod tests {
         ));
 
         let positions = graph
-            .scatter_positions(input, Shape::from([4]), vec![3], vec![-2])
+            .scatter_positions(input, Shape::from([5]), vec![4], vec![-2])
             .unwrap();
         let item = crate::schedule(&graph, positions)
             .unwrap()
             .items
             .pop()
             .unwrap();
+        let rendered = PtxRenderer::new(80).unwrap().render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert!(
+            rendered
+                .source
+                .contains(PTX_STATIC_POSITION_RENDERER_VERSION)
+        );
+        assert!(rendered.source.contains("rem.u64 %rd7, %rd6, 2;"));
+        assert!(rendered.source.contains("sub.u64 %rd6, 1, %rd6;"));
+        assert!(rendered.source.contains("@%p1 bra ZERO;"));
+        assert!(rendered.source.contains("mov.b32 %r4, 0;"));
+        assert_eq!(rendered.buffers[0].elements, 2);
+        assert_eq!(rendered.buffers[1].elements, 5);
+        assert_eq!(rendered.extent, 5);
+        let encoded = crate::uop::artifact::encode(&item.kernel).unwrap();
+        let decoded = crate::uop::artifact::decode(&encoded).unwrap();
+        assert_eq!(crate::uop::artifact::encode(&decoded).unwrap(), encoded);
+        assert_eq!(
+            PtxRenderer::new(80)
+                .unwrap()
+                .render(&decoded)
+                .unwrap()
+                .cache_key,
+            rendered.cache_key
+        );
+        let Operation::Movement(MovementValue::Plan(plan)) = item.kernel.operation() else {
+            panic!("static-position movement root")
+        };
+        let mut stale_plan = plan.as_ref().clone();
+        stale_plan.cache_key ^= 1;
+        let stale_root = UOp::from_operation(
+            Operation::Movement(MovementValue::Plan(Box::new(stale_plan))),
+            Some(UType::scalar(DType::I32)),
+            vec![],
+        );
         assert!(matches!(
-            PtxRenderer::new(80).unwrap().render(&item.kernel),
-            Err(PtxError::Unsupported(reason)) if reason.contains("only raw affine and contiguous")
+            PtxRenderer::new(80).unwrap().render(&stale_root),
+            Err(PtxError::InvalidBinding(_))
         ));
+
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let allocator = primary.allocator();
+        let input_buffer = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let output_buffer = allocator.allocate(NonZeroUsize::new(20).unwrap()).unwrap();
+        input_buffer
+            .view()
+            .unwrap()
+            .copy_from(
+                0,
+                &[11i32, -7i32]
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let stream = primary.stream().unwrap();
+        let kernel = ConcurrentPtxCache::new()
+            .get_or_load(&primary, rendered.clone(), 32)
+            .unwrap();
+        let bindings = rendered
+            .buffers
+            .iter()
+            .map(|abi| PtxBinding {
+                buffer: if abi.mutable {
+                    output_buffer.view().unwrap()
+                } else {
+                    input_buffer.view().unwrap()
+                },
+                dtype: abi.dtype,
+                mutable: abi.mutable,
+            })
+            .collect::<Vec<_>>();
+        kernel.launch(&stream, &bindings, true).unwrap();
+        let mut actual = vec![0; 20];
+        output_buffer
+            .view()
+            .unwrap()
+            .copy_to(0, &mut actual)
+            .unwrap();
+        assert_eq!(
+            actual,
+            [0i32, 0, -7, 0, 11]
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        for dtype in DType::ALL {
+            let mut typed = Graph::new();
+            let input = typed.input_dtype("input", [2], dtype);
+            let output = typed
+                .scatter_positions(input, Shape::from([5]), vec![4], vec![-2])
+                .unwrap();
+            let item = crate::schedule(&typed, output)
+                .unwrap()
+                .items
+                .pop()
+                .unwrap();
+            let rendered = PtxRenderer::new(80).unwrap().render(&item.kernel).unwrap();
+            let raw = match dtype.itemsize() {
+                1 => "u8",
+                2 => "u16",
+                4 => "u32",
+                8 => "u64",
+                _ => unreachable!(),
+            };
+            assert!(rendered.source.contains(&format!("ld.global.{raw}")));
+            assert!(rendered.source.contains(&format!("st.global.{raw}")));
+        }
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0], DType::F32);
+        let output = empty
+            .scatter_positions(input, Shape::from([3]), vec![-1], vec![-1])
+            .unwrap();
+        let item = crate::schedule(&empty, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = PtxRenderer::new(80).unwrap().render(&item.kernel).unwrap();
+        assert!(!rendered.source.contains("ld.global.u32"));
+        assert!(rendered.source.contains("mov.b32 %r4, 0;"));
+
+        let mut zero = Graph::new();
+        let input = zero.input_dtype("input", [0, 2], DType::U8);
+        let output = zero
+            .scatter_positions(input, Shape::from([0, 5]), vec![-1, 4], vec![-1, -1])
+            .unwrap();
+        let item = crate::schedule(&zero, output).unwrap().items.pop().unwrap();
+        let rendered = PtxRenderer::new(80).unwrap().render(&item.kernel).unwrap();
+        assert_eq!(rendered.extent, 0);
+        assert_eq!(rendered.buffers[0].elements, 0);
+        assert!(!rendered.source.contains("ld.global.u8"));
     }
 
     fn global(dtype: DType, buffer: u64) -> UOp {
