@@ -5895,6 +5895,7 @@ pub(crate) mod tests {
                 crate::ptx::KernelSemanticProgram::UOp(program) => match program.operation() {
                     crate::Operation::Random(plan) => plan.output.index() as u64,
                     crate::Operation::PrefixScan(plan) => plan.destination.index() as u64,
+                    crate::Operation::Threefry(plan) => plan.output.index() as u64,
                     crate::Operation::Movement(crate::MovementValue::Plan(plan)) => {
                         plan.output.index() as u64
                     }

@@ -1150,7 +1150,7 @@ mod tests {
             crate::Operation::After(payload) if payload.as_ref() == first.payload()
         ));
         assert_eq!(after.sources(), std::slice::from_ref(&store));
-        let encoded = crate::uop::artifact::encode_effect_aware(&after).unwrap();
+        let encoded = crate::uop::artifact::encode_schedule_identity(&after).unwrap();
         assert_eq!(crate::uop::artifact::decode(&encoded).unwrap(), after);
         assert_eq!(
             EffectSchedule::lower(&graph).unwrap().cache_key,

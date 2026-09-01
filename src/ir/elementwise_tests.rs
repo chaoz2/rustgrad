@@ -12156,86 +12156,10 @@ fn live_threefry_matches_source_vectors_and_captured_graph_structure() {
     assert!(!graph.requires_grad(output).unwrap());
     assert!(matches!(
         graph.op(output).unwrap(),
-        Op::Binary {
-            op: BinaryOp::BitOr,
-            ..
-        }
+        Op::Threefry { counter: got_counter, key: got_key }
+            if *got_counter == counter && *got_key == key
     ));
-    assert!(
-        !(0..graph.node_count())
-            .any(|index| matches!(graph.op(NodeId(index)).unwrap(), Op::Random { .. }))
-    );
-    let mut u32_constants = 0;
-    let mut u64_constants = 0;
-    let mut u32_adds = 0;
-    let mut u32_xors = 0;
-    let mut u32_left_shifts = 0;
-    let mut u32_right_shifts = 0;
-    let mut u64_left_shifts = 0;
-    let mut u64_right_shifts = 0;
-    let mut u64_ors = 0;
-    for index in 0..graph.node_count() {
-        let node = NodeId(index);
-        match (graph.op(node).unwrap(), graph.dtype(node).unwrap()) {
-            (Op::Constant(_), DType::U32) => u32_constants += 1,
-            (Op::Constant(_), DType::U64) => u64_constants += 1,
-            (
-                Op::Binary {
-                    op: BinaryOp::Add, ..
-                },
-                DType::U32,
-            ) => u32_adds += 1,
-            (
-                Op::Binary {
-                    op: BinaryOp::BitXor,
-                    ..
-                },
-                DType::U32,
-            ) => u32_xors += 1,
-            (
-                Op::Binary {
-                    op: BinaryOp::Shl, ..
-                },
-                DType::U32,
-            ) => u32_left_shifts += 1,
-            (
-                Op::Binary {
-                    op: BinaryOp::Shr, ..
-                },
-                DType::U32,
-            ) => u32_right_shifts += 1,
-            (
-                Op::Binary {
-                    op: BinaryOp::Shl, ..
-                },
-                DType::U64,
-            ) => u64_left_shifts += 1,
-            (
-                Op::Binary {
-                    op: BinaryOp::Shr, ..
-                },
-                DType::U64,
-            ) => u64_right_shifts += 1,
-            (
-                Op::Binary {
-                    op: BinaryOp::BitOr,
-                    ..
-                },
-                DType::U64,
-            ) => u64_ors += 1,
-            (Op::Binary { .. }, DType::U64) => panic!("unexpected U64 Threefry intermediate"),
-            _ => {}
-        }
-    }
-    // One U32 parity, both halves of eight rotations, and five injection
-    // counts are retained literals. The sole U64 literal is the pack/split
-    // width. Each rotate is two shifts plus source-literal wrapping Add; the
-    // fifteen extra Adds are the three separate additions per key injection.
-    assert_eq!((u32_constants, u64_constants), (22, 1));
-    assert_eq!(u32_adds, 57);
-    assert_eq!(u32_xors, 22);
-    assert_eq!((u32_left_shifts, u32_right_shifts), (20, 20));
-    assert_eq!((u64_left_shifts, u64_right_shifts, u64_ors), (1, 2, 1));
+    assert_eq!(graph.node_count(), 3);
     assert!(matches!(
         graph.grad(output, counter),
         Err(Error::NonDifferentiableTarget(node)) if node == output
@@ -12287,20 +12211,60 @@ fn live_threefry_matches_source_vectors_and_captured_graph_structure() {
     );
 
     let scheduled = crate::schedule(&graph, output).unwrap();
-    assert!(!scheduled.items.is_empty());
-    assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
-    assert!(scheduled.items.iter().all(|item| {
-        item.kernel
-            .topological()
-            .unwrap()
+    assert_eq!(scheduled.items.len(), 1);
+    let item = &scheduled.items[0];
+    assert!(item.boundary.is_none());
+    let crate::Operation::Threefry(plan) = item.kernel.operation() else {
+        panic!("live Threefry must retain its typed schedule plan")
+    };
+    assert_eq!(
+        (plan.counter, plan.key, plan.output),
+        (counter, key, output)
+    );
+    assert_eq!(
+        item.input_bindings
             .iter()
-            .all(|node| !matches!(node.operation(), crate::Operation::Random(_)))
-    }));
-    let kernel = &scheduled.items.last().unwrap().kernel;
-    assert!(matches!(
-        crate::ptx::PtxRenderer::new(80).unwrap().render(kernel),
-        Err(crate::ptx::PtxError::Unsupported(_))
-    ));
+            .map(|binding| (binding.input_node, binding.abi_index))
+            .collect::<Vec<_>>(),
+        vec![(counter, 0), (key, 1)]
+    );
+    let mut tampered = scheduled.clone();
+    tampered.items[0].input_bindings[0].desc.shape = Shape::from([5, 2]);
+    tampered.items[0].inputs[0].shape = Shape::from([5, 2]);
+    assert!(tampered.validate().is_err());
+    let kernel = &item.kernel;
+    let c11 = crate::CpuJit::render(kernel).unwrap();
+    assert!(c11.source.contains("rustgrad-c11-live-threefry-v1"));
+    assert!(c11.source.contains("rg_x1<<13"));
+    assert_eq!(c11.abi.buffers.len(), 3);
+    let malformed_dtype = crate::UOp::from_operation(
+        crate::Operation::Threefry(plan.clone()),
+        Some(crate::UType::scalar(DType::F32)),
+        vec![],
+    );
+    let stray_source = crate::UOp::scalar_constant(DType::U64, 0, crate::UType::scalar(DType::U64));
+    let malformed_sources = crate::UOp::from_operation(
+        crate::Operation::Threefry(plan.clone()),
+        Some(crate::UType::scalar(DType::U64)),
+        vec![stray_source],
+    );
+    for malformed in [&malformed_dtype, &malformed_sources] {
+        assert!(crate::CpuJit::render(malformed).is_err());
+        assert!(crate::CpuJit::render_vectorized(malformed).is_err());
+    }
+    let ptx = crate::ptx::PtxRenderer::new(80)
+        .unwrap()
+        .render(kernel)
+        .unwrap();
+    assert!(
+        ptx.source
+            .contains(crate::ptx::PTX_THREEFRY_RENDERER_VERSION)
+    );
+    assert!(ptx.source.contains("xor.b32 %r22"));
+    assert!(ptx.source.contains("ld.param.u64 %rd3, [p2]"));
+    assert!(ptx.source.contains("add.u64 %rd25, %rd3, %rd25"));
+    assert!(!ptx.source.contains("cvt.u64.u32 %rd3,"));
+    assert_eq!(ptx.buffers.len(), 3);
     let metal = crate::runtime::metal::MetalRenderer::new(
         8,
         crate::runtime::metal::MetalCapabilities {
@@ -12313,6 +12277,11 @@ fn live_threefry_matches_source_vectors_and_captured_graph_structure() {
     assert!(matches!(
         metal.render(kernel),
         Err(crate::runtime::metal::MetalError::Unsupported(_))
+    ));
+    let opencl = crate::runtime::opencl::OpenClRenderer::new(8).unwrap();
+    assert!(matches!(
+        opencl.render(kernel),
+        Err(crate::runtime::opencl::OpenClError::Unsupported(_))
     ));
     let wgsl = crate::runtime::webgpu::WgslRenderer::new(
         8,
@@ -12416,11 +12385,129 @@ fn live_threefry_broadcasts_scalar_empty_and_rectangular_u64_operands() {
     let output = scalar.threefry(counter, key).unwrap();
     assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
 
+    let mut shared = Graph::new();
+    let words = shared.input_dtype("words", [4], DType::U64);
+    let output = shared.threefry(words, words).unwrap();
+    let scheduled = crate::schedule(&shared, output).unwrap();
+    assert_eq!(scheduled.items[0].input_bindings.len(), 1);
+    assert_eq!(scheduled.items[0].input_bindings[0].input_node, words);
+    assert_eq!(
+        crate::CpuJit::render(&scheduled.items[0].kernel)
+            .unwrap()
+            .abi
+            .buffers
+            .len(),
+        2
+    );
+    let aliased_ptx = crate::ptx::PtxRenderer::new(80)
+        .unwrap()
+        .render(&scheduled.items[0].kernel)
+        .unwrap();
+    assert_eq!(aliased_ptx.buffers.len(), 2);
+    assert!(aliased_ptx.source.contains("ld.param.u64 %rd2, [p1]"));
+    assert!(aliased_ptx.source.contains("add.u64 %rd25, %rd2, %rd25"));
+
     let mut empty = Graph::new();
     let counter = empty.input_dtype("counter", [0, 3], DType::U64);
     let key = empty.input_dtype("key", [1, 3], DType::U64);
     let output = empty.threefry(counter, key).unwrap();
     assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+    let scheduled = crate::schedule(&empty, output).unwrap();
+    let c11 = crate::CpuJit::render(&scheduled.items[0].kernel).unwrap();
+    let ptx = crate::ptx::PtxRenderer::new(80)
+        .unwrap()
+        .render(&scheduled.items[0].kernel)
+        .unwrap();
+    assert!(c11.source.contains("rg_i<0u"));
+    assert_eq!(ptx.extent, 0);
+}
+
+#[test]
+fn live_threefry_captures_computed_dependencies_and_deduplicates_shared_producers() {
+    let mut graph = Graph::new();
+    let counter_left = graph.input_dtype("counter_left", [2, 1], DType::U64);
+    let counter_right = graph.input_dtype("counter_right", [2, 1], DType::U64);
+    let key_left = graph.input_dtype("key_left", [1, 3], DType::U64);
+    let key_right = graph.input_dtype("key_right", [1, 3], DType::U64);
+    let counter = graph.add(counter_left, counter_right).unwrap();
+    let key = graph.add(key_left, key_right).unwrap();
+    let output = graph.threefry(counter, key).unwrap();
+    let scheduled = crate::schedule(&graph, output).unwrap();
+    let producer_ids = [counter, key].map(|node| {
+        scheduled
+            .items
+            .iter()
+            .find(|item| item.primary_output().id == node.index() as u64)
+            .unwrap()
+            .id
+    });
+    let threefry = scheduled
+        .items
+        .iter()
+        .find(|item| item.primary_output().id == output.index() as u64)
+        .unwrap();
+    assert_eq!(threefry.dependencies, producer_ids);
+    assert!(producer_ids.into_iter().all(|id| id < threefry.id));
+
+    let inputs = HashMap::from([
+        (
+            "counter_left".into(),
+            TensorData::from_storage(
+                [2, 1],
+                Storage::U64(vec![0x0000_000a_0000_0000, 0x0000_000b_0000_0001]),
+            )
+            .unwrap(),
+        ),
+        (
+            "counter_right".into(),
+            TensorData::from_storage([2, 1], Storage::U64(vec![1, 2])).unwrap(),
+        ),
+        (
+            "key_left".into(),
+            TensorData::from_storage([1, 3], Storage::U64(vec![0, 1, 2])).unwrap(),
+        ),
+        (
+            "key_right".into(),
+            TensorData::from_storage([1, 3], Storage::U64(vec![0x0000_0539_0000_0000; 3])).unwrap(),
+        ),
+    ]);
+    let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+    let captured = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    assert_eq!(captured.items.last().unwrap().dependencies, producer_ids);
+    let replay_inputs = inputs.into_iter().collect::<BTreeMap<_, _>>();
+    let executor = crate::CapturedReplayExecutor::default();
+    let interpreted = executor
+        .replay(
+            &captured,
+            &replay_inputs,
+            crate::CapturedReplayOptions::default(),
+        )
+        .unwrap();
+    let native = executor
+        .replay(
+            &captured,
+            &replay_inputs,
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(interpreted.outputs[0].storage(), expected.storage());
+    assert_eq!(native.outputs[0].storage(), expected.storage());
+
+    let mut shared = Graph::new();
+    let left = shared.input_dtype("left", [2], DType::U64);
+    let right = shared.input_dtype("right", [2], DType::U64);
+    let computed = shared.add(left, right).unwrap();
+    let shared_output = shared.threefry(computed, computed).unwrap();
+    let shared_schedule = crate::schedule(&shared, shared_output).unwrap();
+    let shared_item = shared_schedule.items.last().unwrap();
+    assert_eq!(shared_item.dependencies.len(), 1);
+    assert_eq!(shared_item.input_bindings.len(), 1);
+    let crate::Operation::Threefry(plan) = shared_item.kernel.operation() else {
+        unreachable!()
+    };
+    assert_eq!(plan.buffer_operands().count(), 2);
 }
 
 #[test]

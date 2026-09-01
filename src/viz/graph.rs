@@ -218,6 +218,9 @@ fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
         Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } | Op::Matmul { lhs, rhs } => {
             vec![dependency("lhs", *lhs), dependency("rhs", *rhs)]
         }
+        Op::Threefry { counter, key } => {
+            vec![dependency("counter", *counter), dependency("key", *key)]
+        }
         Op::Logical { lhs, rhs, .. } => std::iter::once(dependency("lhs", *lhs))
             .chain(rhs.iter().copied().map(|id| dependency("rhs", id)))
             .collect(),
@@ -365,6 +368,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::Detach { .. } => "detach",
         Op::Unary { .. } => "unary",
         Op::Binary { .. } => "binary",
+        Op::Threefry { .. } => "threefry",
         Op::Compare { .. } => "compare",
         Op::Logical { .. } => "logical",
         Op::Select { .. } => "select",
@@ -435,6 +439,7 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
         Op::Bitcast { dtype, .. } => node.field("to", dtype_name(*dtype)),
         Op::Unary { op, .. } => node.field("operator", op.name()),
         Op::Binary { op, .. } => node.field("operator", op.name()),
+        Op::Threefry { .. } => node.field("algorithm", "threefry2x32-20"),
         Op::Compare { op, .. } => node.field("operator", op.name()),
         Op::Logical { op, .. } => node.field("operator", op.name()),
         Op::Reduce {

@@ -7,16 +7,27 @@ pub mod plan;
 pub(crate) const THREEFRY_PARITY: u32 = 0x1BD1_1BDA;
 pub(crate) const THREEFRY_ROTATIONS: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
 
+/// Canonical source round inventory shared by native emitters. The optional
+/// injection number is one-based and occurs after every fourth round.
+pub(crate) fn threefry_rounds() -> impl Iterator<Item = (usize, u32, Option<usize>)> {
+    (0..20).map(|round| {
+        (
+            round,
+            THREEFRY_ROTATIONS[round % THREEFRY_ROTATIONS.len()],
+            (round % 4 == 3).then_some(round / 4 + 1),
+        )
+    })
+}
+
 /// Evaluates the Random123/Threefry 2x32 permutation used by tinygrad.
 pub(crate) fn threefry2x32(key: [u32; 2], counter: [u32; 2]) -> [u32; 2] {
     let keys = [key[0], key[1], key[0] ^ key[1] ^ THREEFRY_PARITY];
     let mut x0 = counter[0].wrapping_add(keys[0]);
     let mut x1 = counter[1].wrapping_add(keys[1]);
-    for round in 0..20 {
+    for (_round, rotation, injection) in threefry_rounds() {
         x0 = x0.wrapping_add(x1);
-        x1 = x1.rotate_left(THREEFRY_ROTATIONS[round % THREEFRY_ROTATIONS.len()]) ^ x0;
-        if round % 4 == 3 {
-            let injection = round / 4 + 1;
+        x1 = x1.rotate_left(rotation) ^ x0;
+        if let Some(injection) = injection {
             x0 = x0.wrapping_add(keys[injection % 3]);
             x1 = x1
                 .wrapping_add(keys[(injection + 1) % 3])
@@ -24,6 +35,41 @@ pub(crate) fn threefry2x32(key: [u32; 2], counter: [u32; 2]) -> [u32; 2] {
         }
     }
     [x0, x1]
+}
+
+/// Executes the live packed-U64 Threefry operation over the canonical
+/// right-aligned broadcast domain. This is shared by the graph oracle and
+/// graph-free captured replay; it never reads or mutates RNG stream state.
+pub(crate) fn execute_live_threefry(
+    counter: &crate::TensorData,
+    key: &crate::TensorData,
+    output_shape: &crate::Shape,
+) -> crate::Result<crate::TensorData> {
+    use crate::{DType, IterationPlan, Storage};
+
+    if counter.dtype() != DType::U64
+        || key.dtype() != DType::U64
+        || counter.shape().broadcast_with(key.shape())? != *output_shape
+    {
+        return Err(crate::Error::InvalidIndex);
+    }
+    let plan = IterationPlan::new(output_shape.clone());
+    let len = plan.len()?;
+    let mut output = Vec::with_capacity(len);
+    for linear in 0..len {
+        let counter = counter
+            .scalar_at(plan.broadcast_offset(counter.shape(), linear)?)
+            .as_u64();
+        let key = key
+            .scalar_at(plan.broadcast_offset(key.shape(), linear)?)
+            .as_u64();
+        let result = threefry2x32(
+            [key as u32, (key >> 32) as u32],
+            [counter as u32, (counter >> 32) as u32],
+        );
+        output.push(u64::from(result[0]) | (u64::from(result[1]) << 32));
+    }
+    crate::TensorData::from_storage(output_shape.clone(), Storage::U64(output))
 }
 
 /// Advances a little-endian two-word counter by `words`, returning the start.

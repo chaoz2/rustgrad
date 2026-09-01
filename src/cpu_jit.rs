@@ -27,6 +27,7 @@ mod random;
 // this identity before they can reuse a native-renderer admission decision.
 pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v31";
 const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
+const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -591,12 +592,15 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
             | Operation::Movement(_)
             | Operation::Random(_)
             | Operation::PrefixScan(_)
+            | Operation::Threefry(_)
     ) {
         return Ok(VectorPlan {
             lanes: 1,
             enabled: false,
             reason: if matches!(root.operation(), Operation::PrefixScan(_)) {
                 "prefix scan uses a serial axis loop"
+            } else if matches!(root.operation(), Operation::Threefry(_)) {
+                "live Threefry uses a dedicated scalar kernel"
             } else {
                 "static contraction uses scalar lanes"
             }
@@ -622,6 +626,9 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     }
     if let Operation::Random(plan) = root.operation() {
         return random::render(plan);
+    }
+    if let Operation::Threefry(plan) = root.operation() {
+        return render_threefry(root, plan);
     }
     if let Operation::Matmul(MatmulValue::Quantized(plan)) = root.operation() {
         return render_quantized_matmul(plan);
@@ -2018,6 +2025,74 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
+        abi,
+        cache_key,
+    })
+}
+
+fn render_threefry(root: &UOp, plan: &crate::ThreefryValue) -> Result<RenderedC, JitError> {
+    root.validate()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    plan.validate()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    let elements = |shape: &crate::Shape| {
+        shape
+            .numel()
+            .map_err(|_| JitError::Unsupported("threefry shape overflow".into()))
+    };
+    let mut buffers = Vec::new();
+    for (node, shape, mutable) in plan.buffer_operands() {
+        buffers.push(BufferAbi {
+            id: node.index() as u64,
+            dtype: DType::U64,
+            elements: elements(shape)?,
+            mutable,
+        });
+    }
+    let abi = KernelAbi {
+        version: ABI_VERSION,
+        pointer_order: (0..buffers.len()).map(KernelPointerAbi::Dense).collect(),
+        buffers,
+        quantized_buffers: Vec::new(),
+        symbol_count: 0,
+    };
+    let ids = abi
+        .buffers
+        .iter()
+        .enumerate()
+        .map(|(index, buffer)| (buffer.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let counter_slot = ids[&(plan.counter.index() as u64)];
+    let key_slot = ids[&(plan.key.index() as u64)];
+    let output_slot = ids[&(plan.output.index() as u64)];
+    let extent = elements(&plan.output_shape)?;
+    let counter_offset = broadcast_offset(&plan.counter_shape, &plan.output_shape);
+    let key_offset = broadcast_offset(&plan.key_shape, &plan.output_shape);
+    let parity = crate::random::THREEFRY_PARITY;
+    let mut source = format!(
+        "#include <stdint.h>\n#include <stddef.h>\n/* {THREEFRY_RENDERER_VERSION} */\nint rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) {{ (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;\n  for (size_t rg_i=0; rg_i<{extent}u; ++rg_i) {{\n    uint64_t rg_counter=((const uint64_t*)buffers[{counter_slot}])[{counter_offset}];\n    uint64_t rg_key=((const uint64_t*)buffers[{key_slot}])[{key_offset}];\n    uint32_t rg_k[3]={{(uint32_t)rg_key,(uint32_t)(rg_key>>32),0u}}; rg_k[2]=rg_k[0]^rg_k[1]^0x{parity:08x}u;\n    uint32_t rg_x0=(uint32_t)rg_counter+rg_k[0], rg_x1=(uint32_t)(rg_counter>>32)+rg_k[1];\n"
+    );
+    for (_round, rotation, injection) in crate::random::threefry_rounds() {
+        source.push_str(&format!(
+            "    rg_x0+=rg_x1; rg_x1=((rg_x1<<{rotation})+(rg_x1>>{}))^rg_x0;\n",
+            32 - rotation
+        ));
+        if let Some(injection) = injection {
+            source.push_str(&format!(
+                "    rg_x0+=rg_k[{}]; rg_x1+=rg_k[{}]+{}u;\n",
+                injection % 3,
+                (injection + 1) % 3,
+                injection
+            ));
+        }
+    }
+    source.push_str(&format!(
+        "    ((uint64_t*)buffers[{output_slot}])[rg_i]=((uint64_t)rg_x1<<32)|(uint64_t)rg_x0;\n  }}\n  return 0;\n}}\n"
+    ));
+    let cache_key = native_cache_key(THREEFRY_RENDERER_VERSION, &source);
+    Ok(RenderedC {
+        source,
+        source_map: BTreeMap::new(),
         abi,
         cache_key,
     })

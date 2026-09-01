@@ -1,15 +1,7 @@
 use super::*;
 use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 
-/// Fully checked descriptor for tinygrad's live U64 Threefry permutation.
-/// The implementation is deliberately a graph composition: this records the
-/// only externally visible descriptor while the candidate graph owns all
-/// staged casts, shifts, and wrapping arithmetic before publication.
-struct ThreefryPlan {
-    output_shape: Shape,
-}
-
-fn threefry_plan(graph: &Graph, counter: NodeId, key: NodeId) -> Result<ThreefryPlan> {
+fn threefry_output_shape(graph: &Graph, counter: NodeId, key: NodeId) -> Result<Shape> {
     let counter_node = graph.node(counter)?;
     if counter_node.dtype != DType::U64 {
         return Err(Error::InvalidElementwiseDType {
@@ -25,84 +17,17 @@ fn threefry_plan(graph: &Graph, counter: NodeId, key: NodeId) -> Result<Threefry
         });
     }
     let output_shape = counter_node.shape.broadcast_with(&key_node.shape)?;
-    let extent = |shape: &Shape, dtype: DType| {
+    let extent = |shape: &Shape| {
         shape
             .numel()?
-            .checked_mul(dtype.itemsize())
+            .checked_mul(DType::U64.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
             .map(|_| ())
     };
     for shape in [&counter_node.shape, &key_node.shape, &output_shape] {
-        extent(shape, DType::U64)?;
-        extent(shape, DType::U32)?;
+        extent(shape)?;
     }
-    Ok(ThreefryPlan { output_shape })
-}
-
-fn lower_threefry(
-    graph: &mut Graph,
-    counter: NodeId,
-    key: NodeId,
-    plan: &ThreefryPlan,
-) -> Result<NodeId> {
-    let scalar = |graph: &mut Graph, value: u32, dtype| {
-        graph.constant(TensorData::scalar_with_dtype(
-            Scalar::U(u64::from(value)),
-            dtype,
-        ))
-    };
-    let shift_32_u64 = scalar(graph, 32, DType::U64);
-    let parity = scalar(graph, crate::random::THREEFRY_PARITY, DType::U32);
-    let rotations = crate::random::THREEFRY_ROTATIONS.map(|rotation| {
-        (
-            scalar(graph, rotation, DType::U32),
-            scalar(graph, 32 - rotation, DType::U32),
-        )
-    });
-    let injections = [1, 2, 3, 4, 5].map(|value| scalar(graph, value, DType::U32));
-
-    let split = |graph: &mut Graph, input: NodeId| -> Result<[NodeId; 2]> {
-        let low = graph.cast(input, DType::U32)?;
-        let shifted = graph.rshift(input, shift_32_u64)?;
-        let high = graph.cast(shifted, DType::U32)?;
-        Ok([low, high])
-    };
-    let [counter_low, counter_high] = split(graph, counter)?;
-    let [key_low, key_high] = split(graph, key)?;
-    let key_pair_xor = graph.bitwise_xor(key_low, key_high)?;
-    let key_parity = graph.bitwise_xor(key_pair_xor, parity)?;
-    let keys = [key_low, key_high, key_parity];
-
-    let mut x0 = graph.add(counter_low, keys[0])?;
-    let mut x1 = graph.add(counter_high, keys[1])?;
-    for round in 0..20 {
-        x0 = graph.add(x0, x1)?;
-        let (left_amount, right_amount) = rotations[round % rotations.len()];
-        let left = graph.lshift(x1, left_amount)?;
-        let right = graph.rshift(x1, right_amount)?;
-        let rotated = graph.add(left, right)?;
-        x1 = graph.bitwise_xor(rotated, x0)?;
-        if round % 4 == 3 {
-            let injection = round / 4 + 1;
-            x0 = graph.add(x0, keys[injection % keys.len()])?;
-            let injected_key = graph.add(x1, keys[(injection + 1) % keys.len()])?;
-            x1 = graph.add(injected_key, injections[injection - 1])?;
-        }
-    }
-
-    let high_u64 = graph.cast(x1, DType::U64)?;
-    let shifted_high = graph.lshift(high_u64, shift_32_u64)?;
-    let low_u64 = graph.cast(x0, DType::U64)?;
-    let output = graph.bitwise_or(shifted_high, low_u64)?;
-    debug_assert_eq!(
-        graph.shape(output).expect("threefry shape preflighted"),
-        &plan.output_shape
-    );
-    debug_assert_eq!(
-        graph.dtype(output).expect("threefry dtype preflighted"),
-        DType::U64
-    );
-    Ok(output)
+    Ok(output_shape)
 }
 
 /// Descriptor-only plan for tinygrad's `Tensor.bitwise_not` spelling. Bool
@@ -4981,15 +4906,12 @@ impl Graph {
 
     /// Applies tinygrad's public live-tensor Threefry 2x32 permutation to
     /// broadcast-compatible packed U64 counters and keys. Each low/high U32
-    /// pair follows the source's exact 20-round wrapping network. The graph is
-    /// clone-rehearsed so a late lowering failure cannot publish a partial
-    /// round sequence.
+    /// pair follows the source's exact 20-round wrapping network. The
+    /// dependency-bearing operation is retained through scheduling and
+    /// capture instead of being confused with ambient random state.
     pub fn threefry(&mut self, counter: NodeId, key: NodeId) -> Result<NodeId> {
-        let plan = threefry_plan(self, counter, key)?;
-        let mut candidate = self.clone();
-        let output = lower_threefry(&mut candidate, counter, key, &plan)?;
-        *self = candidate;
-        Ok(output)
+        let shape = threefry_output_shape(self, counter, key)?;
+        Ok(self.push(Op::Threefry { counter, key }, shape, DType::U64))
     }
 
     /// Mirrors tinygrad's `Tensor.bitwise_not` / `~x` without introducing a

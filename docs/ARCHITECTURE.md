@@ -1422,6 +1422,25 @@ control flow with target approximate transcendental instructions, so live CUDA
 is a documented tolerance contract while mock execution remains plan-exact.
 State reservation and live accelerator validation remain explicit boundaries.
 
+The public live `Graph::threefry(counter, key)` route is deliberately a
+different operation from that zero-input random source. One typed
+`ThreefryValue` retains both packed-U64 dependency identities, their exact
+broadcast shapes, the output identity and shape, and the first-use pointer
+order (deduplicating aliased operands). The graph-free CPU interpreter, RGUA
+v19 codec, strict C11 renderer, and PTX renderer all validate and consume that
+same value. The raw evaluator and both native emitters share the source's
+20-round rotation/injection inventory; neither renderer reconstructs a second
+input taxonomy. OpenCL, Metal, and WebGPU reject this live operation before
+backend work. This adds no ambient stream mutation, device-random reservation,
+or live CUDA validation claim.
+
+Durable schedule keys encode each kernel with its minimum admitted semantic
+RGUA envelope rather than the current standalone writer version. Existing
+operations therefore retain their released v18 key bytes when the v19
+Threefry tag is added; a kernel containing Threefry uses v19. RGSA, RGSO, and
+RGSM identities consequently remain stable without pretending that a v18
+decoder understands the new operation.
+
 `CapturedReplayExecutor` owns process-local scalar and vector CPU-JIT caches;
 compiled libraries and pointers never enter the artifact. A typed replay policy
 selects interpreter, strict native JIT, or explicit interpreter fallback. The

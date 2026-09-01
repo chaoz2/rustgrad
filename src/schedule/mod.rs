@@ -646,6 +646,47 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    if let crate::Operation::Threefry(plan) = kernel.operation() {
+        plan.validate()
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        let operands = plan.buffer_operands().collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for &(node, shape, mutable) in &operands[..operands.len() - 1] {
+            debug_assert!(!mutable);
+            let desc = inputs
+                .iter()
+                .find(|desc| desc.id == node.index() as u64)
+                .cloned()
+                .ok_or_else(|| ScheduleError::Binding("threefry input is absent".into()))?;
+            if desc.shape != *shape
+                || desc.dtype != crate::DType::U64
+                || !desc.read_only
+                || desc.view.is_some()
+            {
+                return Err(ScheduleError::Binding(
+                    "threefry input descriptor mismatch".into(),
+                ));
+            }
+            out.push(ScheduleInputBinding {
+                input_node: node,
+                desc,
+                abi_index: out.len(),
+            });
+        }
+        let (output_node, output_shape, output_mutable) = operands[operands.len() - 1];
+        if !output_mutable
+            || output.id != output_node.index() as u64
+            || output.shape != *output_shape
+            || output.dtype != crate::DType::U64
+            || output.read_only
+            || output.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "threefry output descriptor mismatch".into(),
+            ));
+        }
+        return Ok(out);
+    }
     if let crate::Operation::PrefixScan(plan) = kernel.operation() {
         let desc = inputs
             .iter()
@@ -1046,6 +1087,7 @@ fn supported(op: &Op) -> bool {
         Op::Input { .. }
             | Op::Constant(_)
             | Op::Random { .. }
+            | Op::Threefry { .. }
             | Op::Cast { .. }
             | Op::Bitcast { .. }
             | Op::Contiguous { .. }
@@ -1149,6 +1191,10 @@ pub fn schedule_with_external_materializations(
             | Op::Pad { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
+            | Op::Threefry {
+                counter: lhs,
+                key: rhs,
+            }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
             Op::Conv2d {
                 input,
@@ -1246,6 +1292,10 @@ fn schedule_many_with_external(
             | Op::Pad { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
+            | Op::Threefry {
+                counter: lhs,
+                key: rhs,
+            }
             | Op::Matmul { lhs, rhs } => {
                 child(*lhs)?;
                 child(*rhs)?;
@@ -1366,6 +1416,20 @@ fn schedule_many_with_external(
             )
         })
         .collect::<BTreeSet<_>>();
+    let threefry_operands = needed
+        .iter()
+        .filter_map(|index| match graph.op(NodeId::from_index(*index)) {
+            Ok(Op::Threefry { counter, key }) => Some([counter.index(), key.index()]),
+            _ => None,
+        })
+        .flatten()
+        .filter(|index| {
+            !matches!(
+                graph.op(NodeId::from_index(*index)),
+                Ok(Op::Input { .. } | Op::Constant(_))
+            )
+        })
+        .collect::<BTreeSet<_>>();
     // Materializing movement kernels name their exact pointer ABI. In
     // particular, a contiguous boundary over an affine view consumes the
     // rangeified storage source rather than first materializing the view.
@@ -1433,6 +1497,7 @@ fn schedule_many_with_external(
                 && (requested.contains(index)
                     || matmul_operands.contains(index)
                     || prefix_scan_operands.contains(index)
+                    || threefry_operands.contains(index)
                     || movement_operands.contains(index)
                     || computed_view_sources.contains(index)
                     || (consumers[*index] > 1
@@ -1440,6 +1505,7 @@ fn schedule_many_with_external(
                     || matches!(
                         graph.op(id),
                         Ok(Op::Random { .. }
+                            | Op::Threefry { .. }
                             | Op::Reduce { .. }
                             | Op::PrefixScan { .. }
                             | Op::Sort { .. }
@@ -1530,6 +1596,10 @@ fn schedule_many_with_external(
             },
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
+            | Op::Threefry {
+                counter: lhs,
+                key: rhs,
+            }
             | Op::Matmul { lhs, rhs } => {
                 leaves(g, *lhs, roots, here, out, boundary, external)?;
                 leaves(g, *rhs, roots, here, out, boundary, external)?;
@@ -1619,6 +1689,8 @@ fn schedule_many_with_external(
             if boundary.is_none() {
                 match graph.op(node).map_err(ScheduleError::Graph)? {
                     Op::Random { .. } => crate::kernel::lower_graph_random(graph, node)
+                        .map_err(ScheduleError::UOp)?,
+                    Op::Threefry { .. } => crate::kernel::lower_graph_threefry(graph, node)
                         .map_err(ScheduleError::UOp)?,
                     Op::Matmul { .. } => crate::kernel::lower_graph_matmul(graph, node)
                         .map_err(ScheduleError::UOp)?,
@@ -1807,7 +1879,12 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
                     leaves.insert(input.index());
                 }
             },
-            Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
+            Op::Binary { lhs, rhs, .. }
+            | Op::Compare { lhs, rhs, .. }
+            | Op::Threefry {
+                counter: lhs,
+                key: rhs,
+            } => {
                 walk(g, *lhs, leaves, boundary)?;
                 walk(g, *rhs, leaves, boundary)?
             }
@@ -1845,6 +1922,8 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
                 Op::Reduce { .. } => crate::kernel::lower_graph_reduction(graph, output)
                     .map_err(ScheduleError::UOp)?,
                 Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, output)
+                    .map_err(ScheduleError::UOp)?,
+                Op::Threefry { .. } => crate::kernel::lower_graph_threefry(graph, output)
                     .map_err(ScheduleError::UOp)?,
                 _ => crate::kernel::lower_graph_elementwise(graph, output)
                     .map_err(ScheduleError::UOp)?,

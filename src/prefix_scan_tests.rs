@@ -200,7 +200,7 @@ fn native_prefix_scan_plan_carries_exact_source_result_abi_and_value_kinds() {
                 rendered.cache_key
             );
             let bytes = crate::uop::artifact::encode(&kernel).unwrap();
-            assert_eq!(bytes[4], 18);
+            assert_eq!(bytes[4], 19);
             assert_eq!(crate::uop::artifact::decode(&bytes).unwrap(), kernel);
         }
     }
