@@ -1063,6 +1063,14 @@ impl Op {
             | Self::ArgReduce { .. }
             | Self::Compare { .. }
             | Self::Logical { .. }
+            | Self::PrefixScan {
+                output: PrefixScanOutput::Indices,
+                ..
+            }
+            | Self::Sort {
+                output: SortOutput::Indices,
+                ..
+            }
             // Boolean reductions are predicate operations. They never form
             // reverse-mode value edges, even when their source was float.
             | Self::Reduce {

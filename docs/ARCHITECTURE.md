@@ -413,12 +413,18 @@ input/output descriptor in its UOp and RGUA artifact payload. The CPU oracle
 owns inclusive scan execution and cache identity; scalar and zero-extent shapes
 remain exact. Sums use their existing promotion contract while products retain
 source dtype, including Bool. Floating `cumsum` reverse mode composes existing
-signed-axis reverse views around another sum scan, retaining graph-on-graph
-seed edges; product scans and non-floating sum scans reject before derivative
-graph mutation.
+signed-axis reverse views around another sum scan, and floating `cumprod` uses
+the existing zero-aware scan composition. Floating cumulative-extrema values
+move the normalized axis last and build one prefix/equality winner matrix from
+ordinary compare, logical, cast, reduction, multiply, and divide nodes. Each
+prefix cotangent is divided among every equal winner, including signed-zero
+ties; NaN follows the same equality/count route. Both the winner-count and
+final contribution reductions retain the upstream storage dtype. These paths
+retain graph-on-graph seed edges, while non-floating and Float8 scans reject
+before derivative graph mutation.
 `Graph::cummax` and `Graph::cummin` use the same CPU-static `PrefixScan` path to
 return values plus I32 last-matching-prefix indices, with left-biased NaN and
-signed-zero ties. Cumulative extrema are explicitly nondifferentiable; all
+signed-zero ties. Their index outputs remain explicitly nondifferentiable; all
 PrefixScan forms remain fail-closed for JIT and device lowering.
 This is deliberately not a CPU-JIT, PTX, OpenCL, Metal,
 WebGPU, dynamic, parallel, or generic replay contract. The fixed-size
@@ -426,7 +432,7 @@ WebGPU, dynamic, parallel, or generic replay contract. The fixed-size
 reuses its boolean prefix ranks as nondifferentiable control/index values to
 gather explicit upstream cotangents into retained row-major source lanes;
 padding, truncation, and false lanes are zeroed. This does not add a dynamic
-cardinality gradient path or a product-scan value VJP.
+cardinality gradient path.
 
 Each scheduled kernel retains immutable `ScheduleInputBinding` entries ordered
 by first lowered `Load` use (with repeated reads canonicalized), never by graph

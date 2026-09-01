@@ -970,11 +970,27 @@ impl Graph {
                     self.accumulate(&mut grads, input, gradient)?;
                 }
                 Op::PrefixScan {
+                    input,
+                    axis,
                     kind: crate::PrefixScanKind::Max | crate::PrefixScanKind::Min,
+                    output: crate::PrefixScanOutput::Values,
+                } => {
+                    let gradient = self.cumulative_extrema_vjp(upstream, input, node, axis)?;
+                    let input_dtype = self.node(input)?.dtype;
+                    let gradient = if self.node(gradient)?.dtype == input_dtype {
+                        gradient
+                    } else {
+                        self.cast(gradient, input_dtype)?
+                    };
+                    self.accumulate(&mut grads, input, gradient)?;
+                }
+                Op::PrefixScan {
+                    kind: crate::PrefixScanKind::Max | crate::PrefixScanKind::Min,
+                    output: crate::PrefixScanOutput::Indices,
                     ..
                 } => {
                     return Err(Error::NonDifferentiableIndexing(
-                        "cumulative extrema gradients are not yet represented",
+                        "cumulative extrema indices",
                     ));
                 }
                 Op::Sort {
@@ -1463,22 +1479,31 @@ impl Graph {
             }
             if let Op::PrefixScan { input, kind, .. } = &self.nodes[index].op {
                 match kind {
-                    crate::PrefixScanKind::Sum if !self.node(*input)?.dtype.is_float() => {
+                    crate::PrefixScanKind::Sum
+                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
+                    {
                         return Err(Error::NonDifferentiableIndexing(
                             "cumsum gradients require floating input",
                         ));
                     }
-                    crate::PrefixScanKind::Product if !self.node(*input)?.dtype.is_float() => {
+                    crate::PrefixScanKind::Product
+                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
+                    {
                         return Err(Error::NonDifferentiableIndexing(
                             "cumprod gradients require floating input",
                         ));
                     }
-                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min => {
+                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min
+                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
+                    {
                         return Err(Error::NonDifferentiableIndexing(
-                            "cumulative extrema gradients are not yet represented",
+                            "cumulative extrema gradients require floating input",
                         ));
                     }
-                    crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => {}
+                    crate::PrefixScanKind::Sum
+                    | crate::PrefixScanKind::Product
+                    | crate::PrefixScanKind::Max
+                    | crate::PrefixScanKind::Min => {}
                 }
             }
         }
@@ -1537,22 +1562,31 @@ impl Graph {
             }
             if let Op::PrefixScan { input, kind, .. } = &current.op {
                 match kind {
-                    crate::PrefixScanKind::Sum if !self.node(*input)?.dtype.is_float() => {
+                    crate::PrefixScanKind::Sum
+                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
+                    {
                         return Err(Error::NonDifferentiableIndexing(
                             "cumsum gradients require floating input",
                         ));
                     }
-                    crate::PrefixScanKind::Product if !self.node(*input)?.dtype.is_float() => {
+                    crate::PrefixScanKind::Product
+                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
+                    {
                         return Err(Error::NonDifferentiableIndexing(
                             "cumprod gradients require floating input",
                         ));
                     }
-                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min => {
+                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min
+                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
+                    {
                         return Err(Error::NonDifferentiableIndexing(
-                            "cumulative extrema gradients are not yet represented",
+                            "cumulative extrema gradients require floating input",
                         ));
                     }
-                    crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => {}
+                    crate::PrefixScanKind::Sum
+                    | crate::PrefixScanKind::Product
+                    | crate::PrefixScanKind::Max
+                    | crate::PrefixScanKind::Min => {}
                 }
             }
             pending.extend(
@@ -1593,6 +1627,67 @@ impl Graph {
         let ordinary = self.div(ordinary_sum, safe_input)?;
         let zero_lane = self.cumsum_vjp(zero_lane, axis)?;
         self.select(zero_mask, zero_lane, ordinary)
+    }
+
+    fn cumulative_extrema_vjp(
+        &mut self,
+        upstream: NodeId,
+        input: NodeId,
+        values: NodeId,
+        axis: usize,
+    ) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let shape = input_node.shape.clone();
+        if shape.rank() == 0 || shape.numel()? == 0 {
+            return Ok(upstream);
+        }
+        let extent = shape.dims()[axis];
+        let end = i64::try_from(extent).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let mut order = (0..shape.rank())
+            .filter(|candidate| *candidate != axis)
+            .collect::<Vec<_>>();
+        order.push(axis);
+        let mut inverse = vec![0usize; shape.rank()];
+        for (position, original) in order.iter().copied().enumerate() {
+            inverse[original] = position;
+        }
+
+        let input = self.permute(input, order.clone())?;
+        let values = self.permute(values, order.clone())?;
+        let upstream = self.permute(upstream, order)?;
+        let input = self.unsqueeze(input, -1)?;
+        let values = self.unsqueeze(values, -2)?;
+        let winners = self.eq(input, values)?;
+
+        let coordinates = self.lazy_arange_default_int(0, end, 1)?;
+        let rows = self.reshape(coordinates, Shape::from([extent, 1]))?;
+        let columns = self.reshape(coordinates, Shape::from([1, extent]))?;
+        let prefix = self.le(rows, columns)?;
+        let winners = self.logical_and(winners, prefix)?;
+        let upstream_dtype = self.node(upstream)?.dtype;
+        let winners = self.cast(winners, upstream_dtype)?;
+        let winner_axis =
+            isize::try_from(shape.rank() - 1).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let counts = self.reduce_with_output_dtype(
+            winners,
+            crate::ReduceKind::Sum,
+            Some(vec![winner_axis]),
+            true,
+            upstream_dtype,
+        )?;
+        let upstream = self.unsqueeze(upstream, -2)?;
+        let contributions = self.mul(winners, upstream)?;
+        let contributions = self.div(contributions, counts)?;
+        let prefix_axis =
+            isize::try_from(shape.rank()).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let gradient = self.reduce_with_output_dtype(
+            contributions,
+            crate::ReduceKind::Sum,
+            Some(vec![prefix_axis]),
+            false,
+            upstream_dtype,
+        )?;
+        self.permute(gradient, inverse)
     }
 
     fn reverse_axis(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
@@ -1671,6 +1766,10 @@ fn filled(shape: Shape, value: f64, dtype: DType) -> Result<TensorData> {
         dtype,
         std::iter::repeat_n(Scalar::F(value), elements),
     )
+}
+
+fn prefix_scan_gradient_dtype_supported(dtype: DType) -> bool {
+    dtype.is_float() && !dtype.is_float8()
 }
 
 #[cfg(test)]
@@ -2006,6 +2105,190 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_extrema_value_vjp_splits_prefix_ties_and_preserves_axes() {
+        let mut graph = Graph::new();
+        let maximum_input = graph.input("maximum_input", [3]);
+        let (maximum_values, maximum_indices) = graph.cummax(maximum_input, 0).unwrap();
+        let maximum_seed = graph.constant(data([3], &[10.0, 20.0, 30.0]));
+        let maximum_gradient = graph
+            .grad_with(maximum_values, maximum_input, Some(maximum_seed), true)
+            .unwrap();
+        assert!(matches!(
+            graph.grad(maximum_indices, maximum_input),
+            Err(Error::NonDifferentiableTarget(node)) if node == maximum_indices
+        ));
+
+        let minimum_input = graph.input("minimum_input", [3]);
+        let (minimum_values, _) = graph.cummin(minimum_input, 0).unwrap();
+        let minimum_seed = graph.constant(data([3], &[10.0, 20.0, 30.0]));
+        let minimum_gradient = graph
+            .grad_with(minimum_values, minimum_input, Some(minimum_seed), true)
+            .unwrap();
+
+        let axis_input = graph.input("axis_input", [3, 2]);
+        let (axis_values, _) = graph.cummax(axis_input, 0).unwrap();
+        let axis_seed = graph.constant(data([3, 2], &[1.0; 6]));
+        let axis_gradient = graph
+            .grad_with(axis_values, axis_input, Some(axis_seed), true)
+            .unwrap();
+
+        let zero_input = graph.input("zero_input", [2]);
+        let (zero_values, _) = graph.cummax(zero_input, 0).unwrap();
+        let zero_seed = graph.constant(data([2], &[2.0, 4.0]));
+        let zero_gradient = graph
+            .grad_with(zero_values, zero_input, Some(zero_seed), true)
+            .unwrap();
+
+        let bindings = HashMap::from([
+            ("maximum_input".into(), data([3], &[2.0, 2.0, 1.0])),
+            ("minimum_input".into(), data([3], &[1.0, 1.0, 2.0])),
+            (
+                "axis_input".into(),
+                data([3, 2], &[2.0, 1.0, 2.0, 3.0, 1.0, 3.0]),
+            ),
+            ("zero_input".into(), data([2], &[-0.0, 0.0])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, maximum_gradient, &bindings)
+                .unwrap(),
+            data([3], &[35.0, 25.0, 0.0])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, minimum_gradient, &bindings)
+                .unwrap(),
+            data([3], &[35.0, 25.0, 0.0])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, axis_gradient, &bindings)
+                .unwrap(),
+            data([3, 2], &[2.0, 1.0, 1.0, 1.5, 0.0, 0.5])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, zero_gradient, &bindings)
+                .unwrap(),
+            data([2], &[4.0, 2.0])
+        );
+    }
+
+    #[test]
+    fn cumulative_extrema_value_vjp_handles_scalar_empty_nan_and_higher_order() {
+        let mut graph = Graph::new();
+        let scalar = graph.input("scalar", []);
+        let (scalar_values, _) = graph.cummax(scalar, 0).unwrap();
+        let scalar_gradient = graph.grad(scalar_values, scalar).unwrap();
+
+        let empty = graph.input("empty", [0, 2]);
+        let (empty_values, _) = graph.cummin(empty, 0).unwrap();
+        let empty_seed = graph.constant(data([0, 2], &[]));
+        let empty_gradient = graph
+            .grad_with(empty_values, empty, Some(empty_seed), true)
+            .unwrap();
+
+        let nan = graph.input("nan", [2]);
+        let (nan_values, _) = graph.cummax(nan, 0).unwrap();
+        let nan_seed = graph.constant(data([2], &[1.0, 1.0]));
+        let nan_gradient = graph
+            .grad_with(nan_values, nan, Some(nan_seed), true)
+            .unwrap();
+
+        let first_sum = graph.sum_all(nan_gradient).unwrap();
+        let second = graph.gradient_default(first_sum, &[nan]).unwrap()[0];
+        let bindings = HashMap::from([
+            ("scalar".into(), data([], &[7.0])),
+            ("empty".into(), data([0, 2], &[])),
+            ("nan".into(), data([2], &[f32::NAN, 1.0])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, scalar_gradient, &bindings)
+                .unwrap(),
+            data([], &[1.0])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, empty_gradient, &bindings)
+                .unwrap(),
+            data([0, 2], &[])
+        );
+        let nan_gradient = CpuBackend.execute(&graph, nan_gradient, &bindings).unwrap();
+        assert!(nan_gradient.values().iter().all(|value| value.is_nan()));
+        assert_eq!(
+            CpuBackend.execute(&graph, second, &bindings).unwrap(),
+            data([2], &[0.0, 0.0])
+        );
+
+        for dtype in [DType::F16, DType::BF16, DType::F64] {
+            let input = graph.input_dtype(format!("{dtype:?}_input"), [2], dtype);
+            let (values, _) = graph.cummin(input, 0).unwrap();
+            let seed = graph
+                .lazy_full_with_dtype([2], Scalar::F(1.0), dtype)
+                .unwrap();
+            let first_vjp_node = graph.node_count();
+            let gradient = graph.grad_with(values, input, Some(seed), true).unwrap();
+            assert_eq!(graph.dtype(gradient).unwrap(), dtype);
+            if matches!(dtype, DType::F16 | DType::BF16) {
+                let sum_reductions = (first_vjp_node..graph.node_count())
+                    .map(NodeId)
+                    .filter(|node| {
+                        matches!(
+                            graph.op(*node).unwrap(),
+                            Op::Reduce {
+                                kind: crate::ReduceKind::Sum,
+                                ..
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(sum_reductions.len(), 2);
+                assert!(
+                    sum_reductions
+                        .iter()
+                        .all(|node| graph.dtype(*node).unwrap() == dtype)
+                );
+                assert!(
+                    (first_vjp_node..graph.node_count())
+                        .map(NodeId)
+                        .all(|node| graph.dtype(node).unwrap() != DType::F32)
+                );
+            }
+        }
+
+        let float8 = graph.input_dtype("float8", [2], DType::F8E4M3);
+        let (float8_values, _) = graph.cummax(float8, 0).unwrap();
+        let float8_seed = graph
+            .lazy_full_with_dtype([2], Scalar::F(1.0), DType::F8E4M3)
+            .unwrap();
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient(float8_values, &[float8], Some(float8_seed)),
+            Err(Error::NonDifferentiableIndexing(_))
+        ));
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn source_cumulative_extrema_vjp_discards_late_descriptor_failure() {
+        let mut graph = Graph::new();
+        let extent = 1usize << 32;
+        let input = graph.input("input", [extent]);
+        let (values, _) = graph.cummax(input, 0).unwrap();
+        let seed = graph
+            .lazy_full_with_dtype([extent], Scalar::F(1.0), DType::F32)
+            .unwrap();
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient(values, &[input], Some(seed)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
     fn source_gradient_normalizes_custom_seed_and_prunes_unrequested_paths() {
         let mut graph = Graph::new();
         let x = graph.input("x", [3]);
@@ -2013,10 +2296,16 @@ mod tests {
         let product = graph.mul(x, y).unwrap();
         let product_sum = graph.sum_all(product).unwrap();
         let unrelated = graph.input("unrelated", [3]);
-        let (cumulative, _) = graph.cummax(unrelated, 0).unwrap();
+        let (cumulative, cumulative_indices) = graph.cummax(unrelated, 0).unwrap();
         let cumulative_sum = graph.sum_all(cumulative).unwrap();
-        let loss = graph.add(product_sum, cumulative_sum).unwrap();
+        let cumulative_indices = graph.cast(cumulative_indices, DType::F32).unwrap();
+        let cumulative_indices_sum = graph.sum_all(cumulative_indices).unwrap();
+        let cumulative_branch = graph.add(cumulative_sum, cumulative_indices_sum).unwrap();
+        let loss = graph.add(product_sum, cumulative_branch).unwrap();
         let seed = graph.constant(data([1], &[3.0]));
+        let indices_only_gradient = graph
+            .gradient_default(cumulative_indices_sum, &[unrelated])
+            .unwrap()[0];
 
         // `[1]` is the concrete public representation accepted by tinygrad's
         // scalar custom-gradient example. Normalize it to the scalar loss
@@ -2031,15 +2320,20 @@ mod tests {
             CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
             data([3], &[21.0, 33.0, 39.0])
         );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, indices_only_gradient, &bindings)
+                .unwrap(),
+            data([3], &[0.0, 0.0, 0.0])
+        );
 
-        // Cumulative extrema are still unsupported in reverse mode, but an
-        // unrelated branch must not poison a target-pruned source traversal.
-        let before = graph.node_count();
-        assert!(matches!(
-            graph.gradient_default(loss, &[unrelated]),
-            Err(Error::NonDifferentiableIndexing(_))
-        ));
-        assert_eq!(graph.node_count(), before);
+        let unrelated_gradient = graph.gradient_default(loss, &[unrelated]).unwrap()[0];
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, unrelated_gradient, &bindings)
+                .unwrap(),
+            data([3], &[1.0, 2.0, 0.0])
+        );
     }
 
     #[test]
