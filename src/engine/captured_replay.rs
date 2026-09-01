@@ -2377,6 +2377,54 @@ mod tests {
     }
 
     #[test]
+    fn captured_typed_unbroadcast_matches_interpreter_and_native() {
+        let mut graph = Graph::new();
+        let target = graph.input_dtype("target", [1], DType::BF16);
+        let other = graph.input_dtype("other", [3], DType::BF16);
+        let output = graph.add(target, other).unwrap();
+        let seed = graph.input_dtype_requires_grad("seed", [3], DType::BF16, false);
+        let gradient = graph.grad_with(output, target, Some(seed), true).unwrap();
+        let capture = captured(&graph, &[gradient]);
+        assert!(!capture.items.is_empty());
+        assert!(capture.items.iter().all(|item| item.boundary.is_none()));
+        assert_eq!(capture.inputs.len(), 1);
+        assert_eq!(capture.inputs[0].name, "seed");
+
+        let bindings = BTreeMap::from([(
+            "seed".into(),
+            TensorData::from_scalars(
+                [3],
+                DType::BF16,
+                [Scalar::F(256.0), Scalar::F(1.0), Scalar::F(-256.0)],
+            )
+            .unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let interpreted = executor
+            .replay(&capture, &bindings, CapturedReplayOptions::default())
+            .unwrap();
+        let native = executor
+            .replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        let expected = TensorData::from_scalars([1], DType::BF16, [Scalar::F(1.0)]).unwrap();
+        assert_eq!(interpreted.outputs, vec![expected.clone()]);
+        assert_eq!(native.outputs, vec![expected]);
+        assert!(
+            native
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
+    }
+
+    #[test]
     fn unsupported_native_policy_is_explicit() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2]), DType::F32);

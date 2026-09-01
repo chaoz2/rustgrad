@@ -1748,6 +1748,43 @@ fn computed_affine_materialization_preserves_graph_vjp_routing() {
 }
 
 #[test]
+fn typed_unbroadcast_vjp_is_an_owned_scheduleable_reduction_chain() {
+    let mut graph = Graph::new();
+    let target = graph.input_dtype("target", [1, 2], DType::BF16);
+    let other = graph.input_dtype("other", [3, 2], DType::BF16);
+    let output = graph.add(target, other).unwrap();
+    let seed = graph.input_dtype_requires_grad("seed", [3, 2], DType::BF16, false);
+    let gradient = graph.grad_with(output, target, Some(seed), true).unwrap();
+
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::from([1, 2]));
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::BF16);
+    assert!(
+        (0..graph.node_count())
+            .map(crate::NodeId::from_index)
+            .all(|node| !matches!(graph.op(node).unwrap(), crate::Op::SumTo { .. }))
+    );
+
+    let scheduled = schedule(&graph, gradient).unwrap();
+    scheduled.validate().unwrap();
+    assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
+    assert!(scheduled.items.iter().any(|item| {
+        item.kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(node.operation(), crate::Operation::ReduceFinalize))
+    }));
+    assert!(
+        scheduled
+            .items
+            .iter()
+            .flat_map(|item| item.ordered_inputs())
+            .any(|binding| binding.input_node == seed)
+    );
+    crate::MemoryPlan::from_schedule(&scheduled, &[gradient], true).unwrap();
+}
+
+#[test]
 fn scheduled_outputs_are_nonempty_ordered_and_define_cache_identity() {
     let output = buffer(7, 4, 1);
     assert!(ScheduledOutputs::new(vec![]).is_err());
