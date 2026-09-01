@@ -1623,7 +1623,9 @@ Gradient recording is graph-local state. `Graph::no_grad` temporarily disables
 recording only for its closure and restores the prior state even while unwinding;
 there is no process-global gradient switch. Float inputs default to tracked,
 while constants and explicitly frozen inputs do not. Every resulting node
-carries an inspectable `requires_grad` bit derived from its value inputs.
+carries an inspectable `requires_grad` bit derived from the shared structural
+reverse-edge projection, with the coupled Sort producer retaining its
+historical lifecycle-bit policy.
 
 `Graph::detach` is a value-preserving `Detach` node: it is a new tracked float
 leaf, but reverse traversal deliberately does not cross its input edge. This
@@ -1633,10 +1635,15 @@ gradient history.
 `Graph::grad` retains a differentiable derivative graph. `Graph::grad_with`
 accepts an explicit same-shaped upstream node and its `create_graph` flag
 controls whether newly built derivative nodes themselves record reverse edges.
-The static graph does not retain or free a tape: the graph is immutable in
-meaning, and each transform appends nodes. Parameters retain graph-independent
-versioned host state. A graph-local registry captures each parameter identity
-and version into one immutable input leaf; optimizer writes reject stale or
+Both it and the ordered multi-target transform derive one graph-checked,
+edge-aware root-to-target frontier: predicate/index edges, Detach, nonfloating
+Cast boundaries, and unrequested operand derivatives are not traversed or
+built. The complete seed and derivative candidate commits only after every
+local rule succeeds. The static graph does not retain or free a tape: the graph
+is immutable in meaning, and each successful transform appends nodes.
+Parameters retain graph-independent versioned host state. A graph-local
+registry captures each parameter identity and version into one immutable input
+leaf; optimizer writes reject stale or
 wrong-identity gradients, and subsequent forwards bind the new host version.
 In-process `TrainingCheckpoint` resume retains those host objects and validates
 their exact identity/version/value stamps before restoring fresh optimizer and
@@ -1651,7 +1658,8 @@ binding for whole, injective signed-affine, and normalized static-index
 replacement writes. It returns the old-state adjoint and an RHS adjoint in the
 actual pure-output descriptor, reducing assignment broadcasts and preserving
 last-writer semantics. `graph_vjp` hands that explicit RHS seed to
-`Graph::grad_with` for pure leaves. Effect graph gradients, higher-order
+`Graph::grad_with` for pure leaves within the same clone-then-commit
+transaction. Effect graph gradients, higher-order
 mutation AD, capture/native/device mutation AD, global mutable aliases, and
 device-resident effect state remain intentionally unsupported.
 

@@ -336,5 +336,22 @@ mod tests {
             CpuBackend.execute(&graph, derivative, &values).unwrap(),
             TensorData::new([2], vec![12.0f32, 24.0]).unwrap()
         );
+
+        let disconnected = graph.input("disconnected", [2]);
+        let before = graph.node_count();
+        assert!(matches!(
+            tape.graph_vjp(
+                &mut graph,
+                disconnected,
+                TensorData::new([2], vec![1.0f32, 1.0]).unwrap(),
+                false,
+            ),
+            Err(crate::effects::MutationVjpError::GraphNode(node)) if node == disconnected
+        ));
+        assert_eq!(
+            graph.node_count(),
+            before,
+            "failed mutation VJP must not publish its explicit seed"
+        );
     }
 }
