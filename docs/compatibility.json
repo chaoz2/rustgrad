@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:46ecbe294dfee632",
+  "source_fingerprint": "fnv1a64:e0590f49bf48ec95",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -198,7 +198,7 @@
       "subject": "Realized host values and mutation",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`TensorData::item` accepts exactly one stored element independent of rank and returns the typed `Scalar`; exported recursive `TensorList`/`tolist` preserves row-major concrete nesting and zero extents with F16/BF16 decoded through the established float conversion; exported borrowed `TensorDataReader`/`byte_reader` admits rank-one U8 storage, provides bounded `Read`/`read_to_end` and clamped `Seek`, and has no write interface; `replace` atomically swaps same-shape owned storage while allowing dtype changes; `assign`/`assign_from` perform source-order broadcast-before-dtype validation, exact same-dtype raw-lane broadcast copies, and transactional mutation. No live Graph/device realization API, borrowed typed memoryview/zero-copy data view, NumPy ndarray interop, gradient/device-aware clone/replace/transfer, weak/symbolic host values, or view-alias mutation claim."
+        "Acceptance requirement": "`TensorData::item` accepts exactly one stored element independent of rank and returns the typed `Scalar`; exported recursive `TensorList`/`tolist` preserves row-major concrete nesting and zero extents with F16/BF16 decoded through the established float conversion; exported borrowed `TensorDataReader`/`byte_reader` admits rank-one U8 storage, provides bounded `Read`/`read_to_end` and clamped `Seek`, and has no write interface; `replace` atomically swaps same-shape owned storage while allowing dtype changes; `assign`/`assign_from` perform source-order broadcast-before-dtype validation, exact same-dtype raw-lane broadcast copies, and transactional mutation. `CpuSession::realize_many` authenticates an ordered handle set before one `schedule_many`/`MemoryPlan` CPU transaction, executes shared producers once, preserves duplicate request positions and exact owned source/output storage, reports engine failures as typed `Error::SessionRealization`, and returns no partial result on failure; the recursive single-output CPU oracle remains unchanged. No live device realization API, borrowed typed memoryview/zero-copy data view, NumPy ndarray interop, gradient/device-aware clone/replace/transfer, weak/symbolic host values, or view-alias mutation claim."
       }
     },
     {

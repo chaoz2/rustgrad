@@ -599,7 +599,15 @@ allocation, copy, or launch.
 `HostSlotPool` leases are generation-checked and views/detached outputs retain
 their runtime ownership. Exact-compatible `MemoryPlan` reuse is alias-safe; the
 remaining boundary is backend-owned slot placement and vector/lane byte-window
-planning. The backend-neutral `effects` subsystem separately owns immutable
+planning. Ordinary CPU batch realization derives one checked ordered output
+projection before allocation or compilation, then executes the canonical
+`schedule_many` DAG once. Scheduled outputs retain producer-owned buffers;
+requested Inputs and Constants retain exact owned source storage; duplicate
+requests are projected back into their original positions without duplicate
+execution. The entire output vector is published only after every item and
+host-slot invariant succeeds. This changes neither the recursive single-output
+CPU oracle nor capture/artifact identity. The backend-neutral `effects`
+subsystem separately owns immutable
 logical buffer versions and explicit read/write-after dependencies; it is the
 only planned bridge from pure graph dataflow to STORE/AFTER scheduling. Dense
 `TensorData::assign_from` is its CPU reference predecessor, with same-dtype

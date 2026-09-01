@@ -89,6 +89,174 @@ pub struct Realized {
     pub trace: RealizationTrace,
 }
 
+/// Checked ordered output inventory for one ordinary realization transaction.
+///
+/// Scheduled values retain their producer-owned buffers. Requested graph
+/// inputs and constants have no producer item, so the transaction retains
+/// their exact owned storage here. The ordered IDs deliberately preserve
+/// duplicate requests without scheduling or materializing the value twice.
+struct RequestedOutputPlan {
+    ordered: Vec<u64>,
+    retained_sources: HashMap<u64, TensorData>,
+}
+
+impl RequestedOutputPlan {
+    fn new(
+        graph: &Graph,
+        schedule: &Schedule,
+        requested: &[NodeId],
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<Self, RealizationError> {
+        let produced = schedule
+            .items
+            .iter()
+            .flat_map(|item| {
+                item.outputs
+                    .iter()
+                    .map(move |output| (output.id, (item, output)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut ordered = Vec::with_capacity(requested.len());
+        let mut retained_sources = HashMap::new();
+        for &node in requested {
+            let shape = graph
+                .shape(node)
+                .map_err(|error| RealizationError::Schedule(error.to_string()))?
+                .clone();
+            let dtype = graph
+                .dtype(node)
+                .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+            let elements = shape
+                .numel()
+                .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+            let bytes = elements.checked_mul(dtype.itemsize()).ok_or_else(|| {
+                RealizationError::Schedule("requested output byte overflow".into())
+            })?;
+            let id = node.index() as u64;
+            ordered.push(id);
+            let op = graph
+                .op(node)
+                .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+            if matches!(op, Op::Input { .. } | Op::Constant(_)) {
+                if produced.contains_key(&id) {
+                    return Err(RealizationError::Schedule(format!(
+                        "requested source {id} is shadowed by a scheduled producer"
+                    )));
+                }
+                let value = match op {
+                    Op::Input { name } => inputs.get(name).ok_or_else(|| {
+                        RealizationError::Execution(format!("missing input {name}"))
+                    })?,
+                    Op::Constant(value) => value,
+                    _ => unreachable!("source operation was classified above"),
+                };
+                if value.shape() != &shape || value.dtype() != dtype {
+                    return Err(RealizationError::Execution(format!(
+                        "requested value {id} descriptor mismatch"
+                    )));
+                }
+                retained_sources.entry(id).or_insert_with(|| value.clone());
+                continue;
+            }
+            if let Some((item, output)) = produced.get(&id) {
+                let owns_output = match item.kernel.operation() {
+                    crate::Operation::Sort(_) => canonical_sort_item_owns(graph, item, node)?,
+                    _ => item.node == node,
+                };
+                if !owns_output {
+                    return Err(RealizationError::Schedule(format!(
+                        "requested value {id} has a graph-inconsistent scheduled producer"
+                    )));
+                }
+                if output.shape != shape
+                    || output.dtype != dtype
+                    || output.bytes != bytes
+                    || output.alignment != dtype.itemsize().max(1)
+                    || output.view.is_some()
+                    || output.read_only
+                {
+                    return Err(RealizationError::Schedule(format!(
+                        "requested output {id} descriptor mismatch"
+                    )));
+                }
+                continue;
+            }
+            return Err(RealizationError::Schedule(format!(
+                "requested value {id} has no scheduled producer"
+            )));
+        }
+        Ok(Self {
+            ordered,
+            retained_sources,
+        })
+    }
+}
+
+fn canonical_sort_item_owns(
+    graph: &Graph,
+    item: &crate::ScheduleItem,
+    requested: NodeId,
+) -> Result<bool, RealizationError> {
+    let crate::Operation::Sort(payload) = item.kernel.operation() else {
+        return Ok(false);
+    };
+    let plan =
+        crate::CpuStableSortPlan::from_graph(graph, payload.input, payload.values, payload.indices)
+            .map_err(|error| {
+                RealizationError::Schedule(format!(
+                    "requested Sort producer is not canonical: {error}"
+                ))
+            })?;
+    let descriptor_matches =
+        |actual: &crate::BufferDesc, expected: &crate::CpuStableSortDescriptor, read_only: bool| {
+            actual.id == expected.node.index() as u64
+                && actual.shape == expected.shape
+                && actual.dtype == expected.dtype
+                && actual.bytes == expected.bytes
+                && actual.alignment == expected.dtype.itemsize().max(1)
+                && actual.read_only == read_only
+                && actual.view.is_none()
+        };
+    let owner_matches = matches!(
+        graph.op(item.node),
+        Ok(Op::Sort {
+            input,
+            axis,
+            descending,
+            pair,
+            output: crate::SortOutput::Values,
+        }) if *input == plan.source().node
+            && *axis == plan.axis()
+            && *descending == plan.descending()
+            && *pair == plan.pair()
+            && item.node == plan.values().node
+    );
+    let payload_matches = payload.input == plan.source().node
+        && payload.input_shape == plan.source().shape
+        && payload.axis == plan.axis()
+        && payload.descending == plan.descending()
+        && payload.values == plan.values().node
+        && payload.indices == plan.indices().node
+        && payload.dtype == plan.source().dtype;
+    let input_matches = item.ordered_inputs().len() == 1
+        && item.ordered_inputs()[0].input_node == plan.source().node
+        && item.ordered_inputs()[0].abi_index == 0
+        && descriptor_matches(&item.ordered_inputs()[0].desc, plan.source(), true);
+    let outputs_match = item.outputs.len() == 2
+        && descriptor_matches(item.outputs.primary(), plan.values(), false)
+        && item
+            .outputs
+            .iter()
+            .nth(1)
+            .is_some_and(|output| descriptor_matches(output, plan.indices(), false));
+    if !owner_matches || !payload_matches || !input_matches || !outputs_match {
+        return Err(RealizationError::Schedule(
+            "requested Sort producer diverges from its canonical graph pair".into(),
+        ));
+    }
+    Ok(requested == plan.values().node || requested == plan.indices().node)
+}
+
 enum PlannedRealizationItem {
     Interpreter,
     ZeroDomain { cache_hit: bool },
@@ -460,6 +628,7 @@ pub fn realize_with_options(
     }
     let policy = options.backend;
     validate_realization_inputs(graph, schedule, inputs)?;
+    let requested_plan = RequestedOutputPlan::new(graph, schedule, requested, inputs)?;
     let memory_plan = MemoryPlan::from_schedule(
         schedule,
         requested,
@@ -479,13 +648,14 @@ pub fn realize_with_options(
         .iter()
         .map(|request| (request.buffer_id, request))
         .collect::<HashMap<_, _>>();
-    let requested_buffers = requested
+    let requested_buffers = requested_plan
+        .ordered
         .iter()
-        .map(|node| node.index() as u64)
+        .copied()
         .collect::<std::collections::BTreeSet<_>>();
     // Only retained outputs live here. Internal values are reachable solely
     // through non-cloneable, generation-checked pool leases.
-    let mut values: HashMap<u64, TensorData> = HashMap::new();
+    let mut values = requested_plan.retained_sources;
     let mut leases: HashMap<u64, HostBufferLease> = HashMap::new();
     let pool = HostSlotPool::new();
     let mut trace = RealizationTrace::default();
@@ -655,13 +825,14 @@ pub fn realize_with_options(
             lease.release().map_err(RealizationError::Host)?;
         }
     }
-    let outputs = requested
+    let outputs = requested_plan
+        .ordered
         .iter()
-        .map(|node| {
+        .map(|id| {
             values
-                .get(&(node.index() as u64))
+                .get(id)
                 .cloned()
-                .ok_or(RealizationError::MissingBuffer(node.index() as u64))
+                .ok_or(RealizationError::MissingBuffer(*id))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if pool.physical_slots().map_err(RealizationError::Host)? != memory_plan.peak_allocations {
@@ -1063,6 +1234,261 @@ mod tests {
         )
         .unwrap();
         assert_eq!(native.trace.items[0].backend, ItemBackend::NativeJit);
+    }
+
+    #[test]
+    fn cpu_batch_execution_preserves_order_duplicates_and_source_storage() {
+        let mut graph = Graph::new();
+        let source = graph.input_dtype("source", Shape::from([2]), DType::BF16);
+        let source_f32 = graph.cast(source, DType::F32).unwrap();
+        let shared = graph.square(source_f32).unwrap();
+        let one = graph.constant(TensorData::scalar(1.0));
+        let left = graph.add(shared, one).unwrap();
+        let right = graph.mul(shared, one).unwrap();
+        let empty = graph.input_dtype("empty", Shape::from([0]), DType::U32);
+        let raw_source =
+            TensorData::from_storage([2], Storage::BF16(vec![0x8000, 0x7fc1])).unwrap();
+        let raw_empty = TensorData::from_storage([0], Storage::U32(vec![])).unwrap();
+        let inputs = HashMap::from([
+            ("source".into(), raw_source.clone()),
+            ("empty".into(), raw_empty.clone()),
+        ]);
+        let direct = CpuBackend
+            .execute_many(&graph, &[source, empty, one, source], &inputs)
+            .unwrap();
+        assert!(direct.trace.items.is_empty());
+        assert_eq!(direct.outputs[0].storage(), raw_source.storage());
+        assert_eq!(direct.outputs[1].storage(), raw_empty.storage());
+        assert_eq!(direct.outputs[0].storage(), direct.outputs[3].storage());
+        let requested = [right, source, left, right, empty, one];
+
+        let realized = CpuBackend
+            .execute_many(&graph, &requested, &inputs)
+            .unwrap();
+        assert_eq!(realized.outputs.len(), requested.len());
+        assert_eq!(realized.outputs[1].storage(), raw_source.storage());
+        assert_eq!(realized.outputs[4].storage(), raw_empty.storage());
+        assert_eq!(
+            realized.outputs[5].storage(),
+            TensorData::scalar(1.0).storage()
+        );
+        let f32_lane_bits = |value: &TensorData| {
+            let Storage::F32(lanes) = value.storage() else {
+                panic!("expected F32 batch output")
+            };
+            lanes.iter().map(|lane| lane.to_bits()).collect::<Vec<_>>()
+        };
+        let right_bits = f32_lane_bits(&realized.outputs[0]);
+        assert_eq!(right_bits, f32_lane_bits(&realized.outputs[3]));
+        let single_right = CpuBackend.execute(&graph, right, &inputs).unwrap();
+        assert_eq!(right_bits, f32_lane_bits(&single_right));
+        assert_eq!(right_bits[0], 0.0f32.to_bits());
+        assert!(f32::from_bits(right_bits[1]).is_nan());
+        let single_left = CpuBackend.execute(&graph, left, &inputs).unwrap();
+        assert_eq!(
+            f32_lane_bits(&realized.outputs[2]),
+            f32_lane_bits(&single_left)
+        );
+
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        assert_eq!(realized.trace.items.len(), schedule.items.len());
+        assert_eq!(
+            realized
+                .trace
+                .items
+                .iter()
+                .filter(|item| item.materialized_buffer == shared.index() as u64)
+                .count(),
+            1,
+            "the shared producer is executed once"
+        );
+
+        // Durable capture keeps its established unique-request contract; this
+        // runtime-only duplicate projection does not alter artifact identity.
+        let captured_requested = [right, source, left, empty, one];
+        let captured_schedule = crate::schedule_many(&graph, &captured_requested).unwrap();
+        let capture =
+            crate::CapturedSchedule::capture(&graph, &captured_schedule, &captured_requested)
+                .unwrap();
+        let decoded = crate::CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded.requested, capture.requested);
+        assert_eq!(decoded.identity, capture.identity);
+    }
+
+    #[test]
+    fn requested_source_descriptors_preflight_before_batch_execution() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([2]), DType::F32);
+        let y = graph.input_dtype("y", Shape::from([2]), DType::F32);
+        // This output would fail at execution, but it depends only on x. The
+        // separately requested direct y descriptor must reject first.
+        let faulting = graph.tensor_guard_distribution(x, 0).unwrap();
+        let schedule = crate::schedule_many(&graph, &[faulting, y]).unwrap();
+        let invalid_x = TensorData::new([2], vec![1.0, -1.0]).unwrap();
+        assert!(matches!(
+            realize(
+                &graph,
+                &schedule,
+                &[faulting, y],
+                &HashMap::from([("x".into(), invalid_x.clone())]),
+                RealizationPolicy::Interpreter,
+            ),
+            Err(RealizationError::Execution(reason)) if reason == "missing input y"
+        ));
+        assert!(matches!(
+            realize(
+                &graph,
+                &schedule,
+                &[faulting, y],
+                &HashMap::from([
+                    ("x".into(), invalid_x),
+                    (
+                        "y".into(),
+                        TensorData::from_storage([2], Storage::U32(vec![1, 2])).unwrap(),
+                    ),
+                ]),
+                RealizationPolicy::Interpreter,
+            ),
+            Err(RealizationError::Execution(reason))
+                if reason == format!("requested value {} descriptor mismatch", y.index())
+        ));
+
+        let computed = graph.neg(x).unwrap();
+        assert!(matches!(
+            realize(
+                &graph,
+                &schedule,
+                &[computed],
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::new([2], vec![1.0, 2.0]).unwrap(),
+                )]),
+                RealizationPolicy::Interpreter,
+            ),
+            Err(RealizationError::Schedule(reason))
+                if reason.contains("has no scheduled producer")
+        ));
+
+        // A structurally valid Store schedule is still not allowed to claim a
+        // graph-owned source ID. Requested source classification precedes the
+        // producer lookup, so the caller's exact y binding cannot be shadowed.
+        let stored = graph.square(x).unwrap();
+        let mut shadow = crate::schedule_many(&graph, &[stored]).unwrap();
+        let item = &mut shadow.items[0];
+        let kernel_sources = item.kernel.sources().to_vec();
+        item.kernel = crate::UOp::sink(
+            kernel_sources
+                .iter()
+                .map(|source| {
+                    if !matches!(source.operation(), crate::Operation::Store) {
+                        return source.clone();
+                    }
+                    let [index, value] = source.sources() else {
+                        panic!("scheduled Store has two sources")
+                    };
+                    let crate::Operation::Index(crate::IndexValue::Buffer {
+                        elements,
+                        input_shape,
+                        output_shape,
+                        ..
+                    }) = index.operation()
+                    else {
+                        panic!("scheduled Store has a dense output index")
+                    };
+                    let address = crate::UOp::from_operation(
+                        crate::Operation::DefineGlobal(crate::AddressValue {
+                            space: crate::AddressSpace::Global,
+                            name: format!("b{}", y.index()),
+                            element: crate::UType::scalar(DType::F32),
+                        }),
+                        Some(crate::UType::scalar(DType::F32)),
+                        vec![],
+                    );
+                    let index = crate::UOp::from_operation(
+                        crate::Operation::Index(crate::IndexValue::Buffer {
+                            buffer: y.index() as u64,
+                            elements: *elements,
+                            input_shape: input_shape.clone(),
+                            output_shape: output_shape.clone(),
+                        }),
+                        Some(crate::UType::scalar(DType::F32)),
+                        vec![address, index.sources()[1].clone()],
+                    );
+                    crate::UOp::from_operation(
+                        crate::Operation::Store,
+                        None,
+                        vec![index, value.clone()],
+                    )
+                })
+                .collect(),
+        );
+        let mut shadow_output = item.primary_output().clone();
+        shadow_output.id = y.index() as u64;
+        item.outputs = crate::ScheduledOutputs::single(shadow_output);
+        item.cache_key = crate::schedule::item_cache_key(item).unwrap();
+        shadow.validate().unwrap();
+        assert!(matches!(
+            realize(
+                &graph,
+                &shadow,
+                &[y],
+                &HashMap::from([
+                    ("x".into(), TensorData::new([2], vec![2.0, 3.0]).unwrap()),
+                    ("y".into(), TensorData::new([2], vec![5.0, 7.0]).unwrap()),
+                ]),
+                RealizationPolicy::Interpreter,
+            ),
+            Err(RealizationError::Schedule(reason))
+                if reason == format!(
+                    "requested source {} is shadowed by a scheduled producer",
+                    y.index()
+                )
+        ));
+    }
+
+    #[test]
+    fn requested_sort_secondary_requires_the_canonical_graph_pair() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([3]), DType::F32);
+        let (values, indices) = graph.sort(input, 0, false).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::new([3], vec![2.0, 1.0, 3.0]).unwrap(),
+        )]);
+        let canonical = crate::schedule_many(&graph, &[indices]).unwrap();
+        let realized = realize(
+            &graph,
+            &canonical,
+            &[indices],
+            &bindings,
+            RealizationPolicy::Interpreter,
+        )
+        .unwrap();
+        assert_eq!(realized.outputs[0].to_vec_f64(), vec![1.0, 0.0, 2.0]);
+
+        // Keep a structurally valid, rekeyed coupled Sort item, but swap its
+        // payload and output descriptors to a different graph pair while the
+        // item retains the original canonical values owner.
+        let (other_values, other_indices) = graph.sort(input, 0, true).unwrap();
+        let other = crate::schedule_many(&graph, &[other_indices]).unwrap();
+        let mut tampered = crate::schedule_many(&graph, &[indices]).unwrap();
+        tampered.items[0].kernel = other.items[0].kernel.clone();
+        tampered.items[0].outputs = other.items[0].outputs.clone();
+        tampered.items[0].cache_key = crate::schedule::item_cache_key(&tampered.items[0]).unwrap();
+        tampered.validate().unwrap();
+        assert_eq!(tampered.items[0].node, values);
+        assert_ne!(tampered.items[0].node, other_values);
+        assert!(matches!(
+            realize(
+                &graph,
+                &tampered,
+                &[other_indices],
+                &bindings,
+                RealizationPolicy::Interpreter,
+            ),
+            Err(RealizationError::Schedule(reason))
+                if reason.contains("canonical graph pair")
+        ));
     }
 
     #[test]

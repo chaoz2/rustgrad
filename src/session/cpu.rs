@@ -571,6 +571,23 @@ impl CpuSession {
         CpuBackend.execute(&self.graph, self.node(tensor)?, &self.bindings)
     }
 
+    /// Realizes an ordered tensor set through one shared scheduled CPU
+    /// transaction. Every handle is authenticated before scheduling; shared
+    /// producers execute once, while repeated handles retain their request
+    /// positions in the returned values.
+    pub fn realize_many(&self, tensors: &[&Tensor]) -> Result<Vec<TensorData>> {
+        let outputs = tensors
+            .iter()
+            .map(|tensor| self.node(tensor))
+            .collect::<Result<Vec<_>>>()?;
+        CpuBackend
+            .execute_many(&self.graph, &outputs, &self.bindings)
+            .map(|realized| realized.outputs)
+            .map_err(|error| Error::SessionRealization {
+                reason: format!("shared CPU realization: {error}"),
+            })
+    }
+
     /// Realizes a CPU-session value into owned storage, then copies and syncs
     /// it through one checked mutable mapped-file window.
     ///
@@ -1035,6 +1052,94 @@ mod literal_tests {
         assert!(session.trace(&output).unwrap().to_string().contains("add"));
         drop(writer);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shared_cpu_realization_preserves_order_duplicates_and_raw_sources() {
+        let mut session = CpuSession::new();
+        let input = session.variable([2], [2.0, 3.0]).unwrap();
+        let shared = session.mul(&input, &input).unwrap();
+        let one = session.tensor([], [1.0]).unwrap();
+        let left = session.add(&shared, &one).unwrap();
+        let right = session.mul(&shared, &one).unwrap();
+        let raw =
+            TensorData::from_storage([2], crate::Storage::BF16(vec![0x8000, 0x7fc1])).unwrap();
+        let source = session.variable_data(raw.clone()).unwrap();
+        let empty = session
+            .constant(TensorData::from_storage([0], crate::Storage::U32(vec![])).unwrap())
+            .unwrap();
+
+        let mut outputs = session
+            .realize_many(&[&right, &source, &left, &right, &empty, &one])
+            .unwrap();
+        assert!(session.realize_many(&[]).unwrap().is_empty());
+        assert_eq!(outputs.len(), 6);
+        assert_eq!(outputs[0].to_vec_f64(), vec![4.0, 9.0]);
+        assert_eq!(outputs[2].to_vec_f64(), vec![5.0, 10.0]);
+        assert_eq!(outputs[0].storage(), outputs[3].storage());
+        assert_eq!(outputs[1].storage(), raw.storage());
+        assert_eq!(outputs[4].shape(), &Shape::new([0]));
+        assert_eq!(outputs[4].dtype(), DType::U32);
+        assert_eq!(outputs[5].shape(), &Shape::new([]));
+        outputs[0]
+            .assign(&TensorData::new([2], vec![11.0, 13.0]).unwrap())
+            .unwrap();
+        assert_eq!(outputs[0].to_vec_f64(), vec![11.0, 13.0]);
+        assert_eq!(
+            outputs[3].to_vec_f64(),
+            vec![4.0, 9.0],
+            "duplicate projections are detached owned values"
+        );
+
+        let requested = [
+            right.node,
+            source.node,
+            left.node,
+            right.node,
+            empty.node,
+            one.node,
+        ];
+        let schedule = crate::schedule_many(&session.graph, &requested).unwrap();
+        assert_eq!(
+            schedule
+                .items
+                .iter()
+                .filter(|item| item.node == shared.node)
+                .count(),
+            1,
+            "the shared producer has one scheduled execution"
+        );
+    }
+
+    #[test]
+    fn shared_cpu_realization_preflights_handles_and_publishes_no_partial_state() {
+        let mut session = CpuSession::new();
+        let input = session.variable([2], [2.0, 3.0]).unwrap();
+        let good = session.mul(&input, &input).unwrap();
+        let invalid_distribution = session.variable([2], [1.0, -1.0]).unwrap();
+        let late_failure = session
+            .tensor_guard_distribution(&invalid_distribution, 0)
+            .unwrap();
+        let node_count = session.graph.node_count();
+        let bindings = session.bindings.clone();
+        let error = session.realize_many(&[&good, &late_failure]).unwrap_err();
+        assert!(matches!(&error, Error::SessionRealization { .. }));
+        assert!(
+            error
+                .to_string()
+                .starts_with("CPU session realization error:")
+        );
+        assert_eq!(session.graph.node_count(), node_count);
+        assert_eq!(session.bindings, bindings);
+        assert_eq!(session.realize(&good).unwrap().to_vec_f64(), vec![4.0, 9.0]);
+
+        let foreign = CpuSession::new().tensor([1], [7.0]).unwrap();
+        assert!(matches!(
+            session.realize_many(&[&good, &foreign, &good]),
+            Err(Error::SessionHandleMismatch { .. })
+        ));
+        assert_eq!(session.graph.node_count(), node_count);
+        assert_eq!(session.bindings, bindings);
     }
 
     #[test]
