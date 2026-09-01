@@ -68,6 +68,375 @@ fn requested_source_values_are_passthroughs_not_schedule_producers() {
 }
 
 #[test]
+fn sole_use_contiguous_redirects_ordinary_producer_into_owned_output() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [3], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let output = graph.contiguous(producer).unwrap();
+
+    let first = schedule(&graph, output).unwrap();
+    let second = schedule(&graph, output).unwrap();
+    first.validate().unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].node, output);
+    assert_eq!(first.items[0].primary_output().id, output.index() as u64);
+    assert_eq!(first.items[0].dependencies, Vec::<u64>::new());
+    assert_eq!(
+        first.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input]
+    );
+    assert!(matches!(
+        first.items[0].kernel.operation(),
+        crate::Operation::Sink
+    ));
+    let nodes = first.items[0].kernel.topological().unwrap();
+    assert!(nodes.iter().any(|node| matches!(
+        node.operation(),
+        crate::Operation::GraphBinary(crate::BinaryOp::Mul)
+    )));
+    assert!(nodes.iter().any(|node| matches!(
+        node.operation(),
+        crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })
+            if *buffer == output.index() as u64
+    )));
+    assert!(
+        !nodes
+            .iter()
+            .any(|node| matches!(node.operation(), crate::Operation::Movement(_)))
+    );
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|item| (item.node, item.cache_key))
+            .collect::<Vec<_>>(),
+        second
+            .items
+            .iter()
+            .map(|item| (item.node, item.cache_key))
+            .collect::<Vec<_>>()
+    );
+    assert!(first.internal_temporaries(&[output]).is_empty());
+    assert!(
+        crate::MemoryPlan::from_schedule(&first, &[output], true)
+            .unwrap()
+            .temporaries
+            .is_empty()
+    );
+
+    let actual = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::new([3], vec![-2.0, 0.0, 3.0]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(actual.storage(), &crate::Storage::F32(vec![4.0, 0.0, 9.0]));
+
+    let mut tampered = first.clone();
+    let store = &tampered.items[0].kernel.sources()[0];
+    let index = &store.sources()[0];
+    let value = store.sources()[1].clone();
+    let crate::Operation::Index(crate::IndexValue::Buffer {
+        buffer: _,
+        elements,
+        input_shape,
+        output_shape,
+    }) = index.operation()
+    else {
+        panic!("redirected Store must use a dense output index")
+    };
+    let wrong_buffer = producer.index() as u64;
+    let wrong_address = UOp::from_operation(
+        crate::Operation::DefineGlobal(crate::AddressValue {
+            space: crate::AddressSpace::Global,
+            name: format!("b{wrong_buffer}"),
+            element: crate::UType::scalar(DType::F32),
+        }),
+        Some(crate::UType::scalar(DType::F32)),
+        vec![],
+    );
+    let wrong_index = UOp::from_operation(
+        crate::Operation::Index(crate::IndexValue::Buffer {
+            buffer: wrong_buffer,
+            elements: *elements,
+            input_shape: input_shape.clone(),
+            output_shape: output_shape.clone(),
+        }),
+        index.ty(),
+        vec![wrong_address, index.sources()[1].clone()],
+    );
+    let wrong_store = UOp::from_operation(crate::Operation::Store, None, vec![wrong_index, value]);
+    tampered.items[0].kernel = UOp::sink(vec![
+        wrong_store,
+        tampered.items[0].kernel.sources()[1].clone(),
+    ]);
+    assert!(tampered.validate().is_err());
+    assert!(crate::CapturedSchedule::capture(&graph, &tampered, &[output]).is_err());
+    let mut encoded = crate::CapturedSchedule::capture(&graph, &first, &[output]).unwrap();
+    encoded.items[0].kernel = tampered.items[0].kernel.clone();
+    encoded.items[0].cache_key = crate::schedule::item_cache_key(&encoded.items[0]).unwrap();
+    encoded.identity = crate::schedule::artifact::identity(&encoded).unwrap();
+    assert!(encoded.to_bytes().is_err());
+
+    let mut missing_store = first.clone();
+    missing_store.items[0].kernel = UOp::sink(vec![first.items[0].kernel.sources()[1].clone()]);
+    assert!(missing_store.validate().is_err());
+    assert!(crate::CapturedSchedule::capture(&graph, &missing_store, &[output]).is_err());
+
+    let mut empty_sink = first.clone();
+    empty_sink.items[0].kernel = UOp::sink(vec![]);
+    assert!(empty_sink.validate().is_err());
+    assert!(crate::CapturedSchedule::capture(&graph, &empty_sink, &[output]).is_err());
+    let mut current = crate::CapturedSchedule::capture(&graph, &first, &[output]).unwrap();
+    current.items[0].kernel = UOp::sink(vec![]);
+    current.items[0].cache_key = crate::schedule::item_cache_key(&current.items[0]).unwrap();
+    current.identity = crate::schedule::artifact::identity(&current).unwrap();
+    assert!(current.to_bytes().is_err());
+
+    let mut add_graph = Graph::new();
+    let lhs = add_graph.input_dtype("lhs", [3], DType::F32);
+    let rhs = add_graph.input_dtype("rhs", [3], DType::F32);
+    let sum = add_graph.binary(crate::BinaryOp::Add, lhs, rhs).unwrap();
+    let copied = add_graph.contiguous(sum).unwrap();
+    let added = schedule(&add_graph, copied).unwrap();
+    added.validate().unwrap();
+    assert_eq!(added.items.len(), 1);
+    assert_eq!(added.items[0].node, copied);
+    assert_eq!(
+        added.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![lhs, rhs]
+    );
+}
+
+#[test]
+fn contiguous_redirection_preserves_portable_and_raw_copy_dtype_routes() {
+    for dtype in DType::ALL {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let producer = graph.detach(input).unwrap();
+        let output = graph.contiguous(producer).unwrap();
+        let scheduled = schedule(&graph, output).unwrap();
+        scheduled.validate().unwrap();
+        let portable = matches!(dtype, DType::Bool | DType::I32 | DType::U32 | DType::F32);
+        assert_eq!(
+            scheduled.items.len(),
+            if portable { 1 } else { 2 },
+            "{dtype:?}"
+        );
+        let output_item = scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap();
+        assert_eq!(output_item.node, output, "{dtype:?}");
+        assert_eq!(output_item.primary_output().dtype, dtype, "{dtype:?}");
+        assert_eq!(
+            matches!(output_item.kernel.operation(), crate::Operation::Sink),
+            portable,
+            "{dtype:?}"
+        );
+    }
+
+    for shape in [Shape::from([]), Shape::from([0])] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", shape.clone(), DType::F32);
+        let producer = graph.detach(input).unwrap();
+        let output = graph.contiguous(producer).unwrap();
+        let scheduled = schedule(&graph, output).unwrap();
+        scheduled.validate().unwrap();
+        assert_eq!(scheduled.items.len(), 1, "{shape:?}");
+        assert_eq!(scheduled.items[0].primary_output().shape, shape);
+    }
+}
+
+#[test]
+fn contiguous_redirection_preserves_requested_shared_specialized_and_external_producers() {
+    let mut requested_graph = Graph::new();
+    let input = requested_graph.input_dtype("input", [2], DType::F32);
+    let producer = requested_graph.square(input).unwrap();
+    let copied = requested_graph.contiguous(producer).unwrap();
+    let requested = schedule_many(&requested_graph, &[producer, copied]).unwrap();
+    assert_eq!(requested.items.len(), 2);
+    assert!(matches!(
+        requested
+            .items
+            .iter()
+            .find(|item| item.node == copied)
+            .unwrap()
+            .kernel
+            .operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::Contiguous { input } if input.node == producer)
+    ));
+
+    let sibling = requested_graph.neg(producer).unwrap();
+    let shared = schedule_many(&requested_graph, &[copied, sibling]).unwrap();
+    assert_eq!(shared.items.len(), 3);
+    assert!(shared.items.iter().any(|item| item.node == producer));
+    assert!(matches!(
+        shared
+            .items
+            .iter()
+            .find(|item| item.node == copied)
+            .unwrap()
+            .kernel
+            .operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::Contiguous { .. })
+    ));
+
+    let mut specialized_graph = Graph::new();
+    let input = specialized_graph.input_dtype("input", [2, 2], DType::F32);
+    let reduced = specialized_graph.sum_all(input).unwrap();
+    let copied = specialized_graph.contiguous(reduced).unwrap();
+    let specialized = schedule(&specialized_graph, copied).unwrap();
+    assert_eq!(specialized.items.len(), 3);
+    assert!(matches!(
+        specialized
+            .items
+            .iter()
+            .find(|item| item.node == copied)
+            .unwrap()
+            .kernel
+            .operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::Contiguous { input } if input.node == reduced)
+    ));
+
+    let mut external_graph = Graph::new();
+    let input = external_graph.input_dtype("input", [2], DType::F32);
+    let producer = external_graph.square(input).unwrap();
+    let copied = external_graph.contiguous(producer).unwrap();
+    let external =
+        schedule_with_external_materializations(&external_graph, &[copied], &[producer]).unwrap();
+    assert_eq!(external.items.len(), 1);
+    assert_eq!(external.items[0].external_materializations, vec![producer]);
+    assert!(matches!(
+        external.items[0].kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::Contiguous { input } if input.node == producer)
+    ));
+
+    let mut faulting_graph = Graph::new();
+    let lhs = faulting_graph.input_dtype("lhs", [2], DType::I32);
+    let rhs = faulting_graph.input_dtype("rhs", [2], DType::I32);
+    let quotient = faulting_graph
+        .binary(crate::BinaryOp::Div, lhs, rhs)
+        .unwrap();
+    let copied = faulting_graph.contiguous(quotient).unwrap();
+    let faulting = schedule(&faulting_graph, copied).unwrap();
+    assert_eq!(faulting.items.len(), 2);
+    assert!(matches!(
+        faulting
+            .items
+            .iter()
+            .find(|item| item.node == copied)
+            .unwrap()
+            .kernel
+            .operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::Contiguous { .. })
+    ));
+
+    let mut backward_graph = Graph::new();
+    let input = backward_graph.input_dtype("input", [2], DType::F32);
+    let backward = backward_graph.contiguous_backward(input).unwrap();
+    let copied = backward_graph.contiguous(backward).unwrap();
+    let backward_schedule = schedule(&backward_graph, copied).unwrap();
+    assert_eq!(backward_schedule.items.len(), 2);
+    assert!(
+        backward_schedule
+            .items
+            .iter()
+            .any(|item| item.node == backward)
+    );
+}
+
+#[test]
+fn unrequested_contiguous_redirection_remains_a_downstream_materialization() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let contiguous = graph.contiguous(producer).unwrap();
+    let output = graph.neg(contiguous).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    let redirected = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == contiguous)
+        .unwrap();
+    let consumer = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(matches!(
+        redirected.kernel.operation(),
+        crate::Operation::Sink
+    ));
+    assert_eq!(consumer.dependencies, vec![redirected.id]);
+    assert_eq!(consumer.ordered_inputs()[0].input_node, contiguous);
+    assert_eq!(
+        scheduled
+            .internal_temporaries(&[output])
+            .into_iter()
+            .map(|temporary| temporary.id)
+            .collect::<Vec<_>>(),
+        vec![contiguous.index() as u64]
+    );
+}
+
+#[test]
+fn contiguous_redirection_does_not_change_graph_vjp_or_affine_copy_boundaries() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [3], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let contiguous = graph.contiguous(producer).unwrap();
+    let loss = graph.sum_all(contiguous).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::from([3]));
+    let bindings = HashMap::from([(
+        "input".into(),
+        TensorData::new([3], vec![-2.0, 0.0, 3.0]).unwrap(),
+    )]);
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![-4.0, 0.0, 6.0]
+    );
+
+    let expanded = graph.expand(producer, [2, 3]).unwrap();
+    let materialized = graph.contiguous(expanded).unwrap();
+    let scheduled = schedule(&graph, materialized).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == materialized)
+        .unwrap();
+    assert!(matches!(
+        item.kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. })
+    ));
+}
+
+#[test]
 fn computed_affine_read_outputs_share_one_materialized_producer() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [2, 1], DType::F32);
@@ -250,12 +619,16 @@ fn scheduled_outputs_are_nonempty_ordered_and_define_cache_identity() {
         canonical_identity
     );
 
-    let schedule = crate::Schedule {
+    let live = crate::Schedule {
         items: vec![single],
         value_bindings: vec![],
         state_bindings: vec![],
     };
-    schedule.validate().unwrap();
+    assert!(matches!(
+        live.validate(),
+        Err(crate::ScheduleError::Binding(reason))
+            if reason == "scheduled single-output Sink has no Store"
+    ));
 }
 
 #[test]

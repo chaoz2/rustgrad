@@ -1073,8 +1073,13 @@ mod tests {
         let computed = graph.add(input, bias).unwrap();
         let output = graph.contiguous(computed).unwrap();
         let schedule = crate::schedule_many(&graph, &[output]).unwrap();
-        assert_eq!(schedule.items.len(), 2);
-        assert_eq!(schedule.items[1].dependencies, [schedule.items[0].id]);
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.items[0].node, output);
+        assert!(schedule.items[0].dependencies.is_empty());
+        assert!(matches!(
+            schedule.items[0].kernel.operation(),
+            crate::Operation::Sink
+        ));
 
         let bindings = HashMap::from([(
             "input".into(),
@@ -1205,7 +1210,8 @@ mod tests {
         let one = graph.constant(TensorData::scalar(1.0));
         let computed = graph.add(input, one).unwrap();
         let output = graph.contiguous(computed).unwrap();
-        let schedule = crate::schedule_many(&graph, &[output]).unwrap();
+        let schedule = crate::schedule_many(&graph, &[computed, output]).unwrap();
+        assert_eq!(schedule.items.len(), 2);
 
         let mut malformed_edge = schedule.clone();
         malformed_edge.items[1].dependencies.clear();
@@ -1257,8 +1263,8 @@ mod tests {
         let first = graph.square(x).unwrap();
         let second = graph.add(first, y).unwrap();
         let output = graph.contiguous(second).unwrap();
-        let schedule = crate::schedule_many(&graph, &[output]).unwrap();
-        assert!(schedule.items.len() >= 2);
+        let schedule = crate::schedule_many(&graph, &[first, output]).unwrap();
+        assert_eq!(schedule.items.len(), 2);
 
         let missing = HashMap::from([("x".into(), TensorData::new([2], vec![2.0, 3.0]).unwrap())]);
         assert!(matches!(

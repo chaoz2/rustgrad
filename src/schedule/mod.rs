@@ -157,6 +157,94 @@ pub struct Schedule {
     /// Explicit immutable persistent-state snapshots consumed by pure items.
     pub state_bindings: Vec<ScheduleStateBinding>,
 }
+
+/// Proves that an ordinary scalar kernel owns exactly the dense output ABI it
+/// declares. Replay-local mixed schedules may deliberately rebind `node`, so
+/// output integrity is defined by the Store graph and descriptors rather than
+/// by a generic node/output identity projection.
+pub(crate) fn validate_item_output_bindings(item: &ScheduleItem) -> Result<(), ScheduleError> {
+    if item.boundary.is_some() || !matches!(item.kernel.operation(), crate::Operation::Sink) {
+        return Ok(());
+    }
+    // Multi-output inventories are inspection-only envelopes and are rejected
+    // by executable replay, not validated as ordinary scalar kernels.
+    if !item.outputs.is_single() {
+        return Ok(());
+    }
+    // A live/current executable schedule must always produce its declared
+    // single output. Authenticated historical empty Sinks are upgraded to an
+    // explicit unsupported boundary before reaching this validator.
+    if item.kernel.sources().is_empty() {
+        return Err(ScheduleError::Binding(
+            "scheduled single-output Sink has no Store".into(),
+        ));
+    }
+    let outputs = item
+        .outputs
+        .iter()
+        .map(|output| (output.id, output))
+        .collect::<BTreeMap<_, _>>();
+    let mut stores = BTreeSet::new();
+    for node in item.kernel.topological().map_err(ScheduleError::UOp)? {
+        if !matches!(node.operation(), crate::Operation::Store) {
+            continue;
+        }
+        let [index, value] = node.sources() else {
+            return Err(ScheduleError::Binding(
+                "scheduled Store does not have index and value sources".into(),
+            ));
+        };
+        let crate::Operation::Index(crate::IndexValue::Buffer {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+        }) = index.operation()
+        else {
+            return Err(ScheduleError::Binding(
+                "scheduled Store target is not a dense output".into(),
+            ));
+        };
+        let Some(output) = outputs.get(buffer) else {
+            return Err(ScheduleError::Binding(
+                "scheduled Store target is not a declared output".into(),
+            ));
+        };
+        let expected_elements = output.shape.numel().map_err(|_| ScheduleError::Overflow)?;
+        let expected_type = crate::UType::scalar(output.dtype);
+        let exact_address = index.sources().first().is_some_and(|address| {
+            matches!(
+                address.operation(),
+                crate::Operation::DefineGlobal(crate::AddressValue {
+                    space: crate::AddressSpace::Global,
+                    name,
+                    element,
+                }) if name == &format!("b{buffer}") && *element == expected_type
+            ) && address.ty() == Some(expected_type)
+        });
+        if !stores.insert(*buffer)
+            || *elements != expected_elements
+            || input_shape != &output.shape
+            || output_shape != &output.shape
+            || output.read_only
+            || output.view.is_some()
+            || index.ty() != Some(expected_type)
+            || value.ty() != Some(expected_type)
+            || !exact_address
+        {
+            return Err(ScheduleError::Binding(
+                "scheduled Store/output descriptor mismatch".into(),
+            ));
+        }
+    }
+    if stores.len() != outputs.len() {
+        return Err(ScheduleError::Binding(
+            "scheduled Stores and declared outputs are not bijective".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Schedule {
     /// Validates deterministic DAG and universal effect-item invariants before
     /// a backend is allowed to inspect a kernel.
@@ -218,6 +306,7 @@ impl Schedule {
                 }
             }
             item.kernel.validate().map_err(ScheduleError::UOp)?;
+            validate_item_output_bindings(item)?;
             if item.is_effect() {
                 if !item.outputs.is_single()
                     || item.boundary != Some(ScheduleBoundary::Effect)
@@ -1081,6 +1170,161 @@ fn buffer(graph: &Graph, id: NodeId, read_only: bool) -> Result<BufferDesc, Sche
         view: None,
     })
 }
+
+/// Uses the existing pure renderers as the shared capability oracle for the
+/// bounded cross-backend redirection. A rejected ordinary kernel retains its
+/// raw Contiguous copy, so transport-only dtypes and backend-specific scalar
+/// gaps never lose an already-supported materialization route.
+fn portable_ordinary_kernel(kernel: &UOp) -> bool {
+    let ptx = crate::PtxRenderer::new(80).and_then(|renderer| renderer.render(kernel));
+    let opencl = crate::runtime::opencl::OpenClRenderer::default().render(kernel);
+    let metal = crate::runtime::metal::MetalRenderer::new(
+        1,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: usize::MAX,
+            unified_memory: false,
+            family: "portable-schedule-admission".into(),
+        },
+    )
+    .and_then(|renderer| renderer.render(kernel));
+    let webgpu = crate::runtime::webgpu::WgslRenderer::new(
+        1,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: usize::MAX,
+            max_storage_buffers_per_shader_stage: u32::MAX,
+            max_compute_workgroup_size_x: 1,
+            max_compute_workgroups_per_dimension: u32::MAX,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .and_then(|renderer| renderer.render(kernel));
+    ptx.is_ok() && opencl.is_ok() && metal.is_ok() && webgpu.is_ok()
+}
+
+/// Returns the fully rehearsed scalar kernel when one dense Contiguous output
+/// may own its sole-use producer's computation. `None` is the conservative
+/// explicit-copy fallback; malformed canonical plans still reject scheduling.
+fn checked_contiguous_redirection(
+    graph: &Graph,
+    output: NodeId,
+    producer: NodeId,
+    roots: &BTreeSet<usize>,
+    external: &BTreeSet<usize>,
+) -> Result<Option<UOp>, ScheduleError> {
+    let plan = crate::MovementKernelPlan::from_scheduled_graph(graph, output)
+        .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+    if !matches!(
+        &plan.kind,
+        crate::MovementKernelKind::Contiguous { input } if input.node == producer
+    ) || matches!(
+        graph.op(producer).map_err(ScheduleError::Graph)?,
+        Op::ContiguousBackward { .. }
+    ) || crate::kernel::single_reduction_epilogue(graph, producer)
+        .map_err(ScheduleError::UOp)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let producer_desc = buffer(graph, producer, false)?;
+    let output_desc = buffer(graph, output, false)?;
+    if producer_desc.shape != output_desc.shape
+        || producer_desc.dtype != output_desc.dtype
+        || producer_desc.bytes != output_desc.bytes
+        || producer_desc.alignment != output_desc.alignment
+        || producer_desc.view.is_some()
+        || output_desc.view.is_some()
+    {
+        return Ok(None);
+    }
+
+    let mut materialized = roots.clone();
+    materialized.remove(&producer.index());
+    materialized.extend(external.iter().copied());
+    let Ok(kernel) = crate::kernel::lower_graph_elementwise_into_with_materialized(
+        graph,
+        producer,
+        output,
+        &materialized,
+    ) else {
+        return Ok(None);
+    };
+    kernel.validate().map_err(ScheduleError::UOp)?;
+    let topology = kernel.topological().map_err(ScheduleError::UOp)?;
+    let stores = topology
+        .iter()
+        .filter(|value| matches!(value.operation(), crate::Operation::Store))
+        .collect::<Vec<_>>();
+    if stores.len() != 1
+        || kernel.sources().len() != 2
+        || !matches!(kernel.sources()[0].operation(), crate::Operation::Store)
+        || !matches!(kernel.sources()[1].operation(), crate::Operation::EndRange)
+    {
+        return Ok(None);
+    }
+    let Some(store_index) = stores[0].sources().first() else {
+        return Ok(None);
+    };
+    let crate::Operation::Index(crate::IndexValue::Buffer {
+        buffer: store_buffer,
+        elements,
+        input_shape,
+        output_shape,
+    }) = store_index.operation()
+    else {
+        return Ok(None);
+    };
+    if *store_buffer != output.index() as u64
+        || *elements != output_desc.shape.numel().map_err(ScheduleError::Graph)?
+        || input_shape != &output_desc.shape
+        || output_shape != &output_desc.shape
+    {
+        return Ok(None);
+    }
+    for value in &topology {
+        if let crate::Operation::GraphBinary(op) = value.operation()
+            && matches!(
+                op,
+                crate::BinaryOp::Div
+                    | crate::BinaryOp::FloorDiv
+                    | crate::BinaryOp::TruncDiv
+                    | crate::BinaryOp::Mod
+                    | crate::BinaryOp::FMod
+                    | crate::BinaryOp::Shl
+                    | crate::BinaryOp::Shr
+            )
+        {
+            return Ok(None);
+        }
+        if !matches!(value.operation(), crate::Operation::Load) {
+            continue;
+        }
+        let Some(index) = value.sources().first() else {
+            return Ok(None);
+        };
+        let loaded = match index.operation() {
+            crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })
+            | crate::Operation::Index(crate::IndexValue::View { buffer, .. }) => *buffer,
+            _ => return Ok(None),
+        };
+        if loaded == producer.index() as u64 || loaded == output.index() as u64 {
+            return Ok(None);
+        }
+        let loaded_node = NodeId::from_index(loaded as usize);
+        let is_leaf = matches!(
+            graph.op(loaded_node).map_err(ScheduleError::Graph)?,
+            Op::Input { .. } | Op::Constant(_)
+        );
+        if !is_leaf && !materialized.contains(&(loaded as usize)) {
+            return Ok(None);
+        }
+    }
+    if !portable_ordinary_kernel(&kernel) {
+        return Ok(None);
+    }
+    Ok(Some(kernel))
+}
+
 fn supported(op: &Op) -> bool {
     matches!(
         op,
@@ -1123,7 +1367,17 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
 /// Schedules requested graph outputs as a stable producer-aware DAG. Pure
 /// elementwise/view chains are fused until an explicit materialization root.
 pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, ScheduleError> {
-    schedule_many_with_external(graph, outputs, &BTreeSet::new())
+    schedule_many_with_external(graph, outputs, &BTreeSet::new(), true)
+}
+
+/// Symbolic families retain the explicit movement boundary because their
+/// specialized kernel and buffer schema are authenticated independently.
+pub(crate) fn schedule_many_for_symbolic_capture(
+    graph: &Graph,
+    outputs: &[NodeId],
+    external: &BTreeSet<usize>,
+) -> Result<Schedule, ScheduleError> {
+    schedule_many_with_external(graph, outputs, external, false)
 }
 /// Schedules with explicit caller-owned computed buffers. Only these named
 /// nodes become lowered Load boundaries; ordinary scheduling stays unchanged.
@@ -1240,12 +1494,13 @@ pub fn schedule_with_external_materializations(
             ));
         }
     }
-    schedule_many_with_external(graph, outputs, &external)
+    schedule_many_with_external(graph, outputs, &external, true)
 }
 fn schedule_many_with_external(
     graph: &Graph,
     outputs: &[NodeId],
     external: &BTreeSet<usize>,
+    redirect_contiguous: bool,
 ) -> Result<Schedule, ScheduleError> {
     if outputs.is_empty() {
         return Ok(Schedule {
@@ -1608,6 +1863,48 @@ fn schedule_many_with_external(
     for fused in fused_roots {
         roots.remove(&fused);
     }
+
+    // A dense Contiguous boundary normally owns a raw-copy item. When its
+    // ordinary pure producer has exactly this one graph use and is neither
+    // requested nor caller-owned, the producer can instead write directly to
+    // the boundary's fresh dense buffer. The Contiguous node remains the sole
+    // observable schedule/output identity; every uncertain ownership or
+    // operation-specific producer retains the explicit copy.
+    let mut contiguous_redirections = BTreeMap::<usize, (usize, UOp)>::new();
+    if redirect_contiguous {
+        for contiguous in roots.iter().copied().collect::<Vec<_>>() {
+            let node = NodeId::from_index(contiguous);
+            let Op::Contiguous { input } = graph.op(node).map_err(ScheduleError::Graph)? else {
+                continue;
+            };
+            let producer = input.index();
+            if !roots.contains(&producer)
+                || requested.contains(&producer)
+                || external.contains(&producer)
+                || consumers[producer] != 1
+            {
+                continue;
+            }
+            // Trial the exact value-root/destination projection before changing
+            // root ownership. Specialized roots lower as a load of `producer` and
+            // are rejected below; ordinary scalar DAGs lower to one checked Store.
+            let Some(kernel) = checked_contiguous_redirection(
+                graph,
+                node,
+                NodeId::from_index(producer),
+                &roots,
+                external,
+            )?
+            else {
+                continue;
+            };
+            contiguous_redirections.insert(contiguous, (producer, kernel));
+        }
+    }
+    for (producer, _) in contiguous_redirections.values() {
+        roots.remove(producer);
+    }
+
     let mut node_to_item: std::collections::BTreeMap<usize, u64> = roots
         .iter()
         .enumerate()
@@ -1773,7 +2070,9 @@ fn schedule_many_with_external(
             .map(|sibling| buffer(graph, sibling, false))
             .transpose()?;
         let kernel = if boundary.is_none() {
-            if let Some(reduction) = fused_epilogues.get(&index) {
+            if let Some((_, kernel)) = contiguous_redirections.get(&index) {
+                kernel.clone()
+            } else if let Some(reduction) = fused_epilogues.get(&index) {
                 crate::kernel::lower_graph_reduction_epilogue_with_materialized(
                     graph,
                     node,

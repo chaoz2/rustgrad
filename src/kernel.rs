@@ -408,11 +408,40 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
     output: NodeId,
     materialized: &std::collections::BTreeSet<usize>,
 ) -> std::result::Result<UOp, UOpError> {
-    lower_graph_elementwise_with_substitutions(graph, output, materialized, &HashMap::new())
+    lower_graph_elementwise_with_substitutions(graph, output, output, materialized, &HashMap::new())
+}
+
+/// Lowers one ordinary pure value directly into another graph node's owned
+/// buffer. The scheduler admits this only for a same-descriptor, sole-use
+/// `Contiguous` boundary; keeping the destination explicit prevents the
+/// producer node from acquiring a second materialized identity.
+pub(crate) fn lower_graph_elementwise_into_with_materialized(
+    graph: &Graph,
+    value: NodeId,
+    output: NodeId,
+    materialized: &std::collections::BTreeSet<usize>,
+) -> std::result::Result<UOp, UOpError> {
+    if graph
+        .shape(value)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+        != graph
+            .shape(output)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+        || graph
+            .dtype(value)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            != graph
+                .dtype(output)
+                .map_err(|_| UOpError::UseBeforeDefinition)?
+    {
+        return Err(UOpError::InvalidArgument);
+    }
+    lower_graph_elementwise_with_substitutions(graph, value, output, materialized, &HashMap::new())
 }
 
 fn lower_graph_elementwise_with_substitutions(
     graph: &Graph,
+    value: NodeId,
     output: NodeId,
     materialized: &std::collections::BTreeSet<usize>,
     substitutions: &HashMap<NodeId, UOp>,
@@ -636,7 +665,7 @@ fn lower_graph_elementwise_with_substitutions(
     }
     let value = lower(
         graph,
-        output,
+        value,
         &output_shape,
         &range,
         &mut HashMap::new(),
@@ -907,6 +936,7 @@ pub(crate) fn lower_graph_reduction_epilogue_with_materialized(
     );
     let kernel = lower_graph_elementwise_with_substitutions(
         graph,
+        output,
         output,
         materialized,
         &HashMap::from([(reduction, committed)]),

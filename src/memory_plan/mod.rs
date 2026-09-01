@@ -424,7 +424,7 @@ mod tests {
         schedule.items[0].outputs = crate::ScheduledOutputs::single(aliased);
         assert!(matches!(
             MemoryPlan::from_schedule(&schedule, &[left, right], true),
-            Err(MemoryPlanError::AliasEscape(_))
+            Err(MemoryPlanError::InvalidSchedule(_))
         ));
 
         let (_, mut schedule, left, right) = shared_schedule();
@@ -446,6 +446,28 @@ mod tests {
         let plan = MemoryPlan::from_schedule(&schedule, &[left, right], true).unwrap();
         assert_eq!(plan.temporaries.len(), 1);
         assert_eq!(plan.temporaries[0].allocation_id, None);
+        assert_eq!(plan.peak_bytes, 0);
+    }
+
+    #[test]
+    fn redirected_contiguous_has_no_dead_producer_allocation() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let output = graph.contiguous(producer).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.items[0].node, output);
+        assert!(
+            schedule
+                .items
+                .iter()
+                .all(|item| item.primary_output().id != producer.index() as u64)
+        );
+        let plan = MemoryPlan::from_schedule(&schedule, &[output], true).unwrap();
+        assert!(plan.requests.is_empty());
+        assert!(plan.temporaries.is_empty());
+        assert_eq!(plan.peak_allocations, 0);
         assert_eq!(plan.peak_bytes, 0);
     }
 

@@ -1198,7 +1198,12 @@ fn raw_movement_copy_metal_executes_affine_and_dense_storage_contracts() {
     let input = dense.input_dtype("input", [2], DType::I32);
     let producer = dense.square(input).unwrap();
     let output = dense.contiguous(producer).unwrap();
-    let item = schedule(&dense, output).unwrap().items.pop().unwrap();
+    let item = crate::schedule_many(&dense, &[producer, output])
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.node == output)
+        .unwrap();
     assert!(matches!(
         item.kernel.operation(),
         Operation::Movement(MovementValue::Plan(plan))
@@ -1209,6 +1214,12 @@ fn raw_movement_copy_metal_executes_affine_and_dense_storage_contracts() {
         .render(&item.kernel)
         .unwrap();
     assert!(rendered.source.contains("b1[gid] = b0[gid]"));
+    let redirected = schedule(&dense, output).unwrap().items.pop().unwrap();
+    assert!(matches!(redirected.kernel.operation(), Operation::Sink));
+    MetalRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&redirected.kernel)
+        .unwrap();
     let (actual, _) = execute_mock(
         &dense,
         output,
