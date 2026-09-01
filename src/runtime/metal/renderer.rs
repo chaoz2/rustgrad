@@ -3,7 +3,8 @@ use super::{
     MetalCapabilities, MetalError, guard::emit_transactional, transaction::MetalTransactionAbi,
 };
 use crate::{
-    AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+    AffineView, DType, IndexValue, LiteralValue, MovementValue, Operation, ScheduleInputBinding,
+    Shape, UOp,
     runtime::scalar_lane::{
         ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
     },
@@ -15,6 +16,7 @@ use std::{
 };
 
 pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v6";
+pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -114,6 +116,14 @@ impl MetalRenderer {
 
     /// Lowers a validated scheduled UOp into the exact static subset.
     pub fn render(&self, root: &UOp) -> Result<RenderedMetal, MetalError> {
+        if let Operation::Movement(value) = root.operation() {
+            return match value {
+                MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
+                MovementValue::QuantizedRowGather(_) => Err(MetalError::Unsupported(
+                    "quantized movement is outside Metal contiguous-copy lowering".into(),
+                )),
+            };
+        }
         if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
@@ -393,6 +403,124 @@ impl MetalRenderer {
             ))),
         })
     }
+}
+
+fn render_raw_copy(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let copy = plan
+        .raw_copy()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| {
+            MetalError::Unsupported(
+                "only raw AffineCopy and Contiguous have Metal movement lowering".into(),
+            )
+        })?;
+    let input = copy.input();
+    let extent = copy.elements();
+    if extent > u32::MAX as usize {
+        return Err(MetalError::Unsupported(
+            "raw-copy Metal extent exceeds u32 thread indexing".into(),
+        ));
+    }
+    let width = copy.width();
+    let raw_type = match width {
+        1 => "uchar",
+        2 => "ushort",
+        4 => "uint",
+        8 => "ulong",
+        _ => {
+            return Err(MetalError::Unsupported(format!(
+                "raw-copy Metal storage width {width}"
+            )));
+        }
+    };
+    debug_assert_eq!(copy.bytes(), extent * width);
+    let input_abi = MetalBufferAbi {
+        id: input.node.index() as u64,
+        dtype: input.dtype,
+        source_shape: input.shape.clone(),
+        elements: copy.input_elements(),
+        mutable: false,
+        view: None,
+    };
+    let output_abi = MetalBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: extent,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input_abi.clone(), output_abi];
+    let entry = format!("rg_metal_raw_copy_w{width}");
+    let mut lines = vec![
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        format!("// {METAL_RAW_COPY_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        format!("kernel void {entry}("),
+        format!("    device const {raw_type}* b0 [[buffer(0)]],"),
+        format!("    device {raw_type}* b1 [[buffer(1)]],"),
+        "    constant ulong& extent [[buffer(2)]],".into(),
+        "    uint gid [[thread_position_in_grid]]) {".into(),
+        "  if ((ulong)gid >= extent) return;".into(),
+    ];
+    let source_index = if let Some(address) = copy
+        .address()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
+    {
+        lines.push(format!("  ulong rg_source = (ulong){}ul;", address.offset));
+        for axis in address.axes {
+            let output_axis = axis.output_axis;
+            lines.push(format!(
+                "  ulong rg_axis_{output_axis} = ((ulong)gid / (ulong){}ul) % (ulong){}ul;",
+                axis.divisor, axis.dimension
+            ));
+            if axis.reversed {
+                lines.push(format!(
+                    "  rg_axis_{output_axis} = (ulong){}ul - rg_axis_{output_axis};",
+                    axis.dimension - 1
+                ));
+            }
+            lines.push(format!(
+                "  rg_source += rg_axis_{output_axis} * (ulong){}ul;",
+                axis.stride
+            ));
+        }
+        "rg_source"
+    } else {
+        "gid"
+    };
+    lines.push(format!("  b1[gid] = b0[{source_index}];"));
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_RAW_COPY_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        copy.plan(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        schedule_inputs: vec![input_abi],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
 }
 
 fn emit_metal_reduction(

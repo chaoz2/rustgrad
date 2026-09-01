@@ -1,11 +1,15 @@
-use super::renderer::{OPENCL_ABI_VERSION, OPENCL_RENDERER_VERSION, OpenClScalarDialect};
+use super::renderer::{
+    OPENCL_ABI_VERSION, OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
+    OpenClScalarDialect,
+};
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CompareOp, CpuBackend, DType, Graph,
-    IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, Operation, Scalar, Shape,
-    Storage, TensorData, TypedValue, UOp, UType, schedule,
+    IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, MovementKernelKind,
+    MovementValue, Operation, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UOp, UType,
+    schedule,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -861,6 +865,133 @@ fn execute_mock_rendered(
     let mut bytes = vec![0; output.elements * output.dtype.itemsize()];
     queue.read(buffers.last().unwrap(), 0, &mut bytes).unwrap();
     (bytes, mock.calls())
+}
+
+#[test]
+fn raw_movement_copy_opencl_uses_exact_affine_abi_and_preserves_storage_bits() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [4], DType::F32);
+    let viewed = graph
+        .stride(
+            input,
+            [Slice {
+                start: None,
+                stop: None,
+                step: -1,
+            }],
+        )
+        .unwrap();
+    let output = graph.contiguous(viewed).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.buffers[0].elements, 4);
+    assert_eq!(rendered.buffers[1].elements, 4);
+    assert!(rendered.source.contains(OPENCL_RAW_COPY_RENDERER_VERSION));
+    assert!(
+        rendered
+            .source
+            .contains("rg_axis_0 = (ulong)3ul - rg_axis_0")
+    );
+    assert!(rendered.source.contains("b1[gid] = b0[rg_source]"));
+    assert_eq!(
+        renderer.render(&item.kernel).unwrap().cache_key,
+        rendered.cache_key
+    );
+    let raw = [0x8000_0000_u32, 0x7fc1_2345, 0x7f80_0000, 0xff80_0000];
+    let value = TensorData::from_storage(
+        [4],
+        Storage::F32(raw.into_iter().map(f32::from_bits).collect()),
+    )
+    .unwrap();
+    let (actual, calls) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(input.index() as u64, value)]),
+    );
+    assert_eq!(
+        actual,
+        raw.into_iter()
+            .rev()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+    assert!(calls.iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn raw_movement_copy_opencl_covers_computed_dense_empty_and_fail_closed_kinds() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 1], DType::I32);
+    let producer = graph.square(input).unwrap();
+    let output = graph.contiguous(producer).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let copy_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(matches!(
+        copy_item.kernel.operation(),
+        Operation::Movement(MovementValue::Plan(plan))
+            if matches!(&plan.kind, MovementKernelKind::Contiguous { input } if input.node == producer)
+    ));
+    let rendered = renderer.render(&copy_item.kernel).unwrap();
+    assert!(rendered.source.contains("b1[gid] = b0[gid]"));
+    assert_eq!(rendered.buffers[0].id, producer.index() as u64);
+
+    let viewed = graph.expand(producer, [2, 3]).unwrap();
+    let affine_output = graph.contiguous(viewed).unwrap();
+    let affine_item = schedule(&graph, affine_output)
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.node == affine_output)
+        .unwrap();
+    assert!(matches!(
+        affine_item.kernel.operation(),
+        Operation::Movement(MovementValue::Plan(plan))
+            if matches!(&plan.kind, MovementKernelKind::AffineCopy { input, .. } if input.node == producer)
+    ));
+    let rendered = renderer.render(&affine_item.kernel).unwrap();
+    assert_eq!(rendered.buffers[0].elements, 2);
+    assert_eq!(rendered.buffers[1].elements, 6);
+    assert!(rendered.source.contains("b1[gid] = b0[rg_source]"));
+
+    let empty_input = graph.input_dtype("empty", [0, 2], DType::Bool);
+    let empty_view = graph.permute(empty_input, [1, 0]).unwrap();
+    let empty = graph.contiguous(empty_view).unwrap();
+    let empty_item = schedule(&graph, empty).unwrap().items.pop().unwrap();
+    let empty_rendered = renderer.render(&empty_item.kernel).unwrap();
+    assert_eq!(empty_rendered.extent, 0);
+    assert_eq!(empty_rendered.buffers[0].elements, 0);
+
+    let padded = graph.pad(input, [(1, 1), (0, 0)], Scalar::I(0)).unwrap();
+    let padded_item = schedule(&graph, padded).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&padded_item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("only raw AffineCopy and Contiguous")
+    ));
+
+    let mut wide = Graph::new();
+    let input = wide.input_dtype("wide", [2], DType::U64);
+    let producer = wide.square(input).unwrap();
+    let output = wide.contiguous(producer).unwrap();
+    let item = schedule(&wide, output).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("64-bit integer support")
+    ));
+    assert!(
+        OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL)
+            .unwrap()
+            .render(&item.kernel)
+            .is_ok()
+    );
 }
 
 #[test]

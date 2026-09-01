@@ -1514,15 +1514,21 @@ explicit copy plan. Signed reverse and zero-stride broadcast reads are valid
 because source aliases never alias the output or each other as write targets.
 The interpreter and movement-v2 CPU renderer share that immutable plan; native
 addressing normalizes the proof to nonnegative indices and copies raw storage
-widths. A separate `rustgrad-ptx-affine-copy-v1` renderer consumes only that
-validated concrete plan, retains its exact two-buffer schedule ABI, and emits
-unsigned 64-bit address arithmetic plus raw 8/16/32/64-bit loads and stores.
-The fixed-schema CUDA graph executor therefore keeps computed producers and
-affine materialization device-resident and downloads only requested dense
-outputs. This changes neither RGUA/RGSA movement bytes nor generic elementwise
-PTX identity. Symbolic specialization is retained only for source-backed
-Contiguous views; computed-symbolic, effectful, non-affine, OpenCL/Metal/WebGPU,
-and live-CUDA routes remain fail-closed or unvalidated.
+widths. One checked `RawCopyView` projects only `AffineCopy` and dense
+`Contiguous` plans into their exact two-buffer ABI. Its renderer-neutral
+`RawCopyAddress` owns the row-major divisor, reverse, and stride terms, leaving
+PTX, OpenCL C, MSL, and WGSL to spell only backend syntax and packing. Affine
+copies use the source descriptor's full element count and map each output lane
+through the normalized address; dense copies use the identity lane. PTX,
+OpenCL, and Metal load/store raw 8/16/32/64-bit storage words (OpenCL gates
+64-bit words on integer capability), while WGSL uses disjoint packed-word
+atomics for 8/16-bit lanes and raw words for 32/64-bit lanes. Operation-specific
+renderer versions isolate these new source/cache identities without changing
+RGUA/RGSA movement bytes or generic elementwise identities. The fixed-schema
+static executors can therefore retain computed producers and materialized
+outputs on device. Symbolic computed views, effects, non-affine reshape,
+producer-output redirection, other movement kinds, and live-device validation
+remain fail-closed or unclaimed.
 The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
 preflight/plan/execute path rather than adding a profiler or executor. Its
 immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`

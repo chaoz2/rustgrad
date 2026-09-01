@@ -1,11 +1,12 @@
+use super::renderer::METAL_RAW_COPY_RENDERER_VERSION;
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CompareOp,
     CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
-    KernelBindings, KernelBufferDesc, LaneInstruction, NodeId, Operation, ReduceKind, Scalar,
-    Shape, Slice, Storage, TensorData, TypedValue, UType, schedule,
+    KernelBindings, KernelBufferDesc, LaneInstruction, MovementKernelKind, MovementValue, NodeId,
+    Operation, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UType, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -1137,6 +1138,135 @@ fn execute_mock(
         TensorData::from_le_bytes(output_abi.source_shape.clone(), output_abi.dtype, &bytes)
             .unwrap();
     (result, mock)
+}
+
+#[test]
+fn raw_movement_copy_metal_executes_affine_and_dense_storage_contracts() {
+    let mut affine = Graph::new();
+    let input = affine.input_dtype("input", [4], DType::F32);
+    let viewed = affine
+        .stride(
+            input,
+            [Slice {
+                start: None,
+                stop: None,
+                step: -1,
+            }],
+        )
+        .unwrap();
+    let output = affine.contiguous(viewed).unwrap();
+    let item = schedule(&affine, output).unwrap().items.pop().unwrap();
+    let rendered = MetalRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert!(rendered.source.contains(METAL_RAW_COPY_RENDERER_VERSION));
+    assert!(
+        rendered
+            .source
+            .contains("rg_axis_0 = (ulong)3ul - rg_axis_0")
+    );
+    assert!(rendered.source.contains("b1[gid] = b0[rg_source]"));
+    assert_eq!(
+        MetalRenderer::new(8, capabilities())
+            .unwrap()
+            .render(&item.kernel)
+            .unwrap()
+            .cache_key,
+        rendered.cache_key
+    );
+    let raw = [0x8000_0000_u32, 0x7fc1_2345, 0x7f80_0000, 0xff80_0000];
+    let value = TensorData::from_storage(
+        [4],
+        Storage::F32(raw.into_iter().map(f32::from_bits).collect()),
+    )
+    .unwrap();
+    let (actual, calls) = execute_mock(&affine, output, &HashMap::from([("input".into(), value)]));
+    assert_eq!(
+        actual.to_le_bytes().unwrap(),
+        raw.into_iter()
+            .rev()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+    assert!(calls.calls().iter().any(|call| call.starts_with("launch:")));
+
+    let mut dense = Graph::new();
+    let input = dense.input_dtype("input", [2], DType::I32);
+    let producer = dense.square(input).unwrap();
+    let output = dense.contiguous(producer).unwrap();
+    let item = schedule(&dense, output).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        item.kernel.operation(),
+        Operation::Movement(MovementValue::Plan(plan))
+            if matches!(&plan.kind, MovementKernelKind::Contiguous { input } if input.node == producer)
+    ));
+    let rendered = MetalRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    assert!(rendered.source.contains("b1[gid] = b0[gid]"));
+    let (actual, _) = execute_mock(
+        &dense,
+        output,
+        &HashMap::from([(
+            "input".into(),
+            TensorData::from_storage([2], Storage::I32(vec![3, -4])).unwrap(),
+        )]),
+    );
+    assert_eq!(actual.storage(), &Storage::I32(vec![9, 16]));
+
+    let reshaped = dense.reshape(producer, [2, 1]).unwrap();
+    let viewed = dense.expand(reshaped, [2, 3]).unwrap();
+    let affine_output = dense.contiguous(viewed).unwrap();
+    let affine_item = schedule(&dense, affine_output)
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.node == affine_output)
+        .unwrap();
+    assert!(matches!(
+        affine_item.kernel.operation(),
+        Operation::Movement(MovementValue::Plan(plan))
+            if matches!(&plan.kind, MovementKernelKind::AffineCopy { input, .. } if input.node == producer)
+    ));
+    let rendered = MetalRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&affine_item.kernel)
+        .unwrap();
+    assert_eq!(rendered.buffers[0].elements, 2);
+    assert_eq!(rendered.buffers[1].elements, 6);
+    assert!(rendered.source.contains("b1[gid] = b0[rg_source]"));
+}
+
+#[test]
+fn raw_movement_copy_metal_preserves_zero_domain_and_rejects_other_movements() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("empty", [0, 2], DType::Bool);
+    let viewed = graph.permute(input, [1, 0]).unwrap();
+    let output = graph.contiguous(viewed).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert_eq!(rendered.extent, 0);
+    assert_eq!(rendered.buffers[0].elements, 0);
+
+    let scalar = graph.input_dtype("scalar", [], DType::U64);
+    let producer = graph.detach(scalar).unwrap();
+    let output = graph.contiguous(producer).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    assert_eq!(renderer.render(&item.kernel).unwrap().extent, 1);
+
+    let pad_input = graph.input_dtype("pad", [2], DType::U64);
+    let padded = graph.pad(pad_input, [(1, 1)], Scalar::U(0)).unwrap();
+    let padded_item = schedule(&graph, padded).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&padded_item.kernel),
+        Err(MetalError::Unsupported(reason)) if reason.contains("only raw AffineCopy and Contiguous")
+    ));
 }
 
 #[test]

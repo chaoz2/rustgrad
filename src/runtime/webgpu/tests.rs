@@ -1,12 +1,13 @@
+use super::renderer::WGSL_RAW_COPY_RENDERER_VERSION;
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CapturedMixedBatch,
     CapturedReplayExecutor, CompareOp, CpuBackend, DType, EffectBatchStep, EffectRuntime, Graph,
-    IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, LiteralValue, NodeId, Operation,
-    ReduceKind, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UOp, UType, ViewMap,
-    schedule,
+    IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, LiteralValue,
+    MovementKernelKind, MovementValue, NodeId, Operation, ReduceKind, Scalar, Shape, Slice,
+    Storage, TensorData, TypedValue, UOp, UType, ViewMap, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawAdapter, RawBuffer, RawCommand,
@@ -1061,6 +1062,113 @@ fn execute_mock(
         TensorData::from_le_bytes(output_abi.source_shape.clone(), output_abi.dtype, &bytes)
             .unwrap();
     (result, mock)
+}
+
+#[test]
+fn raw_movement_copy_wgsl_executes_packed_affine_and_dense_storage_contracts() {
+    let mut affine = Graph::new();
+    let input = affine.input_dtype("input", [2, 1], DType::Bool);
+    let viewed = affine.expand(input, [2, 3]).unwrap();
+    let output = affine.contiguous(viewed).unwrap();
+    let item = schedule(&affine, output).unwrap().items.pop().unwrap();
+    let rendered = WgslRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.buffers[0].elements, 2);
+    assert_eq!(rendered.buffers[1].elements, 6);
+    assert!(rendered.source.contains(WGSL_RAW_COPY_RENDERER_VERSION));
+    assert!(rendered.source.contains("atomicAnd(&b1[rg_output_word]"));
+    assert!(rendered.source.contains("b0[rg_source_word]"));
+    assert_eq!(
+        WgslRenderer::new(8, capabilities())
+            .unwrap()
+            .render(&item.kernel)
+            .unwrap()
+            .cache_key,
+        rendered.cache_key
+    );
+    let (actual, calls) = execute_mock(
+        &affine,
+        output,
+        &HashMap::from([(
+            "input".into(),
+            TensorData::from_storage([2, 1], Storage::Bool(vec![false, true])).unwrap(),
+        )]),
+    );
+    assert_eq!(
+        actual.storage(),
+        &Storage::Bool(vec![false, false, false, true, true, true])
+    );
+    assert!(calls.calls().iter().any(|call| call.starts_with("launch:")));
+
+    let mut dense = Graph::new();
+    let input = dense.input_dtype("input", [2], DType::F32);
+    let producer = dense.square(input).unwrap();
+    let output = dense.contiguous(producer).unwrap();
+    let item = schedule(&dense, output).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        item.kernel.operation(),
+        Operation::Movement(MovementValue::Plan(plan))
+            if matches!(&plan.kind, MovementKernelKind::Contiguous { input } if input.node == producer)
+    ));
+    let rendered = WgslRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    assert!(rendered.source.contains("atomicStore(&b1[gid], b0[gid])"));
+
+    let reshaped = dense.reshape(producer, [2, 1]).unwrap();
+    let viewed = dense.expand(reshaped, [2, 3]).unwrap();
+    let affine_output = dense.contiguous(viewed).unwrap();
+    let affine_item = schedule(&dense, affine_output)
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.node == affine_output)
+        .unwrap();
+    assert!(matches!(
+        affine_item.kernel.operation(),
+        Operation::Movement(MovementValue::Plan(plan))
+            if matches!(&plan.kind, MovementKernelKind::AffineCopy { input, .. } if input.node == producer)
+    ));
+    let rendered = WgslRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&affine_item.kernel)
+        .unwrap();
+    assert_eq!(rendered.buffers[0].elements, 2);
+    assert_eq!(rendered.buffers[1].elements, 6);
+    assert!(rendered.source.contains("b0[rg_source]"));
+}
+
+#[test]
+fn raw_movement_copy_wgsl_preserves_zero_domain_and_rejects_other_movements() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("empty", [0, 2], DType::U32);
+    let viewed = graph.permute(input, [1, 0]).unwrap();
+    let output = graph.contiguous(viewed).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert_eq!(rendered.extent, 0);
+    assert_eq!(rendered.buffers[0].elements, 0);
+
+    let scalar = graph.input_dtype("scalar", [], DType::I32);
+    let producer = graph.detach(scalar).unwrap();
+    let output = graph.contiguous(producer).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    assert_eq!(renderer.render(&item.kernel).unwrap().extent, 1);
+
+    let pad_input = graph.input_dtype("pad", [2], DType::I32);
+    let padded = graph.pad(pad_input, [(1, 1)], Scalar::I(0)).unwrap();
+    let padded_item = schedule(&graph, padded).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&padded_item.kernel),
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("only raw AffineCopy and Contiguous")
+    ));
 }
 
 #[test]

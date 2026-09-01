@@ -6,7 +6,8 @@ use super::{
     transaction::WebGpuTransactionAbi,
 };
 use crate::{
-    AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+    AffineView, DType, IndexValue, LiteralValue, MovementValue, Operation, ScheduleInputBinding,
+    Shape, UOp,
     runtime::scalar_lane::{
         ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
     },
@@ -19,6 +20,7 @@ use std::{
 
 /// Deterministic renderer/source identity.
 pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v7";
+pub const WGSL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-wgsl-raw-copy-v1";
 /// Ordered storage-plus-extent bind-group ABI version.
 pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
@@ -111,6 +113,28 @@ impl RenderedWgsl {
     }
 
     pub(super) fn validate_artifact(&self) -> Result<(), WebGpuError> {
+        let contiguous_copy = match self.semantic_program.as_ref() {
+            super::dispatch::KernelSemanticProgram::UOp(root)
+                if matches!(root.operation(), Operation::Movement(_)) =>
+            {
+                let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
+                    return Err(WebGpuError::Unsupported(
+                        "quantized movement is outside WGSL contiguous-copy lowering".into(),
+                    ));
+                };
+                Some(
+                    plan.raw_copy()
+                        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
+                        .ok_or_else(|| {
+                            WebGpuError::Unsupported(
+                                "only raw AffineCopy and Contiguous have WGSL movement lowering"
+                                    .into(),
+                            )
+                        })?,
+                )
+            }
+            _ => None,
+        };
         if self.buffers.is_empty()
             || self.buffers.last().is_none_or(|buffer| !buffer.mutable)
             || self.buffers[..self.buffers.len() - 1]
@@ -132,7 +156,13 @@ impl RenderedWgsl {
         }
         let mut ids = BTreeSet::new();
         for buffer in &self.buffers {
-            supported_storage(buffer.dtype)?;
+            if contiguous_copy.is_none() {
+                supported_storage(buffer.dtype)?;
+            } else if !matches!(buffer.dtype.itemsize(), 1 | 2 | 4 | 8) {
+                return Err(WebGpuError::Unsupported(
+                    "WGSL raw copy requires a concrete storage width".into(),
+                ));
+            }
             let source_elements = buffer
                 .source_shape
                 .numel()
@@ -164,6 +194,29 @@ impl RenderedWgsl {
             return Err(WebGpuError::InvalidBinding(
                 "artifact output extent mismatch".into(),
             ));
+        }
+        if let Some(copy) = contiguous_copy {
+            let input = copy.input();
+            if self.buffers.len() != 2
+                || self.transaction.is_some()
+                || self.buffers[0].id != input.node.index() as u64
+                || self.buffers[0].dtype != input.dtype
+                || self.buffers[0].source_shape != input.shape
+                || self.buffers[0].elements != copy.input_elements()
+                || self.buffers[0].mutable
+                || self.buffers[0].view.is_some()
+                || self.buffers[1].id != copy.plan().output.index() as u64
+                || self.buffers[1].dtype != copy.plan().dtype
+                || self.buffers[1].source_shape != copy.plan().output_shape
+                || self.buffers[1].elements != copy.elements()
+                || !self.buffers[1].mutable
+                || self.buffers[1].view.is_some()
+            {
+                return Err(WebGpuError::InvalidBinding(
+                    "WGSL raw-copy artifact disagrees with its movement plan".into(),
+                ));
+            }
+            return Ok(());
         }
         let Some(transaction) = &self.transaction else {
             return Ok(());
@@ -209,6 +262,14 @@ impl WgslRenderer {
 
     /// Lowers a validated scheduled UOp without executing or allocating.
     pub fn render(&self, root: &UOp) -> Result<RenderedWgsl, WebGpuError> {
+        if let Operation::Movement(value) = root.operation() {
+            return match value {
+                MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
+                MovementValue::QuantizedRowGather(_) => Err(WebGpuError::Unsupported(
+                    "quantized movement is outside WGSL contiguous-copy lowering".into(),
+                )),
+            };
+        }
         if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
@@ -569,6 +630,185 @@ impl WgslRenderer {
             ))),
         })
     }
+}
+
+fn render_raw_copy(
+    renderer: &WgslRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedWgsl, WebGpuError> {
+    root.validate()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let copy = plan
+        .raw_copy()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| {
+            WebGpuError::Unsupported(
+                "only raw AffineCopy and Contiguous have WGSL movement lowering".into(),
+            )
+        })?;
+    let input = copy.input();
+    let extent = copy.elements();
+    let extent_u32 = u32::try_from(extent).map_err(|_| {
+        WebGpuError::Unsupported("raw-copy WGSL extent exceeds u32 indexing".into())
+    })?;
+    let words = copy.bytes().checked_add(3).ok_or(WebGpuError::Overflow)? / 4;
+    u32::try_from(words)
+        .map_err(|_| WebGpuError::Unsupported("raw-copy WGSL words exceed u32 indexing".into()))?;
+    u32::try_from(copy.input_elements()).map_err(|_| {
+        WebGpuError::Unsupported("raw-copy WGSL source extent exceeds u32 indexing".into())
+    })?;
+    let input_words = copy
+        .input_bytes()
+        .checked_add(3)
+        .ok_or(WebGpuError::Overflow)?
+        / 4;
+    u32::try_from(input_words).map_err(|_| {
+        WebGpuError::Unsupported("raw-copy WGSL source words exceed u32 indexing".into())
+    })?;
+    let width = copy.width();
+    if !matches!(width, 1 | 2 | 4 | 8) {
+        return Err(WebGpuError::Unsupported(format!(
+            "raw-copy WGSL storage width {width}"
+        )));
+    }
+    let input_abi = WgslBufferAbi {
+        id: input.node.index() as u64,
+        dtype: input.dtype,
+        source_shape: input.shape.clone(),
+        elements: copy.input_elements(),
+        mutable: false,
+        view: None,
+    };
+    let output_abi = WgslBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: extent,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input_abi.clone(), output_abi];
+    for abi in &buffers {
+        if abi.physical_bytes()? > renderer.capabilities.max_buffer_size {
+            return Err(WebGpuError::Unsupported(
+                "raw-copy binding exceeds adapter buffer limit".into(),
+            ));
+        }
+    }
+    if buffers.len() > renderer.capabilities.max_storage_buffers_per_shader_stage as usize {
+        return Err(WebGpuError::Unsupported(
+            "raw-copy bindings exceed adapter limit".into(),
+        ));
+    }
+    let entry = format!("rg_wgsl_raw_copy_w{width}");
+    let mut address_lines = Vec::new();
+    let source_index = if let Some(address) = copy
+        .address()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
+    {
+        let offset = u32::try_from(address.offset).map_err(|_| {
+            WebGpuError::Unsupported("raw-copy WGSL offset exceeds u32 indexing".into())
+        })?;
+        address_lines.push(format!("  var rg_source: u32 = {offset}u;"));
+        for axis in address.axes {
+            let output_axis = axis.output_axis;
+            let dimension = u32::try_from(axis.dimension).map_err(|_| {
+                WebGpuError::Unsupported("raw-copy WGSL dimension exceeds u32 indexing".into())
+            })?;
+            let stride = u32::try_from(axis.stride).map_err(|_| {
+                WebGpuError::Unsupported("raw-copy WGSL stride exceeds u32 indexing".into())
+            })?;
+            let divisor = u32::try_from(axis.divisor).map_err(|_| {
+                WebGpuError::Unsupported("raw-copy WGSL divisor exceeds u32 indexing".into())
+            })?;
+            address_lines.push(format!(
+                "  var rg_axis_{output_axis}: u32 = (gid / {divisor}u) % {dimension}u;"
+            ));
+            if axis.reversed {
+                address_lines.push(format!(
+                    "  rg_axis_{output_axis} = {}u - rg_axis_{output_axis};",
+                    dimension - 1
+                ));
+            }
+            address_lines.push(format!(
+                "  rg_source = rg_source + rg_axis_{output_axis} * {stride}u;"
+            ));
+        }
+        "rg_source"
+    } else {
+        "gid"
+    };
+    let copy_lines = match width {
+        1 => vec![
+            format!("  let rg_source_word: u32 = {source_index} >> 2u;"),
+            format!("  let rg_source_shift: u32 = ({source_index} & 3u) * 8u;"),
+            "  let rg_output_word: u32 = gid >> 2u;".into(),
+            "  let rg_output_shift: u32 = (gid & 3u) * 8u;".into(),
+            "  let rg_bits: u32 = (b0[rg_source_word] >> rg_source_shift) & 0xffu;".into(),
+            "  atomicAnd(&b1[rg_output_word], ~(0xffu << rg_output_shift));".into(),
+            "  atomicOr(&b1[rg_output_word], rg_bits << rg_output_shift);".into(),
+        ],
+        2 => vec![
+            format!("  let rg_source_word: u32 = {source_index} >> 1u;"),
+            format!("  let rg_source_shift: u32 = ({source_index} & 1u) * 16u;"),
+            "  let rg_output_word: u32 = gid >> 1u;".into(),
+            "  let rg_output_shift: u32 = (gid & 1u) * 16u;".into(),
+            "  let rg_bits: u32 = (b0[rg_source_word] >> rg_source_shift) & 0xffffu;".into(),
+            "  atomicAnd(&b1[rg_output_word], ~(0xffffu << rg_output_shift));".into(),
+            "  atomicOr(&b1[rg_output_word], rg_bits << rg_output_shift);".into(),
+        ],
+        4 => vec![format!("  atomicStore(&b1[gid], b0[{source_index}]);")],
+        8 => vec![
+            format!("  let rg_source_word: u32 = {source_index} * 2u;"),
+            "  let rg_output_word: u32 = gid * 2u;".into(),
+            "  atomicStore(&b1[rg_output_word], b0[rg_source_word]);".into(),
+            "  atomicStore(&b1[rg_output_word + 1u], b0[rg_source_word + 1u]);".into(),
+        ],
+        _ => unreachable!("validated raw width"),
+    };
+    let mut lines = vec![
+        format!("// {WGSL_RAW_COPY_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION}"),
+        "struct RustGradExtent { value: u32, };".into(),
+        "@group(0) @binding(0) var<storage, read> b0: array<u32>;".into(),
+        "@group(0) @binding(1) var<storage, read_write> b1: array<atomic<u32>>;".into(),
+        "@group(0) @binding(2) var<uniform> rg_extent: RustGradExtent;".into(),
+        format!("@compute @workgroup_size({}, 1, 1)", renderer.local_size),
+        format!("fn {entry}(@builtin(global_invocation_id) rg_global: vec3<u32>) {{"),
+        "  let gid: u32 = rg_global.x;".into(),
+        "  if (gid >= rg_extent.value) { return; }".into(),
+    ];
+    lines.extend(address_lines);
+    lines.extend(copy_lines);
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        WGSL_RAW_COPY_RENDERER_VERSION,
+        WEBGPU_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        copy.plan(),
+        extent_u32,
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedWgsl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        local_size: renderer.local_size,
+        transaction: None,
+        schedule_inputs: vec![input_abi],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    };
+    rendered.validate_artifact()?;
+    Ok(rendered)
 }
 
 fn emit_wgsl_reduction(
