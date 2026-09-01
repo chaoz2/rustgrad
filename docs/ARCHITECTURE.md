@@ -1509,8 +1509,17 @@ padding, optional bias) → ReLU → AdaptiveAvgPool2d(1,1) → Flatten → Line
 `MovementKernelPlan::AffineCopy` is the narrow pure static affine-view boundary:
 any exactly bounded affine read map from a source or computed producer is copied
 into fresh owned dense storage. A Contiguous boundary selects this plan directly
-instead of publishing an intermediate view; ordinary dense producers retain the
-explicit copy plan. Signed reverse and zero-stride broadcast reads are valid
+instead of publishing an intermediate view. For a concrete static schedule, one
+checked sole-use, unrequested ordinary scalar producer may instead be lowered
+directly into the Contiguous node's fresh dense output, eliminating only the
+intermediate producer allocation and raw copy. The Contiguous node remains the
+schedule, capture, dependency, and output identity; requested, shared, external,
+stateful, guarded/faulting, specialized, affine-view, dynamic, and otherwise
+uncertain producers retain the explicit copy. Eligibility is rehearsed through
+the existing PTX, OpenCL, Metal, and WGSL ordinary-kernel renderers, so a dtype
+or scalar operation outside any established backend route keeps the raw copy.
+Signed reverse and
+zero-stride broadcast reads are valid
 because source aliases never alias the output or each other as write targets.
 The interpreter and movement-v2 CPU renderer share that immutable plan; native
 addressing normalizes the proof to nonnegative indices and copies raw storage
@@ -1526,9 +1535,11 @@ atomics for 8/16-bit lanes and raw words for 32/64-bit lanes. Operation-specific
 renderer versions isolate these new source/cache identities without changing
 RGUA/RGSA movement bytes or generic elementwise identities. The fixed-schema
 static executors can therefore retain computed producers and materialized
-outputs on device. Symbolic computed views, effects, non-affine reshape,
-producer-output redirection, other movement kinds, and live-device validation
-remain fail-closed or unclaimed.
+outputs on device. Symbolic capture deliberately rebuilds the explicit
+Contiguous movement boundary before authenticating its specialization schema;
+symbolic computed views, effects, non-affine reshape, broader producer-output
+redirection, other movement kinds, and live-device validation remain
+fail-closed or unclaimed.
 The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
 preflight/plan/execute path rather than adding a profiler or executor. Its
 immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`

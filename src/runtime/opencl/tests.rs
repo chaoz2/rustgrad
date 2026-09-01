@@ -929,7 +929,7 @@ fn raw_movement_copy_opencl_covers_computed_dense_empty_and_fail_closed_kinds() 
     let input = graph.input_dtype("input", [2, 1], DType::I32);
     let producer = graph.square(input).unwrap();
     let output = graph.contiguous(producer).unwrap();
-    let scheduled = schedule(&graph, output).unwrap();
+    let scheduled = crate::schedule_many(&graph, &[producer, output]).unwrap();
     let copy_item = scheduled
         .items
         .iter()
@@ -943,6 +943,13 @@ fn raw_movement_copy_opencl_covers_computed_dense_empty_and_fail_closed_kinds() 
     let rendered = renderer.render(&copy_item.kernel).unwrap();
     assert!(rendered.source.contains("b1[gid] = b0[gid]"));
     assert_eq!(rendered.buffers[0].id, producer.index() as u64);
+    let redirected = schedule(&graph, output).unwrap();
+    assert_eq!(redirected.items.len(), 1);
+    assert!(matches!(
+        redirected.items[0].kernel.operation(),
+        Operation::Sink
+    ));
+    renderer.render(&redirected.items[0].kernel).unwrap();
 
     let viewed = graph.expand(producer, [2, 3]).unwrap();
     let affine_output = graph.contiguous(viewed).unwrap();

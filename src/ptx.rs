@@ -7620,7 +7620,7 @@ mod tests {
         let input = graph.input_dtype("input", shape, dtype);
         let producer = graph.square(input).unwrap();
         let output = graph.contiguous(producer).unwrap();
-        crate::schedule(&graph, output)
+        crate::schedule_many(&graph, &[producer, output])
             .unwrap()
             .items
             .into_iter()
@@ -7785,6 +7785,18 @@ mod tests {
             assert_eq!(rendered.buffers[0].elements, 2);
             assert_eq!(rendered.buffers[1].elements, 2);
         }
+
+        let mut redirected_graph = Graph::new();
+        let input = redirected_graph.input_dtype("input", [2], DType::F32);
+        let producer = redirected_graph.square(input).unwrap();
+        let output = redirected_graph.contiguous(producer).unwrap();
+        let redirected = crate::schedule(&redirected_graph, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        assert!(matches!(redirected.kernel.operation(), Operation::Sink));
+        renderer.render(&redirected.kernel).unwrap();
 
         let scalar = renderer
             .render(&computed_contiguous_item(DType::U64, Shape::new([])).kernel)

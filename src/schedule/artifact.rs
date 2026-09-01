@@ -79,16 +79,21 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         return Err(ArtifactError::Format("schedule trailing bytes"));
     }
     if version <= LAST_OPAQUE_KEY_VERSION {
+        let decoded_identity = fnv1a64(&bytes[HEADER_LEN..body]);
+        if decoded_identity != stored_identity {
+            return Err(ArtifactError::Format("schedule identity"));
+        }
+        upgrade_legacy_storeless_sinks(&mut capture);
         // Historical item keys are authenticated bytes, not values the
         // current process can reproduce. Validate every other executable
         // field first while deliberately skipping only current-key equality.
         validate(&capture, false)?;
     } else {
         validate(&capture, true)?;
-    }
-    let decoded_identity = fnv1a64(&bytes[HEADER_LEN..body]);
-    if decoded_identity != stored_identity {
-        return Err(ArtifactError::Format("schedule identity"));
+        let decoded_identity = fnv1a64(&bytes[HEADER_LEN..body]);
+        if decoded_identity != stored_identity {
+            return Err(ArtifactError::Format("schedule identity"));
+        }
     }
     if version <= LAST_OPAQUE_KEY_VERSION {
         // Historical item keys were opaque `DefaultHasher` outputs. The
@@ -961,6 +966,8 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
         item.kernel
             .validate()
             .map_err(|_| ArtifactError::Format("kernel"))?;
+        super::validate_item_output_bindings(item)
+            .map_err(|_| ArtifactError::Format("kernel outputs"))?;
         let mut inventory = BTreeSet::new();
         for desc in &item.inputs {
             validate_desc(desc)?;
@@ -1131,6 +1138,23 @@ fn rekey_current(capture: &mut CapturedSchedule) -> Result<(), ArtifactError> {
         .map_err(|_| ArtifactError::Format("item cache identity"))?;
     }
     Ok(())
+}
+
+/// Historical RGSA v1-v6 authenticated a boundary-free empty Sink. It never
+/// produced its declared output, so upgrade it to the existing explicit
+/// materialization boundary rather than granting current executable meaning.
+fn upgrade_legacy_storeless_sinks(capture: &mut CapturedSchedule) {
+    for item in &mut capture.items {
+        if item.boundary.is_none()
+            && item.outputs.is_single()
+            && matches!(item.kernel.operation(), crate::Operation::Sink)
+            && item.kernel.sources().is_empty()
+        {
+            item.boundary = Some(ScheduleBoundary::Unsupported(
+                "operation requires materialization",
+            ));
+        }
+    }
 }
 
 /// Validates the distinct inspection envelope without weakening the released
@@ -1792,6 +1816,13 @@ mod tests {
         ));
         let upgraded = decode(&bytes).unwrap();
         assert_eq!(upgraded.items.len(), 1);
+        assert_eq!(
+            upgraded.items[0].boundary,
+            Some(ScheduleBoundary::Unsupported(
+                "operation requires materialization"
+            ))
+        );
+        assert!(upgraded.replay(&BTreeMap::new()).is_err());
         assert_ne!(upgraded.items[0].cache_key, 0x8877_6655_4433_2211);
         assert_eq!(
             upgraded.items[0].cache_key,
@@ -1804,6 +1835,8 @@ mod tests {
         let decoded = decode(&current).unwrap();
         assert_eq!(decoded.identity, upgraded.identity);
         assert_eq!(decoded.items[0].cache_key, upgraded.items[0].cache_key);
+        assert_eq!(decoded.items[0].boundary, upgraded.items[0].boundary);
+        assert!(decoded.replay(&BTreeMap::new()).is_err());
         assert_eq!(encode(&decoded).unwrap(), current);
 
         let mut forged = bytes;

@@ -419,10 +419,25 @@ impl CapturedSchedule {
         spec: &crate::SymbolicCaptureSpec,
         template_bindings: &BTreeMap<String, i64>,
     ) -> Result<Self, ReplayError> {
-        let mut capture = Self::capture(graph, schedule, requested)?;
+        // Validate the caller's concrete schedule first, but authenticate the
+        // symbolic family against an explicit movement boundary. Redirection
+        // is a concrete ownership optimization; retaining Contiguous here
+        // keeps specialization shapes, buffer schemas, and historical replay
+        // structure independent of that optimization.
+        let _validated = Self::capture(graph, schedule, requested)?;
+        let external = schedule
+            .items
+            .iter()
+            .flat_map(|item| item.external_materializations.iter())
+            .map(|node| node.index())
+            .collect::<BTreeSet<_>>();
+        let symbolic_schedule =
+            crate::schedule::schedule_many_for_symbolic_capture(graph, requested, &external)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        let mut capture = Self::capture(graph, &symbolic_schedule, requested)?;
         capture.symbolic = Some(super::symbolic::build_schema(
             graph,
-            schedule,
+            &symbolic_schedule,
             &capture,
             spec,
             template_bindings,
@@ -632,6 +647,110 @@ mod tests {
         let mut extra = a;
         extra.insert("unexpected".into(), TensorData::scalar(0.0));
         assert!(matches!(c.replay(&extra), Err(ReplayError::Extra(_))));
+    }
+
+    #[test]
+    fn redirected_contiguous_capture_roundtrips_one_owned_producer() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([3]), DType::F32);
+        let producer = graph.square(input).unwrap();
+        let output = graph.contiguous(producer).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.items[0].node, output);
+        assert!(matches!(
+            schedule.items[0].kernel.operation(),
+            crate::Operation::Sink
+        ));
+        assert!(
+            schedule.items[0]
+                .kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .all(|node| !matches!(node.operation(), crate::Operation::Movement(_)))
+        );
+
+        let capture = CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].node, output);
+        assert_eq!(decoded.items[0].primary_output().id, output.index() as u64);
+        let value = TensorData::new([3], vec![-2.0, 0.0, 3.0]).unwrap();
+        let replayed = decoded
+            .replay(&BTreeMap::from([("input".into(), value)]))
+            .unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(
+            replayed[0].storage(),
+            &crate::Storage::F32(vec![4.0, 0.0, 9.0])
+        );
+    }
+
+    #[test]
+    fn contiguous_capture_preserves_raw_bytes_across_redirect_and_copy_routes() {
+        use crate::{Float8Format, Float8Storage, Storage};
+
+        let values = vec![
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E4M3,
+                vec![0x80, 0x7f],
+            )),
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E5M2,
+                vec![0x80, 0x7d],
+            )),
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E4M3FNUZ,
+                vec![0x80, 0xff],
+            )),
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E5M2FNUZ,
+                vec![0x80, 0xff],
+            )),
+            Storage::F16(vec![0x8000, 0x7e01]),
+            Storage::BF16(vec![0x8000, 0x7fc1]),
+            Storage::F32(vec![
+                f32::from_bits(0x8000_0000),
+                f32::from_bits(0x7fc0_0001),
+            ]),
+            Storage::F64(vec![
+                f64::from_bits(0x8000_0000_0000_0000),
+                f64::from_bits(0x7ff8_0000_0000_0001),
+            ]),
+            Storage::U8(vec![0, u8::MAX]),
+            Storage::U16(vec![0, u16::MAX]),
+            Storage::U32(vec![0, u32::MAX]),
+            Storage::U64(vec![0, u64::MAX]),
+            Storage::I8(vec![i8::MIN, i8::MAX]),
+            Storage::I16(vec![i16::MIN, i16::MAX]),
+            Storage::I32(vec![i32::MIN, i32::MAX]),
+            Storage::I64(vec![i64::MIN, i64::MAX]),
+            Storage::Bool(vec![false, true]),
+        ];
+        for storage in values {
+            let dtype = storage.dtype();
+            let value = TensorData::from_storage([2], storage).unwrap();
+            let expected = value.to_le_bytes().unwrap();
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let producer = graph.detach(input).unwrap();
+            let output = graph.contiguous(producer).unwrap();
+            let schedule = crate::schedule(&graph, output).unwrap();
+            let portable = matches!(dtype, DType::Bool | DType::I32 | DType::U32 | DType::F32);
+            assert_eq!(
+                schedule.items.len(),
+                if portable { 1 } else { 2 },
+                "{dtype:?}"
+            );
+            let capture = CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+            let replayed = capture
+                .replay(&BTreeMap::from([("input".into(), value)]))
+                .unwrap();
+            assert_eq!(replayed[0].to_le_bytes().unwrap(), expected, "{dtype:?}");
+        }
     }
 
     #[test]
