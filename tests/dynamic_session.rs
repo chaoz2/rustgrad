@@ -118,3 +118,77 @@ fn dynamic_session_empty_pipeline_preserves_exact_empty_and_scalar_identities() 
     );
     assert!(session.realize_dynamic(&mean).unwrap().to_vec_f64()[0].is_nan());
 }
+
+#[test]
+fn dynamic_session_mean_vjp_reuses_graph_with_exact_runtime_count() {
+    let mut session = CpuSession::new();
+    let input = session.variable([4], [2.0, 3.0, 5.0, 7.0]).unwrap();
+    let mask = session
+        .variable_data(
+            TensorData::from_scalars(
+                [4],
+                DType::Bool,
+                [true, false, true, true].into_iter().map(Scalar::Bool),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let selected = session.masked_select_dynamic(&input, &mask).unwrap();
+    let mean = session.dynamic_mean(&selected).unwrap();
+    let upstream = TensorData::scalar_with_dtype(Scalar::F(6.0), DType::F32);
+
+    assert_eq!(
+        session
+            .dynamic_vjp(&mean, &upstream, &input)
+            .unwrap()
+            .to_vec_f64(),
+        vec![2.0, 0.0, 2.0, 2.0]
+    );
+    session
+        .set(
+            &mask,
+            TensorData::from_scalars(
+                [4],
+                DType::Bool,
+                [false, true, false, false].into_iter().map(Scalar::Bool),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .dynamic_vjp(&mean, &upstream, &input)
+            .unwrap()
+            .to_vec_f64(),
+        vec![0.0, 6.0, 0.0, 0.0]
+    );
+    session
+        .set(
+            &mask,
+            TensorData::from_scalars([4], DType::Bool, [Scalar::Bool(false); 4]).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .dynamic_vjp(&mean, &upstream, &input)
+            .unwrap()
+            .to_vec_f64(),
+        vec![0.0; 4]
+    );
+
+    assert!(matches!(
+        session.dynamic_vjp(
+            &mean,
+            &TensorData::from_scalars([1], DType::F32, [Scalar::F(1.0)]).unwrap(),
+            &input,
+        ),
+        Err(Error::DynamicVjp {
+            reason: "upstream descriptor mismatch"
+        })
+    ));
+    let foreign = CpuSession::new();
+    assert!(matches!(
+        foreign.dynamic_vjp(&mean, &upstream, &input),
+        Err(Error::SessionHandleMismatch { .. })
+    ));
+}

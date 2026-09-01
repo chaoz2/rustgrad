@@ -2227,7 +2227,8 @@ impl Graph {
         Ok(id)
     }
 
-    /// Reduces a dynamic rank-one result using the ordinary mean dtype policy.
+    /// Reduces every realized element of a dynamic result to one scalar using
+    /// the ordinary mean dtype policy.
     pub fn dynamic_mean(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
         let source = self.dynamic_node(input)?;
         let dtype = super::dynamic_reduction_dtypes(source.dtype, ReduceKind::Mean)

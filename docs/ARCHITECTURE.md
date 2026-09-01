@@ -245,8 +245,12 @@ within one request. `DynamicOutputShape` retains the exact count-producing node
 and its scalar, one-dimensional, or row-coordinate expression. Pointwise
 `Neg`/`Square` and `Add`/`Sub`/`Mul` compose arbitrary topological branches
 when dynamic operands share that count provenance; scalar reductions remain
-ordinary composable values in the runtime DAG. General dynamic broadcasting,
-higher order, and every device boundary remain explicit follow-up work.
+ordinary composable values in the runtime DAG. Their first-order CPU/session
+VJP evaluates Mean's divisor from the immediate input's realized element count
+through the same committed work-width quotient as static native reductions;
+an empty input produces an empty local cotangent without division. General
+dynamic broadcasting, graph-on-graph higher order, and every device boundary
+remain explicit follow-up work.
 
 The 0.1 runtime-cardinality API intentionally replaced the former rank-only
 shape constructor and side binding projection. `DynamicOutputShape` is now the
@@ -319,21 +323,22 @@ participating static reverse boundary on a private graph clone, and
 excludes Bool mask/cardinality inputs before CPU work. The shared CPU executor
 requires an upstream with the exact realized output shape, then scatters its
 row-major lanes through broadcast masks into the static source shape. Dynamic
-`Sum` uses that same plan for its implicit one seed. Local cotangents cross
-admitted derived static graph boundaries through an explicit cloned-graph
+`Sum` uses that same plan for its implicit one seed. Dynamic `Mean` derives its
+denominator from the immediate input's realized element count, divides at the
+canonical F32/F64 work width, narrows to the input storage, and broadcasts the
+local cotangent over that exact shape; an empty input produces no lanes. Local
+cotangents cross admitted derived static graph boundaries through an explicit cloned-graph
 `grad_with` seed, including the masked value expression and derived scalar
-operands. Dynamic `Mean` is forward-only; matching the checked-in source's
-current forward-only `size=None` masked-select acceptance, neither this
-first-order host result nor the runtime schedule participates in `Graph::grad`
-or higher-order dynamic autograd.
+operands. This owned first-order host result and the runtime schedule still do
+not participate in `Graph::grad` or higher-order dynamic autograd.
 
 `CpuSession` exposes this same exact ABI without mutable or raw arena-index
 access: `DynamicTensor::shape_expression` carries an opaque graph-local count
 provenance token, and every operation validates session ownership.
 `nonzero_dynamic` and `masked_select_dynamic` create session-owned handles;
 pointwise branches,
-checked static scalars, fixed scalar `Sum`/forward-only `Mean`, and CPU
-realization accept them. `dynamic_vjp` takes exact realized upstream storage
+checked static scalars, fixed scalar `Sum`/`Mean`, their exact first-order VJP,
+and CPU realization accept them. `dynamic_vjp` takes exact realized upstream storage
 and returns the fixed target-shaped first-order cotangent. Handles are
 session-identified like static session tensors. This is a public workflow
 facade over the existing plans, not a capture surface or dynamic device

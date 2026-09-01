@@ -397,11 +397,14 @@ runtime-sized selection can run without bespoke host glue.
 
 **Evidence and gap.** CPU-only source-policy `nonzero`, dynamic masked select,
 shared-count `Neg`/`Square` and `Add`/`Sub`/`Mul` DAGs, checked scalar operands,
-composable `Sum`/forward-only `Mean`, and first-order Sum VJPs exist. The public
+composable `Sum`/`Mean`, and first-order Sum/Mean VJPs exist. Mean uses the
+immediate input's exact realized all-element count at the canonical work dtype,
+including zero-cardinality and scalar domains. The public
 `CpuSession` path exposes the same exact shape expressions and rejects foreign
-session provenance. General dynamic broadcasting, session-level dynamic
-autograd, artifact/capture/replay/native JIT/device lowering, and dynamic-mean
-autograd remain deliberately unavailable.
+session provenance. General dynamic broadcasting, reverse rules beyond this
+first-order CPU/session slice, graph-on-graph higher order,
+artifact/capture/replay/native JIT, and device lowering remain deliberately
+unavailable.
 No current P0 acceptance has yet demonstrated that the remaining generality is
 its concrete blocker.
 

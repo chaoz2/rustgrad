@@ -285,19 +285,8 @@ impl NativeReductionPlan {
         if self.kind != ReduceKind::Mean {
             return self.output_dtype.commit_scalar(accumulator);
         }
-        let count = self.reduction_len();
-        let value = if count == 0 {
-            Scalar::F(f64::NAN)
-        } else if self.accumulator_dtype.is_float() {
-            let divisor = self.mean_divisor().expect("nonempty validated Mean");
-            Scalar::F(if self.accumulator_dtype == DType::F64 {
-                accumulator.as_f64() / divisor.as_f64()
-            } else {
-                ((accumulator.as_f64() as f32) / (divisor.as_f64() as f32)) as f64
-            })
-        } else {
-            unreachable!("validated Mean accumulator is floating")
-        };
+        let value = mean_quotient(accumulator, self.reduction_len(), self.accumulator_dtype)
+            .expect("validated Mean accumulator is floating");
         self.output_dtype.commit_scalar(value)
     }
 
@@ -307,6 +296,27 @@ impl NativeReductionPlan {
                 .commit_scalar(Scalar::F(self.reduction_len() as f64))
         })
     }
+}
+
+/// Divides one Mean numerator by its concrete cardinality at the committed
+/// work width. Static native reductions and runtime-cardinality reductions use
+/// this same scalar boundary so an F32 divisor/count never inherits host F64
+/// precision. Empty Mean is the canonical typed NaN.
+pub(crate) fn mean_quotient(numerator: Scalar, count: usize, work_dtype: DType) -> Option<Scalar> {
+    if !work_dtype.is_float() {
+        return None;
+    }
+    let numerator = work_dtype.commit_scalar(numerator);
+    if count == 0 {
+        return Some(work_dtype.commit_scalar(Scalar::F(f64::NAN)));
+    }
+    let divisor = work_dtype.commit_scalar(Scalar::F(count as f64));
+    let quotient = if work_dtype == DType::F64 {
+        numerator.as_f64() / divisor.as_f64()
+    } else {
+        ((numerator.as_f64() as f32) / (divisor.as_f64() as f32)) as f64
+    };
+    Some(work_dtype.commit_scalar(Scalar::F(quotient)))
 }
 
 /// Emits the backend-neutral row-major integer address formula. Callers own
@@ -638,6 +648,10 @@ mod tests {
 
         let rounded_count = plan(ReduceKind::Mean, DType::F32, DType::F32, (1 << 24) + 1);
         assert_eq!(rounded_count.mean_divisor().unwrap().as_f64(), 16_777_216.0);
+        assert_eq!(
+            mean_quotient(Scalar::F(16_777_216.0), (1 << 24) + 1, DType::F32),
+            Some(Scalar::F(1.0))
+        );
     }
 
     #[test]

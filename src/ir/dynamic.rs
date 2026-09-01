@@ -115,6 +115,33 @@ pub struct DynamicVjpPlan {
     identity: u64,
 }
 
+/// Checked reverse rule for one runtime-cardinality Mean.
+///
+/// The concrete denominator deliberately remains absent: execution derives it
+/// from the realized `input`. Keeping the canonical reduction dtype pair here
+/// makes graph preflight and the CPU executor agree on the cast/divide/cast
+/// boundary without adding another dynamic operation or schedule payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DynamicMeanVjpRule {
+    input: DynamicNodeId,
+    source_dtype: DType,
+    dtypes: ReductionDType,
+}
+
+impl DynamicMeanVjpRule {
+    pub(crate) fn input(self) -> DynamicNodeId {
+        self.input
+    }
+
+    pub(crate) fn source_dtype(self) -> DType {
+        self.source_dtype
+    }
+
+    pub(crate) fn dtypes(self) -> ReductionDType {
+        self.dtypes
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DynamicAllocationError {
     UnsupportedOutput {
@@ -560,13 +587,9 @@ impl Graph {
                 }
                 self.validate_dynamic_vjp_path(input, target, memo)?
             }
-            DynamicOperation::Mean { input } => {
-                if self.validate_dynamic_vjp_path(input, target, memo)? {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "dynamic mean autograd is not implemented",
-                    ));
-                }
-                false
+            DynamicOperation::Mean { .. } => {
+                let rule = self.dynamic_mean_vjp_rule(output)?;
+                self.validate_dynamic_vjp_path(rule.input(), target, memo)?
             }
             DynamicOperation::Binary { op, lhs, rhs } => {
                 if !matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) {
@@ -581,6 +604,36 @@ impl Graph {
         };
         memo.insert(output.index, contains);
         Ok(contains)
+    }
+
+    /// Reconstructs and validates the only supported runtime-cardinality Mean
+    /// reverse rule. The denominator is intentionally realized later.
+    pub(crate) fn dynamic_mean_vjp_rule(
+        &self,
+        output: DynamicNodeId,
+    ) -> Result<DynamicMeanVjpRule> {
+        let node = self.dynamic_node(output)?;
+        let DynamicOperation::Mean { input } = &node.operation else {
+            return Err(Error::DynamicVjp {
+                reason: "dynamic VJP node is not Mean",
+            });
+        };
+        let input = *input;
+        let source = self.dynamic_node(input)?;
+        let dtypes =
+            dynamic_reduction_dtypes(source.dtype, ReduceKind::Mean).ok_or(Error::DynamicVjp {
+                reason: "dynamic Mean dtype policy is unsupported",
+            })?;
+        if node.output != DynamicOutputShape::Scalar || node.dtype != dtypes.output {
+            return Err(Error::DynamicVjp {
+                reason: "dynamic Mean descriptor is not canonical",
+            });
+        }
+        Ok(DynamicMeanVjpRule {
+            input,
+            source_dtype: source.dtype,
+            dtypes,
+        })
     }
 }
 
@@ -821,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_vjp_plan_prunes_masks_and_rejects_unsupported_paths_atomically() {
+    fn dynamic_vjp_plan_prunes_masks_and_checks_runtime_mean_atomically() {
         let (mut graph, input, mask, output) = dynamic_vjp_graph();
         let before_static = graph.node_count();
         let before_dynamic = graph.dynamic_nodes.len();
@@ -881,14 +934,41 @@ mod tests {
         assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
         let mean = graph.dynamic_mean(output).unwrap();
         let before_dynamic = graph.dynamic_nodes.len();
+        let mean_plan = graph.dynamic_vjp_plan(mean, input).unwrap();
+        assert_eq!(mean_plan.output(), mean);
+        assert_eq!(mean_plan.upstream_shape(), DynamicOutputShape::Scalar);
+        let rule = graph.dynamic_mean_vjp_rule(mean).unwrap();
+        assert_eq!(rule.input(), output);
+        assert_eq!(rule.source_dtype(), DType::F32);
+        assert_eq!(rule.dtypes(), ReductionDType::new(DType::F32, DType::F32));
+        assert_eq!(graph.node_count(), before_static);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+
+        graph.dynamic_nodes[mean.index].dtype = DType::F64;
         assert!(matches!(
             graph.dynamic_vjp_plan(mean, input),
-            Err(Error::NonDifferentiableIndexing(
-                "dynamic mean autograd is not implemented"
-            ))
+            Err(Error::DynamicVjp {
+                reason: "dynamic Mean descriptor is not canonical"
+            })
         ));
         assert_eq!(graph.node_count(), before_static);
         assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+
+        for dtype in [DType::I32, DType::F8E5M2] {
+            let mut unsupported = Graph::new();
+            let input = unsupported.input_dtype("input", [2], dtype);
+            let mask = unsupported.input_dtype("mask", [2], DType::Bool);
+            let selected = unsupported.masked_select_dynamic(input, mask).unwrap();
+            let mean = unsupported.dynamic_mean(selected).unwrap();
+            let before_static = unsupported.node_count();
+            let before_dynamic = unsupported.dynamic_nodes.len();
+            assert!(matches!(
+                unsupported.dynamic_vjp_plan(mean, input),
+                Err(Error::NonDifferentiableTarget(node)) if node == input
+            ));
+            assert_eq!(unsupported.node_count(), before_static);
+            assert_eq!(unsupported.dynamic_nodes.len(), before_dynamic);
+        }
     }
 
     #[test]

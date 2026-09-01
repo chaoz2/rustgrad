@@ -2,7 +2,9 @@ use super::Backend;
 use crate::engine::dynamic::RuntimeMaterializationMap;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
-use crate::ir::{DynamicInput, DynamicNodeId, DynamicOperation, DynamicVjpPlan};
+use crate::ir::{
+    DynamicInput, DynamicMeanVjpRule, DynamicNodeId, DynamicOperation, DynamicVjpPlan,
+};
 use crate::schedule::dynamic::{
     RuntimeBufferDesc, RuntimeCount, RuntimeCountId, RuntimeInstruction, RuntimeSchedule,
     RuntimeValueDesc, RuntimeValueSource, schedule_dynamic,
@@ -806,14 +808,18 @@ impl CpuBackend {
                             } else {
                                 dtypes.output
                             };
-                            let numerator = sum.cast(work_dtype).scalar_at(0).as_f64();
-                            let mean = if source.is_empty() {
-                                f64::NAN
-                            } else {
-                                numerator / source.len() as f64
-                            };
-                            TensorData::scalar_with_dtype(Scalar::F(mean), work_dtype)
-                                .cast(dtypes.output)
+                            let numerator = sum.cast(work_dtype).scalar_at(0);
+                            let mean = crate::reduction_native::mean_quotient(
+                                numerator,
+                                source.len(),
+                                work_dtype,
+                            )
+                            .ok_or_else(|| {
+                                Error::DynamicAllocation {
+                                    reason: "dynamic Mean work dtype is not floating".into(),
+                                }
+                            })?;
+                            TensorData::scalar_with_dtype(mean, work_dtype).cast(dtypes.output)
                         }
                         _ => {
                             return Err(Error::DynamicAllocation {
@@ -878,9 +884,12 @@ impl CpuBackend {
                 )?;
                 self.dynamic_vjp(graph, input, &expanded, wrt, inputs)
             }
-            DynamicOperation::Mean { .. } => Err(Error::NonDifferentiableIndexing(
-                "dynamic mean autograd is not implemented",
-            )),
+            DynamicOperation::Mean { .. } => {
+                let rule = graph.dynamic_mean_vjp_rule(output)?;
+                let value = self.dynamic_value(graph, rule.input(), inputs)?;
+                let expanded = dynamic_mean_vjp_upstream(rule, &value, upstream)?;
+                self.dynamic_vjp(graph, rule.input(), &expanded, wrt, inputs)
+            }
             DynamicOperation::MaskedSelect { input, mask }
                 if graph.backward_slice_contains(input, wrt)? =>
             {
@@ -3009,6 +3018,51 @@ fn dynamic_masked_select_vjp(
         );
     }
     TensorData::from_scalars(input.shape().clone(), input.dtype(), output)
+}
+
+fn dynamic_mean_vjp_upstream(
+    rule: DynamicMeanVjpRule,
+    input: &TensorData,
+    upstream: &TensorData,
+) -> Result<TensorData> {
+    let dtypes = rule.dtypes();
+    if input.dtype() != rule.source_dtype()
+        || upstream.shape().rank() != 0
+        || upstream.dtype() != dtypes.output
+    {
+        return Err(Error::DynamicVjp {
+            reason: "runtime Mean VJP descriptor mismatch",
+        });
+    }
+
+    // tinygrad expresses Mean as typed Sum followed by true division. An
+    // empty reduction therefore has a NaN forward scalar, but its broadcast
+    // reverse edge has no lanes. Construct the empty cotangent directly so a
+    // later static-scalar boundary reduces it to the additive zero identity.
+    if input.is_empty() {
+        return TensorData::from_scalars(
+            input.shape().clone(),
+            rule.source_dtype(),
+            std::iter::empty::<Scalar>(),
+        );
+    }
+
+    let work_dtype = if dtypes.accumulator.is_float() {
+        dtypes.accumulator
+    } else {
+        dtypes.output
+    };
+    let numerator = upstream.cast(work_dtype).scalar_at(0);
+    let quotient = crate::reduction_native::mean_quotient(numerator, input.len(), work_dtype)
+        .ok_or(Error::DynamicVjp {
+            reason: "runtime Mean work dtype is not floating",
+        })?;
+    let quotient = TensorData::scalar_with_dtype(quotient, work_dtype).cast(rule.source_dtype());
+    TensorData::from_scalars(
+        input.shape().clone(),
+        rule.source_dtype(),
+        (0..input.len()).map(|_| quotient.scalar_at(0)),
+    )
 }
 
 fn dynamic_binary(
@@ -7179,6 +7233,239 @@ mod tests {
             .unwrap();
         assert_eq!(result.loss.output.to_vec_f64(), vec![20.]);
         assert_eq!(result.gradient.to_vec_f64(), vec![4., 0., 12.]);
+    }
+
+    #[test]
+    fn dynamic_mean_vjp_uses_each_realized_cardinality_and_explicit_seed() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [4]);
+        let mask = graph.input_dtype("mask", [4], DType::Bool);
+        let selected = graph.masked_select_dynamic(x, mask).unwrap();
+        let mean = graph.dynamic_mean(selected).unwrap();
+        let sum = graph.dynamic_sum(selected).unwrap();
+        let mean_of_sum = graph.dynamic_mean(sum).unwrap();
+        let plan = graph.dynamic_vjp_plan(mean, x).unwrap();
+
+        for (mask_values, expected) in [
+            (vec![true, false, true, true], vec![2.0, 0.0, 2.0, 2.0]),
+            (vec![false, true, false, false], vec![0.0, 6.0, 0.0, 0.0]),
+            (vec![false; 4], vec![0.0; 4]),
+        ] {
+            let inputs = HashMap::from([
+                ("x".into(), data([4], &[2., 3., 5., 7.])),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [4],
+                        DType::Bool,
+                        mask_values.into_iter().map(Scalar::Bool),
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            let gradient = CpuBackend
+                .execute_dynamic_vjp(
+                    &graph,
+                    &plan,
+                    &TensorData::scalar_with_dtype(Scalar::F(6.0), DType::F32),
+                    &inputs,
+                )
+                .unwrap();
+            assert_eq!(gradient.to_vec_f64(), expected);
+        }
+
+        let inputs = HashMap::from([
+            ("x".into(), data([4], &[2., 3., 5., 7.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [4],
+                    DType::Bool,
+                    [true, false, true, true].into_iter().map(Scalar::Bool),
+                )
+                .unwrap(),
+            ),
+        ]);
+        let implicit = CpuBackend
+            .execute_dynamic_gradient(&graph, mean, x, &inputs)
+            .unwrap();
+        assert_eq!(
+            implicit.loss.output.to_vec_f64(),
+            vec![f64::from(14.0f32 / 3.0f32)]
+        );
+        let third = f64::from(1.0f32 / 3.0f32);
+        assert_eq!(
+            implicit.gradient.to_vec_f64(),
+            vec![third, 0.0, third, third]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic_gradient(&graph, mean_of_sum, x, &inputs)
+                .unwrap()
+                .gradient
+                .to_vec_f64(),
+            vec![1.0, 0.0, 1.0, 1.0],
+            "the immediate scalar Mean input has cardinality one"
+        );
+        assert!(matches!(
+            CpuBackend.execute_dynamic_vjp(&graph, &plan, &data([1], &[1.0]), &inputs,),
+            Err(Error::DynamicVjp {
+                reason: "upstream descriptor mismatch"
+            })
+        ));
+    }
+
+    #[test]
+    fn dynamic_mean_vjp_composes_below_and_into_static_scalars() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let mask = graph.input_dtype("mask", [3], DType::Bool);
+        let scale = graph.input("scale", []);
+        let selected = graph.masked_select_dynamic(x, mask).unwrap();
+        let squared = graph.dynamic_unary(selected, UnaryOp::Square).unwrap();
+        let shifted = graph
+            .dynamic_binary(squared, DynamicInput::StaticScalar(scale), BinaryOp::Add)
+            .unwrap();
+        let mean = graph.dynamic_mean(shifted).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([3], &[2., 3., 4.])),
+            ("scale".into(), TensorData::scalar(5.0)),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [true, false, true].into_iter().map(Scalar::Bool),
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic_gradient(&graph, mean, x, &inputs)
+                .unwrap()
+                .gradient
+                .to_vec_f64(),
+            vec![2.0, 0.0, 4.0]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic_gradient(&graph, mean, scale, &inputs)
+                .unwrap()
+                .gradient
+                .to_vec_f64(),
+            vec![1.0]
+        );
+
+        let empty_inputs = HashMap::from([
+            ("x".into(), data([3], &[2., 3., 4.])),
+            ("scale".into(), TensorData::scalar(5.0)),
+            (
+                "mask".into(),
+                TensorData::from_scalars([3], DType::Bool, [Scalar::Bool(false); 3]).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic_gradient(&graph, mean, scale, &empty_inputs)
+                .unwrap()
+                .gradient
+                .to_vec_f64(),
+            vec![0.0]
+        );
+    }
+
+    #[test]
+    fn dynamic_mean_vjp_uses_all_count_rows_elements_and_prunes_nonzero() {
+        let mut graph = Graph::new();
+        let coordinates_source = graph.input("coordinates_source", [2, 2]);
+        let scale = graph.input("scale", []);
+        let coordinates = graph.nonzero(coordinates_source).unwrap();
+        let shifted = graph
+            .dynamic_binary(
+                coordinates,
+                DynamicInput::StaticScalar(scale),
+                BinaryOp::Add,
+            )
+            .unwrap();
+        let mean = graph.dynamic_mean(shifted).unwrap();
+
+        for (source, expected) in [
+            (data([2, 2], &[0.0, 2.0, 3.0, 0.0]), 1.0),
+            (data([2, 2], &[0.0; 4]), 0.0),
+        ] {
+            let inputs = HashMap::from([
+                ("coordinates_source".into(), source),
+                ("scale".into(), TensorData::scalar(7.0)),
+            ]);
+            let result = CpuBackend
+                .execute_dynamic_gradient(&graph, mean, scale, &inputs)
+                .unwrap();
+            assert_eq!(result.gradient.to_vec_f64(), vec![expected]);
+        }
+        assert!(matches!(
+            graph.dynamic_vjp_plan(mean, coordinates_source),
+            Err(Error::NonDifferentiableTarget(node)) if node == coordinates_source
+        ));
+
+        let mut scalar_graph = Graph::new();
+        let source = scalar_graph.input("source", []);
+        let scale = scalar_graph.input("scale", []);
+        let coordinates = scalar_graph.nonzero(source).unwrap();
+        let shifted = scalar_graph
+            .dynamic_binary(
+                coordinates,
+                DynamicInput::StaticScalar(scale),
+                BinaryOp::Add,
+            )
+            .unwrap();
+        let mean = scalar_graph.dynamic_mean(shifted).unwrap();
+        let inputs = HashMap::from([
+            ("source".into(), TensorData::scalar(1.0)),
+            ("scale".into(), TensorData::scalar(7.0)),
+        ]);
+        let result = CpuBackend
+            .execute_dynamic_gradient(&scalar_graph, mean, scale, &inputs)
+            .unwrap();
+        assert_eq!(result.loss.output.shape(), &Shape::from([]));
+        assert!(result.loss.output.scalar_at(0).as_f64().is_nan());
+        assert_eq!(result.gradient.to_vec_f64(), vec![0.0]);
+    }
+
+    #[test]
+    fn dynamic_mean_vjp_divides_in_float_work_dtype_then_narrows() {
+        for (dtype, expected) in [
+            (DType::F16, crate::Storage::F16(vec![0x3555; 3])),
+            (DType::BF16, crate::Storage::BF16(vec![0x3eab; 3])),
+            (DType::F32, crate::Storage::F32(vec![1.0f32 / 3.0; 3])),
+            (DType::F64, crate::Storage::F64(vec![1.0f64 / 3.0; 3])),
+        ] {
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", [3], dtype);
+            let mask = graph.input_dtype("mask", [3], DType::Bool);
+            let selected = graph.masked_select_dynamic(x, mask).unwrap();
+            let mean = graph.dynamic_mean(selected).unwrap();
+            let plan = graph.dynamic_vjp_plan(mean, x).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "x".into(),
+                    TensorData::from_scalars([3], dtype, [Scalar::F(1.0); 3]).unwrap(),
+                ),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars([3], DType::Bool, [Scalar::Bool(true); 3]).unwrap(),
+                ),
+            ]);
+            let gradient = CpuBackend
+                .execute_dynamic_vjp(
+                    &graph,
+                    &plan,
+                    &TensorData::scalar_with_dtype(Scalar::F(1.0), dtype),
+                    &inputs,
+                )
+                .unwrap();
+            assert_eq!(gradient.storage(), &expected, "{dtype:?}");
+        }
     }
 
     #[test]
