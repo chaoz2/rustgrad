@@ -2430,15 +2430,20 @@ impl Graph {
             ReduceKind::Sum => sum_dtype(source.dtype),
             _ => source.dtype,
         };
-        self.reduce_with_output_dtype(input, kind, axes, keepdim, dtype)
+        let accumulator =
+            if source.dtype.is_float8() && matches!(kind, ReduceKind::Sum | ReduceKind::Mean) {
+                DType::F32
+            } else {
+                dtype
+            };
+        self.reduce_with_accumulator_dtype(input, kind, axes, keepdim, accumulator, dtype)
     }
 
     /// Appends a reduction whose storage dtype is supplied by the caller.
     ///
-    /// `Op::Reduce` obtains its computation type from the result descriptor,
-    /// so this is the single checked boundary for callers with an explicit
-    /// accumulator contract. The legacy [`Self::reduce`] policy remains above
-    /// it; this method only changes the descriptor selected by typed plans.
+    /// This is the checked same-storage boundary for typed callers whose
+    /// accumulator and result descriptors are identical. Raw reductions with
+    /// distinct work/result storage use the private generalized constructor.
     pub(crate) fn reduce_with_output_dtype(
         &mut self,
         input: NodeId,
@@ -2447,21 +2452,36 @@ impl Graph {
         keepdim: bool,
         dtype: DType,
     ) -> Result<NodeId> {
-        let source = self.node(input)?;
-        let axes = normalize_axes(input, source.shape.rank(), axes)?;
-        if matches!(kind, ReduceKind::Any | ReduceKind::All) && source.dtype != DType::Bool {
+        self.reduce_with_accumulator_dtype(input, kind, axes, keepdim, dtype, dtype)
+    }
+
+    fn reduce_with_accumulator_dtype(
+        &mut self,
+        input: NodeId,
+        kind: ReduceKind,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        accumulator: DType,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let (input_shape, input_dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let axes = normalize_axes(input, input_shape.rank(), axes)?;
+        if matches!(kind, ReduceKind::Any | ReduceKind::All) && input_dtype != DType::Bool {
             return Err(Error::InvalidElementwiseDType {
                 op: match kind {
                     ReduceKind::Any => "any",
                     ReduceKind::All => "all",
                     _ => unreachable!(),
                 },
-                actual: source.dtype,
+                actual: input_dtype,
             });
         }
-        let shape = reduction_shape(&source.shape, &axes, keepdim);
+        let shape = reduction_shape(&input_shape, &axes, keepdim);
         if matches!(kind, ReduceKind::Max | ReduceKind::Min)
-            && has_empty_reduction_domain(&source.shape, &shape, &axes)
+            && has_empty_reduction_domain(&input_shape, &shape, &axes)
         {
             return Err(Error::EmptyReduction {
                 op: match kind {
@@ -2469,29 +2489,66 @@ impl Graph {
                     ReduceKind::Min => "min",
                     _ => unreachable!(),
                 },
-                shape: source.shape.clone(),
+                shape: input_shape.clone(),
                 axes,
             });
         }
-        source
-            .shape
+        input_shape
             .numel()?
-            .checked_mul(source.dtype.itemsize())
-            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+            .checked_mul(input_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
         shape
             .numel()?
             .checked_mul(dtype.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-        Ok(self.push(
+        let effective_axes = axes
+            .iter()
+            .copied()
+            .filter(|axis| input_shape.dims()[*axis] != 1)
+            .collect::<Vec<_>>();
+        if effective_axes.is_empty() {
+            let value = if input_dtype == dtype {
+                input
+            } else {
+                self.cast(input, dtype)?
+            };
+            return if input_shape == shape {
+                Ok(value)
+            } else {
+                self.reshape(value, shape)
+            };
+        }
+        let filtered = effective_axes.len() != axes.len();
+        let operation_keepdim = keepdim || filtered;
+        let operation_shape = reduction_shape(&input_shape, &effective_axes, operation_keepdim);
+        crate::reduction_native::NativeReductionPlan::new(
+            input_shape.clone(),
+            operation_shape.clone(),
+            effective_axes.clone(),
+            operation_keepdim,
+            kind,
+            input_dtype,
+            crate::ReductionDType::new(accumulator, dtype),
+        )
+        .map_err(|reason| Error::Serialization {
+            reason: reason.into(),
+        })?;
+        let reduced = self.push(
             Op::Reduce {
                 input,
                 kind,
-                axes,
-                keepdim,
+                axes: effective_axes,
+                keepdim: operation_keepdim,
+                accumulator,
             },
-            shape,
+            operation_shape.clone(),
             dtype,
-        ))
+        );
+        if operation_shape == shape {
+            Ok(reduced)
+        } else {
+            self.reshape(reduced, shape)
+        }
     }
     pub fn argmax(&mut self, input: NodeId, axis: Option<isize>, keepdim: bool) -> Result<NodeId> {
         self.arg_reduce(input, true, axis, keepdim)

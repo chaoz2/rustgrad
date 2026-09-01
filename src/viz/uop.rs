@@ -154,7 +154,6 @@ fn operation_fields(operation: &Operation) -> BTreeMap<String, String> {
             axes,
             keepdim,
             kind,
-            mean,
         }) => {
             out.insert("input_shape".into(), shape_name(input_shape));
             out.insert("output_shape".into(), shape_name(output_shape));
@@ -173,7 +172,6 @@ fn operation_fields(operation: &Operation) -> BTreeMap<String, String> {
                 }
                 .into(),
             );
-            out.insert("mean".into(), mean.to_string());
         }
         Operation::Matmul(MatmulValue::Serial(plan)) => matmul_fields(&mut out, plan, "serial"),
         Operation::Conv2d(plan) => {

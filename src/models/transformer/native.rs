@@ -966,16 +966,21 @@ fn native_stage_graph(
             on_false: local[2],
         },
         Op::Reduce {
+            input,
             kind,
             axes,
             keepdim,
-            ..
-        } => Op::Reduce {
-            input: local[0],
-            kind: *kind,
-            axes: axes.clone(),
-            keepdim: *keepdim,
-        },
+            accumulator,
+        } => {
+            debug_assert_eq!(originals.first(), Some(input));
+            Op::Reduce {
+                input: local[0],
+                kind: *kind,
+                axes: axes.clone(),
+                keepdim: *keepdim,
+                accumulator: *accumulator,
+            }
+        }
         Op::Shrink { bounds, .. } => Op::Shrink {
             input: local[0],
             bounds: bounds.clone(),

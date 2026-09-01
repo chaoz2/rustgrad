@@ -606,7 +606,7 @@ fn max_plan(
     let output_shape = reduction_shape(shape, &axes, keepdim);
     extent(shape)?;
     extent(&output_shape)?;
-    let lowering = if axes.is_empty() {
+    let lowering = if axes.iter().all(|axis| shape.dims()[*axis] == 1) {
         MaxLowering::Identity
     } else if output_shape.numel()? > 0 && axes.iter().any(|axis| shape.dims()[*axis] == 0) {
         MaxLowering::IdentityValue(max_reduction_identity(dtype))
@@ -1708,9 +1708,16 @@ impl Graph {
         keepdim: bool,
     ) -> Result<NodeId> {
         let input_node = self.node(input)?;
-        let plan = max_plan(input, &input_node.shape, input_node.dtype, axes, keepdim)?;
+        let input_shape = input_node.shape.clone();
+        let plan = max_plan(input, &input_shape, input_node.dtype, axes, keepdim)?;
         let output = match plan.lowering {
-            MaxLowering::Identity => input,
+            MaxLowering::Identity => {
+                if input_shape == plan.output_shape {
+                    input
+                } else {
+                    self.reshape(input, plan.output_shape.clone())?
+                }
+            }
             MaxLowering::IdentityValue(value) => {
                 self.full_with_dtype(plan.output_shape.clone(), value, plan.dtype)?
             }
@@ -2162,6 +2169,104 @@ mod tests {
         assert_eq!(
             CpuBackend.execute(&graph, dx, &inputs).unwrap(),
             data([2, 2, 2], &[0.125; 8])
+        );
+    }
+
+    #[test]
+    fn public_reductions_filter_singleton_axes_and_preserve_source_bits() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 1], DType::F32);
+        let sum = graph
+            .sum_with_options(input, Some(vec![1]), false, None)
+            .unwrap();
+        let maximum = graph.max_with_axes(input, Some(vec![1]), false).unwrap();
+        assert!(matches!(graph.op(sum).unwrap(), crate::Op::Reshape { .. }));
+        assert!(matches!(
+            graph.op(maximum).unwrap(),
+            crate::Op::Reshape { .. }
+        ));
+        let source = TensorData::from_storage(
+            [2, 1],
+            crate::Storage::F32(vec![f32::from_bits(0x7fc0_1234), -0.0]),
+        )
+        .unwrap();
+        let inputs = HashMap::from([("input".into(), source.clone())]);
+        for output in [sum, maximum] {
+            let actual = CpuBackend.execute(&graph, output, &inputs).unwrap();
+            assert_eq!(actual.shape(), &Shape::from([2]));
+            assert_eq!(actual.to_le_bytes().unwrap(), source.to_le_bytes().unwrap());
+        }
+
+        let mut mixed = Graph::new();
+        let input = mixed.input_dtype("input", [2, 1, 3], DType::F32);
+        let sum = mixed
+            .sum_with_options(input, Some(vec![1, 2]), false, None)
+            .unwrap();
+        assert!(matches!(mixed.op(sum).unwrap(), crate::Op::Reshape { .. }));
+        let actual = CpuBackend
+            .execute(
+                &mixed,
+                sum,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_storage(
+                        [2, 1, 3],
+                        crate::Storage::F32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(actual.shape(), &Shape::from([2]));
+        assert_eq!(actual, data([2], &[6.0, 15.0]));
+
+        // Raw reductions with no effective axis remain an exact storage-lane
+        // identity, including reserved Float8 bytes. The tinygrad-facing Sum
+        // surface still owns its explicit F32 work cast and final narrowing.
+        let mut float8 = Graph::new();
+        let input = float8.input_dtype("input", [1], DType::F8E4M3);
+        let raw = float8
+            .reduce(input, ReduceKind::Sum, Some(vec![0]), false)
+            .unwrap();
+        assert!(
+            matches!(float8.op(raw).unwrap(), crate::Op::Reshape { input: source, .. } if *source == input)
+        );
+        let public = float8
+            .sum_with_options(input, Some(vec![0]), false, None)
+            .unwrap();
+        let public_work = match float8.op(public).unwrap() {
+            crate::Op::Cast {
+                input,
+                dtype: DType::F8E4M3,
+            } => *input,
+            op => panic!("expected public final Float8 cast, got {op:?}"),
+        };
+        let pre_cast = match float8.op(public_work).unwrap() {
+            crate::Op::Reshape { input, .. } => *input,
+            op => panic!("expected public singleton reshape, got {op:?}"),
+        };
+        assert!(matches!(
+            float8.op(pre_cast).unwrap(),
+            crate::Op::Cast {
+                input: source,
+                dtype: DType::F32,
+            } if *source == input
+        ));
+        let source = TensorData::from_storage(
+            [1],
+            crate::Storage::Float8(crate::Float8Storage::from_raw(
+                crate::Float8Format::E4M3,
+                vec![0xff],
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(&float8, raw, &HashMap::from([("input".into(), source)]),)
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            vec![0xff]
         );
     }
 
@@ -3177,6 +3282,7 @@ mod tests {
         let empty_output = empty.logcumsumexp(empty_input, -1).unwrap();
         assert_eq!(empty.shape(empty_output).unwrap(), &Shape::from([2, 0]));
         assert_eq!(empty.dtype(empty_output).unwrap(), DType::BF16);
+        crate::schedule(&empty, empty_output).unwrap();
 
         let mut invalid = Graph::new();
         let invalid_input = invalid.input("invalid", [2, 3]);
@@ -3356,6 +3462,38 @@ mod tests {
         ));
         assert_eq!(malformed.node_count(), original_nodes);
 
+        let boolean = malformed.input_dtype("boolean", [2], DType::Bool);
+        let boolean_sum = malformed
+            .reduce_with_dtypes(
+                boolean,
+                ReduceKind::Sum,
+                None,
+                false,
+                ReductionDType::new(DType::Bool, DType::Bool),
+            )
+            .unwrap();
+        assert_eq!(malformed.dtype(boolean_sum).unwrap(), DType::Bool);
+        assert!(matches!(
+            malformed.op(boolean_sum).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Sum,
+                accumulator: DType::Bool,
+                ..
+            }
+        ));
+
+        let numeric = malformed.input_dtype("numeric", [2], DType::I32);
+        let numeric_boolean_sum = malformed
+            .reduce_with_dtypes(
+                numeric,
+                ReduceKind::Sum,
+                None,
+                false,
+                ReductionDType::new(DType::Bool, DType::Bool),
+            )
+            .unwrap();
+        assert_eq!(malformed.dtype(numeric_boolean_sum).unwrap(), DType::Bool);
+
         let mut graph = Graph::new();
         let narrow = graph.input_dtype("narrow", [2, 2], DType::F16);
         let narrowed_sum = graph
@@ -3476,6 +3614,55 @@ mod tests {
         let legacy = graph.input_dtype("legacy", [2], DType::F16);
         let legacy_sum = graph.reduce(legacy, ReduceKind::Sum, None, false).unwrap();
         assert_eq!(graph.dtype(legacy_sum).unwrap(), DType::F32);
+
+        let raw_float8 = graph.input_dtype("raw_float8", [3], DType::F8E5M2);
+        let raw_sum = graph
+            .reduce(raw_float8, ReduceKind::Sum, None, false)
+            .unwrap();
+        assert!(matches!(
+            graph.op(raw_sum).unwrap(),
+            crate::Op::Reduce {
+                input,
+                kind: ReduceKind::Sum,
+                accumulator: DType::F32,
+                ..
+            } if *input == raw_float8
+        ));
+        let public_sum = graph.sum_default(raw_float8).unwrap();
+        let public_reduced = match graph.op(public_sum).unwrap() {
+            crate::Op::Cast {
+                input,
+                dtype: DType::F8E5M2,
+            } => *input,
+            op => panic!("expected public Float8 final cast, got {op:?}"),
+        };
+        assert!(matches!(
+            graph.op(public_reduced).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Sum,
+                accumulator: DType::F32,
+                ..
+            }
+        ));
+        assert_eq!(graph.dtype(public_reduced).unwrap(), DType::F32);
+
+        let explicit_same_storage = graph
+            .reduce_with_dtypes(
+                raw_float8,
+                ReduceKind::Sum,
+                None,
+                false,
+                ReductionDType::new(DType::F8E5M2, DType::F8E5M2),
+            )
+            .unwrap();
+        assert!(matches!(
+            graph.op(explicit_same_storage).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Sum,
+                accumulator: DType::F8E5M2,
+                ..
+            }
+        ));
 
         let mut overflow = Graph::new();
         let input = overflow.input("input", [usize::MAX, 2]);
@@ -4450,7 +4637,7 @@ mod tests {
         )]);
         let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
         assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
-        assert!(values.scalar_at(1).as_f64().is_nan());
+        assert_eq!(values.scalar_at(1).as_f64(), 3.0);
         let gradients = CpuBackend
             .execute(&graph, gradient, &bindings)
             .unwrap()
@@ -4531,7 +4718,7 @@ mod tests {
         )]);
         let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
         assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
-        assert!(values.scalar_at(1).as_f64().is_nan());
+        assert_eq!(values.scalar_at(1).as_f64(), -3.0);
         let gradients = CpuBackend
             .execute(&graph, gradient, &bindings)
             .unwrap()

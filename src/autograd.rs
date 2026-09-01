@@ -862,6 +862,7 @@ impl Graph {
                     kind: crate::ReduceKind::Sum,
                     axes,
                     keepdim,
+                    ..
                 } => {
                     let input_shape = self.node(input)?.shape.clone();
                     let mut kept_dims = self.node(upstream)?.shape.dims().to_vec();
@@ -885,6 +886,7 @@ impl Graph {
                     kind: crate::ReduceKind::Mean,
                     axes,
                     keepdim,
+                    ..
                 } => {
                     let shape = self.node(input)?.shape.clone();
                     let count = axes.iter().try_fold(1usize, |n, a| {
@@ -921,6 +923,7 @@ impl Graph {
                         | crate::ReduceKind::Min),
                     axes,
                     keepdim,
+                    ..
                 } => {
                     let grad = self.reduce_grad(input, upstream, kind, axes, keepdim)?;
                     let input_dtype = self.node(input)?.dtype;

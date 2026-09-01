@@ -783,6 +783,7 @@ pub(crate) fn lower_graph_reduction_with_materialized(
         kind,
         axes,
         keepdim,
+        accumulator,
     } = graph
         .op(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?
@@ -800,11 +801,12 @@ pub(crate) fn lower_graph_reduction_with_materialized(
         .shape(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?
         .clone();
-    let ty = UType::scalar(
+    let output_ty = UType::scalar(
         graph
             .dtype(output)
             .map_err(|_| UOpError::UseBeforeDefinition)?,
     );
+    let accumulator_ty = UType::scalar(*accumulator);
     let extent = output_shape
         .numel()
         .map_err(|_| UOpError::InvalidArgument)?;
@@ -820,9 +822,9 @@ pub(crate) fn lower_graph_reduction_with_materialized(
         Operation::DefineGlobal(AddressValue {
             space: crate::AddressSpace::Global,
             name: format!("b{}", output.index()),
-            element: ty,
+            element: output_ty,
         }),
-        Some(ty),
+        Some(output_ty),
         vec![],
     );
     let index = UOp::from_operation(
@@ -832,7 +834,7 @@ pub(crate) fn lower_graph_reduction_with_materialized(
             input_shape: output_shape.clone(),
             output_shape,
         }),
-        Some(ty),
+        Some(output_ty),
         vec![address, range.clone()],
     );
     let init = UOp::from_operation(
@@ -848,13 +850,16 @@ pub(crate) fn lower_graph_reduction_with_materialized(
             axes: axes.clone(),
             keepdim: *keepdim,
             kind: *kind,
-            mean: matches!(kind, crate::ReduceKind::Mean),
         }),
-        Some(ty),
+        Some(accumulator_ty),
         vec![],
     );
-    let update = UOp::from_operation(Operation::ReduceAccumulate, Some(ty), vec![init, value]);
-    let finalize = UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![update]);
+    let update = UOp::from_operation(
+        Operation::ReduceAccumulate,
+        Some(accumulator_ty),
+        vec![init, value],
+    );
+    let finalize = UOp::from_operation(Operation::ReduceFinalize, Some(output_ty), vec![update]);
     Ok(UOp::sink(vec![
         UOp::from_operation(Operation::Store, None, vec![index, finalize]),
         UOp::from_operation(Operation::EndRange, None, vec![range]),
@@ -1409,103 +1414,32 @@ fn eval(
             }
         }
         Operation::ReduceFinalize => {
-            let update = n.sources().first().ok_or(Error::InvalidIndex)?;
-            let init = update.sources().first().ok_or(Error::InvalidIndex)?;
-            let Operation::ReduceInit(ReductionValue {
-                input_shape,
-                output_shape,
-                axes,
-                keepdim,
-                kind,
-                mean,
-            }) = init.operation()
-            else {
-                return Err(Error::InvalidIndex);
-            };
-            if &plan.output != output_shape {
+            let (reduction, value) = crate::reduction_native::NativeReductionPlan::from_finalize(n)
+                .map_err(|_| Error::InvalidIndex)?;
+            if plan.output != reduction.geometry.output {
                 return Err(Error::InvalidIndex);
             }
-            let reduction = ReductionPlan::new(
-                input_shape.clone(),
-                output_shape.clone(),
-                axes.to_vec(),
-                *keepdim,
-            )?;
-            let source_plan = IterationPlan::new(input_shape.clone());
-            let dtype = n.ty().ok_or(Error::InvalidIndex)?.scalar;
-            let value = update.sources().get(1).ok_or(Error::InvalidIndex)?;
-            let reduction_len = reduction.reduction_len()?;
-            let mut acc = match kind {
-                crate::ReduceKind::Sum | crate::ReduceKind::Mean => Scalar::I(0),
-                crate::ReduceKind::Product => Scalar::I(1),
-                crate::ReduceKind::Max => Scalar::F(f64::NEG_INFINITY),
-                crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
-                crate::ReduceKind::Any => Scalar::Bool(false),
-                crate::ReduceKind::All => Scalar::Bool(true),
-            };
-            let mut extrema_seen = false;
-            for reduce_linear in 0..reduction_len {
+            let source_plan = IterationPlan::new(reduction.geometry.input.clone());
+            let mut acc = reduction.identity();
+            for reduce_linear in 0..reduction.reduction_len() {
                 let next = eval(
                     value,
                     bindings,
-                    reduction.input_linear(linear, reduce_linear)?,
+                    reduction.geometry.input_linear(linear, reduce_linear)?,
                     &source_plan,
                 )?
                 .scalar();
-                acc = match kind {
-                    crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
-                        binary(acc, next, dtype, BinaryOp::Add)?
-                    }
-                    crate::ReduceKind::Product => binary(acc, next, dtype, BinaryOp::Mul)?,
-                    crate::ReduceKind::Max | crate::ReduceKind::Min => {
-                        let replace = !extrema_seen
-                            || reduction_extrema_is_better(
-                                dtype,
-                                matches!(kind, crate::ReduceKind::Max),
-                                next,
-                                acc,
-                            );
-                        extrema_seen = true;
-                        if replace { next } else { acc }
-                    }
-                    crate::ReduceKind::Any => Scalar::Bool(acc.as_bool() || next.as_bool()),
-                    crate::ReduceKind::All => Scalar::Bool(acc.as_bool() && next.as_bool()),
-                };
+                acc = reduction.update(acc, next);
             }
-            if *mean {
-                acc = Scalar::F(if reduction_len == 0 {
-                    f64::NAN
-                } else {
-                    acc.as_f64() / reduction_len as f64
-                });
-            }
-            Ok(FusedValue::typed(acc, dtype))
+            Ok(FusedValue::typed(
+                reduction.finalize(acc),
+                reduction.output_dtype,
+            ))
         }
         _ => Err(Error::InvalidIndex),
     }
 }
 
-/// Match the CPU oracle's stored-lane extrema ordering. A leading NaN and
-/// equal signed-zero lanes keep their first payload, while I64/U64 lanes are
-/// compared without a lossy floating projection.
-fn reduction_extrema_is_better(dtype: DType, max: bool, candidate: Scalar, best: Scalar) -> bool {
-    use std::cmp::Ordering;
-
-    let ordering = if dtype.is_float() {
-        candidate.as_f64().partial_cmp(&best.as_f64())
-    } else if matches!(dtype.category(), crate::DTypeCategory::Unsigned) {
-        Some(candidate.as_u64().cmp(&best.as_u64()))
-    } else if dtype == DType::Bool {
-        Some(candidate.as_bool().cmp(&best.as_bool()))
-    } else {
-        Some(candidate.as_i64().cmp(&best.as_i64()))
-    };
-    if max {
-        ordering == Some(Ordering::Greater)
-    } else {
-        ordering == Some(Ordering::Less)
-    }
-}
 fn cast_scalar(x: Scalar, dtype: DType) -> Scalar {
     match dtype {
         DType::Bool => Scalar::Bool(x.as_bool()),

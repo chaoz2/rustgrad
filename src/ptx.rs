@@ -2,16 +2,16 @@
 //!
 //! The renderer accepts the fused UOp subset and immutable kernel plans that
 //! have a complete PTX contract. The CPU UOp interpreter remains the semantic
-//! oracle; only exact static F32/F64 sum/mean reductions are admitted. Narrow
-//! floats remain rejected outside validated operation-scoped or raw-copy
-//! storage ABIs; guarded integer division/shifts and device-status reporting
-//! remain fail-closed.
+//! oracle; static reductions consume the shared typed recurrence for the
+//! proven scalar storage subset. Float8 remains rejected outside validated
+//! operation-scoped or raw-copy storage ABIs; guarded integer division/shifts
+//! and device-status reporting remain fail-closed.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
     AddressSpace, AddressValue, BufferView, Capture, CudaError, DType, Function, IndexValue,
-    LaunchConfig, LiteralValue, MatmulValue, MovementKernelKind, MovementValue, Operation,
-    ReductionValue, Shape, Stream, UOp, UType,
+    LaunchConfig, LiteralValue, MatmulValue, MovementKernelKind, MovementValue, Operation, Shape,
+    Stream, UOp, UType,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -28,7 +28,7 @@ mod matmul_tests;
 #[path = "ptx_prefix_scan.rs"]
 mod prefix_scan;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v29";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v30";
 /// Separate identity for raw storage-width computed affine materialization.
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 pub const PTX_THREEFRY_RENDERER_VERSION: &str = "rustgrad-ptx-live-threefry-v1";
@@ -5617,12 +5617,7 @@ fn emit(
 }
 
 struct ReductionSpec<'a> {
-    input_shape: &'a Shape,
-    output_shape: &'a Shape,
-    axes: &'a [usize],
-    keepdim: bool,
-    kind: crate::ReduceKind,
-    mean: bool,
+    plan: crate::reduction_native::NativeReductionPlan,
     value: &'a UOp,
 }
 
@@ -5636,75 +5631,133 @@ enum ReductionAccumulator {
     U64,
 }
 
-fn reduction_accumulator(
-    output: DType,
-    value: DType,
-    kind: crate::ReduceKind,
-    mean: bool,
-) -> Result<ReductionAccumulator, PtxError> {
-    // CpuBackend stores every reduction result at `output` precision, but its
-    // Scalar oracle accumulates F32/F16/BF16 through f64.  The tuple below is
-    // therefore a typed ABI decision, not an inference from rendered PTX.
-    if matches!(kind, crate::ReduceKind::Any | crate::ReduceKind::All) {
-        return Err(PtxError::Unsupported(
-            "boolean reductions are outside the exact PTX subset".into(),
-        ));
-    }
-    if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) {
-        return match (output, value) {
-            (DType::F16 | DType::BF16 | DType::F32, DType::F16 | DType::BF16 | DType::F32) => {
-                Ok(ReductionAccumulator::F32)
-            }
-            (DType::F64, DType::F64) => Ok(ReductionAccumulator::F64),
-            (
-                DType::Bool | DType::I8 | DType::I16 | DType::I32,
-                DType::Bool | DType::I8 | DType::I16 | DType::I32,
-            ) => Ok(ReductionAccumulator::I32),
-            (DType::U8 | DType::U16 | DType::U32, DType::U8 | DType::U16 | DType::U32) => {
-                Ok(ReductionAccumulator::U32)
-            }
-            (DType::I64, DType::I64) => Ok(ReductionAccumulator::I64),
-            (DType::U64, DType::U64) => Ok(ReductionAccumulator::U64),
-            _ => Err(PtxError::Unsupported(format!(
-                "reduction {kind:?} output {output:?} from {value:?} is outside the exact PTX subset",
-            ))),
-        };
-    }
-    match (mean, output, value) {
-        // CPU reduces F32 through its f64 Scalar representation before the
-        // final F32 quantization. Keep that accumulation width on PTX too.
-        (false, DType::F32, DType::F16 | DType::BF16 | DType::F32)
-        | (_, DType::F16, DType::F16)
-        | (_, DType::BF16, DType::BF16)
-        | (
-            true,
-            DType::F32,
-            DType::Bool
-            | DType::I8
-            | DType::U8
-            | DType::I16
-            | DType::U16
-            | DType::I32
-            | DType::U32
-            | DType::I64
-            | DType::U64,
-        )
-        | (true, DType::F32, DType::F32) => Ok(ReductionAccumulator::F32),
-        (_, DType::F64, DType::F64) => Ok(ReductionAccumulator::F64),
-        (
-            false,
-            DType::Bool | DType::I8 | DType::I16 | DType::I32,
-            DType::Bool | DType::I8 | DType::I16 | DType::I32,
-        ) => Ok(ReductionAccumulator::I32),
-        (false, DType::U8 | DType::U16 | DType::U32, DType::U8 | DType::U16 | DType::U32) => {
-            Ok(ReductionAccumulator::U32)
+fn ptx_reduction_identity(accumulator: ReductionAccumulator, value: crate::Scalar) -> String {
+    match accumulator {
+        ReductionAccumulator::F32 => {
+            format!(
+                "  mov.b32 %f60, 0x{:08x};",
+                (value.as_f64() as f32).to_bits()
+            )
         }
-        (false, DType::I64, DType::I64) => Ok(ReductionAccumulator::I64),
-        (false, DType::U64, DType::U64) => Ok(ReductionAccumulator::U64),
-        _ => Err(PtxError::Unsupported(format!(
-            "reduction {:?} output from {value:?} is outside the exact PTX subset",
-            if mean { "mean" } else { "sum" },
-        ))),
+        ReductionAccumulator::F64 => {
+            format!("  mov.b64 %fd60, 0x{:016x};", value.as_f64().to_bits())
+        }
+        ReductionAccumulator::I32 | ReductionAccumulator::U32 => {
+            format!("  mov.u32 %r60, 0x{:08x};", value.as_u64() as u32)
+        }
+        ReductionAccumulator::I64 | ReductionAccumulator::U64 => {
+            format!("  mov.u64 %rd60, 0x{:016x};", value.as_u64())
+        }
+    }
+}
+
+fn ptx_reduction_candidate(
+    lines: &mut Vec<String>,
+    accumulator: ReductionAccumulator,
+    source: DType,
+    value: &str,
+) -> Result<String, PtxError> {
+    let source_type = match source {
+        DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
+        DType::I8 | DType::I16 | DType::I32 => "s32",
+        DType::I64 => "s64",
+        DType::U64 => "u64",
+        DType::F16 | DType::BF16 | DType::F32 => "f32",
+        DType::F64 => "f64",
+        dtype if dtype.is_float8() => {
+            return Err(PtxError::Unsupported(
+                "Float8 reduction source is outside PTX".into(),
+            ));
+        }
+        _ => {
+            return Err(PtxError::Unsupported(
+                "reduction source dtype is outside PTX".into(),
+            ));
+        }
+    };
+    Ok(match accumulator {
+        ReductionAccumulator::F32 => {
+            if source_type == "f32" {
+                lines.push(format!("  mov.f32 %f61, {value};"));
+            } else {
+                lines.push(format!("  cvt.rn.f32.{source_type} %f61, {value};"));
+            }
+            "%f61".into()
+        }
+        ReductionAccumulator::F64 => {
+            if source_type == "f64" {
+                lines.push(format!("  mov.f64 %fd61, {value};"));
+            } else {
+                lines.push(format!("  cvt.rn.f64.{source_type} %fd61, {value};"));
+            }
+            "%fd61".into()
+        }
+        ReductionAccumulator::I32 | ReductionAccumulator::U32 => {
+            lines.push(format!("  mov.b32 %r61, {value};"));
+            "%r61".into()
+        }
+        ReductionAccumulator::I64 | ReductionAccumulator::U64 => {
+            lines.push(format!("  mov.b64 %rd61, {value};"));
+            "%rd61".into()
+        }
+    })
+}
+
+fn ptx_commit_narrow_accumulator(lines: &mut Vec<String>, dtype: DType) {
+    match dtype {
+        DType::I8 => {
+            lines.push("  shl.b32 %r60, %r60, 24;".into());
+            lines.push("  shr.s32 %r60, %r60, 24;".into());
+        }
+        DType::U8 => lines.push("  and.b32 %r60, %r60, 0xff;".into()),
+        DType::I16 => {
+            lines.push("  shl.b32 %r60, %r60, 16;".into());
+            lines.push("  shr.s32 %r60, %r60, 16;".into());
+        }
+        DType::U16 => lines.push("  and.b32 %r60, %r60, 0xffff;".into()),
+        DType::F16 => {
+            lines.push("  cvt.rn.f16.f32 %r62, %f60;".into());
+            lines.push("  cvt.f32.f16 %f60, %r62;".into());
+        }
+        DType::BF16 => {
+            lines.push("  mov.b32 %r62, %f60;".into());
+            lines.push("  and.b32 %r63, %r62, 0x7f800000;".into());
+            lines.push("  setp.eq.u32 %p6, %r63, 0x7f800000;".into());
+            lines.push("  and.b32 %r63, %r62, 0x007fffff;".into());
+            lines.push("  setp.ne.u32 %p7, %r63, 0;".into());
+            lines.push("  and.pred %p6, %p6, %p7;".into());
+            lines.push("  shr.u32 %r64, %r62, 16;".into());
+            lines.push("  and.b32 %r65, %r64, 0x7f;".into());
+            lines.push("  setp.eq.u32 %p7, %r65, 0;".into());
+            lines.push("  or.b32 %r65, %r64, 1;".into());
+            lines.push("  selp.b32 %r64, %r65, %r64, %p7;".into());
+            lines.push("  shr.u32 %r63, %r62, 16;".into());
+            lines.push("  and.b32 %r63, %r63, 1;".into());
+            lines.push("  add.u32 %r63, %r63, 0x7fff;".into());
+            lines.push("  add.u32 %r63, %r62, %r63;".into());
+            lines.push("  shr.u32 %r63, %r63, 16;".into());
+            lines.push("  selp.b32 %r62, %r64, %r63, %p6;".into());
+            lines.push("  shl.b32 %r62, %r62, 16;".into());
+            lines.push("  mov.b32 %f60, %r62;".into());
+        }
+        _ => {}
+    }
+}
+
+fn reduction_accumulator(dtype: DType) -> Result<ReductionAccumulator, PtxError> {
+    match dtype {
+        DType::F16 | DType::BF16 | DType::F32 => Ok(ReductionAccumulator::F32),
+        DType::F64 => Ok(ReductionAccumulator::F64),
+        DType::Bool | DType::I8 | DType::I16 | DType::I32 => Ok(ReductionAccumulator::I32),
+        DType::U8 | DType::U16 | DType::U32 => Ok(ReductionAccumulator::U32),
+        DType::I64 => Ok(ReductionAccumulator::I64),
+        DType::U64 => Ok(ReductionAccumulator::U64),
+        dtype if dtype.is_float8() => Err(PtxError::Unsupported(
+            "Float8 reduction is outside the exact PTX subset".into(),
+        )),
+        _ => Err(PtxError::Unsupported(
+            "reduction accumulator is outside the exact PTX subset".into(),
+        )),
     }
 }
 
@@ -5716,38 +5769,9 @@ fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
     else {
         return Ok(None);
     };
-    let update = finalize
-        .sources()
-        .first()
-        .ok_or_else(|| PtxError::Unsupported("reduction finalize without update".into()))?;
-    let init = update
-        .sources()
-        .first()
-        .ok_or_else(|| PtxError::Unsupported("reduction update without init".into()))?;
-    let Operation::ReduceInit(ReductionValue {
-        input_shape,
-        output_shape,
-        axes,
-        keepdim,
-        kind,
-        mean,
-    }) = init.operation()
-    else {
-        return Err(PtxError::Unsupported("reduction metadata".into()));
-    };
-    let value = update
-        .sources()
-        .get(1)
-        .ok_or_else(|| PtxError::Unsupported("reduction producer".into()))?;
-    Ok(Some(ReductionSpec {
-        input_shape,
-        output_shape,
-        axes,
-        keepdim: *keepdim,
-        kind: *kind,
-        mean: *mean,
-        value,
-    }))
+    let (plan, value) = crate::reduction_native::NativeReductionPlan::from_finalize(finalize)
+        .map_err(|reason| PtxError::Unsupported(reason.into()))?;
+    Ok(Some(ReductionSpec { plan, value }))
 }
 
 fn render_reduction(
@@ -5762,64 +5786,37 @@ fn render_reduction(
         .iter()
         .find(|buffer| buffer.id == out_id)
         .ok_or_else(|| PtxError::Unsupported("reduction output missing ABI".into()))?;
-    let value_dtype = reduction
-        .value
-        .ty()
-        .ok_or_else(|| PtxError::Unsupported("untyped reduction producer".into()))?
-        .scalar;
-    let accumulator =
-        reduction_accumulator(out.dtype, value_dtype, reduction.kind, reduction.mean)?;
-    let extrema = matches!(
-        reduction.kind,
-        crate::ReduceKind::Max | crate::ReduceKind::Min
-    );
-    let product = matches!(reduction.kind, crate::ReduceKind::Product);
+    let plan = &reduction.plan;
+    if out.dtype != plan.output_dtype {
+        return Err(PtxError::Unsupported(
+            "reduction output ABI dtype is inconsistent".into(),
+        ));
+    }
+    let value_dtype = plan.source_dtype;
+    let accumulator = reduction_accumulator(plan.accumulator_dtype)?;
+    if plan.output_dtype != plan.accumulator_dtype
+        && !(plan.accumulator_dtype == DType::F32
+            && matches!(plan.output_dtype, DType::F16 | DType::BF16))
+    {
+        return Err(PtxError::Unsupported(
+            "reduction accumulator-to-output conversion is outside the exact PTX subset".into(),
+        ));
+    }
+    let extrema = matches!(plan.kind, crate::ReduceKind::Max | crate::ReduceKind::Min);
+    let product = matches!(plan.kind, crate::ReduceKind::Product);
     if (matches!(out.dtype, DType::F16) || matches!(value_dtype, DType::F16)) && renderer.sm < 53 {
         return Err(PtxError::Unsupported(
             "F16 reduction conversion requires sm_53 or newer".into(),
         ));
     }
-    if reduction.axes.windows(2).any(|axes| axes[0] >= axes[1])
-        || reduction
-            .axes
-            .iter()
-            .any(|axis| *axis >= reduction.input_shape.rank())
-    {
-        return Err(PtxError::Unsupported("invalid reduction axes".into()));
-    }
-    let expected_output = Shape::new(
-        reduction
-            .input_shape
-            .dims()
-            .iter()
-            .enumerate()
-            .filter_map(|(axis, dimension)| {
-                if reduction.axes.contains(&axis) {
-                    reduction.keepdim.then_some(1)
-                } else {
-                    Some(*dimension)
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
-    if &expected_output != reduction.output_shape
-        || extent
-            != reduction
-                .output_shape
-                .numel()
-                .map_err(|_| PtxError::Overflow)?
-    {
+    if extent != plan.geometry.output_len().map_err(|_| PtxError::Overflow)? {
         return Err(PtxError::Unsupported(
             "inconsistent static reduction geometry".into(),
         ));
     }
-    let reduction_len = reduction.axes.iter().try_fold(1usize, |length, axis| {
-        length
-            .checked_mul(reduction.input_shape.dims()[*axis])
-            .ok_or(PtxError::Overflow)
-    })?;
+    let reduction_len = plan.reduction_len();
     let reduction_len_u32 = u32::try_from(reduction_len).map_err(|_| PtxError::Overflow)?;
-    if extrema && reduction_len == 0 {
+    if extrema && reduction_len == 0 && extent != 0 {
         return Err(PtxError::Unsupported(
             "empty extrema has no PTX identity".into(),
         ));
@@ -5863,40 +5860,7 @@ fn render_reduction(
     for (index, buffer) in buffers.iter().enumerate() {
         ids.insert(buffer.id, index);
     }
-    match accumulator {
-        ReductionAccumulator::F32 | ReductionAccumulator::F64 => lines.push(
-            if extrema && matches!(reduction.kind, crate::ReduceKind::Max) {
-                "  mov.b64 %fd60, 0xfff0000000000000;"
-            } else if extrema {
-                "  mov.b64 %fd60, 0x7ff0000000000000;"
-            } else if product {
-                "  mov.f64 %fd60, 0d3ff0000000000000;"
-            } else {
-                "  mov.f64 %fd60, 0d0000000000000000;"
-            }
-            .into(),
-        ),
-        ReductionAccumulator::I32 | ReductionAccumulator::U32 => lines.push(
-            if extrema {
-                "  mov.u32 %r60, 0;"
-            } else if product {
-                "  mov.u32 %r60, 1;"
-            } else {
-                "  mov.u32 %r60, 0;"
-            }
-            .into(),
-        ),
-        ReductionAccumulator::I64 | ReductionAccumulator::U64 => lines.push(
-            if extrema {
-                "  mov.u64 %rd60, 0;"
-            } else if product {
-                "  mov.u64 %rd60, 1;"
-            } else {
-                "  mov.u64 %rd60, 0;"
-            }
-            .into(),
-        ),
-    }
+    lines.push(ptx_reduction_identity(accumulator, plan.identity()));
     let mut map = BTreeMap::new();
     if reduction_len != 0 {
         lines.extend([
@@ -5906,10 +5870,10 @@ fn render_reduction(
             "  @%p1 bra REDUCE_DONE;".into(),
         ]);
         lines.extend(reduction_index_ptx(
-            reduction.input_shape,
-            reduction.output_shape,
-            reduction.axes,
-            reduction.keepdim,
+            &plan.geometry.input,
+            &plan.geometry.output,
+            &plan.geometry.axes,
+            plan.geometry.keepdim,
         )?);
         let value = emit(
             reduction.value,
@@ -5923,95 +5887,78 @@ fn render_reduction(
                 allow_linked_f32_exp: false,
             },
         )?;
-        if extrema {
-            let convert = match value_dtype {
-                DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
-                DType::I8 | DType::I16 | DType::I32 => "s32",
-                DType::I64 => "s64",
-                DType::U64 => "u64",
-                DType::F16 | DType::BF16 | DType::F32 => "f32",
-                DType::F64 => "f64",
-                DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => "b8",
-            };
-            if value_dtype == DType::F64 {
-                lines.push(format!("  mov.f64 %fd61, {value};"));
-            } else {
-                lines.push(format!("  cvt.rn.f64.{convert} %fd61, {value};"));
-            }
-            lines.push(format!(
-                "  setp.{}.f64 %p2, %fd61, %fd60;",
-                if matches!(reduction.kind, crate::ReduceKind::Max) {
-                    "gt"
-                } else {
-                    "lt"
-                }
-            ));
-            lines.push("  selp.f64 %fd60, %fd61, %fd60, %p2;".into());
-            match accumulator {
-                ReductionAccumulator::F32 | ReductionAccumulator::F64 => {}
+        let candidate = ptx_reduction_candidate(&mut lines, accumulator, value_dtype, &value)?;
+        if plan.is_singleton_identity() {
+            lines.push(match accumulator {
+                ReductionAccumulator::F32 => format!("  mov.f32 %f60, {candidate};"),
+                ReductionAccumulator::F64 => format!("  mov.f64 %fd60, {candidate};"),
                 ReductionAccumulator::I32 | ReductionAccumulator::U32 => {
-                    lines.push(format!("  selp.b32 %r60, {value}, %r60, %p2;"));
+                    format!("  mov.b32 %r60, {candidate};")
                 }
                 ReductionAccumulator::I64 | ReductionAccumulator::U64 => {
-                    lines.push(format!("  selp.b64 %rd60, {value}, %rd60, %p2;"));
+                    format!("  mov.b64 %rd60, {candidate};")
                 }
-            }
+            });
+        } else if extrema {
+            let comparison = if matches!(plan.kind, crate::ReduceKind::Max) {
+                "gt"
+            } else {
+                "lt"
+            };
+            let (predicate_type, acc_register, select_type) = match accumulator {
+                ReductionAccumulator::F32 => ("f32", "%f60", "f32"),
+                ReductionAccumulator::F64 => ("f64", "%fd60", "f64"),
+                ReductionAccumulator::I32 => ("s32", "%r60", "b32"),
+                ReductionAccumulator::U32 => ("u32", "%r60", "b32"),
+                ReductionAccumulator::I64 => ("s64", "%rd60", "b64"),
+                ReductionAccumulator::U64 => ("u64", "%rd60", "b64"),
+            };
+            lines.push(format!(
+                "  setp.{comparison}.{predicate_type} %p2, {candidate}, {acc_register};"
+            ));
+            lines.push(format!(
+                "  selp.{select_type} {acc_register}, {candidate}, {acc_register}, %p2;"
+            ));
+        } else if plan.accumulator_dtype == DType::Bool {
+            lines.push(format!(
+                "  {}.b32 %r60, %r60, {candidate};",
+                if matches!(
+                    plan.kind,
+                    crate::ReduceKind::Product | crate::ReduceKind::All
+                ) {
+                    "and"
+                } else {
+                    "or"
+                }
+            ));
         } else {
             match accumulator {
-                ReductionAccumulator::F32 => {
-                    let convert = match value_dtype {
-                        DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
-                        DType::I8 | DType::I16 | DType::I32 => "s32",
-                        DType::I64 => "s64",
-                        DType::U64 => "u64",
-                        DType::F16 | DType::BF16 | DType::F32 => "f32",
-                        _ => unreachable!(),
-                    };
-                    lines.push(format!("  cvt.rn.f64.{convert} %fd61, {value};"));
-                    lines.push(
-                        if product {
-                            "  mul.rn.f64 %fd60, %fd60, %fd61;"
-                        } else {
-                            "  add.rn.f64 %fd60, %fd60, %fd61;"
-                        }
-                        .into(),
-                    );
-                }
-                ReductionAccumulator::F64 => {
-                    lines.push(format!(
-                        "  {}.rn.f64 %fd60, %fd60, {value};",
-                        if product { "mul" } else { "add" }
-                    ));
-                }
-                ReductionAccumulator::I32 => {
-                    if product && out.dtype == DType::Bool {
-                        lines.push(format!("  and.b32 %r60, %r60, {value};"));
-                    } else {
-                        lines.push(format!(
-                            "  {}.s32 %r60, %r60, {value};",
-                            if product { "mul.lo" } else { "add" }
-                        ));
-                    }
-                }
-                ReductionAccumulator::U32 => {
-                    lines.push(format!(
-                        "  {}.u32 %r60, %r60, {value};",
-                        if product { "mul.lo" } else { "add" }
-                    ));
-                }
-                ReductionAccumulator::I64 => {
-                    lines.push(format!(
-                        "  {}.s64 %rd60, %rd60, {value};",
-                        if product { "mul.lo" } else { "add" }
-                    ));
-                }
-                ReductionAccumulator::U64 => {
-                    lines.push(format!(
-                        "  {}.u64 %rd60, %rd60, {value};",
-                        if product { "mul.lo" } else { "add" }
-                    ));
-                }
+                ReductionAccumulator::F32 => lines.push(format!(
+                    "  {}.rn.f32 %f60, %f60, {candidate};",
+                    if product { "mul" } else { "add" }
+                )),
+                ReductionAccumulator::F64 => lines.push(format!(
+                    "  {}.rn.f64 %fd60, %fd60, {candidate};",
+                    if product { "mul" } else { "add" }
+                )),
+                ReductionAccumulator::I32 => lines.push(format!(
+                    "  {}.s32 %r60, %r60, {candidate};",
+                    if product { "mul.lo" } else { "add" }
+                )),
+                ReductionAccumulator::U32 => lines.push(format!(
+                    "  {}.u32 %r60, %r60, {candidate};",
+                    if product { "mul.lo" } else { "add" }
+                )),
+                ReductionAccumulator::I64 => lines.push(format!(
+                    "  {}.s64 %rd60, %rd60, {candidate};",
+                    if product { "mul.lo" } else { "add" }
+                )),
+                ReductionAccumulator::U64 => lines.push(format!(
+                    "  {}.u64 %rd60, %rd60, {candidate};",
+                    if product { "mul.lo" } else { "add" }
+                )),
             }
+            ptx_commit_narrow_accumulator(&mut lines, plan.accumulator_dtype);
         }
         lines.extend([
             "  add.u32 %r5, %r5, 1;".into(),
@@ -6019,7 +5966,7 @@ fn render_reduction(
             "REDUCE_DONE:".into(),
         ]);
     }
-    let result = if reduction.mean && reduction_len == 0 {
+    let result = if plan.kind == crate::ReduceKind::Mean && reduction_len == 0 {
         match accumulator {
             ReductionAccumulator::F32 => {
                 lines.push("  mov.b32 %f60, 0x7fc00000;".into());
@@ -6031,15 +5978,16 @@ fn render_reduction(
             }
             _ => return Err(PtxError::Unsupported("integer mean output".into())),
         }
-    } else if reduction.mean {
+    } else if plan.kind == crate::ReduceKind::Mean {
         match accumulator {
             ReductionAccumulator::F32 => {
-                lines.push(format!(
-                    "  mov.b64 %fd61, 0x{:016x};",
-                    (reduction_len as f64).to_bits()
-                ));
-                lines.push("  div.rn.f64 %fd60, %fd60, %fd61;".into());
-                lines.push("  cvt.rn.f32.f64 %f60, %fd60;".into());
+                let divisor = plan
+                    .mean_divisor()
+                    .expect("nonempty validated Mean divisor")
+                    .as_f64() as f32;
+                lines.push(format!("  mov.b32 %f61, 0x{:08x};", divisor.to_bits()));
+                lines.push("  div.rn.f32 %f60, %f60, %f61;".into());
+                ptx_commit_narrow_accumulator(&mut lines, plan.accumulator_dtype);
                 "%f60"
             }
             ReductionAccumulator::F64 => {
@@ -6054,10 +6002,7 @@ fn render_reduction(
         }
     } else {
         match accumulator {
-            ReductionAccumulator::F32 => {
-                lines.push("  cvt.rn.f32.f64 %f60, %fd60;".into());
-                "%f60"
-            }
+            ReductionAccumulator::F32 => "%f60",
             ReductionAccumulator::F64 => "%fd60",
             ReductionAccumulator::I32 | ReductionAccumulator::U32 => "%r60",
             ReductionAccumulator::I64 | ReductionAccumulator::U64 => "%rd60",
@@ -8503,7 +8448,7 @@ mod tests {
                 "and.b32",
             ),
             (
-                "i64 minimum compares through f64 and keeps first tie",
+                "i64 minimum compares at storage width",
                 DType::I64,
                 crate::ReduceKind::Min,
                 vec![
@@ -8512,10 +8457,10 @@ mod tests {
                     crate::Scalar::I(-2),
                     crate::Scalar::I(3),
                 ],
-                "cvt.rn.f64.s64",
+                "setp.lt.s64",
             ),
             (
-                "u64 maximum compares through f64 high-bit ties",
+                "u64 maximum compares at storage width",
                 DType::U64,
                 crate::ReduceKind::Max,
                 vec![
@@ -8524,7 +8469,7 @@ mod tests {
                     crate::Scalar::U(3),
                     crate::Scalar::U(2),
                 ],
-                "cvt.rn.f64.u64",
+                "setp.gt.u64",
             ),
             (
                 "bool minimum is and",
@@ -8536,7 +8481,7 @@ mod tests {
                     crate::Scalar::Bool(true),
                     crate::Scalar::Bool(true),
                 ],
-                "setp.lt.f64",
+                "setp.lt.s32",
             ),
             (
                 "bool maximum is or",
@@ -8548,7 +8493,7 @@ mod tests {
                     crate::Scalar::Bool(false),
                     crate::Scalar::Bool(false),
                 ],
-                "setp.gt.f64",
+                "setp.gt.s32",
             ),
             (
                 "i8 sum sign extends into i32",
@@ -8599,7 +8544,7 @@ mod tests {
                 "ld.global.u16",
             ),
             (
-                "u64 mean promotes through f64",
+                "u64 mean promotes through f32",
                 DType::U64,
                 crate::ReduceKind::Mean,
                 vec![
@@ -8608,10 +8553,10 @@ mod tests {
                     crate::Scalar::U(1_u64 << 63),
                     crate::Scalar::U(3),
                 ],
-                "cvt.rn.f64.u64",
+                "cvt.rn.f32.u64",
             ),
             (
-                "i16 mean promotes through f64",
+                "i16 mean promotes through f32",
                 DType::I16,
                 crate::ReduceKind::Mean,
                 vec![
@@ -8620,7 +8565,7 @@ mod tests {
                     crate::Scalar::I(i16::MAX as i64),
                     crate::Scalar::I(-2),
                 ],
-                "cvt.rn.f64.s32",
+                "cvt.rn.f32.s32",
             ),
         ];
         for (name, dtype, kind, values, instruction) in cases {
@@ -8668,6 +8613,33 @@ mod tests {
             let mut actual = vec![0; expected.to_le_bytes().unwrap().len()];
             output_lease.view().copy_to(0, &mut actual).unwrap();
             assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+        }
+    }
+
+    #[test]
+    fn explicit_narrow_integer_sum_commits_each_ptx_recurrence_step() {
+        for (dtype, narrow) in [
+            (DType::I8, "shr.s32 %r60, %r60, 24"),
+            (DType::U8, "and.b32 %r60, %r60, 0xff"),
+            (DType::I16, "shr.s32 %r60, %r60, 16"),
+            (DType::U16, "and.b32 %r60, %r60, 0xffff"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [3], dtype);
+            let output = graph
+                .reduce_with_dtypes(
+                    input,
+                    crate::ReduceKind::Sum,
+                    Some(vec![0]),
+                    false,
+                    crate::ReductionDType::new(dtype, dtype),
+                )
+                .unwrap();
+            let rendered = PtxRenderer::new(80)
+                .unwrap()
+                .render(&crate::lower_graph_reduction(&graph, output).unwrap())
+                .unwrap();
+            assert!(rendered.source.contains(narrow), "{dtype:?}");
         }
     }
 
@@ -8864,6 +8836,40 @@ mod tests {
         let before_zero_launch = mock.calls().len();
         zero_kernel.launch(&stream, &zero_bindings, true).unwrap();
         assert_eq!(mock.calls().len(), before_zero_launch);
+        let mut zero_extrema_graph = Graph::new();
+        let zero_extrema_input = zero_extrema_graph.input_dtype("x", [0, 0], DType::F32);
+        let zero_extrema_output = zero_extrema_graph
+            .reduce(
+                zero_extrema_input,
+                crate::ReduceKind::Max,
+                Some(vec![1]),
+                false,
+            )
+            .unwrap();
+        let zero_extrema_rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(
+                &crate::lower_graph_reduction(&zero_extrema_graph, zero_extrema_output).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(zero_extrema_rendered.extent, 0);
+        let zero_extrema_kernel = cache
+            .get_or_load(&primary, zero_extrema_rendered.clone(), 32)
+            .unwrap();
+        let zero_extrema_bindings = zero_extrema_rendered
+            .buffers
+            .iter()
+            .map(|abi| PtxBinding {
+                buffer: zero_buffer.view(),
+                dtype: abi.dtype,
+                mutable: abi.mutable,
+            })
+            .collect::<Vec<_>>();
+        let before_zero_extrema = mock.calls().len();
+        zero_extrema_kernel
+            .launch(&stream, &zero_extrema_bindings, true)
+            .unwrap();
+        assert_eq!(mock.calls().len(), before_zero_extrema);
         let before = mock.calls().len();
         let mut f16_graph = Graph::new();
         let f16_input = f16_graph.input_dtype("x", [2, 2], DType::F16);

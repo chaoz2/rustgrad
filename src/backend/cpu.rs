@@ -1,5 +1,4 @@
 use super::Backend;
-use super::float8_reduce;
 use crate::engine::dynamic::RuntimeMaterializationMap;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
@@ -222,14 +221,15 @@ impl Backend for CpuBackend {
                     kind,
                     axes,
                     keepdim,
-                } => {
-                    let input = &values[input.index()];
-                    if input.dtype().is_float8() {
-                        float8_reduce::reduce(input, *kind, axes, *keepdim)?
-                    } else {
-                        reduce(input, *kind, axes, *keepdim, node.dtype)?
-                    }
-                }
+                    accumulator,
+                } => reduce(
+                    &values[input.index()],
+                    *kind,
+                    axes,
+                    *keepdim,
+                    *accumulator,
+                    node.dtype,
+                )?,
                 Op::PrefixScan {
                     input,
                     axis,
@@ -523,7 +523,7 @@ impl Backend for CpuBackend {
 
 /// C2's intentionally narrow float8 CPU-oracle surface. Keeping this table
 /// beside execution makes unsupported graph operations fail before they reach
-/// legacy scalar, reduction, or accelerator-oriented paths.
+/// scalar, typed-reduction, or accelerator-oriented paths.
 fn float8_cpu_capability(op: &Op) -> bool {
     matches!(
         op,
@@ -792,6 +792,7 @@ impl CpuBackend {
                         &axes,
                         false,
                         dtypes.accumulator,
+                        dtypes.accumulator,
                     )?;
                     let value = match op {
                         ReduceKind::Sum => sum.cast(dtypes.output),
@@ -988,6 +989,7 @@ impl CpuBackend {
                                         &(0..local.shape().rank()).collect::<Vec<_>>(),
                                         false,
                                         local.dtype(),
+                                        local.dtype(),
                                     )?
                                 } else {
                                     local
@@ -1002,6 +1004,7 @@ impl CpuBackend {
                                     ReduceKind::Sum,
                                     &(0..local.shape().rank()).collect::<Vec<_>>(),
                                     false,
+                                    dtype,
                                     dtype,
                                 )?;
                                 let local = TensorData::from_scalars(
@@ -1760,7 +1763,8 @@ fn reduce(
     kind: crate::ReduceKind,
     axes: &[usize],
     keepdim: bool,
-    dtype: DType,
+    accumulator_dtype: DType,
+    output_dtype: DType,
 ) -> Result<TensorData> {
     let dims = input.shape().dims();
     let output_shape = Shape::new(
@@ -1775,24 +1779,24 @@ fn reduce(
             })
             .collect::<Vec<_>>(),
     );
+    let plan = crate::reduction_native::NativeReductionPlan::new(
+        input.shape().clone(),
+        output_shape.clone(),
+        axes.to_vec(),
+        keepdim,
+        kind,
+        input.dtype(),
+        crate::ReductionDType::new(accumulator_dtype, output_dtype),
+    )
+    .map_err(|reason| Error::Serialization {
+        reason: reason.into(),
+    })?;
     let input_index = DenseIndex::new(input.shape().clone())?;
     let output_index = DenseIndex::new(output_shape.clone())?;
-    let identity = match kind {
-        crate::ReduceKind::Sum | crate::ReduceKind::Mean => Scalar::I(0),
-        crate::ReduceKind::Product => Scalar::I(1),
-        crate::ReduceKind::Max => Scalar::F(f64::NEG_INFINITY),
-        crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
-        crate::ReduceKind::Any => Scalar::Bool(false),
-        crate::ReduceKind::All => Scalar::Bool(true),
-    };
-    let mut out = vec![identity; output_index.len()];
-    // Preserve each stored scalar until comparison. The initial floating
-    // identity is not a valid ordering representative for integer tensors:
-    // routing I64/U64 candidates through f64 would turn values above 2^53
-    // into false ties. Empty extrema domains remain rejected by Graph::reduce,
-    // so every populated output receives a first concrete candidate here.
-    let mut extrema_seen = vec![false; output_index.len()];
-    let mut counts = vec![0usize; output_index.len()];
+    if plan.is_singleton_identity() && input.dtype() == output_dtype {
+        return TensorData::from_storage(output_shape, input.storage().clone());
+    }
+    let mut out = vec![plan.identity(); output_index.len()];
     for linear in 0..input_index.len() {
         let coords = input_index.coords(linear)?;
         let oc = coords
@@ -1808,42 +1812,12 @@ fn reduce(
             .collect::<Vec<_>>();
         let o = output_index.offset(&oc)?;
         let v = input.scalar_at(linear);
-        counts[o] += 1;
-        out[o] = match kind {
-            crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
-                binary_scalar(out[o], v, dtype, BinaryOp::Add)
-            }
-            crate::ReduceKind::Product => binary_scalar(out[o], v, dtype, BinaryOp::Mul),
-            crate::ReduceKind::Max => {
-                if !extrema_seen[o] || extrema_is_better(dtype, true, v, out[o]) {
-                    extrema_seen[o] = true;
-                    v
-                } else {
-                    out[o]
-                }
-            }
-            crate::ReduceKind::Min => {
-                if !extrema_seen[o] || extrema_is_better(dtype, false, v, out[o]) {
-                    extrema_seen[o] = true;
-                    v
-                } else {
-                    out[o]
-                }
-            }
-            crate::ReduceKind::Any => Scalar::Bool(out[o].as_bool() || v.as_bool()),
-            crate::ReduceKind::All => Scalar::Bool(out[o].as_bool() && v.as_bool()),
-        };
+        out[o] = plan.update(out[o], v);
     }
-    if matches!(kind, crate::ReduceKind::Mean) {
-        for (v, c) in out.iter_mut().zip(counts) {
-            *v = Scalar::F(if c == 0 {
-                f64::NAN
-            } else {
-                v.as_f64() / c as f64
-            });
-        }
+    for value in &mut out {
+        *value = plan.finalize(*value);
     }
-    TensorData::from_scalars(output_shape, dtype, out)
+    TensorData::from_scalars(output_shape, output_dtype, out)
 }
 
 /// Inclusive row-major prefix operation. `axis` is normalized by Graph;
@@ -1949,7 +1923,7 @@ fn reduce_grad(
 ) -> Result<TensorData> {
     let ii = DenseIndex::new(input.shape().clone())?;
     let mut out = vec![Scalar::I(0); ii.len()];
-    let reduced = reduce(input, kind, axes, true, input.dtype())?;
+    let reduced = reduce(input, kind, axes, true, input.dtype(), input.dtype())?;
     let ri = DenseIndex::new(reduced.shape().clone())?;
     let mut zero = vec![0usize; ri.len()];
     let mut nonzero = vec![Scalar::I(1); ri.len()];
@@ -2042,7 +2016,7 @@ fn reduce_grad_vjp(
         });
     }
     let ii = DenseIndex::new(input.shape().clone())?;
-    let reduced = reduce(input, kind, axes, true, input.dtype())?;
+    let reduced = reduce(input, kind, axes, true, input.dtype(), input.dtype())?;
     let ri = DenseIndex::new(reduced.shape().clone())?;
     let ui = DenseIndex::new(upstream.shape().clone())?;
     let output_shape = match wrt {
@@ -5211,7 +5185,7 @@ mod tests {
     }
 
     #[test]
-    fn float8_c3_reductions_use_the_source_audited_policy_table() {
+    fn float8_c3_reductions_use_the_shared_typed_recurrence() {
         for dtype in [
             DType::F8E4M3,
             DType::F8E5M2,
@@ -5259,7 +5233,31 @@ mod tests {
                     Storage::Float8(_)
                 ));
             }
-            // Sum/mean use the decoded lanes in F32; product re-quantizes each step.
+            let expected = |kind, lanes: [Scalar; 2]| {
+                let accumulator = if matches!(kind, ReduceKind::Sum | ReduceKind::Mean) {
+                    DType::F32
+                } else {
+                    dtype
+                };
+                let plan = crate::reduction_native::NativeReductionPlan::new(
+                    Shape::new([2]),
+                    Shape::new([]),
+                    vec![0],
+                    false,
+                    kind,
+                    dtype,
+                    crate::ReductionDType::new(accumulator, dtype),
+                )
+                .unwrap();
+                let accumulator = lanes
+                    .into_iter()
+                    .fold(plan.identity(), |acc, lane| plan.update(acc, lane));
+                TensorData::scalar_with_dtype(plan.finalize(accumulator), dtype)
+                    .to_le_bytes()
+                    .unwrap()[0]
+            };
+            // Historical raw Sum/Mean accumulate in F32 and encode once;
+            // Product/extrema retain source-storage recurrence semantics.
             assert_eq!(
                 CpuBackend
                     .execute(&graph, sum, &inputs)
@@ -5267,8 +5265,8 @@ mod tests {
                     .to_le_bytes()
                     .unwrap(),
                 vec![
-                    format.encode(f64::from(first as f32 + second as f32)),
-                    format.encode(f64::from(third as f32 + fourth as f32))
+                    expected(ReduceKind::Sum, [Scalar::F(first), Scalar::F(second)]),
+                    expected(ReduceKind::Sum, [Scalar::F(third), Scalar::F(fourth)])
                 ]
             );
             assert_eq!(
@@ -5278,8 +5276,8 @@ mod tests {
                     .to_le_bytes()
                     .unwrap(),
                 vec![
-                    format.encode(f64::from((first as f32 + second as f32) / 2.0)),
-                    format.encode(f64::from((third as f32 + fourth as f32) / 2.0))
+                    expected(ReduceKind::Mean, [Scalar::F(first), Scalar::F(second)]),
+                    expected(ReduceKind::Mean, [Scalar::F(third), Scalar::F(fourth)])
                 ]
             );
             assert_eq!(
@@ -5289,30 +5287,31 @@ mod tests {
                     .to_le_bytes()
                     .unwrap(),
                 vec![
-                    format.encode(format.decode(format.encode(first * second))),
-                    format.encode(format.decode(format.encode(third * fourth)))
+                    expected(ReduceKind::Product, [Scalar::F(first), Scalar::F(second)]),
+                    expected(ReduceKind::Product, [Scalar::F(third), Scalar::F(fourth)])
                 ]
             );
-            // Strict comparisons retain the first tied signed-zero byte and ignore NaNs.
             assert_eq!(
                 CpuBackend
                     .execute(&graph, maximum, &inputs)
                     .unwrap()
                     .to_le_bytes()
-                    .unwrap()[0],
-                0x38
+                    .unwrap(),
+                vec![
+                    expected(ReduceKind::Max, [Scalar::F(first), Scalar::F(second)]),
+                    expected(ReduceKind::Max, [Scalar::F(third), Scalar::F(fourth)])
+                ]
             );
             assert_eq!(
                 CpuBackend
                     .execute(&graph, minimum, &inputs)
                     .unwrap()
                     .to_le_bytes()
-                    .unwrap()[1],
-                if matches!(dtype, DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) {
-                    0x01
-                } else {
-                    0x80
-                }
+                    .unwrap(),
+                vec![
+                    expected(ReduceKind::Min, [Scalar::F(first), Scalar::F(second)]),
+                    expected(ReduceKind::Min, [Scalar::F(third), Scalar::F(fourth)])
+                ]
             );
             assert!(graph.trace(sum).unwrap().to_string().contains("Sum"));
 
@@ -5365,10 +5364,7 @@ mod tests {
                             "x".into(),
                             TensorData::from_storage(
                                 [],
-                                Storage::Float8(Float8Storage::from_raw(
-                                    format,
-                                    vec![format.encode(-0.0)],
-                                )),
+                                Storage::Float8(Float8Storage::from_raw(format, vec![0xff],)),
                             )
                             .unwrap(),
                         )]),
@@ -5376,7 +5372,74 @@ mod tests {
                     .unwrap()
                     .to_le_bytes()
                     .unwrap(),
-                vec![format.encode(0.0)]
+                vec![0xff]
+            );
+
+            let cancellation = TensorData::from_scalars(
+                [3],
+                dtype,
+                [Scalar::F(8.0), Scalar::F(1.0), Scalar::F(-8.0)],
+            )
+            .unwrap();
+            let mut recurrence = Graph::new();
+            let input = recurrence.input_dtype("x", [3], dtype);
+            let raw_sum = recurrence
+                .reduce(input, ReduceKind::Sum, None, false)
+                .unwrap();
+            let raw_mean = recurrence
+                .reduce(input, ReduceKind::Mean, None, false)
+                .unwrap();
+            let explicit_same_storage = recurrence
+                .reduce_with_dtypes(
+                    input,
+                    ReduceKind::Sum,
+                    None,
+                    false,
+                    crate::ReductionDType::new(dtype, dtype),
+                )
+                .unwrap();
+            let bindings = HashMap::from([("x".into(), cancellation)]);
+            assert_eq!(
+                CpuBackend
+                    .execute(&recurrence, raw_sum, &bindings)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap(),
+                vec![format.encode(1.0)],
+                "raw sum {dtype:?}"
+            );
+            assert_eq!(
+                CpuBackend
+                    .execute(&recurrence, raw_mean, &bindings)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap(),
+                vec![format.encode(1.0 / 3.0)],
+                "raw mean {dtype:?}"
+            );
+            let same_storage_plan = crate::reduction_native::NativeReductionPlan::new(
+                Shape::from([3]),
+                Shape::new([]),
+                vec![0],
+                false,
+                ReduceKind::Sum,
+                dtype,
+                crate::ReductionDType::new(dtype, dtype),
+            )
+            .unwrap();
+            let expected = [8.0, 1.0, -8.0]
+                .into_iter()
+                .fold(same_storage_plan.identity(), |acc, value| {
+                    same_storage_plan.update(acc, Scalar::F(value))
+                });
+            assert_eq!(
+                CpuBackend
+                    .execute(&recurrence, explicit_same_storage, &bindings)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap(),
+                vec![format.encode(same_storage_plan.finalize(expected).as_f64())],
+                "explicit same-storage sum {dtype:?}"
             );
         }
     }

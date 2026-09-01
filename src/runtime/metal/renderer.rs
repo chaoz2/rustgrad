@@ -1,4 +1,4 @@
-//! Deterministic MSL lowering for static exact elementwise UOps.
+//! Deterministic MSL lowering for static exact scalar and serial-reduction UOps.
 use super::{
     MetalCapabilities, MetalError, guard::emit_transactional, transaction::MetalTransactionAbi,
 };
@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v4";
+pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v5";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -137,16 +137,11 @@ impl MetalRenderer {
         if nodes.iter().any(|node| {
             matches!(
                 node.operation(),
-                Operation::ReduceInit(_)
-                    | Operation::ReduceAccumulate
-                    | Operation::ReduceFinalize
-                    | Operation::Barrier
-                    | Operation::If
-                    | Operation::EndIf
+                Operation::Barrier | Operation::If | Operation::EndIf
             )
         }) {
             return Err(MetalError::Unsupported(
-                "reductions, effects, and control flow are outside the exact Metal subset".into(),
+                "effects and control flow are outside the exact Metal subset".into(),
             ));
         }
         let store = root
@@ -273,6 +268,27 @@ impl MetalRenderer {
             .sources()
             .get(1)
             .ok_or_else(|| MetalError::Unsupported("store has no value".into()))?;
+        let reduction = matches!(value.operation(), Operation::ReduceFinalize)
+            .then(|| {
+                crate::reduction_native::NativeReductionPlan::from_finalize(value)
+                    .map(|(plan, _)| plan)
+                    .map_err(|reason| MetalError::Unsupported(reason.into()))
+            })
+            .transpose()?;
+        let reduction_roots = nodes
+            .iter()
+            .filter(|node| matches!(node.operation(), Operation::ReduceFinalize))
+            .count();
+        if reduction_roots != usize::from(reduction.is_some()) {
+            return Err(MetalError::Unsupported(
+                "reduction must be the sole stored value".into(),
+            ));
+        }
+        if let Some(plan) = &reduction {
+            for dtype in [plan.source_dtype, plan.accumulator_dtype, plan.output_dtype] {
+                supported_storage(dtype)?;
+            }
+        }
         let transaction = MetalTransactionAbi::analyze(
             value,
             output_position,
@@ -305,21 +321,50 @@ impl MetalRenderer {
         lines.push("    uint gid [[thread_position_in_grid]]) {".into());
         lines.push("  if ((ulong)gid >= extent) return;".into());
         let mut source_map = BTreeMap::new();
-        let expression = if let Some(transaction) = &transaction {
-            emit_transactional(value, transaction, &ids, &mut source_map, &mut lines)?
+        let expression = if let Some(plan) = &reduction {
+            if transaction.is_some() {
+                return Err(MetalError::Unsupported(
+                    "guarded reduction producers are outside the exact Metal subset".into(),
+                ));
+            }
+            emit_metal_reduction(
+                plan,
+                value,
+                output_position,
+                &ids,
+                &mut source_map,
+                &mut lines,
+            )?;
+            None
+        } else if let Some(transaction) = &transaction {
+            Some(emit_transactional(
+                value,
+                transaction,
+                &ids,
+                &mut source_map,
+                &mut lines,
+            )?)
         } else {
-            emit_expr(value, &ids, &mut source_map, &mut lines, "(ulong)gid")?
+            Some(emit_expr(
+                value,
+                &ids,
+                &mut source_map,
+                &mut lines,
+                "(ulong)gid",
+            )?)
         };
-        let stored = if output_dtype == DType::Bool {
-            format!("(uchar)(({expression}) != 0)")
-        } else {
-            expression
-        };
-        lines.push(if transaction.is_some() {
-            format!("  if (rg_ok) b{output_position}[gid] = {stored};")
-        } else {
-            format!("  b{output_position}[gid] = {stored};")
-        });
+        if let Some(expression) = expression {
+            let stored = if output_dtype == DType::Bool {
+                format!("(uchar)(({expression}) != 0)")
+            } else {
+                expression
+            };
+            lines.push(if transaction.is_some() {
+                format!("  if (rg_ok) b{output_position}[gid] = {stored};")
+            } else {
+                format!("  b{output_position}[gid] = {stored};")
+            });
+        }
         lines.push("}".into());
         let source = lines.join("\n") + "\n";
         let cache_key = stable_key(&(
@@ -346,6 +391,138 @@ impl MetalRenderer {
                 root.clone(),
             ))),
         })
+    }
+}
+
+fn emit_metal_reduction(
+    plan: &crate::reduction_native::NativeReductionPlan,
+    finalize: &UOp,
+    output_position: usize,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+) -> Result<(), MetalError> {
+    let (_, producer) = crate::reduction_native::NativeReductionPlan::from_finalize(finalize)
+        .map_err(|reason| MetalError::Unsupported(reason.into()))?;
+    let accumulator_type = metal_storage_type(plan.accumulator_dtype);
+    let identity = metal_reduction_literal(plan.accumulator_dtype, plan.identity())?;
+    lines.push(format!("  {accumulator_type} rg_acc = {identity};"));
+    let reduction_len = plan.reduction_len();
+    if reduction_len != 0 {
+        lines.push(format!(
+            "  for (ulong rg_r = 0ul; rg_r < {reduction_len}ul; ++rg_r) {{"
+        ));
+        let source_index =
+            crate::reduction_native::index_expression(&plan.geometry, "(ulong)gid", "rg_r", "ul");
+        lines.push(format!("    const ulong rg_src = {source_index};"));
+        let candidate = emit_expr(producer, ids, source_map, lines, "rg_src")?;
+        let candidate = MetalScalarDialect
+            .cast(plan.source_dtype, plan.accumulator_dtype, &candidate)
+            .map_err(MetalError::Unsupported)?;
+        if plan.is_singleton_identity() {
+            lines.push(format!("    rg_acc = ({accumulator_type})({candidate});"));
+        } else {
+            match plan.kind {
+                crate::ReduceKind::Sum | crate::ReduceKind::Mean => lines.push(format!(
+                    "    rg_acc = {};",
+                    if plan.accumulator_dtype == DType::Bool {
+                        format!("(uchar)(rg_acc || ({candidate}))")
+                    } else {
+                        metal_reduction_arithmetic(
+                            plan.accumulator_dtype,
+                            "rg_acc",
+                            &candidate,
+                            false,
+                        )
+                    }
+                )),
+                crate::ReduceKind::Product => lines.push(format!(
+                    "    rg_acc = {};",
+                    if plan.accumulator_dtype == DType::Bool {
+                        format!("(uchar)(rg_acc && ({candidate}))")
+                    } else {
+                        metal_reduction_arithmetic(
+                            plan.accumulator_dtype,
+                            "rg_acc",
+                            &candidate,
+                            true,
+                        )
+                    }
+                )),
+                crate::ReduceKind::Max | crate::ReduceKind::Min => {
+                    if plan.accumulator_dtype == DType::Bool {
+                        lines.push(format!(
+                            "    rg_acc = (uchar)(rg_acc {} ({candidate}));",
+                            if plan.kind == crate::ReduceKind::Max {
+                                "||"
+                            } else {
+                                "&&"
+                            }
+                        ));
+                    } else {
+                        let comparison = if plan.kind == crate::ReduceKind::Max {
+                            ">"
+                        } else {
+                            "<"
+                        };
+                        lines.push(format!(
+                            "    if (({candidate}) {comparison} rg_acc) rg_acc = ({candidate});"
+                        ));
+                    }
+                }
+                crate::ReduceKind::Any => {
+                    lines.push(format!("    rg_acc = (uchar)(rg_acc || ({candidate}));"));
+                }
+                crate::ReduceKind::All => {
+                    lines.push(format!("    rg_acc = (uchar)(rg_acc && ({candidate}));"));
+                }
+            }
+        }
+        lines.push("  }".into());
+    }
+    if plan.kind == crate::ReduceKind::Mean {
+        if reduction_len == 0 {
+            lines.push("  rg_acc = as_type<float>(0x7fc00000u);".into());
+        } else {
+            let divisor = metal_reduction_literal(
+                plan.accumulator_dtype,
+                plan.mean_divisor()
+                    .expect("nonempty validated Mean divisor"),
+            )?;
+            lines.push(format!("  rg_acc = (float)(rg_acc / {divisor});"));
+        }
+    }
+    let stored = MetalScalarDialect
+        .cast(plan.accumulator_dtype, plan.output_dtype, "rg_acc")
+        .map_err(MetalError::Unsupported)?;
+    lines.push(format!("  b{output_position}[gid] = {stored};"));
+    Ok(())
+}
+
+fn metal_reduction_literal(dtype: DType, value: crate::Scalar) -> Result<String, MetalError> {
+    Ok(match value {
+        crate::Scalar::Bool(value) => format!("(uchar){}u", u8::from(value)),
+        crate::Scalar::I(value) if dtype == DType::I32 => {
+            format!("as_type<int>(0x{:08x}u)", value as u32)
+        }
+        crate::Scalar::U(value) => format!("(uint){value}u"),
+        crate::Scalar::F(value) => {
+            format!("as_type<float>(0x{:08x}u)", (value as f32).to_bits())
+        }
+        _ => {
+            return Err(MetalError::Unsupported(
+                "Metal reduction identity is outside the exact storage subset".into(),
+            ));
+        }
+    })
+}
+
+fn metal_reduction_arithmetic(dtype: DType, lhs: &str, rhs: &str, product: bool) -> String {
+    let operator = if product { "*" } else { "+" };
+    if dtype == DType::I32 {
+        format!("as_type<int>(as_type<uint>({lhs}) {operator} as_type<uint>({rhs}))")
+    } else {
+        format!("(({lhs}) {operator} ({rhs}))")
     }
 }
 
@@ -383,7 +560,10 @@ impl ScalarLaneDialect for MetalScalarDialect {
 
     fn cast(&self, source: DType, target: DType, value: &str) -> Result<String, String> {
         Ok(match (source, target) {
-            (DType::F32, DType::F32) | (DType::Bool, DType::Bool) => value.into(),
+            (DType::F32, DType::F32)
+            | (DType::Bool, DType::Bool)
+            | (DType::I32, DType::I32)
+            | (DType::U32, DType::U32) => value.into(),
             (DType::Bool, DType::F32) => format!("(float)({value} != 0)"),
             (DType::F32, DType::Bool) => format!("(uchar)({value} != 0.0f)"),
             (DType::Bool, DType::I32) => format!("(int)({value})"),

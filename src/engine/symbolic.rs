@@ -1888,7 +1888,6 @@ pub(crate) fn specialize_kernel(
                 axes,
                 keepdim,
                 kind,
-                mean,
                 ..
             }) => {
                 let (input_shape, _, _) = domain.reduction.as_ref().ok_or_else(|| {
@@ -1900,7 +1899,6 @@ pub(crate) fn specialize_kernel(
                     axes: axes.to_vec(),
                     keepdim: *keepdim,
                     kind: *kind,
-                    mean: *mean,
                 })
             }
             Operation::Movement(crate::MovementValue::Plan(plan)) => Operation::Movement(

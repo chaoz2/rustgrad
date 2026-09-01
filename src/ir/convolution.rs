@@ -1033,13 +1033,13 @@ mod tests {
 
         let mut dtypes = Graph::new();
         let input = dtypes.input_dtype("input", [1, 1, 2], DType::F64);
-        let weight = dtypes.input_dtype("weight", [1, 1, 1], DType::F64);
+        let weight = dtypes.input_dtype("weight", [1, 1, 2], DType::F64);
         let default = dtypes
             .convolution(
                 input,
                 weight,
                 None,
-                spec(&[1], &[1], &[1], &[(0, 0)], 1, None),
+                spec(&[2], &[1], &[1], &[(0, 0)], 1, None),
             )
             .unwrap();
         assert_eq!(dtypes.dtype(default).unwrap(), DType::F64);
@@ -1049,7 +1049,7 @@ mod tests {
                 input,
                 weight,
                 None,
-                spec(&[1], &[1], &[1], &[(0, 0)], 1, Some(DType::F32)),
+                spec(&[2], &[1], &[1], &[(0, 0)], 1, Some(DType::F32)),
             )
             .unwrap();
         assert_eq!(dtypes.dtype(explicit).unwrap(), DType::F32);
@@ -1066,13 +1066,13 @@ mod tests {
 
         let mut narrow = Graph::new();
         let input = narrow.input_dtype("input", [1, 1, 2], DType::F16);
-        let weight = narrow.input_dtype("weight", [1, 1, 1], DType::F16);
+        let weight = narrow.input_dtype("weight", [1, 1, 2], DType::F16);
         let output = narrow
             .convolution(
                 input,
                 weight,
                 None,
-                spec(&[1], &[1], &[1], &[(0, 0)], 1, None),
+                spec(&[2], &[1], &[1], &[(0, 0)], 1, None),
             )
             .unwrap();
         assert_eq!(narrow.dtype(output).unwrap(), DType::F16);
@@ -1096,13 +1096,13 @@ mod tests {
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [1, 1, 2], dtype);
-            let weight = graph.input_dtype("weight", [1, 1, 1], dtype);
+            let weight = graph.input_dtype("weight", [1, 1, 2], dtype);
             let output = graph
                 .convolution(
                     input,
                     weight,
                     None,
-                    spec(&[1], &[1], &[1], &[(0, 0)], 1, None),
+                    spec(&[2], &[1], &[1], &[(0, 0)], 1, None),
                 )
                 .unwrap();
             assert_sum_contract(&graph, output, accumulator, output_dtype);
@@ -1259,13 +1259,13 @@ mod tests {
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [1, 1, 2], dtype);
-            let weight = graph.input_dtype("weight", [1, 1, 1], dtype);
+            let weight = graph.input_dtype("weight", [1, 1, 2], dtype);
             let output = graph
                 .transposed_convolution(
                     input,
                     weight,
                     None,
-                    transposed_spec(&[1], &[1], &[1], &[(0, 0)], &[0], 1),
+                    transposed_spec(&[2], &[1], &[1], &[(0, 0)], &[0], 1),
                 )
                 .unwrap();
             assert_sum_contract(&graph, output, accumulator, output_dtype);

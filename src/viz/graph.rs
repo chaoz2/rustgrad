@@ -446,11 +446,13 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             kind,
             axes,
             keepdim,
+            accumulator,
             ..
         } => node
             .field("reduction", reduce_name(*kind))
             .field("axes", usize_list(axes))
-            .field("keepdim", keepdim.to_string()),
+            .field("keepdim", keepdim.to_string())
+            .field("accumulator", dtype_name(*accumulator)),
         Op::PrefixScan {
             axis, kind, output, ..
         } => node

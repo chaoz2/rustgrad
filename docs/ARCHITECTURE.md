@@ -151,14 +151,34 @@ checked integer conversion semantics. They therefore never add a weak `DType`,
 storage, UOp, artifact, or cache-identity variant.
 None adds a runtime, IR, backend, dynamic-shape, or device path.
 
-`backend/float8_reduce.rs` is the CPU-only float8 reduction policy boundary. It
-is paired with `backend/float8_contract.rs`, which owns the source-audited
-MatMul, Conv2d, and contraction-form Einsum policies: F32 contraction
-accumulation followed by one result narrowing. Diagonal-free single-input
-Einsum reorders remain raw-lane movement operations.
-owns the source-audited accumulator/result matrix and raw-lane extrema selection;
-`backend/cpu.rs` only dispatches through that typed policy after capability
-preflight. No renderer or device backend imports this CPU semantic helper.
+`reduction_native.rs` is the single checked reduction recurrence boundary for
+CPU, capture, and native renderers. It derives exact source/accumulator/output
+dtypes from one scalar Init→Accumulate→Finalize chain, commits every step at
+accumulator width, owns typed identities and Mean finalization, and rejects
+empty extrema. The finalize result may have a different storage dtype from
+the accumulator. Newly emitted raw Float8 Sum/Mean use F32 recurrence followed
+by one final narrow encoding when a real reduction axis remains; a singleton or
+no-effective-axis reduction is an exact raw-lane identity. Explicit
+same-storage reductions commit each step in that storage. The decoder also
+admits only the released v18 all-Float8 Mean tuple, preserving its historical
+per-step commitment without broadening new Graph lowering. Float8 therefore
+follows the same checked recurrence instead of a CPU-only policy module.
+`backend/float8_contract.rs` separately owns the
+source-audited MatMul, Conv2d, and contraction-form Einsum policies: F32
+contraction accumulation followed by one result narrowing. Diagonal-free
+single-input Einsum reorders remain raw-lane movement operations.
+The private historical RGUA reduction codec, opcode tags, and durable v18
+schedule identity are unchanged. Corrected compiled source is separated by
+the bumped renderer/cache versions rather than invalidating released schedule
+artifacts.
+
+`ReductionValue::mean` was removed from the public in-memory UOp payload:
+`kind: ReduceKind::Mean` is now its only source of truth. This is an explicit
+pre-1.0 Rust source migration for struct-literal callers. `Op::Reduce` literals
+now also state their accumulator dtype independently from the node's final
+storage dtype. The historical wire bit remains private, is checked against
+`kind` while decoding, and does not reintroduce the invalid in-memory
+cross-product.
 
 Float8 C4 transport is deliberately separate from numeric execution:
 `TensorData::reorder_raw` and `replace_raw_offsets` preserve tagged storage
@@ -448,7 +468,7 @@ the source value's raw bits when storage is unchanged; widened Sum casts the
 single source value once, while the index result is I32 zero.
 Their index outputs remain explicitly
 nondifferentiable. Scalar CPU-JIT covers all concrete storage dtypes and both
-value/index results through captured replay. PTX v29 uses the same plan and a
+value/index results through captured replay. PTX v30 uses the same plan and a
 two-buffer ABI for Bool/I32/U32/F32, assigning one thread to each independent
 row/inner lane and scanning the selected axis serially; the CUDA semantic mock
 compares exact value/index bytes with the CPU oracle. OpenCL, Metal, WebGPU,
@@ -1333,9 +1353,14 @@ control delimiters.
 `schedule/mod.rs` is a non-mutating deterministic planning view over a requested
 Graph output. It classifies pure elementwise regions, records typed buffer
 descriptors and cache keys, and lowers scalar or rank-N elementwise chains to
-a single ranged UOp sink. Static sum/mean/product/min/max reductions fuse a pure producer and
-expose accumulator initialization/update/finalization UOps; the portable
-interpreter traverses separate output and reduction domains. Generalized static
+a single ranged UOp sink. Static sum/mean/product/min/max reductions fuse a pure
+producer and expose one exact scalar Init→Accumulate→Finalize UOp chain. The
+backend-neutral `NativeReductionPlan` validates that topology, geometry, and
+source/accumulator/output dtype contract before the portable interpreter or a
+renderer can traverse separate output and reduction domains. Historical RGUA
+Reduce opcode/kind tags and bytes remain unchanged; its redundant `mean` bit is
+a private wire projection and a mismatch rejects before scheduling or caching.
+Generalized static
 matmul is a materialization root whose immutable Matmul UOp payload reuses
 `MatmulKernelPlan` for normalized batch/vector/M/N/K geometry, original and
 promoted dtypes, ordered operands, and cache identity. Eligible nonempty F32
@@ -1436,10 +1461,11 @@ or live CUDA validation claim.
 
 Durable schedule keys encode each kernel with its minimum admitted semantic
 RGUA envelope rather than the current standalone writer version. Existing
-operations therefore retain their released v18 key bytes when the v19
-Threefry tag is added; a kernel containing Threefry uses v19. RGSA, RGSO, and
-RGSM identities consequently remain stable without pretending that a v18
-decoder understands the new operation.
+operations, including reductions, retain their released v18 key bytes when the
+v19 Threefry tag is added; a kernel containing Threefry uses v19. Corrected
+reduction code generation is separated by renderer-specific source/cache
+versions. RGSA, RGSO, and RGSM identities consequently remain stable without
+pretending that a v18 decoder understands the new operation.
 
 `CapturedReplayExecutor` owns process-local scalar and vector CPU-JIT caches;
 compiled libraries and pointers never enter the artifact. A typed replay policy
@@ -1746,19 +1772,18 @@ short-circuits dependent work after a fault, and lazily evaluates only the
 selected branch. Guard operands may therefore be computed from retained
 casts/arithmetic and static broadcast/view loads rather than only direct loads.
 
-Static Sum/Mean/Product/Min/Max reductions use a separate serial row-major plan,
-including multi-axis, keepdim, scalar, zero-output, and empty-domain geometry.
-Sum covers every supported stored dtype with wrapping integer/Bool-OR storage
-semantics; floating Sum and Mean require fp64 because the CPU oracle accumulates
-through f64. Integer Mean is promoted by the graph to F32 before finalization.
-Product covers every supported stored dtype with
-typed wrapping/Bool-AND identities; floating Product also follows the CPU f64
-intermediate and requires fp64. Extrema cover the same stored dtypes, ignore
-NaNs, retain the first equal value (including signed zero), and preserve raw
-selected words. I64/U64 extrema require fp64 because their CPU ordering is an
-f64 projection and projection ties must retain the first raw word. Empty sum
-writes zero, empty mean writes the canonical quiet NaN, empty product writes its
-typed identity, and empty extrema remain a graph error. Pointer arguments
+Static Sum/Mean/Product/Min/Max reductions consume that shared typed recurrence
+through a serial row-major OpenCL plan, including multi-axis, keepdim, scalar,
+zero-output, and empty-domain geometry. Sum and Product use exact wrapping or
+floating accumulator-width arithmetic and commit every update; Bool uses OR/AND.
+Mean commits its divisor and divides at F32 or F64 work width. Extrema start at
+the committed dtype identity and use strict typed comparisons, so equal or
+unordered candidates retain the accumulator and I64/U64 never project through
+floating point. Effective singleton domains bypass recurrence. F16/BF16 use the
+software codecs and require the existing fp64 helper capability; Float8 remains
+outside OpenCL. Empty sum writes zero, empty mean writes a canonical quiet NaN,
+empty product writes its typed identity, and empty extrema remain a graph error.
+Pointer arguments
 follow `ScheduleInputBinding` first-use order, the output follows inputs, and a
 checked `ulong` extent is the final scalar ABI. Compile-time empty reductions
 omit their unused input pointer. The semantic mock executes the retained typed
@@ -1813,8 +1838,9 @@ tensor bytes. Legal zero-domain pure items are retained as typed plan sentinels:
 they materialize exact empty `TensorData` values without queue, pipeline,
 buffer, or command work. This adapter is strict—unsupported renderer/ABI/view/
 dtype/capability items return before resource work and never select CPU
-fallback. It currently covers only static elementwise/view session graphs, not
-model/Linear/ONNX inference, reductions, unary activation, effects, dynamic
+fallback. It currently covers static elementwise/view and proven typed-reduction
+session graphs, not model/Linear/ONNX inference, unsupported unary activation,
+effects, dynamic
 shapes, persistent device state, graph capture, or profiling.
 
 `MetalRuntime::discover` is the narrow diagnostic seam for deployment setup:
@@ -1902,11 +1928,11 @@ host returns `MetalDiscovery::NoDevices` before queue creation; consequently
 this document claims semantic/mock evidence and structured unavailable-device
 handling, not successful live deployment evidence.
 
-MSL has no F64 type, while RustGrad's CPU oracle accumulates floating Sum/Mean
-through F64 before storage conversion. This milestone therefore rejects all
-reductions rather than claiming inexact F32 accumulation. I64/U64 are also
-rejected before submission: this milestone does not claim an exact 64-bit
-atomic status/detail capability contract. F16/BF16/F64 and other storage,
+MSL has no F64 type. Correctness-first serial reductions consume the shared
+typed recurrence for F32/Bool/I32/U32, including F32 accumulator-width
+arithmetic, exact Bool/integer ordering, singleton bypass, and zero-domain
+identities. F16/BF16/F64 and I64/U64 reject before submission: this milestone
+does not claim their storage or 64-bit atomic status/detail contracts. Other
 unary/transcendental operations, bitwise integer operations, dynamic/symbolic shapes,
 runtime-polymorphic views, shared/local memory, tensor cores, graph capture,
 profiling, multi-device synchronization, and broad model workloads remain
@@ -2005,9 +2031,12 @@ or registering a callback. This deliberately prevents a callback from
 outliving stack or resource ownership and means the ignored live discovery/
 compile/H2D/D2D/launch/query/collect/D2H smoke cannot execute on this host.
 
-WGSL has no F64 storage/arithmetic contract, while RustGrad reductions require
-F64 intermediate accumulation for floating parity. All reductions therefore
-reject before submission. Guarded F32/F16/BF16 and 8/16/64-bit integer
+WGSL has no F64 storage/arithmetic contract. Static serial reductions instead
+consume the backend-neutral checked recurrence for the proven
+F16/BF16/F32/Bool/I32/U32 intersection; narrow arithmetic commits through the
+same software codec at every update, and F32 recurrence remains F32. F64,
+I64/U64, dynamic axes, and parallel reduction remain fail-closed before
+submission. Guarded F32/F16/BF16 and 8/16/64-bit integer
 division/modulo/shift remain outside the exact status ABI and reject before
 submission. F64 and narrow/wide integer storage, narrow division and remainder,
 broader narrow casts, unary/transcendental/bitwise ops, dynamic or
@@ -2144,23 +2173,24 @@ MMA is not claimed. Current differentials use exact-representable fixtures and
 raw special-value classification. Live CUDA/ptxas, tail padding, multi-warp
 tiles, asynchronous copy, double buffering, and empirical autotuning remain
 unclaimed.
-F32/F64 retain CPU-equivalent floating accumulation/finalization; I32/I64 and
+F32/F64 retain CPU-equivalent typed accumulation/finalization; I32/I64 and
 U32/U64 sums use defined wrapping PTX arithmetic; bool sum is the I32 count of
-true inputs; and bool/wide-integer mean promotes through F64 before the F32
-store, matching the CPU scalar contract. Empty sum domains store zero and empty
+true inputs; and bool/integer mean promotes through F32 before the F32 store,
+matching the checked recurrence. Empty sum domains store zero and empty
 float mean domains store a canonical quiet NaN without emitting a divide by
 zero. I8/I16 and U8/U16 loads explicitly sign/zero extend into their promoted
 I32/U32 sum accumulators or F32 mean finalization. F16 (on sm_53+) and BF16
 reduction buffers are decoded from raw 16-bit storage,
-accumulated through F64, and deterministically requantized at the final store;
+accumulated at the plan-selected F32 or source width, and deterministically
+requantized after each source-width update and at the final store;
 the BF16 store uses the same raw ties-to-even bit arithmetic as `TensorData`.
 The same serial path also carries Product/Min/Max for every static stored
 scalar dtype. Product uses typed wrapping ALU (Bool is AND), its multiplicative
-identity, and the existing raw narrow-float finalization. Extremum selection
-projects each candidate through the CPU oracle's `f64` comparison contract but
-retains the selected raw storage word: NaNs are ignored and equal values retain
-their first row-major occurrence, including signed-zero and high-bit integer
-ties. F16 requires sm_53 conversion support; BF16 uses the explicit raw decode
+identity, and the existing raw narrow-float finalization. Extrema begin at the
+committed dtype identity and use strict typed comparisons, so unordered and
+equal candidates retain the accumulator while I64/U64 never project through
+floating point. Effective singleton reductions bypass recurrence. F16 requires
+sm_53 conversion support; BF16 uses the explicit raw decode
 and ties-to-even requantization path. Empty extrema remain graph validation
 errors, while empty Product stores its typed identity. This is not a
 shared-memory or symbolic reduction claim; optimized reductions remain an
