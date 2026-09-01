@@ -207,6 +207,68 @@ fn native_prefix_scan_plan_carries_exact_source_result_abi_and_value_kinds() {
 }
 
 #[test]
+fn portable_prefix_scan_projection_authenticates_common_dtype_kind_and_launch_domains() {
+    for dtype in [DType::Bool, DType::I32, DType::U32, DType::F32] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], dtype);
+        let sum = graph.cumsum(input, 1).unwrap();
+        let product = graph.cumprod(input, 1).unwrap();
+        let (maximum, maximum_indices) = graph.cummax(input, 1).unwrap();
+        let (minimum, minimum_indices) = graph.cummin(input, 1).unwrap();
+        for output in [
+            sum,
+            product,
+            maximum,
+            maximum_indices,
+            minimum,
+            minimum_indices,
+        ] {
+            let kernel = crate::lower_graph_prefix_scan(&graph, output).unwrap();
+            let crate::Operation::PrefixScan(value) = kernel.operation() else {
+                unreachable!()
+            };
+            let portable = crate::prefix_scan_native::PortablePrefixScan::new(value).unwrap();
+            assert_eq!(portable.plan().elements, 6);
+            assert_eq!(portable.launch_extent(), 2);
+        }
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [2, 0, 3], DType::F32);
+    let output = empty.cumsum(input, 1).unwrap();
+    let kernel = crate::lower_graph_prefix_scan(&empty, output).unwrap();
+    let crate::Operation::PrefixScan(value) = kernel.operation() else {
+        unreachable!()
+    };
+    let portable = crate::prefix_scan_native::PortablePrefixScan::new(value).unwrap();
+    assert_eq!(portable.plan().elements, 0);
+    assert_eq!(portable.launch_extent(), 0);
+
+    let mut zero_inner = Graph::new();
+    let input = zero_inner.input_dtype("x", [2, 3, 0], DType::F32);
+    let output = zero_inner.cumsum(input, 1).unwrap();
+    let kernel = crate::lower_graph_prefix_scan(&zero_inner, output).unwrap();
+    let crate::Operation::PrefixScan(value) = kernel.operation() else {
+        unreachable!()
+    };
+    let portable = crate::prefix_scan_native::PortablePrefixScan::new(value).unwrap();
+    assert_eq!(portable.plan().inner, 0);
+    assert_eq!(portable.launch_extent(), 0);
+
+    let mut narrow = Graph::new();
+    let input = narrow.input_dtype("x", [2], DType::F16);
+    let output = narrow.cumsum(input, 0).unwrap();
+    let kernel = crate::lower_graph_prefix_scan(&narrow, output).unwrap();
+    let crate::Operation::PrefixScan(value) = kernel.operation() else {
+        unreachable!()
+    };
+    assert!(matches!(
+        crate::prefix_scan_native::PortablePrefixScan::new(value),
+        Err(crate::prefix_scan_native::PortablePrefixScanError::Unsupported(_))
+    ));
+}
+
+#[test]
 fn native_prefix_scan_indices_share_exact_abi_and_tampered_source_dtype_fails_closed() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", [3], DType::I16);

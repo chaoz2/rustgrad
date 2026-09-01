@@ -1,6 +1,6 @@
 use super::renderer::{
-    METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_RAW_COPY_RENDERER_VERSION,
-    METAL_STATIC_POSITION_RENDERER_VERSION,
+    METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
+    METAL_RAW_COPY_RENDERER_VERSION, METAL_STATIC_POSITION_RENDERER_VERSION,
 };
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
@@ -20,6 +20,124 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
+
+#[test]
+fn portable_prefix_scan_metal_renders_common_matrix_and_executes_first_match_indices() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    for dtype in [DType::Bool, DType::I32, DType::U32, DType::F32] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], dtype);
+        let sum = graph.cumsum(input, 1).unwrap();
+        let product = graph.cumprod(input, 1).unwrap();
+        let (maximum, maximum_indices) = graph.cummax(input, 1).unwrap();
+        let (minimum, minimum_indices) = graph.cummin(input, 1).unwrap();
+        for output in [
+            sum,
+            product,
+            maximum,
+            maximum_indices,
+            minimum,
+            minimum_indices,
+        ] {
+            let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+            let rendered = renderer.render(&item.kernel).unwrap();
+            rendered
+                .validate_schedule_bindings(item.ordered_inputs())
+                .unwrap();
+            assert_eq!(rendered.extent, 2);
+            assert_eq!(rendered.buffers.len(), 2);
+            assert!(
+                rendered
+                    .source
+                    .contains(METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION)
+            );
+            if output == maximum
+                || output == maximum_indices
+                || output == minimum
+                || output == minimum_indices
+            {
+                assert!(rendered.source.contains("rg_equal_before"));
+            } else {
+                assert!(rendered.source.contains("rg_acc ="));
+            }
+            if dtype == DType::I32 && (output == sum || output == product) {
+                assert!(
+                    rendered
+                        .source
+                        .contains("as_type<int>(as_type<uint>(rg_acc)")
+                );
+            }
+            if output == product && dtype == DType::I32 {
+                assert!(rendered.source.contains("int rg_acc = (int)1;"));
+            }
+            if output == product && dtype == DType::U32 {
+                assert!(rendered.source.contains("uint rg_acc = 1u;"));
+            }
+        }
+    }
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F32);
+    let output = graph.cummax(input, 1).unwrap().1;
+    let (actual, _) = execute_mock(
+        &graph,
+        output,
+        &HashMap::from([(
+            "x".into(),
+            TensorData::from_storage(
+                [2, 3],
+                Storage::F32(vec![1.0, 3.0, 3.0, f32::NAN, 5.0, 4.0]),
+            )
+            .unwrap(),
+        )]),
+    );
+    assert_eq!(actual.storage(), &Storage::I32(vec![0, 1, 1, 3, 1, 1]));
+
+    let mut narrow = Graph::new();
+    let input = narrow.input_dtype("x", [2], DType::F16);
+    let output = narrow.cumsum(input, 0).unwrap();
+    let item = schedule(&narrow, output).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(MetalError::Unsupported(reason)) if reason.contains("Bool/I32/U32/F32")
+    ));
+
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("x", [], DType::F32);
+    let output = scalar.cumsum(input, 0).unwrap();
+    let item = schedule(&scalar, output).unwrap().items.pop().unwrap();
+    assert!(
+        renderer
+            .render(&item.kernel)
+            .unwrap()
+            .source
+            .contains("as_type<float>(as_type<uint>(b0[0]))")
+    );
+}
+
+#[test]
+fn portable_prefix_scan_metal_zero_domain_skips_buffers_queue_and_launch() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 0, 3], DType::F32);
+    let output = graph.cumsum(input, 1).unwrap();
+    let items = schedule(&graph, output).unwrap().items;
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let before = mock.calls();
+    let prefix = PreparedMetalPrefix::prepare(device, &items, renderer).unwrap();
+    let mut values = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([2, 0, 3], Storage::F32(Vec::new())).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    assert!(values[&(output.index() as u64)].is_empty());
+    assert!(!mock.calls()[before.len()..].iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("queue_create:")
+            || call.starts_with("launch:")
+    }));
+}
 
 #[test]
 fn portable_f32_matmul_metal_renders_shared_geometry_and_executes_zero_k() {

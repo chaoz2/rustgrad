@@ -460,9 +460,9 @@ F16/BF16 and Float8 `exp2` remain outside the native contract.
 materialization with an explicit normalized axis, Sum/Product kind, source and
 destination identities, and exact source/result dtypes in UOp/RGUA v18. One
 checked `NativePrefixScanPlan` derives the row/axis/inner domain and the work
-dtype for the CPU oracle, scalar CPU-JIT, and PTX instead of duplicating a scan
-operation taxonomy. Scalar and zero-extent shapes remain exact. F32 Sum commits
-each recurrence in F32; F16/BF16/Float8 Sum works in F32 and casts each prefix
+dtype for the CPU oracle and every native renderer instead of duplicating a
+scan operation taxonomy. Scalar and zero-extent shapes remain exact. F32 Sum
+commits each recurrence in F32; F16/BF16/Float8 Sum works in F32 and casts each prefix
 result to source storage, while Product/extrema commit source-width arithmetic.
 Integer Sum retains its public promotion contract and Product retains source
 dtype, including Bool. Floating `cumsum` reverse mode composes existing
@@ -488,13 +488,19 @@ the source value's raw bits when storage is unchanged; widened Sum casts the
 single source value once, while the index result is I32 zero.
 Their index outputs remain explicitly
 nondifferentiable. Scalar CPU-JIT covers all concrete storage dtypes and both
-value/index results through captured replay. PTX v31 uses the same plan and a
-two-buffer ABI for Bool/I32/U32/F32, assigning one thread to each independent
-row/inner lane and scanning the selected axis serially; the CUDA semantic mock
-compares exact value/index bytes with the CPU oracle. OpenCL, Metal, WebGPU,
-other PTX dtypes, dynamic domains, and parallel scan algorithms remain
-fail-closed. Legacy PrefixScan RGUA v11--v17 payloads also fail closed because
-they cannot prove source dtype or destination identity. The fixed-size
+value/index results through captured replay. PTX v31 and operation-specific
+OpenCL C, MSL, and WGSL renderer identities use the same checked portable
+Bool/I32/U32/F32 projection and two-buffer ABI, assigning one work item to each
+independent row/inner lane and scanning the selected axis serially. WGSL Bool
+outputs use packed atomic byte-lane writes. Static prepared prefixes validate
+the logical output extent separately from this launch domain, keep producer and
+consumer intermediates device-resident, and create no buffers, queues, or
+launches for a zero work domain. Other scan dtypes, dynamic domains, parallel
+algorithms, and live-device numeric validation remain fail-closed or unclaimed. Existing RGUA
+v18 schedule/capture identities are unchanged; only renderer source/cache keys
+distinguish the new accelerator programs. Legacy PrefixScan RGUA v11--v17
+payloads also fail closed because they cannot prove source dtype or destination
+identity. The fixed-size
 `MaskedSelect` reverse edge alone
 reuses its boolean prefix ranks as nondifferentiable control/index values to
 gather explicit upstream cotangents into retained row-major source lanes;
