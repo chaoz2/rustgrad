@@ -242,6 +242,62 @@ fn portable_f32_matmul_opencl_capture_keeps_dependent_prefix_device_resident() {
 }
 
 #[test]
+fn prepared_opencl_prefix_reuses_disjoint_exact_temporary_slots() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let first_value = graph.square(input).unwrap();
+    let first = graph.contiguous(first_value).unwrap();
+    let second_value = graph.square(first).unwrap();
+    let second = graph.contiguous(second_value).unwrap();
+    let third_value = graph.square(second).unwrap();
+    let third = graph.contiguous(third_value).unwrap();
+    let output_value = graph.square(third).unwrap();
+    let output = graph.contiguous(output_value).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 4);
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let plan = OpenClPrefixPlan::plan_for_outputs(
+        context.clone(),
+        &decoded.items,
+        &[output.index() as u64],
+        OpenClRenderer::default(),
+    )
+    .unwrap();
+    assert_eq!(capture.to_bytes().unwrap(), bytes);
+    let prefix = PreparedOpenClPrefix::from_plan(context, plan).unwrap();
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_create:"))
+            .count(),
+        4,
+        "input, retained output, and two alternating temporary slots"
+    );
+    let mut values = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([2], Storage::F32(vec![1.0, -1.0])).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![1.0, 1.0])
+    );
+    drop(prefix);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_release:"))
+            .count(),
+        4
+    );
+}
+
+#[test]
 fn portable_f32_matmul_opencl_rejects_payloads_and_bindings_before_resource_work() {
     let renderer = OpenClRenderer::default();
     let mock = Arc::new(MockDispatch::default());

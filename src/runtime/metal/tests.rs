@@ -143,6 +143,53 @@ fn portable_f32_matmul_metal_renders_shared_geometry_and_executes_zero_k() {
 }
 
 #[test]
+fn prepared_metal_prefix_reuses_disjoint_exact_temporary_slots() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let first_value = graph.square(input).unwrap();
+    let first = graph.contiguous(first_value).unwrap();
+    let second_value = graph.square(first).unwrap();
+    let second = graph.contiguous(second_value).unwrap();
+    let third_value = graph.square(second).unwrap();
+    let third = graph.contiguous(third_value).unwrap();
+    let output_value = graph.square(third).unwrap();
+    let output = graph.contiguous(output_value).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 4);
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let plan =
+        MetalPrefixPlan::plan_for_outputs(&scheduled.items, &[output.index() as u64], renderer)
+            .unwrap();
+    let prefix = PreparedMetalPrefix::from_plan(device, plan).unwrap();
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_create:"))
+            .count(),
+        4
+    );
+    let mut values = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([2], Storage::F32(vec![1.0, -1.0])).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![1.0, 1.0])
+    );
+    drop(prefix);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("buffer_release:"))
+            .count(),
+        4
+    );
+}
+
+#[test]
 fn reduction_epilogue_renders_one_metal_kernel() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", Shape::from([2, 3]), DType::F32);
