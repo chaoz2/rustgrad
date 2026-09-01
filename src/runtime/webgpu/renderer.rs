@@ -25,6 +25,7 @@ pub const WGSL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-wgsl-static-po
 pub const WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-f32-matmul-v1";
 pub const WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
     "rustgrad-wgsl-portable-prefix-scan-v1";
+pub const WGSL_PORTABLE_SORT_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-sort-v1";
 /// Ordered storage-plus-extent bind-group ABI version.
 pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
@@ -41,7 +42,8 @@ pub struct WgslBufferAbi {
     pub source_shape: Shape,
     /// Logical source-storage element count.
     pub elements: usize,
-    /// Whether this is the unique output binding.
+    /// Whether this is an output binding. Mutable entries are ordered by
+    /// their scheduled output ordinal.
     pub mutable: bool,
     /// Optional source-backed affine logical mapping.
     pub view: Option<AffineView>,
@@ -71,11 +73,12 @@ pub struct RenderedWgsl {
     pub source: String,
     /// Expression IDs to one-based source lines.
     pub source_map: BTreeMap<usize, usize>,
-    /// Ordered inputs followed by the unique output.
+    /// Ordered inputs followed by the ordered output bindings.
     pub buffers: Vec<WgslBufferAbi>,
     /// Exact launch work-item count supplied through the final uniform.
     /// This equals the logical output extent for ordinary kernels; a serial
-    /// PrefixScan launches one item per independent `(row, inner)` lane.
+    /// PrefixScan and coupled Sort launch one item per independent
+    /// `(row, inner)` lane.
     pub extent: usize,
     /// Generated compute entry point.
     pub entry: String,
@@ -114,6 +117,14 @@ impl RenderedWgsl {
                 &portable, bindings,
             )
             .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Sort(value) = root.operation()
+        {
+            crate::portable_sort::PortableSortPair::new(value)
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
         }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(WebGpuError::InvalidBinding(
@@ -181,7 +192,33 @@ impl RenderedWgsl {
             }
             _ => None,
         };
+        let portable_sort = match self.semantic_program.as_ref() {
+            super::dispatch::KernelSemanticProgram::UOp(root)
+                if matches!(root.operation(), Operation::Sort(_)) =>
+            {
+                let Operation::Sort(value) = root.operation() else {
+                    unreachable!("guarded above")
+                };
+                Some(crate::portable_sort::PortableSortPair::new(value).map_err(
+                    |error| match error {
+                        crate::portable_sort::PortableSortError::Unsupported(reason) => {
+                            WebGpuError::Unsupported(reason.into())
+                        }
+                        crate::portable_sort::PortableSortError::Overflow => WebGpuError::Overflow,
+                        other => WebGpuError::InvalidBinding(other.to_string()),
+                    },
+                )?)
+            }
+            _ => None,
+        };
         if let Some(portable) = portable_scan.as_ref() {
+            validate_portable_prefix_scan_launch(
+                portable.launch_extent(),
+                self.local_size,
+                &self.capabilities,
+            )?;
+        }
+        if let Some(portable) = portable_sort.as_ref() {
             validate_portable_prefix_scan_launch(
                 portable.launch_extent(),
                 self.local_size,
@@ -214,14 +251,18 @@ impl RenderedWgsl {
             }
             _ => None,
         };
+        let expected_mutable = if portable_sort.is_some() { 2 } else { 1 };
         if self.buffers.is_empty()
-            || self.buffers.last().is_none_or(|buffer| !buffer.mutable)
-            || self.buffers[..self.buffers.len() - 1]
+            || self.buffers.iter().filter(|buffer| buffer.mutable).count() != expected_mutable
+            || self.buffers[self.buffers.len() - expected_mutable..]
+                .iter()
+                .any(|buffer| !buffer.mutable)
+            || self.buffers[..self.buffers.len() - expected_mutable]
                 .iter()
                 .any(|buffer| buffer.mutable)
         {
             return Err(WebGpuError::InvalidBinding(
-                "artifact requires one final mutable output binding".into(),
+                "artifact mutable output ABI mismatch".into(),
             ));
         }
         if self.buffers.len() > self.capabilities.max_storage_buffers_per_shader_stage as usize
@@ -246,7 +287,9 @@ impl RenderedWgsl {
                 .source_shape
                 .numel()
                 .map_err(|_| WebGpuError::Overflow)?;
-            let physical_bytes = if (portable_matmul.is_some() || portable_scan.is_some())
+            let physical_bytes = if (portable_matmul.is_some()
+                || portable_scan.is_some()
+                || portable_sort.is_some())
                 && self.extent != 0
                 && buffer.elements == 0
             {
@@ -271,15 +314,16 @@ impl RenderedWgsl {
                 }
             }
         }
-        let expected_extent = portable_scan.as_ref().map_or_else(
-            || {
+        let expected_extent = portable_scan
+            .as_ref()
+            .map(|scan| scan.launch_extent())
+            .or_else(|| portable_sort.as_ref().map(|sort| sort.launch_extent()))
+            .unwrap_or_else(|| {
                 self.buffers
                     .last()
                     .expect("nonempty checked above")
                     .elements
-            },
-            |scan| scan.launch_extent(),
-        );
+            });
         if self.extent != expected_extent {
             return Err(WebGpuError::InvalidBinding(
                 "artifact output extent mismatch".into(),
@@ -310,6 +354,41 @@ impl RenderedWgsl {
             {
                 return Err(WebGpuError::InvalidBinding(
                     "WGSL prefix-scan artifact disagrees with its plan".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(portable) = portable_sort {
+            let value = portable.value();
+            let [input, values, indices] = self.buffers.as_slice() else {
+                return Err(WebGpuError::InvalidBinding(
+                    "WGSL portable sort requires three buffers".into(),
+                ));
+            };
+            if self.transaction.is_some()
+                || self.schedule_inputs.len() != 1
+                || self.schedule_inputs.first() != Some(input)
+                || input.id != value.input.index() as u64
+                || input.dtype != value.dtype
+                || input.source_shape != value.input_shape
+                || input.elements != portable.elements()
+                || input.mutable
+                || input.view.is_some()
+                || values.id != value.values.index() as u64
+                || values.dtype != value.dtype
+                || values.source_shape != value.input_shape
+                || values.elements != portable.elements()
+                || !values.mutable
+                || values.view.is_some()
+                || indices.id != value.indices.index() as u64
+                || indices.dtype != DType::I32
+                || indices.source_shape != value.input_shape
+                || indices.elements != portable.elements()
+                || !indices.mutable
+                || indices.view.is_some()
+            {
+                return Err(WebGpuError::InvalidBinding(
+                    "WGSL portable-sort artifact disagrees with its plan".into(),
                 ));
             }
             return Ok(());
@@ -438,6 +517,9 @@ impl WgslRenderer {
         if let Operation::PrefixScan(value) = root.operation() {
             return render_portable_prefix_scan(self, root, value);
         }
+        if let Operation::Sort(value) = root.operation() {
+            return render_portable_sort(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -459,10 +541,10 @@ impl WgslRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::Sort(_) | Operation::TensorGuard(_) | Operation::Threefry(_)
+            Operation::TensorGuard(_) | Operation::Threefry(_)
         ) {
             return Err(WebGpuError::Unsupported(
-                "sort pairs, guards, and live Threefry are outside WebGPU lowering".into(),
+                "guards and live Threefry are outside WebGPU lowering".into(),
             ));
         }
         root.validate()
@@ -829,6 +911,365 @@ fn validate_portable_prefix_scan_launch(
         ));
     }
     Ok(())
+}
+
+fn render_portable_sort(
+    renderer: &WgslRenderer,
+    root: &UOp,
+    value: &crate::SortValue,
+) -> Result<RenderedWgsl, WebGpuError> {
+    root.validate()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::portable_sort::PortableSortPair::new(value).map_err(|error| match error {
+            crate::portable_sort::PortableSortError::Unsupported(reason) => {
+                WebGpuError::Unsupported(reason.into())
+            }
+            crate::portable_sort::PortableSortError::Overflow => WebGpuError::Overflow,
+            other => WebGpuError::InvalidBinding(other.to_string()),
+        })?;
+    validate_portable_prefix_scan_launch(
+        portable.launch_extent(),
+        renderer.local_size,
+        &renderer.capabilities,
+    )?;
+    let elements = portable.elements();
+    let input = WgslBufferAbi {
+        id: value.input.index() as u64,
+        dtype: value.dtype,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: false,
+        view: None,
+    };
+    let values = WgslBufferAbi {
+        id: value.values.index() as u64,
+        dtype: value.dtype,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: true,
+        view: None,
+    };
+    let indices = WgslBufferAbi {
+        id: value.indices.index() as u64,
+        dtype: DType::I32,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input.clone(), values, indices];
+    if buffers.len() > renderer.capabilities.max_storage_buffers_per_shader_stage as usize {
+        return Err(WebGpuError::Unsupported(
+            "portable sort bindings exceed adapter limit".into(),
+        ));
+    }
+    for buffer in &buffers {
+        if buffer.physical_bytes()? > renderer.capabilities.max_buffer_size {
+            return Err(WebGpuError::Unsupported(
+                "portable sort binding exceeds adapter buffer limit".into(),
+            ));
+        }
+    }
+    let entry = format!(
+        "rg_wgsl_sort_{:?}_a{}_n{}",
+        value.dtype,
+        value.axis,
+        portable.elements()
+    )
+    .to_ascii_lowercase();
+    let input_storage = wgsl_storage_decl(value.dtype, false);
+    let output_storage = wgsl_storage_decl(value.dtype, true);
+    let mut lines = vec![
+        format!("// {WGSL_PORTABLE_SORT_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION}"),
+        format!("@group(0) @binding(0) var<storage, read> b0: array<{input_storage}>;"),
+        format!("@group(0) @binding(1) var<storage, read_write> b1: array<{output_storage}>;"),
+        "@group(0) @binding(2) var<storage, read_write> b2: array<i32>;".into(),
+        "struct RustGradExtent { value: u32, };".into(),
+        "@group(0) @binding(3) var<uniform> rg_extent: RustGradExtent;".into(),
+        format!("@compute @workgroup_size({}, 1, 1)", renderer.local_size),
+        format!("fn {entry}(@builtin(global_invocation_id) rg_global: vec3<u32>) {{"),
+        "  let gid: u32 = rg_global.x;".into(),
+        "  if (gid >= rg_extent.value) { return; }".into(),
+    ];
+    lines.extend(
+        crate::portable_sort::emit_portable_sort_body(
+            &portable,
+            &WgslPortableSortDialect { dtype: value.dtype },
+        )
+        .map_err(|error| WebGpuError::Unsupported(error.to_string()))?,
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        WGSL_PORTABLE_SORT_RENDERER_VERSION,
+        WEBGPU_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedWgsl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.launch_extent(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        local_size: renderer.local_size,
+        transaction: None,
+        schedule_inputs: vec![input],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    };
+    rendered.validate_artifact()?;
+    Ok(rendered)
+}
+
+struct WgslPortableSortDialect {
+    dtype: DType,
+}
+
+impl WgslPortableSortDialect {
+    fn value_type(&self) -> &'static str {
+        match self.dtype {
+            DType::Bool => "bool",
+            DType::I32 => "i32",
+            DType::U32 => "u32",
+            DType::F32 => "f32",
+            _ => unreachable!("portable sort validated storage"),
+        }
+    }
+
+    fn padding(&self, descending: bool) -> &'static str {
+        match (self.dtype, descending) {
+            (DType::Bool, true) => "false",
+            (DType::Bool, false) => "true",
+            (DType::I32, true) => "bitcast<i32>(0x80000000u)",
+            (DType::I32, false) => "bitcast<i32>(0x7fffffffu)",
+            (DType::U32, true) => "0u",
+            (DType::U32, false) => "0xffffffffu",
+            (DType::F32, true) => "bitcast<f32>(0xff800000u)",
+            (DType::F32, false) => "bitcast<f32>(0x7f800000u)",
+            _ => unreachable!("portable sort validated storage"),
+        }
+    }
+}
+
+impl crate::portable_sort::PortableSortDialect for WgslPortableSortDialect {
+    fn domain(&self, plan: &crate::portable_sort::PortableSortPair<'_>) -> Vec<String> {
+        vec![
+            format!("  let rg_row: u32 = gid / {}u;", plan.inner()),
+            format!("  let rg_inner: u32 = gid % {}u;", plan.inner()),
+        ]
+    }
+
+    fn storage(
+        &self,
+        plan: &crate::portable_sort::PortableSortPair<'_>,
+    ) -> Result<Vec<String>, crate::portable_sort::PortableSortError> {
+        let ty = self.value_type();
+        Ok(vec![
+            format!(
+                "  var rg_original: array<{ty}, {}>;",
+                plan.axis_len().max(1)
+            ),
+            format!("  var rg_work: array<{ty}, {}>;", plan.padded_len().max(1)),
+            format!(
+                "  var rg_original_count: array<i32, {}>;",
+                plan.axis_len().max(1)
+            ),
+            format!(
+                "  var rg_sorted_count: array<i32, {}>;",
+                plan.axis_len().max(1)
+            ),
+        ])
+    }
+
+    fn load_original(
+        &self,
+        plan: &crate::portable_sort::PortableSortPair<'_>,
+        lane: usize,
+    ) -> Result<Vec<String>, crate::portable_sort::PortableSortError> {
+        let offset = format!(
+            "((rg_row * {}u + {lane}u) * {}u + rg_inner)",
+            plan.axis_len(),
+            plan.inner()
+        );
+        let load = if self.dtype == DType::Bool {
+            format!("(((b0[{offset} >> 2u] >> (({offset} & 3u) * 8u)) & 0xffu) != 0u)")
+        } else {
+            format!("b0[{offset}]")
+        };
+        Ok(vec![
+            format!("  rg_original[{lane}] = {load};"),
+            format!("  rg_work[{lane}] = rg_original[{lane}];"),
+        ])
+    }
+
+    fn pad_work(
+        &self,
+        plan: &crate::portable_sort::PortableSortPair<'_>,
+        lane: usize,
+    ) -> Result<String, crate::portable_sort::PortableSortError> {
+        Ok(format!(
+            "  rg_work[{lane}] = {};",
+            self.padding(plan.value().descending)
+        ))
+    }
+
+    fn swap(
+        &self,
+        _plan: &crate::portable_sort::PortableSortPair<'_>,
+        left: usize,
+        right: usize,
+    ) -> Vec<String> {
+        vec![
+            "  {".into(),
+            format!("    let rg_swap: {} = rg_work[{left}];", self.value_type()),
+            format!("    rg_work[{left}] = rg_work[{right}];"),
+            format!("    rg_work[{right}] = rg_swap;"),
+            "  }".into(),
+        ]
+    }
+
+    fn compare(
+        &self,
+        _plan: &crate::portable_sort::PortableSortPair<'_>,
+        step: crate::portable_sort::PortableSortCompare,
+    ) -> Vec<String> {
+        let left = step.left;
+        let right = step.right;
+        let (first, second) = if step.left_takes_larger {
+            ("rg_larger", "rg_smaller")
+        } else {
+            ("rg_smaller", "rg_larger")
+        };
+        let (larger, smaller) = if self.dtype == DType::Bool {
+            (
+                "(rg_left || rg_right)".to_owned(),
+                "(rg_left && rg_right)".to_owned(),
+            )
+        } else {
+            (
+                "select(rg_left, rg_right, rg_right > rg_left)".to_owned(),
+                "select(rg_left, rg_right, rg_right < rg_left)".to_owned(),
+            )
+        };
+        vec![
+            "  {".into(),
+            format!("    let rg_left: {} = rg_work[{left}];", self.value_type()),
+            format!(
+                "    let rg_right: {} = rg_work[{right}];",
+                self.value_type()
+            ),
+            format!("    let rg_larger: {} = {larger};", self.value_type()),
+            format!("    let rg_smaller: {} = {smaller};", self.value_type()),
+            format!("    rg_work[{left}] = {first};"),
+            format!("    rg_work[{right}] = {second};"),
+            "  }".into(),
+        ]
+    }
+
+    fn count_original_open(
+        &self,
+        plan: &crate::portable_sort::PortableSortPair<'_>,
+    ) -> Vec<String> {
+        vec![
+            format!(
+                "  for (var rg_i: u32 = 0u; rg_i < {}u; rg_i = rg_i + 1u) {{",
+                plan.axis_len()
+            ),
+            "    var rg_count: i32 = 0i;".into(),
+            "    for (var rg_j: u32 = 0u; rg_j <= rg_i; rg_j = rg_j + 1u) {".into(),
+        ]
+    }
+
+    fn count_original_step(&self) -> String {
+        "      if (rg_original[rg_j] == rg_original[rg_i]) { rg_count = rg_count + 1i; }".into()
+    }
+
+    fn count_original_close(&self) -> Vec<String> {
+        vec![
+            "    }".into(),
+            "    rg_original_count[rg_i] = rg_count;".into(),
+            "  }".into(),
+        ]
+    }
+
+    fn count_sorted_open(&self, plan: &crate::portable_sort::PortableSortPair<'_>) -> Vec<String> {
+        vec![
+            format!(
+                "  for (var rg_i: u32 = 0u; rg_i < {}u; rg_i = rg_i + 1u) {{",
+                plan.axis_len()
+            ),
+            "    var rg_count: i32 = 0i;".into(),
+            "    for (var rg_j: u32 = 0u; rg_j <= rg_i; rg_j = rg_j + 1u) {".into(),
+        ]
+    }
+
+    fn count_sorted_step(&self) -> String {
+        "      if (rg_work[rg_j] == rg_work[rg_i]) { rg_count = rg_count + 1i; }".into()
+    }
+
+    fn count_sorted_close(&self) -> Vec<String> {
+        vec![
+            "    }".into(),
+            "    rg_sorted_count[rg_i] = rg_count;".into(),
+            "  }".into(),
+        ]
+    }
+
+    fn reconstruct_open(&self, plan: &crate::portable_sort::PortableSortPair<'_>) -> Vec<String> {
+        vec![
+            format!(
+                "  for (var rg_out: u32 = 0u; rg_out < {}u; rg_out = rg_out + 1u) {{",
+                plan.axis_len()
+            ),
+            "    var rg_index: i32 = 0i;".into(),
+            format!(
+                "    for (var rg_in: u32 = 0u; rg_in < {}u; rg_in = rg_in + 1u) {{",
+                plan.axis_len()
+            ),
+        ]
+    }
+
+    fn reconstruct_step(&self) -> String {
+        "      if (rg_original[rg_in] == rg_work[rg_out] && rg_original_count[rg_in] == rg_sorted_count[rg_out]) { rg_index = rg_index + i32(rg_in); }".into()
+    }
+
+    fn reconstruct_store(
+        &self,
+        plan: &crate::portable_sort::PortableSortPair<'_>,
+    ) -> Result<Vec<String>, crate::portable_sort::PortableSortError> {
+        let mut lines = vec![
+            "    }".into(),
+            format!(
+                "    let rg_offset: u32 = (rg_row * {}u + rg_out) * {}u + rg_inner;",
+                plan.axis_len(),
+                plan.inner()
+            ),
+        ];
+        if self.dtype == DType::Bool {
+            lines.extend([
+                "    let rg_shift: u32 = (rg_offset & 3u) * 8u;".into(),
+                "    atomicAnd(&b1[rg_offset >> 2u], ~(0xffu << rg_shift));".into(),
+                "    atomicOr(&b1[rg_offset >> 2u], select(0u, 1u, rg_work[rg_out]) << rg_shift);"
+                    .into(),
+            ]);
+        } else {
+            lines.push("    b1[rg_offset] = rg_work[rg_out];".into());
+        }
+        lines.push("    b2[rg_offset] = rg_index;".into());
+        Ok(lines)
+    }
+
+    fn reconstruct_close(&self) -> Vec<String> {
+        vec!["  }".into()]
+    }
 }
 
 fn render_portable_prefix_scan(

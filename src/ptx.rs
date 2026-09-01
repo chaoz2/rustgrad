@@ -27,6 +27,8 @@ mod matmul;
 mod matmul_tests;
 #[path = "ptx_prefix_scan.rs"]
 mod prefix_scan;
+#[path = "ptx_sort.rs"]
+mod sort;
 
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v31";
 /// Separate identity for raw storage-width computed affine materialization.
@@ -36,6 +38,7 @@ pub const PTX_CONTIGUOUS_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-contiguous-
 /// Separate identity for output-driven raw static placement.
 pub const PTX_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-ptx-static-position-v1";
 pub const PTX_THREEFRY_RENDERER_VERSION: &str = "rustgrad-ptx-live-threefry-v1";
+pub const PTX_PORTABLE_SORT_RENDERER_VERSION: &str = "rustgrad-ptx-portable-sort-v1";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 /// Versioned contract for the sole opt-in linked NVVM-backed F32 Exp route.
@@ -226,6 +229,35 @@ impl RenderedPtx {
             }
         }
         if let Some(KernelSemanticProgram::UOp(program)) = &self.semantic_program
+            && let Operation::Sort(value) = program.operation()
+        {
+            let portable = crate::portable_sort::PortableSortPair::new(value)
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+            if self.launch != PtxLaunchGeometry::Linear
+                || self.extent != portable.launch_extent()
+                || self.buffers.len() != 3
+                || self.buffers[0].id != value.input.index() as u64
+                || self.buffers[0].dtype != value.dtype
+                || self.buffers[0].source_shape != value.input_shape
+                || self.buffers[0].elements != portable.elements()
+                || self.buffers[0].mutable
+                || self.buffers[1].id != value.values.index() as u64
+                || self.buffers[1].dtype != value.dtype
+                || self.buffers[1].source_shape != value.input_shape
+                || self.buffers[1].elements != portable.elements()
+                || !self.buffers[1].mutable
+                || self.buffers[2].id != value.indices.index() as u64
+                || self.buffers[2].dtype != DType::I32
+                || self.buffers[2].source_shape != value.input_shape
+                || self.buffers[2].elements != portable.elements()
+                || !self.buffers[2].mutable
+            {
+                return Err(PtxError::InvalidBinding(
+                    "portable-sort PTX launch disagrees with its plan".into(),
+                ));
+            }
+        }
+        if let Some(KernelSemanticProgram::UOp(program)) = &self.semantic_program
             && let Operation::Threefry(plan) = program.operation()
         {
             plan.validate()
@@ -295,6 +327,11 @@ impl RenderedPtx {
                         value.dtype.itemsize()
                     }
                 }
+                Operation::Sort(value) => match index {
+                    0 | 1 => value.dtype.itemsize(),
+                    2 => DType::I32.itemsize(),
+                    _ => 1,
+                },
                 Operation::Threefry(_) => DType::U64.itemsize(),
                 _ => 1,
             },
@@ -313,6 +350,14 @@ impl RenderedPtx {
         &self,
         bindings: &[crate::ScheduleInputBinding],
     ) -> Result<(), PtxError> {
+        if let Some(KernelSemanticProgram::UOp(program)) = &self.semantic_program
+            && let Operation::Sort(value) = program.operation()
+        {
+            crate::portable_sort::PortableSortPair::new(value)
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+        }
         for (index, binding) in bindings.iter().enumerate() {
             if binding.abi_index != index {
                 return Err(PtxError::InvalidBinding(
@@ -654,15 +699,17 @@ fn render(
             .map_err(|error| PtxError::Unsupported(error.to_string()))?;
         return prefix_scan::render(renderer, root, value);
     }
+    if let Operation::Sort(value) = root.operation() {
+        root.validate()
+            .map_err(|error| PtxError::Unsupported(error.to_string()))?;
+        return sort::render(renderer, root, value);
+    }
     if let Operation::Threefry(plan) = root.operation() {
         return render_live_threefry(renderer, root, plan);
     }
-    if matches!(
-        root.operation(),
-        Operation::Sort(_) | Operation::TensorGuard(_)
-    ) {
+    if matches!(root.operation(), Operation::TensorGuard(_)) {
         return Err(PtxError::Unsupported(
-            "sort pairs and tensor guards are outside the PTX lowering subset".into(),
+            "tensor guards are outside the PTX lowering subset".into(),
         ));
     }
     if let Operation::Matmul(value) = root.operation() {

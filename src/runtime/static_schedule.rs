@@ -29,13 +29,13 @@ pub(crate) struct StaticBufferUse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StaticBufferRole {
     Input,
-    Output,
+    Output(usize),
 }
 
 /// Authenticated logical storage and physical launch domains for one item.
 /// Most kernels launch one work item per output element; serial PrefixScan
-/// launches one work item per `(row, inner)` lane while retaining the full
-/// logical output descriptor.
+/// and coupled Sort launch one work item per `(row, inner)` lane while
+/// retaining the full logical output descriptors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StaticLaunchDomain {
     logical_elements: usize,
@@ -51,6 +51,14 @@ impl StaticLaunchDomain {
                     return Err("prefix-scan logical output extent mismatch");
                 }
                 plan.work_items()
+            }
+            Operation::Sort(value) => {
+                let plan = crate::portable_sort::PortableSortPair::new(value)
+                    .map_err(|_| "portable sort launch geometry is invalid")?;
+                if plan.elements() != logical_elements {
+                    return Err("sort logical output extent mismatch");
+                }
+                plan.launch_extent()
             }
             _ => logical_elements,
         };
@@ -101,7 +109,7 @@ pub(crate) struct StaticRenderedBuffer {
     pub(crate) dtype: DType,
     pub(crate) source_shape: Shape,
     pub(crate) elements: usize,
-    pub(crate) mutable: bool,
+    pub(crate) output_ordinal: Option<usize>,
 }
 
 /// Logical allocation metadata plus the native-handle requirement derived
@@ -125,14 +133,22 @@ pub(crate) fn bind_rendered_buffers<E>(
     overflow: impl Fn() -> E,
 ) -> Result<Vec<StaticBufferUse>, E> {
     let rendered = rendered.into_iter().collect::<Vec<_>>();
-    if rendered.is_empty()
-        || rendered.last().is_none_or(|buffer| !buffer.mutable)
-        || rendered[..rendered.len() - 1]
-            .iter()
-            .any(|buffer| buffer.mutable)
+    if rendered.is_empty() {
+        return Err(invalid("rendered ABI is empty".into()));
+    }
+    let mut output_ordinals = BTreeSet::new();
+    for buffer in &rendered {
+        if let Some(ordinal) = buffer.output_ordinal
+            && (!output_ordinals.insert(ordinal) || ordinal >= item.outputs.len())
+        {
+            return Err(invalid("rendered output ordinal is invalid".into()));
+        }
+    }
+    if output_ordinals.len() != item.outputs.len()
+        || !output_ordinals.iter().copied().eq(0..item.outputs.len())
     {
         return Err(invalid(
-            "rendered ABI requires one final mutable output".into(),
+            "rendered ABI does not bijectively cover scheduled outputs".into(),
         ));
     }
     let mut seen = BTreeSet::new();
@@ -145,8 +161,11 @@ pub(crate) fn bind_rendered_buffers<E>(
                     abi.id
                 )));
             }
-            let desc = if abi.mutable {
-                item.primary_output()
+            let desc = if let Some(ordinal) = abi.output_ordinal {
+                item.outputs
+                    .iter()
+                    .nth(ordinal)
+                    .expect("validated output ordinal")
             } else {
                 &item
                     .ordered_inputs()
@@ -165,7 +184,7 @@ pub(crate) fn bind_rendered_buffers<E>(
                 || abi.dtype != desc.dtype
                 || abi.source_shape != desc.shape
                 || abi.elements != elements
-                || abi.mutable == desc.read_only
+                || abi.output_ordinal.is_some() == desc.read_only
             {
                 return Err(invalid(format!(
                     "rendered ABI descriptor {} mismatches the schedule",
@@ -179,8 +198,8 @@ pub(crate) fn bind_rendered_buffers<E>(
                 elements: abi.elements,
                 bytes: desc.bytes,
                 alignment: desc.alignment,
-                role: if abi.mutable {
-                    StaticBufferRole::Output
+                role: if let Some(ordinal) = abi.output_ordinal {
+                    StaticBufferRole::Output(ordinal)
                 } else {
                     StaticBufferRole::Input
                 },
@@ -246,6 +265,7 @@ pub(crate) struct StaticItemPlan<R> {
     cache_key: String,
     extent: usize,
     buffer_ids: Vec<u64>,
+    input_ids: Vec<u64>,
 }
 
 /// Fully validated schedule/render/buffer graph. Constructing this type is pure
@@ -347,7 +367,6 @@ impl<R> StaticSchedulePlan<R> {
             if item.boundary.is_some()
                 || item.is_effect()
                 || !item.quantized_input_bindings.is_empty()
-                || !item.outputs.is_single()
             {
                 return Err(A::unsupported(
                     "pure prefix item is outside static single-device execution".into(),
@@ -367,40 +386,64 @@ impl<R> StaticSchedulePlan<R> {
             }
 
             let rendered = adapter.render(item)?;
-            if rendered.buffers.is_empty()
-                || rendered
-                    .buffers
-                    .last()
-                    .is_none_or(|buffer| buffer.role != StaticBufferRole::Output)
-                || rendered.buffers[..rendered.buffers.len() - 1]
-                    .iter()
-                    .any(|buffer| buffer.role != StaticBufferRole::Input)
-            {
+            let input_ids = rendered
+                .buffers
+                .iter()
+                .filter(|buffer| buffer.role == StaticBufferRole::Input)
+                .map(|buffer| buffer.id)
+                .collect::<Vec<_>>();
+            let mut output_ids = vec![None; item.outputs.len()];
+            for buffer in &rendered.buffers {
+                if let StaticBufferRole::Output(ordinal) = buffer.role
+                    && output_ids
+                        .get_mut(ordinal)
+                        .is_none_or(|slot| slot.replace(buffer.id).is_some())
+                {
+                    return Err(A::invalid_binding(
+                        "static item output ordinal is invalid".into(),
+                    ));
+                }
+            }
+            if output_ids.into_iter().collect::<Option<Vec<_>>>().is_none() {
                 return Err(A::invalid_binding(
-                    "static item requires read-only inputs and one final writable output".into(),
+                    "static item requires every scheduled output in its writable ABI".into(),
                 ));
             }
-            let output = rendered.buffers.last().expect("checked nonempty");
-            let expected = item.primary_output();
-            let launch = StaticLaunchDomain::checked(item, output.elements)
+            let primary = rendered
+                .buffers
+                .iter()
+                .find(|buffer| buffer.role == StaticBufferRole::Output(0))
+                .ok_or_else(|| A::invalid_binding("static primary output is absent".into()))?;
+            let launch = StaticLaunchDomain::checked(item, primary.elements)
                 .map_err(|reason| A::invalid_binding(reason.into()))?;
-            if expected.view.is_some()
-                || output.id != expected.id
-                || output.dtype != expected.dtype
-                || output.source_shape != expected.shape
-                || output.elements != launch.logical_elements
-                || output.elements != expected.shape.numel().map_err(|_| A::overflow())?
-                || rendered.extent != launch.work_items
-            {
-                return Err(A::invalid_binding(
-                    "rendered output mismatches scheduled output".into(),
-                ));
+            for (ordinal, expected) in item.outputs.iter().enumerate() {
+                let output = rendered
+                    .buffers
+                    .iter()
+                    .find(|buffer| buffer.role == StaticBufferRole::Output(ordinal))
+                    .expect("validated output ordinal");
+                if expected.view.is_some()
+                    || output.id != expected.id
+                    || output.dtype != expected.dtype
+                    || output.source_shape != expected.shape
+                    || output.elements != expected.shape.numel().map_err(|_| A::overflow())?
+                    || output.elements != launch.logical_elements
+                {
+                    return Err(A::invalid_binding(
+                        "rendered output mismatches scheduled output".into(),
+                    ));
+                }
+                if producers.insert(output.id, item_index).is_some() {
+                    return Err(A::invalid_binding(format!(
+                        "duplicate producer for logical buffer {}",
+                        output.id
+                    )));
+                }
             }
-            if producers.insert(output.id, item_index).is_some() {
-                return Err(A::invalid_binding(format!(
-                    "duplicate producer for logical buffer {}",
-                    output.id
-                )));
+            if rendered.extent != launch.work_items {
+                return Err(A::invalid_binding(
+                    "rendered launch extent mismatches scheduled output".into(),
+                ));
             }
 
             let mut item_ids = BTreeSet::new();
@@ -460,12 +503,13 @@ impl<R> StaticSchedulePlan<R> {
                     .into_iter()
                     .map(|buffer| buffer.id)
                     .collect(),
+                input_ids,
             });
         }
 
         for (item_index, item) in planned.iter().enumerate() {
             let source_item = &items[item_index];
-            for input in &item.buffer_ids[..item.buffer_ids.len() - 1] {
+            for input in &item.input_ids {
                 if let Some(producer_index) = producers.get(input).copied() {
                     if producer_index >= item_index {
                         return Err(A::invalid_binding(format!(
@@ -508,7 +552,7 @@ impl<R> StaticSchedulePlan<R> {
             // explicit retained set through `prepare_for_outputs` instead.
             None => items
                 .iter()
-                .map(|item| item.primary_output().id)
+                .flat_map(|item| item.outputs.iter().map(|output| output.id))
                 .collect::<Vec<_>>(),
         };
         if !items.is_empty() && retained_outputs.is_empty() {
@@ -575,11 +619,7 @@ fn build_static_allocation_plan<A: StaticPlanAdapter>(
             let last_consumer_position = items
                 .iter()
                 .enumerate()
-                .filter(|(_, item)| {
-                    item.buffer_ids
-                        .get(..item.buffer_ids.len().saturating_sub(1))
-                        .is_some_and(|inputs| inputs.contains(id))
-                })
+                .filter(|(_, item)| item.input_ids.contains(id))
                 .map(|(position, _)| position)
                 .max()
                 .unwrap_or(producer_position);
@@ -980,15 +1020,22 @@ mod tests {
                 .iter()
                 .map(|binding| fake_use(&binding.desc, false))
                 .collect::<Result<Vec<_>, _>>()?;
-            buffers.push(fake_use(item.primary_output(), true)?);
+            for (ordinal, output) in item.outputs.iter().enumerate() {
+                let mut use_ = fake_use(output, true)?;
+                use_.role = StaticBufferRole::Output(ordinal);
+                buffers.push(use_);
+            }
+            let logical = item
+                .primary_output()
+                .shape
+                .numel()
+                .map_err(|_| "overflow".to_owned())?;
             Ok(StaticRendered {
                 artifact: FakeRendered,
                 cache_key: item.cache_key.to_string(),
-                extent: item
-                    .primary_output()
-                    .shape
-                    .numel()
-                    .map_err(|_| "overflow".to_owned())?,
+                extent: StaticLaunchDomain::checked(item, logical)
+                    .map_err(str::to_owned)?
+                    .work_items,
                 buffers,
             })
         }
@@ -1111,7 +1158,7 @@ mod tests {
             bytes: desc.bytes,
             alignment: desc.alignment,
             role: if mutable {
-                StaticBufferRole::Output
+                StaticBufferRole::Output(0)
             } else {
                 StaticBufferRole::Input
             },
@@ -1639,6 +1686,71 @@ mod tests {
                 calls.read
             ),
             (0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn coupled_sort_outputs_are_bijective_ordered_and_jointly_retained() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let (values, indices) = graph.sort(input, 1, false).unwrap();
+        let schedule = crate::schedule_many(&graph, &[values, indices]).unwrap();
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let plan = StaticSchedulePlan::build(
+            &FakeAdapter(calls),
+            &schedule.items,
+            Some(&[values.index() as u64, indices.index() as u64]),
+        )
+        .unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].buffer_ids,
+            vec![
+                input.index() as u64,
+                values.index() as u64,
+                indices.index() as u64
+            ]
+        );
+        assert_eq!(plan.items[0].input_ids, vec![input.index() as u64]);
+        assert_eq!(
+            plan.retained_outputs,
+            vec![values.index() as u64, indices.index() as u64]
+        );
+        assert_eq!(plan.buffers[&(values.index() as u64)].producer, Some(0));
+        assert_eq!(plan.buffers[&(indices.index() as u64)].producer, Some(0));
+        assert_eq!(plan.allocations.logical_slots.len(), 3);
+        assert_eq!(
+            plan.allocations
+                .logical_slots
+                .values()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3,
+            "input and both same-item outputs own distinct physical slots"
+        );
+    }
+
+    #[test]
+    fn coupled_sort_consumes_a_device_resident_producer_with_exact_dependency() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let (values, indices) = graph.sort(producer, 1, true).unwrap();
+        let schedule = crate::schedule_many(&graph, &[values, indices]).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        let plan = StaticSchedulePlan::build(
+            &FakeAdapter(Rc::new(RefCell::new(Calls::default()))),
+            &schedule.items,
+            Some(&[values.index() as u64, indices.index() as u64]),
+        )
+        .unwrap();
+        assert_eq!(plan.items[1].input_ids, vec![producer.index() as u64]);
+        assert_eq!(schedule.items[1].dependencies, vec![schedule.items[0].id]);
+        assert_eq!(plan.buffers[&(producer.index() as u64)].producer, Some(0));
+        assert!(
+            !plan.external_inputs.contains(&(producer.index() as u64)),
+            "the sort source stays on device instead of becoming a host ABI"
         );
     }
 }

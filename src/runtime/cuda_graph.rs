@@ -26,12 +26,19 @@ impl StaticPlanAdapter for CudaGraphPlanAdapter {
         rendered.validate_schedule_bindings(item.ordered_inputs())?;
         let buffers = bind_rendered_buffers(
             item,
-            rendered.buffers.iter().map(|abi| StaticRenderedBuffer {
-                id: abi.id,
-                dtype: abi.dtype,
-                source_shape: abi.source_shape.clone(),
-                elements: abi.elements,
-                mutable: abi.mutable,
+            rendered.buffers.iter().scan(0usize, |ordinal, abi| {
+                let output_ordinal = abi.mutable.then(|| {
+                    let current = *ordinal;
+                    *ordinal += 1;
+                    current
+                });
+                Some(StaticRenderedBuffer {
+                    id: abi.id,
+                    dtype: abi.dtype,
+                    source_shape: abi.source_shape.clone(),
+                    elements: abi.elements,
+                    output_ordinal,
+                })
             }),
             PtxError::InvalidBinding,
             || PtxError::Overflow,
@@ -417,6 +424,45 @@ mod tests {
 
         let planned = CudaGraphPrefixPlan::plan(&schedule.items, renderer).unwrap();
         assert_eq!(planned.kernel_cache_keys(), vec![rendered_identity]);
+        assert_eq!(schedule.items[0].cache_key, schedule_identity);
+    }
+
+    #[test]
+    fn cuda_graph_executes_both_portable_sort_outputs_without_identity_drift() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], crate::DType::F32);
+        let (values, indices) = graph.sort(input, 1, false).unwrap();
+        let schedule = schedule_many(&graph, &[values, indices]).unwrap();
+        let [item] = schedule.items.as_slice() else {
+            panic!("coupled sort must remain one scheduled item")
+        };
+        let schedule_identity = item.cache_key;
+        assert_eq!(
+            crate::uop::artifact::encode_schedule_identity(&item.kernel).unwrap()[4],
+            18
+        );
+        let input_value = TensorData::from_storage(
+            [2, 3],
+            Storage::F32(vec![-0.0, 0.0, f32::NAN, 3.0, 1.0, 1.0]),
+        )
+        .unwrap();
+        let expected = crate::backend::stable_sort_pair(&input_value, 1, false).unwrap();
+        let (_, primary) = make_primary();
+        let mut prepared = prepare_outputs(
+            primary,
+            &schedule,
+            &[values.index() as u64, indices.index() as u64],
+        );
+        let mut realized = BTreeMap::from([(input.index() as u64, input_value)]);
+        prepared.execute(&mut realized).unwrap();
+        assert_eq!(
+            realized[&(values.index() as u64)].to_le_bytes().unwrap(),
+            expected.0.to_le_bytes().unwrap()
+        );
+        assert_eq!(
+            realized[&(indices.index() as u64)].to_le_bytes().unwrap(),
+            expected.1.to_le_bytes().unwrap()
+        );
         assert_eq!(schedule.items[0].cache_key, schedule_identity);
     }
 

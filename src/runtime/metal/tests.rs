@@ -1,6 +1,7 @@
 use super::renderer::{
     METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
-    METAL_RAW_COPY_RENDERER_VERSION, METAL_STATIC_POSITION_RENDERER_VERSION,
+    METAL_PORTABLE_SORT_RENDERER_VERSION, METAL_RAW_COPY_RENDERER_VERSION,
+    METAL_STATIC_POSITION_RENDERER_VERSION,
 };
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
@@ -20,6 +21,76 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
+
+#[test]
+fn portable_sort_metal_executes_coupled_outputs_and_preserves_storage_bits() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    for dtype in [DType::Bool, DType::I32, DType::U32, DType::F32] {
+        let mut matrix = Graph::new();
+        let input = matrix.input_dtype("x", [2, 3, 2], dtype);
+        let (values, indices) = matrix.sort(input, 1, true).unwrap();
+        let item = crate::schedule_many(&matrix, &[values, indices])
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert_eq!(rendered.extent, 4);
+    }
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F32);
+    let (values_id, indices_id) = graph.sort(input, 1, false).unwrap();
+    let items = crate::schedule_many(&graph, &[values_id, indices_id])
+        .unwrap()
+        .items;
+    let rendered = renderer.render(&items[0].kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(items[0].ordered_inputs())
+        .unwrap();
+    assert_eq!((rendered.extent, rendered.buffers.len()), (2, 3));
+    assert!(
+        rendered
+            .source
+            .contains(METAL_PORTABLE_SORT_RENDERER_VERSION)
+    );
+    let input_value = TensorData::from_storage(
+        [2, 3],
+        Storage::F32(vec![-0.0, 0.0, f32::NAN, 3.0, 1.0, 1.0]),
+    )
+    .unwrap();
+    let expected = crate::backend::stable_sort_pair(&input_value, 1, false).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock);
+    let prefix = PreparedMetalPrefix::prepare(device, &items, renderer.clone()).unwrap();
+    let mut realized = BTreeMap::from([(input.index() as u64, input_value)]);
+    prefix.execute(&mut realized).unwrap();
+    assert_eq!(
+        realized[&(values_id.index() as u64)].to_le_bytes().unwrap(),
+        expected.0.to_le_bytes().unwrap()
+    );
+    assert_eq!(
+        realized[&(indices_id.index() as u64)]
+            .to_le_bytes()
+            .unwrap(),
+        expected.1.to_le_bytes().unwrap()
+    );
+
+    let mut unsupported = Graph::new();
+    let input = unsupported.input_dtype("x", [3], DType::F64);
+    let (values, indices) = unsupported.sort(input, 0, false).unwrap();
+    let item = crate::schedule_many(&unsupported, &[values, indices])
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(MetalError::Unsupported(reason)) if reason.contains("Bool/I32/U32/F32")
+    ));
+}
 
 #[test]
 fn portable_prefix_scan_metal_renders_common_matrix_and_executes_first_match_indices() {
@@ -1025,7 +1096,7 @@ impl Dispatch for MockDispatch {
             return Err(MetalError::InvalidArgument("invalid mock launch geometry"));
         }
         let mut bindings = KernelBindings::default();
-        let mut output = None;
+        let mut outputs = Vec::new();
         for (position, (raw, abi)) in buffers.iter().zip(&semantics.buffers).enumerate() {
             let logical = abi
                 .elements
@@ -1065,7 +1136,7 @@ impl Dispatch for MockDispatch {
                 .insert(&desc, value)
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
             if abi.mutable {
-                output = Some((*raw, logical));
+                outputs.push((*raw, logical));
             }
         }
         if let Some(transaction) = transaction {
@@ -1139,29 +1210,48 @@ impl Dispatch for MockDispatch {
         }
         // This is RustGrad's retained semantic artifact, not CpuBackend or
         // native Metal. Captured random stays graph-free and immutable.
-        let result = match semantics.program.as_ref() {
-            dispatch::KernelSemanticProgram::UOp(program) => {
-                execute_lowered_elementwise(program, &bindings)
-                    .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
-            }
-            dispatch::KernelSemanticProgram::Random(plan) => plan
-                .execute()
-                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?,
-        }
-        .to_le_bytes()
-        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
-        let (output, expected) =
-            output.ok_or_else(|| MetalError::InvalidBinding("mock output absent".into()))?;
-        if result.len() != expected {
+        let results = match semantics.program.as_ref() {
+            dispatch::KernelSemanticProgram::UOp(program) => match program.operation() {
+                crate::Operation::Sort(value) => {
+                    let input = bindings.get(value.input.index() as u64).ok_or_else(|| {
+                        MetalError::InvalidBinding("sort semantic input absent".into())
+                    })?;
+                    let (values, indices) = crate::portable_sort::PortableSortPair::new(value)
+                        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
+                        .execute(input)
+                        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+                    vec![values, indices]
+                }
+                _ => vec![
+                    execute_lowered_elementwise(program, &bindings)
+                        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?,
+                ],
+            },
+            dispatch::KernelSemanticProgram::Random(plan) => vec![
+                plan.execute()
+                    .map_err(|error| MetalError::InvalidBinding(error.to_string()))?,
+            ],
+        };
+        if outputs.is_empty() || results.len() != outputs.len() {
             return Err(MetalError::InvalidBinding(
-                "mock semantic output length mismatch".into(),
+                "mock output ABI mismatch".into(),
             ));
         }
-        state
-            .buffers
-            .get_mut(&(owner, output.0))
-            .ok_or(MetalError::OwnerMismatch)?
-            .copy_from_slice(&result);
+        for (result, (output, expected)) in results.into_iter().zip(outputs) {
+            let result = result
+                .to_le_bytes()
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+            if result.len() != expected {
+                return Err(MetalError::InvalidBinding(
+                    "mock semantic output length mismatch".into(),
+                ));
+            }
+            state
+                .buffers
+                .get_mut(&(owner, output.0))
+                .ok_or(MetalError::OwnerMismatch)?
+                .copy_from_slice(&result);
+        }
         state.calls.push(format!(
             "launch:{owner}:{}:{}",
             geometry.global, geometry.local
