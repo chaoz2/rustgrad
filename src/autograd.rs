@@ -1,5 +1,6 @@
 use crate::{
-    BinaryOp, DType, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp,
+    BinaryOp, DType, Error, Graph, NodeId, Op, ReductionDType, Result, Scalar, Shape, TensorData,
+    UnaryOp,
 };
 use std::collections::BTreeSet;
 
@@ -1289,7 +1290,7 @@ impl Graph {
                 }
                 Op::Expand { input, .. } => {
                     let input_shape = self.node(input)?.shape.clone();
-                    let grad = self.sum_to(upstream, input_shape)?;
+                    let grad = self.unbroadcast(upstream, input_shape)?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Gather { input, index, axis } => {
@@ -1711,16 +1712,33 @@ impl Graph {
     }
 
     fn unbroadcast(&mut self, gradient: NodeId, shape: Shape) -> Result<NodeId> {
-        if self.node(gradient)?.shape == shape {
+        let (source, dtype) = {
+            let gradient = self.node(gradient)?;
+            (gradient.shape.clone(), gradient.dtype)
+        };
+        if source == shape {
             Ok(gradient)
-        } else if self.node(gradient)?.dtype == DType::F32 {
-            // A concrete F32 sum-to is exactly a keepdim sum over leading and
-            // singleton target axes followed by a reshape. Keep the dedicated
-            // SumTo node for other storage contracts, whose accumulation may
-            // intentionally differ, while making the common training VJP an
-            // executable ordinary schedule rather than a CPU-only graph op.
-            let source = self.node(gradient)?.shape.clone();
-            let padding = source.rank() - shape.rank();
+        } else {
+            // tinygrad reduces every shaped reverse edge by casting to
+            // `sum_acc_dtype`, summing the canonical broadcast axes, reshaping
+            // to the source descriptor, and casting once back to the incoming
+            // gradient storage. Keep raw Graph::sum_to available for its
+            // independent same-storage contract, but do not publish that
+            // CPU-only operation from ordinary reverse mode.
+            if shape.broadcast_with(&source).as_ref() != Ok(&source) {
+                return Err(Error::InvalidSumTo {
+                    from: source,
+                    to: shape,
+                });
+            }
+            let padding =
+                source
+                    .rank()
+                    .checked_sub(shape.rank())
+                    .ok_or_else(|| Error::InvalidSumTo {
+                        from: source.clone(),
+                        to: shape.clone(),
+                    })?;
             let mut axes = (0..padding)
                 .map(|axis| isize::try_from(axis).map_err(|_| Error::ShapeOverflow(source.clone())))
                 .collect::<Result<Vec<_>>>()?;
@@ -1738,10 +1756,20 @@ impl Graph {
                     })
                     .collect::<Result<Vec<_>>>()?,
             );
-            let reduced = self.reduce(gradient, crate::ReduceKind::Sum, Some(axes), true)?;
-            self.reshape(reduced, shape)
-        } else {
-            self.sum_to(gradient, shape)
+            let accumulator = dtype.sum_accumulator_dtype();
+            let reduced = self.reduce_with_dtypes(
+                gradient,
+                crate::ReduceKind::Sum,
+                Some(axes),
+                true,
+                ReductionDType::new(accumulator, accumulator),
+            )?;
+            let reshaped = self.reshape(reduced, shape)?;
+            if accumulator == dtype {
+                Ok(reshaped)
+            } else {
+                self.cast(reshaped, dtype)
+            }
         }
     }
 
@@ -1931,6 +1959,10 @@ mod tests {
         TensorData::from_scalars(shape, DType::F64, values.iter().copied().map(Scalar::F)).unwrap()
     }
 
+    fn typed_data(shape: impl Into<Shape>, dtype: DType, values: &[f64]) -> TensorData {
+        TensorData::from_scalars(shape, dtype, values.iter().copied().map(Scalar::F)).unwrap()
+    }
+
     #[test]
     fn stable_sort_values_vjp_uses_the_paired_stable_indices() {
         let mut graph = Graph::new();
@@ -2050,6 +2082,308 @@ mod tests {
             CpuBackend.execute(&graph, wide_grad, &inputs).unwrap(),
             data_f64([1, 2], &[3.0, 3.0])
         );
+    }
+
+    #[test]
+    fn typed_unbroadcast_uses_canonical_axes_and_never_emits_sum_to() {
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let target = graph.input_dtype("target", [1, 3], dtype);
+            let other = graph.input_dtype("other", [2, 4, 3], dtype);
+            let output = graph.add(target, other).unwrap();
+            let seed = graph
+                .lazy_full_with_dtype([2, 4, 3], Scalar::F(1.0), dtype)
+                .unwrap();
+            let first_vjp_node = graph.node_count();
+            let gradient = graph.grad_with(output, target, Some(seed), true).unwrap();
+
+            assert_eq!(graph.shape(gradient).unwrap(), &Shape::from([1, 3]));
+            assert_eq!(graph.dtype(gradient).unwrap(), dtype);
+            assert!(
+                (first_vjp_node..graph.node_count())
+                    .map(NodeId)
+                    .all(|node| !matches!(graph.op(node).unwrap(), Op::SumTo { .. }))
+            );
+
+            let reductions = (first_vjp_node..graph.node_count())
+                .map(NodeId)
+                .filter(|node| {
+                    matches!(
+                        graph.op(*node).unwrap(),
+                        Op::Reduce {
+                            kind: crate::ReduceKind::Sum,
+                            axes,
+                            keepdim: true,
+                            ..
+                        } if axes.as_slice() == [0, 1]
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(reductions.len(), 1);
+            let accumulator = dtype.sum_accumulator_dtype();
+            assert_eq!(graph.dtype(reductions[0]).unwrap(), accumulator);
+            let Op::Reduce {
+                accumulator: committed,
+                ..
+            } = graph.op(reductions[0]).unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(*committed, accumulator);
+            if matches!(dtype, DType::F16 | DType::BF16) {
+                assert!(
+                    matches!(graph.op(gradient).unwrap(), Op::Cast { dtype: actual, .. } if *actual == dtype)
+                );
+                assert!(
+                    (first_vjp_node..graph.node_count())
+                        .map(NodeId)
+                        .any(|node| matches!(
+                            graph.op(node).unwrap(),
+                            Op::Cast {
+                                dtype: DType::F32,
+                                ..
+                            }
+                        ))
+                );
+            }
+
+            let actual = CpuBackend
+                .execute(&graph, gradient, &HashMap::new())
+                .unwrap();
+            assert_eq!(actual, typed_data([1, 3], dtype, &[8.0, 8.0, 8.0]));
+        }
+    }
+
+    #[test]
+    fn narrow_unbroadcast_accumulates_in_f32_then_narrows_once() {
+        for (dtype, magnitude) in [(DType::F16, 2048.0), (DType::BF16, 256.0)] {
+            let mut graph = Graph::new();
+            let target = graph.input_dtype("target", [1], dtype);
+            let other = graph.input_dtype("other", [3], dtype);
+            let output = graph.add(target, other).unwrap();
+            let seed = graph.constant(typed_data([3], dtype, &[magnitude, 1.0, -magnitude]));
+            let gradient = graph.grad_with(output, target, Some(seed), true).unwrap();
+
+            // Per-step narrow accumulation would lose the middle one. The
+            // source contract widens the complete sum and narrows only here.
+            assert_eq!(
+                CpuBackend
+                    .execute(&graph, gradient, &HashMap::new())
+                    .unwrap(),
+                typed_data([1], dtype, &[1.0])
+            );
+            let Op::Cast {
+                input: reshaped,
+                dtype: final_dtype,
+            } = graph.op(gradient).unwrap()
+            else {
+                panic!("narrow unbroadcast must end in one storage cast")
+            };
+            assert_eq!(*final_dtype, dtype);
+            let reduced = match graph.op(*reshaped).unwrap() {
+                Op::Reshape { input, .. } => *input,
+                // A keepdim reduction already has the target descriptor for
+                // this rank-one fixture, so the checked reshape is identity.
+                Op::Reduce { .. } => *reshaped,
+                _ => panic!("narrow unbroadcast must retain its widened reduction"),
+            };
+            assert!(matches!(
+                graph.op(reduced).unwrap(),
+                Op::Reduce {
+                    kind: crate::ReduceKind::Sum,
+                    accumulator: DType::F32,
+                    ..
+                }
+            ));
+            assert_eq!(graph.dtype(reduced).unwrap(), DType::F32);
+        }
+    }
+
+    #[test]
+    fn raw_sum_to_retains_its_same_storage_compatibility_contract() {
+        let mut graph = Graph::new();
+        let input = graph.constant(typed_data([3], DType::F16, &[2048.0, 1.0, -2048.0]));
+        let reduced = graph.sum_to(input, [1]).unwrap();
+        assert!(matches!(graph.op(reduced).unwrap(), Op::SumTo { .. }));
+        assert_eq!(graph.dtype(reduced).unwrap(), DType::F16);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, reduced, &HashMap::new())
+                .unwrap(),
+            typed_data([1], DType::F16, &[1.0])
+        );
+    }
+
+    #[test]
+    fn typed_unbroadcast_preserves_the_incoming_cotangent_storage() {
+        let mut identity_graph = Graph::new();
+        let identity_target = identity_graph.input_dtype("target", [3], DType::F16);
+        let identity_other = identity_graph.input_dtype("other", [3], DType::F16);
+        let identity_output = identity_graph.add(identity_target, identity_other).unwrap();
+        let identity_seed = identity_graph.input_dtype("seed", [3], DType::I32);
+        assert_eq!(
+            identity_graph
+                .gradient(identity_output, &[identity_target], Some(identity_seed))
+                .unwrap(),
+            vec![identity_seed]
+        );
+
+        let before = identity_graph.node_count();
+        assert!(matches!(
+            identity_graph.grad_with(
+                identity_output,
+                identity_target,
+                Some(identity_seed),
+                true
+            ),
+            Err(Error::NonDifferentiableTarget(node)) if node == identity_seed
+        ));
+        assert_eq!(identity_graph.node_count(), before);
+
+        let mut graph = Graph::new();
+        let target = graph.input_dtype("target", [1], DType::F16);
+        let other = graph.input_dtype("other", [2, 3], DType::F16);
+        let output = graph.add(target, other).unwrap();
+        let seed = graph.constant(typed_data(
+            [2, 3],
+            DType::I8,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        ));
+        let gradient = graph.gradient(output, &[target], Some(seed)).unwrap()[0];
+        assert_eq!(graph.dtype(gradient).unwrap(), DType::I8);
+        let Op::Cast {
+            input: reshaped,
+            dtype: DType::I8,
+        } = graph.op(gradient).unwrap()
+        else {
+            panic!("I8 unbroadcast must narrow its I32 accumulation once")
+        };
+        let Op::Reshape { input: reduced, .. } = graph.op(*reshaped).unwrap() else {
+            panic!("I8 unbroadcast must reshape its I32 reduction")
+        };
+        assert_eq!(graph.dtype(*reduced).unwrap(), DType::I32);
+        assert!(matches!(
+            graph.op(*reduced).unwrap(),
+            Op::Reduce {
+                kind: crate::ReduceKind::Sum,
+                accumulator: DType::I32,
+                ..
+            }
+        ));
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, gradient, &HashMap::new())
+                .unwrap(),
+            typed_data([1], DType::I8, &[21.0])
+        );
+    }
+
+    #[test]
+    fn typed_unbroadcast_preserves_scalar_zero_duplicate_and_higher_order_edges() {
+        let mut graph = Graph::new();
+        let scalar = graph.input("scalar", []);
+        let scalar_squared = graph.square(scalar).unwrap();
+        let scalar_gradient = graph.grad(scalar_squared, scalar).unwrap();
+        assert_eq!(graph.shape(scalar_gradient).unwrap(), &Shape::from([]));
+
+        let empty = graph.input("empty", [1, 0]);
+        let expanded_empty = graph.expand(empty, [2, 0]).unwrap();
+        let empty_loss = graph.sum_all(expanded_empty).unwrap();
+        let empty_gradient = graph.grad(empty_loss, empty).unwrap();
+        assert_eq!(graph.shape(empty_gradient).unwrap(), &Shape::from([1, 0]));
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, empty_gradient, &HashMap::new())
+                .unwrap(),
+            data([1, 0], &[])
+        );
+
+        let value = graph.input("value", [1]);
+        let expanded = graph.expand(value, [3]).unwrap();
+        let repeated = graph.add(expanded, expanded).unwrap();
+        let squared = graph.square(repeated).unwrap();
+        let loss = graph.sum_all(squared).unwrap();
+        let first = graph.grad(loss, value).unwrap();
+        let first_sum = graph.sum_all(first).unwrap();
+        let second = graph.grad(first_sum, value).unwrap();
+        // The exact second derivative is the constant 24, so its value edge
+        // no longer needs the original input even though it remains fully
+        // graph-constructible and executable.
+        assert!(!graph.backward_slice_contains(second, value).unwrap());
+        let bindings = HashMap::from([
+            ("scalar".into(), data([], &[2.0])),
+            ("empty".into(), data([1, 0], &[])),
+            ("value".into(), data([1], &[2.0])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, first, &bindings).unwrap(),
+            data([1], &[48.0])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, second, &bindings).unwrap(),
+            data([1], &[24.0])
+        );
+        assert!(
+            (0..graph.node_count())
+                .map(NodeId)
+                .all(|node| !matches!(graph.op(node).unwrap(), Op::SumTo { .. }))
+        );
+    }
+
+    #[test]
+    fn float8_unbroadcast_uses_f32_accumulation_for_every_format() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let mut graph = Graph::new();
+            let target = graph.input_dtype("target", [1], dtype);
+            let other = graph.input_dtype("other", [2, 2], dtype);
+            let output = graph.add(target, other).unwrap();
+            let seed = graph.constant(typed_data([2, 2], dtype, &[1.0, 2.0, 3.0, 4.0]));
+            let first_vjp_node = graph.node_count();
+            let gradient = graph.grad_with(output, target, Some(seed), true).unwrap();
+
+            assert_eq!(graph.dtype(gradient).unwrap(), dtype);
+            let Op::Cast {
+                input: reshaped,
+                dtype: final_dtype,
+            } = graph.op(gradient).unwrap()
+            else {
+                panic!("Float8 unbroadcast must encode its F32 sum once")
+            };
+            assert_eq!(*final_dtype, dtype);
+            let Op::Reshape { input: reduced, .. } = graph.op(*reshaped).unwrap() else {
+                panic!("Float8 unbroadcast must retain the target descriptor")
+            };
+            assert!(matches!(
+                graph.op(*reduced).unwrap(),
+                Op::Reduce {
+                    kind: crate::ReduceKind::Sum,
+                    accumulator: DType::F32,
+                    ..
+                }
+            ));
+            assert!(
+                (first_vjp_node..graph.node_count())
+                    .map(NodeId)
+                    .any(|node| matches!(
+                        graph.op(node).unwrap(),
+                        Op::Cast {
+                            dtype: DType::F32,
+                            ..
+                        }
+                    ))
+            );
+            assert_eq!(
+                CpuBackend
+                    .execute(&graph, gradient, &HashMap::new())
+                    .unwrap(),
+                typed_data([1], dtype, &[10.0])
+            );
+        }
     }
 
     #[test]
@@ -2897,6 +3231,16 @@ mod tests {
             graph.gradient(vector, &[], Some(NodeId(usize::MAX))),
             Err(Error::UnknownNode(NodeId(usize::MAX)))
         ));
+        assert_eq!(graph.node_count(), before);
+
+        let float8_scalar = graph.input_dtype("float8_scalar", [], DType::F8E5M2);
+        let before = graph.node_count();
+        assert!(
+            graph
+                .gradient_default(float8_scalar, &[])
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(graph.node_count(), before);
 
         let integer = graph.input_dtype("integer", [], DType::I32);

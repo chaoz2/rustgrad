@@ -1646,6 +1646,18 @@ Cast boundaries, and unrequested operand derivatives are not traversed or
 built. The complete seed and derivative candidate commits only after every
 local rule succeeds. The static graph does not retain or free a tape: the graph
 is immutable in meaning, and each successful transform appends nodes.
+Ordinary broadcast-shaped reverse edges, including `Expand`, share one private
+typed unbroadcast projection: equal descriptors are identities; otherwise the
+incoming cotangent casts to its `sum_accumulator_dtype`, reduces the checked
+leading and singleton broadcast axes, reshapes to the operand descriptor, and
+casts once back to the incoming cotangent storage. Thus Bool/integer cotangents
+follow their established accumulator widths, Float8/F16/BF16 accumulate in F32,
+and F32/F64 retain their width. The public raw
+`Graph::sum_to` operation and its same-storage CPU contract remain available
+but are no longer emitted by ordinary VJPs. Float8 broadcast unbroadcast is
+covered by the CPU oracle for all four formats; broader Float8 derivative rules
+and native/device execution retain their existing local capability gates. No
+new Op, UOp, schedule, capture, or artifact tag is introduced.
 Parameters retain graph-independent versioned host state. A graph-local
 registry captures each parameter identity and version into one immutable input
 leaf; optimizer writes reject stale or

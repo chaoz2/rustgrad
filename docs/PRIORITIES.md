@@ -473,7 +473,7 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   a strong Graph operand before lowering. It adds no weak dtype/storage/UOp,
   artifact/cache identity, runtime, or device capability.
 
-- Float8 autograd, random, broader CPU-JIT/native replay beyond F32/F64 log2,
+- Float8 autograd beyond typed broadcast unbroadcast, random, broader CPU-JIT/native replay beyond F32/F64 log2,
   and device execution;
   strict opt-in native static-module inference covers static F32 Linear,
   Linear→ReLU→Linear, and the released two-class configured 1×1-Conv CIFAR
