@@ -871,13 +871,32 @@ pub fn execute_elementwise(
     execute_lowered_elementwise(&kernel, &bindings)
 }
 
-/// Executes an already-lowered pure elementwise UOp with checked owned bindings.
-/// This is crate-private so CUDA's test mock can use the same independent
-/// semantic oracle without making host materialization part of a runtime path.
+/// Executes an already-lowered pure kernel UOp with checked owned bindings.
+/// Movement roots delegate to their canonical immutable plan; ordinary fused
+/// roots retain the elementwise evaluator below. This is crate-private so
+/// CUDA's test mock can use the same independent semantic oracle without
+/// making host materialization part of a runtime path.
 pub(crate) fn execute_lowered_elementwise(
     kernel: &UOp,
     bindings: &KernelBindings,
 ) -> Result<TensorData> {
+    if let Operation::Movement(crate::MovementValue::Plan(plan)) = kernel.operation() {
+        let operands = plan
+            .input_operands()
+            .into_iter()
+            .map(|operand| {
+                bindings
+                    .get(operand.node.index() as u64)
+                    .cloned()
+                    .ok_or(Error::InvalidIndex)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return plan
+            .execute(&operands)
+            .map_err(|error| Error::Serialization {
+                reason: error.to_string(),
+            });
+    }
     if let Operation::Random(plan) = kernel.operation() {
         return plan.execute();
     }

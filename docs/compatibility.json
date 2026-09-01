@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:3682e5470f22a5fa",
+  "source_fingerprint": "fnv1a64:3d54aec8bbbb3fa1",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -441,7 +441,7 @@
       "subject": "Computed affine read materialization",
       "status": "verified",
       "fields": {
-        "Acceptance requirement": "Requested or dense-consumer views of pure computed producers use the existing `MovementKernelPlan::AffineCopy` as a fresh owned output. Exact checked affine read bounds admit injective, signed-reverse, and zero-stride broadcast maps without applying write-target alias rules; native movement-v2 addressing normalizes those proofs to nonnegative indices and copies raw storage widths. Diagonal's Pad-to-view composition, computed Expand and reverse Stride, shared producer dependencies, captured interpreter replay, and strict native CPU rendering are acceptance-tested. Existing movement artifact kind/tag/cache identity and source Input/Constant passthrough are unchanged. Symbolic computed views, effects, non-affine reshape, and unsupported devices remain fail-closed."
+        "Acceptance requirement": "Requested or dense-consumer views of pure computed producers use the existing `MovementKernelPlan::AffineCopy` as a fresh owned output. Exact checked affine read bounds admit injective, signed-reverse, and zero-stride broadcast maps without applying write-target alias rules; native movement-v2 addressing normalizes those proofs to nonnegative indices and copies raw storage widths. A separate `rustgrad-ptx-affine-copy-v1` renderer consumes only the validated concrete plan, retains its exact input/output schedule ABI, and emits unsigned 64-bit normalized addressing with raw 8/16/32/64-bit copies across all 17 concrete storage dtypes. Fixed-schema CUDA graph mocks cover device-resident computed reverse and broadcast prefixes with one upload/launch/download. Diagonal's Pad-to-view composition, shared producer dependencies, captured interpreter replay, and strict native CPU rendering remain acceptance-tested. Existing movement artifact tags/bytes/cache identity, generic elementwise PTX v28, and source Input/Constant passthrough are unchanged. Symbolic computed views, effects, non-affine reshape, other movement plans, OpenCL/Metal/WebGPU, and live CUDA validation remain fail-closed or unclaimed."
       }
     },
     {

@@ -1,16 +1,17 @@
 //! Deterministic phase-one PTX rendering and Driver launch glue.
 //!
-//! The renderer intentionally accepts only the fused elementwise UOp subset
-//! that has a clear PTX contract. The CPU UOp interpreter remains the semantic
+//! The renderer accepts the fused UOp subset and immutable kernel plans that
+//! have a complete PTX contract. The CPU UOp interpreter remains the semantic
 //! oracle; only exact static F32/F64 sum/mean reductions are admitted. Narrow
-//! floats remain rejected outside the validated operation-scoped storage ABI;
-//! guarded integer division/shifts and device-status reporting remain
-//! fail-closed.
+//! floats remain rejected outside validated operation-scoped or raw-copy
+//! storage ABIs; guarded integer division/shifts and device-status reporting
+//! remain fail-closed.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
     AddressSpace, AddressValue, BufferView, Capture, CudaError, DType, Function, IndexValue,
-    LaunchConfig, LiteralValue, MatmulValue, Operation, ReductionValue, Shape, Stream, UOp, UType,
+    LaunchConfig, LiteralValue, MatmulValue, MovementKernelKind, MovementValue, Operation,
+    ReductionValue, Shape, Stream, UOp, UType,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -26,6 +27,8 @@ mod matmul;
 mod matmul_tests;
 
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v28";
+/// Separate identity for raw storage-width computed affine materialization.
+pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 /// Versioned contract for the sole opt-in linked NVVM-backed F32 Exp route.
@@ -155,6 +158,37 @@ impl RenderedPtx {
                 ));
             }
         }
+        if let Some(KernelSemanticProgram::UOp(program)) = &self.semantic_program
+            && let Operation::Movement(MovementValue::Plan(plan)) = program.operation()
+        {
+            plan.validate()
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+            let MovementKernelKind::AffineCopy { input, .. } = &plan.kind else {
+                return Err(PtxError::Unsupported(
+                    "only AffineCopy has a PTX movement lowering".into(),
+                ));
+            };
+            let input_elements = input.shape.numel().map_err(|_| PtxError::Overflow)?;
+            let output_elements = plan.output_shape.numel().map_err(|_| PtxError::Overflow)?;
+            if self.launch != PtxLaunchGeometry::Linear
+                || self.extent != output_elements
+                || self.buffers.len() != 2
+                || self.buffers[0].id != input.node.index() as u64
+                || self.buffers[0].dtype != input.dtype
+                || self.buffers[0].source_shape != input.shape
+                || self.buffers[0].elements != input_elements
+                || self.buffers[0].mutable
+                || self.buffers[1].id != plan.output.index() as u64
+                || self.buffers[1].dtype != plan.dtype
+                || self.buffers[1].source_shape != plan.output_shape
+                || self.buffers[1].elements != output_elements
+                || !self.buffers[1].mutable
+            {
+                return Err(PtxError::InvalidBinding(
+                    "affine-copy PTX launch disagrees with its movement plan".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -190,13 +224,13 @@ impl RenderedPtx {
         }
     }
     fn validate_pointer_alignment(&self, index: usize, pointer: u64) -> Result<(), PtxError> {
-        let alignment = if matches!(
-            self.semantic_program,
-            Some(KernelSemanticProgram::TensorCoreMatmul(_))
-        ) {
-            16
-        } else {
-            1
+        let alignment = match &self.semantic_program {
+            Some(KernelSemanticProgram::TensorCoreMatmul(_)) => 16,
+            Some(KernelSemanticProgram::UOp(program)) => match program.operation() {
+                Operation::Movement(MovementValue::Plan(plan)) => plan.dtype.itemsize(),
+                _ => 1,
+            },
+            _ => 1,
         };
         if pointer % alignment as u64 != 0 {
             return Err(PtxError::InvalidBinding(format!(
@@ -526,6 +560,14 @@ fn render(
     root: &UOp,
     allow_linked_f32_exp: bool,
 ) -> Result<RenderedPtx, PtxError> {
+    if let Operation::Movement(value) = root.operation() {
+        return match value {
+            MovementValue::Plan(plan) => render_affine_copy(renderer, root, plan),
+            MovementValue::QuantizedRowGather(_) => Err(PtxError::Unsupported(
+                "quantized row gather is outside affine-copy PTX lowering".into(),
+            )),
+        };
+    }
     if let Operation::Random(plan) = root.operation() {
         return render_random(renderer, root, plan);
     }
@@ -777,6 +819,154 @@ fn render(
         launch: PtxLaunchGeometry::Linear,
         semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
     })
+}
+
+/// Renders the one movement plan whose address domain is completely proved
+/// before source generation. The kernel copies storage words rather than
+/// numeric values, preserving every concrete dtype payload exactly.
+fn render_affine_copy(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedPtx, PtxError> {
+    root.validate()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    plan.validate()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    let MovementKernelKind::AffineCopy { input, view } = &plan.kind else {
+        return Err(PtxError::Unsupported(
+            "only AffineCopy has a PTX movement lowering".into(),
+        ));
+    };
+    let normalized = view
+        .normalized_read()
+        .map_err(|_| PtxError::InvalidBinding("invalid affine-copy read map".into()))?;
+    let input_elements = input.shape.numel().map_err(|_| PtxError::Overflow)?;
+    let extent = plan.output_shape.numel().map_err(|_| PtxError::Overflow)?;
+    if extent > u32::MAX as usize {
+        return Err(PtxError::Unsupported(
+            "affine-copy PTX linear extent exceeds u32 thread indexing".into(),
+        ));
+    }
+    let width = plan.dtype.itemsize();
+    let raw_type = match width {
+        1 => "u8",
+        2 => "u16",
+        4 => "u32",
+        8 => "u64",
+        _ => {
+            return Err(PtxError::Unsupported(format!(
+                "affine-copy PTX storage width {width}"
+            )));
+        }
+    };
+    let buffers = vec![
+        PtxBufferAbi {
+            id: input.node.index() as u64,
+            dtype: input.dtype,
+            source_shape: input.shape.clone(),
+            elements: input_elements,
+            mutable: false,
+        },
+        PtxBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: plan.dtype,
+            source_shape: plan.output_shape.clone(),
+            elements: extent,
+            mutable: true,
+        },
+    ];
+    let entry = format!("rg_affine_copy_w{width}_r{}", plan.output_shape.rank());
+    let mut lines = vec![
+        format!("// {PTX_AFFINE_COPY_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        String::new(),
+        format!(".visible .entry {entry}("),
+        "  .param .u64 p0,".into(),
+        "  .param .u64 p1,".into(),
+        "  .param .u64 extent".into(),
+        ")".into(),
+        "{".into(),
+        "  .reg .pred %p<2>;".into(),
+        "  .reg .b32 %r<8>;".into(),
+        "  .reg .b64 %rd<16>;".into(),
+        "  ld.param.u64 %rd10, [p0];".into(),
+        "  ld.param.u64 %rd11, [p1];".into(),
+        "  ld.param.u64 %rd0, [extent];".into(),
+        "  mov.u32 %r0, %ctaid.x;".into(),
+        "  mov.u32 %r1, %ntid.x;".into(),
+        "  mov.u32 %r2, %tid.x;".into(),
+        "  mad.lo.u32 %r3, %r0, %r1, %r2;".into(),
+        "  cvt.u64.u32 %rd3, %r3;".into(),
+        "  setp.ge.u64 %p0, %rd3, %rd0;".into(),
+        "  @%p0 bra DONE;".into(),
+        format!("  mov.u64 %rd4, {};", normalized.offset),
+    ];
+    for (axis, (&dimension, normalized_axis)) in plan
+        .output_shape
+        .dims()
+        .iter()
+        .zip(&normalized.axes)
+        .enumerate()
+    {
+        if extent == 0 || dimension <= 1 || normalized_axis.stride == 0 {
+            continue;
+        }
+        let divisor = plan.output_shape.dims()[axis + 1..]
+            .iter()
+            .try_fold(1usize, |product, next| product.checked_mul(*next))
+            .ok_or(PtxError::Overflow)?;
+        lines.push(format!("  div.u64 %rd5, %rd3, {divisor};"));
+        lines.push(format!("  rem.u64 %rd5, %rd5, {dimension};"));
+        if normalized_axis.reversed {
+            lines.push(format!("  sub.u64 %rd5, {}, %rd5;", dimension - 1));
+        }
+        lines.push(format!(
+            "  mul.lo.u64 %rd6, %rd5, {};",
+            normalized_axis.stride
+        ));
+        lines.push("  add.u64 %rd4, %rd4, %rd6;".into());
+    }
+    lines.extend([
+        format!("  mul.lo.u64 %rd6, %rd4, {width};"),
+        "  add.u64 %rd6, %rd10, %rd6;".into(),
+        format!("  mul.lo.u64 %rd7, %rd3, {width};"),
+        "  add.u64 %rd7, %rd11, %rd7;".into(),
+        format!(
+            "  ld.global.{raw_type} %{}, [%rd6];",
+            if width == 8 { "rd8" } else { "r4" }
+        ),
+        format!(
+            "  st.global.{raw_type} [%rd7], %{};",
+            if width == 8 { "rd8" } else { "r4" }
+        ),
+        "DONE:".into(),
+        "  ret;".into(),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        PTX_AFFINE_COPY_RENDERER_VERSION,
+        PTX_ABI_VERSION,
+        renderer.sm,
+        plan,
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedPtx {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        cache_key,
+        entry,
+        launch: PtxLaunchGeometry::Linear,
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
+    };
+    rendered.validate()?;
+    Ok(rendered)
 }
 
 /// Renders an immutable captured Threefry source.  It has exactly one output
@@ -6846,7 +7036,9 @@ impl PtxCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, Driver, Graph, Scalar, TensorData, UOp, UType};
+    use crate::{
+        Backend, CpuBackend, Driver, Graph, MovementKernelKind, Scalar, TensorData, UOp, UType,
+    };
     use std::{
         collections::HashMap,
         sync::{Arc, Barrier},
@@ -6871,6 +7063,176 @@ mod tests {
             .unwrap()
             .retain_primary_context()
             .unwrap()
+    }
+
+    fn computed_reverse_item(dtype: DType) -> crate::ScheduleItem {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], dtype);
+        let producer = graph.square(input).unwrap();
+        let output = graph
+            .stride(
+                producer,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        crate::schedule(&graph, output)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.node == output)
+            .unwrap()
+    }
+
+    #[test]
+    fn computed_affine_copy_ptx_uses_normalized_unsigned_raw_storage_abi() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        let item = computed_reverse_item(DType::F32);
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert_eq!(rendered.extent, 4);
+        assert_eq!(rendered.buffers.len(), 2);
+        assert!(!rendered.buffers[0].mutable);
+        assert!(rendered.buffers[1].mutable);
+        assert!(rendered.source.contains(PTX_AFFINE_COPY_RENDERER_VERSION));
+        assert!(rendered.source.contains("sub.u64 %rd5, 3, %rd5;"));
+        assert!(rendered.source.contains("ld.global.u32 %r4"));
+        assert!(rendered.source.contains("st.global.u32"));
+        assert!(!rendered.source.contains("mad.lo.s64"));
+        assert!(!rendered.source.contains(".s64"));
+        assert!(matches!(
+            &rendered.semantic_program,
+            Some(KernelSemanticProgram::UOp(program))
+                if matches!(program.operation(), Operation::Movement(MovementValue::Plan(plan))
+                    if matches!(&plan.kind, MovementKernelKind::AffineCopy { .. }))
+        ));
+        let repeated = renderer.render(&item.kernel).unwrap();
+        assert_eq!(rendered.source, repeated.source);
+        assert_eq!(rendered.cache_key, repeated.cache_key);
+        let bytes = crate::uop::artifact::encode(&item.kernel).unwrap();
+        let decoded = crate::uop::artifact::decode(&bytes).unwrap();
+        assert_eq!(crate::uop::artifact::encode(&decoded).unwrap(), bytes);
+        let decoded_rendered = renderer.render(&decoded).unwrap();
+        assert_eq!(decoded_rendered.source, rendered.source);
+        assert_eq!(decoded_rendered.cache_key, rendered.cache_key);
+
+        let mut wrong_abi = rendered.clone();
+        wrong_abi.buffers[0].elements += 1;
+        assert!(matches!(
+            wrong_abi.validate(),
+            Err(PtxError::InvalidBinding(_))
+        ));
+        let Operation::Movement(MovementValue::Plan(plan)) = item.kernel.operation() else {
+            panic!("affine-copy movement root")
+        };
+        let mut stale_plan = plan.as_ref().clone();
+        stale_plan.cache_key ^= 1;
+        let stale_root = UOp::from_operation(
+            Operation::Movement(MovementValue::Plan(Box::new(stale_plan))),
+            Some(UType::scalar(DType::F32)),
+            vec![],
+        );
+        assert!(matches!(
+            renderer.render(&stale_root),
+            Err(PtxError::InvalidBinding(_))
+        ));
+    }
+
+    #[test]
+    fn computed_affine_copy_ptx_admits_every_concrete_raw_storage_width() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for dtype in DType::ALL {
+            let item = computed_reverse_item(dtype);
+            let rendered = renderer.render(&item.kernel).unwrap();
+            let raw = match dtype.itemsize() {
+                1 => "u8",
+                2 => "u16",
+                4 => "u32",
+                8 => "u64",
+                width => panic!("unexpected concrete storage width {width}"),
+            };
+            assert!(
+                rendered.source.contains(&format!("ld.global.{raw}")),
+                "{dtype:?} raw load"
+            );
+            assert!(
+                rendered.source.contains(&format!("st.global.{raw}")),
+                "{dtype:?} raw store"
+            );
+            assert_eq!(rendered.buffers[0].dtype, dtype);
+            assert_eq!(rendered.buffers[1].dtype, dtype);
+        }
+    }
+
+    #[test]
+    fn computed_affine_copy_cuda_mock_preserves_f32_payload_bits() {
+        use std::num::NonZeroUsize;
+
+        let item = computed_reverse_item(DType::F32);
+        let rendered = PtxRenderer::new(80).unwrap().render(&item.kernel).unwrap();
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let allocator = primary.allocator();
+        let input = allocator.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        let output = allocator.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        let raw = [0x8000_0000_u32, 0x7fc1_2345, 0x7f80_0000, 0xff80_0000];
+        let bytes = raw
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        input.view().unwrap().copy_from(0, &bytes).unwrap();
+        let kernel = ConcurrentPtxCache::new()
+            .get_or_load(&primary, rendered, 32)
+            .unwrap();
+        kernel
+            .launch(
+                &primary.stream().unwrap(),
+                &[
+                    PtxBinding {
+                        buffer: input.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: output.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: true,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+        let mut actual = vec![0; 16];
+        output.view().unwrap().copy_to(0, &mut actual).unwrap();
+        assert_eq!(
+            actual,
+            raw.into_iter()
+                .rev()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn non_affine_copy_movement_plans_remain_fail_closed_in_ptx() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::I32);
+        let output = graph.pad(input, [(1, 1)], Scalar::I(0)).unwrap();
+        let item = crate::schedule(&graph, output)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.node == output)
+            .unwrap();
+        assert!(matches!(
+            PtxRenderer::new(80).unwrap().render(&item.kernel),
+            Err(PtxError::Unsupported(reason)) if reason.contains("only AffineCopy")
+        ));
     }
 
     fn global(dtype: DType, buffer: u64) -> UOp {
