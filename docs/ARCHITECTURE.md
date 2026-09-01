@@ -1519,10 +1519,23 @@ the producer's exact dense shape or one element. Such loads reuse the existing
 `IndexValue::View`; no second index or movement taxonomy is introduced. The
 Contiguous node remains the schedule, capture, dependency, and output identity;
 requested, shared, external, stateful, guarded/faulting, specialized, nested
-source-view, nontrivially broadcast, dynamic, and otherwise uncertain producers
+source-view, coordinate-div/mod reshape, dynamic, and otherwise uncertain producers
 retain the explicit copy. Eligibility is rehearsed through the existing PTX,
 OpenCL, Metal, and WGSL ordinary-kernel renderers, so a dtype or scalar operation
 outside any established backend route keeps the raw copy.
+Ordinary same-geometry scalar consumers also use this checked affine read
+composition without inserting a Contiguous boundary. Candidate collection is
+branch-local: each removable computed producer must have one canonical affine
+map across all of its exclusively owned occurrences, while scalar leaves splat
+and exact or right-broadcast-compatible materialized leaves receive their own
+`IndexValue::View`. Lowering memoizes by graph node plus affine map, so a diamond
+under one map shares its UOp while two maps of the same producer remain split.
+The final normalized Sink—not the graph walk—owns the input/dependency ABI and
+is rehearsed by every portable renderer before roots are removed. Requested,
+shared, external, faulting, specialized, nested-map, symbolic, or otherwise
+uncertain branches retain their materialization boundaries. Schedule item and
+cache identities can consequently change from a split producer/view/consumer
+chain to one existing ordinary Sink, but durable UOp and artifact formats do not.
 Signed reverse and
 zero-stride broadcast reads are valid
 because source aliases never alias the output or each other as write targets.

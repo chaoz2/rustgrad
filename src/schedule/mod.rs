@@ -1212,6 +1212,356 @@ struct ContiguousRedirection {
     kernel: UOp,
 }
 
+struct AffineScalarFusion {
+    removed_roots: BTreeSet<usize>,
+    load_nodes: BTreeSet<usize>,
+    kernel: UOp,
+}
+
+#[derive(Default)]
+struct AffineScalarCandidates {
+    maps: BTreeMap<usize, BTreeSet<crate::AffineView>>,
+    direct_roots: BTreeSet<usize>,
+    view_roots: BTreeMap<usize, BTreeSet<usize>>,
+}
+
+struct AffineCandidateCollector<'a> {
+    graph: &'a Graph,
+    output: NodeId,
+    output_shape: &'a Shape,
+    roots: &'a BTreeSet<usize>,
+    external: &'a BTreeSet<usize>,
+    requested: &'a BTreeSet<usize>,
+    candidates: AffineScalarCandidates,
+    seen: BTreeSet<NodeId>,
+}
+
+impl AffineCandidateCollector<'_> {
+    fn record_view_roots(&mut self, terminal: NodeId, source: NodeId) -> Result<(), ScheduleError> {
+        let mut cursor = terminal;
+        while cursor != source {
+            if self.roots.contains(&cursor.index()) {
+                self.candidates
+                    .view_roots
+                    .entry(source.index())
+                    .or_default()
+                    .insert(cursor.index());
+            }
+            cursor = match self.graph.op(cursor).map_err(ScheduleError::Graph)? {
+                Op::Shrink { input, .. }
+                | Op::Reshape { input, .. }
+                | Op::Permute { input, .. }
+                | Op::Expand { input, .. }
+                | Op::Stride { input, .. } => *input,
+                _ => {
+                    return Err(ScheduleError::Binding(
+                        "invalid computed affine path".into(),
+                    ));
+                }
+            };
+        }
+        Ok(())
+    }
+
+    fn visit(&mut self, node: NodeId) -> Result<(), ScheduleError> {
+        let op = self.graph.op(node).map_err(ScheduleError::Graph)?;
+        let is_view = matches!(
+            op,
+            Op::Shrink { .. }
+                | Op::Reshape { .. }
+                | Op::Permute { .. }
+                | Op::Expand { .. }
+                | Op::Stride { .. }
+        );
+        if is_view
+            && !self.requested.contains(&node.index())
+            && !self.external.contains(&node.index())
+            && let Ok(planned) = crate::rangeify::computed_view(self.graph, node)
+            && self.roots.contains(&planned.source.index())
+            && let Ok(view) = planned.view.expand(self.output_shape.clone())
+        {
+            self.candidates
+                .maps
+                .entry(planned.source.index())
+                .or_default()
+                .insert(view);
+            // `computed_view` canonicalizes the whole movement chain to its
+            // ultimate producer. Retain every scheduled root on that path so
+            // an accepted scalar owner removes the complete physical chain,
+            // including a shared intermediate view hidden below two equivalent
+            // terminal maps.
+            self.record_view_roots(node, planned.source)?;
+            return Ok(());
+        }
+        if node != self.output && self.roots.contains(&node.index()) {
+            self.candidates.direct_roots.insert(node.index());
+            return Ok(());
+        }
+        let children = op.value_inputs();
+        if !self.seen.insert(node) {
+            return Ok(());
+        }
+        for child in children {
+            self.visit(child)?;
+        }
+        Ok(())
+    }
+}
+
+impl AffineScalarCandidates {
+    fn collect(
+        graph: &Graph,
+        output: NodeId,
+        roots: &BTreeSet<usize>,
+        external: &BTreeSet<usize>,
+        requested: &BTreeSet<usize>,
+    ) -> Result<Self, ScheduleError> {
+        let output_shape = graph.shape(output).map_err(ScheduleError::Graph)?;
+        let mut collector = AffineCandidateCollector {
+            graph,
+            output,
+            output_shape,
+            roots,
+            external,
+            requested,
+            candidates: Self::default(),
+            seen: BTreeSet::new(),
+        };
+        collector.visit(output)?;
+        Ok(collector.candidates)
+    }
+}
+
+fn checked_scalar_sink(
+    graph: &Graph,
+    output: NodeId,
+    kernel: UOp,
+    materialized: &BTreeSet<usize>,
+    removed: &BTreeSet<usize>,
+) -> Result<Option<(UOp, BTreeSet<usize>)>, ScheduleError> {
+    let kernel = crate::uop::normalize_kernel(&kernel).map_err(ScheduleError::UOp)?;
+    kernel.validate().map_err(ScheduleError::UOp)?;
+    let topology = kernel.topological().map_err(ScheduleError::UOp)?;
+    let stores = topology
+        .iter()
+        .filter(|value| matches!(value.operation(), crate::Operation::Store))
+        .collect::<Vec<_>>();
+    if stores.len() != 1
+        || kernel.sources().len() != 2
+        || !matches!(kernel.sources()[0].operation(), crate::Operation::Store)
+        || !matches!(kernel.sources()[1].operation(), crate::Operation::EndRange)
+    {
+        return Ok(None);
+    }
+    let output_desc = buffer(graph, output, false)?;
+    let Some(store_index) = stores[0].sources().first() else {
+        return Ok(None);
+    };
+    let crate::Operation::Index(crate::IndexValue::Buffer {
+        buffer: store_buffer,
+        elements,
+        input_shape,
+        output_shape,
+    }) = store_index.operation()
+    else {
+        return Ok(None);
+    };
+    if *store_buffer != output.index() as u64
+        || *elements != output_desc.shape.numel().map_err(ScheduleError::Graph)?
+        || input_shape != &output_desc.shape
+        || output_shape != &output_desc.shape
+    {
+        return Ok(None);
+    }
+    let mut load_nodes = BTreeSet::new();
+    for value in &topology {
+        if crate::kernel::scalar_uop_may_fault(value.operation()) {
+            return Ok(None);
+        }
+        if !matches!(value.operation(), crate::Operation::Load) {
+            continue;
+        }
+        let Some(index) = value.sources().first() else {
+            return Ok(None);
+        };
+        let loaded = match index.operation() {
+            crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })
+            | crate::Operation::Index(crate::IndexValue::View { buffer, .. }) => *buffer,
+            _ => return Ok(None),
+        };
+        let loaded = usize::try_from(loaded).map_err(|_| ScheduleError::Overflow)?;
+        if removed.contains(&loaded) {
+            return Ok(None);
+        }
+        let loaded_node = NodeId::from_index(loaded);
+        let leaf = matches!(
+            graph.op(loaded_node).map_err(ScheduleError::Graph)?,
+            Op::Input { .. } | Op::Constant(_)
+        );
+        if !leaf && !materialized.contains(&loaded) {
+            return Ok(None);
+        }
+        load_nodes.insert(loaded);
+    }
+    if !portable_ordinary_kernel(&kernel) {
+        return Ok(None);
+    }
+    Ok(Some((kernel, load_nodes)))
+}
+
+fn graph_node_uses(graph: &Graph, output: NodeId, target: NodeId) -> Result<usize, ScheduleError> {
+    fn visit(
+        graph: &Graph,
+        node: NodeId,
+        target: NodeId,
+        seen: &mut BTreeSet<NodeId>,
+    ) -> Result<usize, ScheduleError> {
+        if node == target || !seen.insert(node) {
+            return Ok(0);
+        }
+        let mut uses = 0usize;
+        for child in graph.op(node).map_err(ScheduleError::Graph)?.value_inputs() {
+            if child == target {
+                uses = uses.checked_add(1).ok_or(ScheduleError::Overflow)?;
+            } else {
+                uses = uses
+                    .checked_add(visit(graph, child, target, seen)?)
+                    .ok_or(ScheduleError::Overflow)?;
+            }
+        }
+        Ok(uses)
+    }
+    visit(graph, output, target, &mut BTreeSet::new())
+}
+
+fn exclusive_affine_group(
+    graph: &Graph,
+    output: NodeId,
+    source: usize,
+    candidates: &AffineScalarCandidates,
+    external: &BTreeSet<usize>,
+    requested: &BTreeSet<usize>,
+    consumers: &[usize],
+) -> Result<Option<BTreeSet<usize>>, ScheduleError> {
+    let Some(maps) = candidates.maps.get(&source) else {
+        return Ok(None);
+    };
+    if maps.len() != 1
+        || candidates.direct_roots.contains(&source)
+        || requested.contains(&source)
+        || external.contains(&source)
+        || graph_node_uses(graph, output, NodeId::from_index(source))?
+            != consumers.get(source).copied().unwrap_or(0)
+    {
+        return Ok(None);
+    }
+    let mut group = BTreeSet::from([source]);
+    for view in candidates.view_roots.get(&source).into_iter().flatten() {
+        if requested.contains(view)
+            || external.contains(view)
+            || graph_node_uses(graph, output, NodeId::from_index(*view))?
+                != consumers.get(*view).copied().unwrap_or(0)
+        {
+            return Ok(None);
+        }
+        group.insert(*view);
+    }
+    Ok(Some(group))
+}
+
+fn scalar_fusion_materialized(
+    output: NodeId,
+    roots: &BTreeSet<usize>,
+    external: &BTreeSet<usize>,
+    removed: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    roots
+        .iter()
+        .copied()
+        .filter(|root| *root != output.index() && !removed.contains(root))
+        .chain(external.iter().copied())
+        .collect()
+}
+
+fn rehearse_affine_scalar_fusion(
+    graph: &Graph,
+    output: NodeId,
+    roots: &BTreeSet<usize>,
+    external: &BTreeSet<usize>,
+    removed: &BTreeSet<usize>,
+) -> Result<Option<(UOp, BTreeSet<usize>)>, ScheduleError> {
+    let materialized = scalar_fusion_materialized(output, roots, external, removed);
+    let kernel = match crate::kernel::lower_graph_elementwise_with_affine_sources(
+        graph,
+        output,
+        &materialized,
+        removed,
+    ) {
+        Ok(kernel) => kernel,
+        Err(_) => return Ok(None),
+    };
+    checked_scalar_sink(graph, output, kernel, &materialized, removed)
+}
+
+fn affine_scalar_output(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Cast { .. }
+            | Op::Detach { .. }
+            | Op::ContiguousBackward { .. }
+            | Op::Unary { .. }
+            | Op::Binary { .. }
+            | Op::Compare { .. }
+            | Op::Logical { .. }
+            | Op::Select { .. }
+    )
+}
+
+fn checked_affine_scalar_fusion(
+    graph: &Graph,
+    output: NodeId,
+    roots: &BTreeSet<usize>,
+    external: &BTreeSet<usize>,
+    requested: &BTreeSet<usize>,
+    consumers: &[usize],
+) -> Result<Option<AffineScalarFusion>, ScheduleError> {
+    if !affine_scalar_output(graph.op(output).map_err(ScheduleError::Graph)?) {
+        return Ok(None);
+    }
+    let candidates = AffineScalarCandidates::collect(graph, output, roots, external, requested)?;
+    let mut accepted = BTreeSet::new();
+    for source in candidates.maps.keys().copied() {
+        let Some(group) = exclusive_affine_group(
+            graph,
+            output,
+            source,
+            &candidates,
+            external,
+            requested,
+            consumers,
+        )?
+        else {
+            continue;
+        };
+        if rehearse_affine_scalar_fusion(graph, output, roots, external, &group)?.is_some() {
+            accepted.extend(group);
+        }
+    }
+    if accepted.is_empty() {
+        return Ok(None);
+    }
+    let Some((kernel, load_nodes)) =
+        rehearse_affine_scalar_fusion(graph, output, roots, external, &accepted)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(AffineScalarFusion {
+        removed_roots: accepted,
+        load_nodes,
+        kernel,
+    }))
+}
+
 /// Returns the fully rehearsed scalar kernel when one dense Contiguous output
 /// may own its sole-use producer's computation. `None` is the conservative
 /// explicit-copy fallback; malformed canonical plans still reject scheduling.
@@ -1248,10 +1598,10 @@ fn checked_contiguous_redirection(
     // Every movement node between the producer and Contiguous must belong
     // exclusively to this boundary. A requested, external, or shared view is
     // independently observable and retains the producer + AffineCopy route.
-    let Op::Contiguous { input } = graph.op(output).map_err(ScheduleError::Graph)? else {
+    let Op::Contiguous { input: movement } = graph.op(output).map_err(ScheduleError::Graph)? else {
         return Ok(None);
     };
-    let mut cursor = *input;
+    let mut cursor = *movement;
     while cursor != producer {
         if requested.contains(&cursor.index())
             || external.contains(&cursor.index())
@@ -1338,18 +1688,7 @@ fn checked_contiguous_redirection(
     }
     let mut load_nodes = BTreeSet::new();
     for value in &topology {
-        if let crate::Operation::GraphBinary(op) = value.operation()
-            && matches!(
-                op,
-                crate::BinaryOp::Div
-                    | crate::BinaryOp::FloorDiv
-                    | crate::BinaryOp::TruncDiv
-                    | crate::BinaryOp::Mod
-                    | crate::BinaryOp::FMod
-                    | crate::BinaryOp::Shl
-                    | crate::BinaryOp::Shr
-            )
-        {
+        if crate::kernel::scalar_uop_may_fault(value.operation()) {
             return Ok(None);
         }
         if !matches!(value.operation(), crate::Operation::Load) {
@@ -1369,8 +1708,21 @@ fn checked_contiguous_redirection(
                 *buffer
             }
             crate::Operation::Index(crate::IndexValue::View { buffer, view, .. })
-                if iteration_view == Some(view) =>
+                if iteration_view.is_some() =>
             {
+                let loaded = usize::try_from(*buffer).map_err(|_| ScheduleError::Overflow)?;
+                let leaf_shape = graph
+                    .shape(NodeId::from_index(loaded))
+                    .map_err(ScheduleError::Graph)?
+                    .clone();
+                let Ok(expected) = crate::rangeify::computed_broadcast_view(
+                    graph, *movement, producer, leaf_shape,
+                ) else {
+                    return Ok(None);
+                };
+                if &expected != view {
+                    return Ok(None);
+                }
                 *buffer
             }
             _ => return Ok(None),
@@ -1444,8 +1796,9 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
     schedule_many_with_external(graph, outputs, &BTreeSet::new(), true)
 }
 
-/// Symbolic families retain the explicit movement boundary because their
-/// specialized kernel and buffer schema are authenticated independently.
+/// Symbolic families retain explicit computed-affine producer and movement
+/// boundaries because their specialized kernel and buffer schema are
+/// authenticated independently.
 pub(crate) fn schedule_many_for_symbolic_capture(
     graph: &Graph,
     outputs: &[NodeId],
@@ -1805,12 +2158,39 @@ fn schedule_many_with_external(
             .map(|view| view.source.index())
         })
         .collect::<BTreeSet<_>>();
+    // A computed affine alias of a caller-owned materialization does not own
+    // another physical buffer merely because one scalar root reads it more
+    // than once. Keep the named external producer as the exact ABI boundary;
+    // downstream kernels reconstruct the alias with one IndexView. Requested
+    // aliases remain roots because their dense value is independently
+    // observable.
+    let external_view_aliases = needed
+        .iter()
+        .filter(|index| !requested.contains(index))
+        // Specialized payloads name their operands directly rather than
+        // consuming scalar IndexView nodes. Preserve those exact operand
+        // roots even when their storage source is caller-owned; the payload
+        // must depend on the intervening materialization.
+        .filter(|index| {
+            !matmul_operands.contains(index)
+                && !prefix_scan_operands.contains(index)
+                && !threefry_operands.contains(index)
+                && !movement_operands.contains(index)
+        })
+        .filter_map(|index| {
+            crate::rangeify::computed_view(graph, NodeId::from_index(*index))
+                .ok()
+                .filter(|view| external.contains(&view.source.index()))
+                .map(|_| *index)
+        })
+        .collect::<BTreeSet<_>>();
     let mut roots: BTreeSet<usize> = needed
         .iter()
         .copied()
         .filter(|index| {
             let id = NodeId::from_index(*index);
             !external.contains(index)
+                && !external_view_aliases.contains(index)
                 // Inputs and constants are caller/graph-owned values, not
                 // scheduled producers. A requested source value is retained
                 // by capture as an explicit passthrough instead of becoming
@@ -1936,6 +2316,34 @@ fn schedule_many_with_external(
     }
     for fused in fused_roots {
         roots.remove(&fused);
+    }
+
+    // An ordinary scalar consumer may absorb branch-local computed affine
+    // producer roots when every graph use is owned by that consumer and all
+    // occurrences share one exact map. The normalized trial Sink remains the
+    // ABI authority; uncertain or multi-map cases retain their roots.
+    let mut affine_scalar_fusions = BTreeMap::<usize, AffineScalarFusion>::new();
+    if redirect_contiguous {
+        for root in roots.iter().copied().collect::<Vec<_>>() {
+            if !roots.contains(&root) {
+                continue;
+            }
+            let Some(fusion) = checked_affine_scalar_fusion(
+                graph,
+                NodeId::from_index(root),
+                &roots,
+                external,
+                &requested,
+                &consumers,
+            )?
+            else {
+                continue;
+            };
+            for removed in &fusion.removed_roots {
+                roots.remove(removed);
+            }
+            affine_scalar_fusions.insert(root, fusion);
+        }
     }
 
     // A dense Contiguous boundary normally owns a raw-copy item. When its
@@ -2107,12 +2515,14 @@ fn schedule_many_with_external(
     for &index in &roots {
         let node = NodeId::from_index(index);
         let redirection = contiguous_redirections.get(&index);
-        let mut leaf_ids = match redirection {
-            Some(value) => value.load_nodes.clone(),
-            None => BTreeSet::new(),
+        let affine_fusion = affine_scalar_fusions.get(&index);
+        let mut leaf_ids = match (redirection, affine_fusion) {
+            (Some(value), _) => value.load_nodes.clone(),
+            (None, Some(value)) => value.load_nodes.clone(),
+            (None, None) => BTreeSet::new(),
         };
         let mut boundary = None;
-        if redirection.is_none() {
+        if redirection.is_none() && affine_fusion.is_none() {
             match crate::MovementKernelPlan::from_scheduled_graph(graph, node) {
                 Ok(plan) => {
                     // Movement kernels can bypass observable graph-view roots.
@@ -2156,6 +2566,8 @@ fn schedule_many_with_external(
         let kernel = if boundary.is_none() {
             if let Some(redirection) = contiguous_redirections.get(&index) {
                 redirection.kernel.clone()
+            } else if let Some(fusion) = affine_scalar_fusions.get(&index) {
+                fusion.kernel.clone()
             } else if let Some(reduction) = fused_epilogues.get(&index) {
                 crate::kernel::lower_graph_reduction_epilogue_with_materialized(
                     graph,
