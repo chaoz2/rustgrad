@@ -953,7 +953,7 @@ fn raw_movement_copy_opencl_covers_computed_dense_empty_and_fail_closed_kinds() 
 
     let viewed = graph.expand(producer, [2, 3]).unwrap();
     let affine_output = graph.contiguous(viewed).unwrap();
-    let affine_item = schedule(&graph, affine_output)
+    let affine_item = crate::schedule_many(&graph, &[producer, affine_output])
         .unwrap()
         .items
         .into_iter()

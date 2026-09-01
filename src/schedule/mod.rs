@@ -1202,38 +1202,82 @@ fn portable_ordinary_kernel(kernel: &UOp) -> bool {
     ptx.is_ok() && opencl.is_ok() && metal.is_ok() && webgpu.is_ok()
 }
 
+/// One rehearsed Contiguous ownership rewrite. The exact loaded graph nodes
+/// come from the accepted Sink, not from the pre-rewrite movement inventory;
+/// this keeps descriptor/dependency discovery aligned after the producer root
+/// is suppressed.
+struct ContiguousRedirection {
+    producer: usize,
+    load_nodes: BTreeSet<usize>,
+    kernel: UOp,
+}
+
 /// Returns the fully rehearsed scalar kernel when one dense Contiguous output
 /// may own its sole-use producer's computation. `None` is the conservative
 /// explicit-copy fallback; malformed canonical plans still reject scheduling.
 fn checked_contiguous_redirection(
     graph: &Graph,
     output: NodeId,
-    producer: NodeId,
     roots: &BTreeSet<usize>,
     external: &BTreeSet<usize>,
-) -> Result<Option<UOp>, ScheduleError> {
+    requested: &BTreeSet<usize>,
+    consumers: &[usize],
+) -> Result<Option<ContiguousRedirection>, ScheduleError> {
     let plan = crate::MovementKernelPlan::from_scheduled_graph(graph, output)
         .map_err(|error| ScheduleError::Binding(error.to_string()))?;
-    if !matches!(
-        &plan.kind,
-        crate::MovementKernelKind::Contiguous { input } if input.node == producer
-    ) || matches!(
-        graph.op(producer).map_err(ScheduleError::Graph)?,
-        Op::ContiguousBackward { .. }
-    ) || crate::kernel::single_reduction_epilogue(graph, producer)
-        .map_err(ScheduleError::UOp)?
-        .is_some()
+    let (producer, iteration_view) = match &plan.kind {
+        crate::MovementKernelKind::Contiguous { input } => (input.node, None),
+        crate::MovementKernelKind::AffineCopy { input, view } => (input.node, Some(view)),
+        _ => return Ok(None),
+    };
+    if !roots.contains(&producer.index())
+        || requested.contains(&producer.index())
+        || external.contains(&producer.index())
+        || consumers.get(producer.index()) != Some(&1)
+        || matches!(
+            graph.op(producer).map_err(ScheduleError::Graph)?,
+            Op::ContiguousBackward { .. }
+        )
+        || crate::kernel::single_reduction_epilogue(graph, producer)
+            .map_err(ScheduleError::UOp)?
+            .is_some()
     {
         return Ok(None);
     }
+
+    // Every movement node between the producer and Contiguous must belong
+    // exclusively to this boundary. A requested, external, or shared view is
+    // independently observable and retains the producer + AffineCopy route.
+    let Op::Contiguous { input } = graph.op(output).map_err(ScheduleError::Graph)? else {
+        return Ok(None);
+    };
+    let mut cursor = *input;
+    while cursor != producer {
+        if requested.contains(&cursor.index())
+            || external.contains(&cursor.index())
+            || consumers.get(cursor.index()) != Some(&1)
+        {
+            return Ok(None);
+        }
+        cursor = match graph.op(cursor).map_err(ScheduleError::Graph)? {
+            Op::Shrink { input, .. }
+            | Op::Reshape { input, .. }
+            | Op::Permute { input, .. }
+            | Op::Expand { input, .. }
+            | Op::Stride { input, .. } => *input,
+            _ => return Ok(None),
+        };
+    }
+
     let producer_desc = buffer(graph, producer, false)?;
     let output_desc = buffer(graph, output, false)?;
-    if producer_desc.shape != output_desc.shape
-        || producer_desc.dtype != output_desc.dtype
-        || producer_desc.bytes != output_desc.bytes
+    if producer_desc.dtype != output_desc.dtype
         || producer_desc.alignment != output_desc.alignment
         || producer_desc.view.is_some()
         || output_desc.view.is_some()
+        || (iteration_view.is_none()
+            && (producer_desc.shape != output_desc.shape
+                || producer_desc.bytes != output_desc.bytes))
     {
         return Ok(None);
     }
@@ -1241,14 +1285,25 @@ fn checked_contiguous_redirection(
     let mut materialized = roots.clone();
     materialized.remove(&producer.index());
     materialized.extend(external.iter().copied());
-    let Ok(kernel) = crate::kernel::lower_graph_elementwise_into_with_materialized(
-        graph,
-        producer,
-        output,
-        &materialized,
-    ) else {
+    let lowered = match iteration_view {
+        Some(view) => crate::kernel::lower_graph_elementwise_affine_into_with_materialized(
+            graph,
+            producer,
+            output,
+            view,
+            &materialized,
+        ),
+        None => crate::kernel::lower_graph_elementwise_into_with_materialized(
+            graph,
+            producer,
+            output,
+            &materialized,
+        ),
+    };
+    let Ok(kernel) = lowered else {
         return Ok(None);
     };
+    let kernel = crate::uop::normalize_kernel(&kernel).map_err(ScheduleError::UOp)?;
     kernel.validate().map_err(ScheduleError::UOp)?;
     let topology = kernel.topological().map_err(ScheduleError::UOp)?;
     let stores = topology
@@ -1281,6 +1336,7 @@ fn checked_contiguous_redirection(
     {
         return Ok(None);
     }
+    let mut load_nodes = BTreeSet::new();
     for value in &topology {
         if let crate::Operation::GraphBinary(op) = value.operation()
             && matches!(
@@ -1303,26 +1359,44 @@ fn checked_contiguous_redirection(
             return Ok(None);
         };
         let loaded = match index.operation() {
-            crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })
-            | crate::Operation::Index(crate::IndexValue::View { buffer, .. }) => *buffer,
+            crate::Operation::Index(crate::IndexValue::Buffer {
+                buffer,
+                input_shape,
+                ..
+            }) if iteration_view.is_none()
+                || input_shape.numel().map_err(ScheduleError::Graph)? == 1 =>
+            {
+                *buffer
+            }
+            crate::Operation::Index(crate::IndexValue::View { buffer, view, .. })
+                if iteration_view == Some(view) =>
+            {
+                *buffer
+            }
             _ => return Ok(None),
         };
         if loaded == producer.index() as u64 || loaded == output.index() as u64 {
             return Ok(None);
         }
-        let loaded_node = NodeId::from_index(loaded as usize);
+        let loaded = usize::try_from(loaded).map_err(|_| ScheduleError::Overflow)?;
+        let loaded_node = NodeId::from_index(loaded);
         let is_leaf = matches!(
             graph.op(loaded_node).map_err(ScheduleError::Graph)?,
             Op::Input { .. } | Op::Constant(_)
         );
-        if !is_leaf && !materialized.contains(&(loaded as usize)) {
+        if !is_leaf && !materialized.contains(&loaded) {
             return Ok(None);
         }
+        load_nodes.insert(loaded);
     }
     if !portable_ordinary_kernel(&kernel) {
         return Ok(None);
     }
-    Ok(Some(kernel))
+    Ok(Some(ContiguousRedirection {
+        producer: producer.index(),
+        load_nodes,
+        kernel,
+    }))
 }
 
 fn supported(op: &Op) -> bool {
@@ -1870,39 +1944,30 @@ fn schedule_many_with_external(
     // the boundary's fresh dense buffer. The Contiguous node remains the sole
     // observable schedule/output identity; every uncertain ownership or
     // operation-specific producer retains the explicit copy.
-    let mut contiguous_redirections = BTreeMap::<usize, (usize, UOp)>::new();
+    let mut contiguous_redirections = BTreeMap::<usize, ContiguousRedirection>::new();
     if redirect_contiguous {
         for contiguous in roots.iter().copied().collect::<Vec<_>>() {
             let node = NodeId::from_index(contiguous);
-            let Op::Contiguous { input } = graph.op(node).map_err(ScheduleError::Graph)? else {
-                continue;
-            };
-            let producer = input.index();
-            if !roots.contains(&producer)
-                || requested.contains(&producer)
-                || external.contains(&producer)
-                || consumers[producer] != 1
-            {
+            if !matches!(
+                graph.op(node).map_err(ScheduleError::Graph)?,
+                Op::Contiguous { .. }
+            ) {
                 continue;
             }
             // Trial the exact value-root/destination projection before changing
             // root ownership. Specialized roots lower as a load of `producer` and
             // are rejected below; ordinary scalar DAGs lower to one checked Store.
-            let Some(kernel) = checked_contiguous_redirection(
-                graph,
-                node,
-                NodeId::from_index(producer),
-                &roots,
-                external,
+            let Some(redirection) = checked_contiguous_redirection(
+                graph, node, &roots, external, &requested, &consumers,
             )?
             else {
                 continue;
             };
-            contiguous_redirections.insert(contiguous, (producer, kernel));
+            contiguous_redirections.insert(contiguous, redirection);
         }
     }
-    for (producer, _) in contiguous_redirections.values() {
-        roots.remove(producer);
+    for redirection in contiguous_redirections.values() {
+        roots.remove(&redirection.producer);
     }
 
     let mut node_to_item: std::collections::BTreeMap<usize, u64> = roots
@@ -2041,17 +2106,36 @@ fn schedule_many_with_external(
     let mut items = Vec::with_capacity(roots.len());
     for &index in &roots {
         let node = NodeId::from_index(index);
-        let mut leaf_ids = BTreeSet::new();
+        let redirection = contiguous_redirections.get(&index);
+        let mut leaf_ids = match redirection {
+            Some(value) => value.load_nodes.clone(),
+            None => BTreeSet::new(),
+        };
         let mut boundary = None;
-        leaves(
-            graph,
-            node,
-            &roots,
-            index,
-            &mut leaf_ids,
-            &mut boundary,
-            external,
-        )?;
+        if redirection.is_none() {
+            match crate::MovementKernelPlan::from_scheduled_graph(graph, node) {
+                Ok(plan) => {
+                    // Movement kernels can bypass observable graph-view roots.
+                    // Their validated physical operands—not graph traversal—
+                    // are therefore the authoritative input inventory.
+                    leaf_ids.extend(
+                        plan.input_operands()
+                            .into_iter()
+                            .map(|input| input.node.index()),
+                    );
+                }
+                Err(crate::MovementPlanError::NotMovement) => leaves(
+                    graph,
+                    node,
+                    &roots,
+                    index,
+                    &mut leaf_ids,
+                    &mut boundary,
+                    external,
+                )?,
+                Err(error) => return Err(ScheduleError::Binding(error.to_string())),
+            }
+        }
         let materialized = leaf_ids
             .iter()
             .filter(|leaf| roots.contains(leaf))
@@ -2070,8 +2154,8 @@ fn schedule_many_with_external(
             .map(|sibling| buffer(graph, sibling, false))
             .transpose()?;
         let kernel = if boundary.is_none() {
-            if let Some((_, kernel)) = contiguous_redirections.get(&index) {
-                kernel.clone()
+            if let Some(redirection) = contiguous_redirections.get(&index) {
+                redirection.kernel.clone()
             } else if let Some(reduction) = fused_epilogues.get(&index) {
                 crate::kernel::lower_graph_reduction_epilogue_with_materialized(
                     graph,

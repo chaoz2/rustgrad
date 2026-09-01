@@ -1512,12 +1512,17 @@ into fresh owned dense storage. A Contiguous boundary selects this plan directly
 instead of publishing an intermediate view. For a concrete static schedule, one
 checked sole-use, unrequested ordinary scalar producer may instead be lowered
 directly into the Contiguous node's fresh dense output, eliminating only the
-intermediate producer allocation and raw copy. The Contiguous node remains the
-schedule, capture, dependency, and output identity; requested, shared, external,
-stateful, guarded/faulting, specialized, affine-view, dynamic, and otherwise
-uncertain producers retain the explicit copy. Eligibility is rehearsed through
-the existing PTX, OpenCL, Metal, and WGSL ordinary-kernel renderers, so a dtype
-or scalar operation outside any established backend route keeps the raw copy.
+intermediate producer allocation and raw copy. The same checked route admits a
+rangeifiable reshape, permutation, expansion, shrink, or signed stride between
+the producer and Contiguous when every materialized producer leaf has either
+the producer's exact dense shape or one element. Such loads reuse the existing
+`IndexValue::View`; no second index or movement taxonomy is introduced. The
+Contiguous node remains the schedule, capture, dependency, and output identity;
+requested, shared, external, stateful, guarded/faulting, specialized, nested
+source-view, nontrivially broadcast, dynamic, and otherwise uncertain producers
+retain the explicit copy. Eligibility is rehearsed through the existing PTX,
+OpenCL, Metal, and WGSL ordinary-kernel renderers, so a dtype or scalar operation
+outside any established backend route keeps the raw copy.
 Signed reverse and
 zero-stride broadcast reads are valid
 because source aliases never alias the output or each other as write targets.

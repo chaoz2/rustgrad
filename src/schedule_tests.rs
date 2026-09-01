@@ -401,7 +401,7 @@ fn unrequested_contiguous_redirection_remains_a_downstream_materialization() {
 }
 
 #[test]
-fn contiguous_redirection_does_not_change_graph_vjp_or_affine_copy_boundaries() {
+fn contiguous_redirection_does_not_change_graph_vjp_or_uncomposable_affine_boundaries() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [3], DType::F32);
     let producer = graph.square(input).unwrap();
@@ -421,9 +421,17 @@ fn contiguous_redirection_does_not_change_graph_vjp_or_affine_copy_boundaries() 
         vec![-4.0, 0.0, 6.0]
     );
 
-    let expanded = graph.expand(producer, [2, 3]).unwrap();
-    let materialized = graph.contiguous(expanded).unwrap();
-    let scheduled = schedule(&graph, materialized).unwrap();
+    // This broadcasted leaf needs producer-coordinate decomposition after the
+    // reshape, which the existing affine load descriptor cannot represent.
+    // Preserve the producer + AffineCopy fallback rather than misindexing it.
+    let mut fallback = Graph::new();
+    let input = fallback.input_dtype("input", [2, 3], DType::F32);
+    let bias = fallback.input_dtype("bias", [3], DType::F32);
+    let producer = fallback.add(input, bias).unwrap();
+    let reshaped = fallback.reshape(producer, [3, 2]).unwrap();
+    let materialized = fallback.contiguous(reshaped).unwrap();
+    let scheduled = schedule(&fallback, materialized).unwrap();
+    assert_eq!(scheduled.items.len(), 2);
     let item = scheduled
         .items
         .iter()
@@ -431,6 +439,430 @@ fn contiguous_redirection_does_not_change_graph_vjp_or_affine_copy_boundaries() 
         .unwrap();
     assert!(matches!(
         item.kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. })
+    ));
+}
+
+#[test]
+fn affine_contiguous_redirects_exact_shape_producer_loads_into_owned_output() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let permuted = graph.permute(producer, [1, 0]).unwrap();
+    let output = graph.contiguous(permuted).unwrap();
+
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let item = &scheduled.items[0];
+    assert_eq!(item.node, output);
+    assert_eq!(item.primary_output().id, output.index() as u64);
+    assert_eq!(item.dependencies, Vec::<u64>::new());
+    assert_eq!(
+        item.ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input]
+    );
+    assert!(scheduled.internal_temporaries(&[output]).is_empty());
+    assert!(
+        crate::MemoryPlan::from_schedule(&scheduled, &[output], true)
+            .unwrap()
+            .temporaries
+            .is_empty()
+    );
+    let nodes = item.kernel.topological().unwrap();
+    assert!(nodes.iter().all(|node| !matches!(
+        node.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(_))
+    )));
+    let source_shape = Shape::from([2, 3]);
+    let logical_shape = Shape::from([3, 2]);
+    assert!(nodes.iter().any(|node| matches!(
+        node.operation(),
+        crate::Operation::Index(crate::IndexValue::View { buffer, view, .. })
+            if *buffer == input.index() as u64
+                && view.source_shape == source_shape
+                && view.logical_shape == logical_shape
+                && view.strides.as_slice() == [1, 3]
+    )));
+    assert!(nodes.iter().any(|node| matches!(
+        node.operation(),
+        crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })
+            if *buffer == output.index() as u64
+    )));
+
+    crate::PtxRenderer::new(80)
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    crate::runtime::opencl::OpenClRenderer::default()
+        .render(&item.kernel)
+        .unwrap();
+    crate::runtime::metal::MetalRenderer::new(
+        1,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: usize::MAX,
+            unified_memory: false,
+            family: "affine-redirection-test".into(),
+        },
+    )
+    .unwrap()
+    .render(&item.kernel)
+    .unwrap();
+    crate::runtime::webgpu::WgslRenderer::new(
+        1,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: usize::MAX,
+            max_storage_buffers_per_shader_stage: u32::MAX,
+            max_compute_workgroup_size_x: 1,
+            max_compute_workgroups_per_dimension: u32::MAX,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap()
+    .render(&item.kernel)
+    .unwrap();
+
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let provided = std::collections::BTreeMap::from([(
+        "input".into(),
+        TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+    )]);
+    let replayed = decoded.replay(&provided).unwrap();
+    assert_eq!(
+        replayed[0].storage(),
+        &crate::Storage::F32(vec![1.0, 16.0, 4.0, 25.0, 9.0, 36.0])
+    );
+    let native = decoded
+        .replay_with_options(
+            &provided,
+            &crate::CapturedReplayExecutor::default(),
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(native.outputs[0].storage(), replayed[0].storage());
+    assert_eq!(native.trace.items[0].backend, crate::ItemBackend::NativeJit);
+}
+
+#[test]
+fn affine_contiguous_redirects_expand_reverse_scalar_and_empty_geometry() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 1], DType::F32);
+    let scalar = graph.constant(TensorData::scalar(1.0));
+    let producer = graph.add(input, scalar).unwrap();
+    let expanded = graph.expand(producer, [2, 3]).unwrap();
+    let reversed = graph
+        .stride(
+            expanded,
+            [
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                },
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+            ],
+        )
+        .unwrap();
+    let output = graph.contiguous(reversed).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert_eq!(
+        scheduled.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input]
+    );
+    assert!(
+        scheduled.items[0]
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(
+                node.operation(),
+                crate::Operation::Index(crate::IndexValue::View { view, .. })
+                if view.offset == 1 && view.strides.as_slice() == [-1, 0]
+            ))
+    );
+
+    let actual = crate::CapturedSchedule::capture(&graph, &scheduled, &[output])
+        .unwrap()
+        .replay(&std::collections::BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2, 1], vec![2.0, 4.0]).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(
+        actual[0].storage(),
+        &crate::Storage::F32(vec![5.0, 5.0, 5.0, 3.0, 3.0, 3.0])
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::F32);
+    let producer = empty.square(input).unwrap();
+    let permuted = empty.permute(producer, [1, 0]).unwrap();
+    let output = empty.contiguous(permuted).unwrap();
+    let scheduled = schedule(&empty, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert_eq!(
+        scheduled.items[0].primary_output().shape,
+        Shape::from([2, 0])
+    );
+}
+
+#[test]
+fn affine_contiguous_binds_two_exact_shape_producer_leaves() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 3], DType::F32);
+    let rhs = graph.input_dtype("rhs", [2, 3], DType::F32);
+    let producer = graph.add(lhs, rhs).unwrap();
+    let permuted = graph.permute(producer, [1, 0]).unwrap();
+    let output = graph.contiguous(permuted).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert_eq!(
+        scheduled.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![lhs, rhs]
+    );
+    assert_eq!(
+        scheduled.items[0]
+            .inputs
+            .iter()
+            .map(|desc| desc.id)
+            .collect::<Vec<_>>(),
+        vec![lhs.index() as u64, rhs.index() as u64]
+    );
+}
+
+#[test]
+fn affine_contiguous_inventory_uses_normalized_select_loads() {
+    let mut graph = Graph::new();
+    let selected = graph.input_dtype("selected", [2, 2], DType::F32);
+    let lhs = graph.input_dtype("lhs", [2, 2], DType::F32);
+    let rhs = graph.input_dtype("rhs", [2, 2], DType::F32);
+    let unselected = graph.matmul(lhs, rhs).unwrap();
+    let condition = graph.constant(TensorData::scalar_with_dtype(
+        crate::Scalar::Bool(true),
+        DType::Bool,
+    ));
+    let producer = graph.select(condition, selected, unselected).unwrap();
+    let permuted = graph.permute(producer, [1, 0]).unwrap();
+    let output = graph.contiguous(permuted).unwrap();
+
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    let unselected_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == unselected)
+        .expect("the specialized Matmul branch remains independently materialized");
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![selected]
+    );
+    assert_eq!(
+        output_item
+            .inputs
+            .iter()
+            .map(|desc| desc.id)
+            .collect::<Vec<_>>(),
+        vec![selected.index() as u64]
+    );
+    assert!(output_item.dependencies.is_empty());
+    assert!(!output_item.dependencies.contains(&unselected_item.id));
+    assert!(
+        output_item
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .all(|node| {
+                !matches!(
+                    node.operation(),
+                    crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })
+                        | crate::Operation::Index(crate::IndexValue::View { buffer, .. })
+                        if *buffer == unselected.index() as u64
+                )
+            })
+    );
+    crate::MemoryPlan::from_schedule(&scheduled, &[output], true).unwrap();
+}
+
+#[test]
+fn affine_contiguous_redirects_reshape_and_shrink_geometry() {
+    let mut reshape_graph = Graph::new();
+    let input = reshape_graph.input_dtype("input", [2, 3], DType::F32);
+    let producer = reshape_graph.square(input).unwrap();
+    let reshaped = reshape_graph.reshape(producer, [3, 2]).unwrap();
+    let output = reshape_graph.contiguous(reshaped).unwrap();
+    let scheduled = schedule(&reshape_graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let source_shape = Shape::from([2, 3]);
+    let logical_shape = Shape::from([3, 2]);
+    assert!(
+        scheduled.items[0]
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(
+                node.operation(),
+                crate::Operation::Index(crate::IndexValue::View { view, .. })
+                    if view.source_shape == source_shape
+                        && view.logical_shape == logical_shape
+                        && view.strides.as_slice() == [2, 1]
+            ))
+    );
+
+    let mut shrink_graph = Graph::new();
+    let input = shrink_graph.input_dtype("input", [3, 4], DType::F32);
+    let producer = shrink_graph.square(input).unwrap();
+    let shrunk = shrink_graph.shrink(producer, [(1, 3), (1, 4)]).unwrap();
+    let output = shrink_graph.contiguous(shrunk).unwrap();
+    let scheduled = schedule(&shrink_graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert!(
+        scheduled.items[0]
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(
+                node.operation(),
+                crate::Operation::Index(crate::IndexValue::View { view, .. })
+                    if view.offset == 5 && view.strides.as_slice() == [4, 1]
+            ))
+    );
+}
+
+#[test]
+fn affine_contiguous_preserves_requested_shared_and_nested_view_fallbacks() {
+    let mut requested_graph = Graph::new();
+    let input = requested_graph.input_dtype("input", [2, 3], DType::F32);
+    let producer = requested_graph.square(input).unwrap();
+    let permuted = requested_graph.permute(producer, [1, 0]).unwrap();
+    let output = requested_graph.contiguous(permuted).unwrap();
+    let requested = schedule_many(&requested_graph, &[permuted, output]).unwrap();
+    requested.validate().unwrap();
+    assert_eq!(requested.items.len(), 3);
+    assert!(requested.items.iter().any(|item| item.node == producer));
+    assert!(matches!(
+        requested
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap()
+            .kernel
+            .operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. })
+    ));
+    let requested_copy = requested
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(
+        requested_copy
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![producer]
+    );
+    let producer_item = requested
+        .items
+        .iter()
+        .find(|item| item.node == producer)
+        .unwrap();
+    assert_eq!(requested_copy.dependencies, vec![producer_item.id]);
+    crate::MemoryPlan::from_schedule(&requested, &[permuted, output], true).unwrap();
+    crate::CapturedSchedule::capture(&requested_graph, &requested, &[permuted, output]).unwrap();
+
+    let sibling = requested_graph.neg(permuted).unwrap();
+    let shared = schedule_many(&requested_graph, &[output, sibling]).unwrap();
+    shared.validate().unwrap();
+    assert!(shared.items.iter().any(|item| item.node == producer));
+    assert!(matches!(
+        shared
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap()
+            .kernel
+            .operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. })
+    ));
+
+    let mut nested = Graph::new();
+    let input = nested.input_dtype("input", [2, 3], DType::F32);
+    let viewed = nested.permute(input, [1, 0]).unwrap();
+    let rhs = nested.input_dtype("rhs", [3, 2], DType::F32);
+    let producer = nested.add(viewed, rhs).unwrap();
+    let reversed = nested
+        .stride(
+            producer,
+            [
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                },
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+            ],
+        )
+        .unwrap();
+    let output = nested.contiguous(reversed).unwrap();
+    let scheduled = schedule(&nested, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    assert!(matches!(
+        scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap()
+            .kernel
+            .operation(),
         crate::Operation::Movement(crate::MovementValue::Plan(plan))
             if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. })
     ));
