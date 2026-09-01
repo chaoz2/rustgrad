@@ -2503,7 +2503,36 @@ impl Graph {
     pub(crate) fn backward_slice_contains(&self, loss: NodeId, target: NodeId) -> Result<bool> {
         self.node(loss)?;
         self.node(target)?;
-        self.reaches_input(loss, target, |op| op.backward_inputs())
+        let mut pending = vec![loss];
+        let mut seen = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            if node == target {
+                return Ok(true);
+            }
+            pending.extend(self.reverse_inputs(node)?);
+        }
+        Ok(false)
+    }
+
+    /// Graph-checked value edges that a local reverse rule can actually
+    /// traverse. `Op::backward_inputs` owns the structural projection; this
+    /// seam adds descriptor-dependent barriers without creating another op
+    /// taxonomy.
+    pub(crate) fn reverse_inputs(&self, node: NodeId) -> Result<Vec<NodeId>> {
+        let current = self.node(node)?;
+        if let Op::Cast { input, .. } = &current.op {
+            return Ok(
+                if current.dtype.is_float() && self.node(*input)?.dtype.is_float() {
+                    vec![*input]
+                } else {
+                    vec![]
+                },
+            );
+        }
+        Ok(current.op.backward_inputs())
     }
 
     pub(crate) fn value_slice_contains(&self, loss: NodeId, target: NodeId) -> Result<bool> {
@@ -5713,140 +5742,18 @@ impl Graph {
     }
 
     fn op_inputs_require_grad(&self, op: &Op) -> bool {
-        let mut tracked = |id: NodeId| {
+        let tracked = |id: NodeId| {
             self.nodes
                 .get(id.index())
                 .is_some_and(|node| node.requires_grad)
         };
         match op {
-            Op::Input { .. }
-            | Op::Constant(_)
-            | Op::Random { .. }
-            | Op::RandomPermutation { .. }
-            | Op::Bitcast { .. }
-            | Op::Threefry { .. }
-            | Op::Sort { .. } => false,
-            Op::Cast { input, .. }
-            | Op::Contiguous { input }
-            | Op::ContiguousBackward { input }
-            | Op::TensorGuard { input, .. }
-            | Op::Unary { input, .. }
-            | Op::Reduce { input, .. }
-            | Op::PrefixScan { input, .. }
-            | Op::ArgReduce { input, .. }
-            | Op::SumTo { input, .. }
-            | Op::Reshape { input, .. }
-            | Op::Permute { input, .. }
-            | Op::Expand { input, .. }
-            | Op::Shrink { input, .. }
-            | Op::Pad { input, .. }
-            | Op::Stride { input, .. }
-            | Op::ScatterPositions { input, .. }
-            | Op::Gather { input, .. }
-            | Op::StaticIndex { input, .. }
-            | Op::MaskedSelect { input, .. } => tracked(*input),
-            Op::StaticIndexUpdate { base, value, .. } => tracked(*base) || tracked(*value),
-            Op::ScatterPositionsVjp { cotangent, .. }
-            | Op::StaticIndexGrad { cotangent, .. }
-            | Op::StaticIndexUpdateGrad { cotangent, .. } => tracked(*cotangent),
-            Op::Detach { .. } => false,
-            Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
-                tracked(*lhs) || tracked(*rhs)
-            }
-            Op::Logical { lhs, rhs, .. } => tracked(*lhs) || rhs.is_some_and(tracked),
-            Op::Select {
-                on_true, on_false, ..
-            } => tracked(*on_true) || tracked(*on_false),
-            Op::ReduceGrad {
-                input, upstream, ..
-            } => tracked(*input) || tracked(*upstream),
-            Op::ReduceGradVjp {
-                cotangent,
-                input,
-                upstream,
-                ..
-            } => tracked(*cotangent) || tracked(*input) || tracked(*upstream),
-            Op::Concat { inputs, .. } | Op::Einsum { inputs, .. } => {
-                inputs.iter().copied().any(&mut tracked)
-            }
-            Op::Scatter { base, updates, .. } => tracked(*base) || tracked(*updates),
-            Op::Matmul { lhs, rhs } => tracked(*lhs) || tracked(*rhs),
-            Op::EinsumGrad {
-                upstream, inputs, ..
-            } => tracked(*upstream) || inputs.iter().copied().any(&mut tracked),
-            Op::EinsumGradVjp {
-                cotangent,
-                upstream,
-                inputs,
-                ..
-            } => {
-                tracked(*cotangent)
-                    || tracked(*upstream)
-                    || inputs.iter().copied().any(&mut tracked)
-            }
-            Op::MatmulGrad {
-                upstream, lhs, rhs, ..
-            } => tracked(*upstream) || tracked(*lhs) || tracked(*rhs),
-            Op::MatmulGradVjp {
-                cotangent,
-                upstream,
-                lhs,
-                rhs,
-                ..
-            } => tracked(*cotangent) || tracked(*upstream) || tracked(*lhs) || tracked(*rhs),
-            Op::Conv2d {
-                input,
-                weight,
-                bias,
-                ..
-            }
-            | Op::ConvTranspose2d {
-                input,
-                weight,
-                bias,
-                ..
-            } => tracked(*input) || tracked(*weight) || bias.is_some_and(tracked),
-            Op::Conv2dGrad {
-                upstream,
-                input,
-                weight,
-                bias,
-                ..
-            }
-            | Op::ConvTranspose2dGrad {
-                upstream,
-                input,
-                weight,
-                bias,
-                ..
-            } => {
-                tracked(*upstream)
-                    || tracked(*input)
-                    || tracked(*weight)
-                    || bias.is_some_and(tracked)
-            }
-            Op::Conv2dGradVjp {
-                cotangent,
-                upstream,
-                input,
-                weight,
-                bias,
-                ..
-            }
-            | Op::ConvTranspose2dGradVjp {
-                cotangent,
-                upstream,
-                input,
-                weight,
-                bias,
-                ..
-            } => {
-                tracked(*cotangent)
-                    || tracked(*upstream)
-                    || tracked(*input)
-                    || tracked(*weight)
-                    || bias.is_some_and(tracked)
-            }
+            // Sort's coupled values/indices producer deliberately retains its
+            // historical leaf bit. Its values still participate in explicit
+            // reverse transforms through `backward_inputs`; changing this bit
+            // would be an unrelated public lifecycle-policy change.
+            Op::Sort { .. } => false,
+            _ => op.backward_inputs().into_iter().any(tracked),
         }
     }
 

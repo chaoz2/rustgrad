@@ -1141,4 +1141,29 @@ mod literal_tests {
             Err(Error::SessionHandleMismatch { .. })
         ));
     }
+
+    #[test]
+    fn session_grad_prunes_unrequested_nondifferentiable_branches() {
+        let mut session = CpuSession::new();
+        let input = session.variable([3], [2.0, 3.0, 5.0]).unwrap();
+        let unrelated = session.variable([3], [0.2, 0.3, 0.5]).unwrap();
+        let input_square = session.mul(&input, &input).unwrap();
+        let input_loss = session.sum_all(&input_square).unwrap();
+        let guarded = session.tensor_guard_distribution(&unrelated, 0).unwrap();
+        let guarded_square = session.mul(&guarded, &guarded).unwrap();
+        let guarded_loss = session.sum_all(&guarded_square).unwrap();
+        let loss = session.add(&input_loss, &guarded_loss).unwrap();
+
+        let gradient = session.grad(&loss, &input).unwrap();
+        assert_eq!(
+            session.realize(&gradient).unwrap().to_vec_f64(),
+            vec![4.0, 6.0, 10.0]
+        );
+        assert!(matches!(
+            session.grad(&loss, &unrelated),
+            Err(Error::NonDifferentiableIndexing(
+                "tensor guard gradient is not represented"
+            ))
+        ));
+    }
 }

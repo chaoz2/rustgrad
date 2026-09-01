@@ -312,10 +312,16 @@ impl MutationTapeRecord {
         if rhs_output_gradient.shape() != &self.rhs_shape {
             return Err(MutationVjpError::UpstreamShape);
         }
-        let upstream = graph.constant(rhs_output_gradient);
-        graph
+        // The explicit seed belongs to the same transaction as the reverse
+        // transform. A late graph VJP rejection must not leave that constant
+        // (or any partial derivative node) in the caller's arena.
+        let mut candidate = graph.clone();
+        let upstream = candidate.constant(rhs_output_gradient);
+        let derivative = candidate
             .grad_with(self.rhs, wrt, Some(upstream), create_graph)
-            .map_err(|_| MutationVjpError::GraphNode(wrt))
+            .map_err(|_| MutationVjpError::GraphNode(wrt))?;
+        *graph = candidate;
+        Ok(derivative)
     }
 }
 

@@ -1099,6 +1099,45 @@ impl Op {
             | Self::StaticIndex { input, .. }
             | Self::MaskedSelect { input, .. } => vec![*input],
             Self::Scatter { base, updates, .. } => vec![*base, *updates],
+            Self::EinsumGrad {
+                upstream,
+                inputs,
+                target,
+                ..
+            } => std::iter::once(*upstream)
+                .chain(
+                    inputs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, input)| (index != *target).then_some(*input)),
+                )
+                .collect(),
+            Self::MatmulGrad {
+                upstream,
+                lhs,
+                rhs,
+                lhs_gradient,
+            } => vec![*upstream, if *lhs_gradient { *rhs } else { *lhs }],
+            Self::Conv2dGrad {
+                upstream,
+                input,
+                weight,
+                bias,
+                target,
+                ..
+            }
+            | Self::ConvTranspose2dGrad {
+                upstream,
+                input,
+                weight,
+                bias,
+                target,
+                ..
+            } => std::iter::once(*upstream)
+                .chain((*target != 0).then_some(*input))
+                .chain((*target != 1).then_some(*weight))
+                .chain(bias.iter().copied().filter(|_| *target != 2))
+                .collect(),
             _ => self.value_inputs(),
         }
     }

@@ -3,6 +3,78 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
+/// Immutable reverse traversal frontier for one root and an ordered target
+/// request. The bitmap marks exactly the nodes whose local reverse rule must
+/// run to reach at least one requested target; target nodes themselves remain
+/// gradient destinations unless another requested target lies below them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReverseTraversal {
+    original_len: usize,
+    active_inputs: Vec<Vec<NodeId>>,
+}
+
+impl ReverseTraversal {
+    fn new(graph: &Graph, root: NodeId, targets: &[NodeId]) -> Result<Self> {
+        let original_len = graph.node_count();
+        graph.node(root)?;
+        let target_set = targets
+            .iter()
+            .copied()
+            .map(|target| graph.node(target).map(|_| target))
+            .collect::<Result<BTreeSet<_>>>()?;
+
+        let mut ancestors = vec![false; original_len];
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if ancestors[node.index()] {
+                continue;
+            }
+            ancestors[node.index()] = true;
+            pending.extend(graph.reverse_inputs(node)?);
+        }
+
+        // Graph NodeIds are topological. Track whether each root ancestor
+        // contains a requested target, then retain only rules needed to reach
+        // one. This is tinygrad's `_deepwalk` target-path policy expressed over
+        // RustGrad's typed reverse-edge projection.
+        let mut contains_target = vec![false; original_len];
+        let mut active_inputs = vec![vec![]; original_len];
+        for index in 0..original_len {
+            if !ancestors[index] {
+                continue;
+            }
+            let node = NodeId(index);
+            let inputs = graph.reverse_inputs(node)?;
+            active_inputs[index] = inputs
+                .iter()
+                .copied()
+                .filter(|input| contains_target[input.index()])
+                .collect();
+            let reaches_target = !active_inputs[index].is_empty();
+            contains_target[index] = target_set.contains(&node) || reaches_target;
+        }
+        Ok(Self {
+            original_len,
+            active_inputs,
+        })
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        !self.active_inputs[index].is_empty()
+    }
+
+    fn wants(&self, index: usize, input: NodeId) -> bool {
+        self.active_inputs[index].contains(&input)
+    }
+
+    fn active_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.active_inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, inputs)| (!inputs.is_empty()).then_some(NodeId(index)))
+    }
+}
+
 /// Fully resolved descriptor for tinygrad's Pow VJP. This deliberately leaves
 /// Pow forward semantics alone: it only proves that the already-built Pow
 /// node can receive tinygrad's literal, weak-constant backward expansion.
@@ -181,6 +253,7 @@ fn pow_vjp_plan(
     lhs: NodeId,
     rhs: NodeId,
     upstream: NodeId,
+    needed: [bool; 2],
 ) -> Result<PowVjpPlan> {
     let lhs_node = graph.node(lhs)?;
     let lhs_shape = lhs_node.shape.clone();
@@ -249,74 +322,82 @@ fn pow_vjp_plan(
     let log_shape = lhs_shape.clone();
     let tail_dtype = source_promote(output_dtype, log_dtype);
     let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), tail_dtype);
-    for scalar in [
-        &zero_lhs,
-        &zero_rhs,
-        &one_rhs,
-        &negative_inf,
-        &zero_output,
-        &ln2,
-    ] {
-        extent(scalar.shape(), scalar.dtype())?;
+    if needed[0] {
+        for scalar in [&zero_lhs, &zero_rhs, &one_rhs] {
+            extent(scalar.shape(), scalar.dtype())?;
+        }
+        let rhs_minus_one_shape = rhs_shape.broadcast_with(one_rhs.shape())?;
+        let rhs_minus_one_dtype = source_promote(rhs_dtype, one_rhs.dtype());
+        let power_shape = lhs_shape.broadcast_with(&rhs_minus_one_shape)?;
+        let power_dtype = lhs_dtype.promote(rhs_minus_one_dtype);
+        let base_local_shape = rhs_shape.broadcast_with(&power_shape)?;
+        let base_local_dtype = source_promote(rhs_dtype, power_dtype);
+        let lhs_grad_dtype = source_promote(upstream_data.dtype, base_local_dtype);
+        if zero_lhs.dtype() != lhs_dtype
+            || zero_rhs.dtype() != rhs_dtype
+            || one_rhs.dtype() != rhs_dtype
+            || rhs_minus_one_shape != rhs_shape
+            || rhs_minus_one_dtype != rhs_dtype
+            || power_shape != output_shape
+            || power_dtype != output_dtype
+            || base_local_shape != output_shape
+            || base_local_dtype != output_dtype
+            || lhs_shape.broadcast_with(&output_shape)? != output_shape
+        {
+            return Err(fail(output_dtype));
+        }
+        for (shape, dtype) in [
+            (&rhs_minus_one_shape, rhs_minus_one_dtype),
+            (&power_shape, power_dtype),
+            (&base_local_shape, base_local_dtype),
+            (&output_shape, lhs_grad_dtype),
+            (&lhs_shape, lhs_grad_dtype),
+            (&output_shape, DType::Bool),
+            (&lhs_shape, DType::Bool),
+            (&rhs_shape, DType::Bool),
+        ] {
+            extent(shape, dtype)?;
+        }
     }
-    if zero_lhs.dtype() != lhs_dtype
-        || zero_rhs.dtype() != rhs_dtype
-        || one_rhs.dtype() != rhs_dtype
-        || negative_inf.dtype() != output_dtype
-        || zero_output.dtype() != output_dtype
-        || ln2.dtype() != tail_dtype
-    {
-        return Err(fail(tail_dtype));
-    }
-
-    let rhs_minus_one_shape = rhs_shape.broadcast_with(one_rhs.shape())?;
-    let rhs_minus_one_dtype = source_promote(rhs_dtype, one_rhs.dtype());
-    let power_shape = lhs_shape.broadcast_with(&rhs_minus_one_shape)?;
-    let power_dtype = lhs_dtype.promote(rhs_minus_one_dtype);
-    let base_local_shape = rhs_shape.broadcast_with(&power_shape)?;
-    let base_local_dtype = source_promote(rhs_dtype, power_dtype);
-    let zero_local_shape = rhs_shape
-        .broadcast_with(negative_inf.shape())?
-        .broadcast_with(zero_output.shape())?;
-    let zero_local_dtype = source_promote(output_dtype, output_dtype);
-    let tail_shape = output_shape.broadcast_with(&log_shape)?;
-    let final_shape = lhs_shape
-        .broadcast_with(&zero_local_shape)?
-        .broadcast_with(&tail_shape)?;
-    let final_dtype = source_promote(zero_local_dtype, tail_dtype);
-    let lhs_grad_dtype = source_promote(upstream_data.dtype, base_local_dtype);
-    let rhs_grad_dtype = source_promote(upstream_data.dtype, final_dtype);
-    if rhs_minus_one_shape != rhs_shape
-        || rhs_minus_one_dtype != rhs_dtype
-        || power_shape != output_shape
-        || power_dtype != output_dtype
-        || base_local_shape != output_shape
-        || base_local_dtype != output_dtype
-        || zero_local_dtype != output_dtype
-        || tail_shape != output_shape
-        || final_shape != output_shape
-        || lhs_shape.broadcast_with(&output_shape)? != output_shape
-        || rhs_shape.broadcast_with(&output_shape)? != output_shape
-    {
-        return Err(fail(output_dtype));
-    }
-    for (shape, dtype) in [
-        (&rhs_minus_one_shape, rhs_minus_one_dtype),
-        (&power_shape, power_dtype),
-        (&base_local_shape, base_local_dtype),
-        (&zero_local_shape, zero_local_dtype),
-        (&log_shape, log_dtype),
-        (&tail_shape, tail_dtype),
-        (&final_shape, final_dtype),
-        (&output_shape, lhs_grad_dtype),
-        (&output_shape, rhs_grad_dtype),
-        (&lhs_shape, lhs_grad_dtype),
-        (&rhs_shape, rhs_grad_dtype),
-        (&output_shape, DType::Bool),
-        (&lhs_shape, DType::Bool),
-        (&rhs_shape, DType::Bool),
-    ] {
-        extent(shape, dtype)?;
+    if needed[1] {
+        for scalar in [&zero_lhs, &zero_rhs, &negative_inf, &zero_output, &ln2] {
+            extent(scalar.shape(), scalar.dtype())?;
+        }
+        let zero_local_shape = rhs_shape
+            .broadcast_with(negative_inf.shape())?
+            .broadcast_with(zero_output.shape())?;
+        let zero_local_dtype = source_promote(output_dtype, output_dtype);
+        let tail_shape = output_shape.broadcast_with(&log_shape)?;
+        let final_shape = lhs_shape
+            .broadcast_with(&zero_local_shape)?
+            .broadcast_with(&tail_shape)?;
+        let final_dtype = source_promote(zero_local_dtype, tail_dtype);
+        let rhs_grad_dtype = source_promote(upstream_data.dtype, final_dtype);
+        if zero_lhs.dtype() != lhs_dtype
+            || zero_rhs.dtype() != rhs_dtype
+            || negative_inf.dtype() != output_dtype
+            || zero_output.dtype() != output_dtype
+            || ln2.dtype() != tail_dtype
+            || zero_local_dtype != output_dtype
+            || tail_shape != output_shape
+            || final_shape != output_shape
+            || rhs_shape.broadcast_with(&output_shape)? != output_shape
+        {
+            return Err(fail(output_dtype));
+        }
+        for (shape, dtype) in [
+            (&zero_local_shape, zero_local_dtype),
+            (&log_shape, log_dtype),
+            (&tail_shape, tail_dtype),
+            (&final_shape, final_dtype),
+            (&output_shape, rhs_grad_dtype),
+            (&rhs_shape, rhs_grad_dtype),
+            (&output_shape, DType::Bool),
+            (&lhs_shape, DType::Bool),
+            (&rhs_shape, DType::Bool),
+        ] {
+            extent(shape, dtype)?;
+        }
     }
     Ok(PowVjpPlan {
         zero_lhs,
@@ -337,13 +418,34 @@ impl Graph {
 
     /// Builds a reverse-mode derivative graph. An implicit seed is allowed only
     /// for one-element outputs; `create_graph` controls whether this derivative
-    /// itself retains gradient edges for higher-order differentiation.
+    /// itself retains gradient edges for higher-order differentiation. Only the
+    /// graph-checked root-to-`wrt` value slice is transformed, and the complete
+    /// candidate commits atomically after every local rule succeeds.
     pub fn grad_with(
         &mut self,
         loss: NodeId,
         wrt: NodeId,
         upstream: Option<NodeId>,
         create_graph: bool,
+    ) -> Result<NodeId> {
+        // Construct the complete derivative in isolation. A late local VJP,
+        // shape, dtype, or allocation-geometry failure cannot publish a seed
+        // or a partial derivative graph into the caller's arena.
+        let mut candidate = self.clone();
+        let previous_enabled = candidate.grad_enabled;
+        candidate.grad_enabled = create_graph;
+        let result = candidate.grad_with_inner(loss, wrt, upstream);
+        candidate.grad_enabled = previous_enabled;
+        let result = result?;
+        *self = candidate;
+        Ok(result)
+    }
+
+    fn grad_with_inner(
+        &mut self,
+        loss: NodeId,
+        wrt: NodeId,
+        upstream: Option<NodeId>,
     ) -> Result<NodeId> {
         let loss_node = self.node(loss)?;
         if !loss_node.dtype.is_float() {
@@ -354,15 +456,22 @@ impl Graph {
         if !target.dtype.is_float() || !target.requires_grad {
             return Err(Error::NonDifferentiableTarget(wrt));
         }
-        self.validate_prefix_scan_reverse(loss)?;
-        let original_len = self.nodes.len();
-        let previous_enabled = self.grad_enabled;
-        self.grad_enabled = create_graph;
-        let result = self
-            .reverse_with_inner(loss, upstream, original_len, loss_shape, None)
-            .and_then(|grads| grads[wrt.index()].ok_or(Error::NoGradient(wrt)));
-        self.grad_enabled = previous_enabled;
-        result
+        let traversal = ReverseTraversal::new(self, loss, &[wrt])?;
+        self.validate_reverse_path(&traversal)?;
+        if let Some(upstream) = upstream {
+            let upstream_node = self.node(upstream)?;
+            if upstream_node.shape != loss_shape {
+                return Err(Error::GradientShape {
+                    output: loss_shape,
+                    upstream: upstream_node.shape.clone(),
+                });
+            }
+            if !upstream_node.dtype.is_float() {
+                return Err(Error::NonDifferentiableTarget(upstream));
+            }
+        }
+        self.reverse_with_inner(loss, upstream, &traversal, loss_shape)
+            .and_then(|grads| grads[wrt.index()].ok_or(Error::NoGradient(wrt)))
     }
 
     /// Computes tinygrad's public multi-target `Tensor.gradient` transform.
@@ -370,6 +479,8 @@ impl Graph {
     /// All targets are differentiated in one reverse traversal. Repeated
     /// targets therefore return the same graph node, while a disconnected
     /// floating target receives an independent typed `const_like(0)` value.
+    /// An explicit seed is normalized by the established equal-element-count
+    /// reshape or broadcast-to-loss expansion policy.
     /// Unlike [`Graph::grad_with`], this source-facing transform deliberately
     /// does not use RustGrad's leaf `requires_grad` policy for admission:
     /// tinygrad accepts any concrete strong floating target.
@@ -417,9 +528,20 @@ impl Graph {
             }
         }
 
-        let original_len = self.nodes.len();
-        let target_path = self.source_gradient_target_path(loss, targets, original_len)?;
-        self.validate_source_gradient_path(&target_path)?;
+        if targets.is_empty() {
+            if let Some(gradient) = gradient {
+                // Preserve graph ownership/unknown-node admission for an
+                // explicitly supplied handle, but it has no consumer and no
+                // shape contract when no derivative was requested.
+                self.node(gradient)?;
+            } else if loss_shape.rank() != 0 {
+                return Err(Error::NonScalarLoss(loss_shape));
+            }
+            return Ok(vec![]);
+        }
+
+        let traversal = ReverseTraversal::new(self, loss, targets)?;
+        self.validate_reverse_path(&traversal)?;
 
         let gradient = match gradient {
             Some(gradient) => {
@@ -449,13 +571,7 @@ impl Graph {
 
         let previous_enabled = self.grad_enabled;
         self.grad_enabled = true;
-        let result = self.reverse_with_inner(
-            loss,
-            Some(gradient),
-            original_len,
-            loss_shape,
-            Some(&target_path),
-        );
+        let result = self.reverse_with_inner(loss, Some(gradient), &traversal, loss_shape);
         self.grad_enabled = previous_enabled;
         let grads = result?;
 
@@ -480,21 +596,10 @@ impl Graph {
         &mut self,
         loss: NodeId,
         upstream: Option<NodeId>,
-        original_len: usize,
+        traversal: &ReverseTraversal,
         loss_shape: Shape,
-        target_path: Option<&[bool]>,
     ) -> Result<Vec<Option<NodeId>>> {
         let seed = if let Some(upstream) = upstream {
-            let upstream_node = self.node(upstream)?;
-            if upstream_node.shape != loss_shape {
-                return Err(Error::GradientShape {
-                    output: loss_shape,
-                    upstream: upstream_node.shape.clone(),
-                });
-            }
-            if target_path.is_none() && !upstream_node.dtype.is_float() {
-                return Err(Error::NonDifferentiableTarget(upstream));
-            }
             upstream
         } else if loss_shape.numel()? != 1 {
             return Err(Error::NonScalarLoss(loss_shape));
@@ -503,11 +608,11 @@ impl Graph {
             let seed_data = filled(loss_node.shape.clone(), 1.0, loss_node.dtype)?;
             self.constant(seed_data)
         };
-        let mut grads = vec![None; original_len];
+        let mut grads = vec![None; traversal.original_len];
         grads[loss.index()] = Some(seed);
 
-        for index in (0..original_len).rev() {
-            if target_path.is_some_and(|path| !path[index]) {
+        for index in (0..traversal.original_len).rev() {
+            if !traversal.contains(index) {
                 continue;
             }
             let Some(upstream) = grads[index] else {
@@ -515,6 +620,7 @@ impl Graph {
             };
             let node = NodeId(index);
             let op = self.node(node)?.op.clone();
+            let wants = |input| traversal.wants(index, input);
             match op {
                 Op::Input { .. }
                 | Op::Constant(_)
@@ -742,83 +848,141 @@ impl Graph {
                     self.accumulate(&mut grads, input, local)?;
                 }
                 Op::Binary { op, lhs, rhs } => {
+                    let lhs_needed = wants(lhs);
+                    let rhs_needed = wants(rhs);
                     let (lhs_grad, rhs_grad) = match op {
-                        BinaryOp::Add => (upstream, upstream),
-                        BinaryOp::Sub => (upstream, self.neg(upstream)?),
-                        BinaryOp::Mul => (self.mul(upstream, rhs)?, self.mul(upstream, lhs)?),
+                        BinaryOp::Add => (
+                            lhs_needed.then_some(upstream),
+                            rhs_needed.then_some(upstream),
+                        ),
+                        BinaryOp::Sub => (
+                            lhs_needed.then_some(upstream),
+                            if rhs_needed {
+                                Some(self.neg(upstream)?)
+                            } else {
+                                None
+                            },
+                        ),
+                        BinaryOp::Mul => (
+                            if lhs_needed {
+                                Some(self.mul(upstream, rhs)?)
+                            } else {
+                                None
+                            },
+                            if rhs_needed {
+                                Some(self.mul(upstream, lhs)?)
+                            } else {
+                                None
+                            },
+                        ),
                         BinaryOp::Div => {
-                            let lhs_grad = self.div(upstream, rhs)?;
-                            let rhs_sq = self.mul(rhs, rhs)?;
-                            let numerator = self.mul(upstream, lhs)?;
-                            let quotient = self.div(numerator, rhs_sq)?;
-                            let rhs_grad = self.neg(quotient)?;
+                            let lhs_grad = if lhs_needed {
+                                Some(self.div(upstream, rhs)?)
+                            } else {
+                                None
+                            };
+                            let rhs_grad = if rhs_needed {
+                                let rhs_sq = self.mul(rhs, rhs)?;
+                                let numerator = self.mul(upstream, lhs)?;
+                                let quotient = self.div(numerator, rhs_sq)?;
+                                Some(self.neg(quotient)?)
+                            } else {
+                                None
+                            };
                             (lhs_grad, rhs_grad)
                         }
                         BinaryOp::Pow => {
-                            // Do not let one fallible VJP branch publish a
-                            // prefix of another: the plan validates every
-                            // source-literal branch before its first constant.
-                            let plan = pow_vjp_plan(self, node, lhs, rhs, upstream)?;
-                            let zero_lhs = self.constant(plan.zero_lhs);
-                            let zero_rhs = self.constant(plan.zero_rhs);
-                            let one_rhs = self.constant(plan.one_rhs);
-                            let exponent_is_zero = self.eq(rhs, zero_rhs)?;
-                            let exponent_minus_one = self.sub(rhs, one_rhs)?;
-                            let power = self.pow(lhs, exponent_minus_one)?;
-                            let base_local = self.mul(rhs, power)?;
-                            let base_local = self.select(exponent_is_zero, rhs, base_local)?;
-                            let upstream_is_zero = self.eq(upstream, zero_lhs)?;
-                            let base_local = self.select(upstream_is_zero, zero_lhs, base_local)?;
-                            let lhs_grad = self.mul(upstream, base_local)?;
-                            let base_is_zero = self.eq(lhs, zero_lhs)?;
-                            let exponent_negative = self.lt(rhs, zero_rhs)?;
-                            let negative_inf = self.constant(plan.negative_inf);
-                            let exponent_zero = self.constant(plan.zero_output);
-                            let zero_local =
-                                self.select(exponent_negative, negative_inf, exponent_zero)?;
-                            let logarithm = self.log2(lhs)?;
-                            let ln2 = self.constant(plan.ln2);
-                            let exponent_local = self.mul(node, logarithm)?;
-                            let exponent_local = self.mul(exponent_local, ln2)?;
-                            let exponent_local =
-                                self.select(base_is_zero, zero_local, exponent_local)?;
-                            let rhs_grad = self.mul(upstream, exponent_local)?;
+                            // Validate each requested source-literal branch
+                            // before its first constant. Unrequested operand
+                            // derivatives are neither planned nor published.
+                            let plan = pow_vjp_plan(
+                                self,
+                                node,
+                                lhs,
+                                rhs,
+                                upstream,
+                                [lhs_needed, rhs_needed],
+                            )?;
+                            let lhs_grad = if lhs_needed {
+                                let zero_lhs = self.constant(plan.zero_lhs.clone());
+                                let zero_rhs = self.constant(plan.zero_rhs.clone());
+                                let one_rhs = self.constant(plan.one_rhs.clone());
+                                let exponent_is_zero = self.eq(rhs, zero_rhs)?;
+                                let exponent_minus_one = self.sub(rhs, one_rhs)?;
+                                let power = self.pow(lhs, exponent_minus_one)?;
+                                let base_local = self.mul(rhs, power)?;
+                                let base_local = self.select(exponent_is_zero, rhs, base_local)?;
+                                let upstream_is_zero = self.eq(upstream, zero_lhs)?;
+                                let base_local =
+                                    self.select(upstream_is_zero, zero_lhs, base_local)?;
+                                Some(self.mul(upstream, base_local)?)
+                            } else {
+                                None
+                            };
+                            let rhs_grad = if rhs_needed {
+                                let zero_lhs = self.constant(plan.zero_lhs);
+                                let zero_rhs = self.constant(plan.zero_rhs);
+                                let base_is_zero = self.eq(lhs, zero_lhs)?;
+                                let exponent_negative = self.lt(rhs, zero_rhs)?;
+                                let negative_inf = self.constant(plan.negative_inf);
+                                let exponent_zero = self.constant(plan.zero_output);
+                                let zero_local =
+                                    self.select(exponent_negative, negative_inf, exponent_zero)?;
+                                let logarithm = self.log2(lhs)?;
+                                let ln2 = self.constant(plan.ln2);
+                                let exponent_local = self.mul(node, logarithm)?;
+                                let exponent_local = self.mul(exponent_local, ln2)?;
+                                let exponent_local =
+                                    self.select(base_is_zero, zero_local, exponent_local)?;
+                                Some(self.mul(upstream, exponent_local)?)
+                            } else {
+                                None
+                            };
                             (lhs_grad, rhs_grad)
                         }
                         BinaryOp::Atan2 => {
                             let lhs_square = self.square(lhs)?;
                             let rhs_square = self.square(rhs)?;
                             let denominator = self.add(lhs_square, rhs_square)?;
-                            let lhs_numerator = self.mul(upstream, rhs)?;
-                            let lhs_grad = self.div(lhs_numerator, denominator)?;
-                            let rhs_numerator = self.mul(upstream, lhs)?;
-                            let rhs_quotient = self.div(rhs_numerator, denominator)?;
-                            let rhs_grad = self.neg(rhs_quotient)?;
+                            let lhs_grad = if lhs_needed {
+                                let numerator = self.mul(upstream, rhs)?;
+                                Some(self.div(numerator, denominator)?)
+                            } else {
+                                None
+                            };
+                            let rhs_grad = if rhs_needed {
+                                let numerator = self.mul(upstream, lhs)?;
+                                let quotient = self.div(numerator, denominator)?;
+                                Some(self.neg(quotient)?)
+                            } else {
+                                None
+                            };
                             (lhs_grad, rhs_grad)
                         }
                         BinaryOp::Copysign => {
                             // This is tinygrad's comparison/reciprocal sign
                             // selection: differentiable in the magnitude
                             // argument away from zero, and zero in sign.
-                            let lhs_sign = self.sign(lhs)?;
-                            let local = self.copysign(lhs_sign, rhs)?;
-                            let lhs_grad = self.mul(upstream, local)?;
-                            let rhs_node = self.node(rhs)?;
-                            let rhs_grad =
-                                self.constant(filled(rhs_node.shape.clone(), 0.0, rhs_node.dtype)?);
+                            let lhs_grad = if lhs_needed {
+                                let lhs_sign = self.sign(lhs)?;
+                                let local = self.copysign(lhs_sign, rhs)?;
+                                Some(self.mul(upstream, local)?)
+                            } else {
+                                None
+                            };
+                            let rhs_grad = if rhs_needed {
+                                let rhs_node = self.node(rhs)?;
+                                Some(self.constant(filled(
+                                    rhs_node.shape.clone(),
+                                    0.0,
+                                    rhs_node.dtype,
+                                )?))
+                            } else {
+                                None
+                            };
                             (lhs_grad, rhs_grad)
                         }
                         BinaryOp::Maximum | BinaryOp::Minimum => {
-                            let lt = if op == BinaryOp::Maximum {
-                                self.lt(lhs, rhs)?
-                            } else {
-                                self.gt(lhs, rhs)?
-                            };
-                            let gt = if op == BinaryOp::Maximum {
-                                self.gt(lhs, rhs)?
-                            } else {
-                                self.lt(lhs, rhs)?
-                            };
                             let equal = self.eq(lhs, rhs)?;
                             let dtype = self.node(upstream)?.dtype;
                             let zero =
@@ -826,10 +990,28 @@ impl Graph {
                             let half =
                                 self.constant(TensorData::scalar_with_dtype(Scalar::F(0.5), dtype));
                             let half_upstream = self.mul(upstream, half)?;
-                            let lhs_tie = self.select(equal, half_upstream, zero)?;
-                            let rhs_tie = self.select(equal, half_upstream, zero)?;
-                            let lhs_grad = self.select(gt, upstream, lhs_tie)?;
-                            let rhs_grad = self.select(lt, upstream, rhs_tie)?;
+                            let lhs_grad = if lhs_needed {
+                                let winner = if op == BinaryOp::Maximum {
+                                    self.gt(lhs, rhs)?
+                                } else {
+                                    self.lt(lhs, rhs)?
+                                };
+                                let tie = self.select(equal, half_upstream, zero)?;
+                                Some(self.select(winner, upstream, tie)?)
+                            } else {
+                                None
+                            };
+                            let rhs_grad = if rhs_needed {
+                                let winner = if op == BinaryOp::Maximum {
+                                    self.lt(lhs, rhs)?
+                                } else {
+                                    self.gt(lhs, rhs)?
+                                };
+                                let tie = self.select(equal, half_upstream, zero)?;
+                                Some(self.select(winner, upstream, tie)?)
+                            } else {
+                                None
+                            };
                             (lhs_grad, rhs_grad)
                         }
                         BinaryOp::FloorDiv
@@ -841,21 +1023,39 @@ impl Graph {
                         | BinaryOp::BitXor
                         | BinaryOp::Shl
                         | BinaryOp::Shr => {
-                            let lhs_node = self.node(lhs)?;
-                            let zeros_l =
-                                self.constant(filled(lhs_node.shape.clone(), 0.0, lhs_node.dtype)?);
-                            let rhs_node = self.node(rhs)?;
-                            let zeros_r =
-                                self.constant(filled(rhs_node.shape.clone(), 0.0, rhs_node.dtype)?);
+                            let zeros_l = if lhs_needed {
+                                let lhs_node = self.node(lhs)?;
+                                Some(self.constant(filled(
+                                    lhs_node.shape.clone(),
+                                    0.0,
+                                    lhs_node.dtype,
+                                )?))
+                            } else {
+                                None
+                            };
+                            let zeros_r = if rhs_needed {
+                                let rhs_node = self.node(rhs)?;
+                                Some(self.constant(filled(
+                                    rhs_node.shape.clone(),
+                                    0.0,
+                                    rhs_node.dtype,
+                                )?))
+                            } else {
+                                None
+                            };
                             (zeros_l, zeros_r)
                         }
                     };
-                    let lhs_shape = self.node(lhs)?.shape.clone();
-                    let rhs_shape = self.node(rhs)?.shape.clone();
-                    let lhs_grad = self.unbroadcast(lhs_grad, lhs_shape)?;
-                    let rhs_grad = self.unbroadcast(rhs_grad, rhs_shape)?;
-                    self.accumulate(&mut grads, lhs, lhs_grad)?;
-                    self.accumulate(&mut grads, rhs, rhs_grad)?;
+                    if let Some(lhs_grad) = lhs_grad {
+                        let lhs_shape = self.node(lhs)?.shape.clone();
+                        let lhs_grad = self.unbroadcast(lhs_grad, lhs_shape)?;
+                        self.accumulate(&mut grads, lhs, lhs_grad)?;
+                    }
+                    if let Some(rhs_grad) = rhs_grad {
+                        let rhs_shape = self.node(rhs)?.shape.clone();
+                        let rhs_grad = self.unbroadcast(rhs_grad, rhs_shape)?;
+                        self.accumulate(&mut grads, rhs, rhs_grad)?;
+                    }
                 }
                 Op::Reduce {
                     input,
@@ -1044,17 +1244,19 @@ impl Graph {
                     axes,
                     keepdim,
                 } => {
-                    let upstream_grad = self.reduce_grad_vjp(
-                        upstream,
-                        input,
-                        first_upstream,
-                        kind,
-                        axes.clone(),
-                        keepdim,
-                        1,
-                    )?;
-                    self.accumulate(&mut grads, first_upstream, upstream_grad)?;
-                    if self.node(input)?.dtype.is_float() {
+                    if wants(first_upstream) {
+                        let upstream_grad = self.reduce_grad_vjp(
+                            upstream,
+                            input,
+                            first_upstream,
+                            kind,
+                            axes.clone(),
+                            keepdim,
+                            1,
+                        )?;
+                        self.accumulate(&mut grads, first_upstream, upstream_grad)?;
+                    }
+                    if wants(input) && self.node(input)?.dtype.is_float() {
                         let input_grad = self.reduce_grad_vjp(
                             upstream,
                             input,
@@ -1111,24 +1313,26 @@ impl Graph {
                             "static index update gradients require F32",
                         ));
                     }
-                    let base_shape = self.node(base)?.shape.clone();
-                    let value_shape = self.node(value)?.shape.clone();
-                    let base_grad = self.static_index_update_grad(
-                        upstream,
-                        base_shape,
-                        value_shape.clone(),
-                        plan.clone(),
-                        crate::StaticIndexUpdateWrt::Base,
-                    )?;
-                    let value_grad = self.static_index_update_grad(
-                        upstream,
-                        self.node(base)?.shape.clone(),
-                        value_shape,
-                        plan,
-                        crate::StaticIndexUpdateWrt::Value,
-                    )?;
-                    self.accumulate(&mut grads, base, base_grad)?;
-                    self.accumulate(&mut grads, value, value_grad)?;
+                    if wants(base) {
+                        let base_grad = self.static_index_update_grad(
+                            upstream,
+                            self.node(base)?.shape.clone(),
+                            self.node(value)?.shape.clone(),
+                            plan.clone(),
+                            crate::StaticIndexUpdateWrt::Base,
+                        )?;
+                        self.accumulate(&mut grads, base, base_grad)?;
+                    }
+                    if wants(value) {
+                        let value_grad = self.static_index_update_grad(
+                            upstream,
+                            self.node(base)?.shape.clone(),
+                            self.node(value)?.shape.clone(),
+                            plan,
+                            crate::StaticIndexUpdateWrt::Value,
+                        )?;
+                        self.accumulate(&mut grads, value, value_grad)?;
+                    }
                 }
                 Op::StaticIndexUpdateGrad { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
@@ -1145,21 +1349,25 @@ impl Graph {
                     if !add {
                         return Err(Error::NonDifferentiableIndexing("replacement scatter"));
                     }
-                    self.accumulate(&mut grads, base, upstream)?;
-                    let gathered = self.gather(upstream, index, axis)?;
-                    let update_shape = self.node(updates)?.shape.clone();
-                    let grad = if self.node(gathered)?.shape == update_shape {
-                        gathered
-                    } else {
-                        let starts = vec![0; update_shape.rank()];
-                        self.scatter_positions(
-                            gathered,
-                            update_shape,
-                            starts,
-                            vec![1; self.node(gathered)?.shape.rank()],
-                        )?
-                    };
-                    self.accumulate(&mut grads, updates, grad)?;
+                    if wants(base) {
+                        self.accumulate(&mut grads, base, upstream)?;
+                    }
+                    if wants(updates) {
+                        let gathered = self.gather(upstream, index, axis)?;
+                        let update_shape = self.node(updates)?.shape.clone();
+                        let grad = if self.node(gathered)?.shape == update_shape {
+                            gathered
+                        } else {
+                            let starts = vec![0; update_shape.rank()];
+                            self.scatter_positions(
+                                gathered,
+                                update_shape,
+                                starts,
+                                vec![1; self.node(gathered)?.shape.rank()],
+                            )?
+                        };
+                        self.accumulate(&mut grads, updates, grad)?;
+                    }
                 }
                 Op::MaskedSelect { .. } => {
                     return Err(Error::NonDifferentiableIndexing("masked_select"));
@@ -1208,8 +1416,10 @@ impl Graph {
                                 .checked_add(shape.dims()[axis])
                                 .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
                         );
-                        let grad = self.shrink(upstream, bounds)?;
-                        self.accumulate(&mut grads, input, grad)?;
+                        if wants(input) {
+                            let grad = self.shrink(upstream, bounds)?;
+                            self.accumulate(&mut grads, input, grad)?;
+                        }
                         start = start
                             .checked_add(shape.dims()[axis])
                             .ok_or(Error::ShapeOverflow(shape))?;
@@ -1226,14 +1436,18 @@ impl Graph {
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Matmul { lhs, rhs } => {
-                    let lhs_grad = self.matmul_grad(upstream, lhs, rhs, true)?;
-                    let rhs_grad = self.matmul_grad(upstream, lhs, rhs, false)?;
-                    self.accumulate(&mut grads, lhs, lhs_grad)?;
-                    self.accumulate(&mut grads, rhs, rhs_grad)?;
+                    if wants(lhs) {
+                        let lhs_grad = self.matmul_grad(upstream, lhs, rhs, true)?;
+                        self.accumulate(&mut grads, lhs, lhs_grad)?;
+                    }
+                    if wants(rhs) {
+                        let rhs_grad = self.matmul_grad(upstream, lhs, rhs, false)?;
+                        self.accumulate(&mut grads, rhs, rhs_grad)?;
+                    }
                 }
                 Op::Einsum { inputs, plan, .. } => {
                     for (target, input) in inputs.iter().enumerate() {
-                        if self.node(*input)?.dtype.is_float() {
+                        if wants(*input) && self.node(*input)?.dtype.is_float() {
                             let gradient =
                                 self.einsum_grad(upstream, &inputs, plan.clone(), target)?;
                             self.accumulate(&mut grads, *input, gradient)?;
@@ -1246,17 +1460,19 @@ impl Graph {
                     plan,
                     target,
                 } => {
-                    let upstream_grad = self.einsum_grad_vjp(
-                        upstream,
-                        first_upstream,
-                        &inputs,
-                        plan.clone(),
-                        target,
-                        inputs.len(),
-                    )?;
-                    self.accumulate(&mut grads, first_upstream, upstream_grad)?;
+                    if wants(first_upstream) {
+                        let upstream_grad = self.einsum_grad_vjp(
+                            upstream,
+                            first_upstream,
+                            &inputs,
+                            plan.clone(),
+                            target,
+                            inputs.len(),
+                        )?;
+                        self.accumulate(&mut grads, first_upstream, upstream_grad)?;
+                    }
                     for (wrt, input) in inputs.iter().copied().enumerate() {
-                        if wrt != target && self.node(input)?.dtype.is_float() {
+                        if wants(input) && wrt != target && self.node(input)?.dtype.is_float() {
                             let local = self.einsum_grad_vjp(
                                 upstream,
                                 first_upstream,
@@ -1275,11 +1491,19 @@ impl Graph {
                     rhs,
                     lhs_gradient,
                 } => {
-                    let upstream_grad =
-                        self.matmul_grad_vjp(upstream, first_upstream, lhs, rhs, lhs_gradient, 0)?;
-                    self.accumulate(&mut grads, first_upstream, upstream_grad)?;
+                    if wants(first_upstream) {
+                        let upstream_grad = self.matmul_grad_vjp(
+                            upstream,
+                            first_upstream,
+                            lhs,
+                            rhs,
+                            lhs_gradient,
+                            0,
+                        )?;
+                        self.accumulate(&mut grads, first_upstream, upstream_grad)?;
+                    }
                     let factor = if lhs_gradient { rhs } else { lhs };
-                    if self.node(factor)?.dtype.is_float() {
+                    if wants(factor) && self.node(factor)?.dtype.is_float() {
                         let factor_grad = self.matmul_grad_vjp(
                             upstream,
                             first_upstream,
@@ -1307,12 +1531,17 @@ impl Graph {
                     bias,
                     options,
                 } => {
-                    let input_grad = self.conv2d_grad(upstream, input, weight, bias, options, 0)?;
-                    let weight_grad =
-                        self.conv2d_grad(upstream, input, weight, bias, options, 1)?;
-                    self.accumulate(&mut grads, input, input_grad)?;
-                    self.accumulate(&mut grads, weight, weight_grad)?;
-                    if let Some(bias) = bias {
+                    if wants(input) {
+                        let input_grad =
+                            self.conv2d_grad(upstream, input, weight, bias, options, 0)?;
+                        self.accumulate(&mut grads, input, input_grad)?;
+                    }
+                    if wants(weight) {
+                        let weight_grad =
+                            self.conv2d_grad(upstream, input, weight, bias, options, 1)?;
+                        self.accumulate(&mut grads, weight, weight_grad)?;
+                    }
+                    if let Some(bias) = bias.filter(|bias| wants(*bias)) {
                         let bias_grad =
                             self.conv2d_grad(upstream, input, weight, Some(bias), options, 2)?;
                         self.accumulate(&mut grads, bias, bias_grad)?;
@@ -1337,7 +1566,8 @@ impl Graph {
                             },
                             _ => unreachable!(),
                         };
-                        if self.node(node)?.dtype.is_float()
+                        if wants(node)
+                            && self.node(node)?.dtype.is_float()
                             && (wrt == 0 || wrt != target as usize + 1)
                         {
                             let local = self.conv2d_grad_vjp(
@@ -1360,13 +1590,17 @@ impl Graph {
                     bias,
                     options,
                 } => {
-                    let input_grad =
-                        self.conv_transpose2d_grad(upstream, input, weight, bias, options, 0)?;
-                    let weight_grad =
-                        self.conv_transpose2d_grad(upstream, input, weight, bias, options, 1)?;
-                    self.accumulate(&mut grads, input, input_grad)?;
-                    self.accumulate(&mut grads, weight, weight_grad)?;
-                    if let Some(b) = bias {
+                    if wants(input) {
+                        let input_grad =
+                            self.conv_transpose2d_grad(upstream, input, weight, bias, options, 0)?;
+                        self.accumulate(&mut grads, input, input_grad)?;
+                    }
+                    if wants(weight) {
+                        let weight_grad =
+                            self.conv_transpose2d_grad(upstream, input, weight, bias, options, 1)?;
+                        self.accumulate(&mut grads, weight, weight_grad)?;
+                    }
+                    if let Some(b) = bias.filter(|bias| wants(*bias)) {
                         let bias_grad = self.conv_transpose2d_grad(
                             upstream,
                             input,
@@ -1397,7 +1631,8 @@ impl Graph {
                             },
                             _ => unreachable!(),
                         };
-                        if self.node(node)?.dtype.is_float()
+                        if wants(node)
+                            && self.node(node)?.dtype.is_float()
                             && (wrt == 0 || wrt != target as usize + 1)
                         {
                             let local = self.conv_transpose2d_grad_vjp(
@@ -1422,66 +1657,27 @@ impl Graph {
                     let upstream_node = self.node(upstream)?;
                     let zeros = filled(upstream_node.shape.clone(), 0.0, upstream_node.dtype)?;
                     let zeros = self.constant(zeros);
-                    let true_grad = self.select(condition, upstream, zeros)?;
-                    let false_grad = self.select(condition, zeros, upstream)?;
-                    let true_grad =
-                        self.unbroadcast(true_grad, self.node(on_true)?.shape.clone())?;
-                    let false_grad =
-                        self.unbroadcast(false_grad, self.node(on_false)?.shape.clone())?;
-                    self.accumulate(&mut grads, on_true, true_grad)?;
-                    self.accumulate(&mut grads, on_false, false_grad)?;
+                    if wants(on_true) {
+                        let true_grad = self.select(condition, upstream, zeros)?;
+                        let true_grad =
+                            self.unbroadcast(true_grad, self.node(on_true)?.shape.clone())?;
+                        self.accumulate(&mut grads, on_true, true_grad)?;
+                    }
+                    if wants(on_false) {
+                        let false_grad = self.select(condition, zeros, upstream)?;
+                        let false_grad =
+                            self.unbroadcast(false_grad, self.node(on_false)?.shape.clone())?;
+                        self.accumulate(&mut grads, on_false, false_grad)?;
+                    }
                 }
             }
         }
         Ok(grads)
     }
 
-    fn source_gradient_target_path(
-        &self,
-        loss: NodeId,
-        targets: &[NodeId],
-        original_len: usize,
-    ) -> Result<Vec<bool>> {
-        let target_set = targets.iter().copied().collect::<BTreeSet<_>>();
-        let mut ancestors = vec![false; original_len];
-        let mut pending = vec![loss];
-        while let Some(node) = pending.pop() {
-            if ancestors[node.index()] {
-                continue;
-            }
-            ancestors[node.index()] = true;
-            pending.extend(self.node(node)?.op.backward_inputs());
-        }
-
-        // Graph NodeIds are topological. Track whether each ancestor contains
-        // any requested target, and separately whether its reverse rule must
-        // run to reach such a target. A target itself only needs processing
-        // when another requested target lies below it.
-        let mut contains_target = vec![false; original_len];
-        let mut target_path = vec![false; original_len];
-        for index in 0..original_len {
-            if !ancestors[index] {
-                continue;
-            }
-            let node = NodeId(index);
-            let reaches_target = self
-                .node(node)?
-                .op
-                .backward_inputs()
-                .into_iter()
-                .any(|input| contains_target[input.index()]);
-            target_path[index] = reaches_target;
-            contains_target[index] = target_set.contains(&node) || reaches_target;
-        }
-        Ok(target_path)
-    }
-
-    fn validate_source_gradient_path(&self, target_path: &[bool]) -> Result<()> {
-        for (index, &active) in target_path.iter().enumerate() {
-            if !active {
-                continue;
-            }
-            if let Op::PrefixScan { input, kind, .. } = &self.nodes[index].op {
+    fn validate_reverse_path(&self, traversal: &ReverseTraversal) -> Result<()> {
+        for node in traversal.active_nodes() {
+            if let Op::PrefixScan { input, kind, .. } = &self.node(node)?.op {
                 match kind {
                     crate::PrefixScanKind::Sum
                         if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
@@ -1547,61 +1743,6 @@ impl Graph {
         } else {
             self.sum_to(gradient, shape)
         }
-    }
-
-    fn validate_prefix_scan_reverse(&self, loss: NodeId) -> Result<()> {
-        let mut pending = vec![loss];
-        let mut visited = BTreeSet::new();
-        while let Some(node) = pending.pop() {
-            if !visited.insert(node) {
-                continue;
-            }
-            let current = self.node(node)?;
-            // Reverse mode never reaches exact/control-only subgraphs, and a
-            // detach node is a fresh leaf. Do not let an integer coordinate
-            // range or a detached cumulative-extrema implementation reject a
-            // derivative whose active floating path does not cross it.
-            if !current.requires_grad || matches!(&current.op, Op::Detach { .. }) {
-                continue;
-            }
-            if let Op::PrefixScan { input, kind, .. } = &current.op {
-                match kind {
-                    crate::PrefixScanKind::Sum
-                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
-                    {
-                        return Err(Error::NonDifferentiableIndexing(
-                            "cumsum gradients require floating input",
-                        ));
-                    }
-                    crate::PrefixScanKind::Product
-                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
-                    {
-                        return Err(Error::NonDifferentiableIndexing(
-                            "cumprod gradients require floating input",
-                        ));
-                    }
-                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min
-                        if !prefix_scan_gradient_dtype_supported(self.node(*input)?.dtype) =>
-                    {
-                        return Err(Error::NonDifferentiableIndexing(
-                            "cumulative extrema gradients require floating input",
-                        ));
-                    }
-                    crate::PrefixScanKind::Sum
-                    | crate::PrefixScanKind::Product
-                    | crate::PrefixScanKind::Max
-                    | crate::PrefixScanKind::Min => {}
-                }
-            }
-            pending.extend(
-                current
-                    .op
-                    .backward_inputs()
-                    .into_iter()
-                    .filter(|input| self.nodes[input.index()].requires_grad),
-            );
-        }
-        Ok(())
     }
 
     fn cumsum_vjp(&mut self, upstream: NodeId, axis: usize) -> Result<NodeId> {
@@ -2109,6 +2250,265 @@ mod tests {
     }
 
     #[test]
+    fn reverse_edge_projection_excludes_predicate_index_and_detach_edges() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let y = graph.input("y", [3]);
+        let condition = graph.input_dtype("condition", [3], DType::Bool);
+        let index = graph.input_dtype("index", [3], DType::I32);
+
+        let selected = graph.select(condition, x, y).unwrap();
+        assert_eq!(graph.op(selected).unwrap().backward_inputs(), vec![x, y]);
+
+        let gathered = graph.gather(x, index, 0).unwrap();
+        assert_eq!(graph.op(gathered).unwrap().backward_inputs(), vec![x]);
+
+        let scattered = graph.scatter(x, index, y, 0).unwrap();
+        assert_eq!(graph.op(scattered).unwrap().backward_inputs(), vec![x, y]);
+
+        let compacted = graph
+            .masked_select(x, condition, 3, Scalar::F(0.0))
+            .unwrap();
+        assert_eq!(graph.op(compacted).unwrap().backward_inputs(), vec![x]);
+
+        let detached = graph.detach(x).unwrap();
+        assert!(graph.op(detached).unwrap().backward_inputs().is_empty());
+
+        let (_, cumulative_indices) = graph.cummax(x, 0).unwrap();
+        assert!(
+            graph
+                .op(cumulative_indices)
+                .unwrap()
+                .backward_inputs()
+                .is_empty()
+        );
+        let (_, sort_indices) = graph.sort(x, 0, false).unwrap();
+        assert!(graph.op(sort_indices).unwrap().backward_inputs().is_empty());
+    }
+
+    #[test]
+    fn grad_with_prunes_unrequested_failures_and_commits_atomically() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let y = graph.input("y", [3]);
+        let index = graph.input_dtype("index", [3], DType::I32);
+
+        let x_squared = graph.square(x).unwrap();
+        let x_loss = graph.sum_all(x_squared).unwrap();
+        let replacement = graph.scatter(y, index, y, 0).unwrap();
+        let replacement_squared = graph.square(replacement).unwrap();
+        let replacement_loss = graph.sum_all(replacement_squared).unwrap();
+        let loss = graph.add(x_loss, replacement_loss).unwrap();
+
+        // Like tinygrad's target-filtered `_deepwalk`, the reverse transform
+        // never visits the unrelated replacement-scatter rule.
+        let x_gradient = graph.no_grad(|candidate| {
+            assert!(!candidate.grad_enabled());
+            let gradient = candidate.grad(loss, x).unwrap();
+            assert!(!candidate.grad_enabled());
+            gradient
+        });
+        assert!(graph.grad_enabled());
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    x_gradient,
+                    &HashMap::from([
+                        ("x".into(), data([3], &[2.0, 3.0, 5.0])),
+                        ("y".into(), data([3], &[7.0, 11.0, 13.0])),
+                        (
+                            "index".into(),
+                            TensorData::from_scalars(
+                                [3],
+                                DType::I32,
+                                [Scalar::I(0), Scalar::I(1), Scalar::I(2)],
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap(),
+            data([3], &[4.0, 6.0, 10.0])
+        );
+
+        let source_gradient = graph.no_grad(|candidate| {
+            assert!(!candidate.grad_enabled());
+            let gradient = candidate.gradient_default(loss, &[x]).unwrap()[0];
+            assert!(!candidate.grad_enabled());
+            gradient
+        });
+        assert!(graph.grad_enabled());
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    source_gradient,
+                    &HashMap::from([
+                        ("x".into(), data([3], &[2.0, 3.0, 5.0])),
+                        ("y".into(), data([3], &[7.0, 11.0, 13.0])),
+                        (
+                            "index".into(),
+                            TensorData::from_scalars(
+                                [3],
+                                DType::I32,
+                                [Scalar::I(0), Scalar::I(1), Scalar::I(2)],
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap(),
+            data([3], &[4.0, 6.0, 10.0])
+        );
+
+        // The active replacement-scatter path first builds derivatives for
+        // Add, Sum, and Square, then rejects at Scatter. None of those private
+        // candidate nodes, nor the temporary create_graph mode, may publish.
+        graph.no_grad(|candidate| {
+            let before = candidate.node_count();
+            assert!(!candidate.grad_enabled());
+            assert!(matches!(
+                candidate.grad_with(loss, y, None, false),
+                Err(Error::NonDifferentiableIndexing("replacement scatter"))
+            ));
+            assert_eq!(candidate.node_count(), before);
+            assert!(!candidate.grad_enabled());
+        });
+        assert!(graph.grad_enabled());
+
+        graph.no_grad(|candidate| {
+            let before = candidate.node_count();
+            assert!(!candidate.grad_enabled());
+            assert!(matches!(
+                candidate.gradient_default(loss, &[y]),
+                Err(Error::NonDifferentiableIndexing("replacement scatter"))
+            ));
+            assert_eq!(candidate.node_count(), before);
+            assert!(!candidate.grad_enabled());
+        });
+        assert!(graph.grad_enabled());
+    }
+
+    #[test]
+    fn target_slice_builds_only_requested_edges_and_preserves_duplicate_roles() {
+        let mut graph = Graph::new();
+        let condition = graph.input_dtype("condition", [2], DType::Bool);
+        let x = graph.input("x", [2]);
+        let y = graph.input("y", [2]);
+        let selected = graph.select(condition, x, y).unwrap();
+        let loss = graph.sum_all(selected).unwrap();
+        let before = graph.node_count();
+        graph.grad(loss, x).unwrap();
+        assert_eq!(
+            (before..graph.node_count())
+                .map(NodeId)
+                .filter(|node| matches!(graph.op(*node).unwrap(), Op::Select { .. }))
+                .count(),
+            1,
+            "the unrequested false branch must not build a local derivative"
+        );
+
+        let lhs = graph.input("lhs", [2, 3]);
+        let rhs = graph.input("rhs", [3, 2]);
+        let product = graph.matmul(lhs, rhs).unwrap();
+        let product_loss = graph.sum_all(product).unwrap();
+        let before = graph.node_count();
+        let lhs_gradient = graph.grad(product_loss, lhs).unwrap();
+        // The ordinary homogeneous rank-two case decomposes the local VJP
+        // into existing Matmul/Permute primitives. Inspect its actual value
+        // edges: the requested lhs derivative depends on the cotangent and
+        // transposed rhs, never on the original lhs or an eagerly built rhs
+        // derivative branch.
+        let Op::Matmul {
+            lhs: upstream,
+            rhs: transposed_rhs,
+        } = graph.op(lhs_gradient).unwrap()
+        else {
+            unreachable!()
+        };
+        let Op::Permute { input, axes } = graph.op(*transposed_rhs).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(*input, rhs);
+        assert_eq!(axes.as_slice(), &[1, 0]);
+        assert_eq!(
+            graph.op(lhs_gradient).unwrap().backward_inputs(),
+            vec![*upstream, *transposed_rhs],
+            "the original differentiated lhs is not a second-order value edge"
+        );
+        assert!(!graph.backward_slice_contains(lhs_gradient, lhs).unwrap());
+        assert!(graph.backward_slice_contains(lhs_gradient, rhs).unwrap());
+        assert!((before..graph.node_count()).map(NodeId).all(|node| {
+            !matches!(graph.op(node).unwrap(), Op::Permute { input, .. } if *input == lhs)
+        }));
+
+        let repeated = graph.select(condition, x, x).unwrap();
+        let repeated_loss = graph.sum_all(repeated).unwrap();
+        let repeated_gradient = graph.grad(repeated_loss, x).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    repeated_gradient,
+                    &HashMap::from([
+                        (
+                            "condition".into(),
+                            TensorData::from_scalars(
+                                [2],
+                                DType::Bool,
+                                [Scalar::Bool(true), Scalar::Bool(false)],
+                            )
+                            .unwrap()
+                        ),
+                        ("x".into(), data([2], &[2.0, 3.0])),
+                    ]),
+                )
+                .unwrap(),
+            data([2], &[1.0, 1.0])
+        );
+        assert!(matches!(
+            graph.op(repeated_gradient).unwrap(),
+            Op::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn checked_cast_edges_stop_at_nonfloating_storage() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2]);
+        let integer = graph.cast(input, DType::I32).unwrap();
+        let recast = graph.cast(integer, DType::F32).unwrap();
+        let loss = graph.sum_all(recast).unwrap();
+
+        assert!(!graph.backward_slice_contains(loss, input).unwrap());
+        let before = graph.node_count();
+        assert!(matches!(graph.grad(loss, input), Err(Error::NoGradient(node)) if node == input));
+        assert_eq!(graph.node_count(), before);
+
+        let source_gradient = graph.gradient_default(loss, &[input]).unwrap()[0];
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    source_gradient,
+                    &HashMap::from([("input".into(), data([2], &[1.25, -3.5]))]),
+                )
+                .unwrap(),
+            data([2], &[0.0, 0.0])
+        );
+
+        let widened = graph.cast(input, DType::F64).unwrap();
+        let widened_loss = graph.sum_all(widened).unwrap();
+        assert!(graph.backward_slice_contains(widened_loss, input).unwrap());
+        let widened_gradient = graph.grad(widened_loss, input).unwrap();
+        assert_eq!(graph.dtype(widened_gradient).unwrap(), DType::F32);
+    }
+
+    #[test]
     fn cumulative_extrema_value_vjp_splits_prefix_ties_and_preserves_axes() {
         let mut graph = Graph::new();
         let maximum_input = graph.input("maximum_input", [3]);
@@ -2176,6 +2576,73 @@ mod tests {
                 .unwrap(),
             data([2], &[4.0, 2.0])
         );
+    }
+
+    #[test]
+    fn source_gradient_returns_typed_zeros_below_every_nonvalue_edge() {
+        let mut graph = Graph::new();
+        let values = graph.input("values", [3]);
+        let other = graph.input("other", [3]);
+        let zero = graph.constant(TensorData::scalar(0.0));
+
+        let predicate_source = graph.input("predicate_source", [3]);
+        let predicate = graph.gt(predicate_source, zero).unwrap();
+        let selected = graph.select(predicate, values, other).unwrap();
+        let selected_loss = graph.sum_all(selected).unwrap();
+        let predicate_gradient = graph
+            .gradient_default(selected_loss, &[predicate_source])
+            .unwrap()[0];
+
+        let index_source = graph.input("index_source", [3]);
+        let index = graph.cast(index_source, DType::I32).unwrap();
+        let gathered = graph.gather(values, index, 0).unwrap();
+        let base = graph.constant(data([3], &[0.0, 0.0, 0.0]));
+        let scattered = graph.scatter_add(base, index, other, 0).unwrap();
+        let indexed = graph.add(gathered, scattered).unwrap();
+        let indexed_loss = graph.sum_all(indexed).unwrap();
+        let index_gradient = graph
+            .gradient_default(indexed_loss, &[index_source])
+            .unwrap()[0];
+
+        let mask_source = graph.input("mask_source", [3]);
+        let mask = graph.gt(mask_source, zero).unwrap();
+        let compacted = graph
+            .masked_select(values, mask, 3, Scalar::F(0.0))
+            .unwrap();
+        let compacted_loss = graph.sum_all(compacted).unwrap();
+        let mask_gradient = graph
+            .gradient_default(compacted_loss, &[mask_source])
+            .unwrap()[0];
+
+        let detach_source = graph.input("detach_source", [3]);
+        let detached = graph.detach(detach_source).unwrap();
+        let detached_squared = graph.square(detached).unwrap();
+        let detached_loss = graph.sum_all(detached_squared).unwrap();
+        let detach_gradient = graph
+            .gradient_default(detached_loss, &[detach_source])
+            .unwrap()[0];
+
+        let bindings = HashMap::from([
+            ("values".into(), data([3], &[2.0, 3.0, 5.0])),
+            ("other".into(), data([3], &[7.0, 11.0, 13.0])),
+            ("predicate_source".into(), data([3], &[1.0, -1.0, 1.0])),
+            ("index_source".into(), data([3], &[0.0, 1.0, 2.0])),
+            ("mask_source".into(), data([3], &[1.0, -1.0, 1.0])),
+            ("detach_source".into(), data([3], &[17.0, 19.0, 23.0])),
+        ]);
+        for gradient in [
+            predicate_gradient,
+            index_gradient,
+            mask_gradient,
+            detach_gradient,
+        ] {
+            assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
+            assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([3]));
+            assert_eq!(
+                CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
+                data([3], &[0.0, 0.0, 0.0])
+            );
+        }
     }
 
     #[test]
@@ -2293,7 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn source_gradient_normalizes_custom_seed_and_prunes_unrequested_paths() {
+    fn source_gradient_broadcasts_custom_seed_and_prunes_unrequested_paths() {
         let mut graph = Graph::new();
         let x = graph.input("x", [3]);
         let y = graph.input("y", [3]);
@@ -2312,8 +2779,8 @@ mod tests {
             .unwrap()[0];
 
         // `[1]` is the concrete public representation accepted by tinygrad's
-        // scalar custom-gradient example. Normalize it to the scalar loss
-        // descriptor before the one reverse traversal.
+        // scalar custom-gradient example. The established source-facing seed
+        // contract reshapes its one element to the scalar loss descriptor.
         let gradient = graph.gradient(loss, &[x], Some(seed)).unwrap()[0];
         let bindings = HashMap::from([
             ("x".into(), data([3], &[2.0, 3.0, 5.0])),
@@ -2371,6 +2838,142 @@ mod tests {
         assert!(matches!(
             graph.gradient(vector, &[vector], Some(bad_seed)),
             Err(Error::GradientShape { .. })
+        ));
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
+    fn source_gradient_identity_and_empty_target_requests_publish_exactly() {
+        let mut graph = Graph::new();
+        let scalar = graph.input("scalar", []);
+        let explicit = graph.input("explicit", []);
+        let before = graph.node_count();
+        assert_eq!(
+            graph.gradient(scalar, &[scalar], Some(explicit)).unwrap(),
+            vec![explicit]
+        );
+        assert_eq!(graph.node_count(), before);
+        assert_eq!(
+            graph
+                .grad_with(scalar, scalar, Some(explicit), false)
+                .unwrap(),
+            explicit
+        );
+        assert_eq!(graph.node_count(), before);
+
+        let implicit = graph.gradient_default(scalar, &[scalar]).unwrap()[0];
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    implicit,
+                    &HashMap::from([("scalar".into(), TensorData::scalar(7.0))]),
+                )
+                .unwrap(),
+            TensorData::scalar(1.0)
+        );
+
+        let before = graph.node_count();
+        assert!(graph.gradient_default(scalar, &[]).unwrap().is_empty());
+        assert_eq!(graph.node_count(), before);
+
+        let vector = graph.input("vector", [2]);
+        let unused_bad_shape = graph.input("unused_bad_shape", [3]);
+        let before = graph.node_count();
+        assert!(
+            graph
+                .gradient(vector, &[], Some(unused_bad_shape))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(graph.node_count(), before);
+
+        assert!(matches!(
+            graph.gradient_default(vector, &[]),
+            Err(Error::NonScalarLoss(shape)) if shape == Shape::new([2])
+        ));
+        assert_eq!(graph.node_count(), before);
+        assert!(matches!(
+            graph.gradient(vector, &[], Some(NodeId(usize::MAX))),
+            Err(Error::UnknownNode(NodeId(usize::MAX)))
+        ));
+        assert_eq!(graph.node_count(), before);
+
+        let integer = graph.input_dtype("integer", [], DType::I32);
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient_default(integer, &[]),
+            Err(Error::NonDifferentiableTarget(node)) if node == integer
+        ));
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
+    fn source_gradient_restores_equal_numel_and_broadcast_seed_normalization() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let output = graph.square(input).unwrap();
+        let row_seed = graph.input("row_seed", [3]);
+        let row_gradient = graph.gradient(output, &[input], Some(row_seed)).unwrap()[0];
+
+        let scalar_seed = graph.input("scalar_seed", [1]);
+        let scalar_gradient = graph.gradient(output, &[input], Some(scalar_seed)).unwrap()[0];
+
+        let bindings = HashMap::from([
+            (
+                "input".into(),
+                data([2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ),
+            ("row_seed".into(), data([3], &[10.0, 20.0, 30.0])),
+            ("scalar_seed".into(), data([1], &[2.0])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, row_gradient, &bindings).unwrap(),
+            data([2, 3], &[20.0, 80.0, 180.0, 80.0, 200.0, 360.0])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, scalar_gradient, &bindings)
+                .unwrap(),
+            data([2, 3], &[4.0, 8.0, 12.0, 16.0, 20.0, 24.0])
+        );
+
+        let flat_seed = graph.input("flat_seed", [6]);
+        let flat_gradient = graph.gradient(output, &[input], Some(flat_seed)).unwrap()[0];
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    flat_gradient,
+                    &HashMap::from([
+                        (
+                            "input".into(),
+                            data([2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                        ),
+                        (
+                            "flat_seed".into(),
+                            data([6], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                        ),
+                    ]),
+                )
+                .unwrap(),
+            data([2, 3], &[2.0, 8.0, 18.0, 32.0, 50.0, 72.0])
+        );
+
+        let incompatible = graph.input("incompatible", [2, 2]);
+        let before = graph.node_count();
+        assert!(matches!(
+            graph.gradient(output, &[input], Some(incompatible)),
+            Err(Error::GradientShape { output, upstream })
+                if output == Shape::new([2, 3]) && upstream == Shape::new([2, 2])
+        ));
+        assert_eq!(graph.node_count(), before);
+
+        // The legacy single-target API intentionally remains descriptor-exact.
+        assert!(matches!(
+            graph.grad_with(output, input, Some(row_seed), true),
+            Err(Error::GradientShape { output, upstream })
+                if output == Shape::new([2, 3]) && upstream == Shape::new([3])
         ));
         assert_eq!(graph.node_count(), before);
     }
@@ -2603,10 +3206,52 @@ mod tests {
         let output = overflow.pow(lhs, rhs).unwrap();
         let node_count = overflow.node_count();
         assert!(matches!(
-            pow_vjp_plan(&overflow, output, lhs, rhs, output),
+            pow_vjp_plan(&overflow, output, lhs, rhs, output, [true, true]),
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(overflow.node_count(), node_count);
+    }
+
+    #[test]
+    fn shared_pow_operand_retains_both_reverse_roles() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2]);
+        let power = graph.pow(input, input).unwrap();
+        let traversal = ReverseTraversal::new(&graph, power, &[input]).unwrap();
+        assert_eq!(
+            traversal.active_inputs[power.index()],
+            vec![input, input],
+            "duplicate operand roles are part of the checked frontier"
+        );
+        // Each role has an independently checked preflight, and the shared
+        // operand requests both without collapsing duplicate edge roles.
+        pow_vjp_plan(&graph, power, input, input, power, [true, false]).unwrap();
+        pow_vjp_plan(&graph, power, input, input, power, [false, true]).unwrap();
+        pow_vjp_plan(&graph, power, input, input, power, [true, true]).unwrap();
+
+        let loss = graph.sum_all(power).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        assert!(matches!(
+            graph.op(gradient).unwrap(),
+            Op::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+        let realized = CpuBackend
+            .execute(
+                &graph,
+                gradient,
+                &HashMap::from([("input".into(), data([2], &[2.0, 3.0]))]),
+            )
+            .unwrap();
+        for (actual, expected) in realized
+            .values()
+            .iter()
+            .zip([4.0 * (1.0 + 2.0f32.ln()), 27.0 * (1.0 + 3.0f32.ln())])
+        {
+            assert!((actual - expected).abs() < 1e-5);
+        }
     }
 
     #[test]

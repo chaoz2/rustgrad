@@ -832,6 +832,19 @@ mod tests {
         assert_eq!(graph.node_count(), before_static);
         assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
 
+        let cast_source = graph.input_dtype("cast_source", [2, 3], DType::F32);
+        let integer = graph.cast(cast_source, DType::I32).unwrap();
+        let recast = graph.cast(integer, DType::F32).unwrap();
+        let cast_output = graph.masked_select_dynamic(recast, mask).unwrap();
+        let before_static = graph.node_count();
+        let before_dynamic = graph.dynamic_nodes.len();
+        assert!(matches!(
+            graph.dynamic_vjp_plan(cast_output, cast_source),
+            Err(Error::NonDifferentiableTarget(node)) if node == cast_source
+        ));
+        assert_eq!(graph.node_count(), before_static);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+
         let guarded = graph.tensor_guard_distribution(input, 1).unwrap();
         let guarded_output = graph.masked_select_dynamic(guarded, mask).unwrap();
         let before_static = graph.node_count();
