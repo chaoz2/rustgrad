@@ -5214,6 +5214,7 @@ impl Graph {
             | Op::Random { .. }
             | Op::RandomPermutation { .. }
             | Op::Bitcast { .. }
+            | Op::Threefry { .. }
             | Op::Sort { .. } => false,
             Op::Cast { input, .. }
             | Op::Contiguous { input }

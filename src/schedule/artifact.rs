@@ -10,8 +10,8 @@ use crate::engine::symbolic_view::SymbolicViewMap;
 use crate::tensor::artifact as tensor_artifact;
 use crate::uop::artifact::{
     ArtifactError, Reader, Writer, checksum, decode as decode_uop, dtype, dtype_tag,
-    encode as encode_uop, encode_effect_aware, read_affine_view, read_shape, read_symbolic,
-    read_view, write_affine_view, write_shape, write_symbolic, write_view,
+    encode_schedule_identity, read_affine_view, read_shape, read_symbolic, read_view,
+    write_affine_view, write_shape, write_symbolic, write_view,
 };
 use crate::{
     CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
@@ -529,7 +529,7 @@ fn write_item(w: &mut Writer, x: &ScheduleItem, affine_views: bool) -> Result<()
     for output in x.outputs.iter() {
         write_desc_inner(w, output, affine_views)?;
     }
-    let kernel = encode_uop(&x.kernel)?;
+    let kernel = encode_schedule_identity(&x.kernel)?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
     write_boundary(w, x.boundary.as_ref())?;
@@ -568,7 +568,7 @@ fn write_scheduled_outputs_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
     for output in x.outputs.iter() {
         write_desc_inner(w, output, false)?;
     }
-    let kernel = encode_uop(&x.kernel)?;
+    let kernel = encode_schedule_identity(&x.kernel)?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
     write_boundary(w, x.boundary.as_ref())?;
@@ -610,11 +610,7 @@ fn write_item_inner(w: &mut Writer, x: &ScheduleItem, effects: bool) -> Result<(
         w.u64(id.index() as u64)?;
     }
     write_desc_inner(w, x.primary_output(), effects)?;
-    let kernel = if effects {
-        encode_effect_aware(&x.kernel)?
-    } else {
-        encode_uop(&x.kernel)?
-    };
+    let kernel = encode_schedule_identity(&x.kernel)?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
     write_boundary_inner(w, x.boundary.as_ref(), effects)?;
@@ -641,7 +637,7 @@ fn write_item_v3(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> 
         w.u64(id.index() as u64)?;
     }
     write_desc_inner(w, x.primary_output(), false)?;
-    let kernel = encode_uop(&x.kernel)?;
+    let kernel = encode_schedule_identity(&x.kernel)?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
     write_boundary(w, x.boundary.as_ref())?;

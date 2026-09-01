@@ -1,8 +1,8 @@
 //! Bounded portable node-table encoding for validated UOps.
 use super::{
     AddressSpace, AddressValue, AffineView, Binary, IndexValue, LiteralValue, MatmulValue,
-    MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue, TensorGuardValue, UOp,
-    UType, Unary, VariableValue, ViewMap, graph_unary_type_is_valid,
+    MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue, TensorGuardValue,
+    ThreefryValue, UOp, UType, Unary, VariableValue, ViewMap, graph_unary_type_is_valid,
 };
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
@@ -19,9 +19,9 @@ const MAGIC: &[u8; 4] = b"RGUA";
 /// v14 adds the prefix-scan output selector; v16 adds the coupled Sort pair;
 /// v17 adds the CPU-static TensorGuard validation boundary; v18 makes the
 /// prefix-scan source/result buffer ABI and source dtype self-contained.
+/// v19 adds the dependency-bearing live packed-U64 Threefry plan.
 /// v15 is retained as the first internal mixed-schedule envelope.
-const VERSION: u8 = 18;
-const EFFECT_VERSION: u8 = 18;
+const VERSION: u8 = 19;
 const PREVIOUS_EFFECT_VERSION: u8 = 15;
 const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
@@ -52,6 +52,7 @@ enum WireOpcode {
     GraphBinary(BinaryOp),
     GraphCompare(CompareOp),
     GraphLogical(LogicalOp),
+    Threefry,
     Matmul,
     Conv2d,
     Movement,
@@ -153,6 +154,14 @@ enum WireArg {
         axis: usize,
         dtype: DType,
     },
+    Threefry {
+        counter: NodeId,
+        key: NodeId,
+        counter_shape: Shape,
+        key_shape: Shape,
+        output: NodeId,
+        output_shape: Shape,
+    },
     Effect(Box<crate::EffectPayload>),
 }
 
@@ -195,6 +204,17 @@ fn operation_to_wire(operation: &Operation) -> (WireOpcode, WireArg) {
         Operation::GraphBinary(op) => (WireOpcode::GraphBinary(*op), WireArg::None),
         Operation::GraphCompare(op) => (WireOpcode::GraphCompare(*op), WireArg::None),
         Operation::GraphLogical(op) => (WireOpcode::GraphLogical(*op), WireArg::None),
+        Operation::Threefry(value) => (
+            WireOpcode::Threefry,
+            WireArg::Threefry {
+                counter: value.counter,
+                key: value.key,
+                counter_shape: value.counter_shape.clone(),
+                key_shape: value.key_shape.clone(),
+                output: value.output,
+                output_shape: value.output_shape.clone(),
+            },
+        ),
         Operation::Matmul(MatmulValue::Serial(plan)) => {
             (WireOpcode::Matmul, WireArg::Matmul(plan.clone()))
         }
@@ -381,6 +401,24 @@ fn operation_from_wire(opcode: WireOpcode, arg: WireArg) -> Result<Operation, Ar
         (WireOpcode::GraphBinary(op), WireArg::None) => Operation::GraphBinary(op),
         (WireOpcode::GraphCompare(op), WireArg::None) => Operation::GraphCompare(op),
         (WireOpcode::GraphLogical(op), WireArg::None) => Operation::GraphLogical(op),
+        (
+            WireOpcode::Threefry,
+            WireArg::Threefry {
+                counter,
+                key,
+                counter_shape,
+                key_shape,
+                output,
+                output_shape,
+            },
+        ) => Operation::Threefry(ThreefryValue {
+            counter,
+            key,
+            counter_shape,
+            key_shape,
+            output,
+            output_shape,
+        }),
         (WireOpcode::Matmul, WireArg::Matmul(plan)) => Operation::Matmul(MatmulValue::Serial(plan)),
         (WireOpcode::Matmul, WireArg::TiledMatmul(plan)) => {
             Operation::Matmul(MatmulValue::Tiled(plan))
@@ -538,16 +576,35 @@ impl std::error::Error for ArtifactError {}
 /// Encodes one immutable UOp DAG. Node IDs are dense topological indices and
 /// repeated source IDs preserve shared subgraphs.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
-    encode_inner(root, false)
+    encode_inner(root, false, VERSION)
 }
 
-/// Encodes a UOp DAG for the RGSM mixed-schedule envelope. This is crate
-/// private so ordinary RGUA artifacts retain their explicit effect rejection.
-pub(crate) fn encode_effect_aware(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
-    encode_inner(root, true)
+/// Encodes the semantic kernel blob used by durable schedule identities.
+/// Existing operations remain pinned to the released v18 envelope so adding
+/// a later RGUA operation cannot silently invalidate every RGSA/RGSO/RGSM
+/// cache key. Threefry requires its first admitted v19 envelope.
+pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
+    let nodes = root
+        .topological()
+        .map_err(|_| ArtifactError::Format("dag"))?;
+    let effects = nodes.iter().any(|node| {
+        matches!(
+            node.operation(),
+            Operation::EffectStore(_) | Operation::After(_)
+        )
+    });
+    let version = if nodes
+        .iter()
+        .any(|node| matches!(node.operation(), Operation::Threefry(_)))
+    {
+        19
+    } else {
+        18
+    };
+    encode_inner(root, effects, version)
 }
 
-fn encode_inner(root: &UOp, effects: bool) -> Result<Vec<u8>, ArtifactError> {
+fn encode_inner(root: &UOp, effects: bool, version: u8) -> Result<Vec<u8>, ArtifactError> {
     root.validate().map_err(|_| ArtifactError::Format("uop"))?;
     let nodes = root
         .topological()
@@ -572,7 +629,7 @@ fn encode_inner(root: &UOp, effects: bool) -> Result<Vec<u8>, ArtifactError> {
         .collect::<BTreeMap<_, _>>();
     let mut w = Writer::new();
     w.bytes(MAGIC)?;
-    w.u8(if effects { EFFECT_VERSION } else { VERSION })?;
+    w.u8(version)?;
     w.u32(nodes.len() as u32)?;
     w.u32((nodes.len() - 1) as u32)?;
     for (id, node) in nodes.iter().enumerate() {
@@ -637,6 +694,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             | PREVIOUS_EFFECT_VERSION
             | 16
             | 17
+            | 18
             | VERSION
     ) {
         return Err(ArtifactError::Format("version"));
@@ -853,6 +911,23 @@ fn validate_fields(
                 return Err(ArtifactError::Format("tensor guard"));
             }
         }
+        WireArg::Threefry {
+            counter,
+            key,
+            counter_shape,
+            key_shape,
+            output,
+            output_shape,
+        } => ThreefryValue {
+            counter: *counter,
+            key: *key,
+            counter_shape: counter_shape.clone(),
+            key_shape: key_shape.clone(),
+            output: *output,
+            output_shape: output_shape.clone(),
+        }
+        .validate()
+        .map_err(|_| ArtifactError::Format("threefry plan"))?,
         _ => {}
     }
     let operation = operation_from_wire(*kind, arg.clone())?;
@@ -905,6 +980,11 @@ fn validate_fields(
         }
         WireOpcode::GraphLogical(_) => {
             ty == Some(UType::scalar(DType::Bool)) && sources.iter().all(|x| x.ty() == ty)
+        }
+        WireOpcode::Threefry => {
+            matches!(arg, WireArg::Threefry { .. })
+                && ty == Some(UType::scalar(DType::U64))
+                && sources.is_empty()
         }
         WireOpcode::Matmul => match &operation {
             Operation::Matmul(MatmulValue::Serial(plan)) => ty == Some(UType::scalar(plan.dtype)),
@@ -1105,6 +1185,7 @@ fn write_kind(w: &mut Writer, kind: &WireOpcode, effects: bool) -> Result<(), Ar
         PrefixScan => (36, None),
         Sort => (37, None),
         TensorGuard => (38, None),
+        Threefry => (39, None),
         EffectStore if effects => (33, None),
         After if effects => (34, None),
         EffectStore | After => return Err(ArtifactError::Unsupported),
@@ -1160,6 +1241,7 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<WireOpcode, ArtifactErro
         36 if version >= 11 => PrefixScan,
         37 if version >= 16 => Sort,
         38 if version >= 17 => TensorGuard,
+        39 if version >= 19 => Threefry,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
@@ -1362,6 +1444,22 @@ fn write_arg(w: &mut Writer, arg: &WireArg, effects: bool) -> Result<(), Artifac
             w.usize(*axis)?;
             w.u8(dtype_tag(*dtype))
         }
+        WireArg::Threefry {
+            counter,
+            key,
+            counter_shape,
+            key_shape,
+            output,
+            output_shape,
+        } => {
+            w.u8(23)?;
+            w.u64(counter.index() as u64)?;
+            w.u64(key.index() as u64)?;
+            write_shape(w, counter_shape)?;
+            write_shape(w, key_shape)?;
+            w.u64(output.index() as u64)?;
+            write_shape(w, output_shape)
+        }
         WireArg::Effect(payload) if effects => {
             w.u8(18)?;
             write_effect_payload(w, payload)
@@ -1512,6 +1610,20 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<WireArg, ArtifactError> {
             input_shape: read_shape(r)?,
             axis: r.usize()?,
             dtype: dtype(r.u8()?)?,
+        },
+        23 if version >= 19 => WireArg::Threefry {
+            counter: crate::NodeId::from_index(
+                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("threefry counter"))?,
+            ),
+            key: crate::NodeId::from_index(
+                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("threefry key"))?,
+            ),
+            counter_shape: read_shape(r)?,
+            key_shape: read_shape(r)?,
+            output: crate::NodeId::from_index(
+                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("threefry output"))?,
+            ),
+            output_shape: read_shape(r)?,
         },
         _ => return Err(ArtifactError::Format("argument tag")),
     })
@@ -2932,6 +3044,14 @@ mod tests {
         let bytes = encode(&scan).unwrap();
         assert_eq!(bytes[4], VERSION);
         assert_eq!(decode(&bytes).unwrap(), scan);
+        assert_eq!(encode_schedule_identity(&scan).unwrap()[4], 18);
+
+        let mut v18 = bytes.clone();
+        v18[4] = 18;
+        let body_len = v18.len() - 4;
+        let sum = checksum(&v18[..body_len]);
+        v18[body_len..].copy_from_slice(&sum.to_le_bytes());
+        assert_eq!(decode(&v18).unwrap(), scan);
 
         let mut legacy = bytes;
         legacy[4] = 17;
@@ -2944,6 +3064,59 @@ mod tests {
                 "legacy prefix scan lacks source/result ABI"
             ))
         ));
+    }
+
+    #[test]
+    fn live_threefry_v19_round_trip_and_tamper_rejection_are_exact() {
+        let value = ThreefryValue {
+            counter: NodeId::from_index(1),
+            key: NodeId::from_index(2),
+            counter_shape: Shape::from([2, 1]),
+            key_shape: Shape::from([1, 3]),
+            output: NodeId::from_index(3),
+            output_shape: Shape::from([2, 3]),
+        };
+        let root = UOp::from_operation(
+            Operation::Threefry(value.clone()),
+            Some(UType::scalar(DType::U64)),
+            vec![],
+        );
+        let bytes = encode(&root).unwrap();
+        assert_eq!(bytes[4], 19);
+        assert_eq!(encode_schedule_identity(&root).unwrap()[4], 19);
+        assert_eq!(decode(&bytes).unwrap(), root);
+        assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes);
+
+        assert!(read_kind(&mut Reader::new(&[39]), 18).is_err());
+        assert_eq!(
+            read_kind(&mut Reader::new(&[39]), 19).unwrap(),
+            WireOpcode::Threefry
+        );
+        let (_, wire_arg) = operation_to_wire(root.operation());
+        let mut writer = Writer::new();
+        write_arg(&mut writer, &wire_arg, false).unwrap();
+        assert!(read_arg(&mut Reader::new(&writer.out), 18).is_err());
+        assert!(matches!(
+            read_arg(&mut Reader::new(&writer.out), 19).unwrap(),
+            WireArg::Threefry { .. }
+        ));
+
+        let malformed = UOp::from_operation(
+            Operation::Threefry(ThreefryValue {
+                output_shape: Shape::from([3, 2]),
+                ..value
+            }),
+            Some(UType::scalar(DType::U64)),
+            vec![],
+        );
+        assert!(encode(&malformed).is_err());
+
+        let mut legacy = bytes;
+        legacy[4] = 18;
+        let sum = checksum(&legacy[..legacy.len() - 4]);
+        let end = legacy.len();
+        legacy[end - 4..].copy_from_slice(&sum.to_le_bytes());
+        assert!(decode(&legacy).is_err());
     }
     #[test]
     fn shared_sources_remain_shared() {

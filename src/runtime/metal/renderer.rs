@@ -119,10 +119,14 @@ impl MetalRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
+            Operation::PrefixScan(_)
+                | Operation::Sort(_)
+                | Operation::TensorGuard(_)
+                | Operation::Threefry(_)
         ) {
             return Err(MetalError::Unsupported(
-                "prefix scans, sort pairs, and tensor guards are outside Metal lowering".into(),
+                "prefix scans, sort pairs, guards, and live Threefry are outside Metal lowering"
+                    .into(),
             ));
         }
         root.validate()

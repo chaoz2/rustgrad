@@ -246,6 +246,13 @@ pub enum Op {
         lhs: NodeId,
         rhs: NodeId,
     },
+    /// tinygrad's live two-input Threefry2x32 permutation. Both operands and
+    /// the result are packed U64 words; the low and high halves are the two
+    /// U32 lanes of the source operation.
+    Threefry {
+        counter: NodeId,
+        key: NodeId,
+    },
     Compare {
         op: CompareOp,
         lhs: NodeId,
@@ -943,6 +950,10 @@ impl Op {
             | Self::StaticIndex { input, .. } => vec![*input],
             Self::Binary { lhs, rhs, .. }
             | Self::Compare { lhs, rhs, .. }
+            | Self::Threefry {
+                counter: lhs,
+                key: rhs,
+            }
             | Self::Matmul { lhs, rhs } => vec![*lhs, *rhs],
             Self::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
             Self::Select {
@@ -1060,6 +1071,7 @@ impl Op {
             | Self::Constant(_)
             | Self::Random { .. }
             | Self::RandomPermutation { .. }
+            | Self::Threefry { .. }
             | Self::ArgReduce { .. }
             | Self::Compare { .. }
             | Self::Logical { .. }
@@ -1112,6 +1124,7 @@ impl Op {
             }
             Self::Unary { op, input } => format!("{}(%{input})", op.name()),
             Self::Binary { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
+            Self::Threefry { counter, key } => format!("threefry(%{counter}, %{key})"),
             Self::Compare { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
             Self::Logical {
                 op,

@@ -48,6 +48,7 @@ pub(super) fn kind_name(kind: &Operation) -> String {
         Operation::GraphBinary(op) => format!("graph_binary.{}", op.name()),
         Operation::GraphCompare(op) => format!("graph_compare.{}", op.name()),
         Operation::GraphLogical(op) => format!("graph_logical.{}", op.name()),
+        Operation::Threefry(_) => "threefry.live".into(),
         Operation::Matmul(_) => "matmul".into(),
         Operation::Conv2d(_) => "conv2d.static_1x1".into(),
         Operation::Movement(_) => "movement".into(),
@@ -258,6 +259,14 @@ fn operation_fields(operation: &Operation) -> BTreeMap<String, String> {
             out.insert("output_shape".into(), shape_name(&plan.shape));
             out.insert("word_count".into(), plan.word_count.to_string());
             out.insert("device".into(), plan.stream.device.to_string());
+        }
+        Operation::Threefry(value) => {
+            out.insert("counter".into(), value.counter.to_string());
+            out.insert("counter_shape".into(), shape_name(&value.counter_shape));
+            out.insert("key".into(), value.key.to_string());
+            out.insert("key_shape".into(), shape_name(&value.key_shape));
+            out.insert("output".into(), value.output.to_string());
+            out.insert("output_shape".into(), shape_name(&value.output_shape));
         }
         Operation::PrefixScan(value) => {
             out.insert("input".into(), value.input.to_string());

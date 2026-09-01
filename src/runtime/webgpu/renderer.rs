@@ -214,10 +214,14 @@ impl WgslRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
+            Operation::PrefixScan(_)
+                | Operation::Sort(_)
+                | Operation::TensorGuard(_)
+                | Operation::Threefry(_)
         ) {
             return Err(WebGpuError::Unsupported(
-                "prefix scans, sort pairs, and tensor guards are outside WebGPU lowering".into(),
+                "prefix scans, sort pairs, guards, and live Threefry are outside WebGPU lowering"
+                    .into(),
             ));
         }
         root.validate()

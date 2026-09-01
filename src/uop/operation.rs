@@ -93,6 +93,60 @@ pub struct TensorGuardValue {
     pub dtype: DType,
 }
 
+/// Complete dependency-bearing live Threefry2x32 semantic. The two graph
+/// operands are packed U64 words; shapes are retained so capture and cache
+/// identity do not depend on a live graph.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ThreefryValue {
+    pub counter: NodeId,
+    pub key: NodeId,
+    pub counter_shape: Shape,
+    pub key_shape: Shape,
+    pub output: NodeId,
+    pub output_shape: Shape,
+}
+
+impl ThreefryValue {
+    pub fn validate(&self) -> Result<(), super::UOpError> {
+        if self.output == self.counter
+            || self.output == self.key
+            || (self.counter == self.key && self.counter_shape != self.key_shape)
+            || self
+                .counter_shape
+                .broadcast_with(&self.key_shape)
+                .ok()
+                .as_ref()
+                != Some(&self.output_shape)
+        {
+            return Err(super::UOpError::InvalidArgument);
+        }
+        for (_, shape, _) in self.buffer_operands() {
+            shape
+                .numel()
+                .ok()
+                .and_then(|elements| elements.checked_mul(DType::U64.itemsize()))
+                .ok_or(super::UOpError::InvalidArgument)?;
+        }
+        Ok(())
+    }
+
+    /// Canonical pointer ABI: first semantic use wins and an aliased key does
+    /// not create a duplicate pointer. The output is always a distinct final
+    /// buffer because graph nodes are append-only.
+    pub(crate) fn input_operands(&self) -> impl Iterator<Item = (NodeId, &Shape)> {
+        std::iter::once((self.counter, &self.counter_shape))
+            .chain((self.key != self.counter).then_some((self.key, &self.key_shape)))
+    }
+
+    /// Complete canonical pointer ABI. Inputs retain first-use order and the
+    /// distinct mutable output is always last.
+    pub(crate) fn buffer_operands(&self) -> impl Iterator<Item = (NodeId, &Shape, bool)> {
+        self.input_operands()
+            .map(|(node, shape)| (node, shape, false))
+            .chain(std::iter::once((self.output, &self.output_shape, true)))
+    }
+}
+
 /// A closed, typed universal operation. The variant is the semantic identity;
 /// payload-bearing operations cannot exist without their matching payload.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -115,6 +169,8 @@ pub enum Operation {
     GraphBinary(crate::BinaryOp),
     GraphCompare(crate::CompareOp),
     GraphLogical(crate::LogicalOp),
+    /// Live, two-input packed-U64 Threefry2x32 permutation.
+    Threefry(ThreefryValue),
     /// Complete static generalized-matmul semantic.
     Matmul(MatmulValue),
     /// Narrow static F32 NCHW 1x1 convolution semantic.

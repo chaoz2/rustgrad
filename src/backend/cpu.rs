@@ -198,6 +198,11 @@ impl Backend for CpuBackend {
                 }
                 Op::Unary { op, input } => unary(&values[input.index()], *op, node.dtype)?,
                 Op::Binary { op, lhs, rhs } => binary(&values, *lhs, *rhs, &node.shape, *op)?,
+                Op::Threefry { counter, key } => crate::random::execute_live_threefry(
+                    &values[counter.index()],
+                    &values[key.index()],
+                    &node.shape,
+                )?,
                 Op::Compare { op, lhs, rhs } => compare(&values, *lhs, *rhs, &node.shape, *op)?,
                 Op::Logical { op, lhs, rhs } => logical(&values, *lhs, *rhs, &node.shape, *op)?,
                 Op::Select {

@@ -6,8 +6,8 @@
 
 use super::{BufferDesc, QuantizedScheduleInputBinding, ScheduleBoundary, ScheduleInputBinding};
 use crate::uop::artifact::{
-    ArtifactError, Writer, dtype_tag, encode_effect_aware, write_affine_view, write_buffer_state,
-    write_shape,
+    ArtifactError, Writer, dtype_tag, encode_schedule_identity, write_affine_view,
+    write_buffer_state, write_shape,
 };
 use crate::{ScheduleItem, ScheduleStateBinding};
 
@@ -77,7 +77,7 @@ fn item_bytes(item: &ScheduleItem) -> Result<Vec<u8>, ArtifactError> {
         write_desc(&mut writer, desc)?;
     }
     write_boundary(&mut writer, item.boundary.as_ref())?;
-    let kernel = encode_effect_aware(&item.kernel)?;
+    let kernel = encode_schedule_identity(&item.kernel)?;
     write_blob(&mut writer, &kernel)?;
     write_len(&mut writer, item.external_materializations.len())?;
     for node in &item.external_materializations {

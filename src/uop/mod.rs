@@ -5,7 +5,7 @@ pub mod artifact;
 mod operation;
 pub use operation::{
     AddressValue, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation, PrefixScanValue,
-    ReductionValue, SortValue, TensorGuardValue, VariableValue,
+    ReductionValue, SortValue, TensorGuardValue, ThreefryValue, VariableValue,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -742,6 +742,7 @@ fn validate_operation_arity(n: &UOp) -> Result<(), UOpError> {
         | Operation::Conv2d(_)
         | Operation::Movement(_)
         | Operation::Random(_)
+        | Operation::Threefry(_)
         | Operation::PrefixScan(_)
         | Operation::Sort(_)
         | Operation::TensorGuard(_)
@@ -874,6 +875,12 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                     .iter()
                     .any(|s| !s.ty().is_some_and(UType::is_bool))
             {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        Operation::Threefry(value) => {
+            value.validate()?;
+            if n.ty() != Some(UType::scalar(DType::U64)) {
                 return Err(UOpError::InvalidDType);
             }
         }

@@ -279,6 +279,43 @@ pub fn lower_graph_random(graph: &Graph, output: NodeId) -> std::result::Result<
     Ok(kernel)
 }
 
+/// Lowers tinygrad's live packed-U64 Threefry operation as one typed,
+/// dependency-bearing semantic. Unlike [`Operation::Random`], both operands
+/// remain explicit schedule inputs and no stream reservation is involved.
+pub fn lower_graph_threefry(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
+    let Op::Threefry { counter, key } = graph
+        .op(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
+        return Err(UOpError::InvalidArgument);
+    };
+    let value = crate::ThreefryValue {
+        counter: *counter,
+        key: *key,
+        counter_shape: graph
+            .shape(*counter)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            .clone(),
+        key_shape: graph
+            .shape(*key)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            .clone(),
+        output,
+        output_shape: graph
+            .shape(output)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            .clone(),
+    };
+    value.validate()?;
+    let kernel = UOp::from_operation(
+        Operation::Threefry(value),
+        Some(UType::scalar(DType::U64)),
+        vec![],
+    );
+    kernel.validate()?;
+    Ok(kernel)
+}
+
 /// Lowers one static generalized matmul into its authoritative typed UOp
 /// semantic. The payload is already normalized and owns the pointer ABI.
 pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
@@ -915,6 +952,15 @@ pub(crate) fn execute_lowered_elementwise(
             plan.output,
             plan.dtype,
         );
+    }
+    if let Operation::Threefry(plan) = kernel.operation() {
+        let counter = bindings
+            .get(plan.counter.index() as u64)
+            .ok_or(Error::InvalidIndex)?;
+        let key = bindings
+            .get(plan.key.index() as u64)
+            .ok_or(Error::InvalidIndex)?;
+        return crate::random::execute_live_threefry(counter, key, &plan.output_shape);
     }
     let matmul = match kernel.operation() {
         Operation::Matmul(MatmulValue::Serial(plan)) => Some(plan.as_ref()),

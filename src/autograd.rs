@@ -520,6 +520,7 @@ impl Graph {
                 | Op::Constant(_)
                 | Op::Random { .. }
                 | Op::RandomPermutation { .. }
+                | Op::Threefry { .. }
                 | Op::Detach { .. }
                 | Op::Bitcast { .. } => {}
                 Op::Contiguous { input } => {

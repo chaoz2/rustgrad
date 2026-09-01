@@ -123,10 +123,14 @@ impl OpenClRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::PrefixScan(_) | Operation::Sort(_) | Operation::TensorGuard(_)
+            Operation::PrefixScan(_)
+                | Operation::Sort(_)
+                | Operation::TensorGuard(_)
+                | Operation::Threefry(_)
         ) {
             return Err(OpenClError::Unsupported(
-                "prefix scans, sort pairs, and tensor guards are outside OpenCL lowering".into(),
+                "prefix scans, sort pairs, guards, and live Threefry are outside OpenCL lowering"
+                    .into(),
             ));
         }
         root.validate()

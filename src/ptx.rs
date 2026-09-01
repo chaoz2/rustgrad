@@ -31,6 +31,7 @@ mod prefix_scan;
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v29";
 /// Separate identity for raw storage-width computed affine materialization.
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
+pub const PTX_THREEFRY_RENDERER_VERSION: &str = "rustgrad-ptx-live-threefry-v1";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 /// Versioned contract for the sole opt-in linked NVVM-backed F32 Exp route.
@@ -215,6 +216,30 @@ impl RenderedPtx {
                 ));
             }
         }
+        if let Some(KernelSemanticProgram::UOp(program)) = &self.semantic_program
+            && let Operation::Threefry(plan) = program.operation()
+        {
+            plan.validate()
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+            let mut expected = Vec::new();
+            for (node, shape, mutable) in plan.buffer_operands() {
+                expected.push(PtxBufferAbi {
+                    id: node.index() as u64,
+                    dtype: DType::U64,
+                    source_shape: shape.clone(),
+                    elements: shape.numel().map_err(|_| PtxError::Overflow)?,
+                    mutable,
+                });
+            }
+            if self.launch != PtxLaunchGeometry::Linear
+                || self.extent != expected.last().expect("output exists").elements
+                || self.buffers != expected
+            {
+                return Err(PtxError::InvalidBinding(
+                    "live Threefry PTX launch disagrees with its payload".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -261,6 +286,7 @@ impl RenderedPtx {
                         value.dtype.itemsize()
                     }
                 }
+                Operation::Threefry(_) => DType::U64.itemsize(),
                 _ => 1,
             },
             _ => 1,
@@ -608,6 +634,9 @@ fn render(
         root.validate()
             .map_err(|error| PtxError::Unsupported(error.to_string()))?;
         return prefix_scan::render(renderer, root, value);
+    }
+    if let Operation::Threefry(plan) = root.operation() {
+        return render_live_threefry(renderer, root, plan);
     }
     if matches!(
         root.operation(),
@@ -1273,6 +1302,139 @@ fn render_random(
     })
 }
 
+fn render_live_threefry(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    plan: &crate::ThreefryValue,
+) -> Result<RenderedPtx, PtxError> {
+    root.validate()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    plan.validate()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    let extent = plan.output_shape.numel().map_err(|_| PtxError::Overflow)?;
+    if extent > u32::MAX as usize {
+        return Err(PtxError::Unsupported(
+            "live Threefry PTX linear extent exceeds u32 thread indexing".into(),
+        ));
+    }
+    let mut buffers = Vec::new();
+    for (node, shape, mutable) in plan.buffer_operands() {
+        buffers.push(PtxBufferAbi {
+            id: node.index() as u64,
+            dtype: DType::U64,
+            source_shape: shape.clone(),
+            elements: shape.numel().map_err(|_| PtxError::Overflow)?,
+            mutable,
+        });
+    }
+    let ids = buffers
+        .iter()
+        .enumerate()
+        .map(|(index, buffer)| (buffer.id, index + 1))
+        .collect::<BTreeMap<_, _>>();
+    let counter_slot = ids[&(plan.counter.index() as u64)];
+    let key_slot = ids[&(plan.key.index() as u64)];
+    let output_slot = ids[&(plan.output.index() as u64)];
+    let entry = format!("rg_live_threefry_e{extent}_b{}", buffers.len());
+    let mut lines = vec![
+        format!("// {PTX_THREEFRY_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        String::new(),
+        format!(".visible .entry {entry}("),
+    ];
+    for index in 0..buffers.len() {
+        lines.push(format!("  .param .u64 p{index},"));
+    }
+    lines.extend([
+        "  .param .u64 extent".into(),
+        ")".into(),
+        "{".into(),
+        "  .reg .pred %p<4>;".into(),
+        "  .reg .b32 %r<64>;".into(),
+        "  .reg .b64 %rd<40>;".into(),
+    ]);
+    for index in 0..buffers.len() {
+        lines.push(format!("  ld.param.u64 %rd{}, [p{index}];", index + 1));
+    }
+    lines.extend([
+        "  ld.param.u64 %rd0, [extent];".into(),
+        "  mov.u32 %r0, %ctaid.x;".into(),
+        "  mov.u32 %r1, %ntid.x;".into(),
+        "  mov.u32 %r2, %tid.x;".into(),
+        "  mad.lo.u32 %r3, %r0, %r1, %r2;".into(),
+        "  cvt.u64.u32 %rd10, %r3;".into(),
+        "  setp.ge.u64 %p0, %rd10, %rd0;".into(),
+        "  @%p0 bra DONE;".into(),
+    ]);
+    lines.extend(broadcast_offset(
+        plan.counter_shape.dims(),
+        plan.output_shape.dims(),
+        "%r3",
+    )?);
+    lines.extend([
+        "  mul.lo.u64 %rd28, %rd28, 8;".into(),
+        format!("  add.u64 %rd27, %rd{counter_slot}, %rd28;"),
+        "  ld.global.u64 %rd20, [%rd27];".into(),
+    ]);
+    lines.extend(broadcast_offset(
+        plan.key_shape.dims(),
+        plan.output_shape.dims(),
+        "%r3",
+    )?);
+    lines.extend([
+        "  mul.lo.u64 %rd28, %rd28, 8;".into(),
+        format!("  add.u64 %rd27, %rd{key_slot}, %rd28;"),
+        "  ld.global.u64 %rd21, [%rd27];".into(),
+        "  cvt.u32.u64 %r10, %rd20;".into(),
+        "  shr.u64 %rd22, %rd20, 32;".into(),
+        "  cvt.u32.u64 %r11, %rd22;".into(),
+        "  cvt.u32.u64 %r20, %rd21;".into(),
+        "  shr.u64 %rd22, %rd21, 32;".into(),
+        "  cvt.u32.u64 %r21, %rd22;".into(),
+        "  xor.b32 %r22, %r20, %r21;".into(),
+        format!(
+            "  xor.b32 %r22, %r22, 0x{:08x};",
+            crate::random::THREEFRY_PARITY
+        ),
+        "  add.u32 %r30, %r10, %r20;".into(),
+        "  add.u32 %r31, %r11, %r21;".into(),
+    ]);
+    emit_threefry(&mut lines, "%r30", "%r31", "%r20", "%r21", "%r22");
+    lines.extend([
+        "  cvt.u64.u32 %rd23, %r31;".into(),
+        "  shl.b64 %rd23, %rd23, 32;".into(),
+        "  cvt.u64.u32 %rd24, %r30;".into(),
+        "  or.b64 %rd23, %rd23, %rd24;".into(),
+        "  mul.wide.u32 %rd25, %r3, 8;".into(),
+        format!("  add.u64 %rd25, %rd{output_slot}, %rd25;"),
+        "  st.global.u64 [%rd25], %rd23;".into(),
+        "DONE:".into(),
+        "  ret;".into(),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        PTX_THREEFRY_RENDERER_VERSION,
+        renderer.sm,
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedPtx {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        cache_key,
+        entry,
+        launch: PtxLaunchGeometry::Linear,
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
+    };
+    rendered.validate()?;
+    Ok(rendered)
+}
+
 fn emit_random_word(
     lines: &mut Vec<String>,
     word: &str,
@@ -1302,7 +1464,7 @@ fn emit_random_word(
         format!("  mov.u32 %r21, {};", plan.stream.key[1]),
         format!(
             "  mov.u32 %r22, {};",
-            plan.stream.key[0] ^ plan.stream.key[1] ^ 0x1bd1_1bda
+            plan.stream.key[0] ^ plan.stream.key[1] ^ crate::random::THREEFRY_PARITY
         ),
         "  add.u32 %r30, %r10, %r20;".into(),
         "  add.u32 %r31, %r11, %r21;".into(),
@@ -1315,22 +1477,23 @@ fn emit_random_word(
         "  add.u32 %r34, %r30, 0;".into(),
         "  add.u32 %r35, %r31, 0;".into(),
         "  xor.b32 %r36, %r34, %r35;".into(),
-        "  xor.b32 %r36, %r36, 0x1bd11bda;".into(),
+        format!(
+            "  xor.b32 %r36, %r36, 0x{:08x};",
+            crate::random::THREEFRY_PARITY
+        ),
     ]);
     emit_threefry(lines, "%r32", "%r33", "%r34", "%r35", "%r36");
     lines.extend([format!("  selp.b32 {out}, %r32, %r33, %p2;")]);
 }
 
 fn emit_threefry(lines: &mut Vec<String>, a: &str, b: &str, k0: &str, k1: &str, k2: &str) {
-    const ROT: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
-    for round in 0..20 {
+    for (_round, rotation, injection) in crate::random::threefry_rounds() {
         lines.push(format!("  add.u32 {a}, {a}, {b};"));
-        lines.push(format!("  shl.b32 %r40, {b}, {};", ROT[round % 8]));
-        lines.push(format!("  shr.u32 %r41, {b}, {};", 32 - ROT[round % 8]));
+        lines.push(format!("  shl.b32 %r40, {b}, {rotation};"));
+        lines.push(format!("  shr.u32 %r41, {b}, {};", 32 - rotation));
         lines.push(format!("  or.b32 {b}, %r40, %r41;"));
         lines.push(format!("  xor.b32 {b}, {b}, {a};"));
-        if round % 4 == 3 {
-            let z = round / 4 + 1;
+        if let Some(z) = injection {
             let keys = [k0, k1, k2];
             lines.push(format!("  add.u32 {a}, {a}, {};", keys[z % 3]));
             lines.push(format!("  add.u32 {b}, {b}, {};", keys[(z + 1) % 3]));
@@ -11920,6 +12083,88 @@ mod tests {
             .unwrap()
         );
         assert_eq!(mock.generic_kernel_count(), 1);
+    }
+
+    #[test]
+    fn mock_generic_semantics_executes_live_threefry_without_store_fallback() {
+        use std::num::NonZeroUsize;
+
+        let mut graph = crate::Graph::new();
+        let counter = graph.input_dtype("counter", [2], DType::U64);
+        let key = graph.input_dtype("key", [], DType::U64);
+        let output = graph.threefry(counter, key).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&schedule.items[0].kernel)
+            .unwrap();
+
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let pool = primary.allocator();
+        let counter_buffer = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        let key_buffer = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let output_buffer = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        let counters = [0x0000_000a_0000_0000_u64, 0x0000_000b_0000_0001];
+        let packed_key = 0x0000_0539_0000_0000_u64;
+        counter_buffer
+            .view()
+            .unwrap()
+            .copy_from(
+                0,
+                &counters
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        key_buffer
+            .view()
+            .unwrap()
+            .copy_from(0, &packed_key.to_le_bytes())
+            .unwrap();
+        let kernel = ConcurrentPtxCache::new()
+            .get_or_load(&primary, rendered, 32)
+            .unwrap();
+        kernel
+            .launch(
+                &stream,
+                &[
+                    PtxBinding {
+                        buffer: counter_buffer.view().unwrap(),
+                        dtype: DType::U64,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: key_buffer.view().unwrap(),
+                        dtype: DType::U64,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: output_buffer.view().unwrap(),
+                        dtype: DType::U64,
+                        mutable: true,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+        let mut actual = [0_u8; 16];
+        output_buffer
+            .view()
+            .unwrap()
+            .copy_to(0, &mut actual)
+            .unwrap();
+        let expected = crate::random::execute_live_threefry(
+            &crate::TensorData::from_storage([2], crate::Storage::U64(counters.to_vec())).unwrap(),
+            &crate::TensorData::from_storage([], crate::Storage::U64(vec![packed_key])).unwrap(),
+            &crate::Shape::from([2]),
+        )
+        .unwrap()
+        .to_le_bytes()
+        .unwrap();
+        assert_eq!(actual.as_slice(), expected);
     }
 
     #[test]
