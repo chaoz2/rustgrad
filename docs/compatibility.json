@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:e0590f49bf48ec95",
+  "source_fingerprint": "fnv1a64:34f173ddb95fc52d",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -405,7 +405,7 @@
       "subject": "Accumulation, detach/no-grad and assignment rules",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Gradient paths accumulate by graph addition. Inputs carry explicit tracking state; `detach` shares values while stopping its edge; `no_grad` is scoped per graph and panic-safe. Host-only parameters bind by stable identity/current version into graph-local captured leaves; old graphs retain old values, tied handles share one leaf per version, and optimizer gradients carry identity/version stamps. Host-interpreter `EffectSourceBridge` records graph-local frozen provenance and `MutationTapeRecord` provides first-order F32 local replacement VJPs for whole, injective signed-affine, and normalized static-index writes, with broadcast-reduced RHS output gradients and explicit `Graph::grad_with` handoff. Persistent leaf `.grad` buffers, `EffectGraph::grad`, higher-order/capture/native/device mutation AD, and global mutable aliases are not part of the static graph API."
+        "Acceptance requirement": "Gradient paths accumulate by graph addition. Inputs carry explicit tracking state; `detach` shares values while stopping its edge; `no_grad` is scoped per graph and panic-safe. `CpuGradientStore` provides detached persistent CPU-session gradients without mutable graph-node or tensor fields: `CpuSession::backward` authenticates the complete store, loss, caller-supplied targets left-to-right, then optional seed; deduplicates target aliases; calls the shared batch `Graph::gradient` transform once on a private session clone; adds each prior stored value once at the exact target dtype/shape; realizes every unique final gradient through one `CpuSession::realize_many` transaction; validates all old/new descriptors; then atomically commits only the staged store. The scratch derivative graph is discarded, so success and failure leave the live session graph and bindings unchanged. Repeated backward adds exactly, disconnected floating targets receive typed zeros, connected untracked/frozen targets receive real derivatives, and unrequested slots remain untouched. `zero_grad` validates the whole store then removes every entry atomically, matching tinygrad's `grad = None`; there is no numeric-zero reset alias. The source-facing explicit/implicit seed and detach contracts are unchanged. Targets are explicit because RustGrad has no ambient live-tensor registry or automatic backward discovery. Host-only parameters bind by stable identity/current version into graph-local captured leaves; old graphs retain old values, tied handles share one leaf per version, and optimizer gradients carry identity/version stamps. Host-interpreter `EffectSourceBridge` records graph-local frozen provenance and `MutationTapeRecord` provides first-order F32 local replacement VJPs for whole, injective signed-affine, and normalized static-index writes, with broadcast-reduced RHS output gradients and explicit `Graph::grad_with` handoff. Parameter/optimizer integration, persistent-store serialization, higher-order realized-gradient storage, `EffectGraph::grad`, capture/native/device mutation AD, and global mutable aliases remain outside this boundary; lazy higher-order construction remains `Graph::gradient`."
       }
     },
     {

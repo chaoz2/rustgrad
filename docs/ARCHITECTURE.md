@@ -759,6 +759,28 @@ leaves. `training_checkpoint/` depends one way on `nn`, `optim`, and
 identities but permits fresh graphs, optimizers, and schedulers. Cross-process
 identity rehydration remains outside this boundary.
 
+`session/cpu.rs` also owns the detached persistent-gradient lifecycle for
+ordinary CPU-session tensors. `CpuGradientStore` is external to graph nodes but
+authenticated to one session and keyed by stable `NodeId`; tensor-handle
+aliases therefore project one logical slot. `CpuSession::backward` clones the
+complete session, invokes the shared batch `Graph::gradient` transform once,
+adds each prior stored value to its unique target once at the target's exact
+shape and dtype, and realizes all staged results through one `realize_many`
+transaction. Only after every graph, realization, and old/new descriptor check
+succeeds is the detached store swapped into place; the candidate derivative
+graph is discarded and the live session graph and bindings remain unchanged.
+Disconnected floating targets retain `Graph::gradient`'s typed-zero contract,
+while connected untracked/frozen targets receive their real derivative because
+the source-facing transform deliberately ignores leaf tracking. Detach remains
+an edge barrier, and `zero_grad` validates the complete store before atomically
+removing every entry, matching tinygrad's `grad = None` reset. Targets are
+always caller-supplied; no ambient live-tensor registry or automatic discovery
+is introduced. This is deliberately not a
+mutable field on `Graph` nodes or `Tensor`, and it adds no parameter/optimizer,
+serialization, higher-order realized-gradient, capture, native, or device
+gradient-store contract; lazy higher-order composition remains the separate
+`Graph::gradient` API.
+
 `session/train.rs` is the bounded handoff from CPU-session tensor ergonomics to
 versioned static module training. `CpuModuleTrainer` borrows an existing
 `ModuleForward`, optimizer, and scheduler but owns no graph: each request builds

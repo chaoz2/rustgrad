@@ -8,7 +8,7 @@ use crate::{
     MutableMappedFileError, NodeId, Op, Result, Scalar, Shape, Slice, TensorData, UnaryOp,
     schedule,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Debug)]
 pub struct MetalSessionResult {
@@ -94,6 +94,38 @@ pub struct Tensor {
     node: NodeId,
     shape: Shape,
     dtype: DType,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CpuGradientSlot {
+    shape: Shape,
+    dtype: DType,
+    value: TensorData,
+}
+
+/// Detached, session-authenticated persistent CPU gradients.
+///
+/// The store owns no graph nodes, aliases, or backend resources. A
+/// [`CpuSession::backward`] transaction constructs lazy gradients on a private
+/// graph candidate, realizes each unique requested target once, then commits
+/// the complete detached result set here only after every descriptor and
+/// accumulation has succeeded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CpuGradientStore {
+    session: u64,
+    slots: BTreeMap<NodeId, CpuGradientSlot>,
+}
+
+impl CpuGradientStore {
+    /// Number of unique targets with persistent gradient storage.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether no target currently has persistent gradient storage.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
 }
 
 /// A graph-owned exact-cardinality CPU value.
@@ -566,6 +598,140 @@ impl CpuSession {
         self.handle(node)
     }
 
+    /// Creates an empty detached gradient store owned by this session.
+    pub fn gradient_store(&self) -> CpuGradientStore {
+        CpuGradientStore {
+            session: self.graph.id(),
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// Constructs, realizes, accumulates, and atomically commits persistent
+    /// gradients for an ordered target set.
+    ///
+    /// Exactly one [`Graph::gradient`] call builds the unique target gradients
+    /// and exactly one [`CpuSession::realize_many`] call realizes their staged
+    /// accumulations. Duplicate targets are projected back into request order
+    /// without a second accumulation. `gradient` follows the source-facing
+    /// explicit-seed contract; omitting it therefore requires a scalar loss.
+    /// Targets are caller-supplied; the session has no ambient live-tensor
+    /// registry and performs no automatic target discovery. Authentication is
+    /// deterministic: store, loss, targets left-to-right, then optional seed.
+    /// The derivative graph is private scratch state: success commits only
+    /// detached values to `store`, while both success and failure leave this
+    /// session's graph and bindings unchanged.
+    pub fn backward(
+        &self,
+        store: &mut CpuGradientStore,
+        loss: &Tensor,
+        targets: &[&Tensor],
+        gradient: Option<&Tensor>,
+    ) -> Result<Vec<TensorData>> {
+        self.validate_gradient_store(store)?;
+        let loss = self.checked_gradient_node(loss)?;
+        let ordered = targets
+            .iter()
+            .map(|target| self.checked_gradient_node(target))
+            .collect::<Result<Vec<_>>>()?;
+        let gradient = gradient
+            .map(|value| self.checked_gradient_node(value))
+            .transpose()?;
+        let mut seen = BTreeSet::new();
+        let unique = ordered
+            .iter()
+            .copied()
+            .filter(|target| seen.insert(*target))
+            .collect::<Vec<_>>();
+
+        let mut candidate = self.transaction_candidate();
+        let gradients = candidate.graph.gradient(loss, &unique, gradient)?;
+        if gradients.len() != unique.len() {
+            return Err(gradient_store_error(
+                "gradient transform returned an incomplete target inventory",
+            ));
+        }
+
+        let mut accumulated = Vec::with_capacity(unique.len());
+        for (&target, gradient) in unique.iter().zip(gradients) {
+            candidate.validate_gradient_node_descriptor(target, gradient)?;
+            let accumulated_node = if let Some(slot) = store.slots.get(&target) {
+                candidate.validate_gradient_slot(target, slot)?;
+                let previous = candidate.graph.constant(slot.value.clone());
+                let next = candidate.graph.add(previous, gradient)?;
+                candidate.validate_gradient_node_descriptor(target, next)?;
+                next
+            } else {
+                gradient
+            };
+            accumulated.push(candidate.handle(accumulated_node)?);
+        }
+        let accumulated_refs = accumulated.iter().collect::<Vec<_>>();
+        let realized = candidate.realize_many(&accumulated_refs)?;
+        if realized.len() != unique.len() {
+            return Err(gradient_store_error(
+                "gradient realization returned an incomplete target inventory",
+            ));
+        }
+
+        let mut staged = store.clone();
+        for (&target, value) in unique.iter().zip(realized) {
+            candidate.validate_gradient_value(target, &value)?;
+            staged.slots.insert(
+                target,
+                CpuGradientSlot {
+                    shape: value.shape().clone(),
+                    dtype: value.dtype(),
+                    value,
+                },
+            );
+        }
+        candidate.validate_gradient_store(&staged)?;
+        let projected = ordered
+            .iter()
+            .map(|target| {
+                staged
+                    .slots
+                    .get(target)
+                    .map(|slot| slot.value.clone())
+                    .ok_or_else(|| gradient_store_error("staged gradient target is absent"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        *store = staged;
+        Ok(projected)
+    }
+
+    /// Returns detached stored gradients in target order. Duplicate targets
+    /// repeat the same logical slot; missing targets remain `None`.
+    pub fn gradients(
+        &self,
+        store: &CpuGradientStore,
+        targets: &[&Tensor],
+    ) -> Result<Vec<Option<TensorData>>> {
+        self.validate_gradient_store(store)?;
+        targets
+            .iter()
+            .map(|target| {
+                let target = self.checked_gradient_node(target)?;
+                Ok(store.slots.get(&target).map(|slot| slot.value.clone()))
+            })
+            .collect()
+    }
+
+    /// Clears every stored gradient in one commit, matching tinygrad's
+    /// `grad = None` reset semantics.
+    pub fn zero_grad(&self, store: &mut CpuGradientStore) -> Result<()> {
+        self.clear_gradient_store(store)
+    }
+
+    fn clear_gradient_store(&self, store: &mut CpuGradientStore) -> Result<()> {
+        self.validate_gradient_store(store)?;
+        let mut staged = store.clone();
+        staged.slots.clear();
+        *store = staged;
+        Ok(())
+    }
+
     /// Realizes a tensor through the CPU semantic oracle and owned bindings.
     pub fn realize(&self, tensor: &Tensor) -> Result<TensorData> {
         CpuBackend.execute(&self.graph, self.node(tensor)?, &self.bindings)
@@ -586,6 +752,89 @@ impl CpuSession {
             .map_err(|error| Error::SessionRealization {
                 reason: format!("shared CPU realization: {error}"),
             })
+    }
+
+    fn transaction_candidate(&self) -> Self {
+        Self {
+            graph: self.graph.clone(),
+            bindings: self.bindings.clone(),
+            input_names: self.input_names.clone(),
+            next_input: self.next_input,
+        }
+    }
+
+    fn checked_gradient_node(&self, tensor: &Tensor) -> Result<NodeId> {
+        let node = self.node(tensor)?;
+        let shape = self.graph.shape(node)?;
+        let dtype = self.graph.dtype(node)?;
+        if shape != &tensor.shape || dtype != tensor.dtype {
+            return Err(gradient_store_error(
+                "tensor handle descriptor diverges from its graph node",
+            ));
+        }
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| {
+                gradient_store_error("tensor handle descriptor byte extent overflows")
+            })?;
+        Ok(node)
+    }
+
+    fn validate_gradient_node_descriptor(&self, target: NodeId, gradient: NodeId) -> Result<()> {
+        let target_shape = self.graph.shape(target)?;
+        let target_dtype = self.graph.dtype(target)?;
+        if self.graph.shape(gradient)? != target_shape
+            || self.graph.dtype(gradient)? != target_dtype
+        {
+            return Err(gradient_store_error(
+                "gradient node descriptor does not match its target",
+            ));
+        }
+        target_shape
+            .numel()?
+            .checked_mul(target_dtype.itemsize())
+            .ok_or_else(|| gradient_store_error("gradient node byte extent overflows"))?;
+        Ok(())
+    }
+
+    fn validate_gradient_value(&self, target: NodeId, value: &TensorData) -> Result<()> {
+        let shape = self.graph.shape(target)?;
+        let dtype = self.graph.dtype(target)?;
+        let bytes = shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| gradient_store_error("gradient value byte extent overflows"))?;
+        if value.shape() != shape
+            || value.dtype() != dtype
+            || value.len().checked_mul(value.dtype().itemsize()) != Some(bytes)
+        {
+            return Err(gradient_store_error(
+                "realized gradient descriptor does not match its target",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_gradient_slot(&self, target: NodeId, slot: &CpuGradientSlot) -> Result<()> {
+        if slot.value.shape() != &slot.shape || slot.value.dtype() != slot.dtype {
+            return Err(gradient_store_error(
+                "stored gradient metadata diverges from its value",
+            ));
+        }
+        self.validate_gradient_value(target, &slot.value)
+    }
+
+    fn validate_gradient_store(&self, store: &CpuGradientStore) -> Result<()> {
+        if store.session != self.graph.id() {
+            return Err(gradient_store_error(
+                "gradient store belongs to another CPU session",
+            ));
+        }
+        for (&target, slot) in &store.slots {
+            self.validate_gradient_slot(target, slot)?;
+        }
+        Ok(())
     }
 
     /// Realizes a CPU-session value into owned storage, then copies and syncs
@@ -955,6 +1204,12 @@ fn mapped_tensor_error(error: MappedTensorError) -> Error {
     }
 }
 
+fn gradient_store_error(reason: impl Into<String>) -> Error {
+    Error::SessionRealization {
+        reason: format!("persistent gradient store: {}", reason.into()),
+    }
+}
+
 fn mapped_mutable_error(error: MutableMappedFileError) -> Error {
     Error::SessionTraining {
         reason: format!("mapped tensor write: {error:?}"),
@@ -1140,6 +1395,224 @@ mod literal_tests {
         ));
         assert_eq!(session.graph.node_count(), node_count);
         assert_eq!(session.bindings, bindings);
+    }
+
+    #[test]
+    fn persistent_backward_accumulates_unique_targets_and_projects_aliases() {
+        let mut session = CpuSession::new();
+        let x = session.variable([2], [2.0, 3.0]).unwrap();
+        let square = session.mul(&x, &x).unwrap();
+        let loss = session.sum_all(&square).unwrap();
+        let disconnected = session
+            .constant(TensorData::zeros_with_dtype([0], DType::F16).unwrap())
+            .unwrap();
+        let mut store = session.gradient_store();
+        let graph_nodes = session.graph.node_count();
+        let bindings = session.bindings.clone();
+
+        let first = session
+            .backward(&mut store, &loss, &[&x, &x, &disconnected], None)
+            .unwrap();
+        assert_eq!(store.len(), 2, "duplicate targets own one slot");
+        assert_eq!(first[0].to_vec_f64(), vec![4.0, 6.0]);
+        assert_eq!(first[0], first[1]);
+        assert_eq!(first[2].shape(), &Shape::new([0]));
+        assert_eq!(first[2].dtype(), DType::F16);
+        assert_eq!(session.graph.node_count(), graph_nodes);
+        assert_eq!(session.bindings, bindings);
+        let mut returned_snapshot = first[0].clone();
+        returned_snapshot
+            .assign(&TensorData::zeros([2]).unwrap())
+            .unwrap();
+        assert_eq!(returned_snapshot.to_vec_f64(), vec![0.0, 0.0]);
+        assert_eq!(
+            session
+                .gradients(&store, &[&x])
+                .unwrap()
+                .remove(0)
+                .unwrap()
+                .to_vec_f64(),
+            vec![4.0, 6.0],
+            "returned values do not alias stored snapshots"
+        );
+
+        let disconnected_before = session
+            .gradients(&store, &[&disconnected])
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        let second = session
+            .backward(&mut store, &loss, &[&x, &x], None)
+            .unwrap();
+        assert_eq!(second[0].to_vec_f64(), vec![8.0, 12.0]);
+        assert_eq!(second[0], second[1]);
+        assert_eq!(session.graph.node_count(), graph_nodes);
+        assert_eq!(session.bindings, bindings);
+        assert_eq!(
+            session
+                .gradients(&store, &[&disconnected])
+                .unwrap()
+                .remove(0)
+                .unwrap(),
+            disconnected_before,
+            "unrequested stored gradients remain untouched"
+        );
+        let projected = session.gradients(&store, &[&x, &x, &disconnected]).unwrap();
+        assert_eq!(projected[0], projected[1]);
+        assert_eq!(projected[0].as_ref().unwrap().to_vec_f64(), vec![8.0, 12.0]);
+
+        session.zero_grad(&mut store).unwrap();
+        assert!(store.is_empty());
+        assert_eq!(
+            session.gradients(&store, &[&x, &disconnected]).unwrap(),
+            vec![None, None]
+        );
+
+        let mut connected = CpuSession::new();
+        let source = connected.variable([2], [2.0, 3.0]).unwrap();
+        let connected_frozen = connected.tensor([2], [4.0, 5.0]).unwrap();
+        let product = connected.mul(&source, &connected_frozen).unwrap();
+        let loss = connected.sum_all(&product).unwrap();
+        let mut store = connected.gradient_store();
+        let gradient = connected
+            .backward(&mut store, &loss, &[&connected_frozen], None)
+            .unwrap();
+        assert_eq!(gradient[0].to_vec_f64(), vec![2.0, 3.0]);
+
+        let mut narrow = CpuSession::new();
+        let x = narrow
+            .variable_data(
+                TensorData::from_scalars([2], DType::F16, [Scalar::F(2.0), Scalar::F(3.0)])
+                    .unwrap(),
+            )
+            .unwrap();
+        let square = narrow.mul(&x, &x).unwrap();
+        let loss = narrow.sum_all(&square).unwrap();
+        let mut store = narrow.gradient_store();
+        let first = narrow.backward(&mut store, &loss, &[&x], None).unwrap();
+        let second = narrow.backward(&mut store, &loss, &[&x], None).unwrap();
+        assert_eq!(first[0].shape(), &Shape::new([2]));
+        assert_eq!(first[0].dtype(), DType::F16);
+        assert_eq!(second[0].dtype(), DType::F16);
+        assert_eq!(second[0].to_vec_f64(), vec![8.0, 12.0]);
+    }
+
+    #[test]
+    fn persistent_backward_preserves_seed_and_detach_zero_contracts() {
+        let mut seeded = CpuSession::new();
+        let x = seeded.variable([2], [2.0, 3.0]).unwrap();
+        let output = seeded.mul(&x, &x).unwrap();
+        let seed = seeded.tensor([2], [3.0, 4.0]).unwrap();
+        let mut store = seeded.gradient_store();
+        let gradient = seeded
+            .backward(&mut store, &output, &[&x], Some(&seed))
+            .unwrap();
+        assert_eq!(gradient[0].to_vec_f64(), vec![12.0, 24.0]);
+
+        let node_count = seeded.graph.node_count();
+        let snapshot = store.clone();
+        assert!(matches!(
+            seeded.backward(&mut store, &output, &[&x], None),
+            Err(Error::NonScalarLoss(shape)) if shape == Shape::new([2])
+        ));
+        assert_eq!(seeded.graph.node_count(), node_count);
+        assert_eq!(store, snapshot);
+
+        let scalar = seeded.sum_all(&output).unwrap();
+        let empty_nodes = seeded.graph.node_count();
+        let empty_snapshot = store.clone();
+        assert_eq!(
+            seeded.backward(&mut store, &scalar, &[], None).unwrap(),
+            vec![]
+        );
+        assert_eq!(seeded.graph.node_count(), empty_nodes);
+        assert_eq!(store, empty_snapshot);
+        assert_eq!(
+            seeded
+                .backward(&mut store, &output, &[], Some(&seed))
+                .unwrap(),
+            vec![]
+        );
+        assert_eq!(seeded.graph.node_count(), empty_nodes);
+        assert_eq!(store, empty_snapshot);
+
+        let mut detached = CpuSession::new();
+        let x = detached.variable([2], [5.0, 7.0]).unwrap();
+        let detached_node = detached.graph.detach(x.node).unwrap();
+        let detached_x = detached.handle(detached_node).unwrap();
+        let square = detached.mul(&detached_x, &detached_x).unwrap();
+        let loss = detached.sum_all(&square).unwrap();
+        let mut store = detached.gradient_store();
+        let gradient = detached
+            .backward(&mut store, &loss, &[&detached_x, &x], None)
+            .unwrap();
+        assert_eq!(gradient[0].to_vec_f64(), vec![10.0, 14.0]);
+        assert_eq!(gradient[1].to_vec_f64(), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn persistent_backward_and_store_lifecycle_fail_atomically() {
+        let mut session = CpuSession::new();
+        let x = session.variable([2], [2.0, 3.0]).unwrap();
+        let square = session.mul(&x, &x).unwrap();
+        let loss = session.sum_all(&square).unwrap();
+        let mut store = session.gradient_store();
+        session.backward(&mut store, &loss, &[&x], None).unwrap();
+
+        let invalid = session.variable([1], [-1.0]).unwrap();
+        let guard = session.tensor_guard_distribution(&invalid, 0).unwrap();
+        let graph_nodes = session.graph.node_count();
+        let bindings = session.bindings.clone();
+        let snapshot = store.clone();
+        assert!(matches!(
+            session.backward(&mut store, &loss, &[&x], Some(&guard)),
+            Err(Error::SessionRealization { .. })
+        ));
+        assert_eq!(session.graph.node_count(), graph_nodes);
+        assert_eq!(session.bindings, bindings);
+        assert_eq!(store, snapshot);
+
+        let mut malformed = store.clone();
+        malformed.slots.get_mut(&x.node).unwrap().shape = Shape::new([1, 2]);
+        let malformed_snapshot = malformed.clone();
+        assert!(matches!(
+            session.zero_grad(&mut malformed),
+            Err(Error::SessionRealization { .. })
+        ));
+        assert_eq!(malformed, malformed_snapshot);
+
+        let mut foreign_session = CpuSession::new();
+        let foreign = foreign_session.variable([2], [1.0, 1.0]).unwrap();
+        let foreign_loss = foreign_session.sum_all(&foreign).unwrap();
+        let mut foreign_store = foreign_session.gradient_store();
+        let foreign_snapshot = foreign_store.clone();
+        assert!(matches!(
+            session.backward(&mut foreign_store, &loss, &[&x], None),
+            Err(Error::SessionRealization { .. })
+        ));
+        assert_eq!(foreign_store, foreign_snapshot);
+        assert!(matches!(
+            session.gradients(&store, &[&foreign]),
+            Err(Error::SessionHandleMismatch { .. })
+        ));
+        assert!(matches!(
+            session.zero_grad(&mut foreign_store),
+            Err(Error::SessionRealization { .. })
+        ));
+
+        let local_seed = session.tensor([], [1.0]).unwrap();
+        assert!(matches!(
+            session.backward(&mut store, &foreign_loss, &[&foreign], Some(&local_seed)),
+            Err(Error::SessionHandleMismatch { actual, .. }) if actual == foreign_loss.session
+        ));
+
+        let mut seed_session = CpuSession::new();
+        let foreign_seed = seed_session.tensor([], [1.0]).unwrap();
+        assert_ne!(foreign.session, foreign_seed.session);
+        assert!(matches!(
+            session.backward(&mut store, &loss, &[&x, &foreign], Some(&foreign_seed)),
+            Err(Error::SessionHandleMismatch { actual, .. }) if actual == foreign.session
+        ));
     }
 
     #[test]
