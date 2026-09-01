@@ -1190,6 +1190,8 @@ fn derive_shape(
             | Op::Concat { .. }
             | Op::Gather { .. }
             | Op::Scatter { .. }
+            | Op::ScatterPositions { .. }
+            | Op::ScatterPositionsVjp { .. }
             | Op::Bitcast { .. }
             | Op::Contiguous { .. }
     ) {
@@ -1585,6 +1587,9 @@ fn symbolic_movement_output(
             }
             Ok(base)
         }
+        crate::MovementKernelKind::ScatterPositions { .. } => Err(ReplayError::Unsupported(
+            "symbolic static-position movement is unavailable".into(),
+        )),
         crate::MovementKernelKind::Bitcast { input } => {
             if input.dtype.itemsize() != plan.dtype.itemsize() {
                 return Err(ReplayError::Unsupported(

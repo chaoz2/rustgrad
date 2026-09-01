@@ -15,6 +15,182 @@ pub struct MovementOperand {
     pub dtype: DType,
 }
 
+/// One injective static coordinate placement shared by a movement adjoint and
+/// its reverse read. Construction proves the complete Cartesian map in O(rank)
+/// from per-axis endpoints; executors never rediscover bounds policy.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct StaticPositionMap {
+    pub(crate) input_shape: Shape,
+    pub(crate) output_shape: Shape,
+    pub(crate) starts: Vec<i64>,
+    pub(crate) steps: Vec<i64>,
+}
+
+impl StaticPositionMap {
+    pub(crate) fn new(
+        input_shape: Shape,
+        output_shape: Shape,
+        starts: &[isize],
+        steps: &[isize],
+    ) -> Result<Self, MovementPlanError> {
+        let starts = starts
+            .iter()
+            .map(|value| i64::try_from(*value).map_err(|_| MovementPlanError::Overflow))
+            .collect::<Result<Vec<_>, _>>()?;
+        let steps = steps
+            .iter()
+            .map(|value| i64::try_from(*value).map_err(|_| MovementPlanError::Overflow))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_i64(input_shape, output_shape, starts, steps)
+    }
+
+    pub(crate) fn from_i64(
+        input_shape: Shape,
+        output_shape: Shape,
+        starts: Vec<i64>,
+        steps: Vec<i64>,
+    ) -> Result<Self, MovementPlanError> {
+        let map = Self {
+            input_shape,
+            output_shape,
+            starts,
+            steps,
+        };
+        map.validate()?;
+        Ok(map)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), MovementPlanError> {
+        let rank = self.input_shape.rank();
+        if self.output_shape.rank() != rank || self.starts.len() != rank || self.steps.len() != rank
+        {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        self.input_shape
+            .numel()
+            .and_then(|_| self.output_shape.numel())
+            .map_err(|_| MovementPlanError::Overflow)?;
+        for axis in 0..rank {
+            let input = self.input_shape.dims()[axis];
+            let step = i128::from(self.steps[axis]);
+            if step == 0 {
+                return Err(MovementPlanError::InvalidGeometry);
+            }
+            if input == 0 {
+                continue;
+            }
+            let output = i128::try_from(self.output_shape.dims()[axis])
+                .map_err(|_| MovementPlanError::Overflow)?;
+            let start = i128::from(self.starts[axis]);
+            let final_coordinate = start
+                .checked_add(
+                    i128::try_from(input - 1)
+                        .map_err(|_| MovementPlanError::Overflow)?
+                        .checked_mul(step)
+                        .ok_or(MovementPlanError::Overflow)?,
+                )
+                .ok_or(MovementPlanError::Overflow)?;
+            if start.min(final_coordinate) < 0 || start.max(final_coordinate) >= output {
+                return Err(MovementPlanError::InvalidGeometry);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_view(&self) -> Result<AffineView, MovementPlanError> {
+        self.validate()?;
+        if self
+            .input_shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?
+            == 0
+        {
+            let view = AffineView {
+                source_shape: self.output_shape.clone(),
+                logical_shape: self.input_shape.clone(),
+                offset: 0,
+                strides: vec![0; self.input_shape.rank()],
+            };
+            view.validate_read()
+                .map_err(|_| MovementPlanError::InvalidGeometry)?;
+            return Ok(view);
+        }
+        let mut dense_stride = 1i128;
+        let mut strides = vec![0i64; self.input_shape.rank()];
+        let mut offset = 0i128;
+        for axis in (0..self.input_shape.rank()).rev() {
+            offset = offset
+                .checked_add(
+                    i128::from(self.starts[axis])
+                        .checked_mul(dense_stride)
+                        .ok_or(MovementPlanError::Overflow)?,
+                )
+                .ok_or(MovementPlanError::Overflow)?;
+            // A singleton axis never contributes to the address. Canonicalize
+            // it before multiplying so an otherwise irrelevant i64::MIN step
+            // cannot manufacture an overflow in the reverse read projection.
+            strides[axis] = if self.input_shape.dims()[axis] <= 1 {
+                0
+            } else {
+                i64::try_from(
+                    i128::from(self.steps[axis])
+                        .checked_mul(dense_stride)
+                        .ok_or(MovementPlanError::Overflow)?,
+                )
+                .map_err(|_| MovementPlanError::Overflow)?
+            };
+            dense_stride = dense_stride
+                .checked_mul(
+                    i128::try_from(self.output_shape.dims()[axis])
+                        .map_err(|_| MovementPlanError::Overflow)?,
+                )
+                .ok_or(MovementPlanError::Overflow)?;
+        }
+        let view = AffineView {
+            source_shape: self.output_shape.clone(),
+            logical_shape: self.input_shape.clone(),
+            offset: i64::try_from(offset).map_err(|_| MovementPlanError::Overflow)?,
+            strides,
+        };
+        view.validate_read()
+            .map_err(|_| MovementPlanError::InvalidGeometry)?;
+        Ok(view)
+    }
+
+    fn destination_offsets(&self) -> Result<Vec<usize>, MovementExecutionError> {
+        self.validate()?;
+        let input = dense(&self.input_shape)?;
+        let output = dense(&self.output_shape)?;
+        let mut offsets = Vec::with_capacity(input.len());
+        for linear in 0..input.len() {
+            let coords = input
+                .coords(linear)
+                .map_err(|_| MovementExecutionError::InvalidGeometry)?;
+            let destination = coords
+                .iter()
+                .enumerate()
+                .map(|(axis, coordinate)| {
+                    i128::from(self.starts[axis])
+                        .checked_add(
+                            i128::try_from(*coordinate)
+                                .map_err(|_| MovementExecutionError::Overflow)?
+                                .checked_mul(i128::from(self.steps[axis]))
+                                .ok_or(MovementExecutionError::Overflow)?,
+                        )
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or(MovementExecutionError::InvalidGeometry)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            offsets.push(
+                output
+                    .offset(&destination)
+                    .map_err(|_| MovementExecutionError::InvalidGeometry)?,
+            );
+        }
+        Ok(offsets)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MovementKernelKind {
     /// A source or pure computed producer viewed through a checked static
@@ -51,6 +227,15 @@ pub enum MovementKernelKind {
     Bitcast { input: MovementOperand },
     /// Explicit dense owned copy with an unchanged descriptor.
     Contiguous { input: MovementOperand },
+    /// Zero-initialize owned dense storage, then place every input coordinate
+    /// through one checked injective static map using raw storage bytes.
+    /// Appending this variant preserves the derived-hash discriminants—and
+    /// therefore released cache keys—of every historical movement kind.
+    ScatterPositions {
+        input: MovementOperand,
+        starts: Vec<i64>,
+        steps: Vec<i64>,
+    },
 }
 
 /// Fully validated materializing movement geometry and ordered pointer ABI.
@@ -308,6 +493,39 @@ impl MovementKernelPlan {
                 axis: *axis,
                 add: *add,
             },
+            Op::ScatterPositions {
+                input,
+                shape,
+                starts,
+                steps,
+            } => {
+                let input = MovementOperand::from_graph(graph, *input)?;
+                let map =
+                    StaticPositionMap::new(input.shape.clone(), shape.clone(), starts, steps)?;
+                MovementKernelKind::ScatterPositions {
+                    input,
+                    starts: map.starts,
+                    steps: map.steps,
+                }
+            }
+            Op::ScatterPositionsVjp {
+                cotangent,
+                input_shape,
+                starts,
+                steps,
+            } => {
+                let input = MovementOperand::from_graph(graph, *cotangent)?;
+                let map = StaticPositionMap::new(
+                    input_shape.clone(),
+                    input.shape.clone(),
+                    starts,
+                    steps,
+                )?;
+                MovementKernelKind::AffineCopy {
+                    input,
+                    view: map.read_view()?,
+                }
+            }
             Op::Bitcast { input, .. } => MovementKernelKind::Bitcast {
                 input: MovementOperand::from_graph(graph, *input)?,
             },
@@ -559,6 +777,27 @@ impl MovementKernelPlan {
                     return Err(MovementPlanError::UnsupportedDType);
                 }
             }
+            MovementKernelKind::ScatterPositions {
+                input,
+                starts,
+                steps,
+            } => {
+                input
+                    .shape
+                    .numel()
+                    .map_err(|_| MovementPlanError::Overflow)?
+                    .checked_mul(input.dtype.itemsize())
+                    .ok_or(MovementPlanError::Overflow)?;
+                if input.dtype != self.dtype {
+                    return Err(MovementPlanError::InvalidGeometry);
+                }
+                StaticPositionMap::from_i64(
+                    input.shape.clone(),
+                    self.output_shape.clone(),
+                    starts.clone(),
+                    steps.clone(),
+                )?;
+            }
             MovementKernelKind::Bitcast { input } => {
                 let input_itemsize = input.dtype.itemsize();
                 let output_itemsize = self.dtype.itemsize();
@@ -673,6 +912,9 @@ impl MovementKernelPlan {
                 axis: *axis,
                 add: *add,
             },
+            MovementKernelKind::ScatterPositions { .. } => {
+                return Err(MovementPlanError::InvalidGeometry);
+            }
             MovementKernelKind::Bitcast { input } => {
                 if input.dtype.itemsize() != self.dtype.itemsize() {
                     return Err(MovementPlanError::InvalidGeometry);
@@ -737,6 +979,7 @@ impl MovementKernelPlan {
                 updates,
                 ..
             } => vec![base, index, updates],
+            MovementKernelKind::ScatterPositions { input, .. } => vec![input],
             MovementKernelKind::Bitcast { input } => vec![input],
             MovementKernelKind::Contiguous { input } => vec![input],
         }
@@ -814,6 +1057,39 @@ impl MovementKernelPlan {
                 *axis,
                 *add,
             ),
+            MovementKernelKind::ScatterPositions {
+                input,
+                starts,
+                steps,
+            } => {
+                let map = StaticPositionMap::from_i64(
+                    input.shape.clone(),
+                    self.output_shape.clone(),
+                    starts.clone(),
+                    steps.clone(),
+                )?;
+                let bytes = self
+                    .output_shape
+                    .numel()
+                    .map_err(|_| MovementExecutionError::Overflow)?
+                    .checked_mul(self.dtype.itemsize())
+                    .ok_or(MovementExecutionError::Overflow)?;
+                let zero = TensorData::from_le_bytes(
+                    self.output_shape.clone(),
+                    self.dtype,
+                    &vec![0; bytes],
+                )
+                .map_err(|_| MovementExecutionError::InvalidGeometry)?;
+                let destinations = map.destination_offsets()?;
+                let placement = destinations
+                    .into_iter()
+                    .enumerate()
+                    .map(|(source, destination)| (destination, source))
+                    .collect::<Vec<_>>();
+                let storage = scatter_raw(zero.storage(), operands[0].storage(), &placement)?;
+                TensorData::from_storage(self.output_shape.clone(), storage)
+                    .map_err(|_| MovementExecutionError::InvalidGeometry)
+            }
             MovementKernelKind::Bitcast { .. } => operands[0]
                 .bitcast_with_shape(self.output_shape.clone(), self.dtype)
                 .map_err(|_| MovementExecutionError::InvalidGeometry),
@@ -972,7 +1248,45 @@ impl MovementKernelPlan {
             .map_err(|_| MovementExecutionError::InvalidGeometry)
     }
 
-    fn expected_cache_key(&self) -> u64 {
+    pub(crate) fn expected_cache_key(&self) -> u64 {
+        if let MovementKernelKind::ScatterPositions {
+            input,
+            starts,
+            steps,
+        } = &self.kind
+        {
+            fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            fn push_text(bytes: &mut Vec<u8>, value: &str) {
+                push_u64(bytes, value.len() as u64);
+                bytes.extend_from_slice(value.as_bytes());
+            }
+            let mut bytes = b"rustgrad-static-position-map-v1".to_vec();
+            push_u64(&mut bytes, input.node.index() as u64);
+            push_u64(&mut bytes, input.shape.rank() as u64);
+            for dimension in input.shape.dims() {
+                push_u64(&mut bytes, *dimension as u64);
+            }
+            push_text(&mut bytes, input.dtype.canonical_tinygrad_name());
+            push_u64(&mut bytes, self.output.index() as u64);
+            push_u64(&mut bytes, self.output_shape.rank() as u64);
+            for dimension in self.output_shape.dims() {
+                push_u64(&mut bytes, *dimension as u64);
+            }
+            push_text(&mut bytes, self.dtype.canonical_tinygrad_name());
+            push_u64(&mut bytes, starts.len() as u64);
+            for value in starts {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            push_u64(&mut bytes, steps.len() as u64);
+            for value in steps {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            return bytes.into_iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        }
         let mut plan = self.clone();
         plan.cache_key = 0;
         let mut hasher = DefaultHasher::new();
@@ -1858,5 +2172,249 @@ mod tests {
             malformed.validate(),
             Err(MovementPlanError::InvalidGeometry)
         );
+    }
+
+    #[test]
+    fn static_position_map_proves_reverse_gap_empty_and_invalid_geometry() {
+        let map =
+            StaticPositionMap::from_i64(Shape::from([3]), Shape::from([7]), vec![5], vec![-2])
+                .unwrap();
+        let view = map.read_view().unwrap();
+        assert_eq!(view.offset, 5);
+        assert_eq!(view.strides, [-2]);
+        assert_eq!(map.destination_offsets().unwrap(), [5, 3, 1]);
+
+        let empty = StaticPositionMap::from_i64(
+            Shape::from([0, 4]),
+            Shape::from([0, 9]),
+            vec![-1, 8],
+            vec![-1, -2],
+        )
+        .unwrap();
+        let view = empty.read_view().unwrap();
+        assert_eq!(view.offset, 0);
+        assert_eq!(view.strides, [0, 0]);
+        assert!(empty.destination_offsets().unwrap().is_empty());
+        assert_eq!(
+            StaticPositionMap::from_i64(
+                Shape::from([0, 4]),
+                Shape::from([0, 9]),
+                vec![-1, 8],
+                vec![0, -2],
+            ),
+            Err(MovementPlanError::InvalidGeometry)
+        );
+
+        let scalar =
+            StaticPositionMap::from_i64(Shape::from([]), Shape::from([]), vec![], vec![]).unwrap();
+        assert_eq!(scalar.destination_offsets().unwrap(), [0]);
+
+        let singleton_extreme = StaticPositionMap::from_i64(
+            Shape::from([1]),
+            Shape::from([2]),
+            vec![1],
+            vec![i64::MIN],
+        )
+        .unwrap();
+        let singleton_view = singleton_extreme.read_view().unwrap();
+        assert_eq!(singleton_view.offset, 1);
+        assert_eq!(singleton_view.strides, [0]);
+
+        let mut empty_plan = MovementKernelPlan {
+            kind: MovementKernelKind::ScatterPositions {
+                input: MovementOperand {
+                    node: NodeId::from_index(0),
+                    shape: empty.input_shape.clone(),
+                    dtype: DType::F32,
+                },
+                starts: empty.starts.clone(),
+                steps: empty.steps.clone(),
+            },
+            output: NodeId::from_index(1),
+            output_shape: empty.output_shape.clone(),
+            dtype: DType::F32,
+            cache_key: 0,
+        };
+        empty_plan.cache_key = empty_plan.expected_cache_key();
+        let value = TensorData::from_storage([0, 4], Storage::F32(vec![])).unwrap();
+        assert_eq!(
+            empty_plan.execute(&[value]).unwrap().shape(),
+            &Shape::from([0, 9])
+        );
+
+        assert_eq!(
+            StaticPositionMap::from_i64(Shape::from([2]), Shape::from([3]), vec![0], vec![0]),
+            Err(MovementPlanError::InvalidGeometry)
+        );
+        assert_eq!(
+            StaticPositionMap::from_i64(Shape::from([2]), Shape::from([3]), vec![2], vec![1]),
+            Err(MovementPlanError::InvalidGeometry)
+        );
+        assert_eq!(
+            StaticPositionMap::from_i64(Shape::from([2]), Shape::from([3]), vec![-1], vec![1]),
+            Err(MovementPlanError::InvalidGeometry)
+        );
+        assert_eq!(
+            StaticPositionMap::from_i64(
+                Shape::from([usize::MAX, 2]),
+                Shape::from([usize::MAX, 2]),
+                vec![0, 0],
+                vec![1, 1],
+            ),
+            Err(MovementPlanError::Overflow)
+        );
+
+        let mut byte_overflow = MovementKernelPlan {
+            kind: MovementKernelKind::ScatterPositions {
+                input: MovementOperand {
+                    node: NodeId::from_index(0),
+                    shape: Shape::from([0]),
+                    dtype: DType::F64,
+                },
+                starts: vec![-1],
+                steps: vec![-1],
+            },
+            output: NodeId::from_index(1),
+            output_shape: Shape::from([usize::MAX]),
+            dtype: DType::F64,
+            cache_key: 0,
+        };
+        byte_overflow.cache_key = byte_overflow.expected_cache_key();
+        assert_eq!(byte_overflow.validate(), Err(MovementPlanError::Overflow));
+    }
+
+    #[test]
+    fn static_position_movement_preserves_every_storage_width_and_reverse_vjp() {
+        for dtype in DType::ALL {
+            let width = dtype.itemsize();
+            let input_bytes = match dtype {
+                DType::Bool => vec![1, 0],
+                DType::F16 => [0x7e01u16, 0x8000]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                DType::BF16 => [0x7fc1u16, 0x8000]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                DType::F32 => [0x7fc0_0001u32, 0x8000_0000]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+                DType::F64 => [0x7ff8_0000_0000_0001u64, 0x8000_0000_0000_0000]
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
+                    .collect(),
+                DType::F8E4M3 | DType::F8E4M3FNUZ | DType::F8E5M2 | DType::F8E5M2FNUZ => {
+                    vec![0x81, 0x7f]
+                }
+                _ => (0..2 * width)
+                    .map(|index| 0x81u8.wrapping_add(index as u8))
+                    .collect::<Vec<_>>(),
+            };
+            let input = TensorData::from_le_bytes([2], dtype, &input_bytes).unwrap();
+            let operand = MovementOperand {
+                node: NodeId::from_index(0),
+                shape: Shape::from([2]),
+                dtype,
+            };
+            let mut plan = MovementKernelPlan {
+                kind: MovementKernelKind::ScatterPositions {
+                    input: operand.clone(),
+                    starts: vec![4],
+                    steps: vec![-2],
+                },
+                output: NodeId::from_index(1),
+                output_shape: Shape::from([5]),
+                dtype,
+                cache_key: 0,
+            };
+            plan.cache_key = plan.expected_cache_key();
+            let placed = plan.execute(std::slice::from_ref(&input)).unwrap();
+            let placed_bytes = placed.to_le_bytes().unwrap();
+            assert_eq!(&placed_bytes[4 * width..5 * width], &input_bytes[..width]);
+            assert_eq!(&placed_bytes[2 * width..3 * width], &input_bytes[width..]);
+            for lane in [0, 1, 3] {
+                assert_eq!(
+                    &placed_bytes[lane * width..(lane + 1) * width],
+                    vec![0; width]
+                );
+            }
+
+            let map =
+                StaticPositionMap::from_i64(Shape::from([2]), Shape::from([5]), vec![4], vec![-2])
+                    .unwrap();
+            let mut reverse = MovementKernelPlan {
+                kind: MovementKernelKind::AffineCopy {
+                    input: MovementOperand {
+                        node: NodeId::from_index(1),
+                        shape: Shape::from([5]),
+                        dtype,
+                    },
+                    view: map.read_view().unwrap(),
+                },
+                output: NodeId::from_index(2),
+                output_shape: Shape::from([2]),
+                dtype,
+                cache_key: 0,
+            };
+            reverse.cache_key = reverse.expected_cache_key();
+            assert_eq!(
+                reverse.execute(&[placed]).unwrap().to_le_bytes().unwrap(),
+                input_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn static_position_graph_admission_is_atomic() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let before = graph.node_count();
+        assert!(
+            graph
+                .scatter_positions(input, Shape::from([2]), vec![0], vec![0])
+                .is_err()
+        );
+        assert_eq!(graph.node_count(), before);
+        assert!(
+            graph
+                .scatter_positions(input, Shape::from([2]), vec![1], vec![1])
+                .is_err()
+        );
+        assert_eq!(graph.node_count(), before);
+
+        let mut source_overflow = Graph::new();
+        let input = source_overflow.input_dtype("input", [usize::MAX], DType::F64);
+        let before = source_overflow.node_count();
+        assert!(matches!(
+            source_overflow.scatter_positions(input, Shape::from([usize::MAX]), vec![0], vec![1],),
+            Err(crate::Error::ShapeOverflow(_))
+        ));
+        assert_eq!(source_overflow.node_count(), before);
+
+        let mut output_overflow = Graph::new();
+        let input = output_overflow.input_dtype("input", [0], DType::F64);
+        let before = output_overflow.node_count();
+        assert!(matches!(
+            output_overflow
+                .scatter_positions(input, Shape::from([usize::MAX]), vec![-1], vec![-1],),
+            Err(crate::Error::ShapeOverflow(_))
+        ));
+        assert_eq!(output_overflow.node_count(), before);
+
+        let mut vjp_overflow = Graph::new();
+        let cotangent = vjp_overflow.input_dtype("cotangent", [0], DType::F64);
+        let before = vjp_overflow.node_count();
+        assert!(matches!(
+            vjp_overflow.scatter_positions_vjp(
+                cotangent,
+                Shape::from([usize::MAX]),
+                vec![0],
+                vec![1],
+            ),
+            Err(crate::Error::ShapeOverflow(_))
+        ));
+        assert_eq!(vjp_overflow.node_count(), before);
     }
 }

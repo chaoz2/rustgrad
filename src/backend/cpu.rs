@@ -324,18 +324,22 @@ impl Backend for CpuBackend {
                     *add,
                     node.dtype,
                 )?,
-                Op::ScatterPositions {
-                    input,
-                    shape,
-                    starts,
-                    steps,
-                } => scatter(&values[input.index()], shape, starts, steps)?,
-                Op::ScatterPositionsVjp {
-                    cotangent,
-                    input_shape,
-                    starts,
-                    steps,
-                } => scatter_positions_vjp(&values[cotangent.index()], input_shape, starts, steps)?,
+                Op::ScatterPositions { input, .. } => {
+                    crate::MovementKernelPlan::from_graph(graph, NodeId::from_index(index))
+                        .and_then(|plan| {
+                            plan.execute(std::slice::from_ref(&values[input.index()]))
+                                .map_err(|_| crate::MovementPlanError::InvalidGeometry)
+                        })
+                        .map_err(|_| Error::InvalidIndex)?
+                }
+                Op::ScatterPositionsVjp { cotangent, .. } => {
+                    crate::MovementKernelPlan::from_graph(graph, NodeId::from_index(index))
+                        .and_then(|plan| {
+                            plan.execute(std::slice::from_ref(&values[cotangent.index()]))
+                                .map_err(|_| crate::MovementPlanError::InvalidGeometry)
+                        })
+                        .map_err(|_| Error::InvalidIndex)?
+                }
                 Op::Gather { input, index, axis } => {
                     gather(&values[input.index()], &values[index.index()], *axis)?
                 }
@@ -2735,75 +2739,6 @@ fn concat(
         })
         .collect::<Result<Vec<_>>>()?;
     TensorData::from_scalars(output_shape.clone(), dtype, data)
-}
-
-fn scatter(
-    input: &TensorData,
-    output_shape: &Shape,
-    starts: &[isize],
-    steps: &[isize],
-) -> Result<TensorData> {
-    let input_index = DenseIndex::new(input.shape().clone())?;
-    let output_index = DenseIndex::new(output_shape.clone())?;
-    let mut output = vec![Scalar::I(0); output_index.len()];
-    for linear in 0..input_index.len() {
-        let coords = input_index.coords(linear)?;
-        let destination = coords
-            .iter()
-            .zip(starts)
-            .zip(steps)
-            .map(|((coord, start), step)| {
-                let scaled = isize::try_from(*coord)
-                    .ok()
-                    .and_then(|x| x.checked_mul(*step))
-                    .ok_or(Error::InvalidIndex)?;
-                usize::try_from(start.checked_add(scaled).ok_or(Error::InvalidIndex)?)
-                    .map_err(|_| Error::InvalidIndex)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let offset = output_index.offset(&destination)?;
-        output[offset] = input.scalar_at(linear);
-    }
-    TensorData::from_scalars(output_shape.clone(), input.dtype(), output)
-}
-
-fn scatter_positions_vjp(
-    cotangent: &TensorData,
-    input_shape: &Shape,
-    starts: &[isize],
-    steps: &[isize],
-) -> Result<TensorData> {
-    if starts.len() != input_shape.rank()
-        || steps.len() != input_shape.rank()
-        || cotangent.shape().rank() != input_shape.rank()
-    {
-        return Err(Error::InvalidMovementRank {
-            op: "scatter vjp",
-            expected: input_shape.rank(),
-            actual: starts.len().min(steps.len()).min(cotangent.shape().rank()),
-        });
-    }
-    let input_index = DenseIndex::new(input_shape.clone())?;
-    let cotangent_index = DenseIndex::new(cotangent.shape().clone())?;
-    let mut output = Vec::with_capacity(input_index.len());
-    for linear in 0..input_index.len() {
-        let coords = input_index.coords(linear)?;
-        let source = coords
-            .iter()
-            .zip(starts)
-            .zip(steps)
-            .map(|((coord, start), step)| {
-                let scaled = isize::try_from(*coord)
-                    .ok()
-                    .and_then(|value| value.checked_mul(*step))
-                    .ok_or(Error::InvalidIndex)?;
-                usize::try_from(start.checked_add(scaled).ok_or(Error::InvalidIndex)?)
-                    .map_err(|_| Error::InvalidIndex)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        output.push(cotangent.scalar_at(cotangent_index.offset(&source)?));
-    }
-    TensorData::from_scalars(input_shape.clone(), cotangent.dtype(), output)
 }
 
 /// Maps every index coordinate to its source/destination coordinate. Gather

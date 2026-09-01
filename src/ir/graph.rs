@@ -4144,6 +4144,27 @@ impl Graph {
                 actual: starts.len().min(steps.len()).min(source.shape.rank()),
             });
         }
+        source
+            .shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        crate::movement_plan::StaticPositionMap::new(
+            source.shape.clone(),
+            shape.clone(),
+            &starts,
+            &steps,
+        )
+        .map_err(|error| match error {
+            crate::movement_plan::MovementPlanError::Overflow => {
+                Error::ShapeOverflow(shape.clone())
+            }
+            _ => Error::InvalidIndex,
+        })?;
         Ok(self.push(
             Op::ScatterPositions {
                 input,
@@ -4164,13 +4185,37 @@ impl Graph {
         steps: Vec<isize>,
     ) -> Result<NodeId> {
         let source = self.node(cotangent)?;
-        if starts.len() != input_shape.rank() || steps.len() != input_shape.rank() {
+        if starts.len() != input_shape.rank()
+            || steps.len() != input_shape.rank()
+            || source.shape.rank() != input_shape.rank()
+        {
             return Err(Error::InvalidMovementRank {
                 op: "scatter vjp",
                 expected: input_shape.rank(),
-                actual: starts.len().min(steps.len()),
+                actual: starts.len().min(steps.len()).min(source.shape.rank()),
             });
         }
+        input_shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        source
+            .shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        crate::movement_plan::StaticPositionMap::new(
+            input_shape.clone(),
+            source.shape.clone(),
+            &starts,
+            &steps,
+        )
+        .map_err(|error| match error {
+            crate::movement_plan::MovementPlanError::Overflow => {
+                Error::ShapeOverflow(input_shape.clone())
+            }
+            _ => Error::InvalidIndex,
+        })?;
         Ok(self.push(
             Op::ScatterPositionsVjp {
                 cotangent,

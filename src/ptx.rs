@@ -7903,6 +7903,19 @@ mod tests {
             PtxRenderer::new(80).unwrap().render(&item.kernel),
             Err(PtxError::Unsupported(reason)) if reason.contains("only raw affine and contiguous")
         ));
+
+        let positions = graph
+            .scatter_positions(input, Shape::from([4]), vec![3], vec![-2])
+            .unwrap();
+        let item = crate::schedule(&graph, positions)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        assert!(matches!(
+            PtxRenderer::new(80).unwrap().render(&item.kernel),
+            Err(PtxError::Unsupported(reason)) if reason.contains("only raw affine and contiguous")
+        ));
     }
 
     fn global(dtype: DType, buffer: u64) -> UOp {

@@ -3403,6 +3403,16 @@ mod tests {
                 .to_string()
                 .contains("scatter_positions_vjp")
         );
+        let before = graph.node_count();
+        let third_order = graph
+            .grad_with(shrink_vjp, direction, Some(shrink_seed), true)
+            .unwrap_err();
+        assert!(
+            third_order
+                .to_string()
+                .contains("third-order indexed contraction gradient")
+        );
+        assert_eq!(graph.node_count(), before);
     }
 
     #[test]

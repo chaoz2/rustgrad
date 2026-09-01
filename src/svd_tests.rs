@@ -303,7 +303,7 @@ fn source_svd_cpu_interpreter_reconstructs_and_orders_singular_values() {
 }
 
 #[test]
-fn source_svd_constructs_vjp_and_exposes_movement_schedule_prerequisite() {
+fn source_svd_realizes_well_conditioned_vjp_and_matches_finite_difference() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", Shape::new([2, 2]), DType::F32);
     let (_, singular, _) = graph.svd_default(input).unwrap();
@@ -312,21 +312,119 @@ fn source_svd_constructs_vjp_and_exposes_movement_schedule_prerequisite() {
     assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([2, 2]));
     assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
 
-    // Shrink is used by the source Jacobi/QR composition. Its VJP is the
-    // exact static ScatterPositions adjoint, which the CPU oracle can execute
-    // but the ordinary schedule does not yet lower into an owned item.
-    let schedule = crate::schedule(&graph, gradient).unwrap();
+    // Shrink is used by the source Jacobi/QR composition. Its exact static
+    // ScatterPositions adjoint is an owned movement item rather than a hidden
+    // host-oracle prerequisite.
+    let schedule = crate::schedule_many(&graph, &[loss, gradient]).unwrap();
+    schedule.validate().unwrap();
     let scatter_item = schedule
         .items
         .iter()
         .find(|item| matches!(graph.op(item.node), Ok(Op::ScatterPositions { .. })))
         .expect("SVD VJP must retain its static movement adjoint");
+    assert!(scatter_item.boundary.is_none());
+    assert!(matches!(
+        scatter_item.kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::ScatterPositions { .. })
+    ));
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+        scatter_item.kernel.operation()
+    else {
+        unreachable!();
+    };
+    let crate::MovementKernelKind::ScatterPositions { input, .. } = &plan.kind else {
+        unreachable!();
+    };
+    assert_eq!(scatter_item.input_bindings.len(), 1);
+    assert_eq!(scatter_item.input_bindings[0].input_node, input.node);
     assert_eq!(
-        scatter_item.boundary,
-        Some(crate::ScheduleBoundary::Unsupported(
-            "operation requires materialization"
-        ))
+        scatter_item.input_bindings[0].desc.id,
+        input.node.index() as u64
     );
+    let producer = schedule
+        .items
+        .iter()
+        .find(|item| item.node == input.node)
+        .expect("a rejected scalar-fusion rehearsal must retain the movement input producer");
+    assert!(scatter_item.dependencies.contains(&producer.id));
+    // The realized multi-root schedule is also the ownership regression for
+    // reduction-epilogue selection: every computed load retained by a final
+    // normalized kernel must have an earlier producer and dependency. This
+    // specifically covers the Select-through-view source shared across the
+    // source-composed SVD epilogues without relying on arena indices.
+    for item in &schedule.items {
+        for binding in &item.input_bindings {
+            if item.external_materializations.contains(&binding.input_node)
+                || matches!(
+                    graph.op(binding.input_node),
+                    Ok(Op::Input { .. } | Op::Constant(_))
+                )
+            {
+                continue;
+            }
+            let producer = schedule
+                .items
+                .iter()
+                .find(|candidate| {
+                    candidate.id < item.id
+                        && candidate
+                            .outputs
+                            .iter()
+                            .any(|output| output.id == binding.desc.id)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "computed binding {:?} for item {} must retain an earlier producer",
+                        binding.input_node, item.id
+                    )
+                });
+            assert!(item.dependencies.contains(&producer.id));
+        }
+    }
+    crate::MemoryPlan::from_schedule(&schedule, &[loss, gradient], true).unwrap();
+
+    let values = [3.0f32, 0.25, -0.5, 2.0];
+    let realization_inputs = HashMap::from([("x".into(), f32_data([2, 2], values))]);
+    let realized = crate::realize(
+        &graph,
+        &schedule,
+        &[loss, gradient],
+        &realization_inputs,
+        RealizationPolicy::Interpreter,
+    )
+    .unwrap();
+    let analytic = realized.outputs[1].to_vec_f64();
+    let epsilon = 1.0e-3f32;
+    let mut finite = Vec::new();
+    for lane in 0..values.len() {
+        let mut plus = values;
+        plus[lane] += epsilon;
+        let plus = crate::realize_graph(
+            &graph,
+            &[loss],
+            &HashMap::from([("x".into(), f32_data([2, 2], plus))]),
+            RealizationPolicy::Interpreter,
+        )
+        .unwrap()
+        .outputs[0]
+            .scalar_at(0)
+            .as_f64();
+        let mut minus = values;
+        minus[lane] -= epsilon;
+        let minus = crate::realize_graph(
+            &graph,
+            &[loss],
+            &HashMap::from([("x".into(), f32_data([2, 2], minus))]),
+            RealizationPolicy::Interpreter,
+        )
+        .unwrap()
+        .outputs[0]
+            .scalar_at(0)
+            .as_f64();
+        finite.push((plus - minus) / f64::from(2.0 * epsilon));
+    }
+    assert_close(&analytic, &finite, 2.0e-2);
 }
 
 #[test]
