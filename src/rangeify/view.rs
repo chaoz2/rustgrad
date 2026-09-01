@@ -1,4 +1,4 @@
-use crate::{AffineView, Graph, NodeId, Op, ViewMap};
+use crate::{AffineView, Graph, NodeId, Op, Shape, ViewMap};
 use std::{
     collections::hash_map::DefaultHasher,
     fmt,
@@ -105,21 +105,31 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
     })
 }
 
-/// Resolves a static view whose storage source is a pure computed producer.
-/// Source-backed views deliberately stay on the ordinary load-addressing path;
-/// this helper exists only for the explicit owned materialization boundary.
-pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
-    fn go(g: &Graph, n: NodeId) -> Result<(NodeId, AffineView), RangeifyError> {
+fn computed_view_seeded(
+    graph: &Graph,
+    node: NodeId,
+    seed: Option<(NodeId, &AffineView)>,
+) -> Result<(NodeId, AffineView), RangeifyError> {
+    fn go(
+        g: &Graph,
+        n: NodeId,
+        seed: Option<(NodeId, &AffineView)>,
+    ) -> Result<(NodeId, AffineView), RangeifyError> {
+        if let Some((source, view)) = seed
+            && n == source
+        {
+            return Ok((source, view.clone()));
+        }
         match g.op(n).map_err(|_| RangeifyError::Invalid)? {
             Op::Shrink { input, bounds } => {
-                let (source, view) = go(g, *input)?;
+                let (source, view) = go(g, *input, seed)?;
                 Ok((
                     source,
                     view.shrink(bounds).map_err(|_| RangeifyError::Invalid)?,
                 ))
             }
             Op::Reshape { input, shape } => {
-                let (source, view) = go(g, *input)?;
+                let (source, view) = go(g, *input, seed)?;
                 Ok((
                     source,
                     view.reshape_read(shape.clone())
@@ -127,14 +137,14 @@ pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedVie
                 ))
             }
             Op::Permute { input, axes } => {
-                let (source, view) = go(g, *input)?;
+                let (source, view) = go(g, *input, seed)?;
                 Ok((
                     source,
                     view.permute(axes).map_err(|_| RangeifyError::Invalid)?,
                 ))
             }
             Op::Expand { input, shape } => {
-                let (source, view) = go(g, *input)?;
+                let (source, view) = go(g, *input, seed)?;
                 Ok((
                     source,
                     view.expand(shape.clone())
@@ -142,7 +152,7 @@ pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedVie
                 ))
             }
             Op::Stride { input, slices } => {
-                let (source, mut view) = go(g, *input)?;
+                let (source, mut view) = go(g, *input, seed)?;
                 let normalized = slices
                     .iter()
                     .zip(view.logical_shape.dims())
@@ -178,13 +188,21 @@ pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedVie
             // Stop at the first non-view node. It must be a computed producer;
             // input and constant views are already handled by static_view.
             Op::Input { .. } | Op::Constant(_) => Err(RangeifyError::Unsupported(n)),
-            _ => {
+            _ if seed.is_none() => {
                 let shape = g.shape(n).map_err(|_| RangeifyError::Invalid)?.clone();
                 Ok((n, AffineView::from(ViewMap::identity(shape))))
             }
+            _ => Err(RangeifyError::Unsupported(n)),
         }
     }
-    let (source, view) = go(graph, node)?;
+    go(graph, node, seed)
+}
+
+/// Resolves a static view whose storage source is a pure computed producer.
+/// Source-backed views deliberately stay on the ordinary load-addressing path;
+/// this helper exists only for the explicit owned materialization boundary.
+pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
+    let (source, view) = computed_view_seeded(graph, node, None)?;
     let mut h = DefaultHasher::new();
     source.hash(&mut h);
     view.hash(&mut h);
@@ -193,6 +211,32 @@ pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedVie
         view,
         cache_key: h.finish(),
     })
+}
+
+/// Composes one right-aligned producer-leaf broadcast with an already checked
+/// computed movement chain. The result is a direct logical-output-to-leaf
+/// storage map. Reshapes that would require coordinate div/mod decomposition
+/// remain non-affine and fail closed through `reshape_read`.
+pub(crate) fn computed_broadcast_view(
+    graph: &Graph,
+    node: NodeId,
+    producer: NodeId,
+    leaf_shape: Shape,
+) -> Result<AffineView, RangeifyError> {
+    let producer_shape = graph
+        .shape(producer)
+        .map_err(|_| RangeifyError::Invalid)?
+        .clone();
+    let seed = AffineView::identity(leaf_shape)
+        .expand(producer_shape)
+        .map_err(|_| RangeifyError::Unsupported(producer))?;
+    seed.validate_read().map_err(|_| RangeifyError::Invalid)?;
+    let (source, view) = computed_view_seeded(graph, node, Some((producer, &seed)))?;
+    if source != producer {
+        return Err(RangeifyError::Invalid);
+    }
+    view.validate_read().map_err(|_| RangeifyError::Invalid)?;
+    Ok(view)
 }
 
 #[cfg(test)]
@@ -370,5 +414,49 @@ mod tests {
         assert_eq!(source_plan.source, input);
         assert_eq!(source_plan.view.strides, vec![0, 2, 0]);
         assert_eq!(source_plan.view.element_offset(1).unwrap(), 2);
+    }
+
+    #[test]
+    fn computed_broadcast_view_composes_affine_axes_and_rejects_divmod_reshape() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let row = graph.input("row", [3]);
+        let column = graph.input("column", [2, 1]);
+        let producer = graph.add(input, row).unwrap();
+        let producer = graph.add(producer, column).unwrap();
+        let permuted = graph.permute(producer, [1, 0]).unwrap();
+
+        let row_view = computed_broadcast_view(
+            &graph,
+            permuted,
+            producer,
+            graph.shape(row).unwrap().clone(),
+        )
+        .unwrap();
+        assert_eq!(row_view.source_shape, Shape::from([3]));
+        assert_eq!(row_view.logical_shape, Shape::from([3, 2]));
+        assert_eq!(row_view.strides, vec![1, 0]);
+
+        let column_view = computed_broadcast_view(
+            &graph,
+            permuted,
+            producer,
+            graph.shape(column).unwrap().clone(),
+        )
+        .unwrap();
+        assert_eq!(column_view.source_shape, Shape::from([2, 1]));
+        assert_eq!(column_view.logical_shape, Shape::from([3, 2]));
+        assert_eq!(column_view.strides, vec![0, 1]);
+
+        let reshaped = graph.reshape(producer, [3, 2]).unwrap();
+        assert!(
+            computed_broadcast_view(
+                &graph,
+                reshaped,
+                producer,
+                graph.shape(row).unwrap().clone(),
+            )
+            .is_err()
+        );
     }
 }

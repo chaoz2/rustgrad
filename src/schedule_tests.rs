@@ -658,6 +658,532 @@ fn affine_contiguous_binds_two_exact_shape_producer_leaves() {
 }
 
 #[test]
+fn affine_contiguous_composes_right_aligned_broadcast_leaf_reads() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F32);
+    let row = graph.input_dtype("row", [3], DType::F32);
+    let column = graph.input_dtype("column", [2, 1], DType::F32);
+    let producer = graph.add(input, row).unwrap();
+    let producer = graph.add(producer, column).unwrap();
+    let permuted = graph.permute(producer, [1, 0]).unwrap();
+    let output = graph.contiguous(permuted).unwrap();
+
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let item = &scheduled.items[0];
+    assert_eq!(
+        item.ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input, row, column]
+    );
+    let nodes = item.kernel.topological().unwrap();
+    assert!(nodes.iter().any(|node| matches!(
+        node.operation(),
+        crate::Operation::Index(crate::IndexValue::View { buffer, view, .. })
+            if *buffer == row.index() as u64
+                && view.source_shape == Shape::from([3])
+                && view.logical_shape == Shape::from([3, 2])
+                && view.strides.as_slice() == [1, 0]
+    )));
+    assert!(nodes.iter().any(|node| matches!(
+        node.operation(),
+        crate::Operation::Index(crate::IndexValue::View { buffer, view, .. })
+            if *buffer == column.index() as u64
+                && view.source_shape == Shape::from([2, 1])
+                && view.logical_shape == Shape::from([3, 2])
+                && view.strides.as_slice() == [0, 1]
+    )));
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let bindings = std::collections::BTreeMap::from([
+        (
+            "input".into(),
+            TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        ),
+        (
+            "row".into(),
+            TensorData::new([3], vec![10.0, 20.0, 30.0]).unwrap(),
+        ),
+        (
+            "column".into(),
+            TensorData::new([2, 1], vec![100.0, 200.0]).unwrap(),
+        ),
+    ]);
+    let replayed = decoded.replay(&bindings).unwrap();
+    assert_eq!(
+        replayed[0].storage(),
+        &crate::Storage::F32(vec![111.0, 214.0, 122.0, 225.0, 133.0, 236.0])
+    );
+    let native = decoded
+        .replay_with_options(
+            &bindings,
+            &crate::CapturedReplayExecutor::default(),
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(native.outputs[0].storage(), replayed[0].storage());
+}
+
+#[test]
+fn affine_contiguous_broadcasted_materialized_leaf_retains_exact_dependency() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F32);
+    let lhs = graph.input_dtype("lhs", [1, 2], DType::F32);
+    let rhs = graph.input_dtype("rhs", [2, 3], DType::F32);
+    let matrix = graph.matmul(lhs, rhs).unwrap();
+    let producer = graph.add(input, matrix).unwrap();
+    let permuted = graph.permute(producer, [1, 0]).unwrap();
+    let output = graph.contiguous(permuted).unwrap();
+
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    assert!(!scheduled.items.iter().any(|item| item.node == producer));
+    let matrix_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == matrix)
+        .unwrap();
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input, matrix]
+    );
+    assert_eq!(output_item.dependencies, vec![matrix_item.id]);
+    assert!(
+        output_item
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(
+                node.operation(),
+                crate::Operation::Index(crate::IndexValue::View { buffer, view, .. })
+                    if *buffer == matrix.index() as u64 && view.strides.as_slice() == [1, 0]
+            ))
+    );
+    let memory = crate::MemoryPlan::from_schedule(&scheduled, &[output], true).unwrap();
+    assert_eq!(
+        memory
+            .temporaries
+            .iter()
+            .map(|temporary| temporary.buffer_id)
+            .collect::<Vec<_>>(),
+        vec![matrix.index() as u64]
+    );
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let bindings = std::collections::BTreeMap::from([
+        (
+            "input".into(),
+            TensorData::new([2, 3], vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap(),
+        ),
+        (
+            "lhs".into(),
+            TensorData::new([1, 2], vec![1.0, 2.0]).unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        ),
+    ]);
+    let replayed = decoded.replay(&bindings).unwrap();
+    assert_eq!(
+        replayed[0].storage(),
+        &crate::Storage::F32(vec![19.0, 49.0, 32.0, 62.0, 45.0, 75.0])
+    );
+}
+
+#[test]
+fn scalar_consumer_fuses_independent_computed_affine_branches() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 3], DType::F32);
+    let y = graph.input_dtype("y", [2, 3], DType::F32);
+    let x_producer = graph.square(x).unwrap();
+    let x_view = graph.permute(x_producer, [1, 0]).unwrap();
+    let y_producer = graph.neg(y).unwrap();
+    let y_view = graph.permute(y_producer, [1, 0]).unwrap();
+    let output = graph.add(x_view, y_view).unwrap();
+
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let item = &scheduled.items[0];
+    assert_eq!(
+        item.ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![x, y]
+    );
+    for source in [x, y] {
+        assert!(
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|node| matches!(
+                    node.operation(),
+                    crate::Operation::Index(crate::IndexValue::View { buffer, view, .. })
+                        if *buffer == source.index() as u64
+                            && view.source_shape == Shape::from([2, 3])
+                            && view.logical_shape == Shape::from([3, 2])
+                            && view.strides.as_slice() == [1, 3]
+                ))
+        );
+    }
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let bindings = std::collections::BTreeMap::from([
+        (
+            "x".into(),
+            TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        ),
+        (
+            "y".into(),
+            TensorData::new([2, 3], vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap(),
+        ),
+    ]);
+    let replayed = decoded.replay(&bindings).unwrap();
+    assert_eq!(
+        replayed[0].storage(),
+        &crate::Storage::F32(vec![-9.0, -24.0, -16.0, -25.0, -21.0, -24.0])
+    );
+    let native = decoded
+        .replay_with_options(
+            &bindings,
+            &crate::CapturedReplayExecutor::default(),
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(native.outputs[0].storage(), replayed[0].storage());
+}
+
+#[test]
+fn scalar_affine_fusion_shares_one_map_and_rejects_two_maps() {
+    let mut shared_graph = Graph::new();
+    let x = shared_graph.input_dtype("x", [2, 3], DType::F32);
+    let producer = shared_graph.square(x).unwrap();
+    let view = shared_graph.permute(producer, [1, 0]).unwrap();
+    let doubled = shared_graph.add(view, view).unwrap();
+    let output = shared_graph.add(doubled, view).unwrap();
+    let shared = schedule(&shared_graph, output).unwrap();
+    shared.validate().unwrap();
+    assert_eq!(shared.items.len(), 1);
+    assert_eq!(
+        shared.items[0]
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .filter(|node| matches!(
+                node.operation(),
+                crate::Operation::GraphBinary(crate::BinaryOp::Mul)
+            ))
+            .count(),
+        1
+    );
+
+    let mut distinct_graph = Graph::new();
+    let x = distinct_graph.input_dtype("x", [2, 3], DType::F32);
+    let producer = distinct_graph.square(x).unwrap();
+    let first = distinct_graph.permute(producer, [1, 0]).unwrap();
+    let second = distinct_graph
+        .stride(
+            first,
+            [
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                },
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+            ],
+        )
+        .unwrap();
+    let output = distinct_graph.add(first, second).unwrap();
+    let distinct = schedule(&distinct_graph, output).unwrap();
+    distinct.validate().unwrap();
+    assert!(distinct.items.iter().any(|item| item.node == producer));
+    crate::MemoryPlan::from_schedule(&distinct, &[output], true).unwrap();
+}
+
+#[test]
+fn scalar_affine_fusion_owns_shared_intermediate_equivalent_view_paths() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let shared = graph.permute(producer, [1, 0]).unwrap();
+    let first = graph.reshape(shared, [1, 3, 2]).unwrap();
+    let second = graph.reshape(shared, [3, 2, 1]).unwrap();
+    let second = graph.permute(second, [2, 0, 1]).unwrap();
+    let output = graph.add(first, second).unwrap();
+
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert!(
+        [producer, shared, first, second]
+            .into_iter()
+            .all(|removed| scheduled.items.iter().all(|item| item.node != removed))
+    );
+    assert_eq!(
+        scheduled.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input]
+    );
+    crate::MemoryPlan::from_schedule(&scheduled, &[output], true).unwrap();
+
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let replayed = decoded
+        .replay(&std::collections::BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(
+        replayed[0].storage(),
+        &crate::Storage::F32(vec![2.0, 32.0, 8.0, 50.0, 18.0, 72.0])
+    );
+}
+
+#[test]
+fn scalar_affine_fusion_uses_normalized_loads_and_exact_materialized_dependencies() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F32);
+    let lhs = graph.input_dtype("lhs", [1, 2], DType::F32);
+    let rhs = graph.input_dtype("rhs", [2, 3], DType::F32);
+    let matrix = graph.matmul(lhs, rhs).unwrap();
+    let producer = graph.add(input, matrix).unwrap();
+    let view = graph.permute(producer, [1, 0]).unwrap();
+    let output = graph.relu(view).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    assert!(!scheduled.items.iter().any(|item| item.node == producer));
+    let matrix_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == matrix)
+        .unwrap();
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(output_item.dependencies, vec![matrix_item.id]);
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input, matrix]
+    );
+    crate::MemoryPlan::from_schedule(&scheduled, &[output], true).unwrap();
+
+    let mut pruned = Graph::new();
+    let selected_input = pruned.input_dtype("selected", [2, 2], DType::F32);
+    let lhs = pruned.input_dtype("lhs", [2, 2], DType::F32);
+    let rhs = pruned.input_dtype("rhs", [2, 2], DType::F32);
+    let stale = pruned.matmul(lhs, rhs).unwrap();
+    let condition = pruned.constant(TensorData::scalar_with_dtype(
+        crate::Scalar::Bool(true),
+        DType::Bool,
+    ));
+    let selected = pruned.square(selected_input).unwrap();
+    let mapped = pruned.permute(selected, [1, 0]).unwrap();
+    let output = pruned.select(condition, mapped, stale).unwrap();
+    let scheduled = schedule(&pruned, output).unwrap();
+    scheduled.validate().unwrap();
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![selected_input]
+    );
+    assert!(output_item.dependencies.is_empty());
+    assert!(scheduled.items.iter().all(|item| item.node != selected));
+    let stale_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == stale)
+        .expect("the specialized false branch remains independently materialized");
+    assert!(!output_item.dependencies.contains(&stale_item.id));
+    assert!(
+        output_item
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(
+                node.operation(),
+                crate::Operation::GraphBinary(crate::BinaryOp::Mul)
+            ))
+    );
+    crate::MemoryPlan::from_schedule(&scheduled, &[output], true).unwrap();
+}
+
+#[test]
+fn scalar_affine_fusion_preserves_observable_faulting_and_specialized_roots() {
+    fn mapped_output(graph: &mut Graph) -> (crate::NodeId, crate::NodeId) {
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let view = graph.permute(producer, [1, 0]).unwrap();
+        (producer, graph.relu(view).unwrap())
+    }
+
+    let mut requested_graph = Graph::new();
+    let (producer, output) = mapped_output(&mut requested_graph);
+    let requested = schedule_many(&requested_graph, &[producer, output]).unwrap();
+    assert!(requested.items.iter().any(|item| item.node == producer));
+
+    let sibling = requested_graph.neg(producer).unwrap();
+    let shared = schedule_many(&requested_graph, &[output, sibling]).unwrap();
+    assert!(shared.items.iter().any(|item| item.node == producer));
+
+    let symbolic = crate::schedule::schedule_many_for_symbolic_capture(
+        &requested_graph,
+        &[output],
+        &std::collections::BTreeSet::new(),
+    )
+    .unwrap();
+    assert!(symbolic.items.iter().any(|item| item.node == producer));
+
+    let mut external_graph = Graph::new();
+    let (producer, output) = mapped_output(&mut external_graph);
+    let external =
+        schedule_with_external_materializations(&external_graph, &[output], &[producer]).unwrap();
+    assert_eq!(external.items.len(), 1);
+    let output_item = external
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![producer]
+    );
+    assert!(
+        output_item
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| {
+                matches!(
+                    node.operation(),
+                    crate::Operation::Index(crate::IndexValue::View { buffer, .. })
+                        if *buffer == producer.index() as u64
+                )
+            })
+    );
+    assert_eq!(output_item.external_materializations, vec![producer]);
+    assert!(output_item.dependencies.is_empty());
+
+    let mut specialized_external_graph = Graph::new();
+    let input = specialized_external_graph.input_dtype("input", [2, 3], DType::F32);
+    let producer = specialized_external_graph.square(input).unwrap();
+    let view = specialized_external_graph
+        .permute(producer, [1, 0])
+        .unwrap();
+    let rhs = specialized_external_graph.input_dtype("rhs", [2, 4], DType::F32);
+    let output = specialized_external_graph.matmul(view, rhs).unwrap();
+    let specialized_external = schedule_with_external_materializations(
+        &specialized_external_graph,
+        &[output],
+        &[producer],
+    )
+    .unwrap();
+    specialized_external.validate().unwrap();
+    assert_eq!(specialized_external.items.len(), 2);
+    let view_item = specialized_external
+        .items
+        .iter()
+        .find(|item| item.node == view)
+        .unwrap();
+    let output_item = specialized_external
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(view_item.external_materializations, vec![producer]);
+    assert!(view_item.dependencies.is_empty());
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![view, rhs]
+    );
+    assert_eq!(output_item.dependencies, vec![view_item.id]);
+    crate::MemoryPlan::from_schedule(&specialized_external, &[output], true).unwrap();
+
+    let mut faulting_graph = Graph::new();
+    let lhs = faulting_graph.input_dtype("lhs", [2, 3], DType::I32);
+    let rhs = faulting_graph.input_dtype("rhs", [2, 3], DType::I32);
+    let producer = faulting_graph
+        .binary(crate::BinaryOp::Div, lhs, rhs)
+        .unwrap();
+    let view = faulting_graph.permute(producer, [1, 0]).unwrap();
+    let output = faulting_graph.neg(view).unwrap();
+    let faulting = schedule(&faulting_graph, output).unwrap();
+    assert!(faulting.items.iter().any(|item| item.node == producer));
+
+    let mut specialized_graph = Graph::new();
+    let lhs = specialized_graph.input_dtype("lhs", [2, 2], DType::F32);
+    let rhs = specialized_graph.input_dtype("rhs", [2, 2], DType::F32);
+    let producer = specialized_graph.matmul(lhs, rhs).unwrap();
+    let view = specialized_graph.permute(producer, [1, 0]).unwrap();
+    let output = specialized_graph.relu(view).unwrap();
+    let specialized = schedule(&specialized_graph, output).unwrap();
+    assert!(specialized.items.iter().any(|item| item.node == producer));
+}
+
+#[test]
 fn affine_contiguous_inventory_uses_normalized_select_loads() {
     let mut graph = Graph::new();
     let selected = graph.input_dtype("selected", [2, 2], DType::F32);

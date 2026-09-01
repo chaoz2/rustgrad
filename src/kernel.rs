@@ -415,6 +415,27 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
         materialized,
         &HashMap::new(),
         None,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// Lowers one ordinary scalar root while absorbing the exact computed affine
+/// producer roots selected by the scheduler. Each absorbed source is evaluated
+/// under its branch-local read map; all other roots remain typed buffer loads.
+pub(crate) fn lower_graph_elementwise_with_affine_sources(
+    graph: &Graph,
+    output: NodeId,
+    materialized: &std::collections::BTreeSet<usize>,
+    affine_sources: &std::collections::BTreeSet<usize>,
+) -> std::result::Result<UOp, UOpError> {
+    lower_graph_elementwise_with_substitutions(
+        graph,
+        output,
+        output,
+        materialized,
+        &HashMap::new(),
+        None,
+        affine_sources,
     )
 }
 
@@ -450,14 +471,16 @@ pub(crate) fn lower_graph_elementwise_into_with_materialized(
         materialized,
         &HashMap::new(),
         None,
+        &std::collections::BTreeSet::new(),
     )
 }
 
 /// Lowers one ordinary pure producer through an existing checked affine read
-/// map directly into a Contiguous destination. Loads with the producer's exact
-/// dense shape reuse that map, while scalar loads remain invariant. Any load
-/// requiring broadcast-coordinate decomposition or nested view composition
-/// fails closed so the scheduler retains the explicit AffineCopy boundary.
+/// map directly into a Contiguous destination. Materialized leaves reuse one
+/// checked affine composition of their right-aligned producer broadcast and
+/// the movement chain, while scalar loads remain invariant. Non-affine
+/// broadcast reshapes and nested source views fail closed so the scheduler
+/// retains the explicit AffineCopy boundary.
 pub(crate) fn lower_graph_elementwise_affine_into_with_materialized(
     graph: &Graph,
     value: NodeId,
@@ -483,13 +506,74 @@ pub(crate) fn lower_graph_elementwise_affine_into_with_materialized(
     {
         return Err(UOpError::InvalidArgument);
     }
+    let Op::Contiguous { input: movement } = graph
+        .op(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
+        return Err(UOpError::InvalidArgument);
+    };
+    let planned =
+        crate::rangeify::computed_view(graph, *movement).map_err(|_| UOpError::InvalidArgument)?;
+    if planned.source != value || &planned.view != view {
+        return Err(UOpError::InvalidArgument);
+    }
     lower_graph_elementwise_with_substitutions(
         graph,
         value,
         output,
         materialized,
         &HashMap::new(),
-        Some(view),
+        Some(AffineIteration {
+            producer: value,
+            movement: *movement,
+        }),
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct AffineIteration {
+    producer: NodeId,
+    movement: NodeId,
+}
+
+impl AffineIteration {
+    fn project(
+        self,
+        graph: &Graph,
+        shape: Shape,
+        output_shape: &Shape,
+    ) -> std::result::Result<crate::uop::AffineView, UOpError> {
+        crate::rangeify::computed_broadcast_view(graph, self.movement, self.producer, shape)
+            .and_then(|view| {
+                view.expand(output_shape.clone())
+                    .map_err(|_| crate::rangeify::RangeifyError::Invalid)
+            })
+            .map_err(|_| UOpError::InvalidArgument)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ElementwiseMemoKey {
+    node: NodeId,
+    view: Option<crate::uop::AffineView>,
+}
+
+/// Operations whose scalar evaluation can raise a data-dependent fault or
+/// requires guarded transaction ordering. Scheduler fusion must not duplicate
+/// or move these across an existing materialization boundary.
+pub(crate) fn scalar_uop_may_fault(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::GraphBinary(
+            crate::BinaryOp::Div
+                | crate::BinaryOp::FloorDiv
+                | crate::BinaryOp::TruncDiv
+                | crate::BinaryOp::Mod
+                | crate::BinaryOp::FMod
+                | crate::BinaryOp::Shl
+                | crate::BinaryOp::Shr
+        )
     )
 }
 
@@ -499,7 +583,8 @@ fn lower_graph_elementwise_with_substitutions(
     output: NodeId,
     materialized: &std::collections::BTreeSet<usize>,
     substitutions: &HashMap<NodeId, UOp>,
-    iteration_view: Option<&crate::uop::AffineView>,
+    iteration: Option<AffineIteration>,
+    affine_sources: &std::collections::BTreeSet<usize>,
 ) -> std::result::Result<UOp, UOpError> {
     let output_shape = graph
         .shape(output)
@@ -525,7 +610,7 @@ fn lower_graph_elementwise_with_substitutions(
         out: &Shape,
         range: &UOp,
         view: Option<crate::uop::AffineView>,
-        iteration_view: Option<&crate::uop::AffineView>,
+        iteration: Option<AffineIteration>,
     ) -> std::result::Result<UOp, UOpError> {
         let shape = graph
             .shape(id)
@@ -542,7 +627,7 @@ fn lower_graph_elementwise_with_substitutions(
             Some(ty),
             vec![],
         );
-        let operation = match (view, iteration_view) {
+        let operation = match (view, iteration) {
             (Some(_), Some(_)) => return Err(UOpError::InvalidArgument),
             (Some(view), None) => Operation::Index(IndexValue::View {
                 buffer: id.index() as u64,
@@ -554,25 +639,25 @@ fn lower_graph_elementwise_with_substitutions(
                 output_shape: out.clone(),
                 view,
             }),
-            (None, Some(iteration_view)) if shape == iteration_view.source_shape => {
-                Operation::Index(IndexValue::View {
-                    buffer: id.index() as u64,
-                    elements: iteration_view
-                        .logical_shape
-                        .numel()
-                        .map_err(|_| UOpError::InvalidArgument)?,
-                    input_shape: iteration_view.logical_shape.clone(),
-                    output_shape: out.clone(),
-                    view: iteration_view.clone(),
-                })
-            }
             (None, Some(_)) if elements == 1 => Operation::Index(IndexValue::Buffer {
                 buffer: id.index() as u64,
                 elements,
                 input_shape: shape,
                 output_shape: out.clone(),
             }),
-            (None, Some(_)) => return Err(UOpError::InvalidArgument),
+            (None, Some(iteration)) => {
+                let view = iteration.project(graph, shape, out)?;
+                Operation::Index(IndexValue::View {
+                    buffer: id.index() as u64,
+                    elements: view
+                        .logical_shape
+                        .numel()
+                        .map_err(|_| UOpError::InvalidArgument)?,
+                    input_shape: view.logical_shape.clone(),
+                    output_shape: out.clone(),
+                    view,
+                })
+            }
             (None, None) => Operation::Index(IndexValue::Buffer {
                 buffer: id.index() as u64,
                 elements,
@@ -586,7 +671,8 @@ fn lower_graph_elementwise_with_substitutions(
     struct ElementwiseLowering<'a> {
         materialized: &'a std::collections::BTreeSet<usize>,
         substitutions: &'a HashMap<NodeId, UOp>,
-        iteration_view: Option<&'a crate::uop::AffineView>,
+        iteration: Option<AffineIteration>,
+        affine_sources: &'a std::collections::BTreeSet<usize>,
     }
 
     fn lower(
@@ -594,20 +680,33 @@ fn lower_graph_elementwise_with_substitutions(
         id: NodeId,
         out: &Shape,
         range: &UOp,
-        memo: &mut HashMap<NodeId, UOp>,
+        memo: &mut HashMap<ElementwiseMemoKey, UOp>,
         context: &ElementwiseLowering<'_>,
     ) -> std::result::Result<UOp, UOpError> {
-        if let Some(v) = memo.get(&id) {
+        let shape = graph
+            .shape(id)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            .clone();
+        let key = ElementwiseMemoKey {
+            node: id,
+            view: context
+                .iteration
+                .map(|iteration| iteration.project(graph, shape, out))
+                .transpose()?,
+        };
+        if let Some(v) = memo.get(&key) {
             return Ok(v.clone());
         }
         let ty = UType::scalar(graph.dtype(id).map_err(|_| UOpError::UseBeforeDefinition)?);
         let x = if let Some(value) = context.substitutions.get(&id) {
             value.clone()
-        } else if context.materialized.contains(&id.index()) {
-            load(graph, id, out, range, None, context.iteration_view)?
+        } else if context.materialized.contains(&id.index())
+            && !(context.iteration.is_some() && context.affine_sources.contains(&id.index()))
+        {
+            load(graph, id, out, range, None, context.iteration)?
         } else {
             match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-                Op::Input { .. } => load(graph, id, out, range, None, context.iteration_view)?,
+                Op::Input { .. } => load(graph, id, out, range, None, context.iteration)?,
                 // A rank-0 graph constant is dependency-free once its typed
                 // storage payload is present in the UOp. Keep all non-scalar
                 // constants as buffer loads: their allocation, scheduling,
@@ -615,12 +714,12 @@ fn lower_graph_elementwise_with_substitutions(
                 Op::Constant(data) if data.shape().rank() == 0 => {
                     UOp::scalar_constant(data.dtype(), crate::uop::raw_literal_bits(data)?, ty)
                 }
-                Op::Constant(_) => load(graph, id, out, range, None, context.iteration_view)?,
+                Op::Constant(_) => load(graph, id, out, range, None, context.iteration)?,
                 Op::Random { .. } => return Err(UOpError::InvalidArgument),
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
                 Op::Reduce { .. } | Op::PrefixScan { .. } => {
-                    load(graph, id, out, range, None, context.iteration_view)?
+                    load(graph, id, out, range, None, context.iteration)?
                 }
                 Op::Shrink { .. }
                 | Op::Reshape { .. }
@@ -630,14 +729,38 @@ fn lower_graph_elementwise_with_substitutions(
                     let planned = crate::rangeify::static_view(graph, id)
                         .or_else(|_| crate::rangeify::computed_view(graph, id))
                         .map_err(|_| UOpError::InvalidArgument)?;
-                    load(
-                        graph,
-                        planned.source,
-                        out,
-                        range,
-                        Some(planned.view),
-                        context.iteration_view,
-                    )?
+                    if context.materialized.contains(&planned.source.index()) {
+                        load(
+                            graph,
+                            planned.source,
+                            out,
+                            range,
+                            Some(planned.view),
+                            context.iteration,
+                        )?
+                    } else if context.iteration.is_none()
+                        && context.affine_sources.contains(&planned.source.index())
+                    {
+                        let nested = ElementwiseLowering {
+                            materialized: context.materialized,
+                            substitutions: context.substitutions,
+                            iteration: Some(AffineIteration {
+                                producer: planned.source,
+                                movement: id,
+                            }),
+                            affine_sources: context.affine_sources,
+                        };
+                        lower(graph, planned.source, out, range, memo, &nested)?
+                    } else {
+                        load(
+                            graph,
+                            planned.source,
+                            out,
+                            range,
+                            Some(planned.view),
+                            context.iteration,
+                        )?
+                    }
                 }
                 Op::Cast { input, .. } => {
                     UOp::cast(lower(graph, *input, out, range, memo, context)?, ty)
@@ -699,13 +822,14 @@ fn lower_graph_elementwise_with_substitutions(
                 _ => return Err(UOpError::InvalidArgument),
             }
         };
-        memo.insert(id, x.clone());
+        memo.insert(key, x.clone());
         Ok(x)
     }
     let context = ElementwiseLowering {
         materialized,
         substitutions,
-        iteration_view,
+        iteration,
+        affine_sources,
     };
     let value = lower(
         graph,
@@ -984,6 +1108,7 @@ pub(crate) fn lower_graph_reduction_epilogue_with_materialized(
         materialized,
         &HashMap::from([(reduction, committed)]),
         None,
+        &std::collections::BTreeSet::new(),
     )?;
     kernel.validate()?;
     Ok(kernel)
