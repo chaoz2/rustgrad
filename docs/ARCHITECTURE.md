@@ -1421,8 +1421,14 @@ into fresh owned dense storage. Signed reverse and zero-stride broadcast reads
 are valid because source aliases never alias the output or each other as write
 targets. The interpreter and movement-v2 CPU renderer share that immutable plan;
 native addressing normalizes the proof to nonnegative indices and copies raw
-storage widths. Effectful, symbolic, non-affine, and unsupported-device routes
-remain fail-closed.
+storage widths. A separate `rustgrad-ptx-affine-copy-v1` renderer consumes only
+that validated concrete plan, retains its exact two-buffer schedule ABI, and
+emits unsigned 64-bit address arithmetic plus raw 8/16/32/64-bit loads and
+stores. The fixed-schema CUDA graph executor therefore keeps the computed
+producer and affine materialization device-resident and downloads only the
+requested dense output. This path changes neither RGUA/RGSA movement bytes nor
+the generic elementwise PTX identity. Effectful, symbolic, non-affine,
+OpenCL/Metal/WebGPU, and live-CUDA routes remain fail-closed or unvalidated.
 The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
 preflight/plan/execute path rather than adding a profiler or executor. Its
 immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`

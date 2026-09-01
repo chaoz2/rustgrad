@@ -496,6 +496,85 @@ mod tests {
     }
 
     #[test]
+    fn computed_reverse_affine_copy_replays_as_one_device_resident_prefix() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], crate::DType::I32);
+        let squared = graph.square(input).unwrap();
+        let reversed = graph
+            .stride(
+                squared,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        let schedule = crate::schedule(&graph, reversed).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        assert!(matches!(
+            schedule.items[1].kernel.operation(),
+            crate::Operation::Movement(crate::MovementValue::Plan(plan))
+                if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. })
+        ));
+
+        let (mock, primary) = make_primary();
+        let mut prepared = prepare_outputs(primary, &schedule, &[reversed.index() as u64]);
+        assert_eq!(prepared.kernel_cache_keys().len(), 2);
+        let mut values = BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage([4], Storage::I32(vec![1, -2, 3, -4])).unwrap(),
+        )]);
+        prepared.execute(&mut values).unwrap();
+        assert_eq!(
+            values[&(reversed.index() as u64)].storage(),
+            &Storage::I32(vec![16, 9, 4, 1])
+        );
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|call| **call == "htod").count(), 1);
+        assert_eq!(
+            calls.iter().filter(|call| **call == "graph_launch").count(),
+            1
+        );
+        assert_eq!(calls.iter().filter(|call| **call == "dtoh").count(), 1);
+    }
+
+    #[test]
+    fn computed_broadcast_affine_copy_keeps_zero_stride_on_cuda_graph() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 1], crate::DType::F32);
+        let squared = graph.square(input).unwrap();
+        let expanded = graph.expand(squared, [2, 3]).unwrap();
+        let schedule = crate::schedule(&graph, expanded).unwrap();
+        let movement = schedule
+            .items
+            .iter()
+            .find(|item| item.node == expanded)
+            .unwrap();
+        let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+            movement.kernel.operation()
+        else {
+            panic!("computed broadcast needs AffineCopy")
+        };
+        let crate::MovementKernelKind::AffineCopy { view, .. } = &plan.kind else {
+            panic!("computed broadcast needs AffineCopy")
+        };
+        assert_eq!(view.strides, vec![1, 0]);
+
+        let (_, primary) = make_primary();
+        let mut prepared = prepare_outputs(primary, &schedule, &[expanded.index() as u64]);
+        let mut values = BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage([2, 1], Storage::F32(vec![2.0, -3.0])).unwrap(),
+        )]);
+        prepared.execute(&mut values).unwrap();
+        assert_eq!(
+            values[&(expanded.index() as u64)].storage(),
+            &Storage::F32(vec![4.0, 4.0, 4.0, 9.0, 9.0, 9.0])
+        );
+    }
+
+    #[test]
     fn descriptor_and_read_failures_publish_nothing_and_read_failure_retries() {
         let (schedule, external, retained) = branch();
         let (mock, primary) = make_primary();

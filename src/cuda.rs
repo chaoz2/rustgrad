@@ -5892,23 +5892,24 @@ pub(crate) mod tests {
                 return CUDA_SUCCESS;
             }
             let output_index = match &semantics.program {
-                crate::ptx::KernelSemanticProgram::UOp(program) => match program
-                    .sources()
-                    .iter()
-                    .find(|node| matches!(node.operation(), crate::Operation::Store))
-                    .and_then(|store| store.sources().first())
-                    .map(|index| index.operation())
-                {
-                    Some(crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })) => {
-                        *buffer
+                crate::ptx::KernelSemanticProgram::UOp(program) => match program.operation() {
+                    crate::Operation::Random(plan) => plan.output.index() as u64,
+                    crate::Operation::Movement(crate::MovementValue::Plan(plan)) => {
+                        plan.output.index() as u64
                     }
-                    _ if matches!(program.operation(), crate::Operation::Random(_)) => {
-                        match program.operation() {
-                            crate::Operation::Random(plan) => plan.output.index() as u64,
-                            _ => return Self::INVALID_MEMORY,
-                        }
-                    }
-                    _ => return Self::INVALID_MEMORY,
+                    crate::Operation::Movement(_) => return Self::INVALID_MEMORY,
+                    _ => match program
+                        .sources()
+                        .iter()
+                        .find(|node| matches!(node.operation(), crate::Operation::Store))
+                        .and_then(|store| store.sources().first())
+                        .map(|index| index.operation())
+                    {
+                        Some(crate::Operation::Index(crate::IndexValue::Buffer {
+                            buffer, ..
+                        })) => *buffer,
+                        _ => return Self::INVALID_MEMORY,
+                    },
                 },
                 crate::ptx::KernelSemanticProgram::Matmul(plan) => plan.output.index() as u64,
                 crate::ptx::KernelSemanticProgram::TiledMatmul(payload) => {
