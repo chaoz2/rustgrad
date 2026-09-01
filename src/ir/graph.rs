@@ -250,6 +250,39 @@ struct QrPlan {
     stages: usize,
 }
 
+/// Whole-operation descriptor contract for checked-in tinygrad's static
+/// Jacobi SVD composition.
+///
+/// SVD remains a source graph, not a new operation family: QR, two explicit
+/// Contiguous identities, the fixed round-robin Jacobi network, coupled Sort,
+/// source Gather, and the final padding/matmul composition retain their own
+/// typed contracts. The private rehearsal in [`Graph::svd`] validates that
+/// complete graph before the live graph receives its first node.
+#[derive(Clone, Debug)]
+struct SvdPlan {
+    input_shape: Shape,
+    batch: Vec<usize>,
+    dtype: DType,
+    m: usize,
+    n: usize,
+    num: usize,
+    q_num: usize,
+    h: usize,
+    rounds: usize,
+    transpose_input: bool,
+    full_matrices: bool,
+    singular_shape: Shape,
+    left_shape: Shape,
+    right_shape: Shape,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SvdJacobiState {
+    u: NodeId,
+    v: NodeId,
+    permutation: NodeId,
+}
+
 /// Concrete whole-operation contract for tinygrad's public
 /// `Tensor.newton_schulz(steps, params, eps)`.
 #[derive(Clone, Debug)]
@@ -343,6 +376,223 @@ fn qr_plan(graph: &Graph, input: NodeId) -> Result<QrPlan> {
         m,
         stages: m.min(n),
     })
+}
+
+fn svd_plan(graph: &Graph, input: NodeId, full_matrices: bool) -> Result<SvdPlan> {
+    let source = graph.node(input)?;
+    let input_shape = source.shape.clone();
+    let dtype = source.dtype;
+    let checked_extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    checked_extent(&input_shape, dtype)?;
+    if input_shape.rank() < 2 {
+        return Err(Error::InvalidMatmul {
+            lhs: input_shape.clone(),
+            rhs: input_shape,
+        });
+    }
+    let rank = input_shape.rank();
+    let batch = input_shape.dims()[..rank - 2].to_vec();
+    let m = input_shape.dims()[rank - 2];
+    let n = input_shape.dims()[rank - 1];
+    let num = m.min(n);
+    let q_num = m.max(n);
+    let h = num / 2;
+    // Checked-in tinygrad reaches `split(0)` during each of the four Jacobi
+    // rounds for a one-column core. That split returns one empty section, so
+    // the source tuple destructure fails. Preserve the observable rejection,
+    // but report it before RustGrad publishes any of the preceding QR graph.
+    if num == 1 {
+        return Err(Error::InvalidSplit {
+            reason: "source svd split(0) produces one Jacobi section",
+        });
+    }
+    let rounds = num
+        .checked_mul(4)
+        .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+    let _ = h
+        .checked_mul(2)
+        .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+    i64::try_from(num).map_err(|_| Error::ShapeOverflow(input_shape.clone()))?;
+    i64::try_from(h).map_err(|_| Error::ShapeOverflow(input_shape.clone()))?;
+
+    let mut singular_dims = batch.clone();
+    singular_dims.push(num);
+    let singular_shape = Shape::new(singular_dims);
+    checked_extent(&singular_shape, dtype)?;
+
+    let mut left_dims = batch.clone();
+    left_dims.extend(if full_matrices { [m, m] } else { [m, num] });
+    let left_shape = Shape::new(left_dims);
+    checked_extent(&left_shape, dtype)?;
+
+    let mut right_dims = batch.clone();
+    right_dims.extend(if full_matrices { [n, n] } else { [num, n] });
+    let right_shape = Shape::new(right_dims);
+    checked_extent(&right_shape, dtype)?;
+
+    for extent in [num, q_num] {
+        checked_extent(&Shape::new([extent, extent]), dtype)?;
+        let mut square = batch.clone();
+        square.extend([extent, extent]);
+        checked_extent(&Shape::new(square), dtype)?;
+    }
+
+    Ok(SvdPlan {
+        input_shape,
+        batch,
+        dtype,
+        m,
+        n,
+        num,
+        q_num,
+        h,
+        rounds,
+        transpose_input: m < n,
+        full_matrices,
+        singular_shape,
+        left_shape,
+        right_shape,
+    })
+}
+
+fn svd_jacobi_round(
+    graph: &mut Graph,
+    plan: &SvdPlan,
+    state: SvdJacobiState,
+    columns: NodeId,
+    eye: NodeId,
+) -> Result<SvdJacobiState> {
+    let columns = graph.unsqueeze(columns, 1)?;
+    let round_permutation = graph.unsqueeze(state.permutation, 0)?;
+    let selectors = graph.eq(columns, round_permutation)?;
+    let u_dtype = graph.dtype(state.u)?;
+    let selectors = graph.cast(selectors, u_dtype)?;
+    let selector_shape = graph.shape(selectors)?.clone();
+    let last = selector_shape.rank() - 1;
+    let two_h = plan
+        .h
+        .checked_mul(2)
+        .ok_or_else(|| Error::ShapeOverflow(plan.input_shape.clone()))?;
+    let pair_bounds = selector_shape
+        .dims()
+        .iter()
+        .enumerate()
+        .map(|(axis, &extent)| {
+            if axis == last {
+                (0, two_h)
+            } else {
+                (0, extent)
+            }
+        })
+        .collect::<Vec<_>>();
+    let pair_selectors = graph.shrink(selectors, pair_bounds)?;
+
+    let u_pair = graph.dot_default(state.u, pair_selectors)?;
+    let mut u_halves = graph.split(u_pair, plan.h, -1)?;
+    if u_halves.len() != 2 {
+        return Err(Error::InvalidSplit {
+            reason: "svd Jacobi column split must produce two sections",
+        });
+    }
+    let u_right = u_halves.pop().expect("two SVD halves preflighted");
+    let u_left = u_halves.pop().expect("two SVD halves preflighted");
+    let gamma_product = graph.mul(u_left, u_right)?;
+    let gamma = graph.sum_with_options(gamma_product, Some(vec![-2]), false, None)?;
+    let mut gamma_shape = plan.batch.clone();
+    gamma_shape.extend([1, plan.h]);
+    let gamma = graph.reshape(gamma, Shape::new(gamma_shape))?;
+
+    let u_pair_squared = graph.square(u_pair)?;
+    let norms = graph.sum_with_options(u_pair_squared, Some(vec![-2]), false, None)?;
+    let norms = graph.unsqueeze(norms, -2)?;
+    let mut norm_halves = graph.split(norms, plan.h, -1)?;
+    if norm_halves.len() != 2 {
+        return Err(Error::InvalidSplit {
+            reason: "svd Jacobi norm split must produce two sections",
+        });
+    }
+    let beta = norm_halves.pop().expect("two SVD norm halves preflighted");
+    let alpha = norm_halves.pop().expect("two SVD norm halves preflighted");
+    let rotate = graph.ne_scalar(gamma, Scalar::I(0))?;
+    let safe_gamma = graph.where_false_scalar(rotate, gamma, Scalar::I(1))?;
+    let twice_gamma = graph.mul_scalar(safe_gamma, Scalar::I(2))?;
+    let beta_minus_alpha = graph.sub(beta, alpha)?;
+    let tau = graph.div(beta_minus_alpha, twice_gamma)?;
+    let tau_nonzero = graph.ne_scalar(tau, Scalar::I(0))?;
+    let tau_sign = graph.sign(tau)?;
+    let numerator = graph.where_false_scalar(tau_nonzero, tau_sign, Scalar::I(1))?;
+    let tau_squared = graph.square(tau)?;
+    let root = graph.add_scalar(tau_squared, Scalar::I(1))?;
+    let root = graph.sqrt(root)?;
+    let tau_abs = graph.abs(tau)?;
+    let denominator = graph.add(tau_abs, root)?;
+    let tangent = graph.div(numerator, denominator)?;
+    let tangent = graph.where_false_scalar(rotate, tangent, Scalar::I(0))?;
+    let tangent_squared = graph.square(tangent)?;
+    let cosine = graph.add_scalar(tangent_squared, Scalar::I(1))?;
+    let cosine = graph.sqrt(cosine)?;
+    let cosine = graph.reciprocal(cosine)?;
+    let sine = graph.mul(cosine, tangent)?;
+
+    let pair_selectors_t = graph.transpose(pair_selectors, -2, -1)?;
+    let mut selector_halves = graph.split(pair_selectors_t, plan.h, -2)?;
+    if selector_halves.len() != 2 {
+        return Err(Error::InvalidSplit {
+            reason: "svd Jacobi selector split must produce two sections",
+        });
+    }
+    let right_selector = selector_halves
+        .pop()
+        .expect("two SVD selector halves preflighted");
+    let left_selector = selector_halves
+        .pop()
+        .expect("two SVD selector halves preflighted");
+    let left_column = graph.unsqueeze(left_selector, -1)?;
+    let left_row = graph.unsqueeze(left_selector, -2)?;
+    let right_column = graph.unsqueeze(right_selector, -1)?;
+    let right_row = graph.unsqueeze(right_selector, -2)?;
+    let left_diagonal = graph.mul(left_column, left_row)?;
+    let right_diagonal = graph.mul(right_column, right_row)?;
+    let diagonal = graph.add(left_diagonal, right_diagonal)?;
+    let left_right = graph.mul(left_column, right_row)?;
+    let right_left = graph.mul(right_column, left_row)?;
+    let cross = graph.sub(left_right, right_left)?;
+
+    let cosine_delta = graph.sub_scalar(cosine, Scalar::I(1))?;
+    let mut coefficient_shape = plan.batch.clone();
+    coefficient_shape.extend([plan.h, 1, 1]);
+    let coefficient_shape = Shape::new(coefficient_shape);
+    let cosine_delta = graph.reshape(cosine_delta, coefficient_shape.clone())?;
+    let sine = graph.reshape(sine, coefficient_shape)?;
+    let diagonal = graph.mul(cosine_delta, diagonal)?;
+    let cross = graph.mul(sine, cross)?;
+    let delta = graph.add(diagonal, cross)?;
+    let delta = graph.sum_with_options(delta, Some(vec![-3]), false, None)?;
+    let rotation = graph.add(eye, delta)?;
+    let u = graph.dot_default(state.u, rotation)?;
+    let v = graph.dot_default(state.v, rotation)?;
+
+    let num_i64 =
+        i64::try_from(plan.num).map_err(|_| Error::ShapeOverflow(plan.input_shape.clone()))?;
+    let permutation = if plan.num % 2 == 1 {
+        let shifted = graph.sub_scalar(state.permutation, Scalar::I(1))?;
+        graph.modulo_scalar(shifted, Scalar::I(num_i64))?
+    } else {
+        let permutation_shape = graph.shape(state.permutation)?.clone();
+        let first = graph.shrink(state.permutation, vec![(0, 1)])?;
+        let rest = graph.shrink(state.permutation, vec![(1, permutation_shape.dims()[0])])?;
+        let rest = graph.sub_scalar(rest, Scalar::I(2))?;
+        let rest = graph.modulo_scalar(rest, Scalar::I(num_i64 - 1))?;
+        let rest = graph.add_scalar(rest, Scalar::I(1))?;
+        graph.cat(first, vec![rest], 0)?
+    };
+    Ok(SvdJacobiState { u, v, permutation })
 }
 
 fn source_dot_plan(
@@ -4414,6 +4664,164 @@ impl Graph {
             &plan.r_shape
         );
         self.lower_qr(input, &plan)
+    }
+
+    fn lower_svd(&mut self, input: NodeId, plan: &SvdPlan) -> Result<(NodeId, NodeId, NodeId)> {
+        let qr_input = if plan.transpose_input {
+            self.transpose(input, -2, -1)?
+        } else {
+            input
+        };
+        let (q, r) = self.qr(qr_input)?;
+
+        let square_bounds = |shape: &Shape, extent: usize| {
+            let rank = shape.rank();
+            shape
+                .dims()
+                .iter()
+                .enumerate()
+                .map(|(axis, &size)| {
+                    if axis + 2 >= rank {
+                        (0, extent)
+                    } else {
+                        (0, size)
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let r_shape = self.shape(r)?.clone();
+        let r_square_bounds = square_bounds(&r_shape, plan.num);
+        let r_square = self.shrink(r, r_square_bounds)?;
+        // Both barriers are source-visible. The scheduler may redirect an
+        // eligible producer into their owned outputs, but may not erase either
+        // Contiguous node identity.
+        let mut u = self.contiguous(r_square)?;
+        let eye = self.eye(plan.num, Some(plan.num), plan.dtype)?;
+        let mut core_dims = plan.batch.clone();
+        core_dims.extend([plan.num, plan.num]);
+        let core_shape = Shape::new(core_dims);
+        let mut v = self.expand(eye, core_shape.clone())?;
+        v = self.contiguous(v)?;
+
+        let h_i64 =
+            i64::try_from(plan.h).map_err(|_| Error::ShapeOverflow(plan.input_shape.clone()))?;
+        let num_i64 =
+            i64::try_from(plan.num).map_err(|_| Error::ShapeOverflow(plan.input_shape.clone()))?;
+        let first = self.lazy_arange_default_int(0, h_i64, 1)?;
+        let second = self.lazy_arange_default_int(h_i64, num_i64, 1)?;
+        let second = self.flip(second, [0])?;
+        let permutation = self.cat(first, vec![second], 0)?;
+        let columns = self.lazy_arange_default_int(0, num_i64, 1)?;
+        let eye_num = self.eye(plan.num, Some(plan.num), plan.dtype)?;
+        let eye_num = self.expand(eye_num, core_shape.clone())?;
+
+        let mut state = SvdJacobiState { u, v, permutation };
+        for _ in 0..plan.rounds {
+            state = svd_jacobi_round(self, plan, state, columns, eye_num)?;
+        }
+        u = state.u;
+        v = state.v;
+
+        let singular = self.square(u)?;
+        let singular = self.sum_with_options(singular, Some(vec![-2]), false, None)?;
+        let singular = self.sqrt(singular)?;
+        let (singular, indices) = self.sort(singular, -1, true)?;
+        let expanded_indices = self.unsqueeze(indices, -2)?;
+        let expanded_indices = self.expand(expanded_indices, core_shape.clone())?;
+        u = self.gather_tinygrad(u, -1, expanded_indices)?;
+        let nonzero = self.ne_scalar(singular, Scalar::I(0))?;
+        let denominator = self.where_false_scalar(nonzero, singular, Scalar::I(1))?;
+        let denominator = self.unsqueeze(denominator, -2)?;
+        u = self.div(u, denominator)?;
+        v = self.gather_tinygrad(v, -1, expanded_indices)?;
+
+        let padding = plan
+            .batch
+            .iter()
+            .map(|_| (0, 0))
+            .chain(std::iter::repeat_n((0, plan.q_num - plan.num), 2))
+            .collect::<Vec<_>>();
+        let u_dtype = self.dtype(u)?;
+        let mut q_shape = plan.batch.clone();
+        q_shape.extend([plan.q_num, plan.q_num]);
+        let q_shape = Shape::new(q_shape);
+        let eye_q = self.eye(plan.q_num, Some(plan.q_num), u_dtype)?;
+        let eye_q = self.expand(eye_q, q_shape)?;
+        let eye_n = self.eye(plan.num, Some(plan.num), u_dtype)?;
+        let eye_n = self.expand(eye_n, core_shape)?;
+        let eye_n = self.pad(eye_n, padding.clone(), Scalar::I(0))?;
+        let u = self.pad(u, padding, Scalar::I(0))?;
+        let u = self.add(u, eye_q)?;
+        let u = self.sub(u, eye_n)?;
+        let mut u = self.dot_default(q, u)?;
+        if !plan.full_matrices {
+            let u_shape = self.shape(u)?.clone();
+            let last = u_shape.rank() - 1;
+            let bounds = u_shape
+                .dims()
+                .iter()
+                .enumerate()
+                .map(|(axis, &extent)| {
+                    if axis == last {
+                        (0, plan.num)
+                    } else {
+                        (0, extent)
+                    }
+                })
+                .collect::<Vec<_>>();
+            u = self.shrink(u, bounds)?;
+        }
+        let v_t = self.transpose(v, -2, -1)?;
+        let outputs = if plan.m >= plan.n {
+            (u, singular, v_t)
+        } else {
+            let u_t = self.transpose(u, -2, -1)?;
+            (v, singular, u_t)
+        };
+        debug_assert_eq!(
+            self.shape(outputs.0).expect("svd preflighted"),
+            &plan.left_shape
+        );
+        debug_assert_eq!(
+            self.shape(outputs.1).expect("svd preflighted"),
+            &plan.singular_shape
+        );
+        debug_assert_eq!(
+            self.shape(outputs.2).expect("svd preflighted"),
+            &plan.right_shape
+        );
+        Ok(outputs)
+    }
+
+    /// Checked-in tinygrad's static Jacobi `Tensor.svd(full_matrices)`.
+    ///
+    /// This is a source-composed graph rather than an opaque SVD
+    /// operation. The returned tuple is `(U, S, Vt)`. Its coupled Sort stage is
+    /// currently CPU-interpreter-only; capture, strict native JIT, and device
+    /// routes retain their existing fail-closed Sort boundary.
+    pub fn svd(&mut self, input: NodeId, full_matrices: bool) -> Result<(NodeId, NodeId, NodeId)> {
+        let plan = svd_plan(self, input, full_matrices)?;
+        let mut staged = self.clone();
+        let staged_outputs = staged.lower_svd(input, &plan)?;
+        for (output, expected) in [
+            (staged_outputs.0, &plan.left_shape),
+            (staged_outputs.1, &plan.singular_shape),
+            (staged_outputs.2, &plan.right_shape),
+        ] {
+            let shape = staged.shape(output)?;
+            let dtype = staged.dtype(output)?;
+            debug_assert_eq!(shape, expected);
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        }
+        self.lower_svd(input, &plan)
+    }
+
+    /// Checked-in tinygrad's default `Tensor.svd()` form (`full_matrices=true`).
+    pub fn svd_default(&mut self, input: NodeId) -> Result<(NodeId, NodeId, NodeId)> {
+        self.svd(input, true)
     }
 
     fn lower_newton_schulz(
