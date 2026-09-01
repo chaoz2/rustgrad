@@ -316,6 +316,8 @@ mod sort_tests;
 #[cfg(test)]
 mod special_functions_tests;
 #[cfg(test)]
+mod svd_tests;
+#[cfg(test)]
 mod symbolic_tests;
 #[cfg(test)]
 mod topk_tests;
