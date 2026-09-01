@@ -1,6 +1,8 @@
 use super::Backend;
 use crate::engine::dynamic::RuntimeMaterializationMap;
-use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
+use crate::engine::{
+    DynamicGradient, DynamicRealized, RealizationError, RealizationPolicy, Realized, RuntimeShape,
+};
 use crate::index::DenseIndex;
 use crate::ir::{
     DynamicInput, DynamicMeanVjpRule, DynamicNodeId, DynamicOperation, DynamicVjpPlan,
@@ -18,6 +20,23 @@ use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuBackend;
+
+impl CpuBackend {
+    /// Plans and executes one ordered set of graph outputs as a shared CPU
+    /// transaction. Shared producers are scheduled once; returned values retain
+    /// request order and duplicate output IDs without duplicating execution.
+    ///
+    /// This is intentionally separate from [`Backend::execute`], whose
+    /// recursive single-output oracle remains backward compatible.
+    pub fn execute_many(
+        &self,
+        graph: &Graph,
+        outputs: &[NodeId],
+        inputs: &HashMap<String, TensorData>,
+    ) -> std::result::Result<Realized, RealizationError> {
+        crate::engine::realize_graph(graph, outputs, inputs, RealizationPolicy::Interpreter)
+    }
+}
 
 fn random(
     shape: Shape,

@@ -93,6 +93,10 @@ pub enum Error {
     SessionTraining {
         reason: String,
     },
+    /// One checked graph-owned CPU session realization transaction failed.
+    SessionRealization {
+        reason: String,
+    },
     InvalidLogicalDType {
         op: &'static str,
         actual: DType,
@@ -404,6 +408,9 @@ impl fmt::Display for Error {
                 write!(f, "CPU tensor session does not support device {device}")
             }
             Self::SessionTraining { reason } => write!(f, "CPU module training error: {reason}"),
+            Self::SessionRealization { reason } => {
+                write!(f, "CPU session realization error: {reason}")
+            }
             Self::InvalidLogicalDType { op, actual } => {
                 write!(f, "{op} requires bool tensors, got {actual:?}")
             }
