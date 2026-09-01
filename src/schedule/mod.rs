@@ -1364,28 +1364,25 @@ fn schedule_many_with_external(
             )
         })
         .collect::<BTreeSet<_>>();
-    // Materializing movement kernels consume dense direct operands. Any
-    // computed operand, including a source-backed view, therefore becomes its
-    // own producer item instead of being silently replaced by its leaves.
-    let movement_operands = needed
-        .iter()
-        .flat_map(|index| {
-            let id = NodeId::from_index(*index);
-            match graph.op(id) {
-                Ok(
-                    Op::Bitcast { input, .. } | Op::Contiguous { input } | Op::Pad { input, .. },
-                ) => vec![input.index()],
-                Ok(Op::Concat { inputs, .. }) => inputs.iter().map(|input| input.index()).collect(),
-                Ok(Op::Gather { input, index, .. }) => vec![input.index(), index.index()],
-                Ok(Op::Scatter {
-                    base,
-                    index,
-                    updates,
-                    ..
-                }) => vec![base.index(), index.index(), updates.index()],
-                _ => vec![],
-            }
-        })
+    // Materializing movement kernels name their exact pointer ABI. In
+    // particular, a contiguous boundary over an affine view consumes the
+    // rangeified storage source rather than first materializing the view.
+    let mut movement_operands = BTreeSet::new();
+    for index in &needed {
+        let id = NodeId::from_index(*index);
+        let plan = match crate::MovementKernelPlan::from_scheduled_graph(graph, id) {
+            Ok(plan) => plan,
+            Err(crate::MovementPlanError::NotMovement) => continue,
+            Err(error) => return Err(ScheduleError::Binding(error.to_string())),
+        };
+        movement_operands.extend(
+            plan.input_operands()
+                .into_iter()
+                .map(|input| input.node.index()),
+        );
+    }
+    let movement_operands = movement_operands
+        .into_iter()
         .filter(|index| {
             !matches!(
                 graph.op(NodeId::from_index(*index)),
