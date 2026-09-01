@@ -17,6 +17,7 @@ use std::{
 
 pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v6";
 pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
+pub const METAL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-metal-static-position-v1";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -118,6 +119,14 @@ impl MetalRenderer {
     pub fn render(&self, root: &UOp) -> Result<RenderedMetal, MetalError> {
         if let Operation::Movement(value) = root.operation() {
             return match value {
+                MovementValue::Plan(plan)
+                    if matches!(
+                        &plan.kind,
+                        crate::MovementKernelKind::ScatterPositions { .. }
+                    ) =>
+                {
+                    render_static_positions(self, root, plan)
+                }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
                 MovementValue::QuantizedRowGather(_) => Err(MetalError::Unsupported(
                     "quantized movement is outside Metal contiguous-copy lowering".into(),
@@ -504,6 +513,137 @@ fn render_raw_copy(
         renderer.local_size,
         &renderer.capabilities,
         copy.plan(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        schedule_inputs: vec![input_abi],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+fn render_static_positions(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let placement = plan
+        .static_position_write()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| MetalError::InvalidBinding("missing static-position projection".into()))?;
+    let input = placement.input();
+    let extent = placement.elements();
+    if extent > u32::MAX as usize {
+        return Err(MetalError::Unsupported(
+            "static-position Metal extent exceeds u32 thread indexing".into(),
+        ));
+    }
+    let width = placement.width();
+    let raw_type = match width {
+        1 => "uchar",
+        2 => "ushort",
+        4 => "uint",
+        8 => "ulong",
+        _ => {
+            return Err(MetalError::Unsupported(format!(
+                "static-position Metal storage width {width}"
+            )));
+        }
+    };
+    debug_assert_eq!(placement.bytes(), extent * width);
+    let input_abi = MetalBufferAbi {
+        id: input.node.index() as u64,
+        dtype: input.dtype,
+        source_shape: input.shape.clone(),
+        elements: placement.input_elements(),
+        mutable: false,
+        view: None,
+    };
+    let output_abi = MetalBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: extent,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input_abi.clone(), output_abi];
+    let entry = format!("rg_metal_static_position_w{width}");
+    let mut lines = vec![
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        format!("// {METAL_STATIC_POSITION_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        format!("kernel void {entry}("),
+        format!("    device const {raw_type}* b0 [[buffer(0)]],"),
+        format!("    device {raw_type}* b1 [[buffer(1)]],"),
+        "    constant ulong& extent [[buffer(2)]],".into(),
+        "    uint gid32 [[thread_position_in_grid]]) {".into(),
+        "  ulong gid = (ulong)gid32;".into(),
+        "  if (gid >= extent) return;".into(),
+        "  bool rg_mapped = false;".into(),
+        "  ulong rg_source = 0ul;".into(),
+    ];
+    if placement.has_source() {
+        lines.push("  rg_mapped = true;".into());
+        for axis in placement.axes() {
+            let name = axis.output_axis;
+            lines.push(format!(
+                "  ulong rg_coordinate_{name} = (gid / (ulong){}ul) % (ulong){}ul;",
+                axis.output_divisor, axis.output_dimension
+            ));
+            lines.push(format!(
+                "  ulong rg_delta_{name} = rg_coordinate_{name} >= (ulong){}ul ? rg_coordinate_{name} - (ulong){}ul : 0ul;",
+                axis.first, axis.first
+            ));
+            lines.push(format!(
+                "  ulong rg_quotient_{name} = rg_delta_{name} / (ulong){}ul;",
+                axis.spacing
+            ));
+            lines.push(format!(
+                "  if (rg_coordinate_{name} < (ulong){}ul || rg_delta_{name} % (ulong){}ul != 0ul || rg_quotient_{name} >= (ulong){}ul) rg_mapped = false;",
+                axis.first, axis.spacing, axis.source_dimension
+            ));
+            lines.push(format!(
+                "  ulong rg_source_axis_{name} = rg_quotient_{name} < (ulong){}ul ? {} : 0ul;",
+                axis.source_dimension,
+                if axis.reversed {
+                    format!(
+                        "(ulong){}ul - rg_quotient_{name}",
+                        axis.source_dimension - 1
+                    )
+                } else {
+                    format!("rg_quotient_{name}")
+                }
+            ));
+            lines.push(format!(
+                "  rg_source += rg_source_axis_{name} * (ulong){}ul;",
+                axis.source_stride
+            ));
+        }
+    }
+    lines.push(format!("  {raw_type} rg_value = ({raw_type})0;"));
+    lines.push("  if (rg_mapped) rg_value = b0[rg_source];".into());
+    lines.push("  b1[gid] = rg_value;".into());
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_STATIC_POSITION_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        placement.plan(),
         &source,
         &buffers,
     ));

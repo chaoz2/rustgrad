@@ -342,6 +342,38 @@ fn source_svd_realizes_well_conditioned_vjp_and_matches_finite_difference() {
         scatter_item.input_bindings[0].desc.id,
         input.node.index() as u64
     );
+    crate::PtxRenderer::new(80)
+        .unwrap()
+        .render(&scatter_item.kernel)
+        .unwrap();
+    crate::runtime::opencl::OpenClRenderer::default()
+        .render(&scatter_item.kernel)
+        .unwrap();
+    crate::runtime::metal::MetalRenderer::new(
+        8,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: 1 << 20,
+            unified_memory: true,
+            family: "MockApple9".into(),
+        },
+    )
+    .unwrap()
+    .render(&scatter_item.kernel)
+    .unwrap();
+    crate::runtime::webgpu::WgslRenderer::new(
+        8,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: 1 << 20,
+            max_storage_buffers_per_shader_stage: 8,
+            max_compute_workgroup_size_x: 256,
+            max_compute_workgroups_per_dimension: 65_535,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap()
+    .render(&scatter_item.kernel)
+    .unwrap();
     let producer = schedule
         .items
         .iter()

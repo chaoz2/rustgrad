@@ -1,4 +1,4 @@
-use super::renderer::METAL_RAW_COPY_RENDERER_VERSION;
+use super::renderer::{METAL_RAW_COPY_RENDERER_VERSION, METAL_STATIC_POSITION_RENDERER_VERSION};
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;
@@ -1251,6 +1251,47 @@ fn raw_movement_copy_metal_executes_affine_and_dense_storage_contracts() {
     assert_eq!(rendered.buffers[0].elements, 2);
     assert_eq!(rendered.buffers[1].elements, 6);
     assert!(rendered.source.contains("b1[gid] = b0[rg_source]"));
+}
+
+#[test]
+fn static_positions_metal_zeroes_holes_and_preserves_raw_payloads() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let output = graph
+        .scatter_positions(input, Shape::from([5]), vec![4], vec![-2])
+        .unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = MetalRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(METAL_STATIC_POSITION_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("rg_delta_0 % (ulong)2ul"));
+    assert!(rendered.source.contains("rg_mapped = false"));
+    assert_eq!(rendered.buffers[0].elements, 2);
+    assert_eq!(rendered.buffers[1].elements, 5);
+    let raw = [0x7fc1_2345_u32, 0x8000_0000];
+    let value = TensorData::from_storage(
+        [2],
+        Storage::F32(raw.into_iter().map(f32::from_bits).collect()),
+    )
+    .unwrap();
+    let (actual, calls) = execute_mock(&graph, output, &HashMap::from([("input".into(), value)]));
+    assert_eq!(
+        actual.to_le_bytes().unwrap(),
+        [0, 0, raw[1], 0, raw[0]]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+    assert!(calls.calls().iter().any(|call| call.starts_with("launch:")));
 }
 
 #[test]

@@ -1567,16 +1567,22 @@ fail-closed or unclaimed.
 `ScatterPositions` graph adjoint and its `ScatterPositionsVjp` reverse read. It
 validates rank, checked byte geometry, nonzero steps and both endpoints in
 O(rank), while admitting a normalized `-1` start on an empty reverse domain.
-Forward execution allocates a fresh dense output, zeroes its raw bytes, and
+Forward CPU execution allocates a fresh dense output, zeroes its raw bytes, and
 places each source lane exactly once; the VJP lowers to the existing
-`AffineCopy` plan. Scheduling, captured interpreter replay, and strict C11
-native execution use a distinct static-position-v1 renderer identity, preserve
-every concrete storage width, and keep computed and
-external inputs as read-only nonaliasing operands. Forward PTX, OpenCL, Metal,
-WebGPU, CUDA, and symbolic specialization reject before backend allocation or
-cache publication. Adding `ScatterPositions` to the otherwise established
-public `MovementKernelKind` is an intentional 0.1 exhaustive-match source API
-change; no second operation taxonomy or backend trait is introduced.
+`AffineCopy` plan. One checked `StaticPositionWrite` projects the same proof
+into an unsigned output-to-input inverse map. PTX, OpenCL C, MSL, and WGSL use
+that projection for one output-driven kernel in which every lane writes either
+the exact raw source payload or raw zero, avoiding a second memset kernel and
+write races. Their operation-specific static-position-v1 renderer identities
+preserve RGUA v20 and historical movement/cache identities. Scheduling,
+captured interpreter replay, strict C11 native execution, and fixed-schema
+prepared accelerator execution keep computed and external inputs as read-only
+nonaliasing operands across every concrete storage width. Symbolic
+specialization and unproven live-device configurations still reject before
+backend allocation or cache publication. Adding `ScatterPositions` to the
+otherwise established public `MovementKernelKind` is an intentional 0.1
+exhaustive-match source API change; no second operation taxonomy or backend
+trait is introduced.
 The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
 preflight/plan/execute path rather than adding a profiler or executor. Its
 immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`

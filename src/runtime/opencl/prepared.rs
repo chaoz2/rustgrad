@@ -295,6 +295,88 @@ mod tests {
     }
 
     #[test]
+    fn retained_static_position_chain_stays_device_resident() {
+        let mock = Arc::new(super::super::tests::MockDispatch::default());
+        let (context, _) = super::super::tests::setup(mock.clone());
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let placed = graph
+            .scatter_positions(producer, Shape::from([5]), vec![4], vec![-2])
+            .unwrap();
+        let output = graph.square(placed).unwrap();
+        let schedule = schedule(&graph, output).unwrap();
+        assert_eq!(schedule.items.len(), 3);
+        let plan = OpenClPrefixPlan::plan_for_outputs(
+            context.clone(),
+            &schedule.items,
+            &[output.index() as u64],
+            OpenClRenderer::default(),
+        )
+        .unwrap();
+        let prefix = PreparedOpenClPrefix::from_plan(context, plan).unwrap();
+        let before = mock.calls();
+        let mut values = BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage(Shape::from([2]), Storage::F32(vec![2.0, -3.0])).unwrap(),
+        )]);
+        prefix.execute(&mut values).unwrap();
+        let calls = &mock.calls()[before.len()..];
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("write:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("read:"))
+                .count(),
+            1
+        );
+        assert!(!values.contains_key(&(producer.index() as u64)));
+        assert!(!values.contains_key(&(placed.index() as u64)));
+        assert_eq!(
+            values[&(output.index() as u64)].storage(),
+            &Storage::F32(vec![0.0, 0.0, 81.0, 0.0, 16.0])
+        );
+    }
+
+    #[test]
+    fn unsupported_static_position_preflights_before_opencl_resource_work() {
+        let mock = Arc::new(super::super::tests::MockDispatch::default());
+        let (context, _) = super::super::tests::setup(mock.clone());
+        let owner = context.owner_id();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [1], DType::U64);
+        let output = graph
+            .scatter_positions(input, Shape::from([2]), vec![1], vec![1])
+            .unwrap();
+        let items = schedule(&graph, output).unwrap().items;
+        let before = mock.calls();
+        assert!(matches!(
+            PreparedOpenClPrefix::prepare(context, &items, OpenClRenderer::default()),
+            Err(OpenClError::Unsupported(reason)) if reason.contains("64-bit integer")
+        ));
+        let calls = mock.calls();
+        assert_eq!(
+            &calls[before.len()..],
+            &[format!("context_release:{owner}")]
+        );
+        let queue_release = calls
+            .iter()
+            .position(|call| call == &format!("queue_release:{owner}"))
+            .unwrap();
+        let context_release = calls
+            .iter()
+            .position(|call| call == &format!("context_release:{owner}"))
+            .unwrap();
+        assert!(queue_release < context_release);
+    }
+
+    #[test]
     fn zero_domain_preparation_preserves_cache_and_empty_reduction_abi() {
         let mock = Arc::new(super::super::tests::MockDispatch::default());
         let (context, _) = super::super::tests::setup(mock.clone());
