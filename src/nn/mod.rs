@@ -37,7 +37,7 @@ pub use pool::{
     AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool1d,
     AvgPool2d, MaxPool1d, MaxPool2d,
 };
-pub use recurrent::LSTMCell;
+pub use recurrent::{LSTM, LSTMCell, LSTMOutput, LSTMState};
 pub use regularization::{Dropout, ModeDropout};
 pub use sequential::{ModeSequential, Sequential};
 pub use shape::Flatten;

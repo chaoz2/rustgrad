@@ -6,7 +6,12 @@ use super::{
 };
 use crate::{Error, Graph, NodeId, Result, TensorData};
 
-fn apply_dropout(graph: &mut Graph, input: NodeId, probability: f64, seed: u64) -> Result<NodeId> {
+pub(super) fn apply_dropout(
+    graph: &mut Graph,
+    input: NodeId,
+    probability: f64,
+    seed: u64,
+) -> Result<NodeId> {
     if probability == 0.0 {
         return Ok(input);
     }
@@ -22,23 +27,23 @@ fn apply_dropout(graph: &mut Graph, input: NodeId, probability: f64, seed: u64) 
     graph.mul(kept, scale)
 }
 
+pub(super) fn validate_dropout_probability(probability: f64) -> Result<()> {
+    if !(0.0..=1.0).contains(&probability) {
+        return Err(Error::UnsupportedDropout {
+            probability_bits: probability.to_bits(),
+        });
+    }
+    Ok(())
+}
+
 pub struct Dropout {
     pub probability: f64,
     pub training: bool,
     pub seed: u64,
 }
 impl Dropout {
-    fn validate_probability(probability: f64) -> Result<()> {
-        if !(0.0..=1.0).contains(&probability) {
-            return Err(Error::UnsupportedDropout {
-                probability_bits: probability.to_bits(),
-            });
-        }
-        Ok(())
-    }
-
     pub fn new(probability: f64, training: bool, seed: u64) -> Result<Self> {
-        Self::validate_probability(probability)?;
+        validate_dropout_probability(probability)?;
         Ok(Self {
             probability,
             training,
@@ -46,7 +51,7 @@ impl Dropout {
         })
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
-        Self::validate_probability(self.probability)?;
+        validate_dropout_probability(self.probability)?;
         if !self.training || self.probability == 0.0 {
             return Ok(input);
         }
@@ -75,11 +80,7 @@ pub struct ModeDropout {
 
 impl ModeDropout {
     pub fn new(probability: f64, seed: u64) -> Result<Self> {
-        if !(0.0..=1.0).contains(&probability) {
-            return Err(Error::UnsupportedDropout {
-                probability_bits: probability.to_bits(),
-            });
-        }
+        validate_dropout_probability(probability)?;
         Ok(Self { probability, seed })
     }
 
