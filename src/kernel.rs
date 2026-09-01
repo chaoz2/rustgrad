@@ -408,6 +408,15 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
     output: NodeId,
     materialized: &std::collections::BTreeSet<usize>,
 ) -> std::result::Result<UOp, UOpError> {
+    lower_graph_elementwise_with_substitutions(graph, output, materialized, &HashMap::new())
+}
+
+fn lower_graph_elementwise_with_substitutions(
+    graph: &Graph,
+    output: NodeId,
+    materialized: &std::collections::BTreeSet<usize>,
+    substitutions: &HashMap<NodeId, UOp>,
+) -> std::result::Result<UOp, UOpError> {
     let output_shape = graph
         .shape(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?
@@ -476,12 +485,15 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
         range: &UOp,
         memo: &mut HashMap<NodeId, UOp>,
         materialized: &std::collections::BTreeSet<usize>,
+        substitutions: &HashMap<NodeId, UOp>,
     ) -> std::result::Result<UOp, UOpError> {
         if let Some(v) = memo.get(&id) {
             return Ok(v.clone());
         }
         let ty = UType::scalar(graph.dtype(id).map_err(|_| UOpError::UseBeforeDefinition)?);
-        let x = if materialized.contains(&id.index()) {
+        let x = if let Some(value) = substitutions.get(&id) {
+            value.clone()
+        } else if materialized.contains(&id.index()) {
             load(graph, id, out, range, None)?
         } else {
             match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
@@ -508,9 +520,10 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                         .map_err(|_| UOpError::InvalidArgument)?;
                     load(graph, planned.source, out, range, Some(planned.view))?
                 }
-                Op::Cast { input, .. } => {
-                    UOp::cast(lower(graph, *input, out, range, memo, materialized)?, ty)
-                }
+                Op::Cast { input, .. } => UOp::cast(
+                    lower(graph, *input, out, range, memo, materialized, substitutions)?,
+                    ty,
+                ),
                 // Graph bitcasts are materializing raw-byte movement roots.
                 // A nested instance must have been scheduled already rather
                 // than silently lowered as a numeric scalar cast.
@@ -518,37 +531,63 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                     return Err(UOpError::InvalidArgument);
                 }
                 Op::ContiguousBackward { input } => {
-                    lower(graph, *input, out, range, memo, materialized)?
+                    lower(graph, *input, out, range, memo, materialized, substitutions)?
                 }
                 // Detach is an autograd boundary, not a runtime value
                 // transformation. Native lowering keeps the same typed value
                 // while Graph reverse-mode traversal owns the gradient stop.
-                Op::Detach { input } => lower(graph, *input, out, range, memo, materialized)?,
+                Op::Detach { input } => {
+                    lower(graph, *input, out, range, memo, materialized, substitutions)?
+                }
                 Op::Unary { op, input } => UOp::from_operation(
                     Operation::GraphUnary(*op),
                     Some(ty),
-                    vec![lower(graph, *input, out, range, memo, materialized)?],
+                    vec![lower(
+                        graph,
+                        *input,
+                        out,
+                        range,
+                        memo,
+                        materialized,
+                        substitutions,
+                    )?],
                 ),
                 Op::Binary { op, lhs, rhs } => UOp::from_operation(
                     Operation::GraphBinary(*op),
                     Some(ty),
                     vec![
-                        lower(graph, *lhs, out, range, memo, materialized)?,
-                        lower(graph, *rhs, out, range, memo, materialized)?,
+                        lower(graph, *lhs, out, range, memo, materialized, substitutions)?,
+                        lower(graph, *rhs, out, range, memo, materialized, substitutions)?,
                     ],
                 ),
                 Op::Compare { op, lhs, rhs } => UOp::from_operation(
                     Operation::GraphCompare(*op),
                     Some(ty),
                     vec![
-                        lower(graph, *lhs, out, range, memo, materialized)?,
-                        lower(graph, *rhs, out, range, memo, materialized)?,
+                        lower(graph, *lhs, out, range, memo, materialized, substitutions)?,
+                        lower(graph, *rhs, out, range, memo, materialized, substitutions)?,
                     ],
                 ),
                 Op::Logical { op, lhs, rhs } => {
-                    let mut s = vec![lower(graph, *lhs, out, range, memo, materialized)?];
+                    let mut s = vec![lower(
+                        graph,
+                        *lhs,
+                        out,
+                        range,
+                        memo,
+                        materialized,
+                        substitutions,
+                    )?];
                     if let Some(rhs) = rhs {
-                        s.push(lower(graph, *rhs, out, range, memo, materialized)?);
+                        s.push(lower(
+                            graph,
+                            *rhs,
+                            out,
+                            range,
+                            memo,
+                            materialized,
+                            substitutions,
+                        )?);
                     }
                     UOp::from_operation(Operation::GraphLogical(*op), Some(ty), s)
                 }
@@ -560,9 +599,33 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                     Operation::Ternary(crate::uop::Ternary::Where),
                     Some(ty),
                     vec![
-                        lower(graph, *condition, out, range, memo, materialized)?,
-                        lower(graph, *on_true, out, range, memo, materialized)?,
-                        lower(graph, *on_false, out, range, memo, materialized)?,
+                        lower(
+                            graph,
+                            *condition,
+                            out,
+                            range,
+                            memo,
+                            materialized,
+                            substitutions,
+                        )?,
+                        lower(
+                            graph,
+                            *on_true,
+                            out,
+                            range,
+                            memo,
+                            materialized,
+                            substitutions,
+                        )?,
+                        lower(
+                            graph,
+                            *on_false,
+                            out,
+                            range,
+                            memo,
+                            materialized,
+                            substitutions,
+                        )?,
                     ],
                 ),
                 _ => return Err(UOpError::InvalidArgument),
@@ -578,6 +641,7 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
         &range,
         &mut HashMap::new(),
         materialized,
+        substitutions,
     )?;
     let address = UOp::from_operation(
         Operation::DefineGlobal(AddressValue {
@@ -603,6 +667,252 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
         store,
         UOp::from_operation(Operation::EndRange, None, vec![range]),
     ]))
+}
+
+fn scalar_reduction_epilogue_children(op: &Op, dtype: DType) -> Option<Vec<NodeId>> {
+    Some(match op {
+        Op::Input { .. } | Op::Constant(_) => Vec::new(),
+        Op::Cast { input, .. } | Op::Detach { input } | Op::Unary { input, .. } => vec![*input],
+        Op::Binary {
+            op:
+                crate::BinaryOp::Add
+                | crate::BinaryOp::Sub
+                | crate::BinaryOp::Mul
+                | crate::BinaryOp::BitAnd
+                | crate::BinaryOp::BitOr
+                | crate::BinaryOp::BitXor
+                | crate::BinaryOp::Maximum
+                | crate::BinaryOp::Minimum,
+            lhs,
+            rhs,
+        } => vec![*lhs, *rhs],
+        Op::Binary {
+            op: crate::BinaryOp::Div,
+            lhs,
+            rhs,
+        } if dtype.is_float() => vec![*lhs, *rhs],
+        Op::Compare { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Op::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
+        Op::Select {
+            condition,
+            on_true,
+            on_false,
+        } => vec![*condition, *on_true, *on_false],
+        _ => return None,
+    })
+}
+
+/// Returns the sole shape-preserving reduction beneath a pure scalar
+/// epilogue. The result is only a graph eligibility proof; the UOp validator
+/// remains authoritative for the exact typed recurrence and scalar DAG.
+pub(crate) fn single_reduction_epilogue(
+    graph: &Graph,
+    output: NodeId,
+) -> std::result::Result<Option<NodeId>, UOpError> {
+    let output_shape = graph
+        .shape(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?;
+    let mut reductions = std::collections::BTreeSet::new();
+    fn visit(
+        graph: &Graph,
+        node: NodeId,
+        output: NodeId,
+        output_shape: &Shape,
+        reductions: &mut std::collections::BTreeSet<NodeId>,
+        seen: &mut std::collections::BTreeSet<NodeId>,
+    ) -> std::result::Result<bool, UOpError> {
+        if !seen.insert(node) {
+            return Ok(true);
+        }
+        let op = graph.op(node).map_err(|_| UOpError::UseBeforeDefinition)?;
+        let dtype = graph
+            .dtype(node)
+            .map_err(|_| UOpError::UseBeforeDefinition)?;
+        if matches!(op, Op::Reduce { .. }) {
+            if graph
+                .shape(node)
+                .map_err(|_| UOpError::UseBeforeDefinition)?
+                != output_shape
+            {
+                return Ok(false);
+            }
+            reductions.insert(node);
+            return Ok(true);
+        }
+        if node != output && !matches!(op, Op::Input { .. } | Op::Constant(_)) {
+            let shape = graph
+                .shape(node)
+                .map_err(|_| UOpError::UseBeforeDefinition)?;
+            if !matches!(shape.broadcast_with(output_shape), Ok(broadcast) if &broadcast == output_shape)
+            {
+                return Ok(false);
+            }
+        }
+        let Some(children) = scalar_reduction_epilogue_children(op, dtype) else {
+            return Ok(false);
+        };
+        for child in children {
+            if !visit(graph, child, output, output_shape, reductions, seen)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    if !visit(
+        graph,
+        output,
+        output,
+        output_shape,
+        &mut reductions,
+        &mut std::collections::BTreeSet::new(),
+    )? || reductions.len() != 1
+    {
+        return Ok(None);
+    }
+    let reduction = *reductions.first().ok_or(UOpError::InvalidArgument)?;
+    if matches!(graph.dtype(reduction), Ok(DType::F16 | DType::BF16)) {
+        // PTX's narrow-storage scalar modes prove one public scalar operation
+        // around a committed lane. Keep a materialization boundary when the
+        // reducer is nested under a second arithmetic result: otherwise the
+        // scoped emitter could widen two storage operations and round only at
+        // the final Store. Predicate/select shells may reference the reducer
+        // repeatedly but still commit one public operation.
+        let root = graph
+            .op(output)
+            .map_err(|_| UOpError::UseBeforeDefinition)?;
+        let is_leaf = |node: NodeId| {
+            node == reduction || matches!(graph.op(node), Ok(Op::Input { .. } | Op::Constant(_)))
+        };
+        let predicate_shell = |node: NodeId| match graph.op(node) {
+            Ok(Op::Compare { lhs, rhs, .. }) => is_leaf(*lhs) && is_leaf(*rhs),
+            Ok(Op::Logical { lhs, rhs, .. }) => {
+                is_leaf(*lhs) && rhs.as_ref().is_none_or(|rhs| is_leaf(*rhs))
+            }
+            _ => is_leaf(node),
+        };
+        let exact_root = match root {
+            Op::Cast { input, .. } | Op::Detach { input } | Op::Unary { input, .. } => {
+                *input == reduction
+            }
+            Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
+                (*lhs == reduction || *rhs == reduction) && is_leaf(*lhs) && is_leaf(*rhs)
+            }
+            Op::Logical { lhs, rhs, .. } => {
+                (*lhs == reduction || rhs.is_some_and(|rhs| rhs == reduction))
+                    && is_leaf(*lhs)
+                    && rhs.as_ref().is_none_or(|rhs| is_leaf(*rhs))
+            }
+            Op::Select {
+                condition,
+                on_true,
+                on_false,
+            } => {
+                predicate_shell(*condition)
+                    && is_leaf(*on_true)
+                    && is_leaf(*on_false)
+                    && [*condition, *on_true, *on_false]
+                        .iter()
+                        .any(|node| {
+                            *node == reduction
+                                || matches!(graph.op(*node), Ok(Op::Compare { lhs, rhs, .. }) if *lhs == reduction || *rhs == reduction)
+                        })
+            }
+            _ => false,
+        };
+        if !exact_root {
+            return Ok(None);
+        }
+    }
+    Ok((reduction != output).then_some(reduction))
+}
+
+/// Counts the exact graph edges from one eligible epilogue DAG to an internal
+/// node. Schedule construction compares this with the whole-graph consumer
+/// count so repeated predicate nodes can remain inline while any use owned by
+/// another root keeps that node materialized.
+pub(crate) fn reduction_epilogue_node_uses(
+    graph: &Graph,
+    output: NodeId,
+    target: NodeId,
+) -> std::result::Result<usize, UOpError> {
+    fn visit(
+        graph: &Graph,
+        node: NodeId,
+        target: NodeId,
+        seen: &mut std::collections::BTreeSet<NodeId>,
+    ) -> std::result::Result<usize, UOpError> {
+        if node == target || !seen.insert(node) {
+            return Ok(0);
+        }
+        let op = graph.op(node).map_err(|_| UOpError::UseBeforeDefinition)?;
+        // The sole reduction is the terminal of an eligible epilogue DAG.
+        // Probing whether another schedule root is nested beneath this
+        // candidate must report no use instead of trying to traverse through
+        // the materialization boundary.
+        if matches!(op, Op::Reduce { .. }) {
+            return Ok(0);
+        }
+        let dtype = graph
+            .dtype(node)
+            .map_err(|_| UOpError::UseBeforeDefinition)?;
+        let children =
+            scalar_reduction_epilogue_children(op, dtype).ok_or(UOpError::InvalidArgument)?;
+        let mut uses = 0usize;
+        for child in children {
+            if child == target {
+                uses = uses.checked_add(1).ok_or(UOpError::InvalidArgument)?;
+            } else {
+                uses = uses
+                    .checked_add(visit(graph, child, target, seen)?)
+                    .ok_or(UOpError::InvalidArgument)?;
+            }
+        }
+        Ok(uses)
+    }
+    if target == output || single_reduction_epilogue(graph, output)?.is_none() {
+        return Err(UOpError::InvalidArgument);
+    }
+    visit(
+        graph,
+        output,
+        target,
+        &mut std::collections::BTreeSet::new(),
+    )
+}
+
+pub(crate) fn lower_graph_reduction_epilogue_with_materialized(
+    graph: &Graph,
+    output: NodeId,
+    reduction: NodeId,
+    materialized: &std::collections::BTreeSet<usize>,
+) -> std::result::Result<UOp, UOpError> {
+    if single_reduction_epilogue(graph, output)? != Some(reduction) {
+        return Err(UOpError::InvalidArgument);
+    }
+    let reduction_kernel = lower_graph_reduction_with_materialized(graph, reduction, materialized)?;
+    let finalize = reduction_kernel
+        .sources()
+        .iter()
+        .find(|source| matches!(source.operation(), Operation::Store))
+        .and_then(|store| store.sources().get(1))
+        .filter(|value| matches!(value.operation(), Operation::ReduceFinalize))
+        .cloned()
+        .ok_or(UOpError::InvalidArgument)?;
+    // The exact reduction topology permits only one ReduceFinalize consumer.
+    // A same-type Cast is the committed scalar binding that an epilogue may
+    // read repeatedly without duplicating the recurrence edge.
+    let committed = UOp::cast(
+        finalize.clone(),
+        finalize.ty().ok_or(UOpError::InvalidArgument)?,
+    );
+    let kernel = lower_graph_elementwise_with_substitutions(
+        graph,
+        output,
+        materialized,
+        &HashMap::from([(reduction, committed)]),
+    )?;
+    kernel.validate()?;
+    Ok(kernel)
 }
 
 /// Lowers a static reduction with a pure elementwise producer.  The accumulator UOps

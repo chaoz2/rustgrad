@@ -5,13 +5,179 @@ use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     AddressSpace, AddressValue, Backend, BinaryOp, BufferRole, CompareOp, CpuBackend, DType, Graph,
     IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, Operation, Scalar, Shape,
-    TensorData, TypedValue, UOp, UType, schedule,
+    Storage, TensorData, TypedValue, UOp, UType, schedule,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     rc::Rc,
     sync::{Arc, Mutex},
 };
+
+#[test]
+fn reduction_epilogue_renders_one_opencl_kernel_with_committed_value() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", Shape::from([2, 3]), DType::F32);
+    let reduced = graph.sum(input, 1).unwrap();
+    let output = graph.relu(reduced).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let rendered = OpenClRenderer::default()
+        .render(&scheduled.items[0].kernel)
+        .unwrap();
+    assert!(
+        rendered
+            .source
+            .contains("for (ulong r = 0ul; r < 3ul; ++r)")
+    );
+    assert!(rendered.source.contains("acc"));
+    assert!(rendered.source.contains("?"));
+    assert!(
+        rendered
+            .buffers
+            .iter()
+            .all(|buffer| buffer.id != reduced.index() as u64)
+    );
+}
+
+#[test]
+fn narrow_reduction_epilogues_commit_storage_before_opencl_scalar_alu() {
+    for (dtype, words, bias, commit) in [
+        (
+            DType::F16,
+            vec![0x6800_u16, 0x3c00],
+            0x6800_u16,
+            "rg_f16_to_f32(rg_f32_to_f16",
+        ),
+        (
+            DType::BF16,
+            vec![0x4380_u16, 0x3f80],
+            0x4380_u16,
+            "rg_bf16_to_f32(rg_f32_to_bf16",
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [1, 2], dtype);
+        let bias_node = graph.input_dtype("bias", [1], dtype);
+        let reduced = graph
+            .reduce_with_dtypes(
+                input,
+                crate::ReduceKind::Sum,
+                Some(vec![1]),
+                false,
+                crate::ReductionDType::new(dtype, dtype),
+            )
+            .unwrap();
+        let output = graph.binary(BinaryOp::Sub, reduced, bias_node).unwrap();
+        let scheduled = schedule(&graph, output).unwrap();
+        assert_eq!(scheduled.items.len(), 1, "{dtype:?}");
+        let renderer = OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL).unwrap();
+        let rendered = renderer.render(&scheduled.items[0].kernel).unwrap();
+        assert!(rendered.source.contains(commit), "{dtype:?}");
+        let input_value = match dtype {
+            DType::F16 => TensorData::from_storage([1, 2], Storage::F16(words)).unwrap(),
+            DType::BF16 => TensorData::from_storage([1, 2], Storage::BF16(words)).unwrap(),
+            _ => unreachable!(),
+        };
+        let bias_value = match dtype {
+            DType::F16 => TensorData::from_storage([1], Storage::F16(vec![bias])).unwrap(),
+            DType::BF16 => TensorData::from_storage([1], Storage::BF16(vec![bias])).unwrap(),
+            _ => unreachable!(),
+        };
+        let values = BTreeMap::from([
+            (input.index() as u64, input_value.clone()),
+            (bias_node.index() as u64, bias_value.clone()),
+        ]);
+        let (actual, _) = execute_mock_rendered(&rendered, renderer, &values);
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("x".into(), input_value), ("bias".into(), bias_value)]),
+            )
+            .unwrap();
+        match dtype {
+            DType::F16 => assert_eq!(expected.storage(), &Storage::F16(vec![0])),
+            DType::BF16 => assert_eq!(expected.storage(), &Storage::BF16(vec![0])),
+            _ => unreachable!(),
+        }
+        assert_eq!(actual, expected.to_le_bytes().unwrap(), "{dtype:?}");
+
+        let mut extrema = Graph::new();
+        let input = extrema.input_dtype("x", [1, 2], dtype);
+        let reduced = extrema
+            .reduce(input, crate::ReduceKind::Max, Some(vec![1]), false)
+            .unwrap();
+        let output = extrema.neg(reduced).unwrap();
+        let scheduled = schedule(&extrema, output).unwrap();
+        assert_eq!(scheduled.items.len(), 1, "{dtype:?} signed zero");
+        let rendered = renderer.render(&scheduled.items[0].kernel).unwrap();
+        assert!(rendered.source.contains(commit), "{dtype:?} signed zero");
+        let cases = match dtype {
+            DType::F16 => vec![
+                (
+                    "signed zero",
+                    TensorData::from_storage([1, 2], Storage::F16(vec![0x8000, 0])).unwrap(),
+                ),
+                (
+                    "NaN recovery",
+                    TensorData::from_storage([1, 2], Storage::F16(vec![0x7e01, 0x3c00])).unwrap(),
+                ),
+            ],
+            DType::BF16 => vec![
+                (
+                    "signed zero",
+                    TensorData::from_storage([1, 2], Storage::BF16(vec![0x8000, 0])).unwrap(),
+                ),
+                (
+                    "NaN recovery",
+                    TensorData::from_storage([1, 2], Storage::BF16(vec![0x7fc1, 0x3f80])).unwrap(),
+                ),
+            ],
+            _ => unreachable!(),
+        };
+        for (name, input_value) in cases {
+            let (actual, _) = execute_mock_rendered(
+                &rendered,
+                renderer,
+                &BTreeMap::from([(input.index() as u64, input_value.clone())]),
+            );
+            let expected = CpuBackend
+                .execute(
+                    &extrema,
+                    output,
+                    &HashMap::from([("x".into(), input_value)]),
+                )
+                .unwrap()
+                .to_le_bytes()
+                .unwrap();
+            assert_eq!(actual, expected, "{dtype:?} {name}");
+        }
+    }
+}
+
+#[test]
+fn empty_reduction_epilogue_keeps_only_live_opencl_abi_inputs() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", Shape::from([2, 0]), DType::I32);
+    let bias = graph.input_dtype("bias", Shape::from([2]), DType::I32);
+    let reduced = graph.sum(input, 1).unwrap();
+    let output = graph.add(reduced, bias).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let rendered = OpenClRenderer::default()
+        .render(&scheduled.items[0].kernel)
+        .unwrap();
+    assert!(rendered.source.contains("b1[gid] ="));
+    assert!(!rendered.source.contains("for (ulong r"));
+    assert_eq!(
+        rendered
+            .buffers
+            .iter()
+            .map(|buffer| buffer.id)
+            .collect::<Vec<_>>(),
+        vec![bias.index() as u64, output.index() as u64]
+    );
+}
 
 #[derive(Clone, Debug)]
 enum Arg {

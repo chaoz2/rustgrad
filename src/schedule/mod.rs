@@ -1476,7 +1476,7 @@ fn schedule_many_with_external(
             .map(|view| view.source.index())
         })
         .collect::<BTreeSet<_>>();
-    let roots: BTreeSet<usize> = needed
+    let mut roots: BTreeSet<usize> = needed
         .iter()
         .copied()
         .filter(|index| {
@@ -1521,6 +1521,93 @@ fn schedule_many_with_external(
                     || !matches!(graph.op(id), Ok(op) if supported(op)))
         })
         .collect();
+    let fusion_candidates = roots
+        .iter()
+        .copied()
+        .filter_map(|root| {
+            let reduction =
+                match crate::kernel::single_reduction_epilogue(graph, NodeId::from_index(root)) {
+                    Ok(Some(reduction)) => reduction,
+                    Ok(None) => return None,
+                    Err(error) => return Some(Err(ScheduleError::UOp(error))),
+                };
+            (roots.contains(&reduction.index())
+                && !requested.contains(&reduction.index())
+                && !external.contains(&reduction.index())
+                && crate::kernel::reduction_epilogue_node_uses(
+                    graph,
+                    NodeId::from_index(root),
+                    reduction,
+                )
+                .is_ok_and(|uses| uses == consumers[reduction.index()]))
+            .then_some(Ok((root, reduction.index())))
+        })
+        .collect::<Result<Vec<_>, ScheduleError>>()?;
+    // The nearest observable root owns fusion. An outer epilogue must load a
+    // requested, caller-materialized, or shared nested result instead of
+    // subsuming it and removing the reduction recurrence needed to produce
+    // that result. A non-observable nested root may be absorbed only when this
+    // candidate owns every one of its graph uses.
+    let fusion_candidates = fusion_candidates
+        .into_iter()
+        .filter(|(root, reduction)| {
+            roots
+                .iter()
+                .chain(&requested)
+                .chain(external)
+                .filter(|nested| **nested != *root && **nested != *reduction)
+                .all(|nested| {
+                    crate::kernel::reduction_epilogue_node_uses(
+                        graph,
+                        NodeId::from_index(*root),
+                        NodeId::from_index(*nested),
+                    )
+                    .is_ok_and(|uses| {
+                        uses == 0
+                            || (!requested.contains(nested)
+                                && !external.contains(nested)
+                                && uses == consumers[*nested])
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    let fused_epilogues = fusion_candidates
+        .iter()
+        .copied()
+        .filter(|(root, reduction)| {
+            !fusion_candidates.iter().any(|(outer, outer_reduction)| {
+                outer != root
+                    && outer_reduction == reduction
+                    && crate::kernel::reduction_epilogue_node_uses(
+                        graph,
+                        NodeId::from_index(*outer),
+                        NodeId::from_index(*root),
+                    )
+                    .is_ok_and(|uses| uses != 0 && uses == consumers[*root])
+            })
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut fused_roots = BTreeSet::new();
+    for (root, reduction) in &fused_epilogues {
+        fused_roots.insert(*reduction);
+        for nested in roots.iter().copied() {
+            if nested != *root
+                && !requested.contains(&nested)
+                && !external.contains(&nested)
+                && crate::kernel::reduction_epilogue_node_uses(
+                    graph,
+                    NodeId::from_index(*root),
+                    NodeId::from_index(nested),
+                )
+                .is_ok_and(|uses| uses != 0 && uses == consumers[nested])
+            {
+                fused_roots.insert(nested);
+            }
+        }
+    }
+    for fused in fused_roots {
+        roots.remove(&fused);
+    }
     let mut node_to_item: std::collections::BTreeMap<usize, u64> = roots
         .iter()
         .enumerate()
@@ -1685,8 +1772,16 @@ fn schedule_many_with_external(
         let paired_output = sort_siblings(node)?
             .map(|sibling| buffer(graph, sibling, false))
             .transpose()?;
-        let kernel =
-            if boundary.is_none() {
+        let kernel = if boundary.is_none() {
+            if let Some(reduction) = fused_epilogues.get(&index) {
+                crate::kernel::lower_graph_reduction_epilogue_with_materialized(
+                    graph,
+                    node,
+                    NodeId::from_index(*reduction),
+                    &materialized,
+                )
+                .map_err(ScheduleError::UOp)?
+            } else {
                 match graph.op(node).map_err(ScheduleError::Graph)? {
                     Op::Random { .. } => crate::kernel::lower_graph_random(graph, node)
                         .map_err(ScheduleError::UOp)?,
@@ -1744,9 +1839,10 @@ fn schedule_many_with_external(
                     )
                     .map_err(ScheduleError::UOp)?,
                 }
-            } else {
-                UOp::sink(vec![])
-            };
+            }
+        } else {
+            UOp::sink(vec![])
+        };
         let kernel = if boundary.is_none() && matches!(kernel.operation(), crate::Operation::Sink) {
             crate::uop::normalize_kernel(&kernel).map_err(ScheduleError::UOp)?
         } else {

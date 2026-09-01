@@ -3,7 +3,9 @@ use super::{
     OpenClCapabilities, OpenClError,
     guard::{emit_transactional, emit_transactional_reduction},
     narrow,
-    reduction::OpenClReduction,
+    reduction::{
+        input_offset_expression, required_capabilities as reduction_capabilities, validate_dtype,
+    },
     transaction::{GuardedIntegerOp, OpenClGuardDomain, OpenClTransactionAbi},
     view::OpenClViewAccess,
 };
@@ -19,7 +21,7 @@ use std::{
     sync::Arc,
 };
 
-pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v7";
+pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v8";
 pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -235,9 +237,8 @@ impl OpenClRenderer {
             .sources()
             .get(1)
             .ok_or_else(|| OpenClError::Unsupported("store has no value".into()))?;
-        let reduction = matches!(store_value.operation(), Operation::ReduceFinalize)
-            .then(|| OpenClReduction::from_finalize(store_value))
-            .transpose()?;
+        let reduction = crate::reduction_native::NativeReductionKernel::from_store(store)
+            .map_err(|reason| OpenClError::Unsupported(reason.into()))?;
         let mut schedule_inputs = Vec::new();
         let mut seen = BTreeSet::new();
         for node in &nodes {
@@ -266,14 +267,37 @@ impl OpenClRenderer {
                 );
             }
         }
-        let mut buffers = if reduction
+        let zero_epilogue_buffers = reduction
             .as_ref()
-            .is_some_and(|reduction| reduction.plan.reduction_len() == 0)
-        {
-            Vec::new()
-        } else {
-            schedule_inputs.clone()
-        };
+            .filter(|reduction| reduction.plan.reduction_len() == 0)
+            .map(|reduction| {
+                fn collect(node: &UOp, finalize: &UOp, buffers: &mut BTreeSet<u64>) {
+                    if node.shares_node_with(finalize) {
+                        return;
+                    }
+                    if let Operation::Index(
+                        IndexValue::Buffer { buffer, .. } | IndexValue::View { buffer, .. },
+                    ) = node.operation()
+                    {
+                        buffers.insert(*buffer);
+                    }
+                    for source in node.sources() {
+                        collect(source, finalize, buffers);
+                    }
+                }
+                let mut buffers = BTreeSet::new();
+                collect(reduction.epilogue_root, reduction.finalize, &mut buffers);
+                buffers
+            });
+        let mut buffers = schedule_inputs
+            .iter()
+            .filter(|buffer| {
+                zero_epilogue_buffers
+                    .as_ref()
+                    .is_none_or(|epilogue| epilogue.contains(&buffer.id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if seen.insert(*output_id) {
             buffers.push(
                 inventory
@@ -298,7 +322,7 @@ impl OpenClRenderer {
             None
         } else if let Some(reduction) = &reduction {
             OpenClTransactionAbi::analyze(
-                reduction.producer(store_value)?,
+                reduction.producer,
                 output_position,
                 OpenClGuardDomain::ReductionSource {
                     shape: reduction.plan.geometry.input.clone(),
@@ -317,10 +341,15 @@ impl OpenClRenderer {
         let entry = format!("rg_opencl_e{}_b{}", extent, buffers.len());
         let mut required_capabilities = required_capabilities(&buffers, uses_f16 || uses_bf16);
         if let Some(reduction) = &reduction {
-            reduction.validate_dtype(output_dtype, self.capabilities)?;
-            let reduction_capabilities = reduction.required_capabilities(output_dtype);
-            required_capabilities.int64 |= reduction_capabilities.int64;
-            required_capabilities.fp64 |= reduction_capabilities.fp64;
+            validate_dtype(
+                &reduction.plan,
+                reduction.plan.output_dtype,
+                self.capabilities,
+            )?;
+            supported_storage(output_dtype, self.capabilities)?;
+            let needed = reduction_capabilities(&reduction.plan, output_dtype);
+            required_capabilities.int64 |= needed.int64;
+            required_capabilities.fp64 |= needed.fp64;
         }
         let mut lines = Vec::new();
         if required_capabilities.fp64 {
@@ -361,7 +390,6 @@ impl OpenClRenderer {
         if let Some(reduction) = &reduction {
             emit_reduction(
                 reduction,
-                store_value,
                 output_dtype,
                 output_position,
                 &ids,
@@ -410,7 +438,9 @@ impl OpenClRenderer {
             &source,
             &buffers,
             &schedule_inputs,
-            &reduction,
+            &reduction
+                .as_ref()
+                .map(|kernel| (&kernel.plan, kernel.has_epilogue())),
             &transaction,
         ));
         Ok(RenderedOpenCl {
@@ -674,6 +704,23 @@ fn emit_expr(
     linear: &str,
     capabilities: OpenClCapabilities,
 ) -> Result<String, OpenClError> {
+    emit_expr_with_substitution(node, ids, source_map, lines, linear, capabilities, None)
+}
+
+fn emit_expr_with_substitution(
+    node: &UOp,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+    linear: &str,
+    capabilities: OpenClCapabilities,
+    substitution: Option<(&UOp, &str)>,
+) -> Result<String, OpenClError> {
+    if let Some((target, value)) = substitution
+        && node.shares_node_with(target)
+    {
+        return Ok(value.into());
+    }
     let map_id = source_map.len();
     source_map.insert(map_id, lines.len() + 1);
     let dtype = node
@@ -685,7 +732,17 @@ fn emit_expr(
         node.sources()
             .get(index)
             .ok_or_else(|| OpenClError::Unsupported("missing expression operand".into()))
-            .and_then(|source| emit_expr(source, ids, source_map, lines, linear, capabilities))
+            .and_then(|source| {
+                emit_expr_with_substitution(
+                    source,
+                    ids,
+                    source_map,
+                    lines,
+                    linear,
+                    capabilities,
+                    substitution,
+                )
+            })
     };
     match node.operation() {
         Operation::Const(value) => match value {
@@ -790,8 +847,7 @@ fn emit_expr(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_reduction(
-    reduction: &OpenClReduction,
-    finalize: &UOp,
+    reduction: &crate::reduction_native::NativeReductionKernel<'_>,
     dtype: DType,
     output_position: usize,
     ids: &BTreeMap<u64, usize>,
@@ -800,16 +856,30 @@ fn emit_reduction(
     capabilities: OpenClCapabilities,
     transaction: Option<&OpenClTransactionAbi>,
 ) -> Result<(), OpenClError> {
-    let value = reduction.producer(finalize)?;
+    let value = reduction.producer;
     let plan = &reduction.plan;
     let reduction_len = plan.reduction_len();
-    if dtype != plan.output_dtype {
-        return Err(OpenClError::Unsupported(
-            "OpenCL reduction store dtype is inconsistent".into(),
-        ));
-    }
     if reduction_len == 0 {
-        let final_value = reduction_identity_expr(dtype, plan.finalize(plan.identity()))?;
+        let final_value =
+            reduction_identity_expr(plan.output_dtype, plan.finalize(plan.identity()))?;
+        let committed = reduction_finalize_commit_expr(
+            plan.output_dtype,
+            &final_value,
+            reduction.has_epilogue(),
+        );
+        let final_value = if reduction.has_epilogue() {
+            emit_expr_with_substitution(
+                reduction.epilogue_root,
+                ids,
+                source_map,
+                lines,
+                "gid",
+                capabilities,
+                Some((reduction.finalize, committed.as_str())),
+            )?
+        } else {
+            committed
+        };
         lines.push(format!(
             "  b{output_position}[gid] = {};",
             encode_store(dtype, final_value)
@@ -828,7 +898,7 @@ fn emit_reduction(
     ));
     lines.push(format!(
         "    const ulong src_gid = {};",
-        reduction.input_offset_expression()?
+        input_offset_expression(plan)?
     ));
     let expression = if let Some(transaction) = transaction {
         emit_transactional_reduction(value, transaction, ids, source_map, lines, capabilities)?
@@ -890,7 +960,21 @@ fn emit_reduction(
         });
     }
     let final_value = reduction_cast_expr(plan.accumulator_dtype, plan.output_dtype, "acc");
-    let final_value = reduction_storage_expr(dtype, &final_value);
+    let committed =
+        reduction_finalize_commit_expr(plan.output_dtype, &final_value, reduction.has_epilogue());
+    let final_value = if reduction.has_epilogue() {
+        emit_expr_with_substitution(
+            reduction.epilogue_root,
+            ids,
+            source_map,
+            lines,
+            "gid",
+            capabilities,
+            Some((reduction.finalize, committed.as_str())),
+        )?
+    } else {
+        committed
+    };
     let store = format!(
         "b{output_position}[gid] = {};",
         encode_store(dtype, final_value)
@@ -977,6 +1061,14 @@ fn reduction_storage_expr(dtype: DType, value: &str) -> String {
         DType::I32 => format!("as_int({value})"),
         DType::I64 => format!("as_long({value})"),
         _ => value.into(),
+    }
+}
+
+fn reduction_finalize_commit_expr(dtype: DType, value: &str, has_epilogue: bool) -> String {
+    if has_epilogue && matches!(dtype, DType::F16 | DType::BF16) {
+        narrow::quantize(dtype, value).expect("validated narrow reduction output dtype")
+    } else {
+        reduction_storage_expr(dtype, value)
     }
 }
 

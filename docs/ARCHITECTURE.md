@@ -468,7 +468,7 @@ the source value's raw bits when storage is unchanged; widened Sum casts the
 single source value once, while the index result is I32 zero.
 Their index outputs remain explicitly
 nondifferentiable. Scalar CPU-JIT covers all concrete storage dtypes and both
-value/index results through captured replay. PTX v30 uses the same plan and a
+value/index results through captured replay. PTX v31 uses the same plan and a
 two-buffer ABI for Bool/I32/U32/F32, assigning one thread to each independent
 row/inner lane and scanning the selected axis serially; the CUDA semantic mock
 compares exact value/index bytes with the CPU oracle. OpenCL, Metal, WebGPU,
@@ -488,6 +488,18 @@ bindings carry the input node, descriptor, and contiguous pointer-ABI index and
 validate uniqueness, view consistency, output exclusion, and completeness. CPU
 interpreter/JIT and PTX can validate the same map without changing their ordered
 pointer-slice ABI.
+
+A single-use, unrequested Reduce followed by a pure same-shape scalar epilogue
+may remain one scheduled item. One checked `NativeReductionKernel` view locates
+the exact ReduceFinalize inside the existing Store UOp, while renderers bind its
+storage-committed value into their existing scalar emitters. The omitted
+reduction intermediate therefore has no buffer, dependency, or temporary
+identity. Requested/shared reductions, another reduction, movement or broadcast
+epilogues, external materializations, and faulting scalar operations retain the
+ordinary materialization boundary. RGUA tags and the durable encoding version
+are unchanged; the fused graph intentionally has one schedule item and
+therefore a different item/cache identity. Only the affected renderer/source
+cache versions advance.
 
 Prepared OpenCL, Metal, and WebGPU pure prefixes then project those validated
 bindings into one crate-private static residency plan. The plan renders and

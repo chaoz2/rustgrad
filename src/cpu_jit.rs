@@ -25,7 +25,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v32";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v33";
 const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
 const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
 pub const ABI_VERSION: u32 = 2;
@@ -2663,17 +2663,13 @@ fn render_reduction(
     out: &BufferAbi,
     lines: &mut Vec<String>,
 ) -> Result<Option<String>, JitError> {
-    let Some(finalize) = store
-        .sources()
-        .get(1)
-        .filter(|n| matches!(n.operation(), Operation::ReduceFinalize))
+    let Some(kernel) = crate::reduction_native::NativeReductionKernel::from_store(store)
+        .map_err(|reason| JitError::Unsupported(reason.into()))?
     else {
         return Ok(None);
     };
-    let (reduction, value_node) =
-        crate::reduction_native::NativeReductionPlan::from_finalize(finalize)
-            .map_err(|reason| JitError::Unsupported(reason.into()))?;
-    if reduction.output_dtype != out.dtype {
+    let reduction = &kernel.plan;
+    if kernel.output_dtype != out.dtype {
         return Err(JitError::Unsupported(
             "reduction output ABI dtype is inconsistent".into(),
         ));
@@ -2717,7 +2713,7 @@ fn render_reduction(
             )
         ));
         let mut map = BTreeMap::new();
-        let value = emit(value_node, ids, &mut map, lines)?;
+        let value = emit(kernel.producer, ids, &mut map, lines)?;
         let value = if reduction.source_dtype.is_float8() {
             float8_decode_expr(reduction.source_dtype, &value)
                 .expect("guarded Float8 reduction source")
@@ -2760,7 +2756,7 @@ fn render_reduction(
         }
         lines.push("    }".into());
     }
-    let store_value = if reduction.kind == crate::ReduceKind::Mean && reduce_len == 0 {
+    let finalized = if reduction.kind == crate::ReduceKind::Mean && reduce_len == 0 {
         "NAN".into()
     } else if reduction.kind == crate::ReduceKind::Mean {
         let divisor = native_scalar_literal(
@@ -2775,7 +2771,28 @@ fn render_reduction(
     } else {
         "rg_acc".into()
     };
-    let store_value = scan_store_expr(reduction.output_dtype, &store_value);
+    // ReduceFinalize commits to its declared output storage before any
+    // elementwise consumer observes the value. This encode/decode boundary is
+    // semantically visible for narrow floats.
+    let committed = scan_commit_expr(reduction.output_dtype, &finalized);
+    let store_value = if kernel.has_epilogue() {
+        // Elementwise loads are expressed in the output domain. The reduction
+        // loop's `rg_i` is intentionally scoped above, so bind the canonical
+        // elementwise name to this output coordinate before rendering the
+        // epilogue.
+        lines.push("    size_t rg_i = rg_out;".into());
+        let mut map = BTreeMap::new();
+        emit_with_substitution(
+            kernel.epilogue_root,
+            ids,
+            &mut map,
+            lines,
+            Some((kernel.finalize, committed.as_str())),
+        )?
+    } else {
+        committed
+    };
+    let store_value = scan_store_expr(kernel.output_dtype, &store_value);
     lines.push(format!(
         "    (({}*)buffers[{}])[rg_out] = ({});",
         ctype(out.dtype),
@@ -2871,13 +2888,28 @@ fn emit(
     map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
 ) -> Result<String, JitError> {
+    emit_with_substitution(n, ids, map, lines, None)
+}
+
+fn emit_with_substitution(
+    n: &UOp,
+    ids: &BTreeMap<u64, usize>,
+    map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+    substitution: Option<(&UOp, &str)>,
+) -> Result<String, JitError> {
+    if let Some((node, value)) = substitution
+        && n.shares_node_with(node)
+    {
+        return Ok(value.into());
+    }
     let id = map.len();
     map.insert(id, lines.len() + 1);
     let ty = n
         .ty()
         .ok_or_else(|| JitError::Unsupported(format!("untyped {:?}", n.operation())))?
         .scalar;
-    let mut s = |i: usize| emit(&n.sources()[i], ids, map, lines);
+    let mut s = |i: usize| emit_with_substitution(&n.sources()[i], ids, map, lines, substitution);
     match n.operation() {
         Operation::Const(LiteralValue::Int(v)) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
         Operation::Const(LiteralValue::Scalar { dtype, bits })
@@ -4013,7 +4045,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v32");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v33");
 
         let execute = |graph: &Graph,
                        output,
@@ -4181,7 +4213,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v32");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v33");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -7093,5 +7125,38 @@ mod tests {
             CpuJit::render(&crate::lower_graph_matmul(&f64_graph, f64_output).unwrap()).unwrap();
         assert!(f64_rendered.source.contains("double rg_acc=0.0;"));
         assert!(!f64_rendered.source.contains("float rg_product=(float)"));
+    }
+
+    #[test]
+    fn reduction_epilogue_c11_commits_finalize_before_scalar_alu() {
+        for (dtype, commit) in [
+            (DType::F16, "rg_f16_to_f32(rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32(rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [2, 3], dtype);
+            let reduced = graph
+                .reduce_with_dtypes(
+                    input,
+                    crate::ReduceKind::Sum,
+                    Some(vec![1]),
+                    false,
+                    crate::ReductionDType::new(dtype, dtype),
+                )
+                .unwrap();
+            let output = graph.relu(reduced).unwrap();
+            let scheduled = crate::schedule(&graph, output).unwrap();
+            assert_eq!(scheduled.items.len(), 1);
+            let rendered = CpuJit::render(&scheduled.items[0].kernel).unwrap();
+            assert!(rendered.source.contains(commit), "{dtype:?}");
+            assert!(rendered.source.contains("?"));
+            assert!(
+                rendered
+                    .abi
+                    .buffers
+                    .iter()
+                    .all(|buffer| buffer.id != reduced.index() as u64)
+            );
+        }
     }
 }

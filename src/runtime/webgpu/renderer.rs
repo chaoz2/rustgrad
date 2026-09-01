@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Deterministic renderer/source identity.
-pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v6";
+pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v7";
 /// Ordered storage-plus-extent bind-group ABI version.
 pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
@@ -382,23 +382,25 @@ impl WgslRenderer {
             .sources()
             .get(1)
             .ok_or_else(|| WebGpuError::Unsupported("store has no value".into()))?;
-        let reduction = matches!(value.operation(), Operation::ReduceFinalize)
-            .then(|| {
-                crate::reduction_native::NativeReductionPlan::from_finalize(value)
-                    .map(|(plan, _)| plan)
-                    .map_err(|reason| WebGpuError::Unsupported(reason.into()))
-            })
-            .transpose()?;
+        let reduction = crate::reduction_native::NativeReductionKernel::from_store(store)
+            .map_err(|reason| WebGpuError::Unsupported(reason.into()))?;
         let reduction_roots = nodes
             .iter()
             .filter(|node| matches!(node.operation(), Operation::ReduceFinalize))
-            .count();
+            .fold(Vec::<&UOp>::new(), |mut roots, node| {
+                if !roots.iter().any(|root| node.shares_node_with(root)) {
+                    roots.push(node);
+                }
+                roots
+            })
+            .len();
         if reduction_roots != usize::from(reduction.is_some()) {
             return Err(WebGpuError::Unsupported(
                 "reduction must be the sole stored value".into(),
             ));
         }
-        if let Some(plan) = &reduction {
+        if let Some(reduction) = &reduction {
+            let plan = &reduction.plan;
             for dtype in [plan.source_dtype, plan.accumulator_dtype, plan.output_dtype] {
                 supported_storage(dtype)?;
             }
@@ -488,13 +490,13 @@ impl WgslRenderer {
         lines.push("  let gid: u32 = rg_global.x;".into());
         lines.push("  if (gid >= rg_extent.value) { return; }".into());
         let mut source_map = BTreeMap::new();
-        let expression = if let Some(plan) = &reduction {
+        let expression = if let Some(reduction) = &reduction {
             if transaction.is_some() {
                 return Err(WebGpuError::Unsupported(
                     "guarded reduction producers are outside the exact WGSL subset".into(),
                 ));
             }
-            emit_wgsl_reduction(plan, value, &ids, &mut source_map, &mut lines)?
+            emit_wgsl_reduction(reduction, &ids, &mut source_map, &mut lines)?
         } else if let Some(transaction) = &transaction {
             emit_transactional(value, transaction, &ids, &mut source_map, &mut lines)?
         } else {
@@ -570,14 +572,13 @@ impl WgslRenderer {
 }
 
 fn emit_wgsl_reduction(
-    plan: &crate::reduction_native::NativeReductionPlan,
-    finalize: &UOp,
+    reduction: &crate::reduction_native::NativeReductionKernel<'_>,
     ids: &BTreeMap<u64, usize>,
     source_map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
 ) -> Result<String, WebGpuError> {
-    let (_, producer) = crate::reduction_native::NativeReductionPlan::from_finalize(finalize)
-        .map_err(|reason| WebGpuError::Unsupported(reason.into()))?;
+    let plan = &reduction.plan;
+    let producer = reduction.producer;
     let reduction_len = u32::try_from(plan.reduction_len()).map_err(|_| {
         WebGpuError::Unsupported("reduction domain exceeds WGSL u32 indexing".into())
     })?;
@@ -672,9 +673,22 @@ fn emit_wgsl_reduction(
             ));
         }
     }
-    WgslScalarDialect
+    let finalized = WgslScalarDialect
         .cast(plan.accumulator_dtype, plan.output_dtype, "rg_acc")
-        .map_err(WebGpuError::Unsupported)
+        .map_err(WebGpuError::Unsupported)?;
+    let committed = wgsl_reduction_commit(plan.output_dtype, &finalized);
+    if reduction.has_epilogue() {
+        emit_expr_with_substitution(
+            reduction.epilogue_root,
+            ids,
+            source_map,
+            lines,
+            "gid",
+            Some((reduction.finalize, committed.as_str())),
+        )
+    } else {
+        Ok(committed)
+    }
 }
 
 fn wgsl_reduction_type(dtype: DType) -> &'static str {
@@ -846,19 +860,38 @@ fn emit_expr(
     lines: &mut Vec<String>,
     linear: &str,
 ) -> Result<String, WebGpuError> {
+    emit_expr_with_substitution(node, ids, source_map, lines, linear, None)
+}
+
+fn emit_expr_with_substitution(
+    node: &UOp,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+    linear: &str,
+    substitution: Option<(&UOp, &str)>,
+) -> Result<String, WebGpuError> {
+    if let Some((target, value)) = substitution
+        && node.shares_node_with(target)
+    {
+        return Ok(value.into());
+    }
     source_map.insert(source_map.len(), lines.len() + 1);
     let dtype = node
         .ty()
         .ok_or_else(|| WebGpuError::Unsupported(format!("untyped {:?}", node.operation())))?
         .scalar;
     supported_storage(dtype)?;
-    let child =
-        |position: usize, source_map: &mut BTreeMap<usize, usize>, lines: &mut Vec<String>| {
-            node.sources()
-                .get(position)
-                .ok_or_else(|| WebGpuError::Unsupported("missing expression operand".into()))
-                .and_then(|source| emit_expr(source, ids, source_map, lines, linear))
-        };
+    let child = |position: usize,
+                 source_map: &mut BTreeMap<usize, usize>,
+                 lines: &mut Vec<String>| {
+        node.sources()
+            .get(position)
+            .ok_or_else(|| WebGpuError::Unsupported("missing expression operand".into()))
+            .and_then(|source| {
+                emit_expr_with_substitution(source, ids, source_map, lines, linear, substitution)
+            })
+    };
     match node.operation() {
         Operation::Const(value) => match value {
             LiteralValue::Scalar {
