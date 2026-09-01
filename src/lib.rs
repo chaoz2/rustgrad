@@ -141,10 +141,10 @@ pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
     ConvTranspose2dOptions, ConvolutionSpec, DynamicAllocation, DynamicAllocationError,
     DynamicAllocationPlan, DynamicAllocationTarget, DynamicBinding, DynamicCountStage,
-    DynamicInput, DynamicNodeId, DynamicOutputShape, ExpandExtent, Graph, LogicalOp, NodeId, Op,
-    PadMode, Pool2dOptions, PoolOptions, PrefixScanKind, PrefixScanOutput, RandomKind,
-    RandomStream, ReduceKind, ReductionDType, ReshapeExtent, RollDims, RollShifts, ShrinkRange,
-    Slice, SortOutput, SpatialWindow, SpatialWindowError, SplitSections, SplitSizes,
+    DynamicInput, DynamicNodeId, DynamicOutputShape, DynamicVjpPlan, ExpandExtent, Graph,
+    LogicalOp, NodeId, Op, PadMode, Pool2dOptions, PoolOptions, PrefixScanKind, PrefixScanOutput,
+    RandomKind, RandomStream, ReduceKind, ReductionDType, ReshapeExtent, RollDims, RollShifts,
+    ShrinkRange, Slice, SortOutput, SpatialWindow, SpatialWindowError, SplitSections, SplitSizes,
     StaticIndexUpdateWrt, TransposedConvolutionSpec, UnaryOp, UnflattenExtent, VarianceCorrection,
 };
 pub use ir::{ScatterMode, ScatterReduceKind, ScatterSource};

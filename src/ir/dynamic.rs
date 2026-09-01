@@ -1,9 +1,9 @@
 //! Typed graph nodes whose concrete output extent is known only at realization.
 
 use super::{BinaryOp, Graph, NodeId, ReduceKind, ReductionDType, UnaryOp};
-use crate::{DType, Error, Result, Shape, TensorData};
+use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{BTreeMap, hash_map::DefaultHasher},
     fmt,
     hash::{Hash, Hasher},
 };
@@ -97,6 +97,21 @@ pub struct DynamicAllocationPlan {
     count_stage: DynamicCountStage,
     output_dtype: DType,
     output_shape: DynamicOutputShape,
+    identity: u64,
+}
+
+/// Immutable descriptor contract for one first-order dynamic-result VJP.
+///
+/// The upstream retains the exact runtime shape expression of `output`; no
+/// maximum extent or static placeholder is introduced. The target is an
+/// ordinary static graph value because a masked-selection VJP scatters the
+/// compacted cotangent back into that value's fixed descriptor.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct DynamicVjpPlan {
+    output: DynamicNodeId,
+    upstream_shape: DynamicOutputShape,
+    upstream_dtype: DType,
+    target: DynamicBinding,
     identity: u64,
 }
 
@@ -303,6 +318,122 @@ impl DynamicAllocationPlan {
     }
 }
 
+impl DynamicBinding {
+    fn from_graph(graph: &Graph, node: NodeId) -> Result<Self> {
+        let value = graph.node(node)?;
+        let elements = value.shape.numel()?;
+        let bytes = elements
+            .checked_mul(value.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(value.shape.clone()))?;
+        Ok(Self {
+            node,
+            shape: value.shape.clone(),
+            dtype: value.dtype,
+            bytes,
+        })
+    }
+}
+
+impl DynamicVjpPlan {
+    pub(crate) fn for_output(graph: &Graph, output: DynamicNodeId, target: NodeId) -> Result<Self> {
+        let output_node = graph.dynamic_node(output)?;
+        let target_node = graph.node(target)?;
+        if !output_node.dtype.is_float() || output_node.dtype.is_float8() {
+            return Err(Error::NonDifferentiableTarget(target));
+        }
+        if !target_node.dtype.is_float()
+            || target_node.dtype.is_float8()
+            || !target_node.requires_grad
+        {
+            return Err(Error::NonDifferentiableTarget(target));
+        }
+        let mut memo = BTreeMap::new();
+        if !graph.validate_dynamic_vjp_path(output, target, &mut memo)? {
+            return Err(Error::NonDifferentiableTarget(target));
+        }
+        let mut plan = Self {
+            output,
+            upstream_shape: output_node.output,
+            upstream_dtype: output_node.dtype,
+            target: DynamicBinding::from_graph(graph, target)?,
+            identity: 0,
+        };
+        plan.identity = plan.logical_identity();
+        Ok(plan)
+    }
+
+    pub fn output(&self) -> DynamicNodeId {
+        self.output
+    }
+
+    pub fn upstream_shape(&self) -> DynamicOutputShape {
+        self.upstream_shape
+    }
+
+    pub fn upstream_dtype(&self) -> DType {
+        self.upstream_dtype
+    }
+
+    pub fn target(&self) -> &DynamicBinding {
+        &self.target
+    }
+
+    pub fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    pub(crate) fn validate_against(&self, graph: &Graph) -> Result<()> {
+        if Self::for_output(graph, self.output, self.target.node)?.eq(self) {
+            Ok(())
+        } else {
+            Err(Error::DynamicVjp {
+                reason: "plan does not match graph",
+            })
+        }
+    }
+
+    pub(crate) fn validate_realized(
+        &self,
+        output: &TensorData,
+        upstream: &TensorData,
+    ) -> Result<()> {
+        if output.dtype() != self.upstream_dtype
+            || self.upstream_shape.validate(output.shape()).is_err()
+        {
+            return Err(Error::DynamicVjp {
+                reason: "realized output descriptor mismatch",
+            });
+        }
+        if upstream.shape() != output.shape() || upstream.dtype() != self.upstream_dtype {
+            return Err(Error::DynamicVjp {
+                reason: "upstream descriptor mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    fn logical_identity(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        "dynamic-vjp-plan-v1".hash(&mut hasher);
+        self.output.index.hash(&mut hasher);
+        match self.upstream_shape {
+            DynamicOutputShape::Scalar => 0_u8.hash(&mut hasher),
+            DynamicOutputShape::Count1d { count } => {
+                1_u8.hash(&mut hasher);
+                count.index.hash(&mut hasher);
+            }
+            DynamicOutputShape::CountRows { count, width } => {
+                2_u8.hash(&mut hasher);
+                count.index.hash(&mut hasher);
+                width.hash(&mut hasher);
+            }
+        }
+        self.upstream_dtype.hash(&mut hasher);
+        self.target.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 impl DynamicOutputShape {
     pub const fn scalar() -> Self {
         Self::Scalar
@@ -350,6 +481,106 @@ impl DynamicOutputShape {
             Ok(expected) if &expected == shape => Ok(()),
             _ => Err(Error::InvalidIndex),
         }
+    }
+}
+
+impl Graph {
+    /// Builds the immutable descriptor contract for one first-order VJP of an
+    /// exact-cardinality dynamic result into a static graph target.
+    ///
+    /// This is a read-only preflight: supported dynamic rules are checked and
+    /// participating static boundaries rehearse `grad_with` on a private graph
+    /// clone. The caller's arenas are unchanged on success or failure. Mask
+    /// predicates are value-only cardinality inputs and never participate in
+    /// the derivative path.
+    pub fn dynamic_vjp_plan(
+        &self,
+        output: DynamicNodeId,
+        target: NodeId,
+    ) -> Result<DynamicVjpPlan> {
+        DynamicVjpPlan::for_output(self, output, target)
+    }
+
+    pub(crate) fn dynamic_backward_slice_contains(
+        &self,
+        output: DynamicNodeId,
+        target: NodeId,
+    ) -> Result<bool> {
+        self.validate_dynamic_vjp_path(output, target, &mut BTreeMap::new())
+    }
+
+    fn validate_dynamic_input_vjp_path(
+        &self,
+        input: DynamicInput,
+        target: NodeId,
+        memo: &mut BTreeMap<usize, bool>,
+    ) -> Result<bool> {
+        match input {
+            DynamicInput::Dynamic(input) => self.validate_dynamic_vjp_path(input, target, memo),
+            DynamicInput::StaticScalar(input) => self.validate_static_vjp_boundary(input, target),
+        }
+    }
+
+    fn validate_static_vjp_boundary(&self, boundary: NodeId, target: NodeId) -> Result<bool> {
+        if !self.backward_slice_contains(boundary, target)? {
+            return Ok(false);
+        }
+        let boundary_node = self.node(boundary)?;
+        let shape = boundary_node.shape.clone();
+        let dtype = boundary_node.dtype;
+        let mut rehearsal = self.clone();
+        let seed = rehearsal.lazy_full_with_dtype(shape, Scalar::F(1.0), dtype)?;
+        rehearsal.grad_with(boundary, target, Some(seed), false)?;
+        Ok(true)
+    }
+
+    fn validate_dynamic_vjp_path(
+        &self,
+        output: DynamicNodeId,
+        target: NodeId,
+        memo: &mut BTreeMap<usize, bool>,
+    ) -> Result<bool> {
+        let operation = self.dynamic_node(output)?.operation.clone();
+        if let Some(contains) = memo.get(&output.index) {
+            return Ok(*contains);
+        }
+        let contains = match operation {
+            DynamicOperation::Nonzero { .. } => false,
+            DynamicOperation::MaskedSelect { input, .. } => {
+                self.validate_static_vjp_boundary(input, target)?
+            }
+            DynamicOperation::Sum { input } => {
+                self.validate_dynamic_vjp_path(input, target, memo)?
+            }
+            DynamicOperation::Unary { op, input } => {
+                if !matches!(op, UnaryOp::Neg | UnaryOp::Square) {
+                    return Err(Error::DynamicVjp {
+                        reason: "unsupported dynamic unary VJP",
+                    });
+                }
+                self.validate_dynamic_vjp_path(input, target, memo)?
+            }
+            DynamicOperation::Mean { input } => {
+                if self.validate_dynamic_vjp_path(input, target, memo)? {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "dynamic mean autograd is not implemented",
+                    ));
+                }
+                false
+            }
+            DynamicOperation::Binary { op, lhs, rhs } => {
+                if !matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) {
+                    return Err(Error::DynamicVjp {
+                        reason: "unsupported dynamic binary VJP",
+                    });
+                }
+                let lhs = self.validate_dynamic_input_vjp_path(lhs, target, memo)?;
+                let rhs = self.validate_dynamic_input_vjp_path(rhs, target, memo)?;
+                lhs || rhs
+            }
+        };
+        memo.insert(output.index, contains);
+        Ok(contains)
     }
 }
 
@@ -534,6 +765,117 @@ mod tests {
             plan.allocation_for_count(usize::MAX),
             Err(DynamicAllocationError::AllocationOverflow { .. })
         ));
+    }
+
+    fn dynamic_vjp_graph() -> (Graph, NodeId, NodeId, DynamicNodeId) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let mask = graph.input_dtype("mask", [1, 3], DType::Bool);
+        let output = graph.masked_select_dynamic(input, mask).unwrap();
+        (graph, input, mask, output)
+    }
+
+    #[test]
+    fn dynamic_vjp_plan_owns_exact_runtime_and_static_descriptors() {
+        let (graph, input, _, output) = dynamic_vjp_graph();
+        let plan = graph.dynamic_vjp_plan(output, input).unwrap();
+        assert_eq!(plan.output(), output);
+        assert_eq!(plan.upstream_dtype(), DType::F32);
+        assert_eq!(plan.upstream_shape(), DynamicOutputShape::count_1d(output));
+        assert_eq!(plan.target().node, input);
+        assert_eq!(plan.target().shape, Shape::from([2, 3]));
+        assert_eq!(plan.target().bytes, 6 * DType::F32.itemsize());
+
+        let selected = TensorData::from_scalars(
+            [4],
+            DType::F32,
+            [
+                Scalar::F(1.0),
+                Scalar::F(2.0),
+                Scalar::F(3.0),
+                Scalar::F(4.0),
+            ],
+        )
+        .unwrap();
+        assert!(plan.validate_realized(&selected, &selected).is_ok());
+        assert!(
+            plan.validate_realized(
+                &selected,
+                &TensorData::from_scalars([3], DType::F32, [Scalar::F(1.0); 3]).unwrap()
+            )
+            .is_err()
+        );
+
+        let (equivalent, equivalent_input, _, equivalent_output) = dynamic_vjp_graph();
+        assert_eq!(
+            plan.identity(),
+            equivalent
+                .dynamic_vjp_plan(equivalent_output, equivalent_input)
+                .unwrap()
+                .identity()
+        );
+
+        let mut tampered = plan.clone();
+        tampered.identity ^= 1;
+        assert!(tampered.validate_against(&graph).is_err());
+    }
+
+    #[test]
+    fn dynamic_vjp_plan_prunes_masks_and_rejects_unsupported_paths_atomically() {
+        let (mut graph, input, mask, output) = dynamic_vjp_graph();
+        let before_static = graph.node_count();
+        let before_dynamic = graph.dynamic_nodes.len();
+        assert!(matches!(
+            graph.dynamic_vjp_plan(output, mask),
+            Err(Error::NonDifferentiableTarget(node)) if node == mask
+        ));
+        assert_eq!(graph.node_count(), before_static);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+
+        let guarded = graph.tensor_guard_distribution(input, 1).unwrap();
+        let guarded_output = graph.masked_select_dynamic(guarded, mask).unwrap();
+        let before_static = graph.node_count();
+        let before_dynamic = graph.dynamic_nodes.len();
+        assert!(matches!(
+            graph.dynamic_vjp_plan(guarded_output, input),
+            Err(Error::NonDifferentiableIndexing(
+                "tensor guard gradient is not represented"
+            ))
+        ));
+        assert_eq!(graph.node_count(), before_static);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+
+        let mask_source = graph.input_dtype("mask_source", [1, 3], DType::F32);
+        let zero = graph.constant(TensorData::scalar(0.0));
+        let derived_mask = graph.gt(mask_source, zero).unwrap();
+        let derived_output = graph.masked_select_dynamic(input, derived_mask).unwrap();
+        let before_static = graph.node_count();
+        let before_dynamic = graph.dynamic_nodes.len();
+        assert!(matches!(
+            graph.dynamic_vjp_plan(derived_output, mask_source),
+            Err(Error::NonDifferentiableTarget(node)) if node == mask_source
+        ));
+        assert_eq!(graph.node_count(), before_static);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+
+        let unrelated = graph.input_dtype("unrelated", [2, 3], DType::F32);
+        let before_static = graph.node_count();
+        assert!(matches!(
+            graph.dynamic_vjp_plan(output, unrelated),
+            Err(Error::NonDifferentiableTarget(node)) if node == unrelated
+        ));
+        assert_eq!(graph.node_count(), before_static);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+        let mean = graph.dynamic_mean(output).unwrap();
+        let before_dynamic = graph.dynamic_nodes.len();
+        assert!(matches!(
+            graph.dynamic_vjp_plan(mean, input),
+            Err(Error::NonDifferentiableIndexing(
+                "dynamic mean autograd is not implemented"
+            ))
+        ));
+        assert_eq!(graph.node_count(), before_static);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
     }
 
     #[test]

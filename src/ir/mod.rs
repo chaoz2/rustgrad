@@ -31,6 +31,7 @@ pub(crate) use creation::{one_hot_bool_plan, one_hot_plan};
 pub use dynamic::{
     DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan, DynamicAllocationTarget,
     DynamicBinding, DynamicCountStage, DynamicInput, DynamicNodeId, DynamicOutputShape,
+    DynamicVjpPlan,
 };
 pub(crate) use dynamic::{DynamicNode, DynamicOperation, dynamic_reduction_dtypes};
 pub(crate) use elementwise::{logsigmoid_plan, source_lub, source_weak_scalar_dtype};
