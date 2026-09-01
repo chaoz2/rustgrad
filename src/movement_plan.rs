@@ -63,6 +63,106 @@ pub struct MovementKernelPlan {
     pub cache_key: u64,
 }
 
+/// Borrowed, fully checked projection of the existing raw movement-copy plans.
+/// `view == None` is the dense Contiguous identity map; an AffineCopy retains
+/// its canonical proven read map. Renderers keep only syntax and capability
+/// policy locally.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RawCopyView<'a> {
+    plan: &'a MovementKernelPlan,
+    input: &'a MovementOperand,
+    view: Option<&'a AffineView>,
+    input_elements: usize,
+    input_bytes: usize,
+    elements: usize,
+    bytes: usize,
+}
+
+/// One active term in the checked row-major output-to-source address map.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RawCopyAxis {
+    pub(crate) output_axis: usize,
+    pub(crate) dimension: usize,
+    pub(crate) divisor: usize,
+    pub(crate) stride: usize,
+    pub(crate) reversed: bool,
+}
+
+/// Renderer-neutral unsigned address expression for one raw affine copy.
+/// Backends only spell these already-proved terms in their source language.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RawCopyAddress {
+    pub(crate) offset: usize,
+    pub(crate) axes: Vec<RawCopyAxis>,
+}
+
+impl<'a> RawCopyView<'a> {
+    pub(crate) fn plan(self) -> &'a MovementKernelPlan {
+        self.plan
+    }
+
+    pub(crate) fn input(self) -> &'a MovementOperand {
+        self.input
+    }
+
+    pub(crate) fn address(self) -> Result<Option<RawCopyAddress>, MovementPlanError> {
+        let Some(view) = self.view else {
+            return Ok(None);
+        };
+        let normalized = view
+            .normalized_read()
+            .map_err(|_| MovementPlanError::InvalidGeometry)?;
+        let mut axes = Vec::new();
+        for (output_axis, (&dimension, normalized_axis)) in self
+            .plan
+            .output_shape
+            .dims()
+            .iter()
+            .zip(&normalized.axes)
+            .enumerate()
+        {
+            if self.elements == 0 || dimension <= 1 || normalized_axis.stride == 0 {
+                continue;
+            }
+            let divisor = self.plan.output_shape.dims()[output_axis + 1..]
+                .iter()
+                .try_fold(1usize, |product, next| product.checked_mul(*next))
+                .ok_or(MovementPlanError::Overflow)?;
+            axes.push(RawCopyAxis {
+                output_axis,
+                dimension,
+                divisor,
+                stride: normalized_axis.stride,
+                reversed: normalized_axis.reversed,
+            });
+        }
+        Ok(Some(RawCopyAddress {
+            offset: normalized.offset,
+            axes,
+        }))
+    }
+
+    pub(crate) fn input_elements(self) -> usize {
+        self.input_elements
+    }
+
+    pub(crate) fn input_bytes(self) -> usize {
+        self.input_bytes
+    }
+
+    pub(crate) fn elements(self) -> usize {
+        self.elements
+    }
+
+    pub(crate) fn bytes(self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn width(self) -> usize {
+        self.plan.dtype.itemsize()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MovementPlanError {
     NotMovement,
@@ -131,6 +231,41 @@ impl MovementOperand {
 }
 
 impl MovementKernelPlan {
+    /// Returns the renderer-facing raw copy projection after revalidating the
+    /// canonical plan and both checked byte extents. Other movement kinds stay
+    /// distinct and fail closed at each renderer boundary.
+    pub(crate) fn raw_copy(&self) -> Result<Option<RawCopyView<'_>>, MovementPlanError> {
+        let (input, view) = match &self.kind {
+            MovementKernelKind::AffineCopy { input, view } => (input, Some(view)),
+            MovementKernelKind::Contiguous { input } => (input, None),
+            _ => return Ok(None),
+        };
+        self.validate()?;
+        let input_elements = input
+            .shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let input_bytes = input_elements
+            .checked_mul(input.dtype.itemsize())
+            .ok_or(MovementPlanError::Overflow)?;
+        let elements = self
+            .output_shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let bytes = elements
+            .checked_mul(self.dtype.itemsize())
+            .ok_or(MovementPlanError::Overflow)?;
+        Ok(Some(RawCopyView {
+            plan: self,
+            input,
+            view,
+            input_elements,
+            input_bytes,
+            elements,
+            bytes,
+        }))
+    }
+
     pub fn from_graph(graph: &Graph, output: NodeId) -> Result<Self, MovementPlanError> {
         let kind = match graph
             .op(output)
@@ -1547,6 +1682,33 @@ mod tests {
         assert_eq!(operand.node, input);
         assert_eq!(view.logical_shape, Shape::from([3, 2]));
         assert_eq!(view.strides, [1, 3]);
+        let copy = plan.raw_copy().unwrap().unwrap();
+        assert_eq!(copy.input_elements(), 6);
+        assert_eq!(copy.input_bytes(), 24);
+        assert_eq!(copy.elements(), 6);
+        assert_eq!(copy.bytes(), 24);
+        assert_eq!(copy.width(), 4);
+        let address = copy.address().unwrap().unwrap();
+        assert_eq!(address.offset, 0);
+        assert_eq!(
+            address.axes,
+            [
+                RawCopyAxis {
+                    output_axis: 0,
+                    dimension: 3,
+                    divisor: 2,
+                    stride: 1,
+                    reversed: false,
+                },
+                RawCopyAxis {
+                    output_axis: 1,
+                    dimension: 2,
+                    divisor: 1,
+                    stride: 3,
+                    reversed: false,
+                }
+            ]
+        );
 
         let mut expanded = Graph::new();
         let input = expanded.input_dtype("input", [2, 1], DType::I32);
@@ -1613,6 +1775,10 @@ mod tests {
             &plan.kind,
             MovementKernelKind::Contiguous { input } if input.node == producer
         ));
+        let copy = plan.raw_copy().unwrap().unwrap();
+        assert_eq!(copy.input_elements(), 6);
+        assert_eq!(copy.elements(), 6);
+        assert!(copy.address().unwrap().is_none());
 
         let mut non_affine = Graph::new();
         let input = non_affine.input_dtype("input", [2, 3], DType::F32);

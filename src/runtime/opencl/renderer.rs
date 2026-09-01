@@ -10,7 +10,8 @@ use super::{
     view::OpenClViewAccess,
 };
 use crate::{
-    AffineView, DType, IndexValue, LiteralValue, Operation, ScheduleInputBinding, Shape, UOp,
+    AffineView, DType, IndexValue, LiteralValue, MovementValue, Operation, ScheduleInputBinding,
+    Shape, UOp,
     runtime::scalar_lane::{
         ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
     },
@@ -22,6 +23,7 @@ use std::{
 };
 
 pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v8";
+pub const OPENCL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-opencl-raw-copy-v1";
 pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -120,6 +122,14 @@ impl OpenClRenderer {
     }
 
     pub fn render(&self, root: &UOp) -> Result<RenderedOpenCl, OpenClError> {
+        if let Operation::Movement(value) = root.operation() {
+            return match value {
+                MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
+                MovementValue::QuantizedRowGather(_) => Err(OpenClError::Unsupported(
+                    "quantized movement is outside OpenCL contiguous-copy lowering".into(),
+                )),
+            };
+        }
         if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
@@ -458,6 +468,126 @@ impl OpenClRenderer {
             ))),
         })
     }
+}
+
+fn render_raw_copy(
+    renderer: &OpenClRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedOpenCl, OpenClError> {
+    root.validate()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let copy = plan
+        .raw_copy()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| {
+            OpenClError::Unsupported(
+                "only raw AffineCopy and Contiguous have OpenCL movement lowering".into(),
+            )
+        })?;
+    let input = copy.input();
+    let extent = copy.elements();
+    let width = copy.width();
+    let raw_type = match width {
+        1 => "uchar",
+        2 => "ushort",
+        4 => "uint",
+        8 => "ulong",
+        _ => {
+            return Err(OpenClError::Unsupported(format!(
+                "raw-copy OpenCL storage width {width}"
+            )));
+        }
+    };
+    let required_capabilities = OpenClCapabilities {
+        int64: width == 8,
+        fp64: false,
+    };
+    if !renderer.capabilities.supports(required_capabilities) {
+        return Err(OpenClError::Unsupported(
+            "raw-copy OpenCL 64-bit storage requires 64-bit integer support".into(),
+        ));
+    }
+    debug_assert_eq!(copy.bytes(), extent * width);
+    let input_abi = OpenClBufferAbi {
+        id: input.node.index() as u64,
+        dtype: input.dtype,
+        source_shape: input.shape.clone(),
+        elements: copy.input_elements(),
+        mutable: false,
+        view: None,
+    };
+    let output_abi = OpenClBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: extent,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input_abi.clone(), output_abi];
+    let entry = format!("rg_opencl_raw_copy_w{width}");
+    let mut lines = vec![
+        format!("// {OPENCL_RAW_COPY_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
+        format!("__kernel void {entry}("),
+        format!("    __global const {raw_type}* b0,"),
+        format!("    __global {raw_type}* b1,"),
+        "    ulong extent) {".into(),
+        "  const ulong gid = (ulong)get_global_id(0);".into(),
+        "  if (gid >= extent) return;".into(),
+    ];
+    let source_index = if let Some(address) = copy
+        .address()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
+    {
+        lines.push(format!("  ulong rg_source = (ulong){}ul;", address.offset));
+        for axis in address.axes {
+            let output_axis = axis.output_axis;
+            lines.push(format!(
+                "  ulong rg_axis_{output_axis} = (gid / (ulong){}ul) % (ulong){}ul;",
+                axis.divisor, axis.dimension
+            ));
+            if axis.reversed {
+                lines.push(format!(
+                    "  rg_axis_{output_axis} = (ulong){}ul - rg_axis_{output_axis};",
+                    axis.dimension - 1
+                ));
+            }
+            lines.push(format!(
+                "  rg_source += rg_axis_{output_axis} * (ulong){}ul;",
+                axis.stride
+            ));
+        }
+        "rg_source"
+    } else {
+        "gid"
+    };
+    lines.push(format!("  b1[gid] = b0[{source_index}];"));
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        OPENCL_RAW_COPY_RENDERER_VERSION,
+        OPENCL_ABI_VERSION,
+        renderer.local_size,
+        renderer.capabilities,
+        copy.plan(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedOpenCl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        entry,
+        cache_key,
+        required_capabilities,
+        transaction: None,
+        schedule_inputs: vec![input_abi],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
 }
 
 fn supported_storage(dtype: DType, capabilities: OpenClCapabilities) -> Result<(), OpenClError> {

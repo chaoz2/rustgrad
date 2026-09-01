@@ -31,6 +31,8 @@ mod prefix_scan;
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v31";
 /// Separate identity for raw storage-width computed affine materialization.
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
+/// Separate identity for dense raw storage-width materialization.
+pub const PTX_CONTIGUOUS_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-contiguous-copy-v1";
 pub const PTX_THREEFRY_RENDERER_VERSION: &str = "rustgrad-ptx-live-threefry-v1";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
@@ -166,10 +168,14 @@ impl RenderedPtx {
         {
             plan.validate()
                 .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
-            let MovementKernelKind::AffineCopy { input, .. } = &plan.kind else {
-                return Err(PtxError::Unsupported(
-                    "only AffineCopy has a PTX movement lowering".into(),
-                ));
+            let input = match &plan.kind {
+                MovementKernelKind::AffineCopy { input, .. }
+                | MovementKernelKind::Contiguous { input } => input,
+                _ => {
+                    return Err(PtxError::Unsupported(
+                        "only raw affine and contiguous copies have PTX movement lowering".into(),
+                    ));
+                }
             };
             let input_elements = input.shape.numel().map_err(|_| PtxError::Overflow)?;
             let output_elements = plan.output_shape.numel().map_err(|_| PtxError::Overflow)?;
@@ -188,7 +194,7 @@ impl RenderedPtx {
                 || !self.buffers[1].mutable
             {
                 return Err(PtxError::InvalidBinding(
-                    "affine-copy PTX launch disagrees with its movement plan".into(),
+                    "raw-copy PTX launch disagrees with its movement plan".into(),
                 ));
             }
         }
@@ -621,6 +627,11 @@ fn render(
 ) -> Result<RenderedPtx, PtxError> {
     if let Operation::Movement(value) = root.operation() {
         return match value {
+            MovementValue::Plan(plan)
+                if matches!(&plan.kind, MovementKernelKind::Contiguous { .. }) =>
+            {
+                render_contiguous_copy(renderer, root, plan)
+            }
             MovementValue::Plan(plan) => render_affine_copy(renderer, root, plan),
             MovementValue::QuantizedRowGather(_) => Err(PtxError::Unsupported(
                 "quantized row gather is outside affine-copy PTX lowering".into(),
@@ -906,6 +917,116 @@ fn render(
     })
 }
 
+/// Renders a checked dense owned copy as raw storage words. Numeric decode is
+/// deliberately absent so NaN payloads, signed zero, and Float8 reserved bytes
+/// cross the materialization boundary unchanged.
+fn render_contiguous_copy(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedPtx, PtxError> {
+    root.validate()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    let copy = plan
+        .raw_copy()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| PtxError::Unsupported("movement is not a dense contiguous copy".into()))?;
+    let input = copy.input();
+    let extent = copy.elements();
+    if extent > u32::MAX as usize {
+        return Err(PtxError::Unsupported(
+            "contiguous-copy PTX linear extent exceeds u32 thread indexing".into(),
+        ));
+    }
+    let width = copy.width();
+    let raw_type = match width {
+        1 => "u8",
+        2 => "u16",
+        4 => "u32",
+        8 => "u64",
+        _ => {
+            return Err(PtxError::Unsupported(format!(
+                "contiguous-copy PTX storage width {width}"
+            )));
+        }
+    };
+    debug_assert_eq!(copy.bytes(), extent * width);
+    let buffers = vec![
+        PtxBufferAbi {
+            id: input.node.index() as u64,
+            dtype: input.dtype,
+            source_shape: input.shape.clone(),
+            elements: extent,
+            mutable: false,
+        },
+        PtxBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: plan.dtype,
+            source_shape: plan.output_shape.clone(),
+            elements: extent,
+            mutable: true,
+        },
+    ];
+    let entry = format!("rg_contiguous_copy_w{width}");
+    let value = if width == 8 { "%rd4" } else { "%r4" };
+    let source = [
+        format!("// {PTX_CONTIGUOUS_COPY_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        String::new(),
+        format!(".visible .entry {entry}("),
+        "  .param .u64 p0,".into(),
+        "  .param .u64 p1,".into(),
+        "  .param .u64 extent".into(),
+        ")".into(),
+        "{".into(),
+        "  .reg .pred %p<2>;".into(),
+        "  .reg .b32 %r<8>;".into(),
+        "  .reg .b64 %rd<16>;".into(),
+        "  ld.param.u64 %rd10, [p0];".into(),
+        "  ld.param.u64 %rd11, [p1];".into(),
+        "  ld.param.u64 %rd0, [extent];".into(),
+        "  mov.u32 %r0, %ctaid.x;".into(),
+        "  mov.u32 %r1, %ntid.x;".into(),
+        "  mov.u32 %r2, %tid.x;".into(),
+        "  mad.lo.u32 %r3, %r0, %r1, %r2;".into(),
+        "  cvt.u64.u32 %rd3, %r3;".into(),
+        "  setp.ge.u64 %p0, %rd3, %rd0;".into(),
+        "  @%p0 bra DONE;".into(),
+        format!("  mul.lo.u64 %rd5, %rd3, {width};"),
+        "  add.u64 %rd6, %rd10, %rd5;".into(),
+        "  add.u64 %rd7, %rd11, %rd5;".into(),
+        format!("  ld.global.{raw_type} {value}, [%rd6];"),
+        format!("  st.global.{raw_type} [%rd7], {value};"),
+        "DONE:".into(),
+        "  ret;".into(),
+        "}".into(),
+    ]
+    .join("\n")
+        + "\n";
+    let cache_key = stable_key(&(
+        PTX_CONTIGUOUS_COPY_RENDERER_VERSION,
+        PTX_ABI_VERSION,
+        renderer.sm,
+        copy.plan(),
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedPtx {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent,
+        cache_key,
+        entry,
+        launch: PtxLaunchGeometry::Linear,
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
+    };
+    rendered.validate()?;
+    Ok(rendered)
+}
+
 /// Renders the one movement plan whose address domain is completely proved
 /// before source generation. The kernel copies storage words rather than
 /// numeric values, preserving every concrete dtype payload exactly.
@@ -916,18 +1037,22 @@ fn render_affine_copy(
 ) -> Result<RenderedPtx, PtxError> {
     root.validate()
         .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
-    plan.validate()
-        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
-    let MovementKernelKind::AffineCopy { input, view } = &plan.kind else {
+    let MovementKernelKind::AffineCopy { .. } = &plan.kind else {
         return Err(PtxError::Unsupported(
-            "only AffineCopy has a PTX movement lowering".into(),
+            "only raw affine and contiguous copies have PTX movement lowering".into(),
         ));
     };
-    let normalized = view
-        .normalized_read()
-        .map_err(|_| PtxError::InvalidBinding("invalid affine-copy read map".into()))?;
-    let input_elements = input.shape.numel().map_err(|_| PtxError::Overflow)?;
-    let extent = plan.output_shape.numel().map_err(|_| PtxError::Overflow)?;
+    let copy = plan
+        .raw_copy()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| PtxError::InvalidBinding("missing affine-copy projection".into()))?;
+    let input = copy.input();
+    let address = copy
+        .address()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?
+        .ok_or_else(|| PtxError::InvalidBinding("missing affine-copy address map".into()))?;
+    let input_elements = copy.input_elements();
+    let extent = copy.elements();
     if extent > u32::MAX as usize {
         return Err(PtxError::Unsupported(
             "affine-copy PTX linear extent exceeds u32 thread indexing".into(),
@@ -987,31 +1112,15 @@ fn render_affine_copy(
         "  cvt.u64.u32 %rd3, %r3;".into(),
         "  setp.ge.u64 %p0, %rd3, %rd0;".into(),
         "  @%p0 bra DONE;".into(),
-        format!("  mov.u64 %rd4, {};", normalized.offset),
+        format!("  mov.u64 %rd4, {};", address.offset),
     ];
-    for (axis, (&dimension, normalized_axis)) in plan
-        .output_shape
-        .dims()
-        .iter()
-        .zip(&normalized.axes)
-        .enumerate()
-    {
-        if extent == 0 || dimension <= 1 || normalized_axis.stride == 0 {
-            continue;
+    for axis in address.axes {
+        lines.push(format!("  div.u64 %rd5, %rd3, {};", axis.divisor));
+        lines.push(format!("  rem.u64 %rd5, %rd5, {};", axis.dimension));
+        if axis.reversed {
+            lines.push(format!("  sub.u64 %rd5, {}, %rd5;", axis.dimension - 1));
         }
-        let divisor = plan.output_shape.dims()[axis + 1..]
-            .iter()
-            .try_fold(1usize, |product, next| product.checked_mul(*next))
-            .ok_or(PtxError::Overflow)?;
-        lines.push(format!("  div.u64 %rd5, %rd3, {divisor};"));
-        lines.push(format!("  rem.u64 %rd5, %rd5, {dimension};"));
-        if normalized_axis.reversed {
-            lines.push(format!("  sub.u64 %rd5, {}, %rd5;", dimension - 1));
-        }
-        lines.push(format!(
-            "  mul.lo.u64 %rd6, %rd5, {};",
-            normalized_axis.stride
-        ));
+        lines.push(format!("  mul.lo.u64 %rd6, %rd5, {};", axis.stride));
         lines.push("  add.u64 %rd4, %rd4, %rd6;".into());
     }
     lines.extend([
@@ -7506,6 +7615,19 @@ mod tests {
             .unwrap()
     }
 
+    fn computed_contiguous_item(dtype: DType, shape: impl Into<Shape>) -> crate::ScheduleItem {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", shape, dtype);
+        let producer = graph.square(input).unwrap();
+        let output = graph.contiguous(producer).unwrap();
+        crate::schedule(&graph, output)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.node == output)
+            .unwrap()
+    }
+
     #[test]
     fn computed_affine_copy_ptx_uses_normalized_unsigned_raw_storage_abi() {
         let renderer = PtxRenderer::new(80).unwrap();
@@ -7638,6 +7760,54 @@ mod tests {
     }
 
     #[test]
+    fn computed_contiguous_ptx_uses_dense_raw_storage_abi_for_every_width() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for dtype in DType::ALL {
+            let item = computed_contiguous_item(dtype, [2]);
+            let rendered = renderer.render(&item.kernel).unwrap();
+            rendered
+                .validate_schedule_bindings(item.ordered_inputs())
+                .unwrap();
+            let raw = match dtype.itemsize() {
+                1 => "u8",
+                2 => "u16",
+                4 => "u32",
+                8 => "u64",
+                width => panic!("unexpected concrete storage width {width}"),
+            };
+            assert!(
+                rendered
+                    .source
+                    .contains(PTX_CONTIGUOUS_COPY_RENDERER_VERSION)
+            );
+            assert!(rendered.source.contains(&format!("ld.global.{raw}")));
+            assert!(rendered.source.contains(&format!("st.global.{raw}")));
+            assert_eq!(rendered.buffers[0].elements, 2);
+            assert_eq!(rendered.buffers[1].elements, 2);
+        }
+
+        let scalar = renderer
+            .render(&computed_contiguous_item(DType::U64, Shape::new([])).kernel)
+            .unwrap();
+        assert_eq!(scalar.extent, 1);
+        let empty = renderer
+            .render(&computed_contiguous_item(DType::Bool, [0, 2]).kernel)
+            .unwrap();
+        assert_eq!(empty.extent, 0);
+        let bytes = crate::uop::artifact::encode(&computed_contiguous_item(DType::F32, [2]).kernel)
+            .unwrap();
+        let decoded = crate::uop::artifact::decode(&bytes).unwrap();
+        assert_eq!(crate::uop::artifact::encode(&decoded).unwrap(), bytes);
+        assert!(
+            renderer
+                .render(&decoded)
+                .unwrap()
+                .source
+                .contains(PTX_CONTIGUOUS_COPY_RENDERER_VERSION)
+        );
+    }
+
+    #[test]
     fn prefix_scan_ptx_mock_executes_values_and_indices_without_host_round_trip() {
         use std::num::NonZeroUsize;
 
@@ -7719,7 +7889,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             PtxRenderer::new(80).unwrap().render(&item.kernel),
-            Err(PtxError::Unsupported(reason)) if reason.contains("only AffineCopy")
+            Err(PtxError::Unsupported(reason)) if reason.contains("only raw affine and contiguous")
         ));
     }
 
