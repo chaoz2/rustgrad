@@ -9,11 +9,7 @@ use crate::{
     ConcurrentPtxCache, PrimaryBufferLease, PrimaryContext, PrimaryPtxKernel, PtxBinding, PtxError,
     PtxRenderer, RenderedPtx, ScheduleItem, Stream, TensorData,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::NonZeroUsize,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 struct CudaGraphPlanAdapter {
     renderer: PtxRenderer,
@@ -102,7 +98,8 @@ impl CudaGraphPrefixPlan {
 pub struct PreparedCudaGraphPrefix {
     graph: Option<PrimaryGraphExec>,
     stream: Option<Stream>,
-    leases: BTreeMap<u64, Arc<PrimaryBufferLease>>,
+    leases: Vec<Arc<PrimaryBufferLease>>,
+    logical_slots: BTreeMap<u64, usize>,
     buffer_plans: BTreeMap<u64, crate::runtime::static_schedule::StaticBufferPlan>,
     external_inputs: Vec<u64>,
     retained_outputs: Vec<u64>,
@@ -148,32 +145,22 @@ impl PreparedCudaGraphPrefix {
             });
         }
 
-        let allocated_ids = plan
-            .items()
-            .zip(&kernels)
-            .filter(|(_, kernel)| kernel.is_some())
-            .flat_map(|(item, _)| item.buffer_ids().iter().copied())
-            .collect::<BTreeSet<_>>();
         let allocator = primary.allocator();
-        let mut leases = BTreeMap::new();
-        for id in plan
-            .buffer_order()
-            .iter()
-            .filter(|id| allocated_ids.contains(*id))
-        {
-            let buffer = &plan.buffers()[id];
-            let bytes = NonZeroUsize::new(buffer.bytes).ok_or_else(|| {
+        let mut leases = Vec::with_capacity(plan.allocations().slots().len());
+        for (slot, allocation) in plan.allocations().slots().iter().enumerate() {
+            let bytes = NonZeroUsize::new(allocation.bytes).ok_or_else(|| {
                 PtxError::Unsupported(format!(
-                    "nonzero CUDA graph item requires zero-byte buffer {id}"
+                    "nonzero CUDA graph item requires zero-byte physical slot {slot}"
                 ))
             })?;
-            leases.insert(*id, Arc::new(allocator.allocate(bytes)?));
+            leases.push(Arc::new(allocator.allocate(bytes)?));
         }
+        let logical_slots = plan.allocations().logical_slots().clone();
 
         let (stream, graph) = if has_work {
             let stream = primary.stream()?;
             let mut capture = stream.begin_capture()?;
-            for lease in leases.values() {
+            for lease in &leases {
                 capture.retain_shared(lease.clone())?;
             }
             for kernel in kernels.iter().flatten() {
@@ -187,8 +174,9 @@ impl PreparedCudaGraphPrefix {
                     .zip(&item.rendered().buffers)
                     .map(|(id, abi)| {
                         Ok(PtxBinding {
-                            buffer: leases
+                            buffer: logical_slots
                                 .get(id)
+                                .and_then(|slot| leases.get(*slot))
                                 .ok_or_else(|| {
                                     PtxError::InvalidBinding(format!(
                                         "CUDA graph buffer {id} is absent"
@@ -212,6 +200,7 @@ impl PreparedCudaGraphPrefix {
             graph,
             stream,
             leases,
+            logical_slots,
             buffer_plans: plan.buffers().clone(),
             external_inputs: plan.external_inputs().to_vec(),
             retained_outputs: plan.retained_outputs().to_vec(),
@@ -261,12 +250,16 @@ impl PreparedCudaGraphPrefix {
             .iter()
             .map(|id| (*id, vec![0; self.buffer_plans[id].bytes]))
             .collect::<Vec<_>>();
-        for lease in self.leases.values() {
+        for lease in &self.leases {
             lease.execution_metadata()?;
         }
 
         for (id, bytes) in &uploads {
-            if let Some(lease) = self.leases.get(id) {
+            if let Some(lease) = self
+                .logical_slots
+                .get(id)
+                .and_then(|slot| self.leases.get(*slot))
+            {
                 lease.view()?.copy_from(0, bytes)?;
             }
         }
@@ -285,7 +278,7 @@ impl PreparedCudaGraphPrefix {
                 return Err(self.settle_or_poison(settled, error));
             }
             if !self.fence_attached {
-                for lease in self.leases.values() {
+                for lease in &self.leases {
                     if let Err(error) = lease.attach_fence(fence.clone()) {
                         let settled = stream.synchronize().is_ok();
                         return Err(self.settle_or_poison(settled, error));
@@ -299,8 +292,9 @@ impl PreparedCudaGraphPrefix {
             }
             for (id, bytes) in &mut downloads {
                 if !bytes.is_empty() {
-                    self.leases
+                    self.logical_slots
                         .get(id)
+                        .and_then(|slot| self.leases.get(*slot))
                         .ok_or_else(|| {
                             PtxError::InvalidBinding(format!(
                                 "retained CUDA graph output {id} has no lease"
@@ -336,7 +330,7 @@ impl PreparedCudaGraphPrefix {
 
     fn poison(&mut self) {
         self.poisoned = true;
-        for lease in self.leases.values() {
+        for lease in &self.leases {
             lease.quarantine();
         }
         if let Some(graph) = self.graph.as_mut() {
@@ -376,6 +370,59 @@ mod tests {
             input.index() as u64,
             [left.index() as u64, right.index() as u64],
         )
+    }
+
+    fn reusable_linear() -> (crate::Schedule, u64, [u64; 4]) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], crate::DType::F32);
+        let first_value = graph.square(input).unwrap();
+        let first = graph.contiguous(first_value).unwrap();
+        let second_value = graph.square(first).unwrap();
+        let second = graph.contiguous(second_value).unwrap();
+        let third_value = graph.square(second).unwrap();
+        let third = graph.contiguous(third_value).unwrap();
+        let output_value = graph.square(third).unwrap();
+        let output = graph.contiguous(output_value).unwrap();
+        (
+            crate::schedule(&graph, output).unwrap(),
+            input.index() as u64,
+            [
+                first.index() as u64,
+                second.index() as u64,
+                third.index() as u64,
+                output.index() as u64,
+            ],
+        )
+    }
+
+    #[test]
+    fn cuda_graph_reuses_one_stable_lease_for_disjoint_logical_temporaries() {
+        let (schedule, external, outputs) = reusable_linear();
+        assert_eq!(schedule.items.len(), 4);
+        let (mock, primary) = make_primary();
+        let mut prepared = prepare_outputs(primary, &schedule, &[outputs[3]]);
+        assert_eq!(
+            mock.calls().iter().filter(|call| **call == "alloc").count(),
+            4
+        );
+        assert_eq!(
+            prepared.logical_slots[&outputs[0]],
+            prepared.logical_slots[&outputs[2]]
+        );
+        let shared_slot = prepared.logical_slots[&outputs[0]];
+        let stable_lease = prepared.leases[shared_slot].clone();
+
+        let mut first = input(external, [1.0, -1.0]);
+        prepared.execute(&mut first).unwrap();
+        assert_f32(&first, outputs[3], &[1.0, 1.0]);
+        let mut second = input(external, [1.0, 1.0]);
+        prepared.execute(&mut second).unwrap();
+        assert_f32(&second, outputs[3], &[1.0, 1.0]);
+        assert!(Arc::ptr_eq(&stable_lease, &prepared.leases[shared_slot]));
+        assert_eq!(
+            mock.calls().iter().filter(|call| **call == "alloc").count(),
+            4
+        );
     }
 
     fn input(id: u64, values: [f32; 2]) -> BTreeMap<u64, TensorData> {
@@ -424,7 +471,7 @@ mod tests {
                 .filter(|call| **call == "alloc")
                 .count(),
             4,
-            "one stable lease is allocated for each logical buffer"
+            "this branch has four simultaneously live physical slots"
         );
 
         let mut values = input(external, [2.0, 3.0]);
@@ -470,7 +517,7 @@ mod tests {
         assert_eq!(
             second_calls.iter().filter(|call| **call == "alloc").count(),
             4,
-            "replay never reallocates a logical buffer"
+            "replay never reallocates a physical slot"
         );
     }
 

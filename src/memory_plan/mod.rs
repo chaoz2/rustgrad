@@ -53,6 +53,97 @@ pub struct MemoryPlan {
     pub peak_bytes: usize,
 }
 
+/// Whether one validated logical allocation participates in exact slot reuse.
+/// `Absent` retains logical zero-domain metadata without creating storage,
+/// while `Private` creates storage that can never be offered to another value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactSlotPolicy {
+    Absent,
+    Private,
+    Reusable,
+}
+
+/// Backend-neutral input to the deterministic exact-compatible slot allocator.
+/// The caller owns descriptor validation and chooses the complete compatibility
+/// key for its address space; this seam owns only lifetime ordering and reuse.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExactSlotRequest<I, C> {
+    pub(crate) identity: I,
+    pub(crate) compatibility: C,
+    pub(crate) producer_position: usize,
+    pub(crate) last_consumer_position: usize,
+    pub(crate) policy: ExactSlotPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExactSlotAssignment<I> {
+    pub(crate) identity: I,
+    pub(crate) slot: Option<u64>,
+    pub(crate) reused_from: Option<I>,
+}
+
+struct ExactPhysicalSlot<I, C> {
+    id: u64,
+    current: I,
+    compatibility: C,
+    last_consumer_position: usize,
+    reusable: bool,
+}
+
+/// Assigns deterministic physical slots without interpreting operation kinds,
+/// descriptors, or backend resources. Reuse requires an exact compatibility
+/// key and a strict lifetime gap so one item can never read and overwrite a
+/// shared slot simultaneously.
+pub(crate) fn assign_exact_slots<I, C>(
+    requests: impl IntoIterator<Item = ExactSlotRequest<I, C>>,
+) -> Vec<ExactSlotAssignment<I>>
+where
+    I: Clone,
+    C: Clone + Eq,
+{
+    let mut slots = Vec::<ExactPhysicalSlot<I, C>>::new();
+    let mut assignments = Vec::new();
+    for request in requests {
+        let available = if request.policy == ExactSlotPolicy::Reusable {
+            slots.iter().position(|slot| {
+                slot.reusable
+                    && slot.last_consumer_position < request.producer_position
+                    && slot.compatibility == request.compatibility
+            })
+        } else {
+            None
+        };
+        let (slot, reused_from) = match (request.policy, available) {
+            (ExactSlotPolicy::Absent, _) => (None, None),
+            (_, Some(index)) => {
+                let slot = &mut slots[index];
+                let reused_from = slot.current.clone();
+                slot.current = request.identity.clone();
+                slot.compatibility = request.compatibility;
+                slot.last_consumer_position = request.last_consumer_position;
+                (Some(slot.id), Some(reused_from))
+            }
+            (_, None) => {
+                let slot = slots.len() as u64;
+                slots.push(ExactPhysicalSlot {
+                    id: slot,
+                    current: request.identity.clone(),
+                    compatibility: request.compatibility,
+                    last_consumer_position: request.last_consumer_position,
+                    reusable: request.policy == ExactSlotPolicy::Reusable,
+                });
+                (Some(slot), None)
+            }
+        };
+        assignments.push(ExactSlotAssignment {
+            identity: request.identity,
+            slot,
+            reused_from,
+        });
+    }
+    assignments
+}
+
 /// Immutable liveness record for one versioned persistent base/view write.
 /// Persistent effect leases intentionally remain owned by `EffectRuntime`; this
 /// plan proves their logical aliases cannot be treated as reusable temporaries.
@@ -309,56 +400,45 @@ impl MemoryPlan {
             }
         }
         requests.sort_by_key(|(position, request)| (*position, request.buffer_id));
-        let mut slots: Vec<(u64, AllocationRequest, usize)> = vec![];
-        let mut temporaries_out = Vec::with_capacity(requests.len());
-        for (producer_position, request) in &requests {
-            if request.bytes == 0 {
-                temporaries_out.push(TemporaryAllocation {
-                    buffer_id: request.buffer_id,
-                    allocation_id: None,
-                    producer_item: request.producer_item,
-                    last_consumer: request.last_consumer,
-                    bytes: 0,
-                    alignment: request.alignment,
-                    reused_from: None,
-                });
-                continue;
-            }
-            let available = reuse
-                .then(|| {
-                    slots
-                        .iter()
-                        .enumerate()
-                        .find_map(|(index, (_, prior, last_position))| {
-                            (last_position < producer_position
-                                && prior.bytes == request.bytes
-                                && prior.dtype == request.dtype
-                                && prior.shape == request.shape
-                                && prior.alignment == request.alignment
-                                && prior.address_space == request.address_space)
-                                .then_some(index)
-                        })
+        let exact_requests = requests
+            .iter()
+            .map(|(producer_position, request)| {
+                Ok(ExactSlotRequest {
+                    identity: request.buffer_id,
+                    compatibility: (
+                        request.bytes,
+                        request.dtype,
+                        request.shape.clone(),
+                        request.alignment,
+                        request.address_space,
+                    ),
+                    producer_position: *producer_position,
+                    last_consumer_position: request_last_position(items, request)?,
+                    policy: if request.bytes == 0 {
+                        ExactSlotPolicy::Absent
+                    } else if reuse {
+                        ExactSlotPolicy::Reusable
+                    } else {
+                        ExactSlotPolicy::Private
+                    },
                 })
-                .flatten();
-            let (allocation_id, reused_from) = if let Some(slot) = available {
-                let (id, prior, last_position) = &mut slots[slot];
-                let previous = prior.buffer_id;
-                *prior = request.clone();
-                *last_position = request_last_position(items, request)?;
-                (*id, Some(previous))
-            } else {
-                let id = slots.len() as u64;
-                slots.push((id, request.clone(), request_last_position(items, request)?));
-                (id, None)
-            };
+            })
+            .collect::<Result<Vec<_>, MemoryPlanError>>()?;
+        let assignments = assign_exact_slots(exact_requests)
+            .into_iter()
+            .map(|assignment| (assignment.identity, assignment))
+            .collect::<BTreeMap<_, _>>();
+        let mut temporaries_out = Vec::with_capacity(requests.len());
+        for (_, request) in &requests {
+            let assignment = &assignments[&request.buffer_id];
             temporaries_out.push(TemporaryAllocation {
                 buffer_id: request.buffer_id,
-                allocation_id: Some(allocation_id),
+                allocation_id: assignment.slot,
                 producer_item: request.producer_item,
                 last_consumer: request.last_consumer,
                 bytes: request.bytes,
                 alignment: request.alignment,
-                reused_from,
+                reused_from: assignment.reused_from,
             });
         }
         let peak = peak(&temporaries_out)?;
@@ -404,6 +484,107 @@ fn peak(allocations: &[TemporaryAllocation]) -> Result<(usize, usize), MemoryPla
 mod tests {
     use super::*;
     use crate::{DType, Graph, Shape, TensorData, UOp};
+
+    #[test]
+    fn exact_slot_assignment_requires_strict_disjoint_lifetimes_and_exact_classes() {
+        let requests = [
+            ExactSlotRequest {
+                identity: 10u64,
+                compatibility: (16usize, DType::F32, Shape::from([4]), 4usize, "device-a"),
+                producer_position: 0,
+                last_consumer_position: 1,
+                policy: ExactSlotPolicy::Reusable,
+            },
+            ExactSlotRequest {
+                identity: 11,
+                compatibility: (16, DType::F32, Shape::from([4]), 4, "device-a"),
+                producer_position: 1,
+                last_consumer_position: 2,
+                policy: ExactSlotPolicy::Reusable,
+            },
+            ExactSlotRequest {
+                identity: 12,
+                compatibility: (16, DType::F32, Shape::from([4]), 4, "device-a"),
+                producer_position: 2,
+                last_consumer_position: 3,
+                policy: ExactSlotPolicy::Reusable,
+            },
+            ExactSlotRequest {
+                identity: 13,
+                compatibility: (16, DType::F32, Shape::from([4]), 8, "device-a"),
+                producer_position: 4,
+                last_consumer_position: 4,
+                policy: ExactSlotPolicy::Reusable,
+            },
+            ExactSlotRequest {
+                identity: 14,
+                compatibility: (16, DType::F32, Shape::from([4]), 4, "device-b"),
+                producer_position: 5,
+                last_consumer_position: 5,
+                policy: ExactSlotPolicy::Reusable,
+            },
+            ExactSlotRequest {
+                identity: 15,
+                compatibility: (16, DType::I32, Shape::from([4]), 4, "device-a"),
+                producer_position: 6,
+                last_consumer_position: 6,
+                policy: ExactSlotPolicy::Reusable,
+            },
+            ExactSlotRequest {
+                identity: 16,
+                compatibility: (16, DType::F32, Shape::from([2, 2]), 4, "device-a"),
+                producer_position: 7,
+                last_consumer_position: 7,
+                policy: ExactSlotPolicy::Reusable,
+            },
+            ExactSlotRequest {
+                identity: 17,
+                compatibility: (32, DType::F32, Shape::from([4]), 4, "device-a"),
+                producer_position: 8,
+                last_consumer_position: 8,
+                policy: ExactSlotPolicy::Reusable,
+            },
+        ];
+        let assigned = assign_exact_slots(requests);
+        assert_ne!(assigned[0].slot, assigned[1].slot);
+        assert_eq!(assigned[0].slot, assigned[2].slot);
+        assert_ne!(assigned[2].slot, assigned[3].slot);
+        assert_ne!(assigned[2].slot, assigned[4].slot);
+        assert_ne!(assigned[2].slot, assigned[5].slot);
+        assert_ne!(assigned[2].slot, assigned[6].slot);
+        assert_ne!(assigned[2].slot, assigned[7].slot);
+        assert_eq!(assigned[2].reused_from, Some(10));
+    }
+
+    #[test]
+    fn absent_and_private_exact_slot_requests_never_enter_the_reuse_pool() {
+        let assigned = assign_exact_slots([
+            ExactSlotRequest {
+                identity: 1u64,
+                compatibility: 8usize,
+                producer_position: 0,
+                last_consumer_position: 0,
+                policy: ExactSlotPolicy::Absent,
+            },
+            ExactSlotRequest {
+                identity: 2,
+                compatibility: 8,
+                producer_position: 0,
+                last_consumer_position: 0,
+                policy: ExactSlotPolicy::Private,
+            },
+            ExactSlotRequest {
+                identity: 3,
+                compatibility: 8,
+                producer_position: 1,
+                last_consumer_position: 1,
+                policy: ExactSlotPolicy::Reusable,
+            },
+        ]);
+        assert_eq!(assigned[0].slot, None);
+        assert_ne!(assigned[1].slot, assigned[2].slot);
+        assert!(assigned.iter().all(|entry| entry.reused_from.is_none()));
+    }
 
     fn shared_schedule() -> (Graph, Schedule, crate::NodeId, crate::NodeId) {
         let mut graph = Graph::new();

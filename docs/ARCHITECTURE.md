@@ -555,9 +555,19 @@ consumer lists that exactly mirror the derived reverse edges, and valid shared
 buffer descriptors for every input/output. The same descriptor seam validates
 direct temporary planning and artifact decode before allocation, cache, or
 backend work. It is artifact integrity validation, not a new scheduler, compiler backend, or device
-contract. HostDense
-temporary slots reuse only exact-compatible non-aliasing buffers; backend-owned
-slots and vectorization remain outside this planner. Sharded CUDA mock execution
+contract. HostDense temporary slots reuse only exact-compatible non-aliasing
+buffers. Validated pure static prefixes additionally project the authenticated
+rendered buffer graph onto runtime-private device slots: only nonexternal,
+unretained, single-producer temporaries with strictly disjoint inclusive
+lifetimes and exactly equal dtype, source shape, byte length, alignment, and
+backend domain may share a slot. External inputs and retained outputs stay
+private because uploads precede all launches and downloads follow them; zero-byte
+native sentinels also stay private. OpenCL, Metal, and WebGPU prepared prefixes
+own each physical slot once behind a logical-ID map, while CUDA graph capture
+retains one stable lease per physical slot and fences or quarantines it once.
+This projection changes no logical binding order, BufferDesc, ScheduleItem,
+artifact, or cache identity; capacity-class reuse, suballocation, aliases,
+effects, dynamic schedules, and cross-backend slots remain outside it. Sharded CUDA mock execution
 has graph-derived local Add evidence across one, two, and four owners for F32,
 I32, and U64, including canonical zero-byte routes. Typed graph-derived
 redistribution now validates layouts, ranks, owners, node-buffer identities,

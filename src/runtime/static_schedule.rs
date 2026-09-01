@@ -4,7 +4,10 @@
 //! buffer residency and side-effect boundary common to the prepared OpenCL,
 //! Metal, WebGPU, and fixed-schema CUDA graph paths.
 
-use crate::{DType, Operation, ScheduleItem, Shape, TensorData};
+use crate::{
+    DType, Operation, ScheduleItem, Shape, TensorData,
+    memory_plan::{ExactSlotPolicy, ExactSlotRequest, assign_exact_slots},
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod sealed {
@@ -142,6 +145,39 @@ pub(crate) struct StaticBufferPlan {
     pub(crate) producer: Option<usize>,
 }
 
+/// Exact within one `StaticPlanAdapter` build; the adapter type is the backend
+/// domain, so a slot can never cross renderer/device address spaces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StaticSlotCompatibility {
+    dtype: DType,
+    source_shape: Shape,
+    bytes: usize,
+    alignment: usize,
+}
+
+/// Runtime-only physical allocation projection for one validated single-device
+/// prefix. Logical IDs remain the renderer ABI; slots own native resources.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StaticAllocationPlan {
+    slots: Vec<StaticBufferAllocation>,
+    logical_slots: BTreeMap<u64, usize>,
+}
+
+impl StaticAllocationPlan {
+    pub(crate) fn slots(&self) -> &[StaticBufferAllocation] {
+        &self.slots
+    }
+
+    pub(crate) fn logical_slots(&self) -> &BTreeMap<u64, usize> {
+        &self.logical_slots
+    }
+
+    #[cfg(test)]
+    fn peak_bytes(&self) -> usize {
+        self.slots.iter().map(|slot| slot.bytes).sum()
+    }
+}
+
 pub(crate) struct StaticItemPlan<R> {
     rendered: R,
     cache_key: String,
@@ -154,9 +190,9 @@ pub(crate) struct StaticItemPlan<R> {
 pub(crate) struct StaticSchedulePlan<R> {
     items: Vec<StaticItemPlan<R>>,
     buffers: BTreeMap<u64, StaticBufferPlan>,
-    buffer_order: Vec<u64>,
     external_inputs: Vec<u64>,
     retained_outputs: Vec<u64>,
+    allocations: StaticAllocationPlan,
 }
 
 /// Pure renderer/planner seam shared by ordinary device execution and CUDA
@@ -217,16 +253,16 @@ impl<R> StaticSchedulePlan<R> {
         &self.buffers
     }
 
-    pub(crate) fn buffer_order(&self) -> &[u64] {
-        &self.buffer_order
-    }
-
     pub(crate) fn external_inputs(&self) -> &[u64] {
         &self.external_inputs
     }
 
     pub(crate) fn retained_outputs(&self) -> &[u64] {
         &self.retained_outputs
+    }
+
+    pub(crate) fn allocations(&self) -> &StaticAllocationPlan {
+        &self.allocations
     }
 
     pub(crate) fn build<A>(
@@ -283,7 +319,8 @@ impl<R> StaticSchedulePlan<R> {
             }
             let output = rendered.buffers.last().expect("checked nonempty");
             let expected = item.primary_output();
-            if output.id != expected.id
+            if expected.view.is_some()
+                || output.id != expected.id
                 || output.dtype != expected.dtype
                 || output.source_shape != expected.shape
                 || output.elements != expected.shape.numel().map_err(|_| A::overflow())?
@@ -422,14 +459,21 @@ impl<R> StaticSchedulePlan<R> {
             .iter()
             .copied()
             .filter(|id| buffers[id].producer.is_none())
-            .collect();
+            .collect::<Vec<_>>();
+        let allocations = build_static_allocation_plan::<A>(
+            &planned,
+            &buffers,
+            &buffer_order,
+            &external_inputs,
+            &retained_outputs,
+        )?;
 
         Ok(Self {
             items: planned,
             buffers,
-            buffer_order,
             external_inputs,
             retained_outputs,
+            allocations,
         })
     }
 
@@ -440,6 +484,126 @@ impl<R> StaticSchedulePlan<R> {
             .map(|item| item.cache_key.clone())
             .collect()
     }
+}
+
+fn build_static_allocation_plan<A: StaticPlanAdapter>(
+    items: &[StaticItemPlan<A::Rendered>],
+    buffers: &BTreeMap<u64, StaticBufferPlan>,
+    buffer_order: &[u64],
+    external_inputs: &[u64],
+    retained_outputs: &[u64],
+) -> Result<StaticAllocationPlan, A::Error> {
+    let required = items
+        .iter()
+        .filter(|item| item.extent != 0)
+        .flat_map(|item| item.buffer_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let external = external_inputs.iter().copied().collect::<BTreeSet<_>>();
+    let retained = retained_outputs.iter().copied().collect::<BTreeSet<_>>();
+    let mut requests = buffer_order
+        .iter()
+        .enumerate()
+        .map(|(order, id)| {
+            let buffer = &buffers[id];
+            let producer_position = buffer.producer.unwrap_or(0);
+            let last_consumer_position = items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    item.buffer_ids
+                        .get(..item.buffer_ids.len().saturating_sub(1))
+                        .is_some_and(|inputs| inputs.contains(id))
+                })
+                .map(|(position, _)| position)
+                .max()
+                .unwrap_or(producer_position);
+            let policy = if !required.contains(id) {
+                ExactSlotPolicy::Absent
+            } else if buffer.bytes != 0
+                && buffer.producer.is_some()
+                && !external.contains(id)
+                && !retained.contains(id)
+            {
+                ExactSlotPolicy::Reusable
+            } else {
+                ExactSlotPolicy::Private
+            };
+            (
+                producer_position,
+                order,
+                ExactSlotRequest {
+                    identity: *id,
+                    compatibility: StaticSlotCompatibility {
+                        dtype: buffer.dtype,
+                        source_shape: buffer.source_shape.clone(),
+                        bytes: buffer.bytes,
+                        alignment: buffer.alignment,
+                    },
+                    producer_position,
+                    last_consumer_position,
+                    policy,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    requests.sort_by_key(|(producer, order, _)| (*producer, *order));
+    let assignments = assign_exact_slots(requests.into_iter().map(|(_, _, request)| request));
+    let slot_count = assignments
+        .iter()
+        .filter_map(|assignment| assignment.slot)
+        .max()
+        .map_or(0usize, |slot| slot as usize + 1);
+    let mut slots = vec![None; slot_count];
+    let mut logical_slots = BTreeMap::new();
+    for assignment in assignments {
+        let Some(slot) = assignment.slot else {
+            continue;
+        };
+        let slot = usize::try_from(slot).map_err(|_| A::overflow())?;
+        let buffer = &buffers[&assignment.identity];
+        let allocation = StaticBufferAllocation {
+            elements: buffer.elements,
+            bytes: buffer.bytes,
+            dtype: buffer.dtype,
+            requires_native_handle: true,
+        };
+        match &slots[slot] {
+            Some(existing) if existing != &allocation => {
+                return Err(A::invalid_binding(
+                    "reused static slot has conflicting physical descriptors".into(),
+                ));
+            }
+            Some(_) => {}
+            None => slots[slot] = Some(allocation),
+        }
+        logical_slots.insert(assignment.identity, slot);
+    }
+    let slots = slots
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| A::invalid_binding("static allocation slot is vacant".into()))?;
+    for item in items.iter().filter(|item| item.extent != 0) {
+        let item_slots = item
+            .buffer_ids
+            .iter()
+            .map(|id| logical_slots.get(id).copied())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                A::invalid_binding("nonzero static item has an unallocated logical buffer".into())
+            })?;
+        if item_slots.iter().copied().collect::<BTreeSet<_>>().len() != item_slots.len() {
+            return Err(A::invalid_binding(
+                "distinct logical buffers in one static item alias a physical slot".into(),
+            ));
+        }
+    }
+    slots.iter().try_fold(0usize, |total, allocation| {
+        total.checked_add(allocation.bytes).ok_or_else(A::overflow)
+    })?;
+    Ok(StaticAllocationPlan {
+        slots,
+        logical_slots,
+    })
 }
 
 impl<R> StaticItemPlan<R> {
@@ -468,7 +632,8 @@ pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     adapter: A,
     queue: Option<A::Queue>,
     items: Vec<PreparedStaticItem<A::Kernel>>,
-    buffers: BTreeMap<u64, A::Buffer>,
+    slots: Vec<A::Buffer>,
+    logical_slots: BTreeMap<u64, usize>,
     buffer_plans: BTreeMap<u64, StaticBufferPlan>,
     external_inputs: Vec<u64>,
     retained_outputs: Vec<u64>,
@@ -495,9 +660,17 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         adapter: A,
         plan: StaticSchedulePlan<A::Rendered>,
     ) -> Result<Self, A::Error> {
+        let StaticSchedulePlan {
+            items,
+            buffers: buffer_plans,
+            external_inputs,
+            retained_outputs,
+            allocations,
+            ..
+        } = plan;
         let prepare_zero_extent = adapter.prepare_zero_extent();
-        let mut prepared_items = Vec::with_capacity(plan.items.len());
-        for item in plan.items {
+        let mut prepared_items = Vec::with_capacity(items.len());
+        for item in items {
             let kernel = if item.extent != 0 || prepare_zero_extent {
                 Some(adapter.compile(&item.rendered)?)
             } else {
@@ -513,35 +686,9 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 buffer_ids: item.buffer_ids,
             });
         }
-        let allocated_ids = prepared_items
-            .iter()
-            .filter(|item| item.extent != 0)
-            .flat_map(|item| item.buffer_ids.iter().copied())
-            .collect::<BTreeSet<_>>();
-        // Compilation policy is intentionally neither logical allocation nor
-        // physical-handle policy: OpenCL/WebGPU compile zero-extent items, but
-        // those items retain the established no-native-buffer behavior.
-        let native_handle_ids = prepared_items
-            .iter()
-            .filter(|item| item.extent != 0)
-            .flat_map(|item| item.buffer_ids.iter().copied())
-            .collect::<BTreeSet<_>>();
-        let mut buffers = BTreeMap::new();
-        for id in plan
-            .buffer_order
-            .iter()
-            .filter(|id| allocated_ids.contains(*id))
-        {
-            let buffer = &plan.buffers[id];
-            buffers.insert(
-                *id,
-                adapter.allocate(StaticBufferAllocation {
-                    elements: buffer.elements,
-                    bytes: buffer.bytes,
-                    dtype: buffer.dtype,
-                    requires_native_handle: native_handle_ids.contains(id),
-                })?,
-            );
+        let mut slots = Vec::with_capacity(allocations.slots.len());
+        for allocation in &allocations.slots {
+            slots.push(adapter.allocate(*allocation)?);
         }
         let queue = prepared_items
             .iter()
@@ -556,10 +703,11 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             adapter,
             queue,
             items: prepared_items,
-            buffers,
-            buffer_plans: plan.buffers,
-            external_inputs: plan.external_inputs,
-            retained_outputs: plan.retained_outputs,
+            slots,
+            logical_slots: allocations.logical_slots,
+            buffer_plans,
+            external_inputs,
+            retained_outputs,
             compiled_cache_keys,
         })
     }
@@ -570,6 +718,12 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
 
     pub(crate) fn compiled_cache_keys(&self) -> Vec<String> {
         self.compiled_cache_keys.clone()
+    }
+
+    fn buffer(&self, id: u64) -> Option<&A::Buffer> {
+        self.logical_slots
+            .get(&id)
+            .and_then(|slot| self.slots.get(*slot))
     }
 
     pub(crate) fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), A::Error> {
@@ -593,7 +747,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     "prefix input {id} byte length mismatch"
                 )));
             }
-            if self.buffers.contains_key(id) {
+            if self.buffer(*id).is_some() {
                 uploads.push((*id, bytes));
             }
         }
@@ -605,7 +759,13 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
 
         if let Some(queue) = &self.queue {
             for (id, bytes) in &uploads {
-                self.adapter.write(queue, &self.buffers[id], bytes)?;
+                self.adapter.write(
+                    queue,
+                    self.buffer(*id).ok_or_else(|| {
+                        A::invalid_binding(format!("logical input buffer {id} is absent"))
+                    })?,
+                    bytes,
+                )?;
             }
             for item in &self.items {
                 if item.extent == 0 {
@@ -620,7 +780,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     .buffer_ids
                     .iter()
                     .map(|id| {
-                        self.buffers.get(id).ok_or_else(|| {
+                        self.buffer(*id).ok_or_else(|| {
                             A::invalid_binding(format!("logical buffer {id} is absent"))
                         })
                     })
@@ -629,7 +789,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             }
             for (id, bytes) in &mut downloads {
                 if !bytes.is_empty() {
-                    let buffer = self.buffers.get(id).ok_or_else(|| {
+                    let buffer = self.buffer(*id).ok_or_else(|| {
                         A::invalid_binding(format!(
                             "nonempty retained output {id} has no device allocation"
                         ))
@@ -713,10 +873,12 @@ mod tests {
     struct Calls {
         compile: usize,
         allocate: usize,
+        release: usize,
         queue: usize,
         write: usize,
         launch: usize,
         read: usize,
+        fail_allocate_after: Option<usize>,
         fail_launch_after: Option<usize>,
         fail_read_after: Option<usize>,
         allocations: Vec<StaticBufferAllocation>,
@@ -727,7 +889,16 @@ mod tests {
     struct FakeRendered;
     struct FakeKernel;
     struct FakeQueue;
-    struct FakeBuffer(RefCell<Vec<u8>>);
+    struct FakeBuffer {
+        bytes: RefCell<Vec<u8>>,
+        calls: Rc<RefCell<Calls>>,
+    }
+
+    impl Drop for FakeBuffer {
+        fn drop(&mut self) {
+            self.calls.borrow_mut().release += 1;
+        }
+    }
 
     impl Sealed for FakeAdapter {}
     impl StaticPlanAdapter for FakeAdapter {
@@ -784,12 +955,18 @@ mod tests {
             let mut calls = self.0.borrow_mut();
             calls.allocate += 1;
             calls.allocations.push(request);
+            if let Some(remaining) = calls.fail_allocate_after.as_mut() {
+                if *remaining == 0 {
+                    calls.fail_allocate_after = None;
+                    return Err("injected allocation failure".into());
+                }
+                *remaining -= 1;
+            }
             drop(calls);
-            Ok(FakeBuffer(RefCell::new(vec![
-                0;
-                request.elements
-                    * request.dtype.itemsize()
-            ])))
+            Ok(FakeBuffer {
+                bytes: RefCell::new(vec![0; request.elements * request.dtype.itemsize()]),
+                calls: self.0.clone(),
+            })
         }
         fn create_queue(&self) -> Result<Self::Queue, Self::Error> {
             self.0.borrow_mut().queue += 1;
@@ -802,7 +979,7 @@ mod tests {
             bytes: &[u8],
         ) -> Result<(), Self::Error> {
             self.0.borrow_mut().write += 1;
-            buffer.0.borrow_mut().copy_from_slice(bytes);
+            buffer.bytes.borrow_mut().copy_from_slice(bytes);
             Ok(())
         }
         fn launch_and_wait(
@@ -824,13 +1001,13 @@ mod tests {
             let bytes = buffers
                 .first()
                 .ok_or_else(|| "missing input".to_owned())?
-                .0
+                .bytes
                 .borrow()
                 .clone();
             buffers
                 .last()
                 .ok_or_else(|| "missing output".to_owned())?
-                .0
+                .bytes
                 .borrow_mut()
                 .copy_from_slice(&bytes);
             Ok(())
@@ -851,7 +1028,7 @@ mod tests {
                 *remaining -= 1;
             }
             drop(calls);
-            bytes.copy_from_slice(&buffer.0.borrow());
+            bytes.copy_from_slice(&buffer.bytes.borrow());
             Ok(())
         }
         fn cache_len(&self) -> usize {
@@ -889,6 +1066,149 @@ mod tests {
         )
     }
 
+    fn reusable_linear_schedule() -> (crate::Schedule, u64, [u64; 4]) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let first_value = graph.square(input).unwrap();
+        let first = graph.contiguous(first_value).unwrap();
+        let second_value = graph.square(first).unwrap();
+        let second = graph.contiguous(second_value).unwrap();
+        let third_value = graph.square(second).unwrap();
+        let third = graph.contiguous(third_value).unwrap();
+        let output_value = graph.square(third).unwrap();
+        let output = graph.contiguous(output_value).unwrap();
+        (
+            crate::schedule(&graph, output).unwrap(),
+            input.index() as u64,
+            [
+                first.index() as u64,
+                second.index() as u64,
+                third.index() as u64,
+                output.index() as u64,
+            ],
+        )
+    }
+
+    #[test]
+    fn exact_device_slots_reuse_disjoint_linear_temporaries_deterministically() {
+        let (schedule, input, outputs) = reusable_linear_schedule();
+        assert_eq!(schedule.items.len(), 4);
+        let retained = [outputs[3]];
+        let adapter = FakeAdapter(Rc::new(RefCell::new(Calls::default())));
+        let first = StaticSchedulePlan::build(&adapter, &schedule.items, Some(&retained)).unwrap();
+        let second = StaticSchedulePlan::build(&adapter, &schedule.items, Some(&retained)).unwrap();
+        assert_eq!(first.allocations, second.allocations);
+        let slots = first.allocations.logical_slots();
+        assert_eq!(slots[&outputs[0]], slots[&outputs[2]]);
+        assert_ne!(slots[&outputs[0]], slots[&outputs[1]]);
+        assert_ne!(slots[&input], slots[&outputs[0]]);
+        assert_ne!(slots[&outputs[3]], slots[&outputs[0]]);
+        assert_eq!(first.allocations.slots().len(), 4);
+        assert_eq!(
+            first.allocations.peak_bytes(),
+            4 * 2 * DType::F32.itemsize()
+        );
+        for (item, source) in first.items().zip(&schedule.items) {
+            let expected_ids = source
+                .ordered_inputs()
+                .iter()
+                .map(|binding| binding.desc.id)
+                .chain(std::iter::once(source.primary_output().id))
+                .collect::<Vec<_>>();
+            assert_eq!(item.buffer_ids(), expected_ids);
+            let item_slots = item
+                .buffer_ids()
+                .iter()
+                .map(|id| slots[id])
+                .collect::<BTreeSet<_>>();
+            assert_eq!(item_slots.len(), item.buffer_ids().len());
+        }
+
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let prepared = PreparedStaticSchedule::prepare_for_outputs(
+            FakeAdapter(calls.clone()),
+            &schedule.items,
+            &retained,
+        )
+        .unwrap();
+        assert_eq!(calls.borrow().allocate, 4);
+        let mut values = BTreeMap::from([(
+            input,
+            TensorData::from_storage(Shape::from([2]), Storage::F32(vec![2.0, -3.0])).unwrap(),
+        )]);
+        prepared.execute(&mut values).unwrap();
+        assert_eq!(
+            values[&outputs[3]].storage(),
+            &Storage::F32(vec![2.0, -3.0])
+        );
+    }
+
+    #[test]
+    fn public_static_prepare_retains_every_output_and_disables_temporary_reuse() {
+        let (schedule, _, outputs) = reusable_linear_schedule();
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let prepared =
+            PreparedStaticSchedule::prepare(FakeAdapter(calls.clone()), &schedule.items).unwrap();
+        assert_eq!(calls.borrow().allocate, 5);
+        assert!(
+            outputs
+                .iter()
+                .all(|id| prepared.logical_slots.contains_key(id))
+        );
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|id| prepared.logical_slots[id])
+                .collect::<BTreeSet<_>>()
+                .len(),
+            outputs.len()
+        );
+    }
+
+    #[test]
+    fn external_inputs_and_retained_output_always_receive_distinct_private_slots() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2], DType::F32);
+        let rhs = graph.input_dtype("rhs", [2], DType::F32);
+        let output = graph.add(lhs, rhs).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let adapter = FakeAdapter(Rc::new(RefCell::new(Calls::default())));
+        let plan =
+            StaticSchedulePlan::build(&adapter, &schedule.items, Some(&[output.index() as u64]))
+                .unwrap();
+        let slots = plan.allocations.logical_slots();
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots.values().copied().collect::<BTreeSet<_>>().len(), 3);
+        assert_ne!(slots[&(lhs.index() as u64)], slots[&(rhs.index() as u64)]);
+        assert_ne!(
+            slots[&(lhs.index() as u64)],
+            slots[&(output.index() as u64)]
+        );
+    }
+
+    #[test]
+    fn allocation_failure_drops_each_completed_physical_slot_once_before_queue_creation() {
+        let (schedule, _, outputs) = reusable_linear_schedule();
+        let calls = Rc::new(RefCell::new(Calls {
+            fail_allocate_after: Some(2),
+            ..Calls::default()
+        }));
+        assert_eq!(
+            PreparedStaticSchedule::prepare_for_outputs(
+                FakeAdapter(calls.clone()),
+                &schedule.items,
+                &[outputs[3]],
+            )
+            .err()
+            .as_deref(),
+            Some("injected allocation failure")
+        );
+        let calls = calls.borrow();
+        assert_eq!(calls.allocate, 3);
+        assert_eq!(calls.release, 2);
+        assert_eq!(calls.queue, 0);
+    }
+
     #[test]
     fn shared_executor_uploads_once_keeps_intermediate_and_downloads_requested_once() {
         let (schedule, input, outputs) = branched_schedule();
@@ -907,6 +1227,7 @@ mod tests {
         prepared.execute(&mut values).unwrap();
         let calls = calls.borrow();
         assert_eq!(calls.write, 1);
+        assert_eq!(calls.allocate, 4);
         assert_eq!(calls.launch, 3);
         assert_eq!(calls.read, 2);
         assert!(outputs.iter().all(|id| values.contains_key(id)));
@@ -1022,10 +1343,16 @@ mod tests {
             .expect("shared input is inventoried")
             .alignment *= 2;
 
+        let mut aliased_output = schedule.clone();
+        let mut output = aliased_output.items[0].primary_output().clone();
+        output.view = Some(crate::AffineView::identity(output.shape.clone()));
+        aliased_output.items[0].outputs = crate::ScheduledOutputs::single(output);
+
         for (name, items, retained) in [
             ("duplicate", duplicate.items, outputs.to_vec()),
             ("future", future.items, outputs.to_vec()),
             ("conflicting", conflicting.items, outputs.to_vec()),
+            ("aliased-output", aliased_output.items, outputs.to_vec()),
         ] {
             let calls = Rc::new(RefCell::new(Calls::default()));
             assert!(
@@ -1071,6 +1398,18 @@ mod tests {
                 .filter(|id| **id == product.index() as u64)
                 .count(),
             1
+        );
+        assert!(
+            plan.allocations
+                .logical_slots()
+                .contains_key(&(product.index() as u64))
+        );
+        assert!(
+            !plan
+                .allocations
+                .logical_slots()
+                .contains_key(&(transposed.index() as u64)),
+            "consumer-local affine views reuse their base logical slot"
         );
     }
 
@@ -1149,6 +1488,19 @@ mod tests {
         assert!(requests.iter().any(|request| {
             request.bytes == 6 * DType::F32.itemsize() && request.requires_native_handle
         }));
+        assert_eq!(
+            [
+                lhs.index() as u64,
+                rhs.index() as u64,
+                output.index() as u64
+            ]
+            .into_iter()
+            .map(|id| prepared.logical_slots[&id])
+            .collect::<BTreeSet<_>>()
+            .len(),
+            3,
+            "zero-byte K=0 inputs keep private native-handle sentinels"
+        );
         drop(prepared);
 
         let mut empty = Graph::new();
