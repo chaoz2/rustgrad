@@ -245,6 +245,7 @@ fn operation_fields(operation: &Operation) -> BTreeMap<String, String> {
                             "scatter"
                         }
                     }
+                    crate::MovementKernelKind::ScatterPositions { .. } => "scatter_positions",
                     crate::MovementKernelKind::Bitcast { .. } => "bitcast",
                     crate::MovementKernelKind::Contiguous { .. } => "contiguous",
                 }

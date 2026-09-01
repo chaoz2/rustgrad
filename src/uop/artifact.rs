@@ -19,9 +19,10 @@ const MAGIC: &[u8; 4] = b"RGUA";
 /// v14 adds the prefix-scan output selector; v16 adds the coupled Sort pair;
 /// v17 adds the CPU-static TensorGuard validation boundary; v18 makes the
 /// prefix-scan source/result buffer ABI and source dtype self-contained.
-/// v19 adds the dependency-bearing live packed-U64 Threefry plan.
+/// v19 adds the dependency-bearing live packed-U64 Threefry plan; v20 adds
+/// the checked static-position movement payload.
 /// v15 is retained as the first internal mixed-schedule envelope.
-const VERSION: u8 = 19;
+const VERSION: u8 = 20;
 const PREVIOUS_EFFECT_VERSION: u8 = 15;
 const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
@@ -580,17 +581,36 @@ impl fmt::Display for ArtifactError {
 impl std::error::Error for ArtifactError {}
 
 /// Encodes one immutable UOp DAG. Node IDs are dense topological indices and
-/// repeated source IDs preserve shared subgraphs.
+/// repeated source IDs preserve shared subgraphs. Historical operation sets
+/// retain the released v19 standalone envelope; only static-position movement
+/// requires v20.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
-    encode_inner(root, false, VERSION)
+    let nodes = root
+        .topological()
+        .map_err(|_| ArtifactError::Format("dag"))?;
+    let version = if nodes.iter().any(|node| {
+        matches!(
+            node.operation(),
+            Operation::Movement(MovementValue::Plan(plan))
+                if matches!(&plan.kind, MovementKernelKind::ScatterPositions { .. })
+        )
+    }) {
+        VERSION
+    } else {
+        // v20 adds no representation for historical operations. Keep their
+        // standalone canonical bytes on the released v19 writer envelope.
+        19
+    };
+    encode_inner(root, false, version)
 }
 
 /// Encodes the semantic kernel blob used by durable schedule identities.
 /// Existing operations remain pinned to the released v18 envelope so adding
 /// a later RGUA operation cannot silently invalidate every RGSA/RGSO/RGSM
-/// cache key. Only Threefry requires the v19 envelope; corrected reduction
-/// code generation is separated by renderer-specific source/cache versions
-/// without changing its released logical UOp identity.
+/// cache key. Threefry requires the v19 envelope and static-position movement
+/// requires v20; corrected reduction code generation is separated by
+/// renderer-specific source/cache versions without changing its released
+/// logical UOp identity.
 pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let nodes = root
         .topological()
@@ -601,7 +621,15 @@ pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactEr
             Operation::EffectStore(_) | Operation::After(_)
         )
     });
-    let version = if nodes
+    let version = if nodes.iter().any(|node| {
+        matches!(
+            node.operation(),
+            Operation::Movement(MovementValue::Plan(plan))
+                if matches!(&plan.kind, MovementKernelKind::ScatterPositions { .. })
+        )
+    }) {
+        20
+    } else if nodes
         .iter()
         .any(|node| matches!(node.operation(), Operation::Threefry(_)))
     {
@@ -703,6 +731,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             | 16
             | 17
             | 18
+            | 19
             | VERSION
     ) {
         return Err(ArtifactError::Format("version"));
@@ -1526,7 +1555,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<WireArg, ArtifactError> {
             mean: r.bool()?,
         },
         11 if version >= 3 => WireArg::Matmul(Box::new(read_matmul(r)?)),
-        12 if version >= 4 => WireArg::Movement(Box::new(read_movement(r)?)),
+        12 if version >= 4 => WireArg::Movement(Box::new(read_movement(r, version)?)),
         13 if version >= 5 => WireArg::TiledMatmul(Box::new(read_tiled_matmul(r)?)),
         14 if version >= 6 => WireArg::QuantizedMatmul(Box::new(read_quantized_matmul(r)?)),
         15 if version >= 7 => WireArg::TensorCoreMatmul(Box::new(read_tensor_core_matmul(r)?)),
@@ -2285,6 +2314,28 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
             w.usize(*axis)?;
             w.bool(*add)?;
         }
+        MovementKernelKind::ScatterPositions {
+            input,
+            starts,
+            steps,
+        } => {
+            w.u8(7)?;
+            write_operand(w, input)?;
+            w.u32(
+                u32::try_from(starts.len())
+                    .map_err(|_| ArtifactError::Format("movement positions"))?,
+            )?;
+            for start in starts {
+                w.i64(*start)?;
+            }
+            w.u32(
+                u32::try_from(steps.len())
+                    .map_err(|_| ArtifactError::Format("movement positions"))?,
+            )?;
+            for step in steps {
+                w.i64(*step)?;
+            }
+        }
         MovementKernelKind::Bitcast { input } => {
             w.u8(5)?;
             write_operand(w, input)?;
@@ -2300,7 +2351,7 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
     w.u64(plan.cache_key)
 }
 
-fn read_movement(r: &mut Reader<'_>) -> Result<MovementKernelPlan, ArtifactError> {
+fn read_movement(r: &mut Reader<'_>, version: u8) -> Result<MovementKernelPlan, ArtifactError> {
     let kind = match r.u8()? {
         3 => MovementKernelKind::AffineCopy {
             input: read_operand(r)?,
@@ -2348,6 +2399,20 @@ fn read_movement(r: &mut Reader<'_>) -> Result<MovementKernelPlan, ArtifactError
         6 => MovementKernelKind::Contiguous {
             input: read_operand(r)?,
         },
+        7 if version >= 20 => {
+            let input = read_operand(r)?;
+            let starts = (0..r.count(MAX_COLLECTION)?)
+                .map(|_| r.i64())
+                .collect::<Result<Vec<_>, _>>()?;
+            let steps = (0..r.count(MAX_COLLECTION)?)
+                .map(|_| r.i64())
+                .collect::<Result<Vec<_>, _>>()?;
+            MovementKernelKind::ScatterPositions {
+                input,
+                starts,
+                steps,
+            }
+        }
         _ => return Err(ArtifactError::Format("movement kind")),
     };
     let plan = MovementKernelPlan {
@@ -3196,7 +3261,7 @@ mod tests {
         let output = graph.cumsum(input, 1).unwrap();
         let scan = crate::lower_graph_prefix_scan(&graph, output).unwrap();
         let bytes = encode(&scan).unwrap();
-        assert_eq!(bytes[4], VERSION);
+        assert_eq!(bytes[4], 19);
         assert_eq!(decode(&bytes).unwrap(), scan);
         assert_eq!(encode_schedule_identity(&scan).unwrap()[4], 18);
 
@@ -3383,9 +3448,11 @@ mod tests {
         let output = graph.scatter_add(base, index, updates, 1).unwrap();
         let root = crate::lower_graph_movement(&graph, output).unwrap();
         let bytes = encode(&root).unwrap();
+        assert_eq!(bytes[4], 19);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(bytes, encode(&decoded).unwrap());
         assert_eq!(root, decoded);
+        assert_eq!(encode_schedule_identity(&root).unwrap()[4], 18);
 
         let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
             panic!("movement payload missing");
@@ -3440,6 +3507,55 @@ mod tests {
         ));
         assert_eq!(plan.output_shape, Shape::from([2, 2]));
         assert_eq!(plan.dtype, DType::U32);
+
+        let mut positions_graph = crate::Graph::new();
+        let input = positions_graph.input_dtype("input", [2], DType::F32);
+        let output = positions_graph
+            .scatter_positions(input, Shape::from([5]), vec![4], vec![-2])
+            .unwrap();
+        let root = crate::lower_graph_movement(&positions_graph, output).unwrap();
+        let bytes = encode(&root).unwrap();
+        assert_eq!(bytes[4], 20);
+        assert_eq!(decode(&bytes).unwrap(), root);
+        assert_eq!(encode_schedule_identity(&root).unwrap()[4], 20);
+
+        let mut forged_v19 = bytes.clone();
+        forged_v19[4] = 19;
+        let body_len = forged_v19.len() - 4;
+        let sum = checksum(&forged_v19[..body_len]);
+        forged_v19[body_len..].copy_from_slice(&sum.to_le_bytes());
+        assert!(decode(&forged_v19).is_err());
+
+        let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
+            panic!("movement payload missing")
+        };
+        assert_eq!(plan.cache_key, 0xa069_ceb4_6f40_d7b4);
+        let mut malformed = plan.clone();
+        let MovementKernelKind::ScatterPositions { starts, .. } = &mut malformed.kind else {
+            panic!("static-position movement")
+        };
+        starts[0] = 5;
+        let malformed = UOp::from_operation(
+            Operation::Movement(MovementValue::Plan(malformed)),
+            Some(UType::scalar(DType::F32)),
+            vec![],
+        );
+        assert!(malformed.validate().is_err());
+        assert!(encode(&malformed).is_err());
+
+        let mut malformed = plan.clone();
+        let MovementKernelKind::ScatterPositions { steps, .. } = &mut malformed.kind else {
+            panic!("static-position movement")
+        };
+        steps[0] = 0;
+        malformed.cache_key = malformed.expected_cache_key();
+        let malformed = UOp::from_operation(
+            Operation::Movement(MovementValue::Plan(malformed)),
+            Some(UType::scalar(DType::F32)),
+            vec![],
+        );
+        assert!(malformed.validate().is_err());
+        assert!(encode(&malformed).is_err());
     }
 
     #[test]

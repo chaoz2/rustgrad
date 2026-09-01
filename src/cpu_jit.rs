@@ -27,6 +27,7 @@ mod random;
 // this identity before they can reuse a native-renderer admission decision.
 pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v33";
 const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
+const STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-c11-static-position-v1";
 const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
@@ -1753,6 +1754,7 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
         crate::MovementKernelKind::Scatter { base, updates, .. } => {
             base.dtype == plan.dtype && updates.dtype == plan.dtype
         }
+        crate::MovementKernelKind::ScatterPositions { input, .. } => input.dtype == plan.dtype,
         crate::MovementKernelKind::Bitcast { .. } => true,
         crate::MovementKernelKind::Contiguous { input } => input.dtype == plan.dtype,
     };
@@ -1987,6 +1989,72 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
                 "    (({output_ty}*)buffers[{output_slot}])[{destination}] {operator} ((const {output_ty}*)buffers[{}])[{update}];",
                 ids[&(updates.node.index() as u64)]
             ));
+                lines.push("  }".into());
+            }
+        }
+        crate::MovementKernelKind::ScatterPositions {
+            input,
+            starts,
+            steps,
+        } => {
+            lines.push(format!("  /* {STATIC_POSITION_RENDERER_VERSION} */"));
+            let input_len = elements(&input.shape)?;
+            let output_bytes = elements(&plan.output_shape)?
+                .checked_mul(plan.dtype.itemsize())
+                .ok_or_else(|| JitError::Unsupported("scatter-position byte overflow".into()))?;
+            let map = crate::movement_plan::StaticPositionMap::from_i64(
+                input.shape.clone(),
+                plan.output_shape.clone(),
+                starts.clone(),
+                steps.clone(),
+            )
+            .map_err(|_| JitError::Unsupported("scatter-position map is invalid".into()))?;
+            let storage_width = plan.dtype.itemsize();
+            if output_bytes != 0 {
+                lines.push(format!(
+                    "  memset(buffers[{output_slot}], 0, {output_bytes}u);"
+                ));
+            }
+            if input_len != 0 {
+                lines.push(format!(
+                    "  for (size_t rg_i=0; rg_i<{input_len}u; ++rg_i) {{ size_t rg_q=rg_i, rg_destination=0;"
+                ));
+                for axis in (0..map.input_shape.rank()).rev() {
+                    let dimension = map.input_shape.dims()[axis];
+                    let output_stride = map.output_shape.dims()[axis + 1..]
+                        .iter()
+                        .try_fold(1usize, |product, dimension| product.checked_mul(*dimension))
+                        .ok_or_else(|| {
+                            JitError::Unsupported("scatter-position stride overflow".into())
+                        })?;
+                    let start = usize::try_from(map.starts[axis]).map_err(|_| {
+                        JitError::Unsupported("scatter-position start is negative".into())
+                    })?;
+                    if dimension <= 1 {
+                        lines.push(format!(
+                            "    rg_destination += {start}u * {output_stride}u;"
+                        ));
+                        continue;
+                    }
+                    lines.push(format!(
+                        "    size_t rg_c{axis}=rg_q%{dimension}u; rg_q/={dimension}u;"
+                    ));
+                    let coordinate = if map.steps[axis] < 0 {
+                        let step = map.steps[axis].checked_abs().ok_or_else(|| {
+                            JitError::Unsupported("scatter-position step overflow".into())
+                        })?;
+                        format!("({start}u-rg_c{axis}*{step}u)")
+                    } else {
+                        format!("({start}u+rg_c{axis}*{}u)", map.steps[axis])
+                    };
+                    lines.push(format!(
+                        "    rg_destination += {coordinate} * {output_stride}u;"
+                    ));
+                }
+                lines.push(format!(
+                    "    memcpy(((uint8_t*)buffers[{output_slot}])+rg_destination*{storage_width}u, ((const uint8_t*)buffers[{}])+rg_i*{storage_width}u, {storage_width}u);",
+                    ids[&(input.node.index() as u64)]
+                ));
                 lines.push("  }".into());
             }
         }
@@ -3711,6 +3779,52 @@ mod tests {
             "memcpy(((uint8_t*)buffers[1])+rg_i*4u, ((const uint8_t*)buffers[0])+rg_offset*4u, 4u);"
         ));
         assert!(rendered.source.contains(MOVEMENT_RENDERER_VERSION));
+    }
+
+    #[test]
+    fn static_position_renderer_uses_one_raw_byte_copy_contract_for_all_dtypes() {
+        for dtype in DType::ALL {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let output = graph
+                .scatter_positions(input, Shape::from([5]), vec![4], vec![-2])
+                .unwrap();
+            let plan = crate::MovementKernelPlan::from_graph(&graph, output).unwrap();
+            let rendered = render_movement(&plan).unwrap();
+            let width = dtype.itemsize();
+            assert!(rendered.source.contains("memset(buffers[1], 0,"));
+            assert!(rendered.source.contains(STATIC_POSITION_RENDERER_VERSION));
+            assert!(rendered.source.contains(&format!(
+                "memcpy(((uint8_t*)buffers[1])+rg_destination*{width}u, ((const uint8_t*)buffers[0])+rg_i*{width}u, {width}u);"
+            )));
+            assert_eq!(rendered.abi.buffers[0].dtype, dtype);
+            assert_eq!(rendered.abi.buffers[1].dtype, dtype);
+            assert!(!rendered.abi.buffers[0].mutable);
+            assert!(rendered.abi.buffers[1].mutable);
+        }
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("empty", [0], DType::F32);
+        let output = empty
+            .scatter_positions(input, Shape::from([0]), vec![-1], vec![-1])
+            .unwrap();
+        let rendered =
+            render_movement(&crate::MovementKernelPlan::from_graph(&empty, output).unwrap())
+                .unwrap();
+        assert_eq!(rendered.abi.buffers[0].elements, 0);
+        assert_eq!(rendered.abi.buffers[1].elements, 0);
+        assert!(!rendered.source.contains("rg_destination"));
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("scalar", Shape::from([]), DType::F64);
+        let output = scalar
+            .scatter_positions(input, Shape::from([]), vec![], vec![])
+            .unwrap();
+        let rendered =
+            render_movement(&crate::MovementKernelPlan::from_graph(&scalar, output).unwrap())
+                .unwrap();
+        assert!(rendered.source.contains("rg_i<1u"));
+        assert!(rendered.source.contains("rg_destination*8u"));
     }
 
     #[test]

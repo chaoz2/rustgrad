@@ -1474,10 +1474,15 @@ or live CUDA validation claim.
 Durable schedule keys encode each kernel with its minimum admitted semantic
 RGUA envelope rather than the current standalone writer version. Existing
 operations, including reductions, retain their released v18 key bytes when the
-v19 Threefry tag is added; a kernel containing Threefry uses v19. Corrected
-reduction code generation is separated by renderer-specific source/cache
+v19 Threefry tag is added; a kernel containing Threefry uses v19. The checked
+static-position movement payload is the sole v20 addition. Its plan key uses an
+explicit canonical FNV encoding rather than extending the historical
+`DefaultHasher` movement-key seam; every earlier movement plan remains on its
+released v18 durable schedule bytes and key, while ordinary standalone RGUA
+encoding stays on the prior v19 writer envelope. Corrected reduction and
+movement code generation is separated by renderer-specific source/cache
 versions. RGSA, RGSO, and RGSM identities consequently remain stable without
-pretending that a v18 decoder understands the new operation.
+pretending that an older decoder understands a newer operation.
 
 `CapturedReplayExecutor` owns process-local scalar and vector CPU-JIT caches;
 compiled libraries and pointers never enter the artifact. A typed replay policy
@@ -1536,10 +1541,9 @@ shared, external, faulting, specialized, nested-map, symbolic, or otherwise
 uncertain branches retain their materialization boundaries. Schedule item and
 cache identities can consequently change from a split producer/view/consumer
 chain to one existing ordinary Sink, but durable UOp and artifact formats do not.
-Signed reverse and
-zero-stride broadcast reads are valid
+Signed reverse and zero-stride broadcast reads are valid
 because source aliases never alias the output or each other as write targets.
-The interpreter and movement-v2 CPU renderer share that immutable plan; native
+The interpreter and established movement-v2 CPU renderer share that immutable
 addressing normalizes the proof to nonnegative indices and copies raw storage
 widths. One checked `RawCopyView` projects only `AffineCopy` and dense
 `Contiguous` plans into their exact two-buffer ABI. Its renderer-neutral
@@ -1558,6 +1562,21 @@ Contiguous movement boundary before authenticating its specialization schema;
 symbolic computed views, effects, non-affine reshape, broader producer-output
 redirection, other movement kinds, and live-device validation remain
 fail-closed or unclaimed.
+
+`StaticPositionMap` is the single crate-private geometry proof for the existing
+`ScatterPositions` graph adjoint and its `ScatterPositionsVjp` reverse read. It
+validates rank, checked byte geometry, nonzero steps and both endpoints in
+O(rank), while admitting a normalized `-1` start on an empty reverse domain.
+Forward execution allocates a fresh dense output, zeroes its raw bytes, and
+places each source lane exactly once; the VJP lowers to the existing
+`AffineCopy` plan. Scheduling, captured interpreter replay, and strict C11
+native execution use a distinct static-position-v1 renderer identity, preserve
+every concrete storage width, and keep computed and
+external inputs as read-only nonaliasing operands. Forward PTX, OpenCL, Metal,
+WebGPU, CUDA, and symbolic specialization reject before backend allocation or
+cache publication. Adding `ScatterPositions` to the otherwise established
+public `MovementKernelKind` is an intentional 0.1 exhaustive-match source API
+change; no second operation taxonomy or backend trait is introduced.
 The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
 preflight/plan/execute path rather than adding a profiler or executor. Its
 immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`

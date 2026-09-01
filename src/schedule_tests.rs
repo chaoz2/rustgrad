@@ -16,6 +16,200 @@ fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
         view: None,
     }
 }
+
+#[test]
+fn static_position_movement_owns_exact_schedule_capture_and_native_abi() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let output = graph
+        .scatter_positions(input, Shape::from([5]), vec![4], vec![-2])
+        .unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    let item = &scheduled.items[0];
+    assert_eq!(item.node, output);
+    assert_ne!(item.inputs[0].id, item.primary_output().id);
+    assert!(item.inputs[0].read_only);
+    assert!(!item.primary_output().read_only);
+    assert_eq!(
+        item.ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input]
+    );
+    assert!(item.dependencies.is_empty());
+    assert!(matches!(
+        item.kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::ScatterPositions { .. })
+    ));
+    let memory = crate::MemoryPlan::from_schedule(&scheduled, &[output], true).unwrap();
+    assert!(
+        memory
+            .temporaries
+            .iter()
+            .all(|allocation| allocation.buffer_id != item.inputs[0].id)
+    );
+
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let bindings = std::collections::BTreeMap::from([(
+        "input".into(),
+        TensorData::new([2], vec![3.0, -0.0]).unwrap(),
+    )]);
+    let interpreted = decoded.replay(&bindings).unwrap();
+    assert_eq!(
+        interpreted[0]
+            .values()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        vec![0, 0, (-0.0f32).to_bits(), 0, 3.0f32.to_bits()]
+    );
+    let native = decoded
+        .replay_with_options(
+            &bindings,
+            &crate::CapturedReplayExecutor::default(),
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        native.outputs[0]
+            .values()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        interpreted[0]
+            .values()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+
+    let mut computed = Graph::new();
+    let input = computed.input_dtype("input", [2], DType::F32);
+    let producer = computed.square(input).unwrap();
+    let output = computed
+        .scatter_positions(producer, Shape::from([5]), vec![0], vec![2])
+        .unwrap();
+    let scheduled = schedule(&computed, output).unwrap();
+    scheduled.validate().unwrap();
+    let producer_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == producer)
+        .unwrap();
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(output_item.dependencies, vec![producer_item.id]);
+    assert_ne!(output_item.inputs[0].id, output_item.primary_output().id);
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![producer]
+    );
+    crate::MemoryPlan::from_schedule(&scheduled, &[output], true).unwrap();
+
+    let external =
+        schedule_with_external_materializations(&computed, &[output], &[producer]).unwrap();
+    assert_eq!(external.items.len(), 1);
+    assert_eq!(external.items[0].external_materializations, vec![producer]);
+    assert!(external.items[0].dependencies.is_empty());
+    assert_ne!(
+        external.items[0].inputs[0].id,
+        external.items[0].primary_output().id
+    );
+
+    let cotangent = computed.input_dtype("cotangent", [5], DType::F32);
+    let vjp = computed
+        .scatter_positions_vjp(cotangent, Shape::from([2]), vec![4], vec![-2])
+        .unwrap();
+    let vjp_schedule = schedule(&computed, vjp).unwrap();
+    assert_eq!(vjp_schedule.items.len(), 1);
+    assert!(matches!(
+        vjp_schedule.items[0].kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. })
+    ));
+}
+
+#[test]
+fn static_position_capture_preserves_all_storage_bits_in_interpreter_and_native() {
+    for dtype in DType::ALL {
+        let width = dtype.itemsize();
+        let input_bytes = match dtype {
+            DType::Bool => vec![1, 0],
+            DType::F16 => [0x7e01u16, 0x8000]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            DType::BF16 => [0x7fc1u16, 0x8000]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            DType::F32 => [0x7fc0_0001u32, 0x8000_0000]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+            DType::F64 => [0x7ff8_0000_0000_0001u64, 0x8000_0000_0000_0000]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect(),
+            DType::F8E4M3 | DType::F8E4M3FNUZ | DType::F8E5M2 | DType::F8E5M2FNUZ => {
+                vec![0x81, 0x7f]
+            }
+            _ => (0..2 * width)
+                .map(|index| 0x81u8.wrapping_add(index as u8))
+                .collect::<Vec<_>>(),
+        };
+        let input_value = TensorData::from_le_bytes([2], dtype, &input_bytes).unwrap();
+        let mut expected = vec![0; 5 * width];
+        expected[4 * width..5 * width].copy_from_slice(&input_bytes[..width]);
+        expected[2 * width..3 * width].copy_from_slice(&input_bytes[width..]);
+
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let output = graph
+            .scatter_positions(input, Shape::from([5]), vec![4], vec![-2])
+            .unwrap();
+        let scheduled = schedule(&graph, output).unwrap();
+        scheduled.validate().unwrap();
+        let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let capture = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(capture.to_bytes().unwrap(), bytes, "{dtype:?}");
+        let bindings = std::collections::BTreeMap::from([("input".into(), input_value)]);
+        let interpreted = capture.replay(&bindings).unwrap();
+        assert_eq!(interpreted[0].to_le_bytes().unwrap(), expected, "{dtype:?}");
+        let native = capture
+            .replay_with_options(
+                &bindings,
+                &crate::CapturedReplayExecutor::default(),
+                crate::CapturedReplayOptions {
+                    backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            native.outputs[0].to_le_bytes().unwrap(),
+            expected,
+            "{dtype:?}"
+        );
+    }
+}
+
 fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
     ScheduleItem {
         id,

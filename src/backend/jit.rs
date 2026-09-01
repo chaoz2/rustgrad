@@ -386,7 +386,9 @@ impl CpuJitBackend {
             | Op::Contiguous { .. }
             | Op::Concat { .. }
             | Op::Gather { .. }
-            | Op::Scatter { .. } => crate::lower_graph_movement(graph, output),
+            | Op::Scatter { .. }
+            | Op::ScatterPositions { .. }
+            | Op::ScatterPositionsVjp { .. } => crate::lower_graph_movement(graph, output),
             _ => crate::lower_graph_elementwise(graph, output),
         }
         .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
