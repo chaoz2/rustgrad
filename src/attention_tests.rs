@@ -1116,6 +1116,18 @@ fn attention_supports_grouped_query_and_qkv_gradients() {
             );
         }
     }
+    let scheduled = crate::schedule_many(&graph, &[dq, dk, dv]).unwrap();
+    scheduled.validate().unwrap();
+    assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
+    crate::MemoryPlan::from_schedule(&scheduled, &[dq, dk, dv], true).unwrap();
+    assert!(
+        (0..graph.node_count())
+            .map(crate::NodeId::from_index)
+            .all(|node| !matches!(
+                graph.op(node).unwrap(),
+                Op::MatmulGrad { .. } | Op::MatmulGradVjp { .. }
+            ))
+    );
     let trace = graph.trace(output).unwrap().to_string();
     assert!(trace.contains("matmul") && trace.contains("Max") && trace.contains("exp"));
 }

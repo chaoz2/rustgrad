@@ -2425,6 +2425,81 @@ mod tests {
     }
 
     #[test]
+    fn captured_broadcast_matmul_vjp_matches_interpreter_and_native() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1, 2, 3], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 2, 3, 2], dtype);
+            let output = graph.matmul(lhs, rhs).unwrap();
+            let seed = graph.input_dtype_requires_grad("seed", [2, 2, 2, 2], dtype, false);
+            let gradient = graph.grad_with(output, lhs, Some(seed), true).unwrap();
+            let capture = captured(&graph, &[gradient]);
+            assert!(capture.items.iter().all(|item| item.boundary.is_none()));
+            assert!(
+                (0..graph.node_count())
+                    .map(crate::NodeId::from_index)
+                    .all(|node| !matches!(
+                        graph.op(node).unwrap(),
+                        crate::Op::MatmulGrad { .. } | crate::Op::MatmulGradVjp { .. }
+                    ))
+            );
+
+            let bindings = BTreeMap::from([
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [1, 2, 3, 2],
+                        dtype,
+                        [1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.]
+                            .into_iter()
+                            .map(Scalar::F),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "seed".into(),
+                    TensorData::from_scalars(
+                        [2, 2, 2, 2],
+                        dtype,
+                        std::iter::repeat_n(Scalar::F(1.0), 16),
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            let executor = CapturedReplayExecutor::default();
+            let interpreted = executor
+                .replay(&capture, &bindings, CapturedReplayOptions::default())
+                .unwrap();
+            let native = executor
+                .replay(
+                    &capture,
+                    &bindings,
+                    CapturedReplayOptions {
+                        backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                    },
+                )
+                .unwrap();
+            let expected = TensorData::from_scalars(
+                [2, 1, 2, 3],
+                dtype,
+                [18., 26., 34., 18., 26., 34., 18., 26., 34., 18., 26., 34.]
+                    .into_iter()
+                    .map(Scalar::F),
+            )
+            .unwrap();
+            assert_eq!(interpreted.outputs, vec![expected.clone()]);
+            assert_eq!(native.outputs, vec![expected]);
+            assert!(
+                native
+                    .trace
+                    .items
+                    .iter()
+                    .all(|item| item.backend == ItemBackend::NativeJit)
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_native_policy_is_explicit() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2]), DType::F32);

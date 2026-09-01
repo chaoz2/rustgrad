@@ -1785,6 +1785,44 @@ fn typed_unbroadcast_vjp_is_an_owned_scheduleable_reduction_chain() {
 }
 
 #[test]
+fn generalized_raw_matmul_vjp_has_owned_bindings_dependencies_and_memory() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2, 1, 2, 3]);
+    let rhs = graph.input("rhs", [1, 2, 3, 2]);
+    let output = graph.matmul(lhs, rhs).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let gradients = graph.gradient_default(loss, &[lhs, rhs]).unwrap();
+    assert!(
+        (0..graph.node_count())
+            .map(crate::NodeId::from_index)
+            .all(|node| !matches!(
+                graph.op(node).unwrap(),
+                crate::Op::MatmulGrad { .. } | crate::Op::MatmulGradVjp { .. }
+            ))
+    );
+
+    let scheduled = schedule_many(&graph, &gradients).unwrap();
+    scheduled.validate().unwrap();
+    assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
+    assert!(scheduled.items.iter().any(|item| {
+        item.kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(node.operation(), crate::Operation::ReduceFinalize))
+    }));
+    let bound = scheduled
+        .items
+        .iter()
+        .flat_map(|item| item.ordered_inputs())
+        .map(|binding| binding.input_node)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(bound.contains(&lhs));
+    assert!(bound.contains(&rhs));
+    crate::MemoryPlan::from_schedule(&scheduled, &gradients, true).unwrap();
+}
+
+#[test]
 fn scheduled_outputs_are_nonempty_ordered_and_define_cache_identity() {
     let output = buffer(7, 4, 1);
     assert!(ScheduledOutputs::new(vec![]).is_err());
