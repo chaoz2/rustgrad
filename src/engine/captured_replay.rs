@@ -1538,25 +1538,67 @@ mod tests {
         let expanded = computed.expand(producer, [2, 3]).unwrap();
         let output = computed.contiguous(expanded).unwrap();
         let capture = captured(&computed, &[output]);
-        assert_eq!(capture.items.len(), 2);
-        let copy = capture
+        assert_eq!(capture.items.len(), 1);
+        let fused = &capture.items[0];
+        assert_eq!(fused.primary_output().id, output.index() as u64);
+        assert!(matches!(fused.kernel.operation(), crate::Operation::Sink));
+        assert_eq!(
+            fused
+                .ordered_inputs()
+                .iter()
+                .map(|binding| binding.input_node)
+                .collect::<Vec<_>>(),
+            vec![input]
+        );
+        assert!(fused.dependencies.is_empty());
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::from_storage([2, 1], Storage::I32(vec![2, -3])).unwrap(),
+        )]);
+        let interpreted = executor
+            .replay(&capture, &bindings, CapturedReplayOptions::default())
+            .unwrap();
+        let native = executor
+            .replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            interpreted.outputs[0].storage(),
+            &Storage::I32(vec![4, 4, 4, 9, 9, 9])
+        );
+        assert_eq!(
+            native.outputs[0].storage(),
+            interpreted.outputs[0].storage()
+        );
+        assert_eq!(native.trace.items[0].backend, ItemBackend::NativeJit);
+
+        // Requesting the computed producer makes ownership observable and
+        // preserves the explicit AffineCopy capture/dependency contract.
+        let fallback = captured(&computed, &[producer, output]);
+        assert_eq!(fallback.items.len(), 2);
+        let copy = fallback
             .items
             .iter()
             .find(|item| item.primary_output().id == output.index() as u64)
             .unwrap();
-        let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = copy.kernel.operation()
-        else {
-            panic!("computed contiguous copy plan")
-        };
         assert!(matches!(
-            &plan.kind,
-            crate::MovementKernelKind::AffineCopy { input: operand, view }
-                if operand.node == producer && view.strides == [1, 0]
+            copy.kernel.operation(),
+            crate::Operation::Movement(crate::MovementValue::Plan(plan))
+                if matches!(
+                    &plan.kind,
+                    crate::MovementKernelKind::AffineCopy { input: operand, view }
+                        if operand.node == producer && view.strides == [1, 0]
+                )
         ));
         assert!(copy.dependencies.iter().any(|dependency| {
-            capture.items[*dependency as usize].primary_output().id == producer.index() as u64
+            fallback.items[*dependency as usize].primary_output().id == producer.index() as u64
         }));
-        let mut missing_edge = capture.clone();
+        let mut missing_edge = fallback.clone();
         let copy_position = missing_edge
             .items
             .iter()
@@ -1566,21 +1608,18 @@ mod tests {
         missing_edge.items[copy_position].dependencies.clear();
         missing_edge.items[dependency].consumers.clear();
         assert!(crate::schedule::artifact::validate_capture(&missing_edge).is_err());
-        let replay = executor
+        let fallback_replay = executor
             .replay(
-                &capture,
-                &BTreeMap::from([(
-                    "input".into(),
-                    TensorData::from_storage([2, 1], Storage::I32(vec![2, -3])).unwrap(),
-                )]),
+                &fallback,
+                &bindings,
                 CapturedReplayOptions {
                     backend: CapturedBackendPolicy::NativeJit { vectorized: false },
                 },
             )
             .unwrap();
         assert_eq!(
-            replay.outputs[0].storage(),
-            &Storage::I32(vec![4, 4, 4, 9, 9, 9])
+            fallback_replay.outputs[1].storage(),
+            interpreted.outputs[0].storage()
         );
     }
 

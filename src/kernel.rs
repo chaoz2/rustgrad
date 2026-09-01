@@ -408,7 +408,14 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
     output: NodeId,
     materialized: &std::collections::BTreeSet<usize>,
 ) -> std::result::Result<UOp, UOpError> {
-    lower_graph_elementwise_with_substitutions(graph, output, output, materialized, &HashMap::new())
+    lower_graph_elementwise_with_substitutions(
+        graph,
+        output,
+        output,
+        materialized,
+        &HashMap::new(),
+        None,
+    )
 }
 
 /// Lowers one ordinary pure value directly into another graph node's owned
@@ -436,7 +443,54 @@ pub(crate) fn lower_graph_elementwise_into_with_materialized(
     {
         return Err(UOpError::InvalidArgument);
     }
-    lower_graph_elementwise_with_substitutions(graph, value, output, materialized, &HashMap::new())
+    lower_graph_elementwise_with_substitutions(
+        graph,
+        value,
+        output,
+        materialized,
+        &HashMap::new(),
+        None,
+    )
+}
+
+/// Lowers one ordinary pure producer through an existing checked affine read
+/// map directly into a Contiguous destination. Loads with the producer's exact
+/// dense shape reuse that map, while scalar loads remain invariant. Any load
+/// requiring broadcast-coordinate decomposition or nested view composition
+/// fails closed so the scheduler retains the explicit AffineCopy boundary.
+pub(crate) fn lower_graph_elementwise_affine_into_with_materialized(
+    graph: &Graph,
+    value: NodeId,
+    output: NodeId,
+    view: &crate::uop::AffineView,
+    materialized: &std::collections::BTreeSet<usize>,
+) -> std::result::Result<UOp, UOpError> {
+    let value_shape = graph
+        .shape(value)
+        .map_err(|_| UOpError::UseBeforeDefinition)?;
+    let output_shape = graph
+        .shape(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?;
+    if &view.source_shape != value_shape
+        || &view.logical_shape != output_shape
+        || view.validate_read().is_err()
+        || graph
+            .dtype(value)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            != graph
+                .dtype(output)
+                .map_err(|_| UOpError::UseBeforeDefinition)?
+    {
+        return Err(UOpError::InvalidArgument);
+    }
+    lower_graph_elementwise_with_substitutions(
+        graph,
+        value,
+        output,
+        materialized,
+        &HashMap::new(),
+        Some(view),
+    )
 }
 
 fn lower_graph_elementwise_with_substitutions(
@@ -445,6 +499,7 @@ fn lower_graph_elementwise_with_substitutions(
     output: NodeId,
     materialized: &std::collections::BTreeSet<usize>,
     substitutions: &HashMap<NodeId, UOp>,
+    iteration_view: Option<&crate::uop::AffineView>,
 ) -> std::result::Result<UOp, UOpError> {
     let output_shape = graph
         .shape(output)
@@ -470,6 +525,7 @@ fn lower_graph_elementwise_with_substitutions(
         out: &Shape,
         range: &UOp,
         view: Option<crate::uop::AffineView>,
+        iteration_view: Option<&crate::uop::AffineView>,
     ) -> std::result::Result<UOp, UOpError> {
         let shape = graph
             .shape(id)
@@ -486,8 +542,9 @@ fn lower_graph_elementwise_with_substitutions(
             Some(ty),
             vec![],
         );
-        let operation = match view {
-            Some(view) => Operation::Index(IndexValue::View {
+        let operation = match (view, iteration_view) {
+            (Some(_), Some(_)) => return Err(UOpError::InvalidArgument),
+            (Some(view), None) => Operation::Index(IndexValue::View {
                 buffer: id.index() as u64,
                 elements: view
                     .logical_shape
@@ -497,7 +554,26 @@ fn lower_graph_elementwise_with_substitutions(
                 output_shape: out.clone(),
                 view,
             }),
-            None => Operation::Index(IndexValue::Buffer {
+            (None, Some(iteration_view)) if shape == iteration_view.source_shape => {
+                Operation::Index(IndexValue::View {
+                    buffer: id.index() as u64,
+                    elements: iteration_view
+                        .logical_shape
+                        .numel()
+                        .map_err(|_| UOpError::InvalidArgument)?,
+                    input_shape: iteration_view.logical_shape.clone(),
+                    output_shape: out.clone(),
+                    view: iteration_view.clone(),
+                })
+            }
+            (None, Some(_)) if elements == 1 => Operation::Index(IndexValue::Buffer {
+                buffer: id.index() as u64,
+                elements,
+                input_shape: shape,
+                output_shape: out.clone(),
+            }),
+            (None, Some(_)) => return Err(UOpError::InvalidArgument),
+            (None, None) => Operation::Index(IndexValue::Buffer {
                 buffer: id.index() as u64,
                 elements,
                 input_shape: shape,
@@ -507,26 +583,31 @@ fn lower_graph_elementwise_with_substitutions(
         let index = UOp::from_operation(operation, Some(ty), vec![address, range.clone()]);
         Ok(UOp::from_operation(Operation::Load, Some(ty), vec![index]))
     }
+    struct ElementwiseLowering<'a> {
+        materialized: &'a std::collections::BTreeSet<usize>,
+        substitutions: &'a HashMap<NodeId, UOp>,
+        iteration_view: Option<&'a crate::uop::AffineView>,
+    }
+
     fn lower(
         graph: &Graph,
         id: NodeId,
         out: &Shape,
         range: &UOp,
         memo: &mut HashMap<NodeId, UOp>,
-        materialized: &std::collections::BTreeSet<usize>,
-        substitutions: &HashMap<NodeId, UOp>,
+        context: &ElementwiseLowering<'_>,
     ) -> std::result::Result<UOp, UOpError> {
         if let Some(v) = memo.get(&id) {
             return Ok(v.clone());
         }
         let ty = UType::scalar(graph.dtype(id).map_err(|_| UOpError::UseBeforeDefinition)?);
-        let x = if let Some(value) = substitutions.get(&id) {
+        let x = if let Some(value) = context.substitutions.get(&id) {
             value.clone()
-        } else if materialized.contains(&id.index()) {
-            load(graph, id, out, range, None)?
+        } else if context.materialized.contains(&id.index()) {
+            load(graph, id, out, range, None, context.iteration_view)?
         } else {
             match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-                Op::Input { .. } => load(graph, id, out, range, None)?,
+                Op::Input { .. } => load(graph, id, out, range, None, context.iteration_view)?,
                 // A rank-0 graph constant is dependency-free once its typed
                 // storage payload is present in the UOp. Keep all non-scalar
                 // constants as buffer loads: their allocation, scheduling,
@@ -534,11 +615,13 @@ fn lower_graph_elementwise_with_substitutions(
                 Op::Constant(data) if data.shape().rank() == 0 => {
                     UOp::scalar_constant(data.dtype(), crate::uop::raw_literal_bits(data)?, ty)
                 }
-                Op::Constant(_) => load(graph, id, out, range, None)?,
+                Op::Constant(_) => load(graph, id, out, range, None, context.iteration_view)?,
                 Op::Random { .. } => return Err(UOpError::InvalidArgument),
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
-                Op::Reduce { .. } | Op::PrefixScan { .. } => load(graph, id, out, range, None)?,
+                Op::Reduce { .. } | Op::PrefixScan { .. } => {
+                    load(graph, id, out, range, None, context.iteration_view)?
+                }
                 Op::Shrink { .. }
                 | Op::Reshape { .. }
                 | Op::Permute { .. }
@@ -547,12 +630,18 @@ fn lower_graph_elementwise_with_substitutions(
                     let planned = crate::rangeify::static_view(graph, id)
                         .or_else(|_| crate::rangeify::computed_view(graph, id))
                         .map_err(|_| UOpError::InvalidArgument)?;
-                    load(graph, planned.source, out, range, Some(planned.view))?
+                    load(
+                        graph,
+                        planned.source,
+                        out,
+                        range,
+                        Some(planned.view),
+                        context.iteration_view,
+                    )?
                 }
-                Op::Cast { input, .. } => UOp::cast(
-                    lower(graph, *input, out, range, memo, materialized, substitutions)?,
-                    ty,
-                ),
+                Op::Cast { input, .. } => {
+                    UOp::cast(lower(graph, *input, out, range, memo, context)?, ty)
+                }
                 // Graph bitcasts are materializing raw-byte movement roots.
                 // A nested instance must have been scheduled already rather
                 // than silently lowered as a numeric scalar cast.
@@ -560,63 +649,37 @@ fn lower_graph_elementwise_with_substitutions(
                     return Err(UOpError::InvalidArgument);
                 }
                 Op::ContiguousBackward { input } => {
-                    lower(graph, *input, out, range, memo, materialized, substitutions)?
+                    lower(graph, *input, out, range, memo, context)?
                 }
                 // Detach is an autograd boundary, not a runtime value
                 // transformation. Native lowering keeps the same typed value
                 // while Graph reverse-mode traversal owns the gradient stop.
-                Op::Detach { input } => {
-                    lower(graph, *input, out, range, memo, materialized, substitutions)?
-                }
+                Op::Detach { input } => lower(graph, *input, out, range, memo, context)?,
                 Op::Unary { op, input } => UOp::from_operation(
                     Operation::GraphUnary(*op),
                     Some(ty),
-                    vec![lower(
-                        graph,
-                        *input,
-                        out,
-                        range,
-                        memo,
-                        materialized,
-                        substitutions,
-                    )?],
+                    vec![lower(graph, *input, out, range, memo, context)?],
                 ),
                 Op::Binary { op, lhs, rhs } => UOp::from_operation(
                     Operation::GraphBinary(*op),
                     Some(ty),
                     vec![
-                        lower(graph, *lhs, out, range, memo, materialized, substitutions)?,
-                        lower(graph, *rhs, out, range, memo, materialized, substitutions)?,
+                        lower(graph, *lhs, out, range, memo, context)?,
+                        lower(graph, *rhs, out, range, memo, context)?,
                     ],
                 ),
                 Op::Compare { op, lhs, rhs } => UOp::from_operation(
                     Operation::GraphCompare(*op),
                     Some(ty),
                     vec![
-                        lower(graph, *lhs, out, range, memo, materialized, substitutions)?,
-                        lower(graph, *rhs, out, range, memo, materialized, substitutions)?,
+                        lower(graph, *lhs, out, range, memo, context)?,
+                        lower(graph, *rhs, out, range, memo, context)?,
                     ],
                 ),
                 Op::Logical { op, lhs, rhs } => {
-                    let mut s = vec![lower(
-                        graph,
-                        *lhs,
-                        out,
-                        range,
-                        memo,
-                        materialized,
-                        substitutions,
-                    )?];
+                    let mut s = vec![lower(graph, *lhs, out, range, memo, context)?];
                     if let Some(rhs) = rhs {
-                        s.push(lower(
-                            graph,
-                            *rhs,
-                            out,
-                            range,
-                            memo,
-                            materialized,
-                            substitutions,
-                        )?);
+                        s.push(lower(graph, *rhs, out, range, memo, context)?);
                     }
                     UOp::from_operation(Operation::GraphLogical(*op), Some(ty), s)
                 }
@@ -628,33 +691,9 @@ fn lower_graph_elementwise_with_substitutions(
                     Operation::Ternary(crate::uop::Ternary::Where),
                     Some(ty),
                     vec![
-                        lower(
-                            graph,
-                            *condition,
-                            out,
-                            range,
-                            memo,
-                            materialized,
-                            substitutions,
-                        )?,
-                        lower(
-                            graph,
-                            *on_true,
-                            out,
-                            range,
-                            memo,
-                            materialized,
-                            substitutions,
-                        )?,
-                        lower(
-                            graph,
-                            *on_false,
-                            out,
-                            range,
-                            memo,
-                            materialized,
-                            substitutions,
-                        )?,
+                        lower(graph, *condition, out, range, memo, context)?,
+                        lower(graph, *on_true, out, range, memo, context)?,
+                        lower(graph, *on_false, out, range, memo, context)?,
                     ],
                 ),
                 _ => return Err(UOpError::InvalidArgument),
@@ -663,14 +702,18 @@ fn lower_graph_elementwise_with_substitutions(
         memo.insert(id, x.clone());
         Ok(x)
     }
+    let context = ElementwiseLowering {
+        materialized,
+        substitutions,
+        iteration_view,
+    };
     let value = lower(
         graph,
         value,
         &output_shape,
         &range,
         &mut HashMap::new(),
-        materialized,
-        substitutions,
+        &context,
     )?;
     let address = UOp::from_operation(
         Operation::DefineGlobal(AddressValue {
@@ -940,6 +983,7 @@ pub(crate) fn lower_graph_reduction_epilogue_with_materialized(
         output,
         materialized,
         &HashMap::from([(reduction, committed)]),
+        None,
     )?;
     kernel.validate()?;
     Ok(kernel)

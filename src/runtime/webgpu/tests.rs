@@ -1135,7 +1135,7 @@ fn raw_movement_copy_wgsl_executes_packed_affine_and_dense_storage_contracts() {
     let reshaped = dense.reshape(producer, [2, 1]).unwrap();
     let viewed = dense.expand(reshaped, [2, 3]).unwrap();
     let affine_output = dense.contiguous(viewed).unwrap();
-    let affine_item = schedule(&dense, affine_output)
+    let affine_item = crate::schedule_many(&dense, &[producer, affine_output])
         .unwrap()
         .items
         .into_iter()
