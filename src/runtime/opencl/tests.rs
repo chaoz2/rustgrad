@@ -1,8 +1,172 @@
 use super::renderer::{
     OPENCL_ABI_VERSION, OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
-    OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
-    OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
+    OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION, OPENCL_RAW_COPY_RENDERER_VERSION,
+    OPENCL_RENDERER_VERSION, OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
 };
+
+#[test]
+fn portable_prefix_scan_opencl_uses_lane_extent_and_executes_first_match_indices() {
+    let renderer = OpenClRenderer::default();
+    for dtype in [DType::Bool, DType::I32, DType::U32, DType::F32] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], dtype);
+        let sum = graph.cumsum(input, 1).unwrap();
+        let product = graph.cumprod(input, 1).unwrap();
+        let (maximum, maximum_indices) = graph.cummax(input, 1).unwrap();
+        let (minimum, minimum_indices) = graph.cummin(input, 1).unwrap();
+        for output in [
+            sum,
+            product,
+            maximum,
+            maximum_indices,
+            minimum,
+            minimum_indices,
+        ] {
+            let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+            let rendered = renderer.render(&item.kernel).unwrap();
+            rendered
+                .validate_schedule_bindings(item.ordered_inputs())
+                .unwrap();
+            assert_eq!(rendered.extent, 2);
+            assert_eq!(rendered.buffers.len(), 2);
+            assert!(
+                rendered
+                    .source
+                    .contains(OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION)
+            );
+            if output == maximum
+                || output == maximum_indices
+                || output == minimum
+                || output == minimum_indices
+            {
+                assert!(rendered.source.contains("rg_equal_before"));
+            } else {
+                assert!(rendered.source.contains("rg_acc ="));
+            }
+            if dtype == DType::I32 && (output == sum || output == product) {
+                assert!(rendered.source.contains("as_int(as_uint(rg_acc)"));
+            }
+            if output == product && dtype == DType::I32 {
+                assert!(rendered.source.contains("int rg_acc = (int)1;"));
+            }
+            if output == product && dtype == DType::U32 {
+                assert!(rendered.source.contains("uint rg_acc = 1u;"));
+            }
+        }
+    }
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F32);
+    let indices = graph.cummax(input, 1).unwrap().1;
+    let item = schedule(&graph, indices).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    let (bytes, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage(
+                [2, 3],
+                Storage::F32(vec![1.0, 3.0, 3.0, f32::NAN, 5.0, 4.0]),
+            )
+            .unwrap(),
+        )]),
+    );
+    assert_eq!(
+        bytes
+            .chunks_exact(4)
+            .map(|lane| i32::from_le_bytes(lane.try_into().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![0, 1, 1, 3, 1, 1]
+    );
+
+    let mut narrow = Graph::new();
+    let input = narrow.input_dtype("x", [2], DType::F16);
+    let output = narrow.cumsum(input, 0).unwrap();
+    let item = schedule(&narrow, output).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("Bool/I32/U32/F32")
+    ));
+
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("x", [], DType::F32);
+    let output = scalar.cumsum(input, 0).unwrap();
+    let item = schedule(&scalar, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert!(rendered.source.contains("as_float(as_uint(b0[0]))"));
+    let raw = f32::from_bits(0x7fc1_2345);
+    let (bytes, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage([], Storage::F32(vec![raw])).unwrap(),
+        )]),
+    );
+    assert_eq!(u32::from_le_bytes(bytes.try_into().unwrap()), raw.to_bits());
+
+    let mut large_values = Graph::new();
+    let input = large_values.input_dtype("x", [i32::MAX as usize + 1], DType::F32);
+    let (output, indices) = large_values.cummax(input, 0).unwrap();
+    let item = schedule(&large_values, output)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert_eq!(rendered.extent, 1);
+    assert!(!rendered.source.contains("rg_index"));
+    let item = schedule(&large_values, indices)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("index sentinel exceeds I32")
+    ));
+}
+
+#[test]
+fn portable_prefix_scan_opencl_zero_domain_skips_buffers_queue_and_launch() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 0, 3], DType::F32);
+    let output = graph.cumsum(input, 1).unwrap();
+    let mut items = schedule(&graph, output).unwrap().items;
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let before = mock.calls();
+    let prefix = PreparedOpenClPrefix::prepare(context.clone(), &items, renderer).unwrap();
+    let mut missing = BTreeMap::new();
+    let before_missing = mock.calls();
+    assert!(matches!(
+        prefix.execute(&mut missing),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("missing prefix input")
+    ));
+    assert_eq!(mock.calls(), before_missing);
+    assert!(!missing.contains_key(&(output.index() as u64)));
+    let mut values = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([2, 0, 3], Storage::F32(Vec::new())).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    assert!(values[&(output.index() as u64)].is_empty());
+    assert!(!mock.calls()[before.len()..].iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("queue_create:")
+            || call.starts_with("launch:")
+    }));
+
+    items[0].input_bindings[0].desc.bytes += 4;
+    let before = mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(context, &items, renderer),
+        Err(OpenClError::InvalidBinding(_))
+    ));
+    assert_eq!(mock.calls(), before);
+}
 
 #[test]
 fn portable_f32_matmul_opencl_renders_shared_geometry_and_executes_zero_k() {
@@ -238,6 +402,77 @@ fn portable_f32_matmul_opencl_capture_keeps_dependent_prefix_device_resident() {
     assert_eq!(
         values[&(output.index() as u64)].storage(),
         &Storage::F32(vec![361.0, 484.0, 1849.0, 2500.0])
+    );
+}
+
+#[test]
+fn portable_prefix_scan_opencl_capture_keeps_producer_and_consumer_device_resident() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let scanned = graph.cumsum(producer, 1).unwrap();
+    let temporary_value = graph.square(scanned).unwrap();
+    let temporary = graph.contiguous(temporary_value).unwrap();
+    let output = graph.square(temporary).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 4);
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let before_prepare = mock.calls();
+    let plan = OpenClPrefixPlan::plan_for_outputs(
+        context.clone(),
+        &decoded.items,
+        &[output.index() as u64],
+        renderer,
+    )
+    .unwrap();
+    let prefix = PreparedOpenClPrefix::from_plan(context, plan).unwrap();
+    let prepared_calls = &mock.calls()[before_prepare.len()..];
+    assert_eq!(
+        prepared_calls
+            .iter()
+            .filter(|call| call.starts_with("buffer_create:"))
+            .count(),
+        4,
+        "five logical buffers reuse the producer slot for the later temporary while the retained output remains private"
+    );
+    let before_execute = mock.calls();
+    let mut values = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([2, 3], Storage::F32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    let calls = &mock.calls()[before_execute.len()..];
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("launch:"))
+            .count(),
+        4
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1
+    );
+    assert!(!values.contains_key(&(producer.index() as u64)));
+    assert!(!values.contains_key(&(scanned.index() as u64)));
+    assert!(!values.contains_key(&(temporary.index() as u64)));
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![
+            1.0,
+            625.0,
+            38_416.0,
+            65_536.0,
+            2_825_761.0,
+            35_153_040.0,
+        ])
     );
 }
 

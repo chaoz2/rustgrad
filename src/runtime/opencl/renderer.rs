@@ -27,6 +27,8 @@ pub const OPENCL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-opencl-raw-copy-v1"
 pub const OPENCL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-opencl-static-position-v1";
 pub const OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-opencl-portable-f32-matmul-v1";
+pub const OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
+    "rustgrad-opencl-portable-prefix-scan-v1";
 pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -66,6 +68,16 @@ impl RenderedOpenCl {
                 .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
                 .validate_schedule_bindings(bindings)
                 .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::PrefixScan(value) = root.operation()
+        {
+            let portable = crate::prefix_scan_native::PortablePrefixScan::new(value)
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+            crate::runtime::static_schedule::validate_portable_prefix_scan_bindings(
+                &portable, bindings,
+            )
+            .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
         }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(OpenClError::InvalidBinding(
@@ -136,6 +148,9 @@ impl OpenClRenderer {
         if let Operation::Matmul(value) = root.operation() {
             return render_portable_f32_matmul(self, root, value);
         }
+        if let Operation::PrefixScan(value) = root.operation() {
+            return render_portable_prefix_scan(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -157,14 +172,10 @@ impl OpenClRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::PrefixScan(_)
-                | Operation::Sort(_)
-                | Operation::TensorGuard(_)
-                | Operation::Threefry(_)
+            Operation::Sort(_) | Operation::TensorGuard(_) | Operation::Threefry(_)
         ) {
             return Err(OpenClError::Unsupported(
-                "prefix scans, sort pairs, guards, and live Threefry are outside OpenCL lowering"
-                    .into(),
+                "sort pairs, guards, and live Threefry are outside OpenCL lowering".into(),
             ));
         }
         root.validate()
@@ -489,6 +500,249 @@ impl OpenClRenderer {
                 root.clone(),
             ))),
         })
+    }
+}
+
+fn render_portable_prefix_scan(
+    renderer: &OpenClRenderer,
+    root: &UOp,
+    value: &crate::PrefixScanValue,
+) -> Result<RenderedOpenCl, OpenClError> {
+    root.validate()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::prefix_scan_native::PortablePrefixScan::new(value).map_err(|error| match error {
+            crate::prefix_scan_native::PortablePrefixScanError::Unsupported(reason) => {
+                OpenClError::Unsupported(reason.into())
+            }
+            crate::prefix_scan_native::PortablePrefixScanError::Overflow => OpenClError::Overflow,
+            other => OpenClError::InvalidBinding(other.to_string()),
+        })?;
+    let plan = portable.plan();
+    let input = OpenClBufferAbi {
+        id: plan.input,
+        dtype: plan.input_dtype,
+        source_shape: value.input_shape.clone(),
+        elements: plan.elements,
+        mutable: false,
+        view: None,
+    };
+    let output = OpenClBufferAbi {
+        id: plan.output,
+        dtype: plan.output_dtype,
+        source_shape: value.output_shape.clone(),
+        elements: plan.elements,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input.clone(), output];
+    let entry = format!(
+        "rg_opencl_scan_{:?}_{:?}_a{}_n{}",
+        plan.kind, plan.result, plan.axis, plan.elements
+    )
+    .to_ascii_lowercase();
+    let input_type = cl_type(plan.input_dtype);
+    let output_type = cl_type(plan.output_dtype);
+    let mut lines = vec![
+        "#pragma OPENCL FP_CONTRACT OFF".into(),
+        format!("// {OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
+        format!("__kernel void {entry}("),
+        format!("    __global const {input_type}* b0,"),
+        format!("    __global {output_type}* b1,"),
+        "    ulong extent) {".into(),
+        "  const ulong gid = (ulong)get_global_id(0);".into(),
+        format!(
+            "  if (gid >= extent || gid >= (ulong){}ul) return;",
+            plan.work_items()
+        ),
+    ];
+    lines.extend(
+        crate::prefix_scan_native::emit_portable_prefix_scan_body(
+            &portable,
+            &OpenClPrefixScanDialect,
+        )
+        .map_err(|error| OpenClError::Unsupported(error.to_string()))?,
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
+        OPENCL_ABI_VERSION,
+        renderer.local_size,
+        renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedOpenCl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.launch_extent(),
+        entry,
+        cache_key,
+        required_capabilities: OpenClCapabilities::CORE_32,
+        transaction: None,
+        schedule_inputs: vec![input],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+struct OpenClPrefixScanDialect;
+
+impl crate::prefix_scan_native::PortablePrefixScanDialect for OpenClPrefixScanDialect {
+    fn scalar_body(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<Vec<String>, crate::prefix_scan_native::PortablePrefixScanError> {
+        Ok(vec![match plan.result {
+            crate::PrefixScanOutput::Indices => "  b1[0] = (int)0;".into(),
+            crate::PrefixScanOutput::Values if plan.input_dtype == plan.output_dtype => {
+                if plan.input_dtype == DType::F32 {
+                    "  b1[0] = as_float(as_uint(b0[0]));".into()
+                } else {
+                    "  b1[0] = b0[0];".into()
+                }
+            }
+            crate::PrefixScanOutput::Values => "  b1[0] = (int)b0[0];".into(),
+        }])
+    }
+
+    fn domain(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> Vec<String> {
+        vec![
+            format!(
+                "  const uint rg_row = (uint)(gid / (ulong){}ul);",
+                plan.inner
+            ),
+            format!(
+                "  const uint rg_inner = (uint)(gid % (ulong){}ul);",
+                plan.inner
+            ),
+        ]
+    }
+
+    fn identity(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<&'static str, crate::prefix_scan_native::PortablePrefixScanError> {
+        Ok(match (plan.kind, plan.work_dtype) {
+            (crate::PrefixScanKind::Sum, DType::F32) => "0.0f",
+            (crate::PrefixScanKind::Product, DType::F32) => "1.0f",
+            (crate::PrefixScanKind::Max, DType::F32) => "as_float(0xff800000u)",
+            (crate::PrefixScanKind::Min, DType::F32) => "as_float(0x7f800000u)",
+            (crate::PrefixScanKind::Product | crate::PrefixScanKind::Min, DType::Bool) => {
+                "(uchar)1"
+            }
+            (crate::PrefixScanKind::Product, DType::I32) => "(int)1",
+            (crate::PrefixScanKind::Product, DType::U32) => "1u",
+            (crate::PrefixScanKind::Max, DType::I32) => "as_int(0x80000000u)",
+            (crate::PrefixScanKind::Min, DType::I32) => "as_int(0x7fffffffu)",
+            (crate::PrefixScanKind::Min, DType::U32) => "0xffffffffu",
+            (_, DType::Bool | DType::I32 | DType::U32) => "0",
+            _ => {
+                return Err(
+                    crate::prefix_scan_native::PortablePrefixScanError::Unsupported(
+                        "OpenCL portable scan identity dtype",
+                    ),
+                );
+            }
+        })
+    }
+
+    fn accumulator(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        identity: &str,
+    ) -> String {
+        format!("  {} rg_acc = {identity};", cl_type(plan.work_dtype))
+    }
+
+    fn index(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!("  int rg_index = (int){};", plan.index_sentinel)
+    }
+
+    fn loop_open(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "  for (uint rg_axis = 0u; rg_axis < {}u; ++rg_axis) {{",
+            plan.axis_len
+        )
+    }
+
+    fn offset(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "    const ulong rg_offset = ((ulong)rg_row * (ulong){}ul + (ulong)rg_axis) * (ulong){}ul + (ulong)rg_inner;",
+            plan.axis_len, plan.inner
+        )
+    }
+
+    fn load(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<String, crate::prefix_scan_native::PortablePrefixScanError> {
+        let work = cl_type(plan.work_dtype);
+        Ok(format!("    const {work} rg_next = ({work})b0[rg_offset];"))
+    }
+
+    fn strict(
+        &self,
+        _plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        operator: &str,
+    ) -> String {
+        format!("    const int rg_strict = rg_next {operator} rg_acc;")
+    }
+
+    fn equal_before(&self) -> String {
+        "    const int rg_equal_before = rg_next == rg_acc;".into()
+    }
+
+    fn update_extrema(&self) -> String {
+        "    if (rg_strict) rg_acc = rg_next;".into()
+    }
+
+    fn update_first_index(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "    if (rg_strict || (rg_index == (int){} && rg_equal_before)) rg_index = (int)rg_axis;",
+            plan.index_sentinel
+        )
+    }
+
+    fn arithmetic(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        operator: &str,
+    ) -> Result<String, crate::prefix_scan_native::PortablePrefixScanError> {
+        let expression = match plan.work_dtype {
+            DType::Bool => "(uchar)((rg_acc != 0) && (rg_next != 0))".into(),
+            DType::I32 => {
+                format!("as_int(as_uint(rg_acc) {operator} as_uint(rg_next))")
+            }
+            DType::U32 | DType::F32 => format!("rg_acc {operator} rg_next"),
+            _ => {
+                return Err(
+                    crate::prefix_scan_native::PortablePrefixScanError::Unsupported(
+                        "OpenCL portable scan arithmetic dtype",
+                    ),
+                );
+            }
+        };
+        Ok(format!("    rg_acc = {expression};"))
+    }
+
+    fn store(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> Vec<String> {
+        let stored = if plan.result == crate::PrefixScanOutput::Indices {
+            "rg_index".into()
+        } else if plan.output_dtype == DType::Bool {
+            "(uchar)(rg_acc != 0)".into()
+        } else {
+            format!("({})rg_acc", cl_type(plan.output_dtype))
+        };
+        vec![format!("    b1[rg_offset] = {stored};")]
+    }
+
+    fn loop_close(&self) -> String {
+        "  }".into()
     }
 }
 

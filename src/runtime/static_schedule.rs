@@ -5,7 +5,7 @@
 //! Metal, WebGPU, and fixed-schema CUDA graph paths.
 
 use crate::{
-    DType, Operation, ScheduleItem, Shape, TensorData,
+    DType, Operation, ScheduleInputBinding, ScheduleItem, Shape, TensorData,
     memory_plan::{ExactSlotPolicy, ExactSlotRequest, assign_exact_slots},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,6 +30,69 @@ pub(crate) struct StaticBufferUse {
 pub(crate) enum StaticBufferRole {
     Input,
     Output,
+}
+
+/// Authenticated logical storage and physical launch domains for one item.
+/// Most kernels launch one work item per output element; serial PrefixScan
+/// launches one work item per `(row, inner)` lane while retaining the full
+/// logical output descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticLaunchDomain {
+    logical_elements: usize,
+    work_items: usize,
+}
+
+impl StaticLaunchDomain {
+    fn checked(item: &ScheduleItem, logical_elements: usize) -> Result<Self, &'static str> {
+        let work_items = match item.kernel.operation() {
+            Operation::PrefixScan(value) => {
+                let plan = crate::prefix_scan_native::NativePrefixScanPlan::new(value)?;
+                if plan.elements != logical_elements {
+                    return Err("prefix-scan logical output extent mismatch");
+                }
+                plan.work_items()
+            }
+            _ => logical_elements,
+        };
+        Ok(Self {
+            logical_elements,
+            work_items,
+        })
+    }
+}
+
+pub(crate) fn validate_portable_prefix_scan_bindings(
+    portable: &crate::prefix_scan_native::PortablePrefixScan<'_>,
+    bindings: &[ScheduleInputBinding],
+) -> Result<(), crate::prefix_scan_native::PortablePrefixScanError> {
+    let plan = portable.plan();
+    let bytes = plan
+        .elements
+        .checked_mul(plan.input_dtype.itemsize())
+        .ok_or(crate::prefix_scan_native::PortablePrefixScanError::Overflow)?;
+    let [binding] = bindings else {
+        return Err(
+            crate::prefix_scan_native::PortablePrefixScanError::InvalidBinding(
+                "scan requires exactly one dense source binding".into(),
+            ),
+        );
+    };
+    if binding.abi_index != 0
+        || binding.input_node != portable.value().input
+        || binding.desc.id != plan.input
+        || binding.desc.shape != portable.value().input_shape
+        || binding.desc.dtype != plan.input_dtype
+        || binding.desc.bytes != bytes
+        || !binding.desc.read_only
+        || binding.desc.view.is_some()
+    {
+        return Err(
+            crate::prefix_scan_native::PortablePrefixScanError::InvalidBinding(
+                "scan source is not its exact dense descriptor".into(),
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Backend-neutral pointer metadata projected from an existing renderer ABI.
@@ -319,12 +382,15 @@ impl<R> StaticSchedulePlan<R> {
             }
             let output = rendered.buffers.last().expect("checked nonempty");
             let expected = item.primary_output();
+            let launch = StaticLaunchDomain::checked(item, output.elements)
+                .map_err(|reason| A::invalid_binding(reason.into()))?;
             if expected.view.is_some()
                 || output.id != expected.id
                 || output.dtype != expected.dtype
                 || output.source_shape != expected.shape
+                || output.elements != launch.logical_elements
                 || output.elements != expected.shape.numel().map_err(|_| A::overflow())?
-                || rendered.extent != output.elements
+                || rendered.extent != launch.work_items
             {
                 return Err(A::invalid_binding(
                     "rendered output mismatches scheduled output".into(),

@@ -20,6 +20,8 @@ pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-metal-static-position-v1";
 pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-f32-matmul-v1";
+pub const METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
+    "rustgrad-metal-portable-prefix-scan-v1";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -48,7 +50,9 @@ pub struct RenderedMetal {
     pub source_map: BTreeMap<usize, usize>,
     /// Ordered input pointers followed by the output pointer.
     pub buffers: Vec<MetalBufferAbi>,
-    /// Logical output element count supplied as the final scalar ABI value.
+    /// Exact launch work-item count supplied as the final scalar ABI value.
+    /// This equals the logical output extent for ordinary kernels; a serial
+    /// PrefixScan launches one item per independent `(row, inner)` lane.
     pub extent: usize,
     /// Generated MSL entry-point name.
     pub entry: String,
@@ -75,6 +79,16 @@ impl RenderedMetal {
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
                 .validate_schedule_bindings(bindings)
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::PrefixScan(value) = root.operation()
+        {
+            let portable = crate::prefix_scan_native::PortablePrefixScan::new(value)
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+            crate::runtime::static_schedule::validate_portable_prefix_scan_bindings(
+                &portable, bindings,
+            )
+            .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
         }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(MetalError::InvalidBinding(
@@ -130,6 +144,9 @@ impl MetalRenderer {
         if let Operation::Matmul(value) = root.operation() {
             return render_portable_f32_matmul(self, root, value);
         }
+        if let Operation::PrefixScan(value) = root.operation() {
+            return render_portable_prefix_scan(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -151,14 +168,10 @@ impl MetalRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::PrefixScan(_)
-                | Operation::Sort(_)
-                | Operation::TensorGuard(_)
-                | Operation::Threefry(_)
+            Operation::Sort(_) | Operation::TensorGuard(_) | Operation::Threefry(_)
         ) {
             return Err(MetalError::Unsupported(
-                "prefix scans, sort pairs, guards, and live Threefry are outside Metal lowering"
-                    .into(),
+                "sort pairs, guards, and live Threefry are outside Metal lowering".into(),
             ));
         }
         root.validate()
@@ -424,6 +437,263 @@ impl MetalRenderer {
                 root.clone(),
             ))),
         })
+    }
+}
+
+fn render_portable_prefix_scan(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    value: &crate::PrefixScanValue,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::prefix_scan_native::PortablePrefixScan::new(value).map_err(|error| match error {
+            crate::prefix_scan_native::PortablePrefixScanError::Unsupported(reason) => {
+                MetalError::Unsupported(reason.into())
+            }
+            crate::prefix_scan_native::PortablePrefixScanError::Overflow => MetalError::Overflow,
+            other => MetalError::InvalidBinding(other.to_string()),
+        })?;
+    let plan = portable.plan();
+    let input = MetalBufferAbi {
+        id: plan.input,
+        dtype: plan.input_dtype,
+        source_shape: value.input_shape.clone(),
+        elements: plan.elements,
+        mutable: false,
+        view: None,
+    };
+    let output = MetalBufferAbi {
+        id: plan.output,
+        dtype: plan.output_dtype,
+        source_shape: value.output_shape.clone(),
+        elements: plan.elements,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input.clone(), output];
+    for buffer in &buffers {
+        let bytes = buffer
+            .elements
+            .checked_mul(buffer.dtype.itemsize())
+            .ok_or(MetalError::Overflow)?;
+        if bytes > renderer.capabilities.max_buffer_length {
+            return Err(MetalError::Unsupported(
+                "portable scan binding exceeds device buffer limit".into(),
+            ));
+        }
+    }
+    let entry = format!(
+        "rg_metal_scan_{:?}_{:?}_a{}_n{}",
+        plan.kind, plan.result, plan.axis, plan.elements
+    )
+    .to_ascii_lowercase();
+    let input_type = metal_storage_type(plan.input_dtype);
+    let output_type = metal_storage_type(plan.output_dtype);
+    let mut lines = vec![
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        "#pragma clang fp contract(off)".into(),
+        format!("// {METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        format!("kernel void {entry}("),
+        format!("    device const {input_type}* b0 [[buffer(0)]],"),
+        format!("    device {output_type}* b1 [[buffer(1)]],"),
+        "    constant ulong& extent [[buffer(2)]],".into(),
+        "    uint gid32 [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = (ulong)gid32;".into(),
+        "  if (gid >= extent) return;".into(),
+    ];
+    lines.extend(
+        crate::prefix_scan_native::emit_portable_prefix_scan_body(
+            &portable,
+            &MetalPrefixScanDialect,
+        )
+        .map_err(|error| MetalError::Unsupported(error.to_string()))?,
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.launch_extent(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        schedule_inputs: vec![input],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+struct MetalPrefixScanDialect;
+
+impl crate::prefix_scan_native::PortablePrefixScanDialect for MetalPrefixScanDialect {
+    fn scalar_body(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<Vec<String>, crate::prefix_scan_native::PortablePrefixScanError> {
+        Ok(vec![match plan.result {
+            crate::PrefixScanOutput::Indices => "  b1[0] = (int)0;".into(),
+            crate::PrefixScanOutput::Values if plan.input_dtype == plan.output_dtype => {
+                if plan.input_dtype == DType::F32 {
+                    "  b1[0] = as_type<float>(as_type<uint>(b0[0]));".into()
+                } else {
+                    "  b1[0] = b0[0];".into()
+                }
+            }
+            crate::PrefixScanOutput::Values => "  b1[0] = (int)b0[0];".into(),
+        }])
+    }
+
+    fn domain(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> Vec<String> {
+        vec![
+            format!(
+                "  const uint rg_row = (uint)(gid / (ulong){}ul);",
+                plan.inner
+            ),
+            format!(
+                "  const uint rg_inner = (uint)(gid % (ulong){}ul);",
+                plan.inner
+            ),
+        ]
+    }
+
+    fn identity(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<&'static str, crate::prefix_scan_native::PortablePrefixScanError> {
+        Ok(match (plan.kind, plan.work_dtype) {
+            (crate::PrefixScanKind::Sum, DType::F32) => "0.0f",
+            (crate::PrefixScanKind::Product, DType::F32) => "1.0f",
+            (crate::PrefixScanKind::Max, DType::F32) => "as_type<float>(0xff800000u)",
+            (crate::PrefixScanKind::Min, DType::F32) => "as_type<float>(0x7f800000u)",
+            (crate::PrefixScanKind::Product | crate::PrefixScanKind::Min, DType::Bool) => {
+                "(uchar)1"
+            }
+            (crate::PrefixScanKind::Product, DType::I32) => "(int)1",
+            (crate::PrefixScanKind::Product, DType::U32) => "1u",
+            (crate::PrefixScanKind::Max, DType::I32) => "as_type<int>(0x80000000u)",
+            (crate::PrefixScanKind::Min, DType::I32) => "as_type<int>(0x7fffffffu)",
+            (crate::PrefixScanKind::Min, DType::U32) => "0xffffffffu",
+            (_, DType::Bool | DType::I32 | DType::U32) => "0",
+            _ => {
+                return Err(
+                    crate::prefix_scan_native::PortablePrefixScanError::Unsupported(
+                        "Metal portable scan identity dtype",
+                    ),
+                );
+            }
+        })
+    }
+
+    fn accumulator(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        identity: &str,
+    ) -> String {
+        format!(
+            "  {} rg_acc = {identity};",
+            metal_storage_type(plan.work_dtype)
+        )
+    }
+
+    fn index(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!("  int rg_index = (int){};", plan.index_sentinel)
+    }
+
+    fn loop_open(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "  for (uint rg_axis = 0u; rg_axis < {}u; ++rg_axis) {{",
+            plan.axis_len
+        )
+    }
+
+    fn offset(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "    const ulong rg_offset = ((ulong)rg_row * (ulong){}ul + (ulong)rg_axis) * (ulong){}ul + (ulong)rg_inner;",
+            plan.axis_len, plan.inner
+        )
+    }
+
+    fn load(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<String, crate::prefix_scan_native::PortablePrefixScanError> {
+        let work = metal_storage_type(plan.work_dtype);
+        Ok(format!("    const {work} rg_next = ({work})b0[rg_offset];"))
+    }
+
+    fn strict(
+        &self,
+        _plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        operator: &str,
+    ) -> String {
+        format!("    const bool rg_strict = rg_next {operator} rg_acc;")
+    }
+
+    fn equal_before(&self) -> String {
+        "    const bool rg_equal_before = rg_next == rg_acc;".into()
+    }
+
+    fn update_extrema(&self) -> String {
+        "    if (rg_strict) rg_acc = rg_next;".into()
+    }
+
+    fn update_first_index(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "    if (rg_strict || (rg_index == (int){} && rg_equal_before)) rg_index = (int)rg_axis;",
+            plan.index_sentinel
+        )
+    }
+
+    fn arithmetic(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        operator: &str,
+    ) -> Result<String, crate::prefix_scan_native::PortablePrefixScanError> {
+        let expression = match plan.work_dtype {
+            DType::Bool => "(uchar)((rg_acc != 0) && (rg_next != 0))".into(),
+            DType::I32 => {
+                format!("as_type<int>(as_type<uint>(rg_acc) {operator} as_type<uint>(rg_next))")
+            }
+            DType::U32 | DType::F32 => format!("rg_acc {operator} rg_next"),
+            _ => {
+                return Err(
+                    crate::prefix_scan_native::PortablePrefixScanError::Unsupported(
+                        "Metal portable scan arithmetic dtype",
+                    ),
+                );
+            }
+        };
+        Ok(format!("    rg_acc = {expression};"))
+    }
+
+    fn store(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> Vec<String> {
+        let stored = if plan.result == crate::PrefixScanOutput::Indices {
+            "rg_index".into()
+        } else if plan.output_dtype == DType::Bool {
+            "(uchar)(rg_acc != 0)".into()
+        } else {
+            format!("({})rg_acc", metal_storage_type(plan.output_dtype))
+        };
+        vec![format!("    b1[rg_offset] = {stored};")]
+    }
+
+    fn loop_close(&self) -> String {
+        "  }".into()
     }
 }
 

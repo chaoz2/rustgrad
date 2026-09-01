@@ -396,6 +396,31 @@ mod tests {
     }
 
     #[test]
+    fn cuda_graph_prefix_plan_accepts_prefix_scan_lane_extent_without_identity_drift() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], crate::DType::F32);
+        let output = graph.cumsum(input, 1).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let [item] = schedule.items.as_slice() else {
+            panic!("prefix scan must remain one scheduled item")
+        };
+        let schedule_identity = item.cache_key;
+        assert_eq!(
+            crate::uop::artifact::encode_schedule_identity(&item.kernel).unwrap()[4],
+            18
+        );
+        let renderer = PtxRenderer::new(80).unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert_eq!(rendered.buffers.last().unwrap().elements, 6);
+        assert_eq!(rendered.extent, 2);
+        let rendered_identity = rendered.cache_key.clone();
+
+        let planned = CudaGraphPrefixPlan::plan(&schedule.items, renderer).unwrap();
+        assert_eq!(planned.kernel_cache_keys(), vec![rendered_identity]);
+        assert_eq!(schedule.items[0].cache_key, schedule_identity);
+    }
+
+    #[test]
     fn cuda_graph_reuses_one_stable_lease_for_disjoint_logical_temporaries() {
         let (schedule, external, outputs) = reusable_linear();
         assert_eq!(schedule.items.len(), 4);

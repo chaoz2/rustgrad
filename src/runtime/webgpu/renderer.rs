@@ -23,6 +23,8 @@ pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v7";
 pub const WGSL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-wgsl-raw-copy-v1";
 pub const WGSL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-wgsl-static-position-v1";
 pub const WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-f32-matmul-v1";
+pub const WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
+    "rustgrad-wgsl-portable-prefix-scan-v1";
 /// Ordered storage-plus-extent bind-group ABI version.
 pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
@@ -71,7 +73,9 @@ pub struct RenderedWgsl {
     pub source_map: BTreeMap<usize, usize>,
     /// Ordered inputs followed by the unique output.
     pub buffers: Vec<WgslBufferAbi>,
-    /// Logical output element count supplied through the final uniform.
+    /// Exact launch work-item count supplied through the final uniform.
+    /// This equals the logical output extent for ordinary kernels; a serial
+    /// PrefixScan launches one item per independent `(row, inner)` lane.
     pub extent: usize,
     /// Generated compute entry point.
     pub entry: String,
@@ -100,6 +104,16 @@ impl RenderedWgsl {
                 .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
                 .validate_schedule_bindings(bindings)
                 .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::PrefixScan(value) = root.operation()
+        {
+            let portable = crate::prefix_scan_native::PortablePrefixScan::new(value)
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+            crate::runtime::static_schedule::validate_portable_prefix_scan_bindings(
+                &portable, bindings,
+            )
+            .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
         }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(WebGpuError::InvalidBinding(
@@ -144,6 +158,36 @@ impl RenderedWgsl {
             }
             _ => None,
         };
+        let portable_scan = match self.semantic_program.as_ref() {
+            super::dispatch::KernelSemanticProgram::UOp(root)
+                if matches!(root.operation(), Operation::PrefixScan(_)) =>
+            {
+                let Operation::PrefixScan(value) = root.operation() else {
+                    unreachable!("guarded above")
+                };
+                Some(
+                    crate::prefix_scan_native::PortablePrefixScan::new(value).map_err(|error| {
+                        match error {
+                            crate::prefix_scan_native::PortablePrefixScanError::Unsupported(
+                                reason,
+                            ) => WebGpuError::Unsupported(reason.into()),
+                            crate::prefix_scan_native::PortablePrefixScanError::Overflow => {
+                                WebGpuError::Overflow
+                            }
+                            other => WebGpuError::InvalidBinding(other.to_string()),
+                        }
+                    })?,
+                )
+            }
+            _ => None,
+        };
+        if let Some(portable) = portable_scan.as_ref() {
+            validate_portable_prefix_scan_launch(
+                portable.launch_extent(),
+                self.local_size,
+                &self.capabilities,
+            )?;
+        }
         let raw_movement = match self.semantic_program.as_ref() {
             super::dispatch::KernelSemanticProgram::UOp(root)
                 if matches!(root.operation(), Operation::Movement(_)) =>
@@ -202,12 +246,14 @@ impl RenderedWgsl {
                 .source_shape
                 .numel()
                 .map_err(|_| WebGpuError::Overflow)?;
-            let physical_bytes =
-                if portable_matmul.is_some() && self.extent != 0 && buffer.elements == 0 {
-                    DType::F32.itemsize()
-                } else {
-                    buffer.physical_bytes()?
-                };
+            let physical_bytes = if (portable_matmul.is_some() || portable_scan.is_some())
+                && self.extent != 0
+                && buffer.elements == 0
+            {
+                DType::F32.itemsize()
+            } else {
+                buffer.physical_bytes()?
+            };
             if source_elements != buffer.elements
                 || !ids.insert(buffer.id)
                 || physical_bytes > self.capabilities.max_buffer_size
@@ -225,16 +271,48 @@ impl RenderedWgsl {
                 }
             }
         }
-        if self.extent
-            != self
-                .buffers
-                .last()
-                .expect("nonempty checked above")
-                .elements
-        {
+        let expected_extent = portable_scan.as_ref().map_or_else(
+            || {
+                self.buffers
+                    .last()
+                    .expect("nonempty checked above")
+                    .elements
+            },
+            |scan| scan.launch_extent(),
+        );
+        if self.extent != expected_extent {
             return Err(WebGpuError::InvalidBinding(
                 "artifact output extent mismatch".into(),
             ));
+        }
+        if let Some(portable) = portable_scan {
+            let plan = portable.plan();
+            let [input, output] = self.buffers.as_slice() else {
+                return Err(WebGpuError::InvalidBinding(
+                    "WGSL prefix scan requires two buffers".into(),
+                ));
+            };
+            if self.transaction.is_some()
+                || self.schedule_inputs.len() != 1
+                || self.schedule_inputs.first() != Some(input)
+                || input.id != plan.input
+                || input.dtype != plan.input_dtype
+                || input.source_shape != portable.value().input_shape
+                || input.elements != plan.elements
+                || input.mutable
+                || input.view.is_some()
+                || output.id != plan.output
+                || output.dtype != plan.output_dtype
+                || output.source_shape != portable.value().output_shape
+                || output.elements != plan.elements
+                || !output.mutable
+                || output.view.is_some()
+            {
+                return Err(WebGpuError::InvalidBinding(
+                    "WGSL prefix-scan artifact disagrees with its plan".into(),
+                ));
+            }
+            return Ok(());
         }
         if let Some(portable) = portable_matmul {
             let plan = portable.plan();
@@ -357,6 +435,9 @@ impl WgslRenderer {
         if let Operation::Matmul(value) = root.operation() {
             return render_portable_f32_matmul(self, root, value);
         }
+        if let Operation::PrefixScan(value) = root.operation() {
+            return render_portable_prefix_scan(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -378,14 +459,10 @@ impl WgslRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::PrefixScan(_)
-                | Operation::Sort(_)
-                | Operation::TensorGuard(_)
-                | Operation::Threefry(_)
+            Operation::Sort(_) | Operation::TensorGuard(_) | Operation::Threefry(_)
         ) {
             return Err(WebGpuError::Unsupported(
-                "prefix scans, sort pairs, guards, and live Threefry are outside WebGPU lowering"
-                    .into(),
+                "sort pairs, guards, and live Threefry are outside WebGPU lowering".into(),
             ));
         }
         root.validate()
@@ -732,6 +809,332 @@ impl WgslRenderer {
                 root.clone(),
             ))),
         })
+    }
+}
+
+fn validate_portable_prefix_scan_launch(
+    extent: usize,
+    local_size: u32,
+    capabilities: &WebGpuCapabilities,
+) -> Result<(), WebGpuError> {
+    if local_size == 0 {
+        return Err(WebGpuError::InvalidBinding(
+            "zero WGSL prefix-scan workgroup size".into(),
+        ));
+    }
+    let extent = u32::try_from(extent).map_err(|_| WebGpuError::Overflow)?;
+    if extent.div_ceil(local_size) > capabilities.max_compute_workgroups_per_dimension {
+        return Err(WebGpuError::Unsupported(
+            "prefix-scan launch exceeds adapter workgroup-count limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn render_portable_prefix_scan(
+    renderer: &WgslRenderer,
+    root: &UOp,
+    value: &crate::PrefixScanValue,
+) -> Result<RenderedWgsl, WebGpuError> {
+    root.validate()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::prefix_scan_native::PortablePrefixScan::new(value).map_err(|error| match error {
+            crate::prefix_scan_native::PortablePrefixScanError::Unsupported(reason) => {
+                WebGpuError::Unsupported(reason.into())
+            }
+            crate::prefix_scan_native::PortablePrefixScanError::Overflow => WebGpuError::Overflow,
+            other => WebGpuError::InvalidBinding(other.to_string()),
+        })?;
+    validate_portable_prefix_scan_launch(
+        portable.launch_extent(),
+        renderer.local_size,
+        &renderer.capabilities,
+    )?;
+    let plan = portable.plan();
+    let input = WgslBufferAbi {
+        id: plan.input,
+        dtype: plan.input_dtype,
+        source_shape: value.input_shape.clone(),
+        elements: plan.elements,
+        mutable: false,
+        view: None,
+    };
+    let output = WgslBufferAbi {
+        id: plan.output,
+        dtype: plan.output_dtype,
+        source_shape: value.output_shape.clone(),
+        elements: plan.elements,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input.clone(), output];
+    if buffers.len() > renderer.capabilities.max_storage_buffers_per_shader_stage as usize {
+        return Err(WebGpuError::Unsupported(
+            "portable scan bindings exceed adapter limit".into(),
+        ));
+    }
+    for buffer in &buffers {
+        if buffer.physical_bytes()? > renderer.capabilities.max_buffer_size {
+            return Err(WebGpuError::Unsupported(
+                "portable scan binding exceeds adapter buffer limit".into(),
+            ));
+        }
+    }
+    let entry = format!(
+        "rg_wgsl_scan_{:?}_{:?}_a{}_n{}",
+        plan.kind, plan.result, plan.axis, plan.elements
+    )
+    .to_ascii_lowercase();
+    let input_storage = wgsl_storage_decl(plan.input_dtype, false);
+    let output_storage = wgsl_storage_decl(plan.output_dtype, true);
+    let mut lines = vec![
+        format!("// {WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION}"),
+        format!("@group(0) @binding(0) var<storage, read> b0: array<{input_storage}>;"),
+        format!("@group(0) @binding(1) var<storage, read_write> b1: array<{output_storage}>;"),
+        "struct RustGradExtent { value: u32, };".into(),
+        "@group(0) @binding(2) var<uniform> rg_extent: RustGradExtent;".into(),
+        format!("@compute @workgroup_size({}, 1, 1)", renderer.local_size),
+        format!("fn {entry}(@builtin(global_invocation_id) rg_global: vec3<u32>) {{"),
+        "  let gid: u32 = rg_global.x;".into(),
+        "  if (gid >= rg_extent.value) { return; }".into(),
+    ];
+    lines.extend(
+        crate::prefix_scan_native::emit_portable_prefix_scan_body(
+            &portable,
+            &WgslPrefixScanDialect,
+        )
+        .map_err(|error| WebGpuError::Unsupported(error.to_string()))?,
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
+        WEBGPU_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedWgsl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.launch_extent(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        local_size: renderer.local_size,
+        transaction: None,
+        schedule_inputs: vec![input],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    };
+    rendered.validate_artifact()?;
+    Ok(rendered)
+}
+
+struct WgslPrefixScanDialect;
+
+impl WgslPrefixScanDialect {
+    fn work_type(
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<&'static str, crate::prefix_scan_native::PortablePrefixScanError> {
+        match plan.work_dtype {
+            DType::Bool => Ok("bool"),
+            DType::I32 => Ok("i32"),
+            DType::U32 => Ok("u32"),
+            DType::F32 => Ok("f32"),
+            _ => Err(
+                crate::prefix_scan_native::PortablePrefixScanError::Unsupported(
+                    "WGSL portable scan work dtype",
+                ),
+            ),
+        }
+    }
+
+    fn bool_store(offset: &str, value: &str, indent: &str) -> Vec<String> {
+        vec![
+            format!("{indent}let rg_shift: u32 = ({offset} & 3u) * 8u;"),
+            format!("{indent}atomicAnd(&b1[{offset} >> 2u], ~(0xffu << rg_shift));"),
+            format!("{indent}atomicOr(&b1[{offset} >> 2u], select(0u, 1u, {value}) << rg_shift);"),
+        ]
+    }
+}
+
+impl crate::prefix_scan_native::PortablePrefixScanDialect for WgslPrefixScanDialect {
+    fn scalar_body(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<Vec<String>, crate::prefix_scan_native::PortablePrefixScanError> {
+        Ok(match plan.result {
+            crate::PrefixScanOutput::Indices => vec!["  b1[0] = 0i;".into()],
+            crate::PrefixScanOutput::Values if plan.output_dtype == DType::Bool => {
+                Self::bool_store("0u", "((b0[0] & 0xffu) != 0u)", "  ")
+            }
+            crate::PrefixScanOutput::Values if plan.input_dtype == plan.output_dtype => {
+                vec![if plan.input_dtype == DType::F32 {
+                    "  b1[0] = bitcast<f32>(bitcast<u32>(b0[0]));".into()
+                } else {
+                    "  b1[0] = b0[0];".into()
+                }]
+            }
+            crate::PrefixScanOutput::Values => {
+                vec!["  b1[0] = select(0i, 1i, (b0[0] & 0xffu) != 0u);".into()]
+            }
+        })
+    }
+
+    fn domain(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> Vec<String> {
+        vec![
+            format!("  let rg_row: u32 = gid / {}u;", plan.inner),
+            format!("  let rg_inner: u32 = gid % {}u;", plan.inner),
+        ]
+    }
+
+    fn identity(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<&'static str, crate::prefix_scan_native::PortablePrefixScanError> {
+        Ok(match (plan.kind, plan.work_dtype) {
+            (crate::PrefixScanKind::Sum, DType::F32) => "0.0",
+            (crate::PrefixScanKind::Product, DType::F32) => "1.0",
+            (crate::PrefixScanKind::Max, DType::F32) => "bitcast<f32>(0xff800000u)",
+            (crate::PrefixScanKind::Min, DType::F32) => "bitcast<f32>(0x7f800000u)",
+            (crate::PrefixScanKind::Product | crate::PrefixScanKind::Min, DType::Bool) => "true",
+            (crate::PrefixScanKind::Product, DType::I32) => "1i",
+            (crate::PrefixScanKind::Product, DType::U32) => "1u",
+            (crate::PrefixScanKind::Max, DType::I32) => "bitcast<i32>(0x80000000u)",
+            (crate::PrefixScanKind::Min, DType::I32) => "bitcast<i32>(0x7fffffffu)",
+            (crate::PrefixScanKind::Min, DType::U32) => "0xffffffffu",
+            (_, DType::Bool) => "false",
+            (_, DType::I32) => "0i",
+            (_, DType::U32) => "0u",
+            _ => {
+                return Err(
+                    crate::prefix_scan_native::PortablePrefixScanError::Unsupported(
+                        "WGSL portable scan identity dtype",
+                    ),
+                );
+            }
+        })
+    }
+
+    fn accumulator(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        identity: &str,
+    ) -> String {
+        format!(
+            "  var rg_acc: {} = {identity};",
+            Self::work_type(plan).expect("portable projection validated work dtype")
+        )
+    }
+
+    fn index(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!("  var rg_index: i32 = {}i;", plan.index_sentinel)
+    }
+
+    fn loop_open(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "  for (var rg_axis: u32 = 0u; rg_axis < {}u; rg_axis = rg_axis + 1u) {{",
+            plan.axis_len
+        )
+    }
+
+    fn offset(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "    let rg_offset: u32 = (rg_row * {}u + rg_axis) * {}u + rg_inner;",
+            plan.axis_len, plan.inner
+        )
+    }
+
+    fn load(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+    ) -> Result<String, crate::prefix_scan_native::PortablePrefixScanError> {
+        let work = Self::work_type(plan)?;
+        let expression = if plan.input_dtype == DType::Bool {
+            let boolean = "(((b0[rg_offset >> 2u] >> ((rg_offset & 3u) * 8u)) & 0xffu) != 0u)";
+            if plan.work_dtype == DType::I32 {
+                format!("select(0i, 1i, {boolean})")
+            } else {
+                boolean.into()
+            }
+        } else {
+            "b0[rg_offset]".into()
+        };
+        Ok(format!("    let rg_next: {work} = {expression};"))
+    }
+
+    fn strict(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        operator: &str,
+    ) -> String {
+        if plan.work_dtype == DType::Bool {
+            let expression = if plan.kind == crate::PrefixScanKind::Max {
+                "(rg_next && !rg_acc)"
+            } else {
+                "(!rg_next && rg_acc)"
+            };
+            format!("    let rg_strict: bool = {expression};")
+        } else {
+            format!("    let rg_strict: bool = rg_next {operator} rg_acc;")
+        }
+    }
+
+    fn equal_before(&self) -> String {
+        "    let rg_equal_before: bool = rg_next == rg_acc;".into()
+    }
+
+    fn update_extrema(&self) -> String {
+        "    if (rg_strict) { rg_acc = rg_next; }".into()
+    }
+
+    fn update_first_index(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> String {
+        format!(
+            "    if (rg_strict || (rg_index == {}i && rg_equal_before)) {{ rg_index = i32(rg_axis); }}",
+            plan.index_sentinel
+        )
+    }
+
+    fn arithmetic(
+        &self,
+        plan: &crate::prefix_scan_native::NativePrefixScanPlan,
+        operator: &str,
+    ) -> Result<String, crate::prefix_scan_native::PortablePrefixScanError> {
+        let expression = match plan.work_dtype {
+            DType::Bool => "(rg_acc && rg_next)".into(),
+            DType::I32 => {
+                format!("bitcast<i32>(bitcast<u32>(rg_acc) {operator} bitcast<u32>(rg_next))")
+            }
+            DType::U32 | DType::F32 => format!("rg_acc {operator} rg_next"),
+            _ => {
+                return Err(
+                    crate::prefix_scan_native::PortablePrefixScanError::Unsupported(
+                        "WGSL portable scan arithmetic dtype",
+                    ),
+                );
+            }
+        };
+        Ok(format!("    rg_acc = {expression};"))
+    }
+
+    fn store(&self, plan: &crate::prefix_scan_native::NativePrefixScanPlan) -> Vec<String> {
+        if plan.result == crate::PrefixScanOutput::Indices {
+            vec!["    b1[rg_offset] = rg_index;".into()]
+        } else if plan.output_dtype == DType::Bool {
+            Self::bool_store("rg_offset", "rg_acc", "    ")
+        } else {
+            vec!["    b1[rg_offset] = rg_acc;".into()]
+        }
+    }
+
+    fn loop_close(&self) -> String {
+        "  }".into()
     }
 }
 

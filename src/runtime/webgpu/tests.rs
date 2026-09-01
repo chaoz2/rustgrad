@@ -1,6 +1,6 @@
 use super::renderer::{
-    WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION, WGSL_RAW_COPY_RENDERER_VERSION,
-    WGSL_STATIC_POSITION_RENDERER_VERSION,
+    WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION, WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
+    WGSL_RAW_COPY_RENDERER_VERSION, WGSL_STATIC_POSITION_RENDERER_VERSION,
 };
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
@@ -21,6 +21,168 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
+
+#[test]
+fn portable_prefix_scan_wgsl_renders_common_matrix_and_executes_first_match_indices() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    for dtype in [DType::Bool, DType::I32, DType::U32, DType::F32] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], dtype);
+        let sum = graph.cumsum(input, 1).unwrap();
+        let product = graph.cumprod(input, 1).unwrap();
+        let (maximum, maximum_indices) = graph.cummax(input, 1).unwrap();
+        let (minimum, minimum_indices) = graph.cummin(input, 1).unwrap();
+        for output in [
+            sum,
+            product,
+            maximum,
+            maximum_indices,
+            minimum,
+            minimum_indices,
+        ] {
+            let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+            let rendered = renderer.render(&item.kernel).unwrap();
+            rendered
+                .validate_schedule_bindings(item.ordered_inputs())
+                .unwrap();
+            assert_eq!(rendered.extent, 2);
+            assert_eq!(rendered.buffers.len(), 2);
+            assert!(
+                rendered
+                    .source
+                    .contains(WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION)
+            );
+            if output == maximum
+                || output == maximum_indices
+                || output == minimum
+                || output == minimum_indices
+            {
+                assert!(rendered.source.contains("rg_equal_before"));
+            } else {
+                assert!(rendered.source.contains("rg_acc ="));
+            }
+            if dtype == DType::I32 && (output == sum || output == product) {
+                assert!(
+                    rendered
+                        .source
+                        .contains("bitcast<i32>(bitcast<u32>(rg_acc)")
+                );
+            }
+            if output == product && dtype == DType::I32 {
+                assert!(rendered.source.contains("var rg_acc: i32 = 1i;"));
+            }
+            if output == product && dtype == DType::U32 {
+                assert!(rendered.source.contains("var rg_acc: u32 = 1u;"));
+            }
+            if dtype == DType::Bool && (output == maximum || output == maximum_indices) {
+                assert!(rendered.source.contains("rg_next && !rg_acc"));
+            }
+            if graph.dtype(output).unwrap() == DType::Bool {
+                assert!(rendered.source.contains("atomicAnd"));
+                assert!(rendered.source.contains("atomicOr"));
+            }
+        }
+    }
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F32);
+    let output = graph.cummax(input, 1).unwrap().1;
+    let (actual, _) = execute_mock(
+        &graph,
+        output,
+        &HashMap::from([(
+            "x".into(),
+            TensorData::from_storage(
+                [2, 3],
+                Storage::F32(vec![1.0, 3.0, 3.0, f32::NAN, 5.0, 4.0]),
+            )
+            .unwrap(),
+        )]),
+    );
+    assert_eq!(actual.storage(), &Storage::I32(vec![0, 1, 1, 3, 1, 1]));
+
+    let mut narrow = Graph::new();
+    let input = narrow.input_dtype("x", [2], DType::F16);
+    let output = narrow.cumsum(input, 0).unwrap();
+    let item = schedule(&narrow, output).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("Bool/I32/U32/F32")
+    ));
+
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("x", [], DType::F32);
+    let output = scalar.cumsum(input, 0).unwrap();
+    let item = schedule(&scalar, output).unwrap().items.pop().unwrap();
+    assert!(
+        renderer
+            .render(&item.kernel)
+            .unwrap()
+            .source
+            .contains("bitcast<f32>(bitcast<u32>(b0[0]))")
+    );
+}
+
+#[test]
+fn portable_prefix_scan_webgpu_zero_domain_skips_buffers_queue_and_dispatch() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 0, 3], DType::F32);
+    let output = graph.cumsum(input, 1).unwrap();
+    let items = schedule(&graph, output).unwrap().items;
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let before = mock.calls();
+    let prefix = PreparedWebGpuPrefix::prepare(device, &items, renderer).unwrap();
+    let mut values = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([2, 0, 3], Storage::F32(Vec::new())).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    assert!(values[&(output.index() as u64)].is_empty());
+    assert!(!mock.calls()[before.len()..].iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("queue_create:")
+            || call.starts_with("dispatch:")
+    }));
+
+    let mut zero_inner = Graph::new();
+    let input = zero_inner.input_dtype("x", [2, 3, 0], DType::F32);
+    let output = zero_inner.cumsum(input, 1).unwrap();
+    let item = schedule(&zero_inner, output).unwrap().items.pop().unwrap();
+    let source = WgslRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap()
+        .source;
+    assert!(!source.contains(" / 0u"));
+    assert!(!source.contains(" % 0u"));
+}
+
+#[test]
+fn portable_prefix_scan_webgpu_rejects_excess_workgroups_before_resource_or_cache_work() {
+    let mut limits = capabilities();
+    limits.max_compute_workgroups_per_dimension = 1;
+    let renderer = WgslRenderer::new(8, limits).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [16, 2], DType::F32);
+    let output = graph.cumsum(input, 1).unwrap();
+    let items = schedule(&graph, output).unwrap().items;
+    assert!(matches!(
+        renderer.render(&items[0].kernel),
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("workgroup-count limit")
+    ));
+
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let _retained_device = device.clone();
+    let before = mock.calls();
+    assert!(matches!(
+        PreparedWebGpuPrefix::prepare(device, &items, renderer),
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("workgroup-count limit")
+    ));
+    assert_eq!(mock.calls(), before);
+}
 
 #[test]
 fn portable_f32_matmul_wgsl_renders_shared_geometry_and_executes_zero_k() {
