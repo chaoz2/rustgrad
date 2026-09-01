@@ -1495,11 +1495,27 @@ fn renderer_identity_and_unsupported_boundaries_are_pre_submission() {
         .reduce(input, ReduceKind::Sum, Some(vec![1]), false)
         .unwrap();
     let reduction_item = schedule(&graph, reduced).unwrap().items.pop().unwrap();
+    let reduction = MetalRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&reduction_item.kernel)
+        .unwrap();
+    assert!(reduction.source.contains("for (ulong rg_r"));
+
+    let mut unsupported = Graph::new();
+    let f64_input = unsupported.input_dtype("x", [2, 2], DType::F64);
+    let f64_reduced = unsupported
+        .reduce(f64_input, ReduceKind::Sum, Some(vec![1]), false)
+        .unwrap();
+    let f64_item = schedule(&unsupported, f64_reduced)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
     assert!(matches!(
         MetalRenderer::new(4, capabilities())
             .unwrap()
-            .render(&reduction_item.kernel),
-        Err(MetalError::Unsupported(reason)) if reason.contains("reductions")
+            .render(&f64_item.kernel),
+        Err(MetalError::Unsupported(reason)) if reason.contains("F64")
     ));
 
     let mut integer_graph = Graph::new();
@@ -1530,6 +1546,40 @@ fn renderer_identity_and_unsupported_boundaries_are_pre_submission() {
         .unwrap();
     assert_ne!(divided.cache_key, floored.cache_key);
     assert_ne!(divided.transaction, floored.transaction);
+}
+
+#[test]
+fn typed_reduction_recurrence_executes_through_metal_mock() {
+    let cases = [
+        (
+            DType::F32,
+            ReduceKind::Mean,
+            TensorData::from_storage([3], Storage::F32(vec![1.0, 2.0, 4.0])).unwrap(),
+        ),
+        (
+            DType::I32,
+            ReduceKind::Sum,
+            TensorData::from_storage([2], Storage::I32(vec![i32::MAX, 1])).unwrap(),
+        ),
+        (
+            DType::Bool,
+            ReduceKind::Max,
+            TensorData::from_storage([3], Storage::Bool(vec![false, true, false])).unwrap(),
+        ),
+    ];
+    for (dtype, kind, input) in cases {
+        let mut graph = Graph::new();
+        let source = graph.input_dtype("x", input.shape().clone(), dtype);
+        let output = graph.reduce(source, kind, Some(vec![0]), false).unwrap();
+        let inputs = HashMap::from([("x".into(), input)]);
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        let (actual, _) = execute_mock(&graph, output, &inputs);
+        assert_eq!(
+            actual.to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap(),
+            "{dtype:?} {kind:?}"
+        );
+    }
 }
 
 #[test]

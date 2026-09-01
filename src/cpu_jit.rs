@@ -6,8 +6,8 @@
 //! boundary is crossed.  This module never allocates executable memory: the OS
 //! dynamic loader owns executable mappings and `JitKernel` owns the library.
 use crate::{
-    DType, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation, ReductionValue,
-    SymbolicShape, SymbolicVar, UOp,
+    DType, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation, SymbolicShape,
+    SymbolicVar, UOp,
 };
 use std::{
     collections::BTreeMap,
@@ -25,7 +25,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v31";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v32";
 const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
 const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
 pub const ABI_VERSION: u32 = 2;
@@ -1150,21 +1150,25 @@ fn scan_accumulator_type(dtype: DType) -> &'static str {
 fn scan_identity(
     plan: &crate::prefix_scan_native::NativePrefixScanPlan,
 ) -> Result<String, JitError> {
-    Ok(match plan.identity() {
+    native_scalar_literal(plan.identity())
+}
+
+fn native_scalar_literal(value: crate::Scalar) -> Result<String, JitError> {
+    Ok(match value {
         crate::Scalar::Bool(value) => u8::from(value).to_string(),
         crate::Scalar::I(i64::MIN) => "INT64_MIN".into(),
         crate::Scalar::I(value) => value.to_string(),
         crate::Scalar::U(value) => format!("UINT64_C({value})"),
-        crate::Scalar::F(value) if value.is_nan() => {
-            "((union{uint32_t u;float f;}){.u=0x7fc00000u}.f)".into()
-        }
+        crate::Scalar::F(value) if value.is_nan() => format!(
+            "((union{{uint32_t u;float f;}}){{.u=0x{:08x}u}}.f)",
+            (value as f32).to_bits()
+        ),
         crate::Scalar::F(value) if value == f64::NEG_INFINITY => "-INFINITY".into(),
         crate::Scalar::F(value) if value == f64::INFINITY => "INFINITY".into(),
         crate::Scalar::F(0.0) => "0.0".into(),
         crate::Scalar::F(1.0) => "1.0".into(),
-        crate::Scalar::F(_) => {
-            return Err(JitError::Unsupported("prefix scan identity scalar".into()));
-        }
+        crate::Scalar::F(value) if value.is_finite() => format!("{value:.17e}"),
+        crate::Scalar::F(_) => return Err(JitError::Unsupported("native identity scalar".into())),
     })
 }
 
@@ -2666,27 +2670,16 @@ fn render_reduction(
     else {
         return Ok(None);
     };
-    let update = finalize
-        .sources()
-        .first()
-        .ok_or_else(|| JitError::Unsupported("reduction finalize".into()))?;
-    let init = update
-        .sources()
-        .first()
-        .ok_or_else(|| JitError::Unsupported("reduction init".into()))?;
-    let Operation::ReduceInit(ReductionValue {
-        input_shape,
-        output_shape,
-        axes,
-        keepdim,
-        kind,
-        mean,
-    }) = init.operation()
-    else {
-        return Err(JitError::Unsupported("reduction metadata".into()));
-    };
+    let (reduction, value_node) =
+        crate::reduction_native::NativeReductionPlan::from_finalize(finalize)
+            .map_err(|reason| JitError::Unsupported(reason.into()))?;
+    if reduction.output_dtype != out.dtype {
+        return Err(JitError::Unsupported(
+            "reduction output ABI dtype is inconsistent".into(),
+        ));
+    }
     if !matches!(
-        kind,
+        reduction.kind,
         crate::ReduceKind::Sum
             | crate::ReduceKind::Mean
             | crate::ReduceKind::Product
@@ -2697,76 +2690,56 @@ fn render_reduction(
             "native C reduction kind is not implemented".into(),
         ));
     }
-    let value_node = update
-        .sources()
-        .get(1)
-        .ok_or_else(|| JitError::Unsupported("reduction producer".into()))?;
-    let reduce_dims: Vec<usize> = axes.iter().map(|a| input_shape.dims()[*a]).collect();
-    let reduce_len = reduce_dims.iter().product::<usize>();
-    let out_len = output_shape
-        .numel()
+    let reduce_len = reduction.reduction_len();
+    let out_len = reduction
+        .geometry
+        .output_len()
         .map_err(|_| JitError::Unsupported("reduction output overflow".into()))?;
     // Replace the elementwise loop opened by the shared prologue.
     lines.pop();
     lines.push(format!(
         "  for (size_t rg_out = 0; rg_out < {out_len}u; ++rg_out) {{"
     ));
-    let acc = accumulator_type(out.dtype);
-    let initial = if matches!(kind, crate::ReduceKind::Max) && out.dtype.is_float() {
-        "-INFINITY"
-    } else if matches!(kind, crate::ReduceKind::Min) && out.dtype.is_float() {
-        "INFINITY"
-    } else if matches!(kind, crate::ReduceKind::Product) {
-        "1"
-    } else {
-        "0"
-    };
+    let acc = reduction_accumulator_type(reduction.accumulator_dtype);
+    let initial = native_scalar_literal(reduction.identity())?;
     lines.push(format!("    {acc} rg_acc = {initial};"));
-    if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) {
-        // CpuBackend accepts the first stored lane unconditionally. This is
-        // observable for a leading NaN and for equal signed-zero lanes.
-        lines.push("    int rg_seen = 0;".into());
-    }
     if reduce_len != 0 {
         lines.push(format!(
             "    for (size_t rg_r = 0; rg_r < {reduce_len}u; ++rg_r) {{"
         ));
         lines.push(format!(
             "      size_t rg_i = {};",
-            reduction_index_expr(input_shape, output_shape, axes, *keepdim)
+            reduction_index_expr(
+                &reduction.geometry.input,
+                &reduction.geometry.output,
+                &reduction.geometry.axes,
+                reduction.geometry.keepdim,
+            )
         ));
         let mut map = BTreeMap::new();
         let value = emit(value_node, ids, &mut map, lines)?;
-        let value = if value_node.ty().is_some_and(|ty| ty.scalar.is_float8()) {
-            float8_decode_expr(
-                value_node
-                    .ty()
-                    .expect("guarded typed reduction lane")
-                    .scalar,
-                &value,
-            )
-            .expect("guarded Float8 reduction lane")
+        let value = if reduction.source_dtype.is_float8() {
+            float8_decode_expr(reduction.source_dtype, &value)
+                .expect("guarded Float8 reduction source")
         } else {
-            value
+            cast_expression(reduction.source_dtype, reduction.accumulator_dtype, value)
         };
-        if matches!(kind, crate::ReduceKind::Max) && out.dtype.is_float() {
+        if reduction.is_singleton_identity() {
+            lines.push(format!("      rg_acc = ({acc})({value});"));
+        } else if matches!(
+            reduction.kind,
+            crate::ReduceKind::Max | crate::ReduceKind::Min
+        ) {
+            let comparison = if reduction.kind == crate::ReduceKind::Max {
+                ">"
+            } else {
+                "<"
+            };
             lines.push(format!(
-                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
+                "      if (({value}) {comparison} rg_acc) rg_acc = ({value});"
             ));
-        } else if matches!(kind, crate::ReduceKind::Min) && out.dtype.is_float() {
-            lines.push(format!(
-                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (!isnan(({acc})({value})) && !isnan(rg_acc) && ({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
-            ));
-        } else if matches!(kind, crate::ReduceKind::Max) {
-            lines.push(format!(
-                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
-            ));
-        } else if matches!(kind, crate::ReduceKind::Min) {
-            lines.push(format!(
-                "      if (!rg_seen) {{ rg_acc = ({acc})({value}); rg_seen = 1; }} else if (({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
-            ));
-        } else if out.dtype == DType::Bool {
-            let operator = if matches!(kind, crate::ReduceKind::Product) {
+        } else if reduction.accumulator_dtype == DType::Bool {
+            let operator = if matches!(reduction.kind, crate::ReduceKind::Product) {
                 "&&"
             } else {
                 "||"
@@ -2774,37 +2747,35 @@ fn render_reduction(
             lines.push(format!(
                 "      rg_acc = (uint8_t)(rg_acc {operator} ({value}));"
             ));
-        } else if matches!(kind, crate::ReduceKind::Product) {
+        } else if matches!(reduction.kind, crate::ReduceKind::Product) {
             lines.push(format!(
-                "      rg_acc = ({acc})(rg_acc * ({acc})({value}));"
+                "      rg_acc = {};",
+                reduction_arithmetic_expr(reduction.accumulator_dtype, "rg_acc", &value, true)?
             ));
         } else {
             lines.push(format!(
-                "      rg_acc = ({acc})(rg_acc + ({acc})({value}));"
+                "      rg_acc = {};",
+                reduction_arithmetic_expr(reduction.accumulator_dtype, "rg_acc", &value, false)?
             ));
         }
         lines.push("    }".into());
     }
-    let store_value: String = if *mean && reduce_len == 0 {
-        match out.dtype.category() {
-            crate::DTypeCategory::Float => "NAN".into(),
-            _ => "0".into(),
-        }
-    } else if *mean {
-        // CpuBackend turns the finalized scalar into f64 before mean, including
-        // its intentionally lossy U64 conversion, then quantizes to dtype.
-        format!("((double)rg_acc / (double){reduce_len})")
+    let store_value = if reduction.kind == crate::ReduceKind::Mean && reduce_len == 0 {
+        "NAN".into()
+    } else if reduction.kind == crate::ReduceKind::Mean {
+        let divisor = native_scalar_literal(
+            reduction
+                .mean_divisor()
+                .expect("nonempty validated Mean divisor"),
+        )?;
+        scan_commit_expr(
+            reduction.accumulator_dtype,
+            &format!("(rg_acc / ({acc})({divisor}))"),
+        )
     } else {
         "rg_acc".into()
     };
-    let store_value = match out.dtype {
-        dtype if dtype.is_float8() => {
-            float8_encode_expr(dtype, &store_value).expect("guarded Float8 reduction output")
-        }
-        DType::F16 => format!("rg_f32_to_f16((float)({store_value}))"),
-        DType::BF16 => format!("rg_f32_to_bf16((float)({store_value}))"),
-        _ => store_value,
-    };
+    let store_value = scan_store_expr(reduction.output_dtype, &store_value);
     lines.push(format!(
         "    (({}*)buffers[{}])[rg_out] = ({});",
         ctype(out.dtype),
@@ -2816,13 +2787,35 @@ fn render_reduction(
     lines.push("}".into());
     Ok(Some(lines.join("\n") + "\n"))
 }
-fn accumulator_type(dtype: DType) -> &'static str {
-    match dtype.category() {
-        crate::DTypeCategory::Bool => "uint8_t",
-        crate::DTypeCategory::Signed => "int64_t",
-        crate::DTypeCategory::Unsigned => "uint64_t",
-        crate::DTypeCategory::Float => "double",
+fn reduction_accumulator_type(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F64 => "double",
+        dtype if dtype.is_float() => "float",
+        _ => ctype(dtype),
     }
+}
+
+fn reduction_arithmetic_expr(
+    dtype: DType,
+    lhs: &str,
+    rhs: &str,
+    product: bool,
+) -> Result<String, JitError> {
+    let operator = if product { "*" } else { "+" };
+    if matches!(dtype.category(), crate::DTypeCategory::Signed) {
+        return wrap_expr(
+            dtype,
+            format!(
+                "(({})({lhs})){operator}(({})({rhs}))",
+                unsigned_ctype(dtype)?,
+                unsigned_ctype(dtype)?
+            ),
+        );
+    }
+    Ok(scan_commit_expr(
+        dtype,
+        &format!("(({lhs}){operator}({rhs}))"),
+    ))
 }
 fn reduction_index_expr(
     input: &crate::Shape,
@@ -4020,7 +4013,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v31");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v32");
 
         let execute = |graph: &Graph,
                        output,
@@ -4188,7 +4181,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v31");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v32");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -6044,6 +6037,82 @@ mod tests {
     }
 
     #[test]
+    fn explicit_bool_sum_is_or_for_bool_and_numeric_sources() {
+        for (source_dtype, cases) in [
+            (
+                DType::Bool,
+                vec![
+                    (vec![], false),
+                    (vec![Scalar::Bool(true)], true),
+                    (
+                        vec![Scalar::Bool(false), Scalar::Bool(true), Scalar::Bool(false)],
+                        true,
+                    ),
+                ],
+            ),
+            (
+                DType::I32,
+                vec![
+                    (vec![], false),
+                    (vec![Scalar::I(0)], false),
+                    (vec![Scalar::I(0), Scalar::I(-7), Scalar::I(0)], true),
+                ],
+            ),
+        ] {
+            for (values, expected) in cases {
+                let mut graph = Graph::new();
+                let input = graph.input_dtype("input", Shape::from([values.len()]), source_dtype);
+                let output = graph
+                    .reduce_with_dtypes(
+                        input,
+                        crate::ReduceKind::Sum,
+                        Some(vec![0]),
+                        false,
+                        crate::ReductionDType::new(DType::Bool, DType::Bool),
+                    )
+                    .unwrap();
+                let input = TensorData::from_scalars([values.len()], source_dtype, values).unwrap();
+                let inputs = HashMap::from([("input".into(), input.clone())]);
+                let cpu = CpuBackend.execute(&graph, output, &inputs).unwrap();
+                let scheduled = crate::schedule(&graph, output).unwrap();
+                let capture =
+                    crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+                let mut captured = crate::CapturedReplayExecutor::default()
+                    .replay(
+                        &capture,
+                        &BTreeMap::from([("input".into(), input.clone())]),
+                        crate::CapturedReplayOptions::default(),
+                    )
+                    .unwrap()
+                    .outputs;
+                let captured = captured.remove(0);
+                assert_eq!(cpu.storage(), &Storage::Bool(vec![expected]));
+                assert_eq!(captured.storage(), cpu.storage());
+
+                if matches!(graph.op(output).unwrap(), crate::Op::Reduce { .. }) {
+                    let kernel = crate::lower_graph_reduction(&graph, output).unwrap();
+                    let source = CpuJit::render(&kernel).unwrap().source;
+                    if input.is_empty() {
+                        assert!(source.contains("uint8_t rg_acc = 0;"));
+                        assert!(!source.contains("rg_acc ||"));
+                    } else {
+                        assert!(source.contains("rg_acc = (uint8_t)(rg_acc || ("));
+                    }
+                    let jit = CpuJit::compile(&kernel).unwrap();
+                    let mut buffers = [
+                        JitBuffer::from_tensor(&input, false),
+                        JitBuffer::zeroed(DType::Bool, 1, true),
+                    ];
+                    jit.call(&mut buffers, &[]).unwrap();
+                    assert_eq!(buffers[1].bytes(), &[u8::from(expected)]);
+                } else {
+                    assert_eq!(input.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn float8_reduction_renderer_decodes_lanes_and_encodes_results() {
         for dtype in [
             DType::F8E4M3,
@@ -6102,11 +6171,31 @@ mod tests {
                     "captured {dtype:?} {kind:?}",
                 );
 
-                // One native execution per format proves that the generated
-                // decoder/encoder declarations compose and that the raw-byte
-                // ABI agrees with the CPU oracle. The other kinds share this
-                // exact boundary and retain their existing typed formulas.
-                if kind == crate::ReduceKind::Sum {
+                if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) {
+                    let plan = crate::reduction_native::NativeReductionPlan::new(
+                        Shape::from([2, 3]),
+                        Shape::from([2]),
+                        vec![1],
+                        false,
+                        kind,
+                        dtype,
+                        crate::ReductionDType::new(dtype, dtype),
+                    )
+                    .unwrap();
+                    assert!(
+                        rendered
+                            .source
+                            .contains(&native_scalar_literal(plan.identity()).unwrap()),
+                        "{dtype:?} {kind:?}"
+                    );
+                }
+
+                // Arithmetic plus both committed Float8 extrema identities
+                // execute through the generated codec and exact raw-byte ABI.
+                if matches!(
+                    kind,
+                    crate::ReduceKind::Sum | crate::ReduceKind::Max | crate::ReduceKind::Min
+                ) {
                     let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
                     let jit = CpuJit::compile(&uop).unwrap();
                     let mut buffers = [
@@ -6122,6 +6211,35 @@ mod tests {
                         .unwrap();
                     assert_eq!(native.storage(), expected.storage(), "{dtype:?}");
                 }
+            }
+
+            let cancellation = TensorData::from_scalars(
+                [3],
+                dtype,
+                [Scalar::F(8.0), Scalar::F(1.0), Scalar::F(-8.0)],
+            )
+            .unwrap();
+            for (kind, expected) in [
+                (crate::ReduceKind::Sum, 1.0),
+                (crate::ReduceKind::Mean, 1.0 / 3.0),
+            ] {
+                let mut graph = Graph::new();
+                let input = graph.input_dtype("input", [3], dtype);
+                let output = graph.reduce(input, kind, None, false).unwrap();
+                let kernel = crate::lower_graph_reduction(&graph, output).unwrap();
+                let source = CpuJit::render(&kernel).unwrap().source;
+                assert!(source.contains("float rg_acc"), "{dtype:?} {kind:?}");
+                let jit = CpuJit::compile(&kernel).unwrap();
+                let mut buffers = [
+                    JitBuffer::from_tensor(&cancellation, false),
+                    JitBuffer::zeroed(dtype, 1, true),
+                ];
+                jit.call(&mut buffers, &[]).unwrap();
+                assert_eq!(
+                    buffers[1].bytes(),
+                    &[format.encode(expected)],
+                    "{dtype:?} {kind:?}"
+                );
             }
 
             let empty = TensorData::from_storage(
@@ -6151,6 +6269,74 @@ mod tests {
                 .unwrap();
             assert_eq!(native.storage(), expected.storage(), "empty {dtype:?}");
         }
+    }
+
+    #[test]
+    fn legacy_v18_same_storage_float8_mean_artifact_executes() {
+        fn legacy_mean(node: &crate::UOp, dtype: DType) -> crate::UOp {
+            let ty = if matches!(
+                node.operation(),
+                crate::Operation::ReduceInit(_) | crate::Operation::ReduceAccumulate
+            ) {
+                Some(crate::UType::scalar(dtype))
+            } else {
+                node.ty()
+            };
+            crate::UOp::from_operation(
+                node.operation().clone(),
+                ty,
+                node.sources()
+                    .iter()
+                    .map(|source| legacy_mean(source, dtype))
+                    .collect(),
+            )
+        }
+
+        let dtype = DType::F8E5M2;
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([3]), dtype);
+        let output = graph
+            .reduce(input, crate::ReduceKind::Mean, Some(vec![0]), false)
+            .unwrap();
+        let modern = crate::lower_graph_reduction(&graph, output).unwrap();
+        let legacy = legacy_mean(&modern, dtype);
+        legacy.validate().unwrap();
+        let artifact = crate::uop::artifact::encode_schedule_identity(&legacy).unwrap();
+        assert_eq!(artifact[4], 18);
+        let decoded = crate::uop::artifact::decode(&artifact).unwrap();
+        let jit = CpuJit::compile(&decoded).unwrap();
+        let input = TensorData::from_scalars(
+            [3],
+            dtype,
+            [Scalar::F(8.0), Scalar::F(1.0), Scalar::F(-8.0)],
+        )
+        .unwrap();
+        let mut buffers = [
+            JitBuffer::from_tensor(&input, false),
+            JitBuffer::zeroed(dtype, 1, true),
+        ];
+        jit.call(&mut buffers, &[]).unwrap();
+
+        let plan = crate::reduction_native::NativeReductionPlan::new(
+            Shape::from([3]),
+            Shape::new([]),
+            vec![0],
+            false,
+            crate::ReduceKind::Mean,
+            dtype,
+            crate::ReductionDType::new(dtype, dtype),
+        )
+        .unwrap();
+        let accumulator = [8.0, 1.0, -8.0]
+            .into_iter()
+            .fold(plan.identity(), |accumulator, value| {
+                plan.update(accumulator, Scalar::F(value))
+            });
+        let expected = TensorData::scalar_with_dtype(plan.finalize(accumulator), dtype)
+            .to_le_bytes()
+            .unwrap();
+        assert_eq!(buffers[1].bytes(), expected.as_slice());
+        assert_eq!(buffers[1].bytes().len(), 1);
     }
 
     #[test]
@@ -6194,8 +6380,12 @@ mod tests {
         let product_uop = crate::lower_graph_reduction(&numeric, product).unwrap();
         let product_scalar = CpuJit::render(&product_uop).unwrap();
         assert!(product_scalar.source.contains(RENDERER_VERSION));
-        assert!(product_scalar.source.contains("rg_acc = 1;"));
-        assert!(product_scalar.source.contains("rg_acc *"));
+        assert!(product_scalar.source.contains("rg_acc = 1.0;"));
+        assert!(
+            product_scalar
+                .source
+                .contains("rg_acc = ((float)(((rg_acc)*(")
+        );
         assert_eq!(
             product_scalar.cache_key,
             CpuJit::render(&product_uop).unwrap().cache_key
@@ -6237,9 +6427,9 @@ mod tests {
             CpuJit::render(&crate::lower_graph_reduction(&extrema, maximum).unwrap())
                 .unwrap()
                 .source;
-        assert!(extrema_scalar.contains("int rg_seen = 0;"));
-        assert!(extrema_scalar.contains("if (!rg_seen)"));
-        assert!(extrema_scalar.contains("!isnan(rg_acc)"));
+        assert!(extrema_scalar.contains("float rg_acc = -INFINITY;"));
+        assert!(extrema_scalar.contains("> rg_acc"));
+        assert!(!extrema_scalar.contains("rg_seen"));
 
         for (dtype, kind, comparison) in [
             (DType::Bool, crate::ReduceKind::Max, "> rg_acc"),
@@ -6251,7 +6441,7 @@ mod tests {
             let output = integral.reduce(input, kind, Some(vec![1]), false).unwrap();
             let uop = crate::lower_graph_reduction(&integral, output).unwrap();
             let rendered = CpuJit::render(&uop).unwrap();
-            assert!(rendered.source.contains("int rg_seen = 0;"), "{dtype:?}");
+            assert!(!rendered.source.contains("rg_seen"), "{dtype:?}");
             assert!(rendered.source.contains(comparison), "{dtype:?}");
             assert!(!rendered.source.contains("isnan((uint64_t)"), "{dtype:?}");
             assert!(CpuJit::render_vectorized(&uop).is_ok(), "{dtype:?}");

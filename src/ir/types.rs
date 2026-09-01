@@ -273,6 +273,9 @@ pub enum Op {
         kind: ReduceKind,
         axes: Vec<usize>,
         keepdim: bool,
+        /// Storage dtype committed after each recurrence step. The node dtype
+        /// remains the independently committed final output storage.
+        accumulator: DType,
     },
     /// Inclusive, static cumulative operation along one normalized axis.
     PrefixScan {
@@ -1142,7 +1145,10 @@ impl Op {
                 kind,
                 axes,
                 keepdim,
-            } => format!("{kind:?}(%{input}, axes={axes:?}, keepdim={keepdim})"),
+                accumulator,
+            } => format!(
+                "{kind:?}(%{input}, axes={axes:?}, keepdim={keepdim}, accumulator={accumulator:?})"
+            ),
             Self::PrefixScan {
                 input,
                 axis,

@@ -306,6 +306,7 @@ mod prefix_scan_native;
 mod prefix_scan_tests;
 #[cfg(test)]
 mod rearrange_tests;
+mod reduction_native;
 #[cfg(test)]
 mod reduction_tests;
 #[cfg(test)]

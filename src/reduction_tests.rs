@@ -113,7 +113,7 @@ fn arg_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
 }
 
 #[test]
-fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
+fn extrema_reduce_uses_typed_integer_ordering_and_committed_identities() {
     let assert_value = |dtype, data: Vec<Scalar>, kind, expected: Scalar| {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [data.len()], dtype);
@@ -164,9 +164,9 @@ fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
         Scalar::U(u64::MAX),
     );
 
-    // Floating extrema retain partial comparison: the first NaN remains the
-    // result, later NaNs are ignored, and equal signed zeroes keep their first
-    // stored sign for both Max and Min.
+    // Floating extrema begin from the committed dtype identity. Unordered
+    // lanes retain it, later ordered lanes may recover, and equal signed zero
+    // candidates retain the first selected stored sign.
     for kind in [ReduceKind::Max, ReduceKind::Min] {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [2], DType::F64);
@@ -177,7 +177,7 @@ fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
             TensorData::from_scalars([2], DType::F64, [Scalar::F(f64::NAN), Scalar::F(3.0)])
                 .unwrap(),
         );
-        assert!(leading_nan.scalar_at(0).as_f64().is_nan());
+        assert_eq!(leading_nan.scalar_at(0).as_f64(), 3.0);
         let later_nan = execute(
             &graph,
             output,
@@ -191,7 +191,14 @@ fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
             TensorData::from_scalars([2], DType::F64, [Scalar::F(f64::NAN), Scalar::F(f64::NAN)])
                 .unwrap(),
         );
-        assert!(all_nan.scalar_at(0).as_f64().is_nan());
+        assert_eq!(
+            all_nan.scalar_at(0).as_f64(),
+            if kind == ReduceKind::Max {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        );
         let signed_zero = execute(
             &graph,
             output,
@@ -205,7 +212,7 @@ fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
 }
 
 #[test]
-fn extrema_retain_leading_nan_and_ignore_later_nan_in_gradients() {
+fn extrema_ignore_nan_lanes_after_identity_first_recurrence_in_gradients() {
     for kind in [ReduceKind::Max, ReduceKind::Min] {
         for nan_index in 0..3 {
             let mut graph = Graph::new();
@@ -218,16 +225,6 @@ fn extrema_retain_leading_nan_and_ignore_later_nan_in_gradients() {
             let forward = execute(&graph, reduced, input.clone())
                 .scalar_at(0)
                 .as_f64();
-            if nan_index == 0 {
-                assert!(forward.is_nan(), "{kind:?} retains a leading NaN");
-                assert!(
-                    execute(&graph, gradient, input)
-                        .to_vec_f64()
-                        .iter()
-                        .all(|value| value.is_nan())
-                );
-                continue;
-            }
             let expected = match kind {
                 ReduceKind::Max => {
                     if nan_index == 1 {

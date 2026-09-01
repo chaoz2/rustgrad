@@ -57,6 +57,106 @@ fn typed_operations_make_payload_mismatches_unrepresentable_and_validate_arity()
 }
 
 #[test]
+fn reduction_uops_require_one_exact_scalar_init_accumulate_finalize_chain() {
+    let ty = UType::scalar(DType::F32);
+    let init = UOp::from_operation(
+        Operation::ReduceInit(crate::ReductionValue {
+            input_shape: Shape::from([2]),
+            output_shape: Shape::new([]),
+            axes: vec![0],
+            keepdim: false,
+            kind: crate::ReduceKind::Max,
+        }),
+        Some(ty),
+        vec![],
+    );
+    let value = UOp::scalar_constant(DType::F32, 1.0f32.to_bits() as u64, ty);
+    let update = UOp::from_operation(
+        Operation::ReduceAccumulate,
+        Some(ty),
+        vec![init.clone(), value.clone()],
+    );
+    let finalize = UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![update.clone()]);
+    finalize.validate().unwrap();
+    assert!(init.validate().is_err());
+    assert!(update.validate().is_err());
+    assert!(
+        UOp::sink(vec![finalize.clone(), finalize.clone()])
+            .validate()
+            .is_err()
+    );
+
+    let second_update =
+        UOp::from_operation(Operation::ReduceAccumulate, Some(ty), vec![init, value]);
+    let second_finalize =
+        UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![second_update]);
+    assert!(
+        UOp::sink(vec![finalize, second_finalize])
+            .validate()
+            .is_err()
+    );
+
+    let separate_chain = || {
+        let init = UOp::from_operation(
+            Operation::ReduceInit(crate::ReductionValue {
+                input_shape: Shape::from([2]),
+                output_shape: Shape::new([]),
+                axes: vec![0],
+                keepdim: false,
+                kind: crate::ReduceKind::Max,
+            }),
+            Some(ty),
+            vec![],
+        );
+        let value = UOp::scalar_constant(DType::F32, 1.0f32.to_bits() as u64, ty);
+        let update = UOp::from_operation(Operation::ReduceAccumulate, Some(ty), vec![init, value]);
+        UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![update])
+    };
+    let first = separate_chain();
+    let second = separate_chain();
+    let bytes = crate::uop::artifact::encode(&first).unwrap();
+    crate::uop::artifact::decode(&bytes)
+        .unwrap()
+        .validate()
+        .unwrap();
+    let structurally_duplicated = UOp::sink(vec![first, second]);
+    assert!(structurally_duplicated.validate().is_err());
+    assert!(crate::uop::artifact::encode(&structurally_duplicated).is_err());
+
+    let vector_ty = UType {
+        scalar: DType::F32,
+        lanes: 2,
+    };
+    let vector_init = UOp::from_operation(
+        Operation::ReduceInit(crate::ReductionValue {
+            input_shape: Shape::from([2]),
+            output_shape: Shape::new([]),
+            axes: vec![0],
+            keepdim: false,
+            kind: crate::ReduceKind::Sum,
+        }),
+        Some(vector_ty),
+        vec![],
+    );
+    let vector_value = UOp::from_operation(
+        Operation::VConst(crate::LiteralValue::Int(1)),
+        Some(vector_ty),
+        vec![],
+    );
+    let vector_update = UOp::from_operation(
+        Operation::ReduceAccumulate,
+        Some(vector_ty),
+        vec![vector_init, vector_value],
+    );
+    let vector_finalize = UOp::from_operation(
+        Operation::ReduceFinalize,
+        Some(vector_ty),
+        vec![vector_update],
+    );
+    assert!(vector_finalize.validate().is_err());
+}
+
+#[test]
 fn graph_unary_predicates_have_bool_outputs_and_retain_typed_inputs() {
     let input = UOp::scalar_constant(DType::F32, 1.0_f32.to_bits() as u64, f32t());
     for op in [

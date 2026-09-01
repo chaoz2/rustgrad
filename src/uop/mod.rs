@@ -585,6 +585,9 @@ impl UOp {
     pub(crate) fn shares_node_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+    fn node_identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
     pub fn operation(&self) -> &Operation {
         &self.0.operation
     }
@@ -663,14 +666,95 @@ impl UOp {
         let nodes = self.topological()?;
         let mut ranges = BTreeSet::new();
         let mut ifs = Vec::new();
-        for n in nodes {
-            validate_one(&n, &mut ranges, &mut ifs)?
+        for n in &nodes {
+            validate_one(n, &mut ranges, &mut ifs)?
         }
         if !ifs.is_empty() || !ranges.is_empty() {
             return Err(UOpError::UnclosedControl);
         }
+        validate_reduction_topology(self)?;
         Ok(())
     }
+}
+
+fn validate_reduction_topology(root: &UOp) -> Result<(), UOpError> {
+    fn visit(node: &UOp, seen: &mut BTreeSet<usize>, out: &mut Vec<UOp>) {
+        if !seen.insert(node.node_identity()) {
+            return;
+        }
+        for source in node.sources() {
+            visit(source, seen, out);
+        }
+        out.push(node.clone());
+    }
+
+    // `topological` deliberately deduplicates structurally equal UOps for
+    // canonical ordering and cache identity. Reduction ownership instead
+    // follows actual Arc nodes and source edges so two equal-but-distinct
+    // chains cannot hide a duplicated Init/Finalize use.
+    let mut nodes = Vec::new();
+    visit(root, &mut BTreeSet::new(), &mut nodes);
+    let mut structural_reductions = BTreeMap::<UOp, usize>::new();
+    for node in &nodes {
+        if matches!(
+            node.operation(),
+            Operation::ReduceInit(_) | Operation::ReduceAccumulate | Operation::ReduceFinalize
+        ) && structural_reductions
+            .insert(node.clone(), node.node_identity())
+            .is_some_and(|identity| identity != node.node_identity())
+        {
+            // Artifact ordering and source indices use structural UOp
+            // identity. Reject Arc-distinct reduction nodes that would
+            // collapse during serialization and change ownership.
+            return Err(UOpError::InvalidArgument);
+        }
+    }
+    let mut consumers = BTreeMap::<usize, Vec<&UOp>>::new();
+    for node in &nodes {
+        for source in node.sources() {
+            consumers
+                .entry(source.node_identity())
+                .or_default()
+                .push(node);
+        }
+    }
+    for node in &nodes {
+        let uses = consumers
+            .get(&node.node_identity())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match node.operation() {
+            Operation::ReduceInit(_) => {
+                if uses.len() != 1
+                    || !matches!(uses[0].operation(), Operation::ReduceAccumulate)
+                    || !uses[0]
+                        .sources()
+                        .first()
+                        .is_some_and(|source| source.shares_node_with(node))
+                {
+                    return Err(UOpError::InvalidArgument);
+                }
+            }
+            Operation::ReduceAccumulate => {
+                if uses.len() != 1
+                    || !matches!(uses[0].operation(), Operation::ReduceFinalize)
+                    || !uses[0]
+                        .sources()
+                        .first()
+                        .is_some_and(|source| source.shares_node_with(node))
+                {
+                    return Err(UOpError::InvalidArgument);
+                }
+            }
+            Operation::ReduceFinalize => {
+                if uses.len() > 1 {
+                    return Err(UOpError::InvalidArgument);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Returns whether raw scalar storage metadata can faithfully inhabit `ty`.
@@ -1005,16 +1089,23 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::InvalidArgument);
             }
         }
-        Operation::ReduceInit(_) => {}
-        Operation::ReduceAccumulate => {
+        Operation::ReduceInit(_) => {
             if n.ty().is_none() {
+                return Err(UOpError::InvalidArgument);
+            }
+        }
+        Operation::ReduceAccumulate => {
+            if n.ty().is_none()
+                || !matches!(n.sources()[0].operation(), Operation::ReduceInit(_))
+                || n.sources()[0].ty() != n.ty()
+                || n.sources()[1].ty().is_none()
+            {
                 return Err(UOpError::InvalidDType);
             }
         }
         Operation::ReduceFinalize => {
-            if n.ty().is_none() {
-                return Err(UOpError::InvalidDType);
-            }
+            crate::reduction_native::NativeReductionPlan::from_finalize(n)
+                .map_err(|_| UOpError::InvalidDType)?;
         }
         Operation::Ternary(crate::uop::Ternary::Where) => {
             if !n.sources()[0].ty().is_some_and(UType::is_bool)

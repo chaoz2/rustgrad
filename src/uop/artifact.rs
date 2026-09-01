@@ -279,7 +279,7 @@ fn operation_to_wire(operation: &Operation) -> (WireOpcode, WireArg) {
                 axes: value.axes.clone(),
                 keepdim: value.keepdim,
                 kind: value.kind,
-                mean: value.mean,
+                mean: matches!(value.kind, crate::ReduceKind::Mean),
             },
         ),
         Operation::ReduceAccumulate => (WireOpcode::ReduceAccumulate, WireArg::None),
@@ -506,12 +506,18 @@ fn operation_from_wire(opcode: WireOpcode, arg: WireArg) -> Result<Operation, Ar
                 mean,
             },
         ) => Operation::ReduceInit(ReductionValue {
+            // `mean` is a historical redundant wire bit. Preserve decoding
+            // while refusing artifacts whose projection disagrees with the
+            // canonical kind before a UOp can enter scheduling or caching.
+            kind: if mean == matches!(kind, crate::ReduceKind::Mean) {
+                kind
+            } else {
+                return Err(ArtifactError::Format("reduction mean projection"));
+            },
             input_shape,
             output_shape,
             axes,
             keepdim,
-            kind,
-            mean,
         }),
         (WireOpcode::ReduceAccumulate, WireArg::None) => Operation::ReduceAccumulate,
         (WireOpcode::ReduceFinalize, WireArg::None) => Operation::ReduceFinalize,
@@ -582,7 +588,9 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
 /// Encodes the semantic kernel blob used by durable schedule identities.
 /// Existing operations remain pinned to the released v18 envelope so adding
 /// a later RGUA operation cannot silently invalidate every RGSA/RGSO/RGSM
-/// cache key. Threefry requires its first admitted v19 envelope.
+/// cache key. Only Threefry requires the v19 envelope; corrected reduction
+/// code generation is separated by renderer-specific source/cache versions
+/// without changing its released logical UOp identity.
 pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let nodes = root
         .topological()
@@ -2998,6 +3006,152 @@ mod tests {
         w.u32(root).unwrap();
         w
     }
+
+    #[test]
+    fn reduction_mean_wire_projection_is_private_and_fail_closed() {
+        let reduction_arg = |kind, mean| WireArg::Reduction {
+            input_shape: Shape::from([2]),
+            output_shape: Shape::new([]),
+            axes: vec![0],
+            keepdim: false,
+            kind,
+            mean,
+        };
+        for (kind, mean) in [
+            (crate::ReduceKind::Sum, false),
+            (crate::ReduceKind::Mean, true),
+        ] {
+            let operation =
+                operation_from_wire(WireOpcode::ReduceInit, reduction_arg(kind, mean)).unwrap();
+            let (_, wire) = operation_to_wire(&operation);
+            assert_eq!(wire, reduction_arg(kind, mean));
+        }
+        for (kind, mean) in [
+            (crate::ReduceKind::Sum, true),
+            (crate::ReduceKind::Mean, false),
+        ] {
+            assert!(matches!(
+                operation_from_wire(WireOpcode::ReduceInit, reduction_arg(kind, mean)),
+                Err(ArtifactError::Format("reduction mean projection"))
+            ));
+        }
+    }
+
+    #[test]
+    fn typed_reduction_schedule_identity_preserves_the_released_v18_envelope() {
+        let ty = UType::scalar(DType::F32);
+        let source = UOp::from_operation(Operation::Const(LiteralValue::Int(1)), Some(ty), vec![]);
+        let init = UOp::from_operation(
+            Operation::ReduceInit(ReductionValue {
+                input_shape: Shape::from([2]),
+                output_shape: Shape::new([]),
+                axes: vec![0],
+                keepdim: false,
+                kind: crate::ReduceKind::Sum,
+            }),
+            Some(ty),
+            vec![],
+        );
+        let update = UOp::from_operation(Operation::ReduceAccumulate, Some(ty), vec![init, source]);
+        let finalize = UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![update]);
+        assert_eq!(encode_schedule_identity(&finalize).unwrap()[4], 18);
+    }
+
+    #[test]
+    fn v18_reduction_preserves_distinct_accumulator_and_output_types() {
+        for output in [DType::F16, DType::BF16] {
+            let source_ty = UType::scalar(output);
+            let accumulator_ty = UType::scalar(DType::F32);
+            let source = UOp::from_operation(
+                Operation::Const(LiteralValue::Scalar {
+                    dtype: output,
+                    bits: 0,
+                }),
+                Some(source_ty),
+                vec![],
+            );
+            let init = UOp::from_operation(
+                Operation::ReduceInit(ReductionValue {
+                    input_shape: Shape::from([2]),
+                    output_shape: Shape::new([]),
+                    axes: vec![0],
+                    keepdim: false,
+                    kind: crate::ReduceKind::Sum,
+                }),
+                Some(accumulator_ty),
+                vec![],
+            );
+            let update = UOp::from_operation(
+                Operation::ReduceAccumulate,
+                Some(accumulator_ty),
+                vec![init, source],
+            );
+            let finalize =
+                UOp::from_operation(Operation::ReduceFinalize, Some(source_ty), vec![update]);
+            let bytes = encode_schedule_identity(&finalize).unwrap();
+            assert_eq!(bytes[4], 18);
+            let decoded = decode(&bytes).unwrap();
+            assert_eq!(decoded, finalize);
+            let (plan, _) =
+                crate::reduction_native::NativeReductionPlan::from_finalize(&decoded).unwrap();
+            assert_eq!(plan.accumulator_dtype, DType::F32);
+            assert_eq!(plan.output_dtype, output);
+
+            let decoded_update = decoded.sources().first().unwrap();
+            let tampered_update = UOp::from_operation(
+                Operation::ReduceAccumulate,
+                Some(UType::scalar(output)),
+                decoded_update.sources().to_vec(),
+            );
+            let tampered = UOp::from_operation(
+                Operation::ReduceFinalize,
+                Some(source_ty),
+                vec![tampered_update],
+            );
+            assert!(encode_schedule_identity(&tampered).is_err());
+        }
+    }
+
+    #[test]
+    fn v18_legacy_float8_mean_same_storage_round_trips_and_replays() {
+        let dtype = DType::F8E5M2;
+        let ty = UType::scalar(dtype);
+        let source = UOp::from_operation(
+            Operation::Const(LiteralValue::Scalar { dtype, bits: 0 }),
+            Some(ty),
+            vec![],
+        );
+        let init = UOp::from_operation(
+            Operation::ReduceInit(ReductionValue {
+                input_shape: Shape::from([3]),
+                output_shape: Shape::new([]),
+                axes: vec![0],
+                keepdim: false,
+                kind: crate::ReduceKind::Mean,
+            }),
+            Some(ty),
+            vec![],
+        );
+        let update = UOp::from_operation(Operation::ReduceAccumulate, Some(ty), vec![init, source]);
+        let finalize = UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![update]);
+        let bytes = encode_schedule_identity(&finalize).unwrap();
+        assert_eq!(bytes[4], 18);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, finalize);
+        let (plan, _) =
+            crate::reduction_native::NativeReductionPlan::from_finalize(&decoded).unwrap();
+        let accumulator = [8.0, 1.0, -8.0]
+            .into_iter()
+            .fold(plan.identity(), |acc, value| {
+                plan.update(acc, crate::Scalar::F(value))
+            });
+        let expected = dtype.commit_scalar(crate::Scalar::F(f64::from(
+            dtype.commit_scalar(accumulator).as_f64() as f32
+                / dtype.commit_scalar(crate::Scalar::F(3.0)).as_f64() as f32,
+        )));
+        assert_eq!(plan.finalize(accumulator), expected);
+    }
+
     #[test]
     fn exact_scalar_round_trip_is_deterministic() {
         for (d, b) in [

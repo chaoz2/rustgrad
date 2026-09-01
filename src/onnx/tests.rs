@@ -3743,8 +3743,8 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
         assert_eq!(output.values(), expected.as_slice());
     }
 
-    // Source MAX keeps a leading NaN; strict non-NaN ties retain their first
-    // lane (including signed zero), and infinities participate normally.
+    // Source MAX starts from dtype.min. A leading NaN is unordered, while
+    // strict non-NaN ties retain their first lane (including signed zero).
     let mut graph = Graph::new();
     let x = graph.input("x", [1, 1, 1, 3]);
     let mut values = BTreeMap::from([("x".into(), x)]);
@@ -3765,7 +3765,7 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
             )]),
         )
         .unwrap();
-    assert!(output.values()[0].is_nan());
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
 
     let mut graph = Graph::new();
     let x = graph.input("x", [1, 1, 2]);
@@ -3787,7 +3787,7 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
             )]),
         )
         .unwrap();
-    assert!(output.values()[0].is_nan());
+    assert_eq!(output.values(), &[f32::NEG_INFINITY]);
 
     let output = CpuBackend
         .execute(
@@ -11051,8 +11051,8 @@ fn reduce_min_matches_tinygrad_empty_identity_and_preflights() {
         )
         .unwrap();
     assert_eq!(output.shape().dims(), &[2, 1]);
-    // Source Min is inverse -> Max -> inverse, and preserves a leading NaN.
-    assert!(output.values()[0].is_nan());
+    // Source Min is identity-first inverse -> Max -> inverse.
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
     assert_eq!(output.values()[1], f32::NEG_INFINITY);
 
     for (dtype, identity) in [
@@ -11239,8 +11239,8 @@ fn reduce_max_matches_tinygrad_empty_identity_and_preflights() {
         )
         .unwrap();
     assert_eq!(output.shape().dims(), &[2, 1]);
-    // Raw source Max retains a leading unordered payload.
-    assert!(output.values()[0].is_nan());
+    // Raw source Max retains its identity on a leading unordered payload.
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
     assert_eq!(output.values()[1], f32::INFINITY);
 
     for (dtype, identity) in [
@@ -12374,8 +12374,8 @@ fn model_proto_reduction_boundaries_cover_noop_nan_and_zero_domains() {
         .unwrap()
         .run(HashMap::new())
         .unwrap();
-    assert!(extrema["minimum"].values()[0].is_nan());
-    assert!(extrema["maximum"].values()[0].is_nan());
+    assert_eq!(extrema["minimum"].values(), &[-1.0]);
+    assert_eq!(extrema["maximum"].values(), &[2.0]);
 
     let empty = raw_tensor("x", &[2, 0], 1, &[]);
     let axis = raw_tensor("axis", &[1], 7, &i64_bytes(&[1]));

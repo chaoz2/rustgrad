@@ -1,6 +1,5 @@
 pub(crate) mod cpu;
 mod float8_contract;
-mod float8_reduce;
 mod jit;
 
 use crate::{Graph, NodeId, Result, TensorData};

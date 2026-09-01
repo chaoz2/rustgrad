@@ -1,4 +1,4 @@
-//! Deterministic WGSL lowering for a static exact-storage elementwise subset.
+//! Deterministic WGSL lowering for a static exact-storage scalar/reduction subset.
 use super::{
     WebGpuCapabilities, WebGpuError,
     guard::emit_transactional,
@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Deterministic renderer/source identity.
-pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v5";
+pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v6";
 /// Ordered storage-plus-extent bind-group ABI version.
 pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
@@ -232,16 +232,11 @@ impl WgslRenderer {
         if nodes.iter().any(|node| {
             matches!(
                 node.operation(),
-                Operation::ReduceInit(_)
-                    | Operation::ReduceAccumulate
-                    | Operation::ReduceFinalize
-                    | Operation::Barrier
-                    | Operation::If
-                    | Operation::EndIf
+                Operation::Barrier | Operation::If | Operation::EndIf
             )
         }) {
             return Err(WebGpuError::Unsupported(
-                "reductions, effects, and control flow are outside the exact WGSL subset".into(),
+                "effects and control flow are outside the exact WGSL subset".into(),
             ));
         }
         let store = root
@@ -387,6 +382,27 @@ impl WgslRenderer {
             .sources()
             .get(1)
             .ok_or_else(|| WebGpuError::Unsupported("store has no value".into()))?;
+        let reduction = matches!(value.operation(), Operation::ReduceFinalize)
+            .then(|| {
+                crate::reduction_native::NativeReductionPlan::from_finalize(value)
+                    .map(|(plan, _)| plan)
+                    .map_err(|reason| WebGpuError::Unsupported(reason.into()))
+            })
+            .transpose()?;
+        let reduction_roots = nodes
+            .iter()
+            .filter(|node| matches!(node.operation(), Operation::ReduceFinalize))
+            .count();
+        if reduction_roots != usize::from(reduction.is_some()) {
+            return Err(WebGpuError::Unsupported(
+                "reduction must be the sole stored value".into(),
+            ));
+        }
+        if let Some(plan) = &reduction {
+            for dtype in [plan.source_dtype, plan.accumulator_dtype, plan.output_dtype] {
+                supported_storage(dtype)?;
+            }
+        }
         let transaction =
             WebGpuTransactionAbi::analyze(value, output_position, store_shape.clone())?;
         if transaction.is_some()
@@ -472,7 +488,14 @@ impl WgslRenderer {
         lines.push("  let gid: u32 = rg_global.x;".into());
         lines.push("  if (gid >= rg_extent.value) { return; }".into());
         let mut source_map = BTreeMap::new();
-        let expression = if let Some(transaction) = &transaction {
+        let expression = if let Some(plan) = &reduction {
+            if transaction.is_some() {
+                return Err(WebGpuError::Unsupported(
+                    "guarded reduction producers are outside the exact WGSL subset".into(),
+                ));
+            }
+            emit_wgsl_reduction(plan, value, &ids, &mut source_map, &mut lines)?
+        } else if let Some(transaction) = &transaction {
             emit_transactional(value, transaction, &ids, &mut source_map, &mut lines)?
         } else {
             emit_expr(value, &ids, &mut source_map, &mut lines, "gid")?
@@ -544,6 +567,162 @@ impl WgslRenderer {
             ))),
         })
     }
+}
+
+fn emit_wgsl_reduction(
+    plan: &crate::reduction_native::NativeReductionPlan,
+    finalize: &UOp,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+) -> Result<String, WebGpuError> {
+    let (_, producer) = crate::reduction_native::NativeReductionPlan::from_finalize(finalize)
+        .map_err(|reason| WebGpuError::Unsupported(reason.into()))?;
+    let reduction_len = u32::try_from(plan.reduction_len()).map_err(|_| {
+        WebGpuError::Unsupported("reduction domain exceeds WGSL u32 indexing".into())
+    })?;
+    let accumulator_type = wgsl_reduction_type(plan.accumulator_dtype);
+    let identity = wgsl_reduction_literal(plan.accumulator_dtype, plan.identity())?;
+    lines.push(format!("  var rg_acc: {accumulator_type} = {identity};"));
+    if reduction_len != 0 {
+        lines.push(format!(
+            "  for (var rg_r: u32 = 0u; rg_r < {reduction_len}u; rg_r = rg_r + 1u) {{"
+        ));
+        let source_index =
+            crate::reduction_native::index_expression(&plan.geometry, "gid", "rg_r", "u");
+        lines.push(format!("    let rg_src: u32 = {source_index};"));
+        let candidate = emit_expr(producer, ids, source_map, lines, "rg_src")?;
+        let candidate = WgslScalarDialect
+            .cast(plan.source_dtype, plan.accumulator_dtype, &candidate)
+            .map_err(WebGpuError::Unsupported)?;
+        if plan.is_singleton_identity() {
+            lines.push(format!("    rg_acc = {candidate};"));
+        } else {
+            match plan.kind {
+                crate::ReduceKind::Sum | crate::ReduceKind::Mean => lines.push(format!(
+                    "    rg_acc = {};",
+                    if plan.accumulator_dtype == DType::Bool {
+                        format!("(rg_acc || ({candidate}))")
+                    } else {
+                        wgsl_reduction_arithmetic(
+                            plan.accumulator_dtype,
+                            "rg_acc",
+                            &candidate,
+                            false,
+                        )
+                    }
+                )),
+                crate::ReduceKind::Product => lines.push(format!(
+                    "    rg_acc = {};",
+                    if plan.accumulator_dtype == DType::Bool {
+                        format!("(rg_acc && ({candidate}))")
+                    } else {
+                        wgsl_reduction_arithmetic(
+                            plan.accumulator_dtype,
+                            "rg_acc",
+                            &candidate,
+                            true,
+                        )
+                    }
+                )),
+                crate::ReduceKind::Max | crate::ReduceKind::Min => {
+                    if plan.accumulator_dtype == DType::Bool {
+                        lines.push(format!(
+                            "    rg_acc = rg_acc {} ({candidate});",
+                            if plan.kind == crate::ReduceKind::Max {
+                                "||"
+                            } else {
+                                "&&"
+                            }
+                        ));
+                    } else {
+                        let comparison = if plan.kind == crate::ReduceKind::Max {
+                            ">"
+                        } else {
+                            "<"
+                        };
+                        lines.push(format!(
+                            "    if (({candidate}) {comparison} rg_acc) {{ rg_acc = {candidate}; }}"
+                        ));
+                    }
+                }
+                crate::ReduceKind::Any => {
+                    lines.push(format!("    rg_acc = rg_acc || ({candidate});"));
+                }
+                crate::ReduceKind::All => {
+                    lines.push(format!("    rg_acc = rg_acc && ({candidate});"));
+                }
+            }
+        }
+        lines.push("  }".into());
+    }
+    if plan.kind == crate::ReduceKind::Mean {
+        if reduction_len == 0 {
+            lines.push("  rg_acc = bitcast<f32>(0x7fc00000u);".into());
+        } else {
+            let divisor = wgsl_reduction_literal(
+                plan.accumulator_dtype,
+                plan.mean_divisor()
+                    .expect("nonempty validated Mean divisor"),
+            )?;
+            let divided = format!("(rg_acc / {divisor})");
+            lines.push(format!(
+                "  rg_acc = {};",
+                wgsl_reduction_commit(plan.accumulator_dtype, &divided)
+            ));
+        }
+    }
+    WgslScalarDialect
+        .cast(plan.accumulator_dtype, plan.output_dtype, "rg_acc")
+        .map_err(WebGpuError::Unsupported)
+}
+
+fn wgsl_reduction_type(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F16 | DType::BF16 | DType::F32 => "f32",
+        DType::Bool => "bool",
+        DType::I32 => "i32",
+        DType::U32 => "u32",
+        _ => unreachable!("validated WGSL reduction storage"),
+    }
+}
+
+fn wgsl_reduction_literal(dtype: DType, value: crate::Scalar) -> Result<String, WebGpuError> {
+    Ok(match value {
+        crate::Scalar::Bool(value) => value.to_string(),
+        crate::Scalar::I(value) if dtype == DType::I32 => {
+            format!("bitcast<i32>(0x{:08x}u)", value as u32)
+        }
+        crate::Scalar::U(value) => format!("{value}u"),
+        crate::Scalar::F(value) => {
+            format!("bitcast<f32>(0x{:08x}u)", (value as f32).to_bits())
+        }
+        _ => {
+            return Err(WebGpuError::Unsupported(
+                "WGSL reduction identity is outside the exact storage subset".into(),
+            ));
+        }
+    })
+}
+
+fn wgsl_reduction_arithmetic(dtype: DType, lhs: &str, rhs: &str, product: bool) -> String {
+    let operator = if product { "*" } else { "+" };
+    let value = if dtype == DType::I32 {
+        format!("bitcast<i32>(bitcast<u32>({lhs}) {operator} bitcast<u32>({rhs}))")
+    } else {
+        format!("(({lhs}) {operator} ({rhs}))")
+    };
+    wgsl_reduction_commit(dtype, &value)
+}
+
+fn wgsl_reduction_commit(dtype: DType, value: &str) -> String {
+    narrow::quantize(dtype, value).unwrap_or_else(|| match dtype {
+        DType::F32 => format!("f32({value})"),
+        DType::I32 => format!("i32({value})"),
+        DType::U32 => format!("u32({value})"),
+        DType::Bool => format!("bool({value})"),
+        _ => unreachable!("validated WGSL reduction storage"),
+    })
 }
 
 fn supported_storage(dtype: DType) -> Result<(), WebGpuError> {

@@ -1326,7 +1326,7 @@ mod tests {
     fn reuse_is_alias_safe_and_reduces_peak_for_reduction_chain() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2, 1]), DType::F32);
-        let y = graph.input_dtype("y", Shape::from([2, 1]), DType::F32);
+        let y = graph.input_dtype("y", Shape::from([2, 2]), DType::F32);
         let first = graph.square(x).unwrap();
         let one = graph.constant(TensorData::scalar(1.0));
         let reduced = graph.add(first, one).unwrap();
@@ -1344,8 +1344,17 @@ mod tests {
             ),
             (
                 "y".into(),
-                TensorData::from_scalars([2, 1], DType::F32, [Scalar::F(5.0), Scalar::F(7.0)])
-                    .unwrap(),
+                TensorData::from_scalars(
+                    [2, 2],
+                    DType::F32,
+                    [
+                        Scalar::F(5.0),
+                        Scalar::F(1.0),
+                        Scalar::F(7.0),
+                        Scalar::F(1.0),
+                    ],
+                )
+                .unwrap(),
             ),
         ]);
         let requested = [branch, reduced, output];

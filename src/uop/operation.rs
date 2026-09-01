@@ -44,7 +44,6 @@ pub struct ReductionValue {
     pub axes: Vec<usize>,
     pub keepdim: bool,
     pub kind: crate::ReduceKind,
-    pub mean: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

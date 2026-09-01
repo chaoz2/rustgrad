@@ -1417,7 +1417,7 @@ fn narrow_float_reductions_match_cpu_raw_storage_contracts() {
             .validate_schedule_bindings(item.ordered_inputs())
             .unwrap();
         assert!(keys.insert(rendered.cache_key.clone()), "{name}");
-        assert!(rendered.source.contains("double acc"), "{name}");
+        assert!(rendered.source.contains("float acc"), "{name}");
         let (actual, _) = execute_mock_rendered(
             &rendered,
             renderer,
@@ -1462,7 +1462,7 @@ fn narrow_float_reductions_match_cpu_raw_storage_contracts() {
 }
 
 #[test]
-fn serial_sum_mean_reductions_match_cpu_and_gate_fp64() {
+fn serial_sum_mean_reductions_match_cpu_at_the_typed_work_width() {
     let renderer = OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL).unwrap();
     for (name, kind, shape, axes, keepdim, values) in [
         (
@@ -1512,21 +1512,26 @@ fn serial_sum_mean_reductions_match_cpu_and_gate_fp64() {
         let inputs = HashMap::from([("input".into(), value.clone())]);
         let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
         let item = schedule(&graph, output).unwrap().items.remove(0);
-        assert!(matches!(
-            OpenClRenderer::default().render(&item.kernel),
-            Err(OpenClError::Unsupported(_))
-        ));
+        OpenClRenderer::default().render(&item.kernel).unwrap();
         let rendered = renderer.render(&item.kernel).unwrap();
         rendered
             .validate_schedule_bindings(item.ordered_inputs())
             .unwrap();
-        assert!(
-            rendered.source.contains("double acc")
-                || rendered.source.contains("7fc00000")
-                || rendered.source.contains("as_float((uint)0u)"),
-            "{name}: {}",
-            rendered.source
-        );
+        if name == "empty mean" {
+            assert!(rendered.source.contains("b0[gid] = NAN;"));
+            assert!(!rendered.source.contains("float acc"));
+            assert!(!rendered.source.contains("for (ulong r"));
+            assert!(!rendered.source.contains("src_gid"));
+        } else {
+            assert!(
+                rendered.source.contains("float acc")
+                    || rendered.source.contains("7fc00000")
+                    || rendered.source.contains("as_float((uint)0u)")
+                    || rendered.source.contains("b0[gid] = 0.0;"),
+                "{name}: {}",
+                rendered.source
+            );
+        }
         let (actual, _) = execute_mock_rendered(
             &rendered,
             renderer,
@@ -1580,7 +1585,7 @@ fn serial_product_extrema_match_cpu_raw_storage_contracts() {
             .concat(),
         ),
         (
-            "u64 f64-projection tie",
+            "u64 exact-width ordering",
             DType::U64,
             crate::ReduceKind::Max,
             [(1u64 << 63).to_le_bytes(), ((1u64 << 63) + 1).to_le_bytes()].concat(),
@@ -1754,9 +1759,22 @@ fn strided_view_and_capability_preflight_are_exact() {
         },
     )
     .unwrap();
+    assert!(
+        int64_only
+            .render(&schedule(&graph, output).unwrap().items[0].kernel)
+            .is_ok()
+    );
+    let no_int64 = OpenClRenderer::with_capabilities(
+        1,
+        OpenClCapabilities {
+            int64: false,
+            fp64: true,
+        },
+    )
+    .unwrap();
     assert!(matches!(
-        int64_only.render(&schedule(&graph, output).unwrap().items[0].kernel),
-        Err(OpenClError::Unsupported(reason)) if reason.contains("extrema")
+        no_int64.render(&schedule(&graph, output).unwrap().items[0].kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("64-bit integer")
     ));
     assert_eq!(mock.calls().len(), calls);
 }
@@ -1786,10 +1804,7 @@ fn renderer_rejects_unsupported_work_before_icd_calls() {
     let input = graph.input("input", Shape::from([2, 2]));
     let reduced = graph.sum(input, 1).unwrap();
     let item = &schedule(&graph, reduced).unwrap().items[0];
-    assert!(matches!(
-        OpenClRenderer::default().render(&item.kernel),
-        Err(OpenClError::Unsupported(_))
-    ));
+    assert!(OpenClRenderer::default().render(&item.kernel).is_ok());
     assert!(
         OpenClRenderer::with_capabilities(64, OpenClCapabilities::FULL)
             .unwrap()
@@ -2342,7 +2357,7 @@ fn guarded_reductions_order_source_faults_and_swap_only_clean_results() {
     assert_eq!(transaction.guards.len(), 2);
     assert!(rendered.source.contains("(uint)src_gid * 2u + 0u"));
     assert!(rendered.source.contains("(uint)src_gid * 2u + 1u"));
-    assert!(rendered.source.contains("if (rg_ok) acc +="));
+    assert!(rendered.source.contains("if (rg_ok) acc ="));
 
     let ints = |values: &[i32]| {
         TensorData::from_scalars(
