@@ -824,6 +824,17 @@ container rather than being coerced into a hidden calling convention.
 state-free forwarding implementation, and returns output plus the ordered
 pending-effect collection. It deliberately does not make BatchNorm eligible
 for ordinary `Sequential` or invent a global training flag.
+`nn::LSTM` is a separate typed stateful composition rather than another
+sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
+`cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus
+optional separate `[layers,batch,hidden]` hidden/cell state, and returns the
+last-layer sequence with its final typed state. Descriptor, state, layer, and
+explicit-mode seeded-dropout work is rehearsed on a cloned graph before the
+live graph is replaced. The composition is validated through the CPU oracle
+and graph-independent captured interpreter; it adds no Op/UOp/artifact or
+native/device ABI and deliberately does not implement the one-output
+`ModuleForward` seam. Bidirectionality, projections, packed/dynamic sequences,
+fused recurrent kernels, and a full RNNT model remain outside this boundary.
 `nn/activation.rs` owns the state-free `ReLU` leaf, which delegates only to
 `Graph::relu`; it contributes no traversal state and lets ordinary
 `Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
@@ -847,9 +858,8 @@ to the rank-generic compositional transpose-convolution contract; and
 verified CIFAR classifier chain. `nn/norm.rs` additionally gives `LayerNorm`, `LayerNorm2d`,
 `GroupNorm`, `InstanceNorm`, and `RMSNorm` graph-independent construction and their existing checked one-input
 Graph forwards; `LayerNorm2d` preserves the exact NCHW-to-NHWC-to-LayerNorm-to-NCHW composition,
-while `GroupNorm` and `InstanceNorm` preserve their existing static NCHW grouping composition. BatchNorm lifecycle,
-other normalization, and recurrent
-adapters remain separate composition work.
+while `GroupNorm` and `InstanceNorm` preserve their existing static NCHW grouping composition. BatchNorm lifecycle and
+other normalization adapters remain separate composition work.
 
 Graph-independent parameter construction is owned by `nn` rather than the
 session bridge. `Linear::new_static` constructs only versioned host state, and

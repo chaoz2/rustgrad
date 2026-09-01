@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:34f173ddb95fc52d",
+  "source_fingerprint": "fnv1a64:9a070e9be0830037",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -531,7 +531,7 @@
       "subject": "Layers, activations, losses and normalization",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. State-free `ReLU`, `AdaptiveAvgPool2d`, and checked `Flatten`, plus graph-free `Conv2d`, `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, and `RMSNorm`, participate in the public one-input static `ModuleForward` seam: strict static `Linear → ReLU → Linear`, `Linear → LayerNorm`, `Linear → RMSNorm`, `Conv2d → LayerNorm2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear`, `Conv2d → GroupNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear`, and `Conv2d → InstanceNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear` fresh-state/inference acceptance are covered. `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, and `RMSNorm` preserve their existing checked rank/dtype contracts. BatchNorm's separate `ModeModuleForward` composes through explicit `ModeSequential`; its CPU `Conv2d → BatchNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear` workflow realizes output/loss/gradients/statistics before one atomic parameter-and-running-buffer commit, with detached optimizer/scheduler candidates. Evaluation is explicit and read-only. This neither changes ordinary `Sequential` nor adds global mode, generic trainer, checkpoint, native/device/dynamic, or mixed-precision training behavior. Other graph-composed Conv/pool/reshape/normalization/stateful signatures remain explicit. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain. The rank-two-or-greater `BatchNorm` implementation is publicly aliased as both `BatchNorm2d` and `BatchNorm3d`, with shared module/state semantics; no `BatchNorm1d` claim is made."
+        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. Typed stacked `LSTM` composes those cells for static F32 `[time,batch,input] → [time,batch,hidden]` sequences with separate `[layers,batch,hidden]` hidden/cell state, optional carried state, explicit `Mode`, deterministic seeded dropout, `cells.{layer}.*` traversal, and clone-rehearsed atomic graph publication. One/two-layer, carried split, zero/explicit state, empty-batch, gradient construction, CPU oracle, and captured-interpreter behavior are acceptance-tested. It intentionally remains outside one-output `ModuleForward`; bidirectional/projected/packed/dynamic/fused recurrent execution and full RNNT are not claimed. State-free `ReLU`, `AdaptiveAvgPool2d`, and checked `Flatten`, plus graph-free `Conv2d`, `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, and `RMSNorm`, participate in the public one-input static `ModuleForward` seam: strict static `Linear → ReLU → Linear`, `Linear → LayerNorm`, `Linear → RMSNorm`, `Conv2d → LayerNorm2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear`, `Conv2d → GroupNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear`, and `Conv2d → InstanceNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear` fresh-state/inference acceptance are covered. `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, and `RMSNorm` preserve their existing checked rank/dtype contracts. BatchNorm's separate `ModeModuleForward` composes through explicit `ModeSequential`; its CPU `Conv2d → BatchNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear` workflow realizes output/loss/gradients/statistics before one atomic parameter-and-running-buffer commit, with detached optimizer/scheduler candidates. Evaluation is explicit and read-only. This neither changes ordinary `Sequential` nor adds global mode, generic trainer, checkpoint, native/device/dynamic, or mixed-precision training behavior. Other graph-composed Conv/pool/reshape/normalization/stateful signatures remain explicit. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain. The rank-two-or-greater `BatchNorm` implementation is publicly aliased as both `BatchNorm2d` and `BatchNorm3d`, with shared module/state semantics; no `BatchNorm1d` claim is made."
       }
     },
     {
@@ -619,9 +619,9 @@
       "section": "NN, models and distributed",
       "subject_header": "Capability",
       "subject": "BERT, EfficientNet, RNNT, Whisper and conv models",
-      "status": "not_started",
+      "status": "partial",
       "fields": {
-        "Acceptance requirement": "Checked-in model tests"
+        "Acceptance requirement": "The checked-in RNNT-style static stacked LSTM sequence core is covered through typed state and CPU/captured-interpreter acceptance. No encoder/prediction/joint RNNT composition, transcript pipeline, corpus parity, bidirectional/projection/packed/dynamic sequence, fused recurrent kernel, BERT, EfficientNet, Whisper, or broader conv-model claim is made."
       }
     },
     {
