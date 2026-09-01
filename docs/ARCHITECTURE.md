@@ -1416,10 +1416,13 @@ The same adapter also covers the released two-class configured CIFAR chain:
 static F32 NCHW/OIHW `Conv2d(3→2, 1×1, groups=1, unit stride/dilation, zero
 padding, optional bias) → ReLU → AdaptiveAvgPool2d(1,1) → Flatten → Linear(2→2)`.
 `MovementKernelPlan::AffineCopy` is the narrow pure static computed-view
-boundary: a positive, injective affine map from a computed producer is copied
-into owned dense storage before a reduction or matmul ABI consumes it. Signed,
-broadcast, overlapping, effectful, symbolic, and aliasing maps reject before
-native preparation; this is not general view fusion or aliasing support.
+boundary: any exactly bounded affine read map from a computed producer is copied
+into fresh owned dense storage. Signed reverse and zero-stride broadcast reads
+are valid because source aliases never alias the output or each other as write
+targets. The interpreter and movement-v2 CPU renderer share that immutable plan;
+native addressing normalizes the proof to nonnegative indices and copies raw
+storage widths. Effectful, symbolic, non-affine, and unsupported-device routes
+remain fail-closed.
 The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
 preflight/plan/execute path rather than adding a profiler or executor. Its
 immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`
@@ -1448,9 +1451,11 @@ remain outside the artifact contract.
 `rangeify/` owns pure movement-to-index metadata. It extracts source-backed
 static shrink, contiguous reshape, permutation, expansion, and signed-stride
 chains into a deterministic canonical `AffineView` before kernel lowering.
-Computed producers, pad validity, unsupported signed reshape compositions, and
-non-affine composition remain explicit boundaries rather than hidden host
-materializations.
+For a computed base, the scheduler materializes that producer exactly once and
+uses the same affine descriptor for a fresh dense read-copy output; source-backed
+views remain direct addressing or passthrough values. Pad validity, unsupported
+signed reshape compositions, symbolic computed views, and non-affine composition
+remain explicit boundaries rather than hidden host materializations.
 
 ## Static-graph autograd lifecycle
 

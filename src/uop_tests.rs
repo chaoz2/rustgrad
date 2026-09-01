@@ -766,3 +766,63 @@ fn affine_reads_allow_broadcast_aliases_but_writes_require_injectivity() {
     assert_eq!(flipped.element_offset(0).unwrap(), 2);
     assert!(flipped.validate_write().is_ok());
 }
+
+#[test]
+fn empty_affine_reads_still_validate_products_and_address_representability() {
+    let boundary = crate::AffineView {
+        source_shape: Shape::from([4]),
+        logical_shape: Shape::from([4]),
+        strides: vec![-1],
+        offset: 3,
+    };
+    let normalized = boundary.normalized_read().unwrap();
+    assert_eq!(normalized.offset, 0);
+    assert_eq!(normalized.axes[0].stride, 1);
+    assert!(normalized.axes[0].reversed);
+
+    let negative_minimum = crate::AffineView {
+        offset: 2,
+        ..boundary.clone()
+    };
+    assert!(negative_minimum.validate_read().is_err());
+    let upper_oob = crate::AffineView {
+        offset: 4,
+        strides: vec![1],
+        ..boundary.clone()
+    };
+    assert!(upper_oob.validate_read().is_err());
+
+    let overflowing_source = crate::AffineView {
+        source_shape: Shape::from([usize::MAX, 2]),
+        logical_shape: Shape::from([0]),
+        strides: vec![1],
+        offset: 0,
+    };
+    assert!(overflowing_source.validate_read().is_err());
+
+    let overflowing_logical = crate::AffineView {
+        source_shape: Shape::from([0]),
+        logical_shape: Shape::from([usize::MAX, 2, 0]),
+        strides: vec![0, 0, 0],
+        offset: 0,
+    };
+    assert!(overflowing_logical.validate_read().is_err());
+
+    let extreme_stride = crate::AffineView {
+        source_shape: Shape::from([0, 2]),
+        logical_shape: Shape::from([0, 2]),
+        strides: vec![0, i64::MIN],
+        offset: 0,
+    };
+    assert!(extreme_stride.validate_read().is_err());
+
+    let skipped_singleton = crate::AffineView {
+        source_shape: Shape::from([0, 1]),
+        logical_shape: Shape::from([0, 1]),
+        strides: vec![0, i64::MIN],
+        offset: 0,
+    };
+    let normalized = skipped_singleton.normalized_read().unwrap();
+    assert_eq!(normalized.axes[1].stride, 0);
+    assert!(!normalized.axes[1].reversed);
+}

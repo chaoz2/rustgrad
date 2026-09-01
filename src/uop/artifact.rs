@@ -3070,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn computed_affine_copy_payload_round_trip_is_deterministic() {
+    fn established_and_signed_affine_copy_payloads_round_trip_deterministically() {
         let mut graph = crate::Graph::new();
         let input = graph.input_dtype("input", [2, 2], DType::F32);
         let producer = graph.relu(input).unwrap();
@@ -3082,6 +3082,32 @@ mod tests {
             panic!("movement payload missing");
         };
         assert!(matches!(plan.kind, MovementKernelKind::AffineCopy { .. }));
+
+        let mut signed = crate::Graph::new();
+        let input = signed.input_dtype("input", [4], DType::F32);
+        let producer = signed.square(input).unwrap();
+        let output = signed
+            .stride(
+                producer,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        let root = crate::kernel::lower_graph_computed_affine_view(&signed, output).unwrap();
+        let bytes = encode(&root).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(encode(&decoded).unwrap(), bytes);
+        let Operation::Movement(MovementValue::Plan(plan)) = decoded.operation() else {
+            panic!("movement payload missing")
+        };
+        let MovementKernelKind::AffineCopy { view, .. } = &plan.kind else {
+            panic!("affine-copy payload missing")
+        };
+        assert_eq!(view.offset, 3);
+        assert_eq!(view.strides, vec![-1]);
     }
     #[test]
     fn corruption_and_truncation_fail_closed() {

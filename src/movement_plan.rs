@@ -233,19 +233,24 @@ impl MovementKernelPlan {
     pub fn validate(&self) -> Result<(), MovementPlanError> {
         self.output_shape
             .numel()
-            .map_err(|_| MovementPlanError::Overflow)?;
+            .map_err(|_| MovementPlanError::Overflow)?
+            .checked_mul(self.dtype.itemsize())
+            .ok_or(MovementPlanError::Overflow)?;
         if self.cache_key != self.expected_cache_key() {
             return Err(MovementPlanError::InvalidGeometry);
         }
         match &self.kind {
             MovementKernelKind::AffineCopy { input, view } => {
+                input
+                    .shape
+                    .numel()
+                    .map_err(|_| MovementPlanError::Overflow)?
+                    .checked_mul(input.dtype.itemsize())
+                    .ok_or(MovementPlanError::Overflow)?;
                 if input.dtype != self.dtype
                     || view.source_shape != input.shape
                     || view.logical_shape != self.output_shape
-                    || view.offset < 0
-                    || view.strides.iter().any(|stride| *stride < 0)
                     || view.validate_read().is_err()
-                    || view.validate_write().is_err()
                 {
                     return Err(MovementPlanError::InvalidGeometry);
                 }
@@ -1293,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn computed_affine_copy_is_dense_exact_and_rejects_aliasing_maps() {
+    fn computed_affine_copy_is_dense_exact_and_rejects_malformed_maps() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2, 2], DType::F32);
         let producer = graph.relu(input).unwrap();
@@ -1316,15 +1321,106 @@ mod tests {
             .unwrap();
         assert_eq!(copied.storage(), oracle.storage());
 
-        let mut overlapping = plan.clone();
-        let MovementKernelKind::AffineCopy { view, .. } = &mut overlapping.kind else {
+        let mut malformed = plan.clone();
+        let MovementKernelKind::AffineCopy { view, .. } = &mut malformed.kind else {
             unreachable!();
         };
-        view.strides[1] = 0;
-        overlapping.cache_key = overlapping.expected_cache_key();
+        view.offset = 4;
+        malformed.cache_key = malformed.expected_cache_key();
         assert_eq!(
-            overlapping.validate(),
+            malformed.validate(),
             Err(MovementPlanError::InvalidGeometry)
+        );
+
+        let mut stale = plan.clone();
+        stale.output_shape = Shape::from([4, 1]);
+        assert_eq!(stale.validate(), Err(MovementPlanError::InvalidGeometry));
+
+        let mut stale_cache = plan.clone();
+        stale_cache.cache_key ^= 1;
+        assert_eq!(
+            stale_cache.validate(),
+            Err(MovementPlanError::InvalidGeometry)
+        );
+
+        let mut input_bytes_overflow = plan.clone();
+        input_bytes_overflow.output_shape = Shape::from([0]);
+        let MovementKernelKind::AffineCopy { input, view } = &mut input_bytes_overflow.kind else {
+            unreachable!();
+        };
+        input.shape = Shape::from([usize::MAX]);
+        view.source_shape = input.shape.clone();
+        view.logical_shape = Shape::from([0]);
+        view.strides = vec![1];
+        view.offset = 0;
+        input_bytes_overflow.cache_key = input_bytes_overflow.expected_cache_key();
+        assert_eq!(
+            input_bytes_overflow.validate(),
+            Err(MovementPlanError::Overflow)
+        );
+
+        let mut output_bytes_overflow = plan.clone();
+        output_bytes_overflow.output_shape = Shape::from([usize::MAX]);
+        let MovementKernelKind::AffineCopy { input, view } = &mut output_bytes_overflow.kind else {
+            unreachable!();
+        };
+        input.shape = Shape::from([1]);
+        view.source_shape = input.shape.clone();
+        view.logical_shape = output_bytes_overflow.output_shape.clone();
+        view.strides = vec![0];
+        view.offset = 0;
+        output_bytes_overflow.cache_key = output_bytes_overflow.expected_cache_key();
+        assert_eq!(
+            output_bytes_overflow.validate(),
+            Err(MovementPlanError::Overflow)
+        );
+
+        let mut alias = plan;
+        alias.output = producer;
+        alias.cache_key = alias.expected_cache_key();
+        assert_eq!(alias.validate(), Err(MovementPlanError::InvalidGeometry));
+    }
+
+    #[test]
+    fn computed_affine_copy_accepts_broadcast_and_signed_read_maps() {
+        let mut broadcast = Graph::new();
+        let input = broadcast.input_dtype("input", [2, 1], DType::I32);
+        let producer = broadcast.square(input).unwrap();
+        let viewed = broadcast.expand(producer, [2, 3]).unwrap();
+        let plan = MovementKernelPlan::from_computed_affine_view(&broadcast, viewed).unwrap();
+        let MovementKernelKind::AffineCopy { view, .. } = &plan.kind else {
+            panic!("affine copy")
+        };
+        assert_eq!(view.strides, vec![1, 0]);
+        let value = TensorData::from_storage([2, 1], Storage::I32(vec![7, 11])).unwrap();
+        assert_eq!(
+            plan.execute(&[value]).unwrap().storage(),
+            &Storage::I32(vec![7, 7, 7, 11, 11, 11])
+        );
+
+        let mut reverse = Graph::new();
+        let input = reverse.input_dtype("input", [4], DType::I32);
+        let producer = reverse.square(input).unwrap();
+        let viewed = reverse
+            .stride(
+                producer,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        let plan = MovementKernelPlan::from_computed_affine_view(&reverse, viewed).unwrap();
+        let MovementKernelKind::AffineCopy { view, .. } = &plan.kind else {
+            panic!("affine copy")
+        };
+        assert_eq!(view.offset, 3);
+        assert_eq!(view.strides, vec![-1]);
+        let value = TensorData::from_storage([4], Storage::I32(vec![1, 4, 9, 16])).unwrap();
+        assert_eq!(
+            plan.execute(&[value]).unwrap().storage(),
+            &Storage::I32(vec![16, 9, 4, 1])
         );
     }
 

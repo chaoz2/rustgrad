@@ -1182,6 +1182,129 @@ mod tests {
             .remove(0)
     }
 
+    fn assert_computed_affine_replay(
+        graph: &Graph,
+        output: crate::NodeId,
+        bindings: BTreeMap<String, TensorData>,
+    ) {
+        let scheduled = crate::schedule(graph, output).unwrap();
+        let capture = CapturedSchedule::capture(graph, &scheduled, &[output]).unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let capture = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(capture.to_bytes().unwrap(), bytes);
+        let oracle = CpuBackend
+            .execute(
+                graph,
+                output,
+                &bindings.clone().into_iter().collect::<HashMap<_, _>>(),
+            )
+            .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let interpreted = executor
+            .replay(&capture, &bindings, CapturedReplayOptions::default())
+            .unwrap();
+        let native = executor
+            .replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        let f32_bits = |value: &TensorData| {
+            let Storage::F32(values) = value.storage() else {
+                panic!("computed affine replay fixture must remain F32")
+            };
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        let expected = f32_bits(&oracle);
+        assert_eq!(f32_bits(&interpreted.outputs[0]), expected);
+        assert_eq!(f32_bits(&native.outputs[0]), expected);
+        assert!(
+            native
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
+    }
+
+    #[test]
+    fn captured_computed_affine_reads_match_interpreter_and_native() {
+        let mut broadcast = Graph::new();
+        let input = broadcast.input_dtype("input", [2, 1], DType::F32);
+        let producer = broadcast.square(input).unwrap();
+        let output = broadcast.expand(producer, [2, 3]).unwrap();
+        assert_computed_affine_replay(
+            &broadcast,
+            output,
+            BTreeMap::from([(
+                "input".into(),
+                TensorData::new([2, 1], vec![2.0, -3.0]).unwrap(),
+            )]),
+        );
+
+        let mut reverse = Graph::new();
+        let condition = reverse.input_dtype("condition", [4], DType::Bool);
+        let input = reverse.input_dtype("input", [4], DType::F32);
+        let alternative = reverse.input_dtype("alternative", [4], DType::F32);
+        let producer = reverse.select(condition, input, alternative).unwrap();
+        let output = reverse
+            .stride(
+                producer,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        assert_computed_affine_replay(
+            &reverse,
+            output,
+            BTreeMap::from([
+                (
+                    "condition".into(),
+                    TensorData::from_storage([4], Storage::Bool(vec![true, true, true, true]))
+                        .unwrap(),
+                ),
+                (
+                    "input".into(),
+                    TensorData::from_storage(
+                        [4],
+                        Storage::F32(vec![
+                            f32::from_bits(0x8000_0000),
+                            f32::from_bits(0x7fc0_0001),
+                            f32::from_bits(0x7f80_0000),
+                            f32::from_bits(0x3f80_0000),
+                        ]),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "alternative".into(),
+                    TensorData::from_storage([4], Storage::F32(vec![0.0; 4])).unwrap(),
+                ),
+            ]),
+        );
+
+        let mut diagonal = Graph::new();
+        let input = diagonal.input_dtype("input", [3, 3], DType::F32);
+        let output = diagonal.diagonal_default(input).unwrap();
+        assert_computed_affine_replay(
+            &diagonal,
+            output,
+            BTreeMap::from([(
+                "input".into(),
+                TensorData::new([3, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap(),
+            )]),
+        );
+    }
+
     #[test]
     fn captured_raw_matmul_resolves_a_transposed_consumer_view_once() {
         let mut graph = Graph::new();

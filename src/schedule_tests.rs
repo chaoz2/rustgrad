@@ -1,7 +1,9 @@
 use crate::{
-    BufferDesc, DType, Graph, ScheduleItem, ScheduledOutputs, Shape, TensorData, UOp,
-    plan_temporary_reuse, schedule, schedule_many, schedule_with_external_materializations,
+    Backend, BufferDesc, CpuBackend, DType, Graph, ScheduleItem, ScheduledOutputs, Shape,
+    TensorData, UOp, plan_temporary_reuse, schedule, schedule_many,
+    schedule_with_external_materializations,
 };
+use std::collections::HashMap;
 
 fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
     BufferDesc {
@@ -62,6 +64,165 @@ fn requested_source_values_are_passthroughs_not_schedule_producers() {
             .map(|binding| binding.input_node)
             .collect::<Vec<_>>(),
         vec![input, constant]
+    );
+}
+
+#[test]
+fn computed_affine_read_outputs_share_one_materialized_producer() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 1], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let expanded = graph.expand(producer, [2, 3]).unwrap();
+    let scheduled = schedule_many(&graph, &[producer, expanded]).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    assert_eq!(scheduled.items[0].node, producer);
+    assert_eq!(scheduled.items[1].node, expanded);
+    assert_eq!(scheduled.items[1].dependencies, vec![scheduled.items[0].id]);
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+        scheduled.items[1].kernel.operation()
+    else {
+        panic!("computed view must materialize through one movement plan")
+    };
+    let crate::MovementKernelKind::AffineCopy {
+        input: operand,
+        view,
+    } = &plan.kind
+    else {
+        panic!("computed view must use an affine read copy")
+    };
+    assert_eq!(operand.node, producer);
+    assert_eq!(view.strides, vec![1, 0]);
+    assert_eq!(scheduled.items[1].outputs.primary().view, None);
+}
+
+#[test]
+fn diagonal_schedules_pad_then_affine_read_copy_and_keeps_zero_exact() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [3, 3], DType::F32);
+    let diagonal = graph.diagonal_default(input).unwrap();
+    let scheduled = schedule(&graph, diagonal).unwrap();
+    scheduled.validate().unwrap();
+    let pad = scheduled
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kernel.operation(),
+                crate::Operation::Movement(crate::MovementValue::Plan(plan))
+                    if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
+            )
+        })
+        .unwrap();
+    let copied = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == diagonal)
+        .unwrap();
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = copied.kernel.operation()
+    else {
+        panic!("diagonal output must be an affine copy")
+    };
+    let crate::MovementKernelKind::AffineCopy {
+        input: operand,
+        view,
+    } = &plan.kind
+    else {
+        panic!("diagonal output must be an affine copy")
+    };
+    assert_eq!(operand.node, pad.node);
+    assert_eq!(view.logical_shape, Shape::from([3]));
+    assert_eq!(view.strides, vec![4]);
+    assert!(copied.dependencies.contains(&pad.id));
+
+    let mut zero = Graph::new();
+    let input = zero.input_dtype("input", [0, 3], DType::F32);
+    let diagonal = zero.diagonal_default(input).unwrap();
+    let scheduled = schedule(&zero, diagonal).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(zero.shape(diagonal).unwrap(), &Shape::from([0]));
+    assert!(scheduled.items.iter().all(|item| !matches!(
+        item.kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(
+                &plan.kind,
+                crate::MovementKernelKind::Pad { .. }
+                    | crate::MovementKernelKind::AffineCopy { .. }
+            )
+    )));
+}
+
+#[test]
+fn computed_reverse_view_retains_signed_affine_read_metadata() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [4], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let reversed = graph
+        .stride(
+            producer,
+            [crate::Slice {
+                start: None,
+                stop: None,
+                step: -1,
+            }],
+        )
+        .unwrap();
+    let scheduled = schedule(&graph, reversed).unwrap();
+    scheduled.validate().unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == reversed)
+        .unwrap();
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = item.kernel.operation()
+    else {
+        panic!("computed reverse must be a movement plan")
+    };
+    let crate::MovementKernelKind::AffineCopy { view, .. } = &plan.kind else {
+        panic!("computed reverse must be an affine copy")
+    };
+    assert_eq!(view.offset, 3);
+    assert_eq!(view.strides, vec![-1]);
+    assert_eq!(item.outputs.primary().view, None);
+}
+
+#[test]
+fn computed_affine_materialization_preserves_graph_vjp_routing() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 1], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let expanded = graph.expand(producer, [2, 3]).unwrap();
+    let reversed = graph
+        .stride(
+            expanded,
+            [
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                },
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+            ],
+        )
+        .unwrap();
+    let loss = graph.sum_all(reversed).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::from([2, 1]));
+    schedule(&graph, gradient).unwrap().validate().unwrap();
+    let bindings = HashMap::from([(
+        "input".into(),
+        TensorData::new([2, 1], vec![2.0, -3.0]).unwrap(),
+    )]);
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![12.0, -18.0]
     );
 }
 
