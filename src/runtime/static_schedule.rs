@@ -33,9 +33,9 @@ pub(crate) enum StaticBufferRole {
 }
 
 /// Authenticated logical storage and physical launch domains for one item.
-/// Most kernels launch one work item per output element; serial PrefixScan
-/// and coupled Sort launch one work item per `(row, inner)` lane while
-/// retaining the full logical output descriptors.
+/// Most kernels launch one work item per output element; PrefixScan and
+/// coupled Sort launch one item per `(row, inner)` lane, while materializing
+/// Bitcast launches one item per raw byte. Logical descriptors remain exact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StaticLaunchDomain {
     logical_elements: usize,
@@ -59,6 +59,16 @@ impl StaticLaunchDomain {
                     return Err("sort logical output extent mismatch");
                 }
                 plan.launch_extent()
+            }
+            Operation::Movement(crate::MovementValue::Plan(plan))
+                if matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. }) =>
+            {
+                let portable = crate::movement_plan::PortableBitcast::new(plan)
+                    .map_err(|_| "portable bitcast launch geometry is invalid")?;
+                if portable.output_elements() != logical_elements {
+                    return Err("bitcast logical output extent mismatch");
+                }
+                portable.bytes()
             }
             _ => logical_elements,
         };
@@ -1686,6 +1696,42 @@ mod tests {
                 calls.read
             ),
             (0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn bitcast_launch_domain_uses_bytes_while_storage_descriptors_stay_logical() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("bytes", [2, 4], DType::U8);
+        let output = graph.bitcast(input, DType::U32).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let plan = StaticSchedulePlan::build(
+            &FakeAdapter(calls.clone()),
+            &schedule.items,
+            Some(&[output.index() as u64]),
+        )
+        .unwrap();
+        let item = plan.items().next().unwrap();
+        assert_eq!(item.extent(), 8);
+        assert_eq!(plan.buffers[&(input.index() as u64)].elements, 8);
+        assert_eq!(plan.buffers[&(output.index() as u64)].elements, 2);
+
+        let prepared = PreparedStaticSchedule::prepare_for_outputs(
+            FakeAdapter(calls.clone()),
+            &schedule.items,
+            &[output.index() as u64],
+        )
+        .unwrap();
+        let mut values = BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage([2, 4], Storage::U8(vec![1, 2, 3, 4, 0, 0x80, 0xff, 1]))
+                .unwrap(),
+        )]);
+        prepared.execute(&mut values).unwrap();
+        assert_eq!(
+            values[&(output.index() as u64)].storage(),
+            &Storage::U32(vec![0x0403_0201, 0x01ff_8000])
         );
     }
 

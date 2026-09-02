@@ -1,9 +1,157 @@
 use super::renderer::{
-    OPENCL_ABI_VERSION, OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
-    OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION, OPENCL_PORTABLE_SORT_RENDERER_VERSION,
-    OPENCL_PORTABLE_THREEFRY_RENDERER_VERSION, OPENCL_RAW_COPY_RENDERER_VERSION,
-    OPENCL_RENDERER_VERSION, OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
+    OPENCL_ABI_VERSION, OPENCL_PORTABLE_BITCAST_RENDERER_VERSION,
+    OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION, OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
+    OPENCL_PORTABLE_SORT_RENDERER_VERSION, OPENCL_PORTABLE_THREEFRY_RENDERER_VERSION,
+    OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
+    OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
 };
+
+#[test]
+fn portable_bitcast_opencl_preserves_raw_bytes_and_bool_normalization() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("bytes", [2, 4], DType::U8);
+    let output = graph.bitcast(input, DType::U32).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let valid_item = item.clone();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.extent, 8);
+    assert_eq!(rendered.buffers[0].elements, 8);
+    assert_eq!(rendered.buffers[1].elements, 2);
+    assert!(
+        rendered
+            .source
+            .contains(OPENCL_PORTABLE_BITCAST_RENDERER_VERSION)
+    );
+    let raw_cache_key = rendered.cache_key.clone();
+    let value =
+        TensorData::from_storage([2, 4], Storage::U8(vec![1, 2, 3, 4, 0, 0x80, 0xff, 1])).unwrap();
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(input.index() as u64, value)]),
+    );
+    assert_eq!(actual, [1, 2, 3, 4, 0, 0x80, 0xff, 1]);
+
+    let bool_output = graph.bitcast(input, DType::Bool).unwrap();
+    let item = schedule(&graph, bool_output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert!(rendered.source.contains("b0[gid] != (uchar)0"));
+    assert_ne!(rendered.cache_key, raw_cache_key);
+
+    let float8_output = graph.bitcast(input, DType::F8E4M3).unwrap();
+    let item = schedule(&graph, float8_output)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage(
+                [2, 4],
+                Storage::U8(vec![0x80, 0x7f, 0x01, 0xff, 0, 2, 3, 4]),
+            )
+            .unwrap(),
+        )]),
+    );
+    assert_eq!(actual, [0x80, 0x7f, 0x01, 0xff, 0, 2, 3, 4]);
+
+    let empty = graph.input_dtype("empty", [0, 4], DType::U8);
+    let empty_output = graph.bitcast(empty, DType::U32).unwrap();
+    let items = schedule(&graph, empty_output).unwrap().items;
+    assert_eq!(renderer.render(&items[0].kernel).unwrap().extent, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let before = mock.calls();
+    let prefix = PreparedOpenClPrefix::prepare(context, &items, renderer).unwrap();
+    let mut values = BTreeMap::from([(
+        empty.index() as u64,
+        TensorData::from_storage([0, 4], Storage::U8(Vec::new())).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    assert!(values[&(empty_output.index() as u64)].is_empty());
+    assert!(!mock.calls()[before.len()..].iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("queue_create:")
+            || call.starts_with("launch:")
+    }));
+
+    let mut malformed = valid_item;
+    malformed.input_bindings[0].desc.bytes -= 1;
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let owner = context.owner_id();
+    let before = mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(context, &[malformed], renderer),
+        Err(OpenClError::InvalidBinding(_))
+    ));
+    let calls = mock.calls();
+    assert_eq!(
+        &calls[before.len()..],
+        &[format!("context_release:{owner}")]
+    );
+}
+
+#[test]
+fn portable_bitcast_opencl_capture_keeps_computed_prefix_device_resident() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let bits = graph.bitcast(producer, DType::U32).unwrap();
+    let one =
+        graph.constant(TensorData::from_storage(Shape::new([]), Storage::U32(vec![1])).unwrap());
+    let output = graph.add(bits, one).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 3);
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let plan = OpenClPrefixPlan::plan_for_outputs(
+        context.clone(),
+        &decoded.items,
+        &[output.index() as u64],
+        renderer,
+    )
+    .unwrap();
+    let prefix = PreparedOpenClPrefix::from_plan(context, plan).unwrap();
+    let before = mock.calls();
+    let mut values = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([2], Storage::F32(vec![1.0, -2.0])).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    let calls = &mock.calls()[before.len()..];
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("launch:"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1
+    );
+    assert!(!values.contains_key(&(producer.index() as u64)));
+    assert!(!values.contains_key(&(bits.index() as u64)));
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::U32(vec![1.0f32.to_bits() + 1, 4.0f32.to_bits() + 1])
+    );
+}
 
 #[test]
 fn portable_threefry_opencl_renders_broadcast_alias_and_executes_exact_bits() {
