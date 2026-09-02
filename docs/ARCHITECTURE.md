@@ -1571,6 +1571,21 @@ control flow with target approximate transcendental instructions, so live CUDA
 is a documented tolerance contract while mock execution remains plan-exact.
 State reservation and live accelerator validation remain explicit boundaries.
 
+`ir::training` owns the source-facing ambient training flag as tokenized,
+thread-local `TrainingContext` frames; each non-`Send` guard removes only its
+own frame on ordinary drop or unwinding, so out-of-order drops reveal the
+newest surviving mode. `dropout_tinygrad` and
+`scaled_dot_product_attention_tinygrad` read that context, while the older
+explicit mode/seed APIs remain independent. Evaluation and the `p=0` identity
+do not inspect or reserve the stream, and `p=1` constructs typed zeros without
+a reservation. Active training first rehearses the complete composition on a
+cloned graph, then holds the stream registry lock while a second staged graph
+captures exactly one F32 uniform reservation; only after successful lowering
+are the counter and live graph published. The stored `RandomStream` therefore
+keeps CPU and captured-interpreter replay independent of later ambient mode or
+registry state. This is graph-construction context, not mutable tensor/module
+training state, and it adds no fused or live-device attention contract.
+
 The public live `Graph::threefry(counter, key)` route is deliberately a
 different operation from that zero-input random source. One typed
 `ThreefryValue` retains both packed-U64 dependency identities, their exact

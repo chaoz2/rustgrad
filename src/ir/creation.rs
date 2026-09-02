@@ -3396,6 +3396,79 @@ fn reserve_implicit_stream(device: u32, words: u64) -> RandomStream {
     }
 }
 
+impl Graph {
+    /// Rehearses a complete composition around one implicit uniform stream,
+    /// then publishes both the graph and reservation as one transaction.
+    pub(crate) fn with_implicit_uniform_stream(
+        &mut self,
+        shape: Shape,
+        dtype: DType,
+        device: u32,
+        build: impl Fn(&mut Graph, RandomStream) -> Result<NodeId>,
+    ) -> Result<NodeId> {
+        if !dtype.is_float() {
+            return Err(Error::InvalidRandom {
+                reason: "implicit uniform requires a floating point dtype",
+            });
+        }
+        let words = stream_words(&shape, dtype, 1)?;
+        let placeholder = RandomStream {
+            device,
+            key: [device_key(device), 0],
+            counter: [0, 0],
+        };
+        let original_nodes = self.node_count();
+        let validate_reservation = |graph: &Graph, stream: RandomStream| -> Result<()> {
+            let matching = graph.nodes[original_nodes..]
+                .iter()
+                .filter(|node| {
+                    node.shape == shape
+                        && node.dtype == dtype
+                        && matches!(
+                            &node.op,
+                            Op::Random {
+                                kind: RandomKind::Uniform {
+                                    low: 0.0,
+                                    high: 1.0
+                                },
+                                stream: candidate
+                            } if *candidate == stream
+                        )
+                })
+                .count();
+            if matching != 1 {
+                return Err(Error::InvalidRandom {
+                    reason: "implicit uniform transaction must consume its stream exactly once",
+                });
+            }
+            Ok(())
+        };
+        let mut rehearsal = self.clone();
+        build(&mut rehearsal, placeholder)?;
+        validate_reservation(&rehearsal, placeholder)?;
+
+        let mut registry = stream_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seed = registry.seed as u32;
+        let counter = *registry.counters.get(&device).unwrap_or(&[0, 0]);
+        checked_counter_end(counter, words)?;
+        let stream = RandomStream {
+            device,
+            key: [device_key(device), seed],
+            counter,
+        };
+        let mut staged = self.clone();
+        let output = build(&mut staged, stream)?;
+        validate_reservation(&staged, stream)?;
+        let current = registry.counters.entry(device).or_insert([0, 0]);
+        debug_assert_eq!(*current, counter);
+        reserve(current, words);
+        *self = staged;
+        Ok(output)
+    }
+}
+
 fn device_key(device: u32) -> u32 {
     if device == 0 {
         0x14B8_1119
