@@ -6,7 +6,7 @@ use super::{
     norm::{BatchNorm, PendingBatchNormStats},
     restore_parameters,
 };
-use crate::{DType, Error, Graph, NodeId, Result, TensorData, load_safetensors};
+use crate::{DType, Error, Graph, NodeId, Result, TensorData, TrainingContext, load_safetensors};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -42,15 +42,19 @@ impl Default for StrictStateLoadLimits {
     }
 }
 
-/// Explicit execution mode. It is passed to stateful normalization forwards;
-/// RustGrad deliberately has no process-global training flag.
+/// Explicit execution mode for stateful module forwards.
+///
+/// [`ModeModuleForward::forward_mode`] remains the authoritative explicit
+/// route. [`ModeModuleForward::forward_ambient`] derives this value from the
+/// scoped, thread-local [`TrainingContext`] without introducing process-global
+/// mutable module state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     Training,
     Eval,
 }
 
-/// Output from an explicit mode-aware module forward.
+/// Output from a mode-aware module forward.
 ///
 /// The caller realizes `output` first.  In training mode it then realizes the
 /// stat nodes exposed by `pending` and commits them explicitly.  Evaluation is
@@ -64,12 +68,35 @@ pub struct ModeForwardOutput<'a> {
 /// visible to its caller.  This deliberately does not extend [`ModuleForward`]
 /// because that trait promises a state-free one-input/one-output composition.
 pub trait ModeModuleForward: Module {
+    /// Composes this module under an explicit caller-selected mode.
     fn forward_mode<'a>(
         &'a self,
         graph: &mut Graph,
         input: NodeId,
         mode: Mode,
     ) -> Result<ModeForwardOutput<'a>>;
+
+    /// Composes this module under the current scoped [`TrainingContext`].
+    ///
+    /// The complete graph change is staged on a clone before publication.
+    /// Stateful work remains visible in [`ModeForwardOutput::pending`] and is
+    /// never committed implicitly. Explicit [`Self::forward_mode`] behavior is
+    /// unchanged.
+    fn forward_ambient<'a>(
+        &'a self,
+        graph: &mut Graph,
+        input: NodeId,
+    ) -> Result<ModeForwardOutput<'a>> {
+        let mode = if TrainingContext::is_training() {
+            Mode::Training
+        } else {
+            Mode::Eval
+        };
+        let mut candidate = graph.clone();
+        let output = self.forward_mode(&mut candidate, input, mode)?;
+        *graph = candidate;
+        Ok(output)
+    }
 }
 
 /// State-free modules participate in an explicit mode path without gaining an

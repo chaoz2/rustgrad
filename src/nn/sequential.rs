@@ -106,7 +106,36 @@ impl Module for ModeSequential {
 mod tests {
     use super::*;
     use crate::nn::{BatchNorm, Linear, ReLU};
-    use crate::{Backend, CpuBackend, DType, Graph, TensorData};
+    use crate::{Backend, CpuBackend, DType, Error, Graph, TensorData, TrainingContext};
+
+    fn ambient_batchnorm_sequence() -> ModeSequential {
+        let mut init = Graph::new();
+        let mut modules = ModeSequential::default();
+        modules.push(BatchNorm::new(&mut init, 2, 1e-5, false, true, 0.1).unwrap());
+        modules
+    }
+
+    fn ambient_pending_count(modules: &ModeSequential) -> usize {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 2], DType::F32);
+        modules
+            .forward_ambient(&mut graph, input)
+            .unwrap()
+            .pending
+            .batchnorm_stat_nodes()
+            .len()
+    }
+
+    fn explicit_pending_count(modules: &ModeSequential, mode: Mode) -> usize {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 2], DType::F32);
+        modules
+            .forward_mode(&mut graph, input, mode)
+            .unwrap()
+            .pending
+            .batchnorm_stat_nodes()
+            .len()
+    }
 
     #[test]
     fn mode_sequential_mixes_stateless_modules_and_aggregates_batchnorm_effects() {
@@ -158,5 +187,72 @@ mod tests {
             .forward_mode(&mut eval_graph, eval_input, Mode::Eval)
             .unwrap();
         assert!(eval.pending.is_empty());
+    }
+
+    #[test]
+    fn ambient_mode_sequential_tracks_scoped_nested_and_thread_local_mode() {
+        let modules = ambient_batchnorm_sequence();
+        assert_eq!(ambient_pending_count(&modules), 0);
+
+        let training = TrainingContext::training();
+        assert_eq!(ambient_pending_count(&modules), 1);
+        assert_eq!(explicit_pending_count(&modules, Mode::Eval), 0);
+        let evaluation = TrainingContext::evaluation();
+        assert_eq!(ambient_pending_count(&modules), 0);
+        assert_eq!(explicit_pending_count(&modules, Mode::Training), 1);
+
+        drop(training);
+        assert_eq!(ambient_pending_count(&modules), 0);
+        drop(evaluation);
+        assert_eq!(ambient_pending_count(&modules), 0);
+
+        let _training = TrainingContext::training();
+        assert_eq!(ambient_pending_count(&modules), 1);
+        std::thread::spawn(|| {
+            let modules = ambient_batchnorm_sequence();
+            assert_eq!(ambient_pending_count(&modules), 0);
+            let _training = TrainingContext::training();
+            assert_eq!(ambient_pending_count(&modules), 1);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(ambient_pending_count(&modules), 1);
+    }
+
+    #[test]
+    fn ambient_mode_sequential_rehearses_before_graph_publication() {
+        struct LateFailure;
+
+        impl Module for LateFailure {
+            fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+        }
+
+        impl ModeModuleForward for LateFailure {
+            fn forward_mode<'a>(
+                &'a self,
+                graph: &mut Graph,
+                input: NodeId,
+                _: Mode,
+            ) -> Result<ModeForwardOutput<'a>> {
+                let _staged = graph.square(input)?;
+                Err(Error::InvalidRandom {
+                    reason: "injected ambient module failure",
+                })
+            }
+        }
+
+        let mut modules = ambient_batchnorm_sequence();
+        modules.push(LateFailure);
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 2], DType::F32);
+        let before = graph.node_count();
+        let _training = TrainingContext::training();
+        assert!(matches!(
+            modules.forward_ambient(&mut graph, input),
+            Err(Error::InvalidRandom {
+                reason: "injected ambient module failure"
+            })
+        ));
+        assert_eq!(graph.node_count(), before);
     }
 }
