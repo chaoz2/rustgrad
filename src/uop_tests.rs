@@ -363,6 +363,135 @@ fn upat_varargs_and_typed_payload_predicates_drive_rewrites() {
 }
 
 #[test]
+fn upat_early_rejection_is_prepared_direct_source_metadata() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CHILD_VISITS: AtomicUsize = AtomicUsize::new(0);
+    static REWRITE_VISITS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_child(_: &Operation) -> bool {
+        CHILD_VISITS.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+    fn is_const(operation: &Operation) -> bool {
+        matches!(operation, Operation::Const(_))
+    }
+    fn select_right(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
+        REWRITE_VISITS.fetch_add(1, Ordering::Relaxed);
+        captures.get("right").cloned()
+    }
+    fn select_left(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
+        captures.get("left").cloned()
+    }
+
+    let one = UOp::constant(1, i32t());
+    let two = UOp::constant(2, i32t());
+    let three = UOp::constant(3, i32t());
+    let left = UOp::binary(Binary::Mul, one.clone(), two.clone());
+    let right = UOp::binary(Binary::Mul, two.clone(), three);
+    let root = UOp::binary(Binary::Add, left.clone(), right.clone());
+
+    // An exact child operation is a safe inferred direct-source requirement.
+    // Direct pattern matching retains its ordinary declaration-order behavior,
+    // while the rewrite driver rejects the impossible candidate before the
+    // earlier child predicate is visited.
+    let inferred = UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+        UPat::operation_predicate(count_child),
+        UPat::op(Operation::Const(LiteralValue::Int(99))),
+    ]);
+    CHILD_VISITS.store(0, Ordering::Relaxed);
+    assert!(inferred.matches(&root).is_none());
+    assert_eq!(CHILD_VISITS.load(Ordering::Relaxed), 1);
+    CHILD_VISITS.store(0, Ordering::Relaxed);
+    let mut rules = vec![uop::RewriteRule {
+        name: "inferred-direct-source-reject",
+        priority: 0,
+        pattern: inferred,
+        apply: select_right,
+    }];
+    let (unchanged, trace) = uop::rewrite(&root, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(unchanged, root);
+    assert!(trace.rules.is_empty());
+    assert_eq!(CHILD_VISITS.load(Ordering::Relaxed), 0);
+
+    // Mandatory prefix and permuted children infer requirements without
+    // rejecting valid declaration-ordered candidates.
+    let mut prefix_rules = vec![uop::RewriteRule {
+        name: "prefix-inference",
+        priority: 0,
+        pattern: UPat::op(Operation::Binary(Binary::Add))
+            .sources_prefix(vec![UPat::op(Operation::Binary(Binary::Mul)).named("left")]),
+        apply: select_left,
+    }];
+    let (rewritten, trace) = uop::rewrite(&root, &mut prefix_rules, Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, left);
+    assert_eq!(trace.rules, vec!["prefix-inference"]);
+
+    let mut permuted_rules = vec![uop::RewriteRule {
+        name: "permuted-inference",
+        priority: 0,
+        pattern: UPat::op(Operation::Binary(Binary::Add)).sources_permuted(vec![
+            UPat::op(Operation::Binary(Binary::Mul)).named("left"),
+            UPat::op(Operation::Binary(Binary::Mul)).named("right"),
+        ]),
+        apply: select_right,
+    }];
+    let (rewritten, trace) = uop::rewrite(&root, &mut permuted_rules, Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, right);
+    assert_eq!(trace.rules, vec!["permuted-inference"]);
+
+    // A custom predicate covers payload families without introducing a second
+    // operation taxonomy. No direct Const exists at this Add, so the first
+    // rule is skipped and deterministic priority proceeds to the next rule.
+    REWRITE_VISITS.store(0, Ordering::Relaxed);
+    let source_pattern = || {
+        UPat::op(Operation::Binary(Binary::Add))
+            .sources(vec![UPat::any().named("left"), UPat::any().named("right")])
+    };
+    let mut rules = vec![
+        uop::RewriteRule {
+            name: "custom-direct-source-reject",
+            priority: 0,
+            pattern: source_pattern().custom_early_reject([is_const as fn(&Operation) -> bool]),
+            apply: select_right,
+        },
+        uop::RewriteRule {
+            name: "fallback",
+            priority: 1,
+            pattern: source_pattern().custom_early_reject(Vec::<fn(&Operation) -> bool>::new()),
+            apply: select_right,
+        },
+    ];
+    let (rewritten, trace) = uop::rewrite(&root, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, right);
+    assert_eq!(trace.rules, vec!["fallback"]);
+    assert_eq!(REWRITE_VISITS.load(Ordering::Relaxed), 1);
+
+    // Repeated-source varargs still admit an empty list: inferred requirements
+    // are intentionally limited to source constraints with a mandatory child.
+    let source_free = UOp::from_operation(Operation::Special("source-free".into()), None, vec![]);
+    let mut rules = vec![uop::RewriteRule {
+        name: "empty-varargs",
+        priority: 0,
+        pattern: UPat::op(Operation::Special("source-free".into()))
+            .sources_varargs(UPat::op(Operation::Const(LiteralValue::Int(0)))),
+        apply: |_, _| {
+            Some(UOp::from_operation(
+                Operation::Special("rewritten".into()),
+                None,
+                vec![],
+            ))
+        },
+    }];
+    let (rewritten, trace) = uop::rewrite(&source_free, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(
+        rewritten.operation(),
+        &Operation::Special("rewritten".into())
+    );
+    assert_eq!(trace.rules, vec!["empty-varargs"]);
+}
+
+#[test]
 fn upat_alternatives_and_permuted_sources_preserve_candidate_isolation() {
     fn select_named(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
         captures.get("selected").cloned()
@@ -532,6 +661,32 @@ fn upat_alternatives_and_permuted_sources_preserve_candidate_isolation() {
         name: "all-same-permutation",
         priority: 0,
         pattern: all_same,
+        apply: count_and_decline,
+    }];
+    let (unchanged, trace) = uop::rewrite(&vector, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(unchanged, vector);
+    assert!(trace.rules.is_empty());
+    assert_eq!(
+        ALL_SAME_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // Early-reject hints belong to prepared rule dispatch, not observable
+    // child matching. Match-equivalent children with different hints still
+    // collapse to one all-identical permutation candidate.
+    fn any_direct_source(_: &Operation) -> bool {
+        true
+    }
+    ALL_SAME_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let metadata_does_not_split_matches = UPat::op(Operation::Vectorize).sources_permuted(vec![
+        UPat::any().custom_early_reject([any_direct_source as fn(&Operation) -> bool]),
+        UPat::any().custom_early_reject(Vec::<fn(&Operation) -> bool>::new()),
+        UPat::any(),
+    ]);
+    let mut rules = vec![uop::RewriteRule {
+        name: "prepared-metadata-all-same",
+        priority: 0,
+        pattern: metadata_does_not_split_matches,
         apply: count_and_decline,
     }];
     let (unchanged, trace) = uop::rewrite(&vector, &mut rules, Walk::BottomUp).unwrap();

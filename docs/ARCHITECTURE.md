@@ -1511,6 +1511,17 @@ only after its selected branch and source constraints succeed. These matcher-onl
 capabilities do not change UOp nodes, artifact tags, schedule keys, or decoded
 historical DAGs.
 
+The rewrite driver prepares each rule once with direct-source early-rejection
+requirements. Exact, prefix, and permuted source constraints safely infer
+requirements from children with finite `Operation` sets; repeated-source varargs
+infer none because their empty-source match is valid. A pattern may override the
+inference with non-capturing predicates over the same payload-bearing `Operation`
+enum, including an explicitly empty override. Requirements only skip impossible
+rewrite candidates: direct `UPat::matches`, candidate order, and transactional
+capture behavior are unchanged. Built-in constant identities use this path to
+avoid entering source matching when no direct constant exists. This is Rust's
+compiled dispatch metadata, not another operation kind or serialized matcher IR.
+
 Validation also binds address semantics to the defining operation:
 `DefineGlobal`, `DefineLocal`, and `DefineRegister` require the matching embedded
 `AddressValue` memory space. `LinearKernel::from_uop` validates the complete
