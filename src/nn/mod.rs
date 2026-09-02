@@ -8,6 +8,7 @@
 mod activation;
 mod bert;
 mod bert_model;
+mod bert_pretraining;
 mod bert_qa;
 mod conv;
 mod embedding;
@@ -29,6 +30,10 @@ mod transformer;
 pub use activation::{ActivationFn, GELU, GeluApproximation, ReLU, SiLU, Sigmoid, Tanh};
 pub use bert::{BertEncoderLayer, BertEncoderLayerConfig};
 pub use bert_model::{BertEmbeddings, BertEncoder, BertModel, BertModelConfig};
+pub use bert_pretraining::{
+    BertForPretraining, BertLMPredictionHead, BertPooler, BertPreTrainingHeads,
+    BertPredictionHeadTransform, BertPretrainingAccuracy, BertPretrainingOutput,
+};
 pub use bert_qa::BertForQuestionAnswering;
 pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
 pub use embedding::Embedding;

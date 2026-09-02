@@ -12,6 +12,15 @@ use crate::{
 // Checked-in BERT uses the deliberately rounded source literal, not SQRT_2.
 const BERT_GELU_ERF_DIVISOR: f32 = f32::from_bits(0x3fb5_04d5);
 
+pub(crate) fn bert_gelu(graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+    let half = graph.mul_scalar(input, Scalar::F(0.5))?;
+    let scaled = graph.div_scalar(input, Scalar::F(f64::from(BERT_GELU_ERF_DIVISOR)))?;
+    let error = graph.erf(scaled)?;
+    let shifted = graph.add_scalar(error, Scalar::F(1.0))?;
+    let activated = graph.mul(half, shifted)?;
+    graph.contiguous(activated)
+}
+
 /// Static dimensions and dropout controls for one BERT encoder layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BertEncoderLayerConfig {
@@ -373,15 +382,6 @@ impl BertEncoderLayer {
         self.project(graph, &self.attention_dense, attended)
     }
 
-    fn bert_gelu(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
-        let half = graph.mul_scalar(input, Scalar::F(0.5))?;
-        let scaled = graph.div_scalar(input, Scalar::F(f64::from(BERT_GELU_ERF_DIVISOR)))?;
-        let error = graph.erf(scaled)?;
-        let shifted = graph.add_scalar(error, Scalar::F(1.0))?;
-        let activated = graph.mul(half, shifted)?;
-        graph.contiguous(activated)
-    }
-
     fn lower(
         &self,
         graph: &mut Graph,
@@ -396,7 +396,7 @@ impl BertEncoderLayer {
         let attention_output = self.attention_norm.forward(graph, attention_residual)?;
 
         let intermediate = self.project(graph, &self.intermediate_dense, attention_output)?;
-        let intermediate = self.bert_gelu(graph, intermediate)?;
+        let intermediate = bert_gelu(graph, intermediate)?;
         let output = self.project(graph, &self.output_dense, intermediate)?;
         let output = self.apply_hidden_dropout(graph, output, 2, dropout)?;
         let output = graph.add(output, attention_output)?;

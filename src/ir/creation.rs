@@ -3418,12 +3418,12 @@ impl Graph {
     /// It is intentionally crate-private: public random helpers retain their
     /// one-request APIs, while higher-level compositions can prevent a later
     /// validation failure from consuming an earlier ambient draw.
-    pub(crate) fn with_implicit_uniform_streams(
+    pub(crate) fn with_implicit_uniform_streams<T>(
         &mut self,
         requests: Vec<(Shape, DType)>,
         device: u32,
-        build: impl Fn(&mut Graph, &[RandomStream]) -> Result<NodeId>,
-    ) -> Result<NodeId> {
+        build: impl Fn(&mut Graph, &[RandomStream]) -> Result<T>,
+    ) -> Result<T> {
         if requests.is_empty() {
             return Err(Error::InvalidRandom {
                 reason: "implicit uniform transaction requires a stream",
