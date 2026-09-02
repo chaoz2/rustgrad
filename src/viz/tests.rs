@@ -935,6 +935,24 @@ fn schedule_and_capture_show_dependencies_materializations_and_identity() {
 }
 
 #[test]
+fn requested_affine_passthrough_visualizes_immutable_source_ownership() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F32);
+    let output = graph.permute(input, [1, 0]).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let schedule_dot = schedule_viz(&scheduled).unwrap().to_dot();
+    assert!(schedule_dot.contains("requested_passthrough"));
+    assert!(schedule_dot.contains("zero_kernel"));
+    assert!(schedule_dot.contains(&format!("requested={}", output.index())));
+    assert!(!schedule_dot.contains("materializes"));
+
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let capture_dot = captured_schedule_viz(&capture).unwrap().to_dot();
+    assert!(capture_dot.contains("immutable_view"));
+    assert!(capture_dot.contains(&format!("\"p{}\" -> \"capture\"", output.index())));
+}
+
+#[test]
 fn reduction_movement_and_late_kernel_plans_are_inspectable() {
     let mut graph = Graph::new();
     let left = graph.input("left", [2, 3]);

@@ -102,6 +102,7 @@ pub fn combine(
         || effects.items.iter().any(|item| !item.is_effect())
         || !pure.value_bindings.is_empty()
         || !effects.value_bindings.is_empty()
+        || !effects.requested_passthroughs.is_empty()
     {
         return Err(ScheduleError::Binding(
             "mixed construction requires disjoint canonical schedules".into(),
@@ -167,6 +168,7 @@ pub fn combine(
             effect.dependencies.push(binding.producer_item);
         }
     }
+    let requested_passthroughs = pure.requested_passthroughs;
     let state_bindings = pure.state_bindings;
     let mut items = pure.items;
     items.extend(effects.items);
@@ -190,6 +192,7 @@ pub fn combine(
     super::rekey_schedule_items(&mut items, &state_bindings, None)?;
     let schedule = Schedule {
         items,
+        requested_passthroughs,
         value_bindings: bindings,
         state_bindings,
     };

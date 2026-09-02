@@ -30,6 +30,68 @@ pub struct BufferDesc {
     pub view: Option<crate::AffineView>,
 }
 
+/// One requested logical value that is an immutable affine read of an
+/// existing graph-owned input or constant. It deliberately is not a schedule
+/// item: `source` remains the sole physical owner and `requested` names only
+/// the ordered logical result projected through `desc.view`.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RequestedPassthrough {
+    pub requested: NodeId,
+    pub source: NodeId,
+    pub desc: BufferDesc,
+}
+
+impl RequestedPassthrough {
+    pub(crate) fn validate(&self) -> Result<(), ScheduleError> {
+        if self.requested == self.source
+            || self.desc.id != self.source.index() as u64
+            || !self.desc.read_only
+        {
+            return Err(ScheduleError::Binding(
+                "requested passthrough ownership is invalid".into(),
+            ));
+        }
+        validate_buffer_desc(&self.desc)?;
+        let Some(view) = &self.desc.view else {
+            return Err(ScheduleError::Binding(
+                "requested passthrough affine view is absent".into(),
+            ));
+        };
+        if view.source_shape != self.desc.shape {
+            return Err(ScheduleError::Binding(
+                "requested passthrough source shape is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_against_graph(&self, graph: &Graph) -> Result<(), ScheduleError> {
+        self.validate()?;
+        let rangeified = crate::rangeify::static_view(graph, self.requested)
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        if rangeified.source != self.source
+            || self.desc.view.as_ref() != Some(&rangeified.view)
+            || !matches!(
+                graph.op(self.source).map_err(ScheduleError::Graph)?,
+                Op::Input { .. } | Op::Constant(_)
+            )
+        {
+            return Err(ScheduleError::Binding(
+                "requested passthrough diverges from its graph view".into(),
+            ));
+        }
+        let expected = buffer(graph, self.source, true)?;
+        let mut physical = self.desc.clone();
+        physical.view = None;
+        if physical != expected {
+            return Err(ScheduleError::Binding(
+                "requested passthrough source descriptor is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Validates the physical descriptor shared by ordinary schedules, memory
 /// planning, and portable schedule artifacts. A logical view still describes
 /// reads from this base descriptor, so its source shape—not its logical
@@ -151,6 +213,8 @@ pub struct ScheduleItem {
 #[derive(Clone, Debug)]
 pub struct Schedule {
     pub items: Vec<ScheduleItem>,
+    /// Zero-kernel requested aliases of immutable Input/Constant storage.
+    pub requested_passthroughs: Vec<RequestedPassthrough>,
     /// Explicit edges from a materialized pure output to an effect STORE
     /// source. Ordinary pure schedules keep this empty.
     pub value_bindings: Vec<ScheduleValueBinding>,
@@ -278,6 +342,19 @@ impl Schedule {
                         "scheduled output has multiple producers".into(),
                     ));
                 }
+            }
+        }
+        let mut passthrough_ids = BTreeSet::new();
+        for passthrough in &self.requested_passthroughs {
+            passthrough.validate()?;
+            let requested = passthrough.requested.index() as u64;
+            if !passthrough_ids.insert(requested)
+                || output_producers.contains_key(&requested)
+                || output_producers.contains_key(&passthrough.desc.id)
+            {
+                return Err(ScheduleError::Binding(
+                    "requested passthrough has conflicting ownership".into(),
+                ));
             }
         }
         self.validate_dag_edges(&ids)?;
@@ -695,6 +772,7 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
     }
     let schedule = Schedule {
         items,
+        requested_passthroughs: vec![],
         value_bindings: vec![],
         state_bindings: vec![],
     };
@@ -2080,6 +2158,7 @@ fn schedule_many_with_external(
     if outputs.is_empty() {
         return Ok(Schedule {
             items: vec![],
+            requested_passthroughs: vec![],
             value_bindings: vec![],
             state_bindings: vec![],
         });
@@ -2216,6 +2295,49 @@ fn schedule_many_with_external(
         }
     }
     let requested: BTreeSet<usize> = outputs.iter().map(|id| id.index()).collect();
+    let mut requested_passthroughs = Vec::new();
+    let mut requested_passthrough_ids = BTreeSet::new();
+    for &requested_node in outputs {
+        if requested_passthrough_ids.contains(&requested_node.index())
+            || matches!(
+                graph.op(requested_node).map_err(ScheduleError::Graph)?,
+                Op::Input { .. } | Op::Constant(_)
+            )
+        {
+            continue;
+        }
+        let Ok(rangeified) = crate::rangeify::static_view(graph, requested_node) else {
+            continue;
+        };
+        if rangeified.source == requested_node
+            || !matches!(
+                graph.op(rangeified.source).map_err(ScheduleError::Graph)?,
+                Op::Input { .. } | Op::Constant(_)
+            )
+        {
+            continue;
+        }
+        let requested_shape = graph.shape(requested_node).map_err(ScheduleError::Graph)?;
+        let requested_dtype = graph.dtype(requested_node).map_err(ScheduleError::Graph)?;
+        let source_dtype = graph
+            .dtype(rangeified.source)
+            .map_err(ScheduleError::Graph)?;
+        if rangeified.view.logical_shape != *requested_shape || requested_dtype != source_dtype {
+            return Err(ScheduleError::Binding(
+                "requested passthrough graph descriptor is invalid".into(),
+            ));
+        }
+        let mut desc = buffer(graph, rangeified.source, true)?;
+        desc.view = Some(rangeified.view);
+        let passthrough = RequestedPassthrough {
+            requested: requested_node,
+            source: rangeified.source,
+            desc,
+        };
+        passthrough.validate_against_graph(graph)?;
+        requested_passthrough_ids.insert(requested_node.index());
+        requested_passthroughs.push(passthrough);
+    }
     // A matmul payload consumes materialized dense operands; computed operands
     // therefore become roots even when they have only this one consumer.
     let matmul_operands = needed
@@ -2351,6 +2473,22 @@ fn schedule_many_with_external(
                 .map(|_| *index)
         })
         .collect::<BTreeSet<_>>();
+    // Direct-payload kernels own dense operand IDs and cannot consume a
+    // source-backed affine alias through the scalar IndexView path. If the
+    // same alias is requested, retain its existing materialization root
+    // rather than publishing conflicting passthrough/output ownership.
+    requested_passthroughs.retain(|passthrough| {
+        let id = passthrough.requested.index();
+        !matmul_operands.contains(&id)
+            && !prefix_scan_operands.contains(&id)
+            && !sort_operands.contains(&id)
+            && !threefry_operands.contains(&id)
+            && !movement_operands.contains(&id)
+    });
+    requested_passthrough_ids = requested_passthroughs
+        .iter()
+        .map(|passthrough| passthrough.requested.index())
+        .collect();
     let mut roots: BTreeSet<usize> = needed
         .iter()
         .copied()
@@ -2358,6 +2496,7 @@ fn schedule_many_with_external(
             let id = NodeId::from_index(*index);
             !external.contains(index)
                 && !external_view_aliases.contains(index)
+                && !requested_passthrough_ids.contains(index)
                 // Inputs and constants are caller/graph-owned values, not
                 // scheduled producers. A requested source value is retained
                 // by capture as an explicit passthrough instead of becoming
@@ -3023,6 +3162,7 @@ fn schedule_many_with_external(
     }
     let schedule = Schedule {
         items,
+        requested_passthroughs,
         value_bindings: vec![],
         state_bindings: vec![],
     };
@@ -3164,6 +3304,7 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
     item.cache_key = item_cache_key(&item)?;
     Ok(Schedule {
         items: vec![item],
+        requested_passthroughs: vec![],
         value_bindings: vec![],
         state_bindings: vec![],
     })

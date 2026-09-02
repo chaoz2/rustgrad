@@ -248,10 +248,55 @@ fn base_model(items: &[ScheduleItem]) -> Result<(Vec<VizNode>, Vec<VizEdge>), Vi
     Ok((nodes, edges))
 }
 
+fn add_requested_passthroughs(
+    nodes: &mut Vec<VizNode>,
+    edges: &mut Vec<VizEdge>,
+    passthroughs: &[crate::RequestedPassthrough],
+) {
+    for passthrough in passthroughs {
+        let source_id = format!("b{}", passthrough.desc.id);
+        if !nodes.iter().any(|node| node.id == source_id) {
+            let mut physical = passthrough.desc.clone();
+            physical.view = None;
+            nodes.push(buffer_node(&physical));
+        }
+        let view = passthrough
+            .desc
+            .view
+            .as_ref()
+            .expect("validated requested passthrough view");
+        let alias_id = format!("p{}", passthrough.requested.index());
+        nodes.push(
+            VizNode::new(
+                alias_id.clone(),
+                "requested_passthrough",
+                "affine passthrough",
+            )
+            .field("requested", passthrough.requested.index().to_string())
+            .field("source", passthrough.source.index().to_string())
+            .field("dtype", dtype_name(passthrough.desc.dtype))
+            .field("source_shape", shape_name(&view.source_shape))
+            .field("logical_shape", shape_name(&view.logical_shape))
+            .field("strides", i64_list(&view.strides))
+            .field("offset", view.offset.to_string()),
+        );
+        edges.push(VizEdge::new(
+            source_id,
+            alias_id,
+            "immutable_view",
+            "zero_kernel",
+        ));
+    }
+}
+
 /// Builds a deterministic schedule DAG with explicit buffers, bindings,
 /// dependencies, output materializations, boundaries, and kernel/cache IDs.
 pub fn schedule_viz(schedule: &Schedule) -> Result<VizGraph, VizError> {
-    let (nodes, edges) = base_model(&schedule.items)?;
+    schedule
+        .validate()
+        .map_err(|error| VizError::InvalidSchedule(error.to_string()))?;
+    let (mut nodes, mut edges) = base_model(&schedule.items)?;
+    add_requested_passthroughs(&mut nodes, &mut edges, &schedule.requested_passthroughs);
     VizGraph::try_new("rustgrad_schedule", nodes, edges)
 }
 
@@ -262,6 +307,7 @@ pub fn captured_schedule_viz(capture: &CapturedSchedule) -> Result<VizGraph, Viz
     crate::schedule::artifact::validate_capture(capture)
         .map_err(|error| VizError::InvalidSchedule(error.to_string()))?;
     let (mut nodes, mut edges) = base_model(&capture.items)?;
+    add_requested_passthroughs(&mut nodes, &mut edges, &capture.requested_passthroughs);
     nodes.push(
         VizNode::new("capture", "capture", "captured schedule")
             .field("identity", capture.identity.to_string())
@@ -285,8 +331,17 @@ pub fn captured_schedule_viz(capture: &CapturedSchedule) -> Result<VizGraph, Viz
             ),
     );
     for requested in &capture.requested {
+        let source = if capture
+            .requested_passthroughs
+            .iter()
+            .any(|passthrough| passthrough.requested.index() as u64 == *requested)
+        {
+            format!("p{requested}")
+        } else {
+            format!("b{requested}")
+        };
         edges.push(VizEdge::new(
-            format!("b{requested}"),
+            source,
             "capture",
             "requested",
             requested.to_string(),

@@ -438,6 +438,7 @@ mod tests {
             assert!(
                 crate::Schedule {
                     items: decoded.items.clone(),
+                    requested_passthroughs: decoded.requested_passthroughs.clone(),
                     value_bindings: vec![],
                     state_bindings: vec![],
                 }

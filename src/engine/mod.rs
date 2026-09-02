@@ -93,8 +93,10 @@ pub struct Realized {
 ///
 /// Scheduled values retain their producer-owned buffers. Requested graph
 /// inputs and constants have no producer item, so the transaction retains
-/// their exact owned storage here. The ordered IDs deliberately preserve
-/// duplicate requests without scheduling or materializing the value twice.
+/// their exact owned storage here. Requested static affine aliases project
+/// those same immutable sources without fabricating output ownership. The
+/// ordered IDs deliberately preserve duplicate requests without scheduling or
+/// materializing the value twice.
 struct RequestedOutputPlan {
     ordered: Vec<u64>,
     retained_sources: HashMap<u64, TensorData>,
@@ -115,6 +117,11 @@ impl RequestedOutputPlan {
                     .iter()
                     .map(move |output| (output.id, (item, output)))
             })
+            .collect::<BTreeMap<_, _>>();
+        let passthroughs = schedule
+            .requested_passthroughs
+            .iter()
+            .map(|passthrough| (passthrough.requested.index() as u64, passthrough))
             .collect::<BTreeMap<_, _>>();
         let mut ordered = Vec::with_capacity(requested.len());
         let mut retained_sources = HashMap::new();
@@ -137,6 +144,41 @@ impl RequestedOutputPlan {
             let op = graph
                 .op(node)
                 .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+            if let Some(passthrough) = passthroughs.get(&id) {
+                if produced.contains_key(&id) {
+                    return Err(RealizationError::Schedule(format!(
+                        "requested passthrough {id} is shadowed by a scheduled producer"
+                    )));
+                }
+                passthrough
+                    .validate_against_graph(graph)
+                    .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+                let source = match graph
+                    .op(passthrough.source)
+                    .map_err(|error| RealizationError::Schedule(error.to_string()))?
+                {
+                    Op::Input { name } => inputs.get(name).ok_or_else(|| {
+                        RealizationError::Execution(format!("missing input {name}"))
+                    })?,
+                    Op::Constant(value) => value,
+                    _ => {
+                        return Err(RealizationError::Schedule(format!(
+                            "requested passthrough {id} has no immutable source"
+                        )));
+                    }
+                };
+                let view = passthrough.desc.view.as_ref().expect("validated view");
+                let value = source
+                    .affine_read(view)
+                    .map_err(|error| RealizationError::Execution(error.to_string()))?;
+                if value.shape() != &shape || value.dtype() != dtype {
+                    return Err(RealizationError::Execution(format!(
+                        "requested passthrough {id} descriptor mismatch"
+                    )));
+                }
+                retained_sources.entry(id).or_insert(value);
+                continue;
+            }
             if matches!(op, Op::Input { .. } | Op::Constant(_)) {
                 if produced.contains_key(&id) {
                     return Err(RealizationError::Schedule(format!(
@@ -1313,6 +1355,94 @@ mod tests {
         let decoded = crate::CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
         assert_eq!(decoded.requested, capture.requested);
         assert_eq!(decoded.identity, capture.identity);
+    }
+
+    #[test]
+    fn source_affine_passthrough_realizes_in_order_without_a_fake_producer() {
+        let mut graph = Graph::new();
+        let source = graph.input_dtype("source", Shape::from([2, 3]), DType::F32);
+        let transposed = graph.permute(source, [1, 0]).unwrap();
+        let computed = graph.neg(transposed).unwrap();
+        let requested = [transposed, computed, transposed];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.requested_passthroughs.len(), 1);
+        assert!(
+            schedule
+                .items
+                .iter()
+                .flat_map(|item| item.outputs.iter())
+                .all(|output| output.id != transposed.index() as u64)
+        );
+        let source_value = TensorData::from_storage(
+            [2, 3],
+            Storage::F32(vec![
+                -0.0,
+                f32::from_bits(0x7fc0_1234),
+                2.0,
+                f32::INFINITY,
+                -3.0,
+                f32::NEG_INFINITY,
+            ]),
+        )
+        .unwrap();
+        let bindings = HashMap::from([("source".into(), source_value)]);
+        let realized = realize(
+            &graph,
+            &schedule,
+            &requested,
+            &bindings,
+            RealizationPolicy::Interpreter,
+        )
+        .unwrap();
+        let lane_bits = |value: &TensorData| {
+            let Storage::F32(lanes) = value.storage() else {
+                panic!("F32 fixture")
+            };
+            lanes.iter().map(|lane| lane.to_bits()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lane_bits(&realized.outputs[0]),
+            vec![
+                (-0.0f32).to_bits(),
+                f32::INFINITY.to_bits(),
+                0x7fc0_1234,
+                (-3.0f32).to_bits(),
+                2.0f32.to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+            ]
+        );
+        assert_eq!(
+            lane_bits(&realized.outputs[0]),
+            lane_bits(&realized.outputs[2])
+        );
+        assert_eq!(realized.trace.items.len(), 1);
+
+        let mut wrong_dtype = schedule.clone();
+        wrong_dtype.requested_passthroughs[0].desc.dtype = DType::I32;
+        assert!(matches!(
+            realize(
+                &graph,
+                &wrong_dtype,
+                &requested,
+                &bindings,
+                RealizationPolicy::Interpreter,
+            ),
+            Err(RealizationError::Schedule(_))
+        ));
+
+        let mut malformed = schedule;
+        malformed.requested_passthroughs[0].source = transposed;
+        assert!(matches!(
+            realize(
+                &graph,
+                &malformed,
+                &requested,
+                &bindings,
+                RealizationPolicy::Interpreter,
+            ),
+            Err(RealizationError::Schedule(_))
+        ));
     }
 
     #[test]

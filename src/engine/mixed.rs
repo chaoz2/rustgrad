@@ -59,6 +59,7 @@ pub fn realize_mixed_effects(
         .collect::<Vec<_>>();
     let pure = Schedule {
         items: pure_items,
+        requested_passthroughs: schedule.requested_passthroughs.clone(),
         value_bindings: vec![],
         state_bindings: vec![],
     };

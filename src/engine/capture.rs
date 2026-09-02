@@ -17,6 +17,7 @@ pub struct CapturedSchedule {
     pub inputs: Vec<ReplayInput>,
     pub constants: BTreeMap<u64, TensorData>,
     pub quantized_constants: BTreeMap<u64, crate::QuantizedTensorData>,
+    pub requested_passthroughs: Vec<crate::RequestedPassthrough>,
     pub requested: Vec<u64>,
     pub identity: u64,
     pub(crate) symbolic: Option<super::symbolic::SymbolicSchema>,
@@ -112,6 +113,43 @@ impl CapturedSchedule {
             }
             produced.extend(item.outputs.iter().map(|output| output.id));
         }
+        let requested_ids = requested
+            .iter()
+            .map(|node| node.index() as u64)
+            .collect::<BTreeSet<_>>();
+        for passthrough in &schedule.requested_passthroughs {
+            passthrough
+                .validate_against_graph(graph)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+            let requested_id = passthrough.requested.index() as u64;
+            if !requested_ids.contains(&requested_id) || produced.contains(&requested_id) {
+                return Err(ReplayError::Corrupt(
+                    "requested passthrough does not belong to this capture".into(),
+                ));
+            }
+            let mut source_desc = passthrough.desc.clone();
+            source_desc.view = None;
+            match graph
+                .op(passthrough.source)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            {
+                Op::Input { name } => {
+                    inputs.entry(name.clone()).or_insert(ReplayInput {
+                        name: name.clone(),
+                        node: passthrough.source,
+                        desc: source_desc,
+                    });
+                }
+                Op::Constant(value) => {
+                    constants.insert(source_desc.id, value.clone());
+                }
+                _ => {
+                    return Err(ReplayError::Corrupt(
+                        "requested passthrough source is not immutable storage".into(),
+                    ));
+                }
+            }
+        }
         // A source-owned requested value has no scheduled producer. Preserve
         // it in the existing replay input/constant ownership tables so replay
         // can return the exact caller value without fabricating an aliasing
@@ -120,6 +158,13 @@ impl CapturedSchedule {
         for node in requested {
             let id = node.index() as u64;
             if produced.contains(&id) {
+                continue;
+            }
+            if schedule
+                .requested_passthroughs
+                .iter()
+                .any(|passthrough| passthrough.requested == *node)
+            {
                 continue;
             }
             let shape = graph
@@ -170,6 +215,7 @@ impl CapturedSchedule {
             inputs,
             constants,
             quantized_constants: BTreeMap::new(),
+            requested_passthroughs: schedule.requested_passthroughs.clone(),
             requested: requested.iter().map(|n| n.index() as u64).collect(),
             identity: 0,
             symbolic: None,
@@ -282,6 +328,7 @@ impl CapturedSchedule {
             }],
             constants: BTreeMap::new(),
             quantized_constants: BTreeMap::from([(weight_node.index() as u64, weight)]),
+            requested_passthroughs: vec![],
             requested: vec![output.index() as u64],
             identity: 0,
             symbolic: None,
@@ -398,6 +445,7 @@ impl CapturedSchedule {
             }],
             constants: BTreeMap::new(),
             quantized_constants: BTreeMap::from([(weight_node.index() as u64, weight)]),
+            requested_passthroughs: vec![],
             requested: vec![output.index() as u64],
             identity: 0,
             symbolic: None,
@@ -434,6 +482,11 @@ impl CapturedSchedule {
         let symbolic_schedule =
             crate::schedule::schedule_many_for_symbolic_capture(graph, requested, &external)
                 .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        if !symbolic_schedule.requested_passthroughs.is_empty() {
+            return Err(ReplayError::Unsupported(
+                "symbolic requested passthroughs require a symbolic view sidecar".into(),
+            ));
+        }
         let mut capture = Self::capture(graph, &symbolic_schedule, requested)?;
         capture.symbolic = Some(super::symbolic::build_schema(
             graph,
@@ -553,7 +606,8 @@ mod tests {
         )
         .unwrap();
 
-        let schedule = crate::schedule_many(&graph, &[input, constant]).unwrap();
+        let requested = [input, constant];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
         assert!(schedule.items.is_empty());
         let capture = CapturedSchedule::capture(&graph, &schedule, &[input, constant]).unwrap();
         assert!(capture.items.is_empty());
@@ -561,6 +615,13 @@ mod tests {
         assert_eq!(capture.constants.len(), 1);
 
         let bytes = capture.to_bytes().unwrap();
+        assert_eq!(
+            CapturedSchedule::capture(&graph, &schedule, &requested)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
         let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.to_bytes().unwrap(), bytes);
         let provided = BTreeMap::from([("input".into(), provided_value.clone())]);
@@ -582,6 +643,99 @@ mod tests {
             }
         };
         assert_eq!(raw_f32(&replay.outputs[1]), raw_f32(&constant_value));
+    }
+
+    #[test]
+    fn affine_source_passthrough_roundtrips_with_mixed_computed_outputs() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([2, 3]), DType::F32);
+        let input_view = graph.permute(input, [1, 0]).unwrap();
+        let constant_value =
+            TensorData::from_storage([2, 2], crate::Storage::U16(vec![0, u16::MAX, 0x8000, 7]))
+                .unwrap();
+        let constant = graph.constant(constant_value.clone());
+        let constant_view = graph.permute(constant, [1, 0]).unwrap();
+        let computed = graph.neg(input_view).unwrap();
+        let alias_schedule = crate::schedule(&graph, input_view).unwrap();
+        assert!(alias_schedule.items.is_empty());
+        let requested = [input_view, constant_view, computed];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.requested_passthroughs.len(), 2);
+        let capture = CapturedSchedule::capture(&graph, &schedule, &requested).unwrap();
+        assert_eq!(capture.requested_passthroughs.len(), 2);
+        assert_eq!(capture.inputs.len(), 1);
+        assert!(capture.constants.contains_key(&(constant.index() as u64)));
+
+        let bytes = capture.to_bytes().unwrap();
+        assert_eq!(
+            CapturedSchedule::capture(&graph, &schedule, &requested)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+        let input_value = TensorData::from_storage(
+            [2, 3],
+            crate::Storage::F32(vec![
+                -0.0,
+                f32::from_bits(0x7fc0_1234),
+                2.0,
+                f32::INFINITY,
+                -3.0,
+                f32::NEG_INFINITY,
+            ]),
+        )
+        .unwrap();
+        let alias_capture =
+            CapturedSchedule::capture(&graph, &alias_schedule, &[input_view]).unwrap();
+        let alias_replay = crate::CapturedReplayExecutor::default()
+            .replay(
+                &alias_capture,
+                &BTreeMap::from([("input".into(), input_value.clone())]),
+                crate::CapturedReplayOptions {
+                    backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert!(alias_replay.trace.items.is_empty());
+        let replay = crate::CapturedReplayExecutor::default()
+            .replay(
+                &decoded,
+                &BTreeMap::from([("input".into(), input_value)]),
+                crate::CapturedReplayOptions {
+                    backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.trace.items.len(), 1);
+        let crate::Storage::F32(input_lanes) = replay.outputs[0].storage() else {
+            panic!("F32 passthrough")
+        };
+        assert_eq!(
+            input_lanes
+                .iter()
+                .map(|lane| lane.to_bits())
+                .collect::<Vec<_>>(),
+            vec![
+                (-0.0f32).to_bits(),
+                f32::INFINITY.to_bits(),
+                0x7fc0_1234,
+                (-3.0f32).to_bits(),
+                2.0f32.to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+            ]
+        );
+        assert_eq!(
+            replay.outputs[1].storage(),
+            &crate::Storage::U16(vec![0, 0x8000, u16::MAX, 7])
+        );
+
+        let mut malformed = decoded;
+        malformed.requested_passthroughs[0].source = input_view;
+        assert!(matches!(malformed.to_bytes(), Err(ReplayError::Corrupt(_))));
     }
 
     #[test]

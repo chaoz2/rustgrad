@@ -1521,13 +1521,24 @@ or participate in CUDA graph capture. `CapturedSchedule::to_bytes` writes a
 versioned, bounded, checksummed artifact containing typed schedule descriptors,
 explicit dependencies and ordered dense/packed bindings, topological UOp node
 tables, exact raw `TensorData` storage, and exact quantized constant bytes.
-RGSA v7 derives durable item, symbolic-specialization, mixed-state-binding, and
+An exact static affine view of graph-owned Input or Constant storage may instead
+be a `RequestedPassthrough`: the source remains the sole immutable physical
+owner, the requested NodeId is only an ordered logical projection, and no fake
+schedule item, Store, device allocation, or cache entry is created. Capture authenticates
+the source descriptor and signed affine map, replay applies the raw-storage view,
+and visualization exposes the zero-kernel ownership edge. Symbolic capture,
+mixed RGSM serialization, and prepared accelerator prefixes remain fail closed
+because their existing schemas do not carry this logical projection.
+RGSA v8 adds this authenticated passthrough sidecar after the v7 payload; v8
+continues to derive durable item, symbolic-specialization, mixed-state-binding, and
 sharded source identities from explicit versioned canonical bytes and stable
 FNV-1a, never Rust's implementation-selected `DefaultHasher`. Legacy v1--v6
 decode first authenticates the historical envelope over its stored opaque
 keys, validates structure and bindings without comparing them to current keys,
-then rekeys in dependency order and performs the complete current validation.
-The related inspection-only RGSO v2 and mixed/effect RGSM v3 envelopes apply
+then rekeys in dependency order and performs the complete current validation;
+v7 authenticates its canonical payload and current keys without rewriting it.
+The related inspection-only RGSO v3 carries the same sidecar while v1--v2
+decode unchanged; mixed/effect RGSM v3 applies
 the same legacy authentication and current-key upgrade rule.
 RGSM deliberately rejects symbolic schemas and specialization provenance until
 its wire format can retain them. Sharded CUDA local stages likewise admit one
