@@ -3,6 +3,44 @@
 use super::{Module, ModuleForward, Parameter, StateKind};
 use crate::{Graph, NodeId, Result};
 
+/// Adapts a stateless graph function or closure to the typed module seam.
+///
+/// This keeps source-style callable activations ergonomic without erasing
+/// stateful activation modules behind a runtime tag. Captured closures are
+/// traversal-free by contract; callers that own parameters should implement
+/// [`Module`] and [`ModuleForward`] directly instead.
+#[derive(Clone, Copy, Debug)]
+pub struct ActivationFn<F> {
+    function: F,
+}
+
+impl<F> ActivationFn<F> {
+    pub const fn new(function: F) -> Self {
+        Self { function }
+    }
+
+    pub const fn function(&self) -> &F {
+        &self.function
+    }
+
+    pub fn into_inner(self) -> F {
+        self.function
+    }
+}
+
+impl<F> Module for ActivationFn<F> {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
+impl<F> ModuleForward for ActivationFn<F>
+where
+    F: Fn(&mut Graph, NodeId) -> Result<NodeId>,
+{
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        (self.function)(graph, input)
+    }
+}
+
 /// A stateless rectified-linear activation for one-input static compositions.
 ///
 /// It owns no parameters, buffers, or execution mode. Its graph semantics are

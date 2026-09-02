@@ -884,6 +884,23 @@ thread-local `TrainingContext`, rehearses the complete module composition on a
 cloned graph, and publishes only a successful candidate. BatchNorm running
 statistics remain explicit `PendingModeEffects`; the adapter neither commits
 state nor makes BatchNorm eligible for ordinary `Sequential`.
+`nn::TransformerBlock<A>` is a reusable static `[batch,time,embedding]`
+mode-aware composition over this same seam. Its private projection helper
+retains the checked source's `[input,output]` weight orientation, zero biases,
+and scaled-uniform initialization; projections and LayerNorm affines retain
+the source tuple paths (`query.0`, `query.1`, `ln1.0`, `ln1.1`, and peers).
+Stateful activation modules retain declared traversal under `act`, while
+`ActivationFn<F>` adapts a stateless Rust closure without a runtime kind tag.
+One lowering owns both pre- and post-normalization order and every projection
+uses the canonical source-linear composition rather than raw Matmul.
+Explicit training uses its two captured seeds, while ambient training with
+`0 < p < 1` rehearses both residual-dropout branches and reserves their
+source-ordered Threefry streams in one registry transaction before graph
+publication. Evaluation and `p = 0` add no random source, `p = 1` produces
+typed zeros without a reservation, and no route produces hidden pending state.
+This adds no operation, artifact, scheduler, or backend ABI; masks, cross-attention, caches,
+GQA, dynamic shapes, fused/device attention, and a whole Transformer remain
+separate compositions.
 `nn::LSTM` is a separate typed stateful composition rather than another
 sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
 `cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus
