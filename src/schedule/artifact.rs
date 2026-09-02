@@ -24,7 +24,9 @@ const MAGIC: &[u8; 4] = b"RGSA";
 /// keys with the canonical versioned schedule-key codec.
 /// v8 adds authenticated zero-kernel requested affine passthroughs while
 /// preserving every v1-v7 decoder and payload.
-const VERSION: u8 = 8;
+/// v9 removes the nonsemantic symbolic Reduction input-buffer word while
+/// retaining authenticated v8 decode and deterministic current re-encoding.
+const VERSION: u8 = 9;
 const LAST_OPAQUE_KEY_VERSION: u8 = 6;
 const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 // The executable envelope supports ordered outputs; the inspection-only
@@ -33,7 +35,7 @@ const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 /// distinct magic and identity domain from the released single-output
 /// executable artifact above.
 const MULTI_MAGIC: &[u8; 4] = b"RGSO";
-const MULTI_VERSION: u8 = 3;
+const MULTI_VERSION: u8 = 4;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -232,7 +234,7 @@ fn write_payload_v5(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     write_base(w, c, true, true, false)?;
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
-        write_symbolic_schema(w, schema)?;
+        write_symbolic_schema_v8(w, schema)?;
     }
     w.bool(c.specialized_from.is_some())?;
     if let Some(provenance) = &c.specialized_from {
@@ -251,7 +253,7 @@ fn write_payload_v7(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     write_base(w, c, true, true, true)?;
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
-        write_symbolic_schema(w, schema)?;
+        write_symbolic_schema_v8(w, schema)?;
     }
     w.bool(c.specialized_from.is_some())?;
     if let Some(provenance) = &c.specialized_from {
@@ -263,6 +265,25 @@ fn write_payload_v7(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
         write_quantized_data(w, value)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn write_payload_v8(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_base(w, c, true, true, true)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema_v8(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    write_requested_passthroughs(w, &c.requested_passthroughs)
 }
 
 fn write_requested_passthroughs(
@@ -396,7 +417,7 @@ fn write_scheduled_outputs_payload_v2(
     write_u64s(w, &c.requested)?;
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
-        write_symbolic_schema(w, schema)?;
+        write_symbolic_schema_v8(w, schema)?;
     }
     w.bool(c.specialized_from.is_some())?;
     if let Some(provenance) = &c.specialized_from {
@@ -408,6 +429,15 @@ fn write_scheduled_outputs_payload_v2(
         write_quantized_data(w, value)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn write_scheduled_outputs_payload_v3(
+    w: &mut Writer,
+    c: &CapturedSchedule,
+) -> Result<(), ArtifactError> {
+    write_scheduled_outputs_payload_v2(w, c)?;
+    write_requested_passthroughs(w, &c.requested_passthroughs)
 }
 
 fn read_payload(
@@ -442,7 +472,7 @@ fn read_payload(
     }
     let requested = read_u64s(r)?;
     let symbolic = if version >= 2 && r.bool()? {
-        Some(read_symbolic_schema(r, version)?)
+        Some(read_symbolic_schema(r, version, version <= 8)?)
     } else {
         None
     };
@@ -514,7 +544,7 @@ fn read_scheduled_outputs_payload(
     }
     let requested = read_u64s(r)?;
     let symbolic = if r.bool()? {
-        Some(read_symbolic_schema(r, 4)?)
+        Some(read_symbolic_schema(r, 4, version <= 3)?)
     } else {
         None
     };
@@ -1498,7 +1528,20 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
 }
 
 fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
-    write_symbolic_schema_v2(w, schema)?;
+    write_symbolic_schema_core(w, schema, None)?;
+    write_symbolic_schema_sidecars(w, schema)
+}
+
+#[cfg(test)]
+fn write_symbolic_schema_v8(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
+    write_symbolic_schema_core(w, schema, Some(0xfeed_face_dead_beef))?;
+    write_symbolic_schema_sidecars(w, schema)
+}
+
+fn write_symbolic_schema_sidecars(
+    w: &mut Writer,
+    schema: &SymbolicSchema,
+) -> Result<(), ArtifactError> {
     write_len(w, schema.views.len(), MAX_BINDINGS)?;
     for ((item, buffer), view) in &schema.views {
         w.u64(*item)?;
@@ -1518,7 +1561,16 @@ fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), 
     Ok(())
 }
 
+#[cfg(test)]
 fn write_symbolic_schema_v2(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
+    write_symbolic_schema_core(w, schema, Some(0xfeed_face_dead_beef))
+}
+
+fn write_symbolic_schema_core(
+    w: &mut Writer,
+    schema: &SymbolicSchema,
+    legacy_reduction_buffer: Option<u64>,
+) -> Result<(), ArtifactError> {
     write_len(w, schema.parameters.len(), MAX_BINDINGS)?;
     for (parameter, template) in schema.parameters.iter().zip(&schema.template_values) {
         let variable = parameter.variable();
@@ -1559,13 +1611,14 @@ fn write_symbolic_schema_v2(w: &mut Writer, schema: &SymbolicSchema) -> Result<(
                 write_symbolic_shape(w, output)?;
             }
             SymbolicItemDomain::Reduction {
-                input_buffer,
                 input,
                 output,
                 reduction,
             } => {
                 w.u8(1)?;
-                w.u64(*input_buffer)?;
+                if let Some(buffer) = legacy_reduction_buffer {
+                    w.u64(buffer)?;
+                }
                 write_symbolic_shape(w, input)?;
                 write_symbolic_shape(w, output)?;
                 write_symbolic_shape(w, reduction)?;
@@ -1593,7 +1646,11 @@ fn write_symbolic_schema_v2(w: &mut Writer, schema: &SymbolicSchema) -> Result<(
     Ok(())
 }
 
-fn read_symbolic_schema(r: &mut Reader<'_>, version: u8) -> Result<SymbolicSchema, ArtifactError> {
+fn read_symbolic_schema(
+    r: &mut Reader<'_>,
+    version: u8,
+    legacy_reduction_buffer: bool,
+) -> Result<SymbolicSchema, ArtifactError> {
     let count = r.count(MAX_BINDINGS)?;
     let mut parameters = Vec::with_capacity(count);
     let mut template_values = Vec::with_capacity(count);
@@ -1637,12 +1694,16 @@ fn read_symbolic_schema(r: &mut Reader<'_>, version: u8) -> Result<SymbolicSchem
             0 => SymbolicItemDomain::Elementwise {
                 output: read_symbolic_shape(r)?,
             },
-            1 => SymbolicItemDomain::Reduction {
-                input_buffer: r.u64()?,
-                input: read_symbolic_shape(r)?,
-                output: read_symbolic_shape(r)?,
-                reduction: read_symbolic_shape(r)?,
-            },
+            1 => {
+                if legacy_reduction_buffer {
+                    let _legacy_input_buffer = r.u64()?;
+                }
+                SymbolicItemDomain::Reduction {
+                    input: read_symbolic_shape(r)?,
+                    output: read_symbolic_shape(r)?,
+                    reduction: read_symbolic_shape(r)?,
+                }
+            }
             2 => SymbolicItemDomain::Matmul {
                 lhs_buffer: r.u64()?,
                 rhs_buffer: r.u64()?,
@@ -1869,6 +1930,20 @@ mod tests {
         writer.out
     }
 
+    fn legacy_scheduled_outputs_v3(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_scheduled_outputs_payload_v3(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MULTI_MAGIC).unwrap();
+        writer.u8(3).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
     fn legacy_v1(capture: &CapturedSchedule) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
@@ -1909,6 +1984,20 @@ mod tests {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
         writer.u8(7).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
+    fn legacy_v8(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_payload_v8(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(8).unwrap();
         writer.u64(identity).unwrap();
         writer.bytes(&payload.out).unwrap();
         let sum = checksum(&writer.out);
@@ -1961,6 +2050,27 @@ mod tests {
                 SymbolicShape::new(vec![extent.into(), 4usize.into()]),
             )])),
             &BTreeMap::from([("extent".into(), 3)]),
+        )
+        .unwrap()
+    }
+
+    fn symbolic_reduction_fixture() -> CapturedSchedule {
+        let rows = crate::SymbolicExpr::variable("rows", 0, 8).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 4], DType::F32);
+        let output = graph
+            .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![rows.into(), 4usize.into()]),
+            )])),
+            &BTreeMap::from([("rows".into(), 2)]),
         )
         .unwrap()
     }
@@ -2095,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_passthrough_ownership_is_authenticated_in_v8() {
+    fn requested_passthrough_ownership_remains_authenticated() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2, 3], DType::I32);
         let alternate = graph.input_dtype("alternate", [2, 3], DType::I32);
@@ -2104,7 +2214,7 @@ mod tests {
         let schedule = crate::schedule_many(&graph, &requested).unwrap();
         let capture = CapturedSchedule::capture(&graph, &schedule, &requested).unwrap();
         let bytes = encode(&capture).unwrap();
-        assert_eq!(bytes[4], 8);
+        assert_eq!(bytes[4], VERSION);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(
             decoded.requested_passthroughs,
@@ -2112,7 +2222,7 @@ mod tests {
         );
         assert_eq!(encode(&decoded).unwrap(), bytes);
         let ordered = encode_scheduled_outputs(&capture).unwrap();
-        assert_eq!(ordered[4], 3);
+        assert_eq!(ordered[4], MULTI_VERSION);
         let ordered = decode_scheduled_outputs(&ordered).unwrap();
         assert_eq!(
             ordered.requested_passthroughs,
@@ -2249,6 +2359,42 @@ mod tests {
         let upgraded = decode(&legacy_v2(&legacy)).unwrap();
         assert!(upgraded.is_symbolic());
         assert_eq!(encode(&upgraded).unwrap()[4], VERSION);
+    }
+
+    #[test]
+    fn historical_v8_symbolic_reduction_discards_buffer_word_and_reencodes_v9() {
+        let capture = symbolic_reduction_fixture();
+        let historical = legacy_v8(&capture);
+        assert_eq!(historical[4], 8);
+        let upgraded = decode(&historical).unwrap();
+        assert_eq!(upgraded.symbolic, capture.symbolic);
+        let current = encode(&upgraded).unwrap();
+        assert_eq!(current[4], VERSION);
+        assert_eq!(encode(&decode(&current).unwrap()).unwrap(), current);
+        assert_ne!(historical, current);
+    }
+
+    #[test]
+    fn historical_rgso_v3_symbolic_reduction_rekeys_and_reencodes_v4() {
+        let capture = symbolic_reduction_fixture();
+        let historical = legacy_scheduled_outputs_v3(&capture);
+        assert_eq!(historical[4], 3);
+        let historical_identity = u64::from_le_bytes(historical[5..13].try_into().unwrap());
+        let upgraded = decode_scheduled_outputs(&historical).unwrap();
+        assert_eq!(upgraded.symbolic, capture.symbolic);
+        assert_eq!(upgraded.items[0].cache_key, capture.items[0].cache_key);
+        assert_ne!(upgraded.identity, historical_identity);
+
+        let current = encode_scheduled_outputs(&upgraded).unwrap();
+        assert_eq!(current[4], MULTI_VERSION);
+        assert_eq!(
+            u64::from_le_bytes(current[5..13].try_into().unwrap()),
+            upgraded.identity
+        );
+        assert_eq!(
+            encode_scheduled_outputs(&decode_scheduled_outputs(&current).unwrap()).unwrap(),
+            current
+        );
     }
 
     #[test]
