@@ -30,6 +30,7 @@ pub const OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
 pub const OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
     "rustgrad-opencl-portable-prefix-scan-v1";
 pub const OPENCL_PORTABLE_SORT_RENDERER_VERSION: &str = "rustgrad-opencl-portable-sort-v1";
+pub const OPENCL_PORTABLE_THREEFRY_RENDERER_VERSION: &str = "rustgrad-opencl-portable-threefry-v1";
 pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -84,6 +85,14 @@ impl RenderedOpenCl {
             && let Operation::Sort(value) = root.operation()
         {
             crate::portable_sort::PortableSortPair::new(value)
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Threefry(value) = root.operation()
+        {
+            crate::portable_threefry::PortableThreefry::new(value)
                 .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
                 .validate_schedule_bindings(bindings)
                 .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
@@ -163,6 +172,9 @@ impl OpenClRenderer {
         if let Operation::Sort(value) = root.operation() {
             return render_portable_sort(self, root, value);
         }
+        if let Operation::Threefry(value) = root.operation() {
+            return render_portable_threefry(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -182,12 +194,9 @@ impl OpenClRenderer {
         if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
-        if matches!(
-            root.operation(),
-            Operation::TensorGuard(_) | Operation::Threefry(_)
-        ) {
+        if matches!(root.operation(), Operation::TensorGuard(_)) {
             return Err(OpenClError::Unsupported(
-                "guards and live Threefry are outside OpenCL lowering".into(),
+                "guards are outside OpenCL lowering".into(),
             ));
         }
         root.validate()
@@ -513,6 +522,96 @@ impl OpenClRenderer {
             ))),
         })
     }
+}
+
+fn render_portable_threefry(
+    renderer: &OpenClRenderer,
+    root: &UOp,
+    value: &crate::ThreefryValue,
+) -> Result<RenderedOpenCl, OpenClError> {
+    root.validate()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::portable_threefry::PortableThreefry::new(value).map_err(|error| match error {
+            crate::portable_threefry::PortableThreefryError::Unsupported(reason) => {
+                OpenClError::Unsupported(reason.into())
+            }
+            crate::portable_threefry::PortableThreefryError::Overflow => OpenClError::Overflow,
+            other => OpenClError::InvalidBinding(other.to_string()),
+        })?;
+    let required_capabilities = OpenClCapabilities {
+        int64: true,
+        fp64: false,
+    };
+    if !renderer.capabilities.supports(required_capabilities) {
+        return Err(OpenClError::Unsupported(
+            "live Threefry requires OpenCL 64-bit integer storage".into(),
+        ));
+    }
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| OpenClBufferAbi {
+            id: input.node.index() as u64,
+            dtype: DType::U64,
+            source_shape: input.shape.clone(),
+            elements: input.elements,
+            mutable: false,
+            view: None,
+        })
+        .collect::<Vec<_>>();
+    let schedule_inputs = buffers.clone();
+    buffers.push(OpenClBufferAbi {
+        id: value.output.index() as u64,
+        dtype: DType::U64,
+        source_shape: value.output_shape.clone(),
+        elements: portable.elements(),
+        mutable: true,
+        view: None,
+    });
+    let entry = format!("rg_opencl_threefry_e{}", portable.elements());
+    let mut lines = vec![
+        format!("// {OPENCL_PORTABLE_THREEFRY_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
+        format!("__kernel void {entry}("),
+    ];
+    for (index, buffer) in buffers.iter().enumerate() {
+        let qualifier = if buffer.mutable { "" } else { "const " };
+        lines.push(format!("    __global {qualifier}ulong* b{index},"));
+    }
+    lines.extend([
+        "    ulong extent) {".into(),
+        "  const ulong gid = (ulong)get_global_id(0);".into(),
+        "  if (gid >= extent) return;".into(),
+    ]);
+    lines.extend(crate::portable_threefry::emit_portable_threefry_body(
+        &portable,
+        &crate::portable_threefry::CLikePortableThreefryDialect,
+    ));
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        OPENCL_PORTABLE_THREEFRY_RENDERER_VERSION,
+        OPENCL_ABI_VERSION,
+        renderer.local_size,
+        renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedOpenCl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.elements(),
+        entry,
+        cache_key,
+        required_capabilities,
+        transaction: None,
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
 }
 
 fn render_portable_sort(

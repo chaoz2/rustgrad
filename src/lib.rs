@@ -41,6 +41,7 @@ pub mod nn;
 pub mod onnx;
 pub mod optim;
 mod portable_sort;
+mod portable_threefry;
 pub mod ptx;
 mod rangeify;
 pub mod runtime;

@@ -1,8 +1,58 @@
 use super::renderer::{
     WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION, WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
-    WGSL_PORTABLE_SORT_RENDERER_VERSION, WGSL_RAW_COPY_RENDERER_VERSION,
-    WGSL_STATIC_POSITION_RENDERER_VERSION,
+    WGSL_PORTABLE_SORT_RENDERER_VERSION, WGSL_PORTABLE_THREEFRY_RENDERER_VERSION,
+    WGSL_RAW_COPY_RENDERER_VERSION, WGSL_STATIC_POSITION_RENDERER_VERSION,
 };
+
+#[test]
+fn portable_threefry_wgsl_uses_packed_u32_and_executes_exact_bits() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let counter = graph.input_dtype("counter", [2, 1], DType::U64);
+    let key = graph.input_dtype("key", [1, 3], DType::U64);
+    let output = graph.threefry(counter, key).unwrap();
+    let items = schedule(&graph, output).unwrap().items;
+    let rendered = renderer.render(&items[0].kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(items[0].ordered_inputs())
+        .unwrap();
+    assert_eq!((rendered.extent, rendered.buffers.len()), (6, 3));
+    assert!(
+        rendered
+            .source
+            .contains(WGSL_PORTABLE_THREEFRY_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("array<u32>"));
+    assert!(rendered.source.contains("rg_output_offset + 1u"));
+    let counter_value = TensorData::from_storage(
+        [2, 1],
+        Storage::U64(vec![0x0000_0007_0000_0001, 0x0000_000d_ffff_ffff]),
+    )
+    .unwrap();
+    let key_value = TensorData::from_storage(
+        [1, 3],
+        Storage::U64(vec![0x0000_0539_0000_0000, 5, 0x0000_0001_ffff_ffff]),
+    )
+    .unwrap();
+    let expected = crate::random::execute_live_threefry(
+        &counter_value,
+        &key_value,
+        graph.shape(output).unwrap(),
+    )
+    .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock);
+    let prefix = PreparedWebGpuPrefix::prepare(device, &items, renderer).unwrap();
+    let mut realized = BTreeMap::from([
+        (counter.index() as u64, counter_value),
+        (key.index() as u64, key_value),
+    ]);
+    prefix.execute(&mut realized).unwrap();
+    assert_eq!(
+        realized[&(output.index() as u64)].to_le_bytes().unwrap(),
+        expected.to_le_bytes().unwrap()
+    );
+}
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;

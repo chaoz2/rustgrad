@@ -1,8 +1,100 @@
 use super::renderer::{
     METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
-    METAL_PORTABLE_SORT_RENDERER_VERSION, METAL_RAW_COPY_RENDERER_VERSION,
-    METAL_STATIC_POSITION_RENDERER_VERSION,
+    METAL_PORTABLE_SORT_RENDERER_VERSION, METAL_PORTABLE_THREEFRY_RENDERER_VERSION,
+    METAL_RAW_COPY_RENDERER_VERSION, METAL_STATIC_POSITION_RENDERER_VERSION,
 };
+
+#[test]
+fn portable_threefry_metal_renders_and_executes_broadcast_bits() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let counter = graph.input_dtype("counter", [2, 1], DType::U64);
+    let key = graph.input_dtype("key", [1, 3], DType::U64);
+    let output = graph.threefry(counter, key).unwrap();
+    let items = schedule(&graph, output).unwrap().items;
+    let rendered = renderer.render(&items[0].kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(items[0].ordered_inputs())
+        .unwrap();
+    assert_eq!((rendered.extent, rendered.buffers.len()), (6, 3));
+    assert!(
+        rendered
+            .source
+            .contains(METAL_PORTABLE_THREEFRY_RENDERER_VERSION)
+    );
+    let counter_value = TensorData::from_storage(
+        [2, 1],
+        Storage::U64(vec![0x0000_0007_0000_0001, 0x0000_000d_ffff_ffff]),
+    )
+    .unwrap();
+    let key_value = TensorData::from_storage(
+        [1, 3],
+        Storage::U64(vec![0x0000_0539_0000_0000, 5, 0x0000_0001_ffff_ffff]),
+    )
+    .unwrap();
+    let expected = crate::random::execute_live_threefry(
+        &counter_value,
+        &key_value,
+        graph.shape(output).unwrap(),
+    )
+    .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock);
+    let prefix = PreparedMetalPrefix::prepare(device, &items, renderer).unwrap();
+    let mut realized = BTreeMap::from([
+        (counter.index() as u64, counter_value),
+        (key.index() as u64, key_value),
+    ]);
+    prefix.execute(&mut realized).unwrap();
+    assert_eq!(
+        realized[&(output.index() as u64)].to_le_bytes().unwrap(),
+        expected.to_le_bytes().unwrap()
+    );
+
+    let mut chained = Graph::new();
+    let source = chained.input_dtype("source", [1, 2], DType::U64);
+    let viewed = chained.permute(source, [1, 0]).unwrap();
+    let counter = chained.contiguous(viewed).unwrap();
+    let key = chained.input_dtype("key", [1, 3], DType::U64);
+    let output = chained.threefry(counter, key).unwrap();
+    let scheduled = schedule(&chained, output).unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    assert_eq!(scheduled.items[1].dependencies, vec![scheduled.items[0].id]);
+    let source_value = TensorData::from_storage(
+        [1, 2],
+        Storage::U64(vec![0x0000_0007_0000_0001, 0x0000_000d_ffff_ffff]),
+    )
+    .unwrap();
+    let counter_value = TensorData::from_storage(
+        [2, 1],
+        Storage::U64(vec![0x0000_0007_0000_0001, 0x0000_000d_ffff_ffff]),
+    )
+    .unwrap();
+    let key_value = TensorData::from_storage([1, 3], Storage::U64(vec![0, 1, 2])).unwrap();
+    let expected = crate::random::execute_live_threefry(
+        &counter_value,
+        &key_value,
+        chained.shape(output).unwrap(),
+    )
+    .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock);
+    let prefix = PreparedMetalPrefix::prepare(
+        device,
+        &scheduled.items,
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    let mut realized = BTreeMap::from([
+        (source.index() as u64, source_value),
+        (key.index() as u64, key_value),
+    ]);
+    prefix.execute(&mut realized).unwrap();
+    assert_eq!(
+        realized[&(output.index() as u64)].to_le_bytes().unwrap(),
+        expected.to_le_bytes().unwrap()
+    );
+}
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;

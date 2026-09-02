@@ -23,6 +23,7 @@ pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
 pub const METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-prefix-scan-v1";
 pub const METAL_PORTABLE_SORT_RENDERER_VERSION: &str = "rustgrad-metal-portable-sort-v1";
+pub const METAL_PORTABLE_THREEFRY_RENDERER_VERSION: &str = "rustgrad-metal-portable-threefry-v1";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -101,6 +102,14 @@ impl RenderedMetal {
                 .validate_schedule_bindings(bindings)
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
         }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Threefry(value) = root.operation()
+        {
+            crate::portable_threefry::PortableThreefry::new(value)
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(MetalError::InvalidBinding(
                 "schedule/Metal input count mismatch".into(),
@@ -161,6 +170,9 @@ impl MetalRenderer {
         if let Operation::Sort(value) = root.operation() {
             return render_portable_sort(self, root, value);
         }
+        if let Operation::Threefry(value) = root.operation() {
+            return render_portable_threefry(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -180,12 +192,9 @@ impl MetalRenderer {
         if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
-        if matches!(
-            root.operation(),
-            Operation::TensorGuard(_) | Operation::Threefry(_)
-        ) {
+        if matches!(root.operation(), Operation::TensorGuard(_)) {
             return Err(MetalError::Unsupported(
-                "guards and live Threefry are outside Metal lowering".into(),
+                "guards are outside Metal lowering".into(),
             ));
         }
         root.validate()
@@ -452,6 +461,103 @@ impl MetalRenderer {
             ))),
         })
     }
+}
+
+fn render_portable_threefry(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    value: &crate::ThreefryValue,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::portable_threefry::PortableThreefry::new(value).map_err(|error| match error {
+            crate::portable_threefry::PortableThreefryError::Unsupported(reason) => {
+                MetalError::Unsupported(reason.into())
+            }
+            crate::portable_threefry::PortableThreefryError::Overflow => MetalError::Overflow,
+            other => MetalError::InvalidBinding(other.to_string()),
+        })?;
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| MetalBufferAbi {
+            id: input.node.index() as u64,
+            dtype: DType::U64,
+            source_shape: input.shape.clone(),
+            elements: input.elements,
+            mutable: false,
+            view: None,
+        })
+        .collect::<Vec<_>>();
+    let schedule_inputs = buffers.clone();
+    buffers.push(MetalBufferAbi {
+        id: value.output.index() as u64,
+        dtype: DType::U64,
+        source_shape: value.output_shape.clone(),
+        elements: portable.elements(),
+        mutable: true,
+        view: None,
+    });
+    for buffer in &buffers {
+        let bytes = buffer
+            .elements
+            .checked_mul(DType::U64.itemsize())
+            .ok_or(MetalError::Overflow)?;
+        if bytes > renderer.capabilities.max_buffer_length {
+            return Err(MetalError::Unsupported(
+                "portable Threefry binding exceeds device buffer limit".into(),
+            ));
+        }
+    }
+    let entry = format!("rg_metal_threefry_e{}", portable.elements());
+    let mut lines = vec![
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        format!("// {METAL_PORTABLE_THREEFRY_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        format!("kernel void {entry}("),
+    ];
+    for (index, buffer) in buffers.iter().enumerate() {
+        let qualifier = if buffer.mutable { "" } else { "const " };
+        lines.push(format!(
+            "    device {qualifier}ulong* b{index} [[buffer({index})]],"
+        ));
+    }
+    lines.extend([
+        format!("    constant ulong& extent [[buffer({})]],", buffers.len()),
+        "    uint gid32 [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = (ulong)gid32;".into(),
+        "  if (gid >= extent) return;".into(),
+    ]);
+    lines.extend(crate::portable_threefry::emit_portable_threefry_body(
+        &portable,
+        &crate::portable_threefry::CLikePortableThreefryDialect,
+    ));
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_PORTABLE_THREEFRY_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.elements(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
 }
 
 fn render_portable_sort(

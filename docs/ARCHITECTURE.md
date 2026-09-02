@@ -1566,11 +1566,16 @@ different operation from that zero-input random source. One typed
 broadcast shapes, the output identity and shape, and the first-use pointer
 order (deduplicating aliased operands). The graph-free CPU interpreter, RGUA
 v19 codec, strict C11 renderer, and PTX renderer all validate and consume that
-same value. The raw evaluator and both native emitters share the source's
-20-round rotation/injection inventory; neither renderer reconstructs a second
-input taxonomy. OpenCL, Metal, and WebGPU reject this live operation before
-backend work. This adds no ambient stream mutation, device-random reservation,
-or live CUDA validation claim.
+same value. One checked `PortableThreefry` projection now also owns the dense
+U64 ABI and right-aligned broadcast address terms for prepared OpenCL, Metal,
+and WebGPU prefixes. A shared dialect coordinator emits the source's exact
+20-round wrapping rotation/injection program; OpenCL and Metal bind native
+U64 words, while WGSL binds each word as two adjacent U32 lanes. Renderer-only
+versions isolate generated source without changing Op, UOp, schedule, capture,
+or artifact identity. OpenCL capability-gates 64-bit integer storage, zero
+domains submit no work, and unsupported or malformed bindings reject before
+resource work. Semantic mocks are exact; live-device validation, ambient stream
+mutation, and device-random reservation remain unclaimed.
 
 Durable schedule keys encode each kernel with its minimum admitted semantic
 RGUA envelope rather than the current standalone writer version. Existing
