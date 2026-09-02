@@ -366,6 +366,9 @@ pub fn uop_viz(root: &UOp) -> Result<VizGraph, VizError> {
         if let Some(ty) = node.ty() {
             viz = viz.field("type", format!("{}x{}", dtype_name(ty.scalar), ty.lanes));
         }
+        if let Some(tag) = node.tag() {
+            viz = viz.field("tag", format!("{tag:?}"));
+        }
         for (key, value) in operation_fields(node.operation()) {
             viz = viz.field(key, value);
         }

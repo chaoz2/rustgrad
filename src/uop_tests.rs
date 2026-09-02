@@ -1,5 +1,7 @@
-use crate::uop::{self, Binary, Operation, Ternary, UType, Walk};
-use crate::{AddressValue, DType, Graph, IndexValue, LiteralValue, Shape, TensorData, UOp, UPat};
+use crate::uop::{self, Binary, Operation, Ternary, UType, Unary, Walk};
+use crate::{
+    AddressValue, DType, Graph, IndexValue, LiteralValue, Shape, TensorData, UOp, UOpTag, UPat,
+};
 
 fn i64t() -> UType {
     UType::scalar(DType::I64)
@@ -712,6 +714,76 @@ fn upat_alternatives_and_permuted_sources_preserve_candidate_isolation() {
         UOp::constant(2, f32t()),
     );
     assert!(outer_type.matches(&float_add).is_none());
+}
+
+#[test]
+fn upat_tags_are_exact_transactional_metadata_and_survive_source_rewrites() {
+    fn select_value(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
+        captures.get("value").cloned()
+    }
+
+    let lane: UOpTag = (1, DType::I32).into();
+    let one = UOp::constant(1, i32t()).retag(Some(lane.clone()));
+    let zero = UOp::constant(0, i32t()).retag(Some(UOpTag::Text("zero".into())));
+    let add = UOp::binary(Binary::Add, one.clone(), zero.clone())
+        .retag(Some(UOpTag::Text("root".into())));
+
+    assert_ne!(one, UOp::constant(1, i32t()));
+    assert_eq!(one.retag(Some(lane.clone())), one);
+    assert_eq!(one.retag(None).tag(), None);
+    assert!(UPat::any().tag(lane.clone()).matches(&one).is_some());
+    assert!(
+        UPat::any()
+            .tags([UOpTag::Text("other".into()), lane.clone()])
+            .matches(&one)
+            .is_some()
+    );
+    assert!(UPat::any().tag("other").matches(&one).is_none());
+    assert!(
+        UPat::any()
+            .tags(Vec::<UOpTag>::new())
+            .matches(&one)
+            .is_none()
+    );
+
+    let alternatives = UPat::any_of([
+        UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+            UPat::any().named("leaked"),
+            UPat::any().tag("missing"),
+        ]),
+        UPat::op(Operation::Binary(Binary::Add)).sources_permuted(vec![
+            UPat::any().tag("zero"),
+            UPat::any().tag(lane.clone()).named("value"),
+        ]),
+    ])
+    .unwrap()
+    .tag("root");
+    let captures = alternatives.matches(&add).unwrap();
+    assert!(captures.get("leaked").is_none());
+    assert_eq!(captures.get("value"), Some(&one));
+
+    let mut rules = vec![uop::RewriteRule {
+        name: "tagged-commutative-zero",
+        priority: 0,
+        pattern: alternatives,
+        apply: select_value,
+    }];
+    let (rewritten, trace) = uop::rewrite(&add, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, one);
+    assert_eq!(trace.rules, vec!["tagged-commutative-zero"]);
+
+    let inner = UOp::binary(
+        Binary::Add,
+        UOp::constant(2, i32t()),
+        UOp::constant(0, i32t()),
+    );
+    let outer = UOp::unary(Unary::Neg, inner).retag(Some(UOpTag::Text("keep".into())));
+    let (rewritten, _) = uop::rewrite(&outer, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(rewritten.tag(), Some(&UOpTag::Text("keep".into())));
+    assert!(matches!(
+        rewritten.sources()[0].operation(),
+        Operation::Const(LiteralValue::Int(2))
+    ));
 }
 
 #[test]

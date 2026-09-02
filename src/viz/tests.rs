@@ -1,7 +1,7 @@
 use super::*;
 use crate::uop::Binary;
 use crate::{
-    DType, Graph, LinearKernel, MemorySpacePlan, NodeId, Shape, UOp, UType, VectorProgram,
+    DType, Graph, LinearKernel, MemorySpacePlan, NodeId, Shape, UOp, UOpTag, UType, VectorProgram,
     schedule, schedule_many,
 };
 
@@ -863,7 +863,8 @@ fn contiguous_graph_snapshot_distinguishes_forward_and_backward_boundaries() {
 
 #[test]
 fn uop_snapshot_preserves_shared_subgraph_and_typed_metadata() {
-    let shared = UOp::constant(7, UType::scalar(DType::I32));
+    let shared =
+        UOp::constant(7, UType::scalar(DType::I32)).retag(Some(UOpTag::Text("shared".into())));
     let root = UOp::binary(Binary::Add, shared.clone(), shared);
     let model = uop_viz(&root).unwrap();
     assert_eq!(model.nodes().len(), 2);
@@ -874,6 +875,10 @@ fn uop_snapshot_preserves_shared_subgraph_and_typed_metadata() {
     assert_eq!(model.edges()[1].to(), "u1");
     assert_ne!(model.edges()[0].label(), model.edges()[1].label());
     assert!(model.to_dot().contains("binary.add"));
+    assert_eq!(
+        model.nodes()[0].fields().get("tag").map(String::as_str),
+        Some("Text(\"shared\")")
+    );
 }
 
 #[test]
