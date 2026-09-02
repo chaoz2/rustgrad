@@ -146,14 +146,7 @@ impl BertEncoderLayer {
     }
 
     fn project(&self, graph: &mut Graph, projection: &Linear, input: NodeId) -> Result<NodeId> {
-        let weight = projection.weight.bind(graph)?;
-        let weight = graph.permute(weight, [1, 0])?;
-        let bias = projection
-            .bias
-            .as_ref()
-            .map(|bias| bias.bind(graph))
-            .transpose()?;
-        graph.linear(input, weight, bias, None)
+        projection.forward_source(graph, input)
     }
 
     fn geometry(

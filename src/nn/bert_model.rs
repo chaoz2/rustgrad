@@ -428,11 +428,16 @@ pub struct BertModel {
 }
 
 impl BertModel {
-    pub fn new_static(config: BertModelConfig, seed: u64) -> Result<Self> {
+    pub(crate) fn validate_config(config: BertModelConfig) -> Result<()> {
         BertEmbeddings::validate_config(config)?;
         if config.num_hidden_layers > 0 {
             BertEncoderLayer::validate_config(config.layer())?;
         }
+        Ok(())
+    }
+
+    pub fn new_static(config: BertModelConfig, seed: u64) -> Result<Self> {
+        Self::validate_config(config)?;
         Ok(Self {
             embeddings: BertEmbeddings::new_static(config, seed)?,
             encoder: BertEncoder::new_static(
@@ -455,7 +460,7 @@ impl BertModel {
         graph.mul_scalar(mask, Scalar::F(-10_000.0))
     }
 
-    fn lower_explicit(
+    pub(crate) fn lower_explicit(
         &self,
         graph: &mut Graph,
         input_ids: NodeId,
@@ -474,7 +479,7 @@ impl BertModel {
         self.encoder.lower_explicit(graph, hidden, mask, mode)
     }
 
-    fn ambient_requests(
+    pub(crate) fn ambient_requests(
         &self,
         graph: &Graph,
         input_ids: NodeId,
@@ -494,7 +499,7 @@ impl BertModel {
         Ok(requests)
     }
 
-    fn lower_ambient_reserved(
+    pub(crate) fn lower_ambient_reserved(
         &self,
         graph: &mut Graph,
         input_ids: NodeId,
