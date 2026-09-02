@@ -1878,6 +1878,7 @@ mod tests {
             buffer_shapes: BTreeMap::new(),
             item_domains: BTreeMap::new(),
             views: BTreeMap::new(),
+            requested_views: BTreeMap::new(),
             projected: BTreeMap::new(),
             splat_constants: BTreeSet::new(),
         });

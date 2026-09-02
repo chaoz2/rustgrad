@@ -1226,4 +1226,19 @@ fn empty_affine_reads_still_validate_products_and_address_representability() {
     let normalized = skipped_singleton.normalized_read().unwrap();
     assert_eq!(normalized.axes[1].stride, 0);
     assert!(!normalized.axes[1].reversed);
+
+    let addressless_reverse = crate::AffineView {
+        source_shape: Shape::from([0, 4]),
+        logical_shape: Shape::from([1, 0, 4]),
+        strides: vec![0, 4, -1],
+        offset: 0,
+    };
+    let normalized = addressless_reverse.normalized_read().unwrap();
+    assert_eq!(normalized.offset, 0);
+    assert!(
+        normalized
+            .axes
+            .iter()
+            .all(|axis| axis.stride == 0 && !axis.reversed)
+    );
 }

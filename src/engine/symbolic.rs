@@ -173,6 +173,7 @@ pub(crate) struct SymbolicSchema {
     pub(crate) buffer_shapes: BTreeMap<u64, SymbolicShape>,
     pub(crate) item_domains: BTreeMap<u64, SymbolicItemDomain>,
     pub(crate) views: BTreeMap<(u64, u64), SymbolicViewMap>,
+    pub(crate) requested_views: BTreeMap<u64, SymbolicViewMap>,
     pub(crate) projected: BTreeMap<(u64, u32), SymbolicProjectedIndexMap>,
     pub(crate) splat_constants: BTreeSet<u64>,
 }
@@ -432,6 +433,10 @@ pub(crate) fn build_schema(
             relevant.insert(symbolic_inventory_node(item, input.id)?);
         }
     }
+    for passthrough in &schedule.requested_passthroughs {
+        relevant.insert(passthrough.source);
+        relevant.insert(passthrough.requested);
+    }
     for node in relevant.iter().copied() {
         derive_shape(
             graph,
@@ -475,6 +480,21 @@ pub(crate) fn build_schema(
         if buffer_shapes
             .insert(item.primary_output().id, output_shape.clone())
             .is_some_and(|existing| existing != output_shape)
+        {
+            return Err(ReplayError::Symbolic(
+                "one captured buffer has conflicting symbolic shapes".into(),
+            ));
+        }
+    }
+
+    for passthrough in &schedule.requested_passthroughs {
+        let source = memo
+            .get(&passthrough.source)
+            .ok_or_else(|| ReplayError::Symbolic("missing requested-view source shape".into()))?
+            .clone();
+        if buffer_shapes
+            .insert(passthrough.desc.id, source.clone())
+            .is_some_and(|existing| existing != source)
         {
             return Err(ReplayError::Symbolic(
                 "one captured buffer has conflicting symbolic shapes".into(),
@@ -537,6 +557,30 @@ pub(crate) fn build_schema(
     guards.dedup();
 
     let mut views = BTreeMap::new();
+    let mut requested_views = BTreeMap::new();
+    for passthrough in &schedule.requested_passthroughs {
+        let symbolic = super::symbolic_view::derive_view_from_source(
+            graph,
+            passthrough.requested,
+            passthrough.source,
+            &memo,
+            &template_environment,
+        )?;
+        let template = passthrough.desc.view.as_ref().ok_or_else(|| {
+            ReplayError::Corrupt("requested passthrough template view is absent".into())
+        })?;
+        if symbolic.source_shape != memo[&passthrough.source]
+            || symbolic.logical_shape != memo[&passthrough.requested]
+            || symbolic.specialize(&template_environment)? != *template
+            || requested_views
+                .insert(passthrough.requested.index() as u64, symbolic)
+                .is_some()
+        {
+            return Err(ReplayError::Symbolic(
+                "symbolic requested view is inconsistent".into(),
+            ));
+        }
+    }
     let mut projected = BTreeMap::new();
     for item in &schedule.items {
         let mut lowered_views = BTreeSet::new();
@@ -747,6 +791,11 @@ pub(crate) fn build_schema(
         )
         .chain(views.values().flat_map(SymbolicViewMap::expressions))
         .chain(
+            requested_views
+                .values()
+                .flat_map(SymbolicViewMap::expressions),
+        )
+        .chain(
             projected
                 .values()
                 .flat_map(SymbolicProjectedIndexMap::expressions),
@@ -779,6 +828,7 @@ pub(crate) fn build_schema(
         buffer_shapes,
         item_domains,
         views,
+        requested_views,
         projected,
         splat_constants,
     };
@@ -897,6 +947,11 @@ impl SymbolicSchema {
             )
             .chain(self.views.values().flat_map(SymbolicViewMap::expressions))
             .chain(
+                self.requested_views
+                    .values()
+                    .flat_map(SymbolicViewMap::expressions),
+            )
+            .chain(
                 self.projected
                     .values()
                     .flat_map(SymbolicProjectedIndexMap::expressions),
@@ -929,6 +984,12 @@ impl SymbolicSchema {
                     .map(|input| input.id)
                     .chain(std::iter::once(item.primary_output().id))
             })
+            .chain(
+                capture
+                    .requested_passthroughs
+                    .iter()
+                    .map(|passthrough| passthrough.desc.id),
+            )
             .collect::<BTreeSet<_>>();
         if self.buffer_shapes.keys().copied().collect::<BTreeSet<_>>() != expected_buffers {
             return Err(ReplayError::Symbolic(
@@ -947,11 +1008,21 @@ impl SymbolicSchema {
         for shape in self.buffer_shapes.values() {
             validate_shape_bounds(shape)?;
         }
-        for desc in capture.items.iter().flat_map(|item| {
-            item.inputs
-                .iter()
-                .chain(std::iter::once(item.primary_output()))
-        }) {
+        for desc in capture
+            .items
+            .iter()
+            .flat_map(|item| {
+                item.inputs
+                    .iter()
+                    .chain(std::iter::once(item.primary_output()))
+            })
+            .chain(
+                capture
+                    .requested_passthroughs
+                    .iter()
+                    .map(|passthrough| &passthrough.desc),
+            )
+        {
             let elements = self
                 .buffer_shapes
                 .get(&desc.id)
@@ -970,6 +1041,44 @@ impl SymbolicSchema {
         }
         for view in self.views.values() {
             view.validate_bounds()?;
+        }
+        for view in self.requested_views.values() {
+            view.validate_bounds()?;
+        }
+        let expected_requested_views = capture
+            .requested_passthroughs
+            .iter()
+            .map(|passthrough| passthrough.requested.index() as u64)
+            .collect::<BTreeSet<_>>();
+        if self
+            .requested_views
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != expected_requested_views
+        {
+            return Err(ReplayError::Symbolic(
+                "symbolic requested-view coverage is incomplete".into(),
+            ));
+        }
+        for passthrough in &capture.requested_passthroughs {
+            let requested = passthrough.requested.index() as u64;
+            let symbolic = self
+                .requested_views
+                .get(&requested)
+                .ok_or_else(|| ReplayError::Symbolic("symbolic requested view is absent".into()))?;
+            let template = passthrough.desc.view.as_ref().ok_or_else(|| {
+                ReplayError::Symbolic("requested passthrough view is absent".into())
+            })?;
+            if self.buffer_shapes.get(&passthrough.desc.id) != Some(&symbolic.source_shape)
+                || symbolic.specialize(&environment)? != *template
+                || passthrough.desc.id != passthrough.source.index() as u64
+                || !passthrough.desc.read_only
+            {
+                return Err(ReplayError::Symbolic(
+                    "symbolic requested view source or template is inconsistent".into(),
+                ));
+            }
         }
         let mut expected_views = BTreeSet::new();
         for item in &capture.items {
@@ -2656,6 +2765,21 @@ pub(crate) fn specialize_authenticated_capture(
     }
     for input in &mut concrete.inputs {
         input.desc = specialize_desc(schema, None, &input.desc, &environment)?;
+    }
+    for passthrough in &mut concrete.requested_passthroughs {
+        let requested = passthrough.requested.index() as u64;
+        let symbolic = schema
+            .requested_views
+            .get(&requested)
+            .ok_or_else(|| ReplayError::Corrupt("symbolic requested view is absent".into()))?;
+        let shape = bind_shape(&symbolic.source_shape, &environment)?;
+        passthrough.desc.shape = shape.clone();
+        passthrough.desc.bytes = shape
+            .numel()
+            .ok()
+            .and_then(|elements| elements.checked_mul(passthrough.desc.dtype.itemsize()))
+            .ok_or_else(|| ReplayError::Symbolic("specialized buffer size overflows".into()))?;
+        passthrough.desc.view = Some(symbolic.specialize(&environment)?);
     }
     for (buffer, value) in &mut concrete.constants {
         if schema.splat_constants.contains(buffer) {

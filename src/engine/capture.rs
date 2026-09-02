@@ -482,11 +482,6 @@ impl CapturedSchedule {
         let symbolic_schedule =
             crate::schedule::schedule_many_for_symbolic_capture(graph, requested, &external)
                 .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        if !symbolic_schedule.requested_passthroughs.is_empty() {
-            return Err(ReplayError::Unsupported(
-                "symbolic requested passthroughs require a symbolic view sidecar".into(),
-            ));
-        }
         let mut capture = Self::capture(graph, &symbolic_schedule, requested)?;
         capture.symbolic = Some(super::symbolic::build_schema(
             graph,

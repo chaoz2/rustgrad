@@ -314,6 +314,31 @@ impl AffineView {
             .source_shape
             .numel()
             .map_err(|_| UOpError::InvalidIndex)?;
+        if logical_numel == 0 {
+            let axes = self
+                .logical_shape
+                .dims()
+                .iter()
+                .zip(&self.strides)
+                .map(|(&dimension, &stride)| {
+                    if dimension > 1 {
+                        let magnitude = i128::from(stride).abs();
+                        let axis_span = i128::try_from(dimension - 1)
+                            .map_err(|_| UOpError::InvalidIndex)?
+                            .checked_mul(magnitude)
+                            .ok_or(UOpError::InvalidIndex)?;
+                        if axis_span > i128::from(i64::MAX) {
+                            return Err(UOpError::InvalidIndex);
+                        }
+                    }
+                    Ok(NormalizedAffineReadAxis {
+                        stride: 0,
+                        reversed: false,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(NormalizedAffineRead { offset: 0, axes });
+        }
         let mut minimum = i128::from(self.offset);
         let mut span = 0i128;
         let mut axes = Vec::with_capacity(self.strides.len());
