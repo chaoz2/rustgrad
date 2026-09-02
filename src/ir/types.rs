@@ -131,6 +131,15 @@ pub struct AttentionOptions {
     pub dropout_seed: Option<u64>,
 }
 
+/// Source-facing attention controls whose dropout mode comes from
+/// [`TrainingContext`](super::TrainingContext).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AmbientAttentionOptions {
+    pub dropout_p: f64,
+    pub is_causal: bool,
+    pub enable_gqa: bool,
+}
+
 /// Concrete Python-style shift argument accepted by public tinygrad
 /// `Tensor.roll`: one integer or an ordered tuple of integers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +185,15 @@ impl Default for AttentionOptions {
             dropout_p: 0.0,
             training: false,
             dropout_seed: None,
+        }
+    }
+}
+impl Default for AmbientAttentionOptions {
+    fn default() -> Self {
+        Self {
+            dropout_p: 0.0,
+            is_causal: false,
+            enable_gqa: false,
         }
     }
 }

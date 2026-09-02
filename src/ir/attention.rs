@@ -1,5 +1,6 @@
 use super::{
-    AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape,
+    AmbientAttentionOptions, AttentionOptions, Graph, NodeId, RandomKind, RandomStream, ReduceKind,
+    TrainingContext, matmul_shape,
     shape::{normalize_axes, reduction_shape},
 };
 use crate::{DType, Error, ReductionDType, Result, Scalar, Shape, TensorData};
@@ -37,6 +38,130 @@ struct LogsumexpPlan {
     inv_ln2: TensorData,
     ln2: TensorData,
     max_identity: Option<Scalar>,
+}
+
+#[derive(Clone)]
+struct AttentionPlan {
+    query_shape: Shape,
+    key_shape: Shape,
+    score_shape: Shape,
+    output_shape: Shape,
+    query_dtype: DType,
+    compute_dtype: DType,
+    scale: f64,
+    is_causal: bool,
+    enable_gqa: bool,
+}
+
+#[derive(Clone, Copy)]
+struct AttentionRequest {
+    query: NodeId,
+    key: NodeId,
+    value: NodeId,
+    attn_mask: Option<NodeId>,
+    scale: Option<f64>,
+    is_causal: bool,
+    enable_gqa: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AttentionDropout {
+    Explicit { training: bool, seed: Option<u64> },
+    Ambient(RandomStream),
+}
+
+fn attention_plan(graph: &Graph, request: AttentionRequest) -> Result<AttentionPlan> {
+    let AttentionRequest {
+        query,
+        key,
+        value,
+        attn_mask,
+        scale,
+        is_causal,
+        enable_gqa,
+    } = request;
+    let query_shape = graph.shape(query)?.clone();
+    let key_shape = graph.shape(key)?.clone();
+    let value_shape = graph.shape(value)?.clone();
+    for shape in [&query_shape, &key_shape, &value_shape] {
+        if shape.rank() < 3 {
+            return Err(Error::InvalidAttention {
+                reason: "query, key, and value need rank at least three",
+            });
+        }
+    }
+    for id in [query, key, value] {
+        if !graph.dtype(id)?.is_float() {
+            return Err(Error::InvalidAttention {
+                reason: "query, key, and value must have floating point dtype",
+            });
+        }
+    }
+    if key_shape.dims()[key_shape.rank() - 2] != value_shape.dims()[value_shape.rank() - 2] {
+        return Err(Error::InvalidAttention {
+            reason: "key and value sequence lengths must match",
+        });
+    }
+    if query_shape.dims()[query_shape.rank() - 1] != key_shape.dims()[key_shape.rank() - 1] {
+        return Err(Error::InvalidAttention {
+            reason: "query and key embedding sizes must match",
+        });
+    }
+    if is_causal && attn_mask.is_some() {
+        return Err(Error::InvalidAttention {
+            reason: "attn_mask cannot be combined with is_causal",
+        });
+    }
+    let (expected_key_shape, expected_value_shape) = if enable_gqa {
+        (
+            gqa_repeated_shape(&query_shape, &key_shape)?,
+            gqa_repeated_shape(&query_shape, &value_shape)?,
+        )
+    } else {
+        (key_shape.clone(), value_shape.clone())
+    };
+    let mut transposed_key_shape = expected_key_shape.dims().to_vec();
+    let key_rank = transposed_key_shape.len();
+    transposed_key_shape.swap(key_rank - 1, key_rank - 2);
+    let score_shape = matmul_shape(&query_shape, &Shape::new(transposed_key_shape)).ok_or(
+        Error::InvalidAttention {
+            reason: "query and key batch dimensions must broadcast",
+        },
+    )?;
+    score_shape.numel()?;
+    let output_shape =
+        matmul_shape(&score_shape, &expected_value_shape).ok_or(Error::InvalidAttention {
+            reason: "attention scores and value dimensions must match",
+        })?;
+    output_shape.numel()?;
+    if let Some(mask) = attn_mask {
+        let mask_shape = graph.shape(mask)?;
+        if mask_shape.broadcast_with(&score_shape).as_ref() != Ok(&score_shape) {
+            return Err(Error::InvalidAttention {
+                reason: "attn_mask must broadcast to attention scores",
+            });
+        }
+    }
+    let scale =
+        scale.unwrap_or_else(|| 1.0 / (query_shape.dims()[query_shape.rank() - 1] as f64).sqrt());
+    if !scale.is_finite() || scale == 0.0 {
+        return Err(Error::InvalidAttention {
+            reason: "attention scale must be finite and nonzero",
+        });
+    }
+    let query_dtype = graph.dtype(query)?;
+    let compute_dtype = query_dtype.promote(graph.dtype(key)?).promote(DType::F32);
+    Ok(AttentionPlan {
+        query_shape,
+        key_shape,
+        score_shape,
+        output_shape,
+        query_dtype,
+        compute_dtype,
+        scale,
+        is_causal,
+        enable_gqa,
+    })
 }
 
 fn max_identity(dtype: DType) -> Scalar {
@@ -640,6 +765,76 @@ impl Graph {
         self.mul(masked, scale)
     }
 
+    /// Applies checked-in tinygrad's ambient-mode dropout composition.
+    ///
+    /// Evaluation is the default and returns `input` by identity. Within a
+    /// [`TrainingContext`], an active probability reserves exactly one F32
+    /// implicit Threefry stream and captures it in the graph. The graph and
+    /// reservation publish atomically after clone rehearsal.
+    pub fn dropout_tinygrad(&mut self, input: NodeId, dropout_p: f64) -> Result<NodeId> {
+        if !dropout_p.is_finite() || !(0.0..=1.0).contains(&dropout_p) {
+            return Err(Error::InvalidAttention {
+                reason: "dropout_p must be in [0, 1]",
+            });
+        }
+        if !TrainingContext::is_training() || dropout_p == 0.0 {
+            return Ok(input);
+        }
+        let shape = self.shape(input)?.clone();
+        let dtype = self.dtype(input)?;
+        if dropout_p == 1.0 {
+            let mut staged = self.clone();
+            let output = staged.zeros_with_dtype(shape, dtype)?;
+            *self = staged;
+            return Ok(output);
+        }
+        if !dtype.is_float() {
+            return Err(Error::InvalidAttention {
+                reason: "dropout requires a floating point dtype",
+            });
+        }
+        self.with_implicit_uniform_stream(shape, DType::F32, 0, |graph, stream| {
+            graph.lower_ambient_dropout(input, dropout_p, stream)
+        })
+    }
+
+    /// Checked-in tinygrad's default `p=0.5` ambient dropout form.
+    pub fn dropout_tinygrad_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.dropout_tinygrad(input, 0.5)
+    }
+
+    fn lower_ambient_dropout(
+        &mut self,
+        input: NodeId,
+        dropout_p: f64,
+        stream: RandomStream,
+    ) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let dtype = self.dtype(input)?;
+        let random = self.random_stream(
+            shape,
+            DType::F32,
+            RandomKind::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
+            stream,
+        )?;
+        let threshold = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(dropout_p),
+            DType::F32,
+        ));
+        let keep = self.ge(random, threshold)?;
+        let keep = self.contiguous(keep)?;
+        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), dtype));
+        let masked = self.select(keep, input, zero)?;
+        let denominator = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(1.0 - dropout_p),
+            dtype,
+        ));
+        self.div(masked, denominator)
+    }
+
     /// Returns the lower triangular part of `input` over its final two axes.
     ///
     /// Positive `diagonal` includes diagonals above the main diagonal and
@@ -743,8 +938,8 @@ impl Graph {
     pub fn scaled_dot_product_attention(
         &mut self,
         query: NodeId,
-        mut key: NodeId,
-        mut value: NodeId,
+        key: NodeId,
+        value: NodeId,
         attn_mask: Option<NodeId>,
         options: AttentionOptions,
     ) -> Result<NodeId> {
@@ -753,120 +948,165 @@ impl Graph {
                 reason: "dropout_p must be in [0, 1]",
             });
         }
-        let query_shape = self.shape(query)?.clone();
-        let key_shape = self.shape(key)?.clone();
-        let value_shape = self.shape(value)?.clone();
-        for (shape, name) in [
-            (&query_shape, "query"),
-            (&key_shape, "key"),
-            (&value_shape, "value"),
-        ] {
-            if shape.rank() < 3 {
-                return Err(Error::InvalidAttention {
-                    reason: "query, key, and value need rank at least three",
-                });
-            }
-            let _ = name;
-        }
-        for id in [query, key, value] {
-            if !self.dtype(id)?.is_float() {
-                return Err(Error::InvalidAttention {
-                    reason: "query, key, and value must have floating point dtype",
-                });
-            }
-        }
-        if key_shape.dims()[key_shape.rank() - 2] != value_shape.dims()[value_shape.rank() - 2] {
-            return Err(Error::InvalidAttention {
-                reason: "key and value sequence lengths must match",
-            });
-        }
-        if query_shape.dims()[query_shape.rank() - 1] != key_shape.dims()[key_shape.rank() - 1] {
-            return Err(Error::InvalidAttention {
-                reason: "query and key embedding sizes must match",
-            });
-        }
-        if options.is_causal && attn_mask.is_some() {
-            return Err(Error::InvalidAttention {
-                reason: "attn_mask cannot be combined with is_causal",
-            });
-        }
-        let (expected_key_shape, expected_value_shape) = if options.enable_gqa {
-            (
-                gqa_repeated_shape(&query_shape, &key_shape)?,
-                gqa_repeated_shape(&query_shape, &value_shape)?,
-            )
-        } else {
-            (key_shape.clone(), value_shape.clone())
+        let request = AttentionRequest {
+            query,
+            key,
+            value,
+            attn_mask,
+            scale: options.scale,
+            is_causal: options.is_causal,
+            enable_gqa: options.enable_gqa,
         };
-        let mut transposed_key_shape = expected_key_shape.dims().to_vec();
-        let key_rank = transposed_key_shape.len();
-        transposed_key_shape.swap(key_rank - 1, key_rank - 2);
-        let score_shape = matmul_shape(&query_shape, &Shape::new(transposed_key_shape)).ok_or(
-            Error::InvalidAttention {
-                reason: "query and key batch dimensions must broadcast",
+        let plan = attention_plan(self, request)?;
+        let mut staged = self.clone();
+        let output = staged.lower_attention(
+            request,
+            options.dropout_p,
+            &plan,
+            AttentionDropout::Explicit {
+                training: options.training,
+                seed: options.dropout_seed,
             },
         )?;
-        score_shape.numel()?;
-        matmul_shape(&score_shape, &expected_value_shape)
-            .ok_or(Error::InvalidAttention {
-                reason: "attention scores and value dimensions must match",
-            })?
-            .numel()?;
-        if let Some(mask) = attn_mask {
-            let mask_shape = self.shape(mask)?;
-            if mask_shape.broadcast_with(&score_shape).as_ref() != Ok(&score_shape) {
-                return Err(Error::InvalidAttention {
-                    reason: "attn_mask must broadcast to attention scores",
-                });
-            }
-        }
-        let scale = options
-            .scale
-            .unwrap_or_else(|| 1.0 / (query_shape.dims()[query_shape.rank() - 1] as f64).sqrt());
-        if !scale.is_finite() || scale == 0.0 {
+        *self = staged;
+        Ok(output)
+    }
+
+    /// Checked-in tinygrad's source-facing scaled dot-product attention.
+    ///
+    /// Dropout reads [`TrainingContext`] and defaults to evaluation identity.
+    /// Active training captures one ambient F32 Threefry reservation; the
+    /// explicit [`AttentionOptions`] API remains available for seeded callers.
+    pub fn scaled_dot_product_attention_tinygrad(
+        &mut self,
+        query: NodeId,
+        key: NodeId,
+        value: NodeId,
+        attn_mask: Option<NodeId>,
+        options: AmbientAttentionOptions,
+    ) -> Result<NodeId> {
+        let AmbientAttentionOptions {
+            dropout_p,
+            is_causal,
+            enable_gqa,
+        } = options;
+        if !dropout_p.is_finite() || !(0.0..=1.0).contains(&dropout_p) {
             return Err(Error::InvalidAttention {
-                reason: "attention scale must be finite and nonzero",
+                reason: "dropout_p must be in [0, 1]",
             });
         }
-        if options.enable_gqa {
+        let request = AttentionRequest {
+            query,
+            key,
+            value,
+            attn_mask,
+            scale: None,
+            is_causal,
+            enable_gqa,
+        };
+        let plan = attention_plan(self, request)?;
+        let training = TrainingContext::is_training();
+        if training && dropout_p > 0.0 && dropout_p < 1.0 {
+            let random_shape = plan.score_shape.clone();
+            return self.with_implicit_uniform_stream(
+                random_shape,
+                DType::F32,
+                0,
+                |graph, stream| {
+                    graph.lower_attention(
+                        request,
+                        dropout_p,
+                        &plan,
+                        AttentionDropout::Ambient(stream),
+                    )
+                },
+            );
+        }
+        let mut staged = self.clone();
+        let output = staged.lower_attention(
+            request,
+            dropout_p,
+            &plan,
+            AttentionDropout::Explicit {
+                training,
+                seed: None,
+            },
+        )?;
+        *self = staged;
+        Ok(output)
+    }
+
+    /// Checked-in tinygrad's default unmasked evaluation/training-context form.
+    pub fn scaled_dot_product_attention_tinygrad_default(
+        &mut self,
+        query: NodeId,
+        key: NodeId,
+        value: NodeId,
+    ) -> Result<NodeId> {
+        self.scaled_dot_product_attention_tinygrad(
+            query,
+            key,
+            value,
+            None,
+            AmbientAttentionOptions::default(),
+        )
+    }
+
+    fn lower_attention(
+        &mut self,
+        request: AttentionRequest,
+        dropout_p: f64,
+        plan: &AttentionPlan,
+        dropout: AttentionDropout,
+    ) -> Result<NodeId> {
+        let AttentionRequest {
+            query,
+            mut key,
+            mut value,
+            attn_mask,
+            ..
+        } = request;
+        if plan.enable_gqa {
             key = self.repeat_heads_for_gqa(query, key)?;
             value = self.repeat_heads_for_gqa(query, value)?;
         }
-        let compute_dtype = self
-            .dtype(query)?
-            .promote(self.dtype(key)?)
-            .promote(DType::F32);
-        let query_compute = self.cast(query, compute_dtype)?;
-        let key_compute = self.cast(key, compute_dtype)?;
+        let query_compute = self.cast(query, plan.compute_dtype)?;
+        let key_compute = self.cast(key, plan.compute_dtype)?;
         let rank = self.shape(key_compute)?.rank();
         let mut axes: Vec<_> = (0..rank).collect();
         axes.swap(rank - 1, rank - 2);
         let transposed_key = self.permute(key_compute, axes)?;
         let mut scores = self.matmul(query_compute, transposed_key)?;
         let inverse_scale = self.constant(TensorData::scalar_with_dtype(
-            Scalar::F(1.0 / scale),
-            compute_dtype,
+            Scalar::F(1.0 / plan.scale),
+            plan.compute_dtype,
         ));
         scores = self.div(scores, inverse_scale)?;
-        if options.is_causal {
-            let l = query_shape.dims()[query_shape.rank() - 2];
-            let s = key_shape.dims()[key_shape.rank() - 2];
+        if plan.is_causal {
+            let l = plan.query_shape.dims()[plan.query_shape.rank() - 2];
+            let s = plan.key_shape.dims()[plan.key_shape.rank() - 2];
             let causal = self.ones_with_dtype([l, s], DType::Bool)?;
             let causal = self.tril(causal, 0)?;
             scores = self.apply_attention_mask(scores, causal)?;
         } else if let Some(mask) = attn_mask {
             scores = self.apply_attention_mask(scores, mask)?;
         }
-        let query_dtype = self.dtype(query)?;
-        let scores = self.cast(scores, query_dtype)?;
+        let scores = self.cast(scores, plan.query_dtype)?;
         let probabilities = self.softmax(scores, -1, None)?;
-        let probabilities = self.dropout(
-            probabilities,
-            options.dropout_p,
-            options.training,
-            options.dropout_seed,
-        )?;
-        self.matmul(probabilities, value)
+        let probabilities = match dropout {
+            AttentionDropout::Explicit { training, seed } => {
+                self.dropout(probabilities, dropout_p, training, seed)?
+            }
+            AttentionDropout::Ambient(stream) => {
+                self.lower_ambient_dropout(probabilities, dropout_p, stream)?
+            }
+        };
+        let output = self.matmul(probabilities, value)?;
+        debug_assert_eq!(
+            self.shape(output).expect("attention preflighted"),
+            &plan.output_shape
+        );
+        Ok(output)
     }
 
     fn apply_attention_mask(&mut self, scores: NodeId, mask: NodeId) -> Result<NodeId> {

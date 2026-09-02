@@ -20,6 +20,7 @@ pub mod rearrange;
 mod reduce;
 mod shape;
 mod source_gather;
+mod training;
 mod types;
 
 pub(crate) use attention::validate_log_softmax_plan;
@@ -47,4 +48,5 @@ pub(crate) use shape::*;
 pub(crate) use source_gather::{
     SourceGatherPlan, lower_source_gather, source_gather, source_gather_plan,
 };
+pub use training::TrainingContext;
 pub use types::*;

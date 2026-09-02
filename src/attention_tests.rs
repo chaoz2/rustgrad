@@ -1,7 +1,8 @@
 use crate::{
-    AttentionOptions, Backend, CpuBackend, DType, Error, Graph, Op, ReduceKind, Scalar, Shape,
-    TensorData, UnaryOp,
+    AmbientAttentionOptions, AttentionOptions, Backend, CpuBackend, DType, Error, Graph, Op,
+    ReduceKind, Scalar, Shape, TensorData, TrainingContext, UnaryOp,
 };
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 fn data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
@@ -1367,4 +1368,273 @@ fn public_dropout_replays_and_preserves_training_contract() {
             reason: "dropout requires a floating point dtype"
         })
     );
+}
+
+#[test]
+fn ambient_dropout_is_scoped_transactional_and_uses_the_f32_stream() {
+    let _random_lock = Graph::lock_implicit_random_tests();
+    Graph::manual_seed(2026);
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [4], DType::F16);
+    assert_eq!(graph.dropout_tinygrad(x, 0.5).unwrap(), x);
+    let original_nodes = graph.node_count();
+    {
+        let _training = TrainingContext::training();
+        assert_eq!(graph.dropout_tinygrad(x, 0.0).unwrap(), x);
+        let all_dropped = graph.dropout_tinygrad(x, 1.0).unwrap();
+        assert_eq!(graph.dtype(all_dropped).unwrap(), DType::F16);
+        let first = graph.dropout_tinygrad(x, 0.5).unwrap();
+        let second = graph.dropout_tinygrad(x, 0.5).unwrap();
+        let streams = graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Random { kind, stream } => Some((node.dtype, *kind, *stream)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(streams.len(), 2);
+        assert!(streams.iter().all(|(dtype, kind, _)| {
+            *dtype == DType::F32
+                && matches!(
+                    *kind,
+                    crate::RandomKind::Uniform {
+                        low: 0.0,
+                        high: 1.0
+                    }
+                )
+        }));
+        assert_eq!(streams[0].2.counter, [0, 0]);
+        assert_eq!(streams[1].2.counter, [4, 0]);
+
+        let bindings =
+            HashMap::from([("x".into(), data([4], &[1., -2., 3., -4.]).cast(DType::F16))]);
+        assert_eq!(
+            execute(&graph, all_dropped, bindings.clone()).to_vec_f64(),
+            vec![0.0; 4]
+        );
+        let first_value = execute(&graph, first, bindings.clone());
+        let second_value = execute(&graph, second, bindings.clone());
+        for value in first_value
+            .to_vec_f64()
+            .into_iter()
+            .chain(second_value.to_vec_f64())
+        {
+            assert!([0.0, 2.0, -4.0, 6.0, -8.0].contains(&value));
+        }
+        let loss = graph.sum(first, 0).unwrap();
+        let gradient = graph.grad(loss, x).unwrap();
+        assert!(
+            execute(&graph, gradient, bindings)
+                .to_vec_f64()
+                .iter()
+                .all(|value| [0.0, 2.0].contains(value))
+        );
+    }
+    assert!(graph.node_count() > original_nodes);
+    assert!(!TrainingContext::is_training());
+
+    let integer = graph.input_dtype("integer", [4], DType::I32);
+    let before_error = graph.node_count();
+    {
+        let _training = TrainingContext::training();
+        assert_eq!(
+            graph.dropout_tinygrad(integer, 0.5),
+            Err(Error::InvalidAttention {
+                reason: "dropout requires a floating point dtype"
+            })
+        );
+    }
+    assert_eq!(graph.node_count(), before_error);
+}
+
+#[test]
+fn ambient_attention_advances_once_replays_and_fails_before_reservation() {
+    let _random_lock = Graph::lock_implicit_random_tests();
+    Graph::manual_seed(77);
+    let mut graph = Graph::new();
+    let query = graph.input("query", [1, 2, 1, 2]);
+    let key = graph.input("key", [1, 1, 2, 2]);
+    let value = graph.input("value", [1, 1, 2, 2]);
+    let mask = graph.constant(
+        TensorData::from_storage([1, 1, 1, 2], crate::Storage::Bool(vec![true, true])).unwrap(),
+    );
+
+    let eval = graph
+        .scaled_dot_product_attention_tinygrad(
+            query,
+            key,
+            value,
+            Some(mask),
+            AmbientAttentionOptions {
+                dropout_p: 0.5,
+                enable_gqa: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        !graph
+            .nodes
+            .iter()
+            .any(|node| matches!(&node.op, Op::Random { .. }))
+    );
+    let before_error = graph.node_count();
+    {
+        let _training = TrainingContext::training();
+        assert_eq!(
+            graph.scaled_dot_product_attention_tinygrad(
+                query,
+                key,
+                value,
+                Some(mask),
+                AmbientAttentionOptions {
+                    dropout_p: 0.5,
+                    is_causal: true,
+                    enable_gqa: true,
+                },
+            ),
+            Err(Error::InvalidAttention {
+                reason: "attn_mask cannot be combined with is_causal"
+            })
+        );
+    }
+    assert_eq!(graph.node_count(), before_error);
+
+    let training = {
+        let _training = TrainingContext::training();
+        graph
+            .scaled_dot_product_attention_tinygrad(
+                query,
+                key,
+                value,
+                Some(mask),
+                AmbientAttentionOptions {
+                    dropout_p: 0.5,
+                    enable_gqa: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    let random_streams = graph
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Random { stream, .. } => Some(*stream),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(random_streams.len(), 1);
+    assert_eq!(random_streams[0].counter, [0, 0]);
+
+    let bindings = HashMap::from([
+        ("query".into(), data([1, 2, 1, 2], &[1., 0., 0., 1.])),
+        ("key".into(), data([1, 1, 2, 2], &[1., 0., 0., 1.])),
+        ("value".into(), data([1, 1, 2, 2], &[1., 2., 3., 4.])),
+    ]);
+    let expected = execute(&graph, training, bindings.clone());
+    assert!(
+        execute(&graph, eval, bindings.clone())
+            .to_vec_f64()
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    let loss = graph
+        .reduce(training, ReduceKind::Sum, None, false)
+        .unwrap();
+    let gradient = graph.grad(loss, value).unwrap();
+    assert!(
+        execute(&graph, gradient, bindings.clone())
+            .to_vec_f64()
+            .iter()
+            .all(|value| value.is_finite())
+    );
+
+    let schedule = crate::schedule(&graph, training).unwrap();
+    let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[training]).unwrap();
+    let replay = capture
+        .replay(&BTreeMap::from_iter(bindings))
+        .unwrap()
+        .remove(0);
+    assert_eq!(replay, expected);
+
+    let next = graph.rand_implicit([1], DType::F32).unwrap();
+    let Op::Random { stream, .. } = graph.op(next).unwrap() else {
+        panic!("expected the next ambient reservation");
+    };
+    assert_eq!(stream.counter, [4, 0]);
+}
+
+#[test]
+fn ambient_dropout_preserves_scalar_and_empty_geometry() {
+    let _random_lock = Graph::lock_implicit_random_tests();
+    Graph::manual_seed(9);
+    let mut graph = Graph::new();
+    let scalar = graph.input_dtype("scalar", [], DType::F32);
+    let empty = graph.input_dtype("empty", [0, 2], DType::F64);
+    let (scalar_output, empty_output) = {
+        let _training = TrainingContext::training();
+        (
+            graph.dropout_tinygrad(scalar, 0.25).unwrap(),
+            graph.dropout_tinygrad(empty, 0.25).unwrap(),
+        )
+    };
+    assert_eq!(graph.shape(scalar_output).unwrap(), &Shape::new([]));
+    assert_eq!(graph.dtype(scalar_output).unwrap(), DType::F32);
+    assert_eq!(graph.shape(empty_output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(graph.dtype(empty_output).unwrap(), DType::F64);
+    assert_eq!(
+        execute(
+            &graph,
+            empty_output,
+            HashMap::from([(
+                "empty".into(),
+                TensorData::from_storage([0, 2], crate::Storage::F64(Vec::new())).unwrap(),
+            )]),
+        )
+        .shape(),
+        &Shape::new([0, 2])
+    );
+    assert_eq!(
+        graph.dropout_tinygrad(scalar, f64::NAN),
+        Err(Error::InvalidAttention {
+            reason: "dropout_p must be in [0, 1]"
+        })
+    );
+}
+
+#[test]
+fn failed_ambient_composition_publishes_neither_graph_nor_stream() {
+    let _random_lock = Graph::lock_implicit_random_tests();
+    Graph::manual_seed(51);
+    let mut graph = Graph::new();
+    let before = graph.node_count();
+    let result =
+        graph.with_implicit_uniform_stream(Shape::new([2]), DType::F32, 0, |staged, stream| {
+            staged.random_stream(
+                Shape::new([2]),
+                DType::F32,
+                crate::RandomKind::Uniform {
+                    low: 0.0,
+                    high: 1.0,
+                },
+                stream,
+            )?;
+            Err(Error::InvalidAttention {
+                reason: "injected ambient composition failure",
+            })
+        });
+    assert_eq!(
+        result,
+        Err(Error::InvalidAttention {
+            reason: "injected ambient composition failure"
+        })
+    );
+    assert_eq!(graph.node_count(), before);
+    let next = graph.rand_implicit([1], DType::F32).unwrap();
+    let Op::Random { stream, .. } = graph.op(next).unwrap() else {
+        panic!("expected random reservation after rollback");
+    };
+    assert_eq!(stream.counter, [0, 0]);
 }
