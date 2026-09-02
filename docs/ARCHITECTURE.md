@@ -903,6 +903,33 @@ typed zeros without a reservation, and no route produces hidden pending state.
 This adds no operation, artifact, scheduler, or backend ABI; masks, cross-attention, caches,
 GQA, dynamic shapes, fused/device attention, and a whole Transformer remain
 separate compositions.
+`nn::BertEncoderLayer` is the checked source's separate two-input, post-norm
+encoder-layer composition. It accepts static `[batch,time,hidden]` states,
+letting source `Linear` promotion commit their compute dtype, plus a Bool or
+numeric mask broadcastable to `[batch,heads,time,time]`; owns source-named
+query/key/value, attention-output,
+intermediate, output, and two `LayerNorm(eps=1e-12)` modules; and preserves the
+original erf-GELU constant and intermediate `Contiguous` boundary. Its six
+`Linear`-owned projections bind source-oriented state through the canonical
+typed `Graph::linear`/dot composition rather than publishing raw Matmul. Explicit
+mode uses three deterministic module seeds. Ambient fractional training
+rehearses attention-probability and both hidden-output dropout sites and
+reserves those source-ordered Threefry streams in one transaction before graph
+publication. Evaluation and zero dropout are random-free, while unit dropout
+uses typed zeros without reserving a stream. The required attention mask keeps
+this module outside the one-input `ModuleForward` traits; its explicit and
+ambient entrypoints still return the ordinary empty `PendingModeEffects`.
+The source constructor's floor-derived attention-head width and Q/K/V
+`all_head_size` are retained. A non-divisible hidden width whose floor-derived
+head size is nonzero therefore constructs the same narrowed Q/K/V state and
+reaches the source's incompatible hidden-sized output projection, which
+RustGrad rejects during clone rehearsal without graph publication instead of
+inventing an earlier divisibility rule. When `hidden < heads`, the derived head
+width is zero and attention scale validation rejects earlier under that same
+atomic rehearsal boundary.
+This is one reusable encoder layer, not a BERT embedding/encoder stack,
+tokenizer, checkpoint-name translator, task head, training pipeline, dynamic
+shape implementation, fused kernel, or live-device claim.
 `nn::LSTM` is a separate typed stateful composition rather than another
 sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
 `cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus

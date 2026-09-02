@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:2eb642df20c0cf93",
+  "source_fingerprint": "fnv1a64:d80202bb5e6ed156",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -621,7 +621,7 @@
       "subject": "BERT, EfficientNet, RNNT, Whisper and conv models",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "The checked-in RNNT-style static stacked LSTM sequence core is covered through typed state and CPU/captured-interpreter acceptance. No encoder/prediction/joint RNNT composition, transcript pipeline, corpus parity, bidirectional/projection/packed/dynamic sequence, fused recurrent kernel, BERT, EfficientNet, Whisper, or broader conv-model claim is made."
+        "Acceptance requirement": "Public `nn::BertEncoderLayer` composes one checked-in static post-norm BERT layer for `[batch,time,hidden]` states, whose source `Linear` projections perform the established dtype promotion, and a Bool or numeric attention mask broadcastable to `[batch,heads,time,time]`. It preserves the source's floor-derived attention-head/QKV width, source-named query/key/value and dense/LayerNorm state, attention/output dropout under explicit or scoped ambient mode, both residual post-LayerNorm boundaries with `eps=1e-12`, and the original erf-GELU plus intermediate `Contiguous`. Acceptance covers configuration/state traversal, I32-hidden promotion, Bool/additive-mask behavior, and the tested `hidden=5, heads=2` atomic failure at the source-incompatible hidden-sized output projection. When `hidden < heads`, the zero floor head width instead fails earlier during attention scale validation under the same rehearsal boundary. Three-stream ambient ordering and atomicity, empty-batch zero-work behavior, CPU realization, captured-interpreter replay, and input/parameter gradient construction are also covered. The checked-in RNNT-style static stacked LSTM sequence core remains covered through typed state and CPU/captured-interpreter acceptance. No BERT embedding/encoder stack, tokenizer, checkpoint-name translation, task head, whole-model training/inference, encoder/prediction/joint RNNT composition, transcript pipeline, corpus parity, bidirectional/projection/packed/dynamic sequence, fused kernels, live devices, EfficientNet, Whisper, or broader conv-model claim is made."
       }
     },
     {
