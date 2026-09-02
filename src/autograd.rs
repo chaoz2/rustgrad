@@ -1370,8 +1370,13 @@ impl Graph {
                         self.accumulate(&mut grads, updates, grad)?;
                     }
                 }
-                Op::MaskedSelect { .. } => {
-                    return Err(Error::NonDifferentiableIndexing("masked_select"));
+                Op::MaskedSelect {
+                    input, mask, size, ..
+                } => {
+                    if wants(input) {
+                        let gradient = self.masked_select_vjp(upstream, input, mask, size)?;
+                        self.accumulate(&mut grads, input, gradient)?;
+                    }
                 }
                 Op::Shrink { input, bounds } => {
                     let shape = self.node(input)?.shape.clone();
@@ -1916,6 +1921,34 @@ impl Graph {
             ));
         }
         Ok(matches[0])
+    }
+
+    /// Routes one fixed-size compacted cotangent to the retained row-major
+    /// source lanes. Positions and padding validity remain index/control
+    /// values only, so the mask has no reverse edge while the scattered
+    /// cotangent remains compositional for higher-order transforms.
+    fn masked_select_vjp(
+        &mut self,
+        upstream: NodeId,
+        input: NodeId,
+        mask: NodeId,
+        size: usize,
+    ) -> Result<NodeId> {
+        let input_shape = self.node(input)?.shape.clone();
+        let input_dtype = self.node(input)?.dtype;
+        let elements = input_shape.numel()?;
+        let end = i64::try_from(elements).map_err(|_| Error::ShapeOverflow(input_shape.clone()))?;
+        let flat_shape = Shape::from([elements]);
+        let expanded_mask = self.expand(mask, input_shape.clone())?;
+        let indices = self.lazy_arange_default_int(0, end, 1)?;
+        let indices = self.reshape(indices, input_shape.clone())?;
+        let positions = self.masked_select(indices, mask, size, Scalar::I(0))?;
+        let retained = self.masked_select(expanded_mask, mask, size, Scalar::Bool(false))?;
+        let padding = self.zeros_with_dtype([size], input_dtype)?;
+        let upstream = self.select(retained, upstream, padding)?;
+        let zeros = self.zeros_with_dtype(flat_shape, input_dtype)?;
+        let scattered = self.scatter_add(zeros, positions, upstream, 0)?;
+        self.reshape(scattered, input_shape)
     }
 
     fn accumulate(
@@ -2850,6 +2883,114 @@ mod tests {
         );
         let (_, sort_indices) = graph.sort(x, 0, false).unwrap();
         assert!(graph.op(sort_indices).unwrap().backward_inputs().is_empty());
+    }
+
+    #[test]
+    fn fixed_masked_select_vjp_routes_only_values_and_retains_higher_order_seed_edges() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let mask_source = graph.input("mask_source", [3]);
+        let zero = graph.constant(TensorData::scalar(0.0));
+        let mask = graph.gt(mask_source, zero).unwrap();
+        let selected = graph
+            .masked_select(input, mask, 6, Scalar::F(-1.0))
+            .unwrap();
+        let upstream = graph.input("upstream", [6]);
+        let input_gradient = graph
+            .grad_with(selected, input, Some(upstream), true)
+            .unwrap();
+        let gradient_sum = graph.sum_all(input_gradient).unwrap();
+        let upstream_gradient = graph.grad(gradient_sum, upstream).unwrap();
+        let selected_sum = graph.sum_all(selected).unwrap();
+        let mask_gradient = graph
+            .gradient_default(selected_sum, &[mask_source])
+            .unwrap()[0];
+
+        let bindings = HashMap::from([
+            (
+                "input".into(),
+                data([2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ),
+            ("mask_source".into(), data([3], &[1.0, -1.0, 1.0])),
+            (
+                "upstream".into(),
+                data([6], &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, input_gradient, &bindings)
+                .unwrap(),
+            data([2, 3], &[10.0, 0.0, 20.0, 30.0, 0.0, 40.0])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, upstream_gradient, &bindings)
+                .unwrap(),
+            data([6], &[1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, mask_gradient, &bindings)
+                .unwrap(),
+            data([3], &[0.0, 0.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn masked_select_descriptor_failures_publish_neither_static_nor_dynamic_nodes() {
+        let mut graph = Graph::new();
+        let overflow = graph.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+        let bool_mask = graph.constant(TensorData::scalar_with_dtype(
+            Scalar::Bool(true),
+            DType::Bool,
+        ));
+        let wrong_mask = graph.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+        let before_nodes = graph.node_count();
+        let before_dynamic = graph.dynamic_nodes.len();
+        assert!(matches!(
+            graph.masked_select_dynamic(overflow, wrong_mask),
+            Err(Error::InvalidLogicalDType {
+                op: "masked_select_dynamic",
+                actual: DType::I32
+            })
+        ));
+        assert!(matches!(
+            graph.masked_select_dynamic(overflow, bool_mask),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(graph.node_count(), before_nodes);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+
+        let dense = graph.input_dtype("dense", [2, 3], DType::F32);
+        let invalid_mask = graph.input_dtype("invalid_mask", [2, 2], DType::Bool);
+        let before_nodes = graph.node_count();
+        let before_dynamic = graph.dynamic_nodes.len();
+        assert!(matches!(
+            graph.masked_select_dynamic(dense, invalid_mask),
+            Err(Error::InvalidIndexedShape {
+                op: "masked_select_dynamic",
+                ..
+            })
+        ));
+        assert!(matches!(
+            graph.masked_select(dense, invalid_mask, 2, Scalar::I(0)),
+            Err(Error::InvalidIndexedShape {
+                op: "masked_select",
+                ..
+            })
+        ));
+        assert_eq!(graph.node_count(), before_nodes);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
+
+        let scalar = graph.input_dtype("scalar", [], DType::F64);
+        let before_nodes = graph.node_count();
+        assert!(matches!(
+            graph.masked_select(scalar, bool_mask, usize::MAX, Scalar::F(0.0)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(graph.node_count(), before_nodes);
+        assert_eq!(graph.dynamic_nodes.len(), before_dynamic);
     }
 
     #[test]

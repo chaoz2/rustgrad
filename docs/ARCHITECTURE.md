@@ -299,6 +299,14 @@ no NodeIds in effects and is not a VJP, capture, native, or device path.
 `DynamicAllocationPlan` is the graph-owned exact count/allocation contract for
 CPU `nonzero` and `masked_select_dynamic`: the count-stage enum owns its typed
 bindings and has no side projection, sentinel capacity, or placeholder.
+Static and dynamic masked selection share one descriptor preflight for exact
+input/mask bytes, Bool right-broadcast geometry, inherited storage dtype, and
+any fixed output extent before either graph arena publishes a node. CPU
+materialization copies selected storage lanes directly, preserving all concrete
+integer/float widths, narrow NaN payloads, and signed zero. The fixed reverse
+rule composes row-major Arange, fixed compaction, Select, additive Scatter, and
+Reshape to route only retained cotangents; positions and the Bool mask remain
+non-value edges.
 `RuntimeSchedule` is one validated topological instruction DAG. Count,
 allocation-resource, materialization, unary, binary, and reduction variants
 own their operands and results; `RuntimeValueDesc` distinguishes dynamic
@@ -351,7 +359,10 @@ higher-order dynamic-output arena.
 `CpuSession` exposes this same exact ABI without mutable or raw arena-index
 access: `DynamicTensor::shape_expression` carries an opaque graph-local count
 provenance token, and every operation validates session ownership.
-`nonzero_dynamic` and `masked_select_dynamic` create session-owned handles;
+`masked_select(input, mask, size, fill)` returns a typed
+`MaskedSelectOutput`: `None` creates the exact dynamic handle, while `Some(N)`
+creates the fixed padded/truncated tensor. `nonzero_dynamic` and the retained
+lower-level `masked_select_dynamic` create session-owned handles;
 pointwise branches,
 checked static scalars, fixed scalar `Sum`/`Mean`, their exact first-order VJP,
 and CPU realization accept them. `dynamic_vjp` takes exact realized upstream storage

@@ -142,6 +142,43 @@ pub struct DynamicTensor {
     shape: crate::DynamicOutputShape,
 }
 
+/// Source-facing result of [`CpuSession::masked_select`].
+///
+/// `size=None` retains exact runtime cardinality, while `size=Some(_)` is an
+/// ordinary fixed graph tensor. The enum makes that source distinction
+/// explicit without inventing a maximum dynamic extent or a placeholder node.
+#[derive(Clone, Debug)]
+pub enum MaskedSelectOutput {
+    Dynamic(DynamicTensor),
+    Fixed(Tensor),
+}
+
+impl MaskedSelectOutput {
+    /// Storage dtype inherited exactly from the selected input.
+    pub fn dtype(&self) -> DType {
+        match self {
+            Self::Dynamic(tensor) => tensor.dtype(),
+            Self::Fixed(tensor) => tensor.dtype(),
+        }
+    }
+
+    /// Returns the fixed-size tensor when `size=Some(_)` was requested.
+    pub fn as_fixed(&self) -> Option<&Tensor> {
+        match self {
+            Self::Fixed(tensor) => Some(tensor),
+            Self::Dynamic(_) => None,
+        }
+    }
+
+    /// Returns the runtime-cardinality tensor when `size=None` was requested.
+    pub fn as_dynamic(&self) -> Option<&DynamicTensor> {
+        match self {
+            Self::Dynamic(tensor) => Some(tensor),
+            Self::Fixed(_) => None,
+        }
+    }
+}
+
 impl DynamicTensor {
     /// Storage dtype propagated by the exact runtime-buffer plan.
     pub fn dtype(&self) -> DType {
@@ -471,7 +508,45 @@ impl CpuSession {
         self.handle(node)
     }
 
-    /// Selects F32 values at a broadcast Bool mask into an exact rank-one CPU
+    /// Checked-in tinygrad's complete `Tensor.masked_select` surface.
+    ///
+    /// `size=None` returns an exact runtime-cardinality result. `size=Some(N)`
+    /// returns an ordinary rank-one tensor, truncating after `N` row-major
+    /// matches or padding with `fill`. Both forms preserve the input storage
+    /// dtype and accept a Bool mask only when it broadcasts exactly to input.
+    pub fn masked_select(
+        &mut self,
+        input: &Tensor,
+        mask: &Tensor,
+        size: Option<usize>,
+        fill: Scalar,
+    ) -> Result<MaskedSelectOutput> {
+        let input = self.node(input)?;
+        let mask = self.node(mask)?;
+        match size {
+            Some(size) => {
+                let node = self.graph.masked_select(input, mask, size, fill)?;
+                self.handle(node).map(MaskedSelectOutput::Fixed)
+            }
+            None => {
+                let node = self.graph.masked_select_dynamic(input, mask)?;
+                self.dynamic_handle(node).map(MaskedSelectOutput::Dynamic)
+            }
+        }
+    }
+
+    /// Exact-cardinality masked selection with tinygrad's default zero fill.
+    /// The fill is unused by the dynamic result, but retaining one source-level
+    /// default keeps callers independent of the lower fixed/dynamic split.
+    pub fn masked_select_default(
+        &mut self,
+        input: &Tensor,
+        mask: &Tensor,
+    ) -> Result<MaskedSelectOutput> {
+        self.masked_select(input, mask, None, Scalar::I(0))
+    }
+
+    /// Selects values at a broadcast Bool mask into an exact rank-one CPU
     /// result. Its length is the row-major true-count at realization time.
     ///
     /// The dynamic value composes through this session's pointwise unary,
@@ -486,13 +561,6 @@ impl CpuSession {
     ) -> Result<DynamicTensor> {
         let input = self.node(input)?;
         let mask = self.node(mask)?;
-        let dtype = self.graph.dtype(input)?;
-        if dtype != DType::F32 {
-            return Err(Error::InvalidElementwiseDType {
-                op: "masked_select_dynamic",
-                actual: dtype,
-            });
-        }
         let node = self.graph.masked_select_dynamic(input, mask)?;
         self.dynamic_handle(node)
     }
@@ -979,6 +1047,15 @@ impl CpuSession {
             .output)
     }
 
+    /// Realizes either branch of [`Self::masked_select`] without erasing its
+    /// static-versus-runtime shape contract.
+    pub fn realize_masked_select(&self, output: &MaskedSelectOutput) -> Result<TensorData> {
+        match output {
+            MaskedSelectOutput::Dynamic(output) => self.realize_dynamic(output),
+            MaskedSelectOutput::Fixed(output) => self.realize(output),
+        }
+    }
+
     /// Applies an exact realized upstream to one dynamic result and returns
     /// the first-order VJP in the requested static source descriptor.
     ///
@@ -995,6 +1072,34 @@ impl CpuSession {
         let target = self.node(target)?;
         let plan = self.graph.dynamic_vjp_plan(output, target)?;
         CpuBackend.execute_dynamic_vjp(&self.graph, &plan, upstream, &self.bindings)
+    }
+
+    /// Applies one exact upstream to either source-facing masked-select result.
+    /// Bool masks are control-only and are never valid gradient targets.
+    pub fn masked_select_vjp(
+        &self,
+        output: &MaskedSelectOutput,
+        upstream: &TensorData,
+        target: &Tensor,
+    ) -> Result<TensorData> {
+        match output {
+            MaskedSelectOutput::Dynamic(output) => self.dynamic_vjp(output, upstream, target),
+            MaskedSelectOutput::Fixed(output) => {
+                let output = self.node(output)?;
+                let target = self.node(target)?;
+                if upstream.shape() != self.graph.shape(output)?
+                    || upstream.dtype() != self.graph.dtype(output)?
+                {
+                    return Err(Error::DynamicVjp {
+                        reason: "fixed masked-select upstream descriptor mismatch",
+                    });
+                }
+                let mut derivative = self.graph.clone();
+                let seed = derivative.constant(upstream.clone());
+                let gradient = derivative.grad_with(output, target, Some(seed), false)?;
+                CpuBackend.execute(&derivative, gradient, &self.bindings)
+            }
+        }
     }
 
     /// Strict static Metal realization. It preflights the complete schedule
@@ -1856,6 +1961,184 @@ mod literal_tests {
     }
 
     #[test]
+    fn source_masked_select_unifies_dynamic_and_fixed_row_major_semantics() {
+        let mut session = CpuSession::new();
+        let input = session
+            .variable([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap();
+        let mask = session
+            .tensor_with_dtype(
+                [1, 3],
+                DType::Bool,
+                [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+            )
+            .unwrap();
+        let dynamic = session.masked_select_default(&input, &mask).unwrap();
+        let padded = session
+            .masked_select(&input, &mask, Some(6), Scalar::F(-1.0))
+            .unwrap();
+        let truncated = session
+            .masked_select(&input, &mask, Some(2), Scalar::F(-1.0))
+            .unwrap();
+
+        assert!(dynamic.as_dynamic().is_some() && dynamic.as_fixed().is_none());
+        assert!(padded.as_fixed().is_some() && padded.as_dynamic().is_none());
+        assert_eq!(dynamic.dtype(), DType::F32);
+        assert_eq!(
+            session
+                .realize_masked_select(&dynamic)
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.0, 3.0, 4.0, 6.0]
+        );
+        assert_eq!(
+            session.realize_masked_select(&padded).unwrap().to_vec_f64(),
+            vec![1.0, 3.0, 4.0, 6.0, -1.0, -1.0]
+        );
+        assert_eq!(
+            session
+                .realize_masked_select(&truncated)
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn source_masked_select_preserves_raw_selected_lanes_for_every_dtype() {
+        use crate::{Float8Format, Float8Storage, Storage};
+
+        let cases = vec![
+            Storage::Bool(vec![true, false, true]),
+            Storage::I8(vec![i8::MIN, 1, i8::MAX]),
+            Storage::U8(vec![0, 1, u8::MAX]),
+            Storage::I16(vec![i16::MIN, 1, i16::MAX]),
+            Storage::U16(vec![0, 1, u16::MAX]),
+            Storage::I32(vec![i32::MIN, 1, i32::MAX]),
+            Storage::U32(vec![0, 1, u32::MAX]),
+            Storage::I64(vec![i64::MIN, 1, i64::MAX]),
+            Storage::U64(vec![0, 1, u64::MAX]),
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E4M3,
+                vec![0x80, 0x38, 0x7f],
+            )),
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E5M2,
+                vec![0x80, 0x3c, 0x7d],
+            )),
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E4M3FNUZ,
+                vec![0x80, 0x40, 0xff],
+            )),
+            Storage::Float8(Float8Storage::from_raw(
+                Float8Format::E5M2FNUZ,
+                vec![0x80, 0x40, 0xff],
+            )),
+            Storage::F16(vec![0x8000, 0x3c00, 0x7e01]),
+            Storage::BF16(vec![0x8000, 0x3f80, 0x7fc1]),
+            Storage::F32(vec![
+                f32::from_bits(0x8000_0000),
+                1.0,
+                f32::from_bits(0x7fc0_0001),
+            ]),
+            Storage::F64(vec![
+                f64::from_bits(0x8000_0000_0000_0000),
+                1.0,
+                f64::from_bits(0x7ff8_0000_0000_0001),
+            ]),
+        ];
+        for storage in cases {
+            let source = TensorData::from_storage([3], storage).unwrap();
+            let itemsize = source.dtype().itemsize();
+            let bytes = source.to_le_bytes().unwrap();
+            let expected = bytes[..itemsize]
+                .iter()
+                .chain(&bytes[2 * itemsize..3 * itemsize])
+                .copied()
+                .collect::<Vec<_>>();
+            let mut session = CpuSession::new();
+            let input = session.variable_data(source).unwrap();
+            let mask = session
+                .tensor_with_dtype(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap();
+            for output in [
+                session
+                    .masked_select(&input, &mask, None, Scalar::I(0))
+                    .unwrap(),
+                session
+                    .masked_select(&input, &mask, Some(2), Scalar::I(0))
+                    .unwrap(),
+            ] {
+                let realized = session.realize_masked_select(&output).unwrap();
+                assert_eq!(realized.dtype(), input.dtype());
+                assert_eq!(
+                    realized.to_le_bytes().unwrap(),
+                    expected,
+                    "{:?}",
+                    input.dtype()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_masked_select_preserves_scalar_empty_and_typed_fill_geometry() {
+        let mut session = CpuSession::new();
+        let scalar = session
+            .variable_data(TensorData::from_storage([], crate::Storage::F64(vec![-0.0])).unwrap())
+            .unwrap();
+        let scalar_mask = session
+            .tensor_with_dtype([], DType::Bool, [Scalar::Bool(true)])
+            .unwrap();
+        let scalar_output = session
+            .masked_select(&scalar, &scalar_mask, None, Scalar::F(7.0))
+            .unwrap();
+        let scalar_value = session.realize_masked_select(&scalar_output).unwrap();
+        assert_eq!(scalar_value.shape(), &Shape::from([1]));
+        assert_eq!(
+            scalar_value.to_le_bytes().unwrap(),
+            (-0.0f64).to_le_bytes().to_vec()
+        );
+
+        let empty = session
+            .variable_data(
+                TensorData::from_storage([0, 2], crate::Storage::F16(Vec::new())).unwrap(),
+            )
+            .unwrap();
+        let empty_mask = session
+            .tensor_with_dtype(
+                [1, 2],
+                DType::Bool,
+                [Scalar::Bool(true), Scalar::Bool(false)],
+            )
+            .unwrap();
+        let dynamic_empty = session
+            .masked_select(&empty, &empty_mask, None, Scalar::I(0))
+            .unwrap();
+        let fixed_empty = session
+            .masked_select(&empty, &empty_mask, Some(2), Scalar::F(-0.0))
+            .unwrap();
+        assert_eq!(
+            session
+                .realize_masked_select(&dynamic_empty)
+                .unwrap()
+                .shape(),
+            &Shape::from([0])
+        );
+        let fixed_empty = session.realize_masked_select(&fixed_empty).unwrap();
+        assert_eq!(fixed_empty.shape(), &Shape::from([2]));
+        assert_eq!(fixed_empty.dtype(), DType::F16);
+        assert_eq!(
+            fixed_empty.to_le_bytes().unwrap(),
+            vec![0x00, 0x80, 0x00, 0x80]
+        );
+    }
+
+    #[test]
     fn dynamic_session_vjp_preserves_runtime_compaction_and_static_target_shape() {
         let mut session = CpuSession::new();
         let input = session
@@ -1881,6 +2164,47 @@ mod literal_tests {
         assert!(matches!(
             foreign.dynamic_vjp(&selected, &upstream, &input),
             Err(Error::SessionHandleMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn source_masked_select_vjp_routes_input_and_rejects_mask_control() {
+        let mut session = CpuSession::new();
+        let input = session
+            .variable([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap();
+        let mask = session
+            .tensor_with_dtype(
+                [1, 3],
+                DType::Bool,
+                [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+            )
+            .unwrap();
+        let dynamic = session
+            .masked_select(&input, &mask, None, Scalar::I(0))
+            .unwrap();
+        let fixed = session
+            .masked_select(&input, &mask, Some(3), Scalar::I(0))
+            .unwrap();
+        let dynamic_upstream = TensorData::new([4], vec![10.0, 20.0, 30.0, 40.0]).unwrap();
+        let fixed_upstream = TensorData::new([3], vec![10.0, 20.0, 30.0]).unwrap();
+        assert_eq!(
+            session
+                .masked_select_vjp(&dynamic, &dynamic_upstream, &input)
+                .unwrap()
+                .to_vec_f64(),
+            vec![10.0, 0.0, 20.0, 30.0, 0.0, 40.0]
+        );
+        assert_eq!(
+            session
+                .masked_select_vjp(&fixed, &fixed_upstream, &input)
+                .unwrap()
+                .to_vec_f64(),
+            vec![10.0, 0.0, 20.0, 30.0, 0.0, 0.0]
+        );
+        assert!(matches!(
+            session.masked_select_vjp(&dynamic, &dynamic_upstream, &mask),
+            Err(Error::NonDifferentiableTarget(_))
         ));
     }
 

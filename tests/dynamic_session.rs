@@ -66,10 +66,12 @@ fn dynamic_session_rejects_cross_handles_and_out_of_boundary_inputs_before_growt
     let integer = first
         .tensor_with_dtype([2], DType::I32, [Scalar::I(1), Scalar::I(2)])
         .unwrap();
-    assert!(matches!(
-        first.masked_select_dynamic(&integer, &mask),
-        Err(Error::InvalidElementwiseDType { .. })
-    ));
+    let integer_selected = first.masked_select_dynamic(&integer, &mask).unwrap();
+    assert_eq!(integer_selected.dtype(), DType::I32);
+    assert_eq!(
+        first.realize_dynamic(&integer_selected).unwrap(),
+        TensorData::from_scalars([1], DType::I32, [Scalar::I(1)]).unwrap()
+    );
     assert_eq!(first.graph().node_count(), nodes + 1);
 
     let nonscalar = first.tensor([2], [1.0, 2.0]).unwrap();

@@ -19,8 +19,8 @@ pub use compiled_momentum::{
     TrainingParameterInit,
 };
 pub use cpu::{
-    CpuGradientStore, CpuSession, DynamicTensor, MetalSessionResult, MetalSessionTrace,
-    SessionDevice, Tensor,
+    CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,
+    MetalSessionTrace, SessionDevice, Tensor,
 };
 pub use inference::{
     ModuleInferenceResult, NativeModuleExecutionReport, NativeModuleInferenceResult,
