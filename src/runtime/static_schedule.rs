@@ -5,13 +5,210 @@
 //! Metal, WebGPU, and fixed-schema CUDA graph paths.
 
 use crate::{
-    DType, Operation, ScheduleInputBinding, ScheduleItem, Shape, TensorData,
+    CapturedSchedule, DType, Operation, ReplayInput, RequestedPassthrough, ScheduleInputBinding,
+    ScheduleItem, Shape, TensorData,
     memory_plan::{ExactSlotPolicy, ExactSlotRequest, assign_exact_slots},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 mod sealed {
     pub trait Sealed {}
+}
+
+/// Authenticated host ownership around one concrete captured static prefix.
+///
+/// Rendering, allocation, and execution remain in [`StaticSchedulePlan`] and
+/// [`PreparedStaticSchedule`]. This projection only translates the capture's
+/// named inputs and owned constants into their exact logical buffer IDs, then
+/// restores requested values in capture order after a successful transaction.
+#[derive(Clone)]
+pub(crate) struct CapturedStaticExecution {
+    inputs: Vec<ReplayInput>,
+    constants: BTreeMap<u64, TensorData>,
+    passthroughs: Vec<RequestedPassthrough>,
+    requested: Vec<u64>,
+    retained: Vec<u64>,
+}
+
+impl CapturedStaticExecution {
+    pub(crate) fn new(capture: &CapturedSchedule) -> Result<Self, String> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|error| format!("captured static identity: {error}"))?;
+        if capture.is_symbolic() {
+            return Err("captured static execution requires a concrete artifact".into());
+        }
+        if capture
+            .items
+            .iter()
+            .any(|item| item.is_effect() || item.boundary.is_some())
+        {
+            return Err("captured static execution requires a pure boundary-free prefix".into());
+        }
+        if !capture.quantized_constants.is_empty()
+            || capture
+                .items
+                .iter()
+                .any(|item| !item.quantized_input_bindings.is_empty())
+        {
+            return Err("captured static execution does not admit quantized bindings".into());
+        }
+        let produced = capture
+            .items
+            .iter()
+            .flat_map(|item| item.outputs.iter().map(|output| output.id))
+            .collect::<BTreeSet<_>>();
+        let mut retained_seen = BTreeSet::new();
+        let retained = capture
+            .requested
+            .iter()
+            .copied()
+            .filter(|id| produced.contains(id) && retained_seen.insert(*id))
+            .collect::<Vec<_>>();
+        if !capture.items.is_empty() && retained.is_empty() {
+            return Err("captured static prefix has no produced requested output".into());
+        }
+        Ok(Self {
+            inputs: capture.inputs.clone(),
+            constants: capture.constants.clone(),
+            passthroughs: capture.requested_passthroughs.clone(),
+            requested: capture.requested.clone(),
+            retained,
+        })
+    }
+
+    pub(crate) fn retained(&self) -> &[u64] {
+        &self.retained
+    }
+
+    pub(crate) fn stage(
+        &self,
+        provided: &BTreeMap<String, TensorData>,
+    ) -> Result<BTreeMap<u64, TensorData>, String> {
+        let expected = self
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(extra) = provided
+            .keys()
+            .find(|name| !expected.contains(name.as_str()))
+        {
+            return Err(format!("unexpected captured static input {extra}"));
+        }
+        let mut values = self.constants.clone();
+        for input in &self.inputs {
+            let value = provided
+                .get(&input.name)
+                .ok_or_else(|| format!("missing captured static input {}", input.name))?;
+            if value.shape() != &input.desc.shape || value.dtype() != input.desc.dtype {
+                return Err(format!(
+                    "captured static input {} descriptor mismatch",
+                    input.name
+                ));
+            }
+            let bytes = value
+                .to_le_bytes()
+                .map_err(|_| format!("captured static input {} bytes", input.name))?;
+            if bytes.len() != input.desc.bytes {
+                return Err(format!(
+                    "captured static input {} byte length mismatch",
+                    input.name
+                ));
+            }
+            if values.insert(input.desc.id, value.clone()).is_some() {
+                return Err(format!(
+                    "captured static input {} aliases owned storage",
+                    input.name
+                ));
+            }
+        }
+        for passthrough in &self.passthroughs {
+            let source = values
+                .get(&(passthrough.source.index() as u64))
+                .ok_or_else(|| "captured static passthrough source is absent".to_string())?;
+            let view = passthrough
+                .desc
+                .view
+                .as_ref()
+                .ok_or_else(|| "captured static passthrough view is absent".to_string())?;
+            let value = source
+                .affine_read(view)
+                .map_err(|error| format!("captured static passthrough: {error}"))?;
+            if values
+                .insert(passthrough.requested.index() as u64, value)
+                .is_some()
+            {
+                return Err("captured static passthrough aliases another value".into());
+            }
+        }
+        Ok(values)
+    }
+
+    pub(crate) fn project(
+        &self,
+        values: &BTreeMap<u64, TensorData>,
+    ) -> Result<Vec<TensorData>, String> {
+        self.requested
+            .iter()
+            .map(|id| {
+                values
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("captured static requested value {id} is absent"))
+            })
+            .collect()
+    }
+
+    /// Runs one backend transaction around the authenticated host projection.
+    /// No requested value is observable unless staging, device execution, and
+    /// final ordered projection all succeed.
+    pub(crate) fn transact<E>(
+        &self,
+        provided: &BTreeMap<String, TensorData>,
+        invalid_binding: impl Fn(String) -> E,
+        execute: impl FnOnce(&mut BTreeMap<u64, TensorData>) -> Result<(), E>,
+    ) -> Result<Vec<TensorData>, E> {
+        let mut values = self.stage(provided).map_err(&invalid_binding)?;
+        execute(&mut values)?;
+        self.project(&values).map_err(invalid_binding)
+    }
+}
+
+/// A prepared static-device prefix paired with one authenticated capture ABI.
+///
+/// Keeping this state in a distinct type makes capture execution impossible on
+/// a raw prefix and prevents backend APIs from growing optional runtime modes.
+pub struct CapturedStaticPrefix<P> {
+    prepared: P,
+    capture: CapturedStaticExecution,
+}
+
+impl<P> CapturedStaticPrefix<P> {
+    pub(crate) fn new(prepared: P, capture: CapturedStaticExecution) -> Self {
+        Self { prepared, capture }
+    }
+
+    pub(crate) fn transact<E>(
+        &self,
+        provided: &BTreeMap<String, TensorData>,
+        invalid_binding: impl Fn(String) -> E,
+        execute: impl FnOnce(&P, &mut BTreeMap<u64, TensorData>) -> Result<(), E>,
+    ) -> Result<Vec<TensorData>, E> {
+        self.capture.transact(provided, invalid_binding, |values| {
+            execute(&self.prepared, values)
+        })
+    }
+
+    pub(crate) fn transact_mut<E>(
+        &mut self,
+        provided: &BTreeMap<String, TensorData>,
+        invalid_binding: impl Fn(String) -> E,
+        execute: impl FnOnce(&mut P, &mut BTreeMap<u64, TensorData>) -> Result<(), E>,
+    ) -> Result<Vec<TensorData>, E> {
+        self.capture.transact(provided, invalid_binding, |values| {
+            execute(&mut self.prepared, values)
+        })
+    }
 }
 
 /// One use of a logical device buffer in a renderer-owned pointer ABI.
@@ -1797,6 +1994,121 @@ mod tests {
         assert!(
             !plan.external_inputs.contains(&(producer.index() as u64)),
             "the sort source stays on device instead of becoming a host ABI"
+        );
+    }
+
+    #[test]
+    fn captured_static_projection_authenticates_and_preserves_source_requests() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let transposed = graph.permute(input, [1, 0]).unwrap();
+        let constant =
+            graph.constant(TensorData::from_storage([1], Storage::F32(vec![-0.0])).unwrap());
+        let schedule = schedule_many(&graph, &[constant, transposed]).unwrap();
+        let capture =
+            crate::CapturedSchedule::capture(&graph, &schedule, &[constant, transposed]).unwrap();
+        let projection = CapturedStaticExecution::new(&capture).unwrap();
+        assert!(projection.retained().is_empty());
+        let source = TensorData::from_storage(
+            [2, 2],
+            Storage::F32(vec![1.0, 2.0, 3.0, f32::from_bits(0x7fc0_1234)]),
+        )
+        .unwrap();
+        let values = projection
+            .stage(&BTreeMap::from([("input".into(), source)]))
+            .unwrap();
+        let outputs = projection.project(&values).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].to_le_bytes().unwrap(), [0, 0, 0, 128]);
+        let expected = TensorData::from_storage(
+            [2, 2],
+            Storage::F32(vec![1.0, 3.0, 2.0, f32::from_bits(0x7fc0_1234)]),
+        )
+        .unwrap();
+        assert_eq!(
+            outputs[1].to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap()
+        );
+
+        let mut tampered = capture.clone();
+        tampered.identity ^= 1;
+        assert!(CapturedStaticExecution::new(&tampered).is_err());
+        assert!(
+            projection
+                .stage(&BTreeMap::new())
+                .unwrap_err()
+                .contains("missing")
+        );
+        assert!(
+            projection
+                .stage(&BTreeMap::from([
+                    (
+                        "input".into(),
+                        TensorData::from_storage([2, 2], Storage::F32(vec![0.0; 4])).unwrap(),
+                    ),
+                    ("extra".into(), TensorData::scalar(0.0)),
+                ]))
+                .unwrap_err()
+                .contains("unexpected")
+        );
+    }
+
+    #[test]
+    fn captured_static_projection_preserves_external_materialization_ownership() {
+        let mut graph = Graph::new();
+        let left = graph.input_dtype("left", [1, 2], DType::F32);
+        let right = graph.input_dtype("right", [1, 2], DType::F32);
+        let addend = graph.input_dtype("addend", [1, 4], DType::F32);
+        let joined = graph.concat([left, right], 1).unwrap();
+        let output = graph.add(joined, addend).unwrap();
+        let schedule =
+            crate::schedule_with_external_materializations(&graph, &[output], &[joined]).unwrap();
+        let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        let projection = CapturedStaticExecution::new(&capture).unwrap();
+        let external_name = format!("@materialized/{}", joined.index());
+        let values = projection
+            .stage(&BTreeMap::from([
+                (
+                    "addend".into(),
+                    TensorData::new([1, 4], vec![10.0, 20.0, 30.0, 40.0]).unwrap(),
+                ),
+                (
+                    external_name,
+                    TensorData::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                ),
+            ]))
+            .unwrap();
+        assert!(values.contains_key(&(joined.index() as u64)));
+        assert!(!values.contains_key(&(left.index() as u64)));
+        assert!(!values.contains_key(&(right.index() as u64)));
+    }
+
+    #[test]
+    fn captured_static_projection_deduplicates_only_physical_retention() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2], DType::F32);
+        let output = graph.square(input).unwrap();
+        let schedule = schedule_many(&graph, &[output, output]).unwrap();
+        let capture =
+            crate::CapturedSchedule::capture(&graph, &schedule, &[output, output]).unwrap();
+        let capture = crate::CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+        assert_eq!(capture.requested, vec![output.index() as u64; 2]);
+        let projection = CapturedStaticExecution::new(&capture).unwrap();
+        assert_eq!(projection.retained(), &[output.index() as u64]);
+        StaticSchedulePlan::build(
+            &FakeAdapter(Rc::new(RefCell::new(Calls::default()))),
+            &capture.items,
+            Some(projection.retained()),
+        )
+        .unwrap();
+        let value = TensorData::new([2], vec![1.0, 4.0]).unwrap();
+        let projected = projection
+            .project(&BTreeMap::from([(output.index() as u64, value)]))
+            .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(
+            projected[0].to_le_bytes().unwrap(),
+            projected[1].to_le_bytes().unwrap()
         );
     }
 }

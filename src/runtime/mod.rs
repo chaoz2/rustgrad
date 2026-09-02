@@ -9,3 +9,5 @@ pub mod opencl;
 pub(crate) mod scalar_lane;
 pub(crate) mod static_schedule;
 pub mod webgpu;
+
+pub use static_schedule::CapturedStaticPrefix;

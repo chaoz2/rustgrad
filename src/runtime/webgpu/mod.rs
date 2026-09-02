@@ -18,8 +18,8 @@ mod transaction;
 pub use buffer::WebGpuBuffer;
 pub use dispatch::{WebGpuAdapterInfo, WebGpuBackend, WebGpuCapabilities};
 pub use narrow::WEBGPU_NARROW_ABI_VERSION;
-pub use prepared::PreparedWebGpuPrefix;
 pub(crate) use prepared::WebGpuPrefixPlan;
+pub use prepared::{CapturedWebGpuPrefix, PreparedWebGpuPrefix};
 pub use renderer::{
     RenderedWgsl, WEBGPU_ABI_VERSION, WEBGPU_STATUS_VERSION, WGSL_RENDERER_VERSION, WgslBufferAbi,
     WgslRenderer,

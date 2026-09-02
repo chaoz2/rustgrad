@@ -175,6 +175,43 @@ use std::{
 };
 
 #[test]
+fn captured_static_metal_preserves_requested_order_and_passthrough_storage() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2], DType::F32);
+    let squared = graph.square(input).unwrap();
+    let source_value =
+        TensorData::from_storage([2], Storage::F32(vec![-0.0, f32::from_bits(0x7fc0_1234)]))
+            .unwrap();
+    let source = graph.constant(source_value.clone());
+    let viewed = graph.permute(source, [0]).unwrap();
+    let schedule = crate::schedule_many(&graph, &[viewed, squared]).unwrap();
+    let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[viewed, squared]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let prepared = PreparedMetalPrefix::prepare_capture(device, &capture, renderer).unwrap();
+    let outputs = prepared
+        .execute(&BTreeMap::from([(
+            "x".into(),
+            TensorData::new([2], vec![2.0, -3.0]).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(
+        outputs[0].to_le_bytes().unwrap(),
+        source_value.to_le_bytes().unwrap()
+    );
+    assert_eq!(outputs[1].storage(), &Storage::F32(vec![4.0, 9.0]));
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn portable_sort_metal_executes_coupled_outputs_and_preserves_storage_bits() {
     let renderer = MetalRenderer::new(8, capabilities()).unwrap();
     for dtype in [DType::Bool, DType::I32, DType::U32, DType::F32] {

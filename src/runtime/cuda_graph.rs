@@ -116,6 +116,9 @@ pub struct PreparedCudaGraphPrefix {
     poisoned: bool,
 }
 
+/// An authenticated captured schedule bound to one prepared CUDA graph prefix.
+pub type CapturedCudaGraphPrefix = crate::runtime::CapturedStaticPrefix<PreparedCudaGraphPrefix>;
+
 impl PreparedCudaGraphPrefix {
     pub fn prepare(
         primary: PrimaryContext,
@@ -124,6 +127,23 @@ impl PreparedCudaGraphPrefix {
         cache: &ConcurrentPtxCache,
     ) -> Result<Self, PtxError> {
         Self::from_plan(primary, CudaGraphPrefixPlan::plan(items, renderer)?, cache)
+    }
+
+    /// Prepares one authenticated concrete captured schedule for CUDA graph execution.
+    pub fn prepare_capture(
+        primary: PrimaryContext,
+        capture: &crate::CapturedSchedule,
+        renderer: PtxRenderer,
+        cache: &ConcurrentPtxCache,
+    ) -> Result<CapturedCudaGraphPrefix, PtxError> {
+        let projection = crate::runtime::static_schedule::CapturedStaticExecution::new(capture)
+            .map_err(PtxError::InvalidBinding)?;
+        let plan =
+            CudaGraphPrefixPlan::plan_for_outputs(&capture.items, projection.retained(), renderer)?;
+        let prepared = Self::from_plan(primary, plan, cache)?;
+        Ok(crate::runtime::CapturedStaticPrefix::new(
+            prepared, projection,
+        ))
     }
 
     pub fn from_plan(
@@ -346,6 +366,18 @@ impl PreparedCudaGraphPrefix {
         if let Some(stream) = self.stream.as_mut() {
             stream.abandon_uncertain();
         }
+    }
+}
+
+impl CapturedCudaGraphPrefix {
+    /// Executes the capture transaction and returns detached outputs in request order.
+    pub fn execute(
+        &mut self,
+        inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<Vec<TensorData>, PtxError> {
+        self.transact_mut(inputs, PtxError::InvalidBinding, |prepared, values| {
+            prepared.execute(values)
+        })
     }
 }
 
@@ -593,6 +625,33 @@ mod tests {
 
     fn assert_f32(values: &BTreeMap<u64, TensorData>, id: u64, expected: &[f32]) {
         assert_eq!(values[&id].storage(), &Storage::F32(expected.to_vec()));
+    }
+
+    #[test]
+    fn captured_static_cuda_graph_projects_named_inputs_and_requested_outputs() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2], crate::DType::F32);
+        let squared = graph.square(input).unwrap();
+        let one = graph.constant(TensorData::scalar(1.0));
+        let output = graph.add(squared, one).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        let (_, primary) = make_primary();
+        let mut prepared = PreparedCudaGraphPrefix::prepare_capture(
+            primary,
+            &capture,
+            PtxRenderer::new(80).unwrap(),
+            &ConcurrentPtxCache::new(),
+        )
+        .unwrap();
+        let outputs = prepared
+            .execute(&BTreeMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![2.0, -3.0]).unwrap(),
+            )]))
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].storage(), &Storage::F32(vec![5.0, 10.0]));
     }
 
     #[test]

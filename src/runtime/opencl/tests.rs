@@ -171,6 +171,108 @@ fn portable_dense_opencl_keeps_computed_prefix_and_consumer_device_resident() {
 }
 
 #[test]
+fn captured_grouped_convolution_executes_as_one_portable_static_transaction() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [1, 2, 3, 3], DType::F32);
+    let weight = graph.input_dtype("weight", [2, 1, 2, 2], DType::F32);
+    let bias = graph.constant(TensorData::new([2], vec![-1.0, 0.25]).unwrap());
+    let output = graph
+        .convolution(
+            input,
+            weight,
+            Some(bias),
+            crate::ConvolutionSpec::new(
+                crate::SpatialWindow::new([2, 2], [1, 1], [1, 1], [(1, 0), (0, 1)]).unwrap(),
+                std::num::NonZeroUsize::new(2).unwrap(),
+                None,
+            ),
+        )
+        .unwrap();
+    let schedule = crate::schedule_many(&graph, &[output]).unwrap();
+    assert!(schedule.items.iter().any(|item| matches!(
+        item.kernel.operation(),
+        Operation::Movement(MovementValue::Plan(plan))
+            if matches!(&plan.kind, MovementKernelKind::Pad { .. })
+    )));
+    assert!(schedule.items.iter().any(|item| matches!(
+        item.kernel.operation(),
+        Operation::Movement(MovementValue::Plan(plan))
+            if matches!(&plan.kind, MovementKernelKind::Concat { .. })
+    )));
+    let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+    let capture = crate::CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+    let input_value = TensorData::new(
+        [1, 2, 3, 3],
+        (1..=18).map(|value| value as f32).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let weight_value =
+        TensorData::new([2, 1, 2, 2], vec![1.0, 0.0, 0.0, 1.0, 0.5, -1.0, 2.0, 0.0]).unwrap();
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([
+                ("input".into(), input_value.clone()),
+                ("weight".into(), weight_value.clone()),
+            ]),
+        )
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (tampered_context, _) = setup(mock.clone());
+    let tampered_owner = tampered_context.owner_id();
+    let mut tampered = capture.clone();
+    tampered.identity ^= 1;
+    let before_tamper = mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare_capture(tampered_context, &tampered, renderer),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("identity")
+    ));
+    assert_eq!(
+        &mock.calls()[before_tamper.len()..],
+        &[format!("context_release:{tampered_owner}")],
+        "capture authentication precedes programs, queues, and buffers"
+    );
+    let (context, _) = setup(mock.clone());
+    let prepared = PreparedOpenClPrefix::prepare_capture(context, &capture, renderer).unwrap();
+    let before_missing = mock.calls();
+    assert!(matches!(
+        prepared.execute(&BTreeMap::from([("input".into(), input_value.clone())])),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("weight")
+    ));
+    assert_eq!(mock.calls(), before_missing);
+    assert!(matches!(
+        prepared.execute(&BTreeMap::from([
+            ("input".into(), TensorData::new([18], vec![0.0; 18]).unwrap()),
+            ("weight".into(), weight_value.clone()),
+        ])),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("descriptor")
+    ));
+    assert_eq!(mock.calls(), before_missing);
+    let before = mock.calls();
+    let outputs = prepared
+        .execute(&BTreeMap::from([
+            ("input".into(), input_value),
+            ("weight".into(), weight_value),
+        ]))
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        outputs[0].to_le_bytes().unwrap(),
+        expected.to_le_bytes().unwrap()
+    );
+    assert_eq!(
+        mock.calls()[before.len()..]
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1,
+        "only the requested convolution result returns to the host"
+    );
+}
+
+#[test]
 fn portable_bitcast_opencl_preserves_raw_bytes_and_bool_normalization() {
     let renderer = OpenClRenderer::default();
     let mut graph = Graph::new();

@@ -24,7 +24,7 @@ pub use dispatch::{
     RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue,
 };
 pub(crate) use prepared::OpenClPrefixPlan;
-pub use prepared::PreparedOpenClPrefix;
+pub use prepared::{CapturedOpenClPrefix, PreparedOpenClPrefix};
 pub use renderer::{OpenClBufferAbi, OpenClRenderer, RenderedOpenCl};
 pub use resource::{
     OpenClCache, OpenClContext, OpenClDevice, OpenClEvent, OpenClIcd, OpenClKernel, OpenClPlatform,

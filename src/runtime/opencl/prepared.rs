@@ -159,6 +159,9 @@ pub struct PreparedOpenClPrefix {
     inner: PreparedStaticSchedule<OpenClStaticAdapter>,
 }
 
+/// An authenticated captured schedule bound to one prepared OpenCL prefix.
+pub type CapturedOpenClPrefix = crate::runtime::CapturedStaticPrefix<PreparedOpenClPrefix>;
+
 impl PreparedOpenClPrefix {
     pub fn prepare(
         context: OpenClContext,
@@ -171,6 +174,26 @@ impl PreparedOpenClPrefix {
                 items,
             )?,
         })
+    }
+
+    /// Prepares one authenticated concrete captured schedule for OpenCL execution.
+    pub fn prepare_capture(
+        context: OpenClContext,
+        capture: &crate::CapturedSchedule,
+        renderer: OpenClRenderer,
+    ) -> Result<CapturedOpenClPrefix, OpenClError> {
+        let projection = crate::runtime::static_schedule::CapturedStaticExecution::new(capture)
+            .map_err(OpenClError::InvalidBinding)?;
+        let plan = OpenClPrefixPlan::plan_for_outputs(
+            context.clone(),
+            &capture.items,
+            projection.retained(),
+            renderer,
+        )?;
+        let prepared = Self::from_plan(context, plan)?;
+        Ok(crate::runtime::CapturedStaticPrefix::new(
+            prepared, projection,
+        ))
     }
 
     pub(crate) fn from_plan(
@@ -194,6 +217,18 @@ impl PreparedOpenClPrefix {
     }
     pub fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), OpenClError> {
         self.inner.execute(values)
+    }
+}
+
+impl CapturedOpenClPrefix {
+    /// Executes the capture transaction and returns detached outputs in request order.
+    pub fn execute(
+        &self,
+        inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<Vec<TensorData>, OpenClError> {
+        self.transact(inputs, OpenClError::InvalidBinding, |prepared, values| {
+            prepared.execute(values)
+        })
     }
 }
 

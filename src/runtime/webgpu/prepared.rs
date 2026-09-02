@@ -157,6 +157,9 @@ pub struct PreparedWebGpuPrefix {
     inner: PreparedStaticSchedule<WebGpuStaticAdapter>,
 }
 
+/// An authenticated captured schedule bound to one prepared WebGPU prefix.
+pub type CapturedWebGpuPrefix = crate::runtime::CapturedStaticPrefix<PreparedWebGpuPrefix>;
+
 impl PreparedWebGpuPrefix {
     pub fn prepare(
         device: WebGpuDevice,
@@ -169,6 +172,26 @@ impl PreparedWebGpuPrefix {
                 items,
             )?,
         })
+    }
+
+    /// Prepares one authenticated concrete captured schedule for WebGPU execution.
+    pub fn prepare_capture(
+        device: WebGpuDevice,
+        capture: &crate::CapturedSchedule,
+        renderer: WgslRenderer,
+    ) -> Result<CapturedWebGpuPrefix, WebGpuError> {
+        let projection = crate::runtime::static_schedule::CapturedStaticExecution::new(capture)
+            .map_err(WebGpuError::InvalidBinding)?;
+        let plan = WebGpuPrefixPlan::plan_for_outputs(
+            device.clone(),
+            &capture.items,
+            projection.retained(),
+            renderer,
+        )?;
+        let prepared = Self::from_plan(device, plan)?;
+        Ok(crate::runtime::CapturedStaticPrefix::new(
+            prepared, projection,
+        ))
     }
 
     pub(crate) fn from_plan(
@@ -192,5 +215,17 @@ impl PreparedWebGpuPrefix {
     }
     pub fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), WebGpuError> {
         self.inner.execute(values)
+    }
+}
+
+impl CapturedWebGpuPrefix {
+    /// Executes the capture transaction and returns detached outputs in request order.
+    pub fn execute(
+        &self,
+        inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<Vec<TensorData>, WebGpuError> {
+        self.transact(inputs, WebGpuError::InvalidBinding, |prepared, values| {
+            prepared.execute(values)
+        })
     }
 }

@@ -1756,6 +1756,22 @@ coordinate-div/mod reshape, ambiguous stride signs, dynamic rank/cardinality,
 broader producer-output redirection, other movement kinds, and live-device
 validation remain fail-closed or unclaimed.
 
+`CapturedStaticExecution` is the single capture-to-device ownership projection
+for those fixed-schema executors. `CapturedStaticPrefix<P>` pairs that
+projection with a prepared backend prefix so raw prepared executors have no
+optional or runtime-invalid capture mode. The projection first authenticates the complete concrete,
+pure `CapturedSchedule`, then seeds its owned constants and exact named inputs,
+reconstructs source-owned affine passthroughs, and identifies only produced
+requested IDs as device-retained outputs. Prepared OpenCL, Metal, WebGPU, and
+CUDA prefixes consume that same projection and publish detached values only
+after their existing transaction succeeds. Logical request order and repeated
+IDs are preserved while each physical produced buffer is retained once;
+external-materialization bindings are reused without parsing capture metadata
+in a renderer. Symbolic schemas, effects or boundaries, quantized bindings,
+and any operation outside a renderer's existing static subset still reject
+before device work. RGSA, UOp, schedule, and renderer/cache identities are
+unchanged.
+
 `StaticPositionMap` is the single crate-private geometry proof for the existing
 `ScatterPositions` graph adjoint and its `ScatterPositionsVjp` reverse read. It
 validates rank, checked byte geometry, nonzero steps and both endpoints in
@@ -2431,8 +2447,9 @@ partially modified; neither route claims atomic commit. Generic captured replay
 cannot consume either sidecar. The mock uses link/request/cache,
 generic-launch/completion, and commit/rollback-phase hooks to prove successful
 rollback and the documented partial-mutation boundary; live CUDA/ptxas, broader
-operations/dtypes, payload embedding, resource discovery, and general
-captured-device replay are still outside this boundary.
+operations/dtypes, payload embedding, resource discovery, and consuming these
+linked sidecars through generic captured-device replay are still outside this
+boundary.
 
 Static sum, mean, product, min, and max UOp programs have a separate correctness-first PTX path.
 One CUDA thread owns one logical output and serially walks the normalized
