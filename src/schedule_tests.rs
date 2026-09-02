@@ -2164,7 +2164,10 @@ fn affine_contiguous_preserves_requested_shared_and_nested_view_fallbacks() {
     let output = requested_graph.contiguous(permuted).unwrap();
     let requested = schedule_many(&requested_graph, &[permuted, output]).unwrap();
     requested.validate().unwrap();
-    assert_eq!(requested.items.len(), 3);
+    assert_eq!(requested.items.len(), 2);
+    assert_eq!(requested.requested_passthroughs.len(), 1);
+    assert_eq!(requested.requested_passthroughs[0].requested, permuted);
+    assert_eq!(requested.requested_passthroughs[0].source, producer);
     assert!(requested.items.iter().any(|item| item.node == producer));
     assert!(matches!(
         requested
@@ -2255,36 +2258,132 @@ fn affine_contiguous_preserves_requested_shared_and_nested_view_fallbacks() {
 }
 
 #[test]
-fn computed_affine_read_outputs_share_one_materialized_producer() {
+fn computed_affine_requested_aliases_share_one_materialized_producer() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [2, 1], DType::F32);
     let producer = graph.square(input).unwrap();
     let expanded = graph.expand(producer, [2, 3]).unwrap();
     let scheduled = schedule_many(&graph, &[producer, expanded]).unwrap();
     scheduled.validate().unwrap();
-    assert_eq!(scheduled.items.len(), 2);
+    assert_eq!(scheduled.items.len(), 1);
     assert_eq!(scheduled.items[0].node, producer);
-    assert_eq!(scheduled.items[1].node, expanded);
-    assert_eq!(scheduled.items[1].dependencies, vec![scheduled.items[0].id]);
-    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
-        scheduled.items[1].kernel.operation()
-    else {
-        panic!("computed view must materialize through one movement plan")
-    };
-    let crate::MovementKernelKind::AffineCopy {
-        input: operand,
-        view,
-    } = &plan.kind
-    else {
-        panic!("computed view must use an affine read copy")
-    };
-    assert_eq!(operand.node, producer);
-    assert_eq!(view.strides, vec![1, 0]);
-    assert_eq!(scheduled.items[1].outputs.primary().view, None);
+    assert_eq!(scheduled.requested_passthroughs.len(), 1);
+    let alias = &scheduled.requested_passthroughs[0];
+    assert_eq!(alias.requested, expanded);
+    assert_eq!(alias.source, producer);
+    assert_eq!(alias.desc.id, producer.index() as u64);
+    assert_eq!(alias.desc.view.as_ref().unwrap().strides, vec![1, 0]);
+    assert!(scheduled.items.iter().all(|item| {
+        item.outputs
+            .iter()
+            .all(|output| output.id != expanded.index() as u64)
+    }));
+    crate::MemoryPlan::from_schedule(&scheduled, &[producer, expanded], true).unwrap();
 }
 
 #[test]
-fn diagonal_schedules_pad_then_affine_read_copy_and_keeps_zero_exact() {
+fn requested_computed_alias_stays_materialized_for_a_direct_payload_consumer() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 2], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let viewed = graph.permute(producer, [1, 0]).unwrap();
+    let rhs = graph.input_dtype("rhs", [2, 2], DType::F32);
+    let output = graph.matmul(viewed, rhs).unwrap();
+    let scheduled = schedule_many(&graph, &[viewed, output]).unwrap();
+    scheduled.validate().unwrap();
+    assert!(scheduled.requested_passthroughs.is_empty());
+    let view_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == viewed)
+        .expect("direct payload owns one dense view operand");
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = view_item.kernel.operation()
+    else {
+        panic!("direct payload view must retain its movement boundary")
+    };
+    assert!(matches!(
+        &plan.kind,
+        crate::MovementKernelKind::AffineCopy { input, .. } if input.node == producer
+    ));
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(output_item.dependencies.contains(&view_item.id));
+    crate::MemoryPlan::from_schedule(&scheduled, &[viewed, output], true).unwrap();
+}
+
+fn assert_requested_direct_payload_alias_is_materialized(
+    scheduled: &crate::Schedule,
+    viewed: crate::NodeId,
+    producer: crate::NodeId,
+    output: crate::NodeId,
+) {
+    scheduled.validate().unwrap();
+    assert!(scheduled.requested_passthroughs.is_empty());
+    let view_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == viewed)
+        .expect("direct payload owns one dense view operand");
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = view_item.kernel.operation()
+    else {
+        panic!("direct payload view must retain its movement boundary")
+    };
+    assert!(matches!(
+        &plan.kind,
+        crate::MovementKernelKind::AffineCopy { input, .. } if input.node == producer
+    ));
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .filter(|binding| binding.input_node == viewed)
+            .map(|binding| binding.desc.view.as_ref())
+            .collect::<Vec<_>>(),
+        vec![None]
+    );
+    assert!(output_item.dependencies.contains(&view_item.id));
+    crate::MemoryPlan::from_schedule(scheduled, &[viewed, output], true).unwrap();
+}
+
+#[test]
+fn requested_computed_alias_stays_materialized_for_all_direct_payload_abis() {
+    let mut guarded = Graph::new();
+    let input = guarded.input_dtype("input", [2, 2], DType::F32);
+    let producer = guarded.square(input).unwrap();
+    let viewed = guarded.permute(producer, [1, 0]).unwrap();
+    let output = guarded.tensor_guard_distribution(viewed, 1).unwrap();
+    let scheduled = schedule_many(&guarded, &[viewed, output]).unwrap();
+    assert_requested_direct_payload_alias_is_materialized(&scheduled, viewed, producer, output);
+
+    let mut convolution = Graph::new();
+    let input = convolution.input_dtype("input", [1, 1, 2, 2], DType::F32);
+    let producer = convolution.square(input).unwrap();
+    let viewed = convolution.permute(producer, [0, 1, 3, 2]).unwrap();
+    let weight = convolution.input_dtype("weight", [1, 1, 1, 1], DType::F32);
+    let output = convolution.push(
+        crate::Op::Conv2d {
+            input: viewed,
+            weight,
+            bias: None,
+            options: crate::Conv2dOptions::default(),
+        },
+        Shape::from([1, 1, 2, 2]),
+        DType::F32,
+    );
+    let scheduled = schedule_many(&convolution, &[viewed, output]).unwrap();
+    assert_requested_direct_payload_alias_is_materialized(&scheduled, viewed, producer, output);
+}
+
+#[test]
+fn diagonal_requests_affine_alias_of_one_materialized_pad_and_keeps_zero_exact() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [3, 3], DType::F32);
     let diagonal = graph.diagonal_default(input).unwrap();
@@ -2301,26 +2400,22 @@ fn diagonal_schedules_pad_then_affine_read_copy_and_keeps_zero_exact() {
             )
         })
         .unwrap();
-    let copied = scheduled
-        .items
-        .iter()
-        .find(|item| item.node == diagonal)
-        .unwrap();
-    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = copied.kernel.operation()
-    else {
-        panic!("diagonal output must be an affine copy")
-    };
-    let crate::MovementKernelKind::AffineCopy {
-        input: operand,
-        view,
-    } = &plan.kind
-    else {
-        panic!("diagonal output must be an affine copy")
-    };
-    assert_eq!(operand.node, pad.node);
+    assert_eq!(scheduled.items.len(), 2);
+    assert_eq!(scheduled.requested_passthroughs.len(), 1);
+    let alias = &scheduled.requested_passthroughs[0];
+    assert_eq!(alias.requested, diagonal);
+    assert_eq!(alias.source, pad.node);
+    let view = alias.desc.view.as_ref().unwrap();
     assert_eq!(view.logical_shape, Shape::from([3]));
     assert_eq!(view.strides, vec![4]);
-    assert!(copied.dependencies.contains(&pad.id));
+    assert!(scheduled.items.iter().all(|item| {
+        item.outputs
+            .iter()
+            .all(|output| output.id != diagonal.index() as u64)
+    }));
+    let memory = crate::MemoryPlan::from_schedule(&scheduled, &[diagonal], true).unwrap();
+    assert_eq!(memory.temporaries.len(), 1);
+    assert_ne!(memory.temporaries[0].buffer_id, alias.source.index() as u64);
 
     let mut zero = Graph::new();
     let input = zero.input_dtype("input", [0, 3], DType::F32);
@@ -2340,7 +2435,7 @@ fn diagonal_schedules_pad_then_affine_read_copy_and_keeps_zero_exact() {
 }
 
 #[test]
-fn computed_reverse_view_retains_signed_affine_read_metadata() {
+fn computed_reverse_requested_alias_retains_signed_affine_read_metadata() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [4], DType::F32);
     let producer = graph.square(input).unwrap();
@@ -2356,21 +2451,15 @@ fn computed_reverse_view_retains_signed_affine_read_metadata() {
         .unwrap();
     let scheduled = schedule(&graph, reversed).unwrap();
     scheduled.validate().unwrap();
-    let item = scheduled
-        .items
-        .iter()
-        .find(|item| item.node == reversed)
-        .unwrap();
-    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = item.kernel.operation()
-    else {
-        panic!("computed reverse must be a movement plan")
-    };
-    let crate::MovementKernelKind::AffineCopy { view, .. } = &plan.kind else {
-        panic!("computed reverse must be an affine copy")
-    };
+    assert_eq!(scheduled.items.len(), 1);
+    assert_eq!(scheduled.items[0].node, producer);
+    assert_eq!(scheduled.requested_passthroughs.len(), 1);
+    let alias = &scheduled.requested_passthroughs[0];
+    assert_eq!(alias.requested, reversed);
+    assert_eq!(alias.source, producer);
+    let view = alias.desc.view.as_ref().unwrap();
     assert_eq!(view.offset, 3);
     assert_eq!(view.strides, vec![-1]);
-    assert_eq!(item.outputs.primary().view, None);
 }
 
 #[test]
@@ -3080,6 +3169,41 @@ fn reduction_epilogue_fusion_respects_requested_shared_and_shape_boundaries() {
     )
     .unwrap();
     assert_eq!(actual.outputs[0].storage(), expected.storage());
+}
+
+#[test]
+fn reduction_epilogue_cannot_absorb_a_requested_alias_owner() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", Shape::from([2, 3]));
+    let reduced = graph.sum(input, 1).unwrap();
+    let reshaped = graph.reshape(reduced, [2, 1]).unwrap();
+    let alias = graph.expand(reshaped, [2, 4]).unwrap();
+    let bias = graph.input("bias", Shape::from([2]));
+    let epilogue = graph.add(reduced, bias).unwrap();
+
+    let scheduled = schedule_many(&graph, &[alias, epilogue]).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.requested_passthroughs.len(), 1);
+    assert_eq!(scheduled.requested_passthroughs[0].requested, alias);
+    assert_eq!(scheduled.requested_passthroughs[0].source, reduced);
+    let reduction = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == reduced)
+        .expect("requested alias keeps its exact reduction owner");
+    let consumer = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == epilogue)
+        .expect("epilogue remains a separate consumer");
+    assert!(consumer.dependencies.contains(&reduction.id));
+    assert!(
+        consumer
+            .input_bindings
+            .iter()
+            .any(|binding| binding.input_node == reduced)
+    );
+    crate::MemoryPlan::from_schedule(&scheduled, &[alias, epilogue], true).unwrap();
 }
 
 #[test]

@@ -346,7 +346,17 @@ impl CpuSymbolicProgram {
 }
 
 fn preflight_memory(capture: &CapturedSchedule) -> Result<MemoryPlan, ReplayError> {
-    let requested = capture.requested.iter().copied().collect::<BTreeSet<_>>();
+    let requested = capture
+        .requested
+        .iter()
+        .copied()
+        .chain(
+            capture
+                .requested_passthroughs
+                .iter()
+                .map(|alias| alias.source.index() as u64),
+        )
+        .collect::<BTreeSet<_>>();
     let temporaries = capture
         .items
         .iter()
@@ -749,6 +759,7 @@ fn execute(
         .iter()
         .map(|position| capture.requested[*position])
         .collect::<Vec<_>>();
+    values.project_requested_aliases(&capture.requested_passthroughs)?;
     let outputs = values.requested(&requested)?;
     let (peak_temporary_allocations, peak_temporary_bytes) = arena.finish(memory)?;
     Ok(SymbolicExecution {

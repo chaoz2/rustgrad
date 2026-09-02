@@ -8402,8 +8402,8 @@ mod tests {
     fn computed_reverse_item(dtype: DType) -> crate::ScheduleItem {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [4], dtype);
-        let producer = graph.square(input).unwrap();
-        let output = graph
+        let producer = graph.pad(input, [(0, 0)], Scalar::I(0)).unwrap();
+        let viewed = graph
             .stride(
                 producer,
                 [crate::Slice {
@@ -8413,6 +8413,7 @@ mod tests {
                 }],
             )
             .unwrap();
+        let output = graph.contiguous(viewed).unwrap();
         crate::schedule(&graph, output)
             .unwrap()
             .items

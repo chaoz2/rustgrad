@@ -6,6 +6,29 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
+
+/// Graph operands whose scheduled payload ABI names the exact dense NodeId.
+/// These operations cannot reconstruct an intervening computed alias through
+/// the ordinary scalar IndexView path.
+fn op_direct_payload_operands(op: &Op) -> Vec<NodeId> {
+    match op {
+        Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
+        Op::PrefixScan { input, .. } | Op::Sort { input, .. } | Op::TensorGuard { input, .. } => {
+            vec![*input]
+        }
+        Op::Threefry { counter, key } => vec![*counter, *key],
+        Op::Conv2d {
+            input,
+            weight,
+            bias,
+            ..
+        } => [Some(*input), Some(*weight), *bias]
+            .into_iter()
+            .flatten()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 pub mod artifact;
 pub(crate) mod dynamic;
 pub mod execution_summary;
@@ -30,10 +53,11 @@ pub struct BufferDesc {
     pub view: Option<crate::AffineView>,
 }
 
-/// One requested logical value that is an immutable affine read of an
-/// existing graph-owned input or constant. It deliberately is not a schedule
-/// item: `source` remains the sole physical owner and `requested` names only
-/// the ordered logical result projected through `desc.view`.
+/// One requested logical value that is an affine read of one existing storage
+/// owner. It deliberately is not a schedule item: `source` remains the sole
+/// physical owner (an immutable graph source or one scheduled producer) and
+/// `requested` names only the ordered logical result projected through
+/// `desc.view`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RequestedPassthrough {
     pub requested: NodeId,
@@ -68,14 +92,9 @@ impl RequestedPassthrough {
     pub(crate) fn validate_against_graph(&self, graph: &Graph) -> Result<(), ScheduleError> {
         self.validate()?;
         let rangeified = crate::rangeify::static_view(graph, self.requested)
+            .or_else(|_| crate::rangeify::computed_view(graph, self.requested))
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
-        if rangeified.source != self.source
-            || self.desc.view.as_ref() != Some(&rangeified.view)
-            || !matches!(
-                graph.op(self.source).map_err(ScheduleError::Graph)?,
-                Op::Input { .. } | Op::Constant(_)
-            )
-        {
+        if rangeified.source != self.source || self.desc.view.as_ref() != Some(&rangeified.view) {
             return Err(ScheduleError::Binding(
                 "requested passthrough diverges from its graph view".into(),
             ));
@@ -89,6 +108,22 @@ impl RequestedPassthrough {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn project(
+        &self,
+        source: &crate::TensorData,
+    ) -> Result<crate::TensorData, ScheduleError> {
+        self.validate()?;
+        if source.shape() != &self.desc.shape || source.dtype() != self.desc.dtype {
+            return Err(ScheduleError::Binding(
+                "requested passthrough source value is inconsistent".into(),
+            ));
+        }
+        let view = self.desc.view.as_ref().expect("validated view");
+        source
+            .affine_read(view)
+            .map_err(|error| ScheduleError::Binding(error.to_string()))
     }
 }
 
@@ -213,7 +248,7 @@ pub struct ScheduleItem {
 #[derive(Clone, Debug)]
 pub struct Schedule {
     pub items: Vec<ScheduleItem>,
-    /// Zero-kernel requested aliases of immutable Input/Constant storage.
+    /// Zero-kernel requested aliases of one immutable or scheduled owner.
     pub requested_passthroughs: Vec<RequestedPassthrough>,
     /// Explicit edges from a materialized pure output to an effect STORE
     /// source. Ordinary pure schedules keep this empty.
@@ -336,6 +371,7 @@ impl Schedule {
             ));
         }
         let mut output_producers = BTreeMap::new();
+        let mut output_descs = BTreeMap::new();
         for item in &self.items {
             for output in item.outputs.iter() {
                 if output_producers.insert(output.id, item.id).is_some() {
@@ -343,19 +379,27 @@ impl Schedule {
                         "scheduled output has multiple producers".into(),
                     ));
                 }
+                output_descs.insert(output.id, output);
             }
         }
         let mut passthrough_ids = BTreeSet::new();
         for passthrough in &self.requested_passthroughs {
             passthrough.validate()?;
             let requested = passthrough.requested.index() as u64;
-            if !passthrough_ids.insert(requested)
-                || output_producers.contains_key(&requested)
-                || output_producers.contains_key(&passthrough.desc.id)
-            {
+            if !passthrough_ids.insert(requested) || output_producers.contains_key(&requested) {
                 return Err(ScheduleError::Binding(
                     "requested passthrough has conflicting ownership".into(),
                 ));
+            }
+            if let Some(output) = output_descs.get(&passthrough.desc.id) {
+                let mut physical = passthrough.desc.clone();
+                physical.view = None;
+                physical.read_only = false;
+                if *output != &physical {
+                    return Err(ScheduleError::Binding(
+                        "requested passthrough producer descriptor is inconsistent".into(),
+                    ));
+                }
             }
         }
         self.validate_dag_edges(&ids)?;
@@ -479,10 +523,15 @@ impl Schedule {
     /// future allocator. Requested outputs and external identities are kept
     /// out of this list, so a planner cannot accidentally reuse them.
     pub fn internal_temporaries(&self, requested: &[NodeId]) -> Vec<BufferDesc> {
-        let requested = requested
+        let mut requested = requested
             .iter()
             .map(|node| node.index() as u64)
             .collect::<BTreeSet<_>>();
+        requested.extend(
+            self.requested_passthroughs
+                .iter()
+                .map(|passthrough| passthrough.source.index() as u64),
+        );
         self.items
             .iter()
             .flat_map(|item| item.outputs.iter())
@@ -2113,8 +2162,8 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
 }
 
 /// Symbolic families retain explicit computed-affine producer and movement
-/// boundaries because their specialized kernel and buffer schema are
-/// authenticated independently.
+/// boundaries; a terminal requested view remains a separately authenticated
+/// zero-kernel alias of that producer.
 pub(crate) fn schedule_many_for_symbolic_capture(
     graph: &Graph,
     outputs: &[NodeId],
@@ -2416,15 +2465,12 @@ fn schedule_many_with_external(
         {
             continue;
         }
-        let Ok(rangeified) = crate::rangeify::static_view(graph, requested_node) else {
+        let Ok(rangeified) = crate::rangeify::static_view(graph, requested_node)
+            .or_else(|_| crate::rangeify::computed_view(graph, requested_node))
+        else {
             continue;
         };
-        if rangeified.source == requested_node
-            || !matches!(
-                graph.op(rangeified.source).map_err(ScheduleError::Graph)?,
-                Op::Input { .. } | Op::Constant(_)
-            )
-        {
+        if rangeified.source == requested_node {
             continue;
         }
         let requested_shape = graph.shape(requested_node).map_err(ScheduleError::Graph)?;
@@ -2448,61 +2494,18 @@ fn schedule_many_with_external(
         requested_passthrough_ids.insert(requested_node.index());
         requested_passthroughs.push(passthrough);
     }
-    // A matmul payload consumes materialized dense operands; computed operands
-    // therefore become roots even when they have only this one consumer.
-    let matmul_operands = needed
+    // Direct-payload operations authenticate dense operand identities in
+    // their typed plan. Keep every computed operand materialized even when a
+    // requested alias could otherwise publish its producer directly.
+    let direct_payload_operands = needed
         .iter()
-        .filter_map(|index| match graph.op(NodeId::from_index(*index)) {
-            Ok(Op::Matmul { lhs, rhs }) => Some([lhs.index(), rhs.index()]),
-            _ => None,
+        .flat_map(|index| {
+            graph
+                .op(NodeId::from_index(*index))
+                .map(op_direct_payload_operands)
+                .unwrap_or_default()
         })
-        .flatten()
-        .filter(|index| {
-            !matches!(
-                graph.op(NodeId::from_index(*index)),
-                Ok(Op::Input { .. } | Op::Constant(_))
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    // Prefix-scan payloads likewise name one dense logical input directly;
-    // unlike an elementwise Store DAG they cannot reconstruct a computed
-    // operand from its leaves during graph-free captured replay.
-    let prefix_scan_operands = needed
-        .iter()
-        .filter_map(|index| match graph.op(NodeId::from_index(*index)) {
-            Ok(Op::PrefixScan { input, .. }) => Some(input.index()),
-            _ => None,
-        })
-        .filter(|index| {
-            !matches!(
-                graph.op(NodeId::from_index(*index)),
-                Ok(Op::Input { .. } | Op::Constant(_))
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    // Sort is another direct payload boundary: its coupled output item names
-    // one dense input descriptor and cannot reconstruct a computed operand
-    // from scalar leaves during replay.
-    let sort_operands = needed
-        .iter()
-        .filter_map(|index| match graph.op(NodeId::from_index(*index)) {
-            Ok(Op::Sort { input, .. }) => Some(input.index()),
-            _ => None,
-        })
-        .filter(|index| {
-            !matches!(
-                graph.op(NodeId::from_index(*index)),
-                Ok(Op::Input { .. } | Op::Constant(_))
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let threefry_operands = needed
-        .iter()
-        .filter_map(|index| match graph.op(NodeId::from_index(*index)) {
-            Ok(Op::Threefry { counter, key }) => Some([counter.index(), key.index()]),
-            _ => None,
-        })
-        .flatten()
+        .map(NodeId::index)
         .filter(|index| {
             !matches!(
                 graph.op(NodeId::from_index(*index)),
@@ -2536,9 +2539,10 @@ fn schedule_many_with_external(
             )
         })
         .collect::<BTreeSet<_>>();
-    // A computed affine view is materialized as its own dense movement item.
-    // Its producer must consequently be a schedule root even when the view is
-    // its only consumer, so the copy has an owned input ABI.
+    // A computed affine view normally materializes as its own dense movement
+    // item, while a terminal requested alias keeps only its physical source.
+    // Either way that source must remain a schedule root when the view is its
+    // only consumer, so the copy or final projection has an owned input ABI.
     let computed_view_sources = needed
         .iter()
         .filter_map(|index| {
@@ -2580,11 +2584,7 @@ fn schedule_many_with_external(
         // roots even when their storage source is caller-owned; the payload
         // must depend on the intervening materialization.
         .filter(|index| {
-            !matmul_operands.contains(index)
-                && !prefix_scan_operands.contains(index)
-                && !sort_operands.contains(index)
-                && !threefry_operands.contains(index)
-                && !movement_operands.contains(index)
+            !direct_payload_operands.contains(index) && !movement_operands.contains(index)
         })
         .filter_map(|index| {
             let id = NodeId::from_index(*index);
@@ -2607,16 +2607,16 @@ fn schedule_many_with_external(
     // rather than publishing conflicting passthrough/output ownership.
     requested_passthroughs.retain(|passthrough| {
         let id = passthrough.requested.index();
-        !matmul_operands.contains(&id)
-            && !prefix_scan_operands.contains(&id)
-            && !sort_operands.contains(&id)
-            && !threefry_operands.contains(&id)
-            && !movement_operands.contains(&id)
+        !direct_payload_operands.contains(&id) && !movement_operands.contains(&id)
     });
     requested_passthrough_ids = requested_passthroughs
         .iter()
         .map(|passthrough| passthrough.requested.index())
         .collect();
+    let requested_passthrough_sources = requested_passthroughs
+        .iter()
+        .map(|passthrough| passthrough.source.index())
+        .collect::<BTreeSet<_>>();
     let mut roots: BTreeSet<usize> = needed
         .iter()
         .copied()
@@ -2638,10 +2638,7 @@ fn schedule_many_with_external(
                     })
                 )
                 && (requested.contains(index)
-                    || matmul_operands.contains(index)
-                    || prefix_scan_operands.contains(index)
-                    || sort_operands.contains(index)
-                    || threefry_operands.contains(index)
+                    || direct_payload_operands.contains(index)
                     || movement_operands.contains(index)
                     || computed_view_sources.contains(index)
                     || (consumers[*index] > 1
@@ -2679,6 +2676,7 @@ fn schedule_many_with_external(
                 };
             (roots.contains(&reduction.index())
                 && !requested.contains(&reduction.index())
+                && !requested_passthrough_sources.contains(&reduction.index())
                 && !external.contains(&reduction.index())
                 && crate::kernel::reduction_epilogue_node_uses(
                     graph,
@@ -2700,6 +2698,7 @@ fn schedule_many_with_external(
             roots
                 .iter()
                 .chain(&requested)
+                .chain(&requested_passthrough_sources)
                 .chain(external)
                 .filter(|nested| **nested != *root && **nested != *reduction)
                 .all(|nested| {
@@ -2711,6 +2710,7 @@ fn schedule_many_with_external(
                     .is_ok_and(|uses| {
                         uses == 0
                             || (!requested.contains(nested)
+                                && !requested_passthrough_sources.contains(nested)
                                 && !external.contains(nested)
                                 && uses == consumers[*nested])
                     })
@@ -2739,11 +2739,9 @@ fn schedule_many_with_external(
         for nested in roots.iter().copied() {
             if nested != root
                 && !requested.contains(&nested)
+                && !requested_passthrough_sources.contains(&nested)
                 && !external.contains(&nested)
-                && !matmul_operands.contains(&nested)
-                && !prefix_scan_operands.contains(&nested)
-                && !sort_operands.contains(&nested)
-                && !threefry_operands.contains(&nested)
+                && !direct_payload_operands.contains(&nested)
                 && !movement_operands.contains(&nested)
                 && crate::kernel::reduction_epilogue_node_uses(
                     graph,
@@ -2773,6 +2771,7 @@ fn schedule_many_with_external(
         .values()
         .flat_map(|rehearsal| rehearsal.fusion.load_nodes.iter().copied())
         .chain(rehearsed_epilogues.keys().copied())
+        .chain(requested_passthrough_sources.iter().copied())
         .collect::<BTreeSet<_>>();
     let mut accepted_epilogues =
         BTreeMap::<usize, (BTreeSet<usize>, ReductionEpilogueFusion)>::new();
@@ -2817,10 +2816,8 @@ fn schedule_many_with_external(
     let mut scalar_alias_loads = fused_epilogues
         .values()
         .flat_map(|fusion| fusion.load_nodes.iter().copied())
-        .chain(matmul_operands.iter().copied())
-        .chain(prefix_scan_operands.iter().copied())
-        .chain(sort_operands.iter().copied())
-        .chain(threefry_operands.iter().copied())
+        .chain(direct_payload_operands.iter().copied())
+        .chain(requested_passthrough_sources.iter().copied())
         .collect::<BTreeSet<_>>();
     let epilogue_reserved = scalar_alias_loads
         .iter()

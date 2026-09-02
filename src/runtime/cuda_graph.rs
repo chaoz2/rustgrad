@@ -829,7 +829,8 @@ impl CudaSymbolicResult {
 /// kernel-node parameters in place; incompatible and zero/nonzero topology
 /// transitions prepare a replacement only after complete symbolic and static
 /// plan validation. A source-owned requested-view-only specialization has no
-/// device topology and remains a resource-free host projection.
+/// device topology and remains a resource-free host projection; a computed
+/// requested view retains only its producer's device buffer.
 pub struct CudaSymbolicProgram {
     inner: StaticSymbolicProgram<CudaSymbolicBackend>,
 }
@@ -1311,10 +1312,10 @@ mod tests {
     fn computed_reverse_affine_copy_replays_as_one_device_resident_prefix() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [4], crate::DType::I32);
-        let squared = graph.square(input).unwrap();
+        let producer = graph.pad(input, [(0, 0)], crate::Scalar::I(0)).unwrap();
         let reversed = graph
             .stride(
-                squared,
+                producer,
                 [crate::Slice {
                     start: None,
                     stop: None,
@@ -1322,7 +1323,8 @@ mod tests {
                 }],
             )
             .unwrap();
-        let schedule = crate::schedule(&graph, reversed).unwrap();
+        let copied = graph.contiguous(reversed).unwrap();
+        let schedule = crate::schedule(&graph, copied).unwrap();
         assert_eq!(schedule.items.len(), 2);
         assert!(matches!(
             schedule.items[1].kernel.operation(),
@@ -1331,15 +1333,15 @@ mod tests {
         ));
 
         let (mock, primary) = make_primary();
-        let mut prepared = prepare_outputs(primary, &schedule, &[reversed.index() as u64]);
+        let mut prepared = prepare_outputs(primary, &schedule, &[copied.index() as u64]);
         assert_eq!(prepared.kernel_cache_keys().len(), 2);
         let mut values = BTreeMap::from([(
             input.index() as u64,
-            TensorData::from_storage([4], Storage::I32(vec![1, -2, 3, -4])).unwrap(),
+            TensorData::from_storage([4], Storage::I32(vec![1, 4, 9, 16])).unwrap(),
         )]);
         prepared.execute(&mut values).unwrap();
         assert_eq!(
-            values[&(reversed.index() as u64)].storage(),
+            values[&(copied.index() as u64)].storage(),
             &Storage::I32(vec![16, 9, 4, 1])
         );
         let calls = mock.calls();
@@ -1355,13 +1357,16 @@ mod tests {
     fn computed_broadcast_affine_copy_keeps_zero_stride_on_cuda_graph() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2, 1], crate::DType::F32);
-        let squared = graph.square(input).unwrap();
-        let expanded = graph.expand(squared, [2, 3]).unwrap();
-        let schedule = crate::schedule(&graph, expanded).unwrap();
+        let producer = graph
+            .pad(input, [(0, 0), (0, 0)], crate::Scalar::I(0))
+            .unwrap();
+        let expanded = graph.expand(producer, [2, 3]).unwrap();
+        let copied = graph.contiguous(expanded).unwrap();
+        let schedule = crate::schedule(&graph, copied).unwrap();
         let movement = schedule
             .items
             .iter()
-            .find(|item| item.node == expanded)
+            .find(|item| item.node == copied)
             .unwrap();
         let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
             movement.kernel.operation()
@@ -1374,14 +1379,14 @@ mod tests {
         assert_eq!(view.strides, vec![1, 0]);
 
         let (_, primary) = make_primary();
-        let mut prepared = prepare_outputs(primary, &schedule, &[expanded.index() as u64]);
+        let mut prepared = prepare_outputs(primary, &schedule, &[copied.index() as u64]);
         let mut values = BTreeMap::from([(
             input.index() as u64,
-            TensorData::from_storage([2, 1], Storage::F32(vec![2.0, -3.0])).unwrap(),
+            TensorData::from_storage([2, 1], Storage::F32(vec![4.0, 9.0])).unwrap(),
         )]);
         prepared.execute(&mut values).unwrap();
         assert_eq!(
-            values[&(expanded.index() as u64)].storage(),
+            values[&(copied.index() as u64)].storage(),
             &Storage::F32(vec![4.0, 4.0, 4.0, 9.0, 9.0, 9.0])
         );
     }
@@ -2165,6 +2170,90 @@ mod tests {
             &malformed_actual[malformed_calls.len()..],
             ["primary_release"]
         );
+    }
+
+    #[test]
+    fn symbolic_cuda_projects_computed_affine_alias_from_one_retained_buffer() {
+        let extent = SymbolicExpr::variable("extent", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], crate::DType::F32);
+        let producer = graph.square(input).unwrap();
+        let alias = graph
+            .stride(
+                producer,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        let schedule = crate::schedule_many(&graph, &[alias, alias]).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.requested_passthroughs.len(), 1);
+        assert_eq!(schedule.requested_passthroughs[0].source, producer);
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[alias, alias],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap();
+        let cpu = CpuSymbolicProgram::new(capture.clone()).unwrap();
+        let (mock, primary) = make_primary();
+        let mut malformed = capture.clone();
+        malformed.requested_passthroughs[0].source = alias;
+        malformed.requested_passthroughs[0].desc.id = alias.index() as u64;
+        malformed.identity = 0;
+        malformed.identity = crate::schedule::artifact::identity(&malformed).unwrap();
+        let calls = mock.calls();
+        assert!(
+            CudaSymbolicProgram::new(primary.clone(), malformed, PtxRenderer::new(80).unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            mock.calls(),
+            calls,
+            "malformed alias must fail before CUDA work"
+        );
+        let cuda =
+            CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
+        let invocation = |extent: usize| {
+            SymbolicInvocation::new()
+                .with_symbol("extent", extent as i64)
+                .with_input(
+                    "input",
+                    TensorData::new([extent], (1..=extent).map(|value| value as f32).collect())
+                        .unwrap(),
+                )
+        };
+
+        let calls = mock.calls();
+        let empty = cuda.run(invocation(0)).unwrap();
+        assert_eq!(empty.outputs().len(), 2);
+        assert_eq!(empty.outputs()[0].shape(), &Shape::from([0]));
+        assert_eq!(mock.calls(), calls, "zero alias remains resource-free");
+
+        let expected = cpu.run(invocation(3)).unwrap();
+        let populated = cuda.run(invocation(3)).unwrap();
+        for (actual, expected) in populated.outputs().iter().zip(expected.outputs()) {
+            assert_eq!(
+                actual.to_le_bytes().unwrap(),
+                expected.to_le_bytes().unwrap()
+            );
+        }
+        assert_eq!(populated.outputs()[0].to_vec_f64(), vec![9.0, 4.0, 1.0]);
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|call| **call == "alloc").count(), 2);
+        assert_eq!(
+            calls.iter().filter(|call| **call == "graph_launch").count(),
+            1
+        );
+        assert_eq!(calls.iter().filter(|call| **call == "dtoh").count(), 1);
     }
 
     #[test]
