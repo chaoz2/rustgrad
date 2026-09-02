@@ -227,6 +227,13 @@ pub(crate) trait StaticSymbolicBackend: sealed::Sealed {
     fn plan(&self, capture: &CapturedSchedule, retained: &[u64])
     -> Result<Self::Plan, Self::Error>;
     fn prepare(&self, plan: Self::Plan) -> Result<Self::Prepared, Self::Error>;
+    fn rebind(
+        &self,
+        _prepared: &mut Self::Prepared,
+        plan: Self::Plan,
+    ) -> StaticSymbolicRebind<Self::Plan, Self::Error> {
+        StaticSymbolicRebind::Prepare(plan)
+    }
     fn execute(
         &self,
         prepared: &mut Self::Prepared,
@@ -235,9 +242,29 @@ pub(crate) trait StaticSymbolicBackend: sealed::Sealed {
     fn cache_keys(&self, prepared: &Self::Prepared) -> Vec<String>;
 }
 
+/// Result of attempting to reuse one prepared device executable for a new
+/// authenticated concrete specialization. Backends that cannot update an
+/// executable return the untouched plan through `Prepare`.
+pub(crate) enum StaticSymbolicRebind<P, E> {
+    Rebound,
+    Prepare(P),
+    /// `cached_valid` is true only when the backend failed before mutating the
+    /// cached executable. Partial graph-node updates must return false.
+    Failed {
+        error: E,
+        cached_valid: bool,
+    },
+}
+
 struct CachedStaticSpecialization<P> {
     identity: u64,
     prepared: P,
+}
+
+struct PreparedStaticExecution<P> {
+    prepared: P,
+    outputs: Vec<TensorData>,
+    cache_keys: Vec<String>,
 }
 
 /// Shared invocation transaction for a bounded symbolic body and one static
@@ -297,10 +324,38 @@ impl<B: StaticSymbolicBackend> StaticSymbolicProgram<B> {
             .lock()
             .map_err(|_| B::internal_error("static symbolic cache lock poisoned".into()))?;
 
-        let (outputs, prepared_now, cache_keys) = if let Some(entry) = cached
-            .as_mut()
-            .filter(|entry| entry.identity == concrete_identity)
-        {
+        let (outputs, prepared_now, cache_keys) = if let Some(entry) = cached.as_mut() {
+            let rebound = if entry.identity != concrete_identity {
+                match self.backend.rebind(&mut entry.prepared, plan) {
+                    StaticSymbolicRebind::Rebound => true,
+                    StaticSymbolicRebind::Prepare(plan) => {
+                        let candidate = self.prepare_and_execute(plan, &projection, &mut values)?;
+                        *entry = CachedStaticSpecialization {
+                            identity: concrete_identity,
+                            prepared: candidate.prepared,
+                        };
+                        return Ok(StaticSymbolicRun {
+                            outputs: candidate.outputs,
+                            body_identity: self.body.capture().identity,
+                            concrete_identity,
+                            bindings: bound.canonical,
+                            prepared_now: true,
+                            cache_keys: candidate.cache_keys,
+                        });
+                    }
+                    StaticSymbolicRebind::Failed {
+                        error,
+                        cached_valid,
+                    } => {
+                        if !cached_valid {
+                            *cached = None;
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                false
+            };
             let result = self
                 .backend
                 .execute(&mut entry.prepared, &mut values)
@@ -308,8 +363,9 @@ impl<B: StaticSymbolicBackend> StaticSymbolicProgram<B> {
                 .and_then(|outputs| self.order_outputs(outputs));
             match result {
                 Ok(outputs) => {
+                    entry.identity = concrete_identity;
                     let cache_keys = self.backend.cache_keys(&entry.prepared);
-                    (outputs, false, cache_keys)
+                    (outputs, rebound, cache_keys)
                 }
                 Err(error) => {
                     // A backend failure may have uncertain device
@@ -321,18 +377,12 @@ impl<B: StaticSymbolicBackend> StaticSymbolicProgram<B> {
                 }
             }
         } else {
-            let mut candidate = self.backend.prepare(plan)?;
-            self.backend.execute(&mut candidate, &mut values)?;
-            let outputs = projection
-                .project(&values)
-                .map_err(B::invalid_binding)
-                .and_then(|outputs| self.order_outputs(outputs))?;
-            let cache_keys = self.backend.cache_keys(&candidate);
+            let candidate = self.prepare_and_execute(plan, &projection, &mut values)?;
             *cached = Some(CachedStaticSpecialization {
                 identity: concrete_identity,
-                prepared: candidate,
+                prepared: candidate.prepared,
             });
-            (outputs, true, cache_keys)
+            (candidate.outputs, true, candidate.cache_keys)
         };
 
         Ok(StaticSymbolicRun {
@@ -341,6 +391,26 @@ impl<B: StaticSymbolicBackend> StaticSymbolicProgram<B> {
             concrete_identity,
             bindings: bound.canonical,
             prepared_now,
+            cache_keys,
+        })
+    }
+
+    fn prepare_and_execute(
+        &self,
+        plan: B::Plan,
+        projection: &CapturedStaticExecution,
+        values: &mut BTreeMap<u64, TensorData>,
+    ) -> Result<PreparedStaticExecution<B::Prepared>, B::Error> {
+        let mut candidate = self.backend.prepare(plan)?;
+        self.backend.execute(&mut candidate, values)?;
+        let outputs = projection
+            .project(values)
+            .map_err(B::invalid_binding)
+            .and_then(|outputs| self.order_outputs(outputs))?;
+        let cache_keys = self.backend.cache_keys(&candidate);
+        Ok(PreparedStaticExecution {
+            prepared: candidate,
+            outputs,
             cache_keys,
         })
     }
@@ -622,6 +692,7 @@ pub(crate) struct StaticItemPlan<R> {
     extent: usize,
     buffer_ids: Vec<u64>,
     input_ids: Vec<u64>,
+    dependencies: Vec<usize>,
 }
 
 /// Fully validated schedule/render/buffer graph. Constructing this type is pure
@@ -860,6 +931,11 @@ impl<R> StaticSchedulePlan<R> {
                     .map(|buffer| buffer.id)
                     .collect(),
                 input_ids,
+                dependencies: item
+                    .dependencies
+                    .iter()
+                    .map(|dependency| usize::try_from(*dependency).map_err(|_| A::overflow()))
+                    .collect::<Result<Vec<_>, _>>()?,
             });
         }
 
@@ -1079,6 +1155,10 @@ impl<R> StaticItemPlan<R> {
 
     pub(crate) fn buffer_ids(&self) -> &[u64] {
         &self.buffer_ids
+    }
+
+    pub(crate) fn dependencies(&self) -> &[usize] {
+        &self.dependencies
     }
 }
 

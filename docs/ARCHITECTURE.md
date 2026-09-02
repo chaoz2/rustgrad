@@ -1801,11 +1801,24 @@ capture identity. A miss is installed only after execution and final ordered
 duplicate projection succeed; any cached execution failure evicts the entry.
 The first public adapter is `CudaSymbolicProgram`, which reuses
 `CudaGraphPrefixPlan`, `PreparedCudaGraphPrefix`, stable leases, and existing
-fence/poison/quarantine behavior. It does not update CUDA graph node parameters
-across bindings: a different successful nonzero-work binding prepares a new
-concrete graph, while a successful zero-work binding caches a resource-free
-specialization. The existing concurrent PTX cache may be program-owned or
-explicitly shared. No
+fence/poison/quarantine behavior. Its symbolic-only preparation path constructs
+an explicit kernel-node graph from authenticated schedule dependency ordinals;
+canonical prior-active edges retain the serial order assumed by static slot
+liveness. It retains the source graph plus exact node handles and keeps the
+original node-parameter modules and pointer owners immutable until source-graph
+destruction, separately from the replaceable executable generation. A different
+positive-work binding with the same active topology loads and allocates its checked
+specialization, then updates function, grid/block extent, and device-pointer
+arguments on that one executable. Identical identities issue no node update;
+zero/nonzero and changed-topology transitions prepare a replacement, while
+successful zero-work bindings remain resource-free. A failed candidate before
+the first node update leaves the prior entry valid; a partial update or any
+subsequent execution/projection failure evicts it, with uncertain execution
+using the existing quarantine path. Ordinary stream-captured CUDA prefixes are
+unchanged. This follows checked-in tinygrad's retained graph/node-parameter
+model while keeping RustGrad's static topology and typed schedule proof
+explicit. The existing concurrent PTX cache may be program-owned or explicitly
+shared. No
 operation, UOp, schedule, artifact, or renderer identity changes, and symbolic
 OpenCL/Metal/WebGPU execution remains unclaimed. Directly requested symbolic
 Inputs project from their authenticated source ownership, but affine requested

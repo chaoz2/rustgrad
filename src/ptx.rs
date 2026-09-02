@@ -349,7 +349,7 @@ impl RenderedPtx {
         }
     }
 
-    fn launch_config(&self, block_size: u32) -> Result<LaunchConfig, PtxError> {
+    pub(crate) fn launch_config(&self, block_size: u32) -> Result<LaunchConfig, PtxError> {
         match self.launch {
             PtxLaunchGeometry::Linear => {
                 let grid = self
@@ -7685,6 +7685,40 @@ impl PrimaryPtxKernel {
         if self.rendered.extent == 0 {
             return Ok(false);
         }
+        let mut words = self.checked_launch_words(bindings)?;
+        let mut args: Vec<*mut c_void> = words.iter_mut().map(|x| (x as *mut u64).cast()).collect();
+        self.function.launch(
+            self.rendered.launch_config(self.block_size)?,
+            stream,
+            &mut args,
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn kernel_node_launch(
+        self: &Arc<Self>,
+        bindings: &[PtxBinding<'_>],
+    ) -> Result<crate::cuda::PrimaryKernelNodeLaunch, PtxError> {
+        if !self.module.belongs_to_primary(&self.primary) {
+            return Err(PtxError::Cuda(CudaError::ContextMismatch));
+        }
+        if self.rendered.extent == 0 {
+            return Err(PtxError::InvalidBinding(
+                "zero-extent PTX has no CUDA graph kernel node".into(),
+            ));
+        }
+        let words = self.checked_launch_words(bindings)?;
+        self.function
+            .primary_kernel_node_launch(
+                &self.primary,
+                self.rendered.launch_config(self.block_size)?,
+                words,
+                self.clone(),
+            )
+            .map_err(Into::into)
+    }
+
+    fn checked_launch_words(&self, bindings: &[PtxBinding<'_>]) -> Result<Vec<u64>, PtxError> {
         let mut words = Vec::with_capacity(bindings.len() + 1);
         for (index, (want, got)) in self.rendered.buffers.iter().zip(bindings).enumerate() {
             if want.dtype != got.dtype || want.mutable != got.mutable {
@@ -7710,13 +7744,7 @@ impl PrimaryPtxKernel {
             words.push(pointer);
         }
         words.push(self.rendered.extent as u64);
-        let mut args: Vec<*mut c_void> = words.iter_mut().map(|x| (x as *mut u64).cast()).collect();
-        self.function.launch(
-            self.rendered.launch_config(self.block_size)?,
-            stream,
-            &mut args,
-        )?;
-        Ok(true)
+        Ok(words)
     }
     fn attach_primary_completion(
         &self,
