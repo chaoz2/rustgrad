@@ -12274,15 +12274,16 @@ fn live_threefry_matches_source_vectors_and_captured_graph_structure() {
         },
     )
     .unwrap();
-    assert!(matches!(
-        metal.render(kernel),
-        Err(crate::runtime::metal::MetalError::Unsupported(_))
-    ));
-    let opencl = crate::runtime::opencl::OpenClRenderer::new(8).unwrap();
-    assert!(matches!(
-        opencl.render(kernel),
-        Err(crate::runtime::opencl::OpenClError::Unsupported(_))
-    ));
+    let metal = metal.render(kernel).unwrap();
+    assert_eq!(metal.buffers.len(), 3);
+    let opencl = crate::runtime::opencl::OpenClRenderer::with_capabilities(
+        8,
+        crate::runtime::opencl::OpenClCapabilities::FULL,
+    )
+    .unwrap()
+    .render(kernel)
+    .unwrap();
+    assert_eq!(opencl.buffers.len(), 3);
     let wgsl = crate::runtime::webgpu::WgslRenderer::new(
         8,
         crate::runtime::webgpu::WebGpuCapabilities {
@@ -12295,12 +12296,8 @@ fn live_threefry_matches_source_vectors_and_captured_graph_structure() {
         },
     )
     .unwrap();
-    assert!(matches!(
-        wgsl.render(kernel),
-        Err(crate::runtime::webgpu::WebGpuError::Unsupported(_))
-    ));
-    // These are generic typed renderer gates. Their separate zero-input
-    // Random emitters are not evidence for this dependency-bearing graph.
+    let wgsl = wgsl.render(kernel).unwrap();
+    assert_eq!(wgsl.buffers.len(), 3);
     let captured = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
     let encoded = captured.to_bytes().unwrap();
     let decoded = crate::CapturedSchedule::from_bytes(&encoded).unwrap();

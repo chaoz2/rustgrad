@@ -1,9 +1,96 @@
 use super::renderer::{
     OPENCL_ABI_VERSION, OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
     OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION, OPENCL_PORTABLE_SORT_RENDERER_VERSION,
-    OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
-    OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
+    OPENCL_PORTABLE_THREEFRY_RENDERER_VERSION, OPENCL_RAW_COPY_RENDERER_VERSION,
+    OPENCL_RENDERER_VERSION, OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
 };
+
+#[test]
+fn portable_threefry_opencl_renders_broadcast_alias_and_executes_exact_bits() {
+    let renderer = OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL).unwrap();
+    let mut graph = Graph::new();
+    let counter = graph.input_dtype("counter", [2, 1], DType::U64);
+    let key = graph.input_dtype("key", [1, 3], DType::U64);
+    let output = graph.threefry(counter, key).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!((rendered.extent, rendered.buffers.len()), (6, 3));
+    assert!(
+        rendered
+            .source
+            .contains(OPENCL_PORTABLE_THREEFRY_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("rg_x1 << 13u"));
+    let counters = TensorData::from_storage(
+        [2, 1],
+        Storage::U64(vec![0x0000_0007_0000_0001, 0x0000_000d_ffff_ffff]),
+    )
+    .unwrap();
+    let keys = TensorData::from_storage(
+        [1, 3],
+        Storage::U64(vec![0x0000_0539_0000_0000, 5, 0x0000_0001_ffff_ffff]),
+    )
+    .unwrap();
+    let expected =
+        crate::random::execute_live_threefry(&counters, &keys, graph.shape(output).unwrap())
+            .unwrap();
+    let values = BTreeMap::from([
+        (counter.index() as u64, counters),
+        (key.index() as u64, keys),
+    ]);
+    let (actual, _) = execute_mock_rendered(&rendered, renderer, &values);
+    assert_eq!(actual, expected.to_le_bytes().unwrap());
+
+    let mut alias = Graph::new();
+    let words = alias.input_dtype("words", [4], DType::U64);
+    let output = alias.threefry(words, words).unwrap();
+    let item = schedule(&alias, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert_eq!(rendered.buffers.len(), 2);
+
+    let core32 = OpenClRenderer::new(8).unwrap();
+    assert!(matches!(
+        core32.render(&item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("64-bit integer")
+    ));
+
+    let mut empty = Graph::new();
+    let counter = empty.input_dtype("counter", [0, 3], DType::U64);
+    let key = empty.input_dtype("key", [1, 3], DType::U64);
+    let output = empty.threefry(counter, key).unwrap();
+    let items = schedule(&empty, output).unwrap().items;
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let before = mock.calls();
+    let prefix = PreparedOpenClPrefix::prepare(context, &items, renderer).unwrap();
+    let after_prepare = mock.calls();
+    let mut missing = BTreeMap::new();
+    assert!(matches!(
+        prefix.execute(&mut missing),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("missing prefix input")
+    ));
+    assert_eq!(mock.calls(), after_prepare);
+    let mut realized = BTreeMap::from([
+        (
+            counter.index() as u64,
+            TensorData::from_storage([0, 3], Storage::U64(Vec::new())).unwrap(),
+        ),
+        (
+            key.index() as u64,
+            TensorData::from_storage([1, 3], Storage::U64(vec![0, 1, 2])).unwrap(),
+        ),
+    ]);
+    prefix.execute(&mut realized).unwrap();
+    assert!(realized[&(output.index() as u64)].is_empty());
+    assert!(!mock.calls()[before.len()..].iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("queue_create:")
+            || call.starts_with("launch:")
+    }));
+}
 
 #[test]
 fn portable_sort_opencl_executes_coupled_outputs_and_zero_domain_atomically() {

@@ -26,6 +26,7 @@ pub const WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str = "rustgrad-wgsl-porta
 pub const WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
     "rustgrad-wgsl-portable-prefix-scan-v1";
 pub const WGSL_PORTABLE_SORT_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-sort-v1";
+pub const WGSL_PORTABLE_THREEFRY_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-threefry-v1";
 /// Ordered storage-plus-extent bind-group ABI version.
 pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
@@ -126,6 +127,14 @@ impl RenderedWgsl {
                 .validate_schedule_bindings(bindings)
                 .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
         }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Threefry(value) = root.operation()
+        {
+            crate::portable_threefry::PortableThreefry::new(value)
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(WebGpuError::InvalidBinding(
                 "schedule/WebGPU input count mismatch".into(),
@@ -211,16 +220,46 @@ impl RenderedWgsl {
             }
             _ => None,
         };
+        let portable_threefry = match self.semantic_program.as_ref() {
+            super::dispatch::KernelSemanticProgram::UOp(root)
+                if matches!(root.operation(), Operation::Threefry(_)) =>
+            {
+                let Operation::Threefry(value) = root.operation() else {
+                    unreachable!("guarded above")
+                };
+                Some(
+                    crate::portable_threefry::PortableThreefry::new(value).map_err(|error| {
+                        match error {
+                            crate::portable_threefry::PortableThreefryError::Unsupported(
+                                reason,
+                            ) => WebGpuError::Unsupported(reason.into()),
+                            crate::portable_threefry::PortableThreefryError::Overflow => {
+                                WebGpuError::Overflow
+                            }
+                            other => WebGpuError::InvalidBinding(other.to_string()),
+                        }
+                    })?,
+                )
+            }
+            _ => None,
+        };
         if let Some(portable) = portable_scan.as_ref() {
-            validate_portable_prefix_scan_launch(
+            validate_portable_serial_launch(
                 portable.launch_extent(),
                 self.local_size,
                 &self.capabilities,
             )?;
         }
         if let Some(portable) = portable_sort.as_ref() {
-            validate_portable_prefix_scan_launch(
+            validate_portable_serial_launch(
                 portable.launch_extent(),
+                self.local_size,
+                &self.capabilities,
+            )?;
+        }
+        if let Some(portable) = portable_threefry.as_ref() {
+            validate_portable_serial_launch(
+                portable.elements(),
                 self.local_size,
                 &self.capabilities,
             )?;
@@ -276,7 +315,16 @@ impl RenderedWgsl {
         }
         let mut ids = BTreeSet::new();
         for buffer in &self.buffers {
-            if raw_movement.is_none() {
+            if portable_threefry.is_some() {
+                if buffer.dtype != DType::U64
+                    || buffer.view.is_some()
+                    || buffer.elements > u32::MAX as usize / 2 + 1
+                {
+                    return Err(WebGpuError::InvalidBinding(
+                        "portable Threefry requires addressable dense U64 storage".into(),
+                    ));
+                }
+            } else if raw_movement.is_none() {
                 supported_storage(buffer.dtype)?;
             } else if !matches!(buffer.dtype.itemsize(), 1 | 2 | 4 | 8) {
                 return Err(WebGpuError::Unsupported(
@@ -314,10 +362,39 @@ impl RenderedWgsl {
                 }
             }
         }
+        if let Some(portable) = portable_threefry.as_ref() {
+            if self.buffers.len() != portable.inputs().len() + 1 {
+                return Err(WebGpuError::InvalidBinding(
+                    "portable Threefry artifact buffer count mismatch".into(),
+                ));
+            }
+            for (buffer, input) in self.buffers.iter().zip(portable.inputs()) {
+                if buffer.id != input.node.index() as u64
+                    || buffer.source_shape != input.shape
+                    || buffer.elements != input.elements
+                    || buffer.mutable
+                {
+                    return Err(WebGpuError::InvalidBinding(
+                        "portable Threefry artifact input ABI mismatch".into(),
+                    ));
+                }
+            }
+            let output = self.buffers.last().expect("nonempty checked above");
+            if output.id != portable.value().output.index() as u64
+                || output.source_shape != portable.value().output_shape
+                || output.elements != portable.elements()
+                || !output.mutable
+            {
+                return Err(WebGpuError::InvalidBinding(
+                    "portable Threefry artifact output ABI mismatch".into(),
+                ));
+            }
+        }
         let expected_extent = portable_scan
             .as_ref()
             .map(|scan| scan.launch_extent())
             .or_else(|| portable_sort.as_ref().map(|sort| sort.launch_extent()))
+            .or_else(|| portable_threefry.as_ref().map(|plan| plan.elements()))
             .unwrap_or_else(|| {
                 self.buffers
                     .last()
@@ -520,6 +597,9 @@ impl WgslRenderer {
         if let Operation::Sort(value) = root.operation() {
             return render_portable_sort(self, root, value);
         }
+        if let Operation::Threefry(value) = root.operation() {
+            return render_portable_threefry(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -539,12 +619,9 @@ impl WgslRenderer {
         if let Operation::Random(plan) = root.operation() {
             return super::random::render(self, plan);
         }
-        if matches!(
-            root.operation(),
-            Operation::TensorGuard(_) | Operation::Threefry(_)
-        ) {
+        if matches!(root.operation(), Operation::TensorGuard(_)) {
             return Err(WebGpuError::Unsupported(
-                "guards and live Threefry are outside WebGPU lowering".into(),
+                "guards are outside WebGPU lowering".into(),
             ));
         }
         root.validate()
@@ -894,7 +971,7 @@ impl WgslRenderer {
     }
 }
 
-fn validate_portable_prefix_scan_launch(
+fn validate_portable_serial_launch(
     extent: usize,
     local_size: u32,
     capabilities: &WebGpuCapabilities,
@@ -907,10 +984,123 @@ fn validate_portable_prefix_scan_launch(
     let extent = u32::try_from(extent).map_err(|_| WebGpuError::Overflow)?;
     if extent.div_ceil(local_size) > capabilities.max_compute_workgroups_per_dimension {
         return Err(WebGpuError::Unsupported(
-            "prefix-scan launch exceeds adapter workgroup-count limit".into(),
+            "portable launch exceeds adapter workgroup-count limit".into(),
         ));
     }
     Ok(())
+}
+
+fn render_portable_threefry(
+    renderer: &WgslRenderer,
+    root: &UOp,
+    value: &crate::ThreefryValue,
+) -> Result<RenderedWgsl, WebGpuError> {
+    root.validate()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::portable_threefry::PortableThreefry::new(value).map_err(|error| match error {
+            crate::portable_threefry::PortableThreefryError::Unsupported(reason) => {
+                WebGpuError::Unsupported(reason.into())
+            }
+            crate::portable_threefry::PortableThreefryError::Overflow => WebGpuError::Overflow,
+            other => WebGpuError::InvalidBinding(other.to_string()),
+        })?;
+    validate_portable_serial_launch(
+        portable.elements(),
+        renderer.local_size,
+        &renderer.capabilities,
+    )?;
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| WgslBufferAbi {
+            id: input.node.index() as u64,
+            dtype: DType::U64,
+            source_shape: input.shape.clone(),
+            elements: input.elements,
+            mutable: false,
+            view: None,
+        })
+        .collect::<Vec<_>>();
+    let schedule_inputs = buffers.clone();
+    buffers.push(WgslBufferAbi {
+        id: value.output.index() as u64,
+        dtype: DType::U64,
+        source_shape: value.output_shape.clone(),
+        elements: portable.elements(),
+        mutable: true,
+        view: None,
+    });
+    if buffers.len() > renderer.capabilities.max_storage_buffers_per_shader_stage as usize {
+        return Err(WebGpuError::Unsupported(
+            "portable Threefry bindings exceed adapter limit".into(),
+        ));
+    }
+    for buffer in &buffers {
+        if buffer.elements > u32::MAX as usize / 2 + 1 {
+            return Err(WebGpuError::Unsupported(
+                "portable Threefry exceeds packed WGSL word indexing".into(),
+            ));
+        }
+        if buffer.physical_bytes()? > renderer.capabilities.max_buffer_size {
+            return Err(WebGpuError::Unsupported(
+                "portable Threefry binding exceeds adapter buffer limit".into(),
+            ));
+        }
+    }
+    let entry = format!("rg_wgsl_threefry_e{}", portable.elements());
+    let mut lines = vec![format!(
+        "// {WGSL_PORTABLE_THREEFRY_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION}"
+    )];
+    for (index, buffer) in buffers.iter().enumerate() {
+        let access = if buffer.mutable { "read_write" } else { "read" };
+        lines.push(format!(
+            "@group(0) @binding({index}) var<storage, {access}> b{index}: array<u32>;"
+        ));
+    }
+    lines.extend([
+        "struct RustGradExtent { value: u32, };".into(),
+        format!(
+            "@group(0) @binding({}) var<uniform> rg_extent: RustGradExtent;",
+            buffers.len()
+        ),
+        format!("@compute @workgroup_size({}, 1, 1)", renderer.local_size),
+        format!("fn {entry}(@builtin(global_invocation_id) rg_global: vec3<u32>) {{"),
+        "  let gid: u32 = rg_global.x;".into(),
+        "  if (gid >= rg_extent.value) { return; }".into(),
+    ]);
+    lines.extend(crate::portable_threefry::emit_portable_threefry_body(
+        &portable,
+        &crate::portable_threefry::WgslPortableThreefryDialect,
+    ));
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        WGSL_PORTABLE_THREEFRY_RENDERER_VERSION,
+        WEBGPU_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedWgsl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.elements(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        local_size: renderer.local_size,
+        transaction: None,
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    };
+    rendered.validate_artifact()?;
+    Ok(rendered)
 }
 
 fn render_portable_sort(
@@ -928,7 +1118,7 @@ fn render_portable_sort(
             crate::portable_sort::PortableSortError::Overflow => WebGpuError::Overflow,
             other => WebGpuError::InvalidBinding(other.to_string()),
         })?;
-    validate_portable_prefix_scan_launch(
+    validate_portable_serial_launch(
         portable.launch_extent(),
         renderer.local_size,
         &renderer.capabilities,
@@ -1287,7 +1477,7 @@ fn render_portable_prefix_scan(
             crate::prefix_scan_native::PortablePrefixScanError::Overflow => WebGpuError::Overflow,
             other => WebGpuError::InvalidBinding(other.to_string()),
         })?;
-    validate_portable_prefix_scan_launch(
+    validate_portable_serial_launch(
         portable.launch_extent(),
         renderer.local_size,
         &renderer.capabilities,
