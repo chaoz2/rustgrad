@@ -193,10 +193,11 @@ pub use movement_plan::{
 };
 pub use nn::{
     ActivationFn, AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool1d, BatchNorm, BatchNorm2d,
-    BatchNorm3d, BatchNormOutput, BertEncoderLayer, BertEncoderLayerConfig, CastPolicy,
-    ConvTranspose1d, ConvTranspose2d, Flatten, GroupNorm, InstanceNorm, LiveStateDict, LoadReport,
-    MaxPool1d, Mode, ModeForwardOutput, ModeModuleForward, ModeSequential, Module, ModuleForward,
-    Parameter, ParameterId, ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU,
+    BatchNorm3d, BatchNormOutput, BertEmbeddings, BertEncoder, BertEncoderLayer,
+    BertEncoderLayerConfig, BertModel, BertModelConfig, CastPolicy, ConvTranspose1d,
+    ConvTranspose2d, Flatten, GroupNorm, InstanceNorm, LiveStateDict, LoadReport, MaxPool1d, Mode,
+    ModeForwardOutput, ModeModuleForward, ModeSequential, Module, ModuleForward, Parameter,
+    ParameterId, ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU,
     RealizedBatchNormStats, StateDict as ModuleStateDict, StrictStateLoadLimits, TransformerBlock,
     get_parameters, get_state_dict,
 };
