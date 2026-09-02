@@ -6,7 +6,9 @@ use super::{
 use crate::engine::symbolic::{
     SpecializedFrom, SymbolicGuard, SymbolicItemDomain, SymbolicParameter, SymbolicSchema,
 };
+use crate::engine::symbolic_projected::SymbolicProjectedIndexMap;
 use crate::engine::symbolic_view::SymbolicViewMap;
+use crate::projected_index::ProjectedExpr;
 use crate::tensor::artifact as tensor_artifact;
 use crate::uop::artifact::{
     ArtifactError, Reader, Writer, checksum, decode as decode_uop, dtype, dtype_tag,
@@ -15,7 +17,7 @@ use crate::uop::artifact::{
 };
 use crate::{
     CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
-    SymbolicShape, SymbolicVar,
+    SymbolicExpr, SymbolicShape, SymbolicVar,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,7 +28,8 @@ const MAGIC: &[u8; 4] = b"RGSA";
 /// preserving every v1-v7 decoder and payload.
 /// v9 removes the nonsemantic symbolic Reduction input-buffer word while
 /// retaining authenticated v8 decode and deterministic current re-encoding.
-const VERSION: u8 = 9;
+/// v10 authenticates binding-independent projected-index expressions.
+const VERSION: u8 = 10;
 const LAST_OPAQUE_KEY_VERSION: u8 = 6;
 const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 // The executable envelope supports ordered outputs; the inspection-only
@@ -35,7 +38,7 @@ const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 /// distinct magic and identity domain from the released single-output
 /// executable artifact above.
 const MULTI_MAGIC: &[u8; 4] = b"RGSO";
-const MULTI_VERSION: u8 = 4;
+const MULTI_VERSION: u8 = 5;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -286,6 +289,25 @@ fn write_payload_v8(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     write_requested_passthroughs(w, &c.requested_passthroughs)
 }
 
+#[cfg(test)]
+fn write_payload_v9(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_base(w, c, true, true, true)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema_v9(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    write_requested_passthroughs(w, &c.requested_passthroughs)
+}
+
 fn write_requested_passthroughs(
     w: &mut Writer,
     passthroughs: &[crate::RequestedPassthrough],
@@ -440,6 +462,43 @@ fn write_scheduled_outputs_payload_v3(
     write_requested_passthroughs(w, &c.requested_passthroughs)
 }
 
+#[cfg(test)]
+fn write_scheduled_outputs_payload_v4(
+    w: &mut Writer,
+    c: &CapturedSchedule,
+) -> Result<(), ArtifactError> {
+    write_len(w, c.items.len(), MAX_ITEMS)?;
+    for item in &c.items {
+        write_scheduled_outputs_item(w, item)?;
+    }
+    write_len(w, c.inputs.len(), MAX_BINDINGS)?;
+    for input in &c.inputs {
+        w.string(&input.name)?;
+        w.u64(input.node.index() as u64)?;
+        write_desc_inner(w, &input.desc, false)?;
+    }
+    write_len(w, c.constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.constants {
+        w.u64(*id)?;
+        tensor_artifact::encode_into(w, value)?;
+    }
+    write_u64s(w, &c.requested)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema_v9(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    write_requested_passthroughs(w, &c.requested_passthroughs)
+}
+
 fn read_payload(
     r: &mut Reader<'_>,
     identity: u64,
@@ -472,7 +531,12 @@ fn read_payload(
     }
     let requested = read_u64s(r)?;
     let symbolic = if version >= 2 && r.bool()? {
-        Some(read_symbolic_schema(r, version, version <= 8)?)
+        Some(read_symbolic_schema(
+            r,
+            version,
+            version <= 8,
+            version >= 10,
+        )?)
     } else {
         None
     };
@@ -544,7 +608,7 @@ fn read_scheduled_outputs_payload(
     }
     let requested = read_u64s(r)?;
     let symbolic = if r.bool()? {
-        Some(read_symbolic_schema(r, 4, version <= 3)?)
+        Some(read_symbolic_schema(r, 4, version <= 3, version >= 5)?)
     } else {
         None
     };
@@ -1529,18 +1593,25 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
 
 fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
     write_symbolic_schema_core(w, schema, None)?;
-    write_symbolic_schema_sidecars(w, schema)
+    write_symbolic_schema_sidecars(w, schema, true)
 }
 
 #[cfg(test)]
 fn write_symbolic_schema_v8(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
     write_symbolic_schema_core(w, schema, Some(0xfeed_face_dead_beef))?;
-    write_symbolic_schema_sidecars(w, schema)
+    write_symbolic_schema_sidecars(w, schema, false)
+}
+
+#[cfg(test)]
+fn write_symbolic_schema_v9(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
+    write_symbolic_schema_core(w, schema, None)?;
+    write_symbolic_schema_sidecars(w, schema, false)
 }
 
 fn write_symbolic_schema_sidecars(
     w: &mut Writer,
     schema: &SymbolicSchema,
+    projected: bool,
 ) -> Result<(), ArtifactError> {
     write_len(w, schema.views.len(), MAX_BINDINGS)?;
     for ((item, buffer), view) in &schema.views {
@@ -1557,6 +1628,17 @@ fn write_symbolic_schema_sidecars(
     write_len(w, schema.splat_constants.len(), MAX_BINDINGS)?;
     for buffer in &schema.splat_constants {
         w.u64(*buffer)?;
+    }
+    if projected {
+        write_len(w, schema.projected.len(), MAX_BINDINGS)?;
+        for ((item, ordinal), map) in &schema.projected {
+            w.u64(*item)?;
+            w.u32(*ordinal)?;
+            write_symbolic_shape(w, &map.source_shape)?;
+            write_symbolic_shape(w, &map.output_shape)?;
+            let mut nodes = 0;
+            write_projected_expr(w, &map.expression, 0, &mut nodes)?;
+        }
     }
     Ok(())
 }
@@ -1650,6 +1732,7 @@ fn read_symbolic_schema(
     r: &mut Reader<'_>,
     version: u8,
     legacy_reduction_buffer: bool,
+    projected_sidecar: bool,
 ) -> Result<SymbolicSchema, ArtifactError> {
     let count = r.count(MAX_BINDINGS)?;
     let mut parameters = Vec::with_capacity(count);
@@ -1721,6 +1804,7 @@ fn read_symbolic_schema(
     }
     let mut views = BTreeMap::new();
     let mut splat_constants = BTreeSet::new();
+    let mut projected = BTreeMap::new();
     if version >= 3 {
         let count = r.count(MAX_BINDINGS)?;
         let mut previous = None;
@@ -1757,6 +1841,26 @@ fn read_symbolic_schema(
             splat_constants.insert(buffer);
         }
     }
+    if projected_sidecar {
+        let count = r.count(MAX_BINDINGS)?;
+        let mut previous = None;
+        for _ in 0..count {
+            let key = (r.u64()?, r.u32()?);
+            if previous.is_some_and(|previous| key <= previous) {
+                return Err(ArtifactError::Format("symbolic projected order"));
+            }
+            previous = Some(key);
+            let mut nodes = 0;
+            let map = SymbolicProjectedIndexMap {
+                source_shape: read_symbolic_shape(r)?,
+                output_shape: read_symbolic_shape(r)?,
+                expression: read_projected_expr(r, 0, &mut nodes)?,
+            };
+            if projected.insert(key, map).is_some() {
+                return Err(ArtifactError::Format("duplicate symbolic projected index"));
+            }
+        }
+    }
     Ok(SymbolicSchema {
         parameters,
         template_values,
@@ -1764,8 +1868,68 @@ fn read_symbolic_schema(
         buffer_shapes,
         item_domains,
         views,
+        projected,
         splat_constants,
     })
+}
+
+fn write_projected_expr(
+    w: &mut Writer,
+    expression: &ProjectedExpr<SymbolicExpr>,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), ArtifactError> {
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or(ArtifactError::Format("symbolic projected nodes"))?;
+    if depth > crate::projected_index::MAX_PROJECTED_INDEX_DEPTH
+        || *nodes > crate::projected_index::MAX_PROJECTED_INDEX_NODES
+    {
+        return Err(ArtifactError::Format("symbolic projected depth"));
+    }
+    match expression {
+        ProjectedExpr::Linear => w.u8(0),
+        ProjectedExpr::Constant(value) => {
+            w.u8(1)?;
+            write_symbolic(w, value, 0)
+        }
+        ProjectedExpr::Binary {
+            operation,
+            lhs,
+            rhs,
+        } => {
+            w.u8(2)?;
+            w.u8(crate::uop::artifact::binary_tag(*operation))?;
+            write_projected_expr(w, lhs, depth + 1, nodes)?;
+            write_projected_expr(w, rhs, depth + 1, nodes)
+        }
+    }
+}
+
+fn read_projected_expr(
+    r: &mut Reader<'_>,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<ProjectedExpr<SymbolicExpr>, ArtifactError> {
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or(ArtifactError::Format("symbolic projected nodes"))?;
+    if depth > crate::projected_index::MAX_PROJECTED_INDEX_DEPTH
+        || *nodes > crate::projected_index::MAX_PROJECTED_INDEX_NODES
+    {
+        return Err(ArtifactError::Format("symbolic projected depth"));
+    }
+    match r.u8()? {
+        0 => Ok(ProjectedExpr::Linear),
+        1 => Ok(ProjectedExpr::Constant(read_symbolic(r, 0)?)),
+        2 => ProjectedExpr::binary(
+            crate::uop::artifact::binary_from_tag(r.u8()?)?,
+            read_projected_expr(r, depth + 1, nodes)?,
+            read_projected_expr(r, depth + 1, nodes)?,
+        )
+        .map_err(|_| ArtifactError::Format("symbolic projected operation")),
+        _ => Err(ArtifactError::Format("symbolic projected tag")),
+    }
 }
 
 fn write_symbolic_shape(w: &mut Writer, shape: &SymbolicShape) -> Result<(), ArtifactError> {
@@ -1944,6 +2108,20 @@ mod tests {
         writer.out
     }
 
+    fn legacy_scheduled_outputs_v4(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_scheduled_outputs_payload_v4(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MULTI_MAGIC).unwrap();
+        writer.u8(4).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
     fn legacy_v1(capture: &CapturedSchedule) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
@@ -1998,6 +2176,20 @@ mod tests {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
         writer.u8(8).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
+    fn legacy_v9(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_payload_v9(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(9).unwrap();
         writer.u64(identity).unwrap();
         writer.bytes(&payload.out).unwrap();
         let sum = checksum(&writer.out);
@@ -2362,7 +2554,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_v8_symbolic_reduction_discards_buffer_word_and_reencodes_v9() {
+    fn historical_v8_symbolic_reduction_discards_buffer_word_and_reencodes_current() {
         let capture = symbolic_reduction_fixture();
         let historical = legacy_v8(&capture);
         assert_eq!(historical[4], 8);
@@ -2375,7 +2567,23 @@ mod tests {
     }
 
     #[test]
-    fn historical_rgso_v3_symbolic_reduction_rekeys_and_reencodes_v4() {
+    fn historical_v9_symbolic_schema_rekeys_and_reencodes_v10() {
+        let capture = symbolic_fixture();
+        let historical = legacy_v9(&capture);
+        assert_eq!(historical[4], 9);
+        let upgraded = decode(&historical).unwrap();
+        assert_eq!(upgraded.symbolic, capture.symbolic);
+        assert_ne!(
+            upgraded.identity,
+            u64::from_le_bytes(historical[5..13].try_into().unwrap())
+        );
+        let current = encode(&upgraded).unwrap();
+        assert_eq!(current[4], VERSION);
+        assert_eq!(encode(&decode(&current).unwrap()).unwrap(), current);
+    }
+
+    #[test]
+    fn historical_rgso_v3_symbolic_reduction_rekeys_and_reencodes_current() {
         let capture = symbolic_reduction_fixture();
         let historical = legacy_scheduled_outputs_v3(&capture);
         assert_eq!(historical[4], 3);
@@ -2391,6 +2599,21 @@ mod tests {
             u64::from_le_bytes(current[5..13].try_into().unwrap()),
             upgraded.identity
         );
+        assert_eq!(
+            encode_scheduled_outputs(&decode_scheduled_outputs(&current).unwrap()).unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn historical_rgso_v4_symbolic_schema_rekeys_and_reencodes_v5() {
+        let capture = symbolic_fixture();
+        let historical = legacy_scheduled_outputs_v4(&capture);
+        assert_eq!(historical[4], 4);
+        let upgraded = decode_scheduled_outputs(&historical).unwrap();
+        assert_eq!(upgraded.symbolic, capture.symbolic);
+        let current = encode_scheduled_outputs(&upgraded).unwrap();
+        assert_eq!(current[4], MULTI_VERSION);
         assert_eq!(
             encode_scheduled_outputs(&decode_scheduled_outputs(&current).unwrap()).unwrap(),
             current

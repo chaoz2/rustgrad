@@ -585,7 +585,7 @@ impl UOp {
     pub(crate) fn shares_node_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
-    fn node_identity(&self) -> usize {
+    pub(crate) fn node_identity(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
     pub fn operation(&self) -> &Operation {

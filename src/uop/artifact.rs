@@ -2863,6 +2863,14 @@ enum_codec!(
     Unary,
     [Unary::Neg, Unary::Not, Unary::Abs]
 );
+
+pub(crate) fn binary_tag(value: Binary) -> u8 {
+    tag_binary(value)
+}
+
+pub(crate) fn binary_from_tag(tag: u8) -> Result<Binary, ArtifactError> {
+    enum_binary(tag)
+}
 enum_codec!(
     tag_binary,
     enum_binary,

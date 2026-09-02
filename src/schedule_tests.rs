@@ -1465,13 +1465,15 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .iter()
         .find(|item| item.node == output)
         .unwrap();
-    assert!(matches!(
-        &symbolic_projected.boundary,
-        Some(crate::ScheduleBoundary::Unsupported(
-            "projected indexing is outside symbolic capture"
-        ))
-    ));
-    assert!(symbolic_projected.ordered_inputs().is_empty());
+    assert!(symbolic_projected.boundary.is_none());
+    assert_eq!(
+        symbolic_projected
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![producer]
+    );
     assert_eq!(
         symbolic_projected
             .inputs

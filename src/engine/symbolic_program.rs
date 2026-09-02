@@ -765,6 +765,377 @@ mod tests {
         invocation
     }
 
+    fn projected_family(
+        tokens: usize,
+    ) -> (
+        Graph,
+        crate::NodeId,
+        crate::NodeId,
+        crate::NodeId,
+        BTreeMap<String, TensorData>,
+    ) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [1, 2, tokens, 2], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let permuted = graph.permute(producer, [0, 2, 1, 3]).unwrap();
+        let projected = graph.reshape(permuted, [1, tokens, 4]).unwrap();
+        let output = graph.relu(projected).unwrap();
+        let reduced = graph
+            .reduce_with_output_dtype(
+                output,
+                crate::ReduceKind::Sum,
+                Some(vec![2]),
+                false,
+                DType::F32,
+            )
+            .unwrap();
+        let values = TensorData::new(
+            [1, 2, tokens, 2],
+            (0..tokens * 4)
+                .map(|index| index as f32 * 0.25 - 1.0)
+                .collect(),
+        )
+        .unwrap();
+        (
+            graph,
+            input,
+            output,
+            reduced,
+            BTreeMap::from([("input".into(), values)]),
+        )
+    }
+
+    #[test]
+    fn owned_program_authenticates_and_specializes_projected_permute_reshape() {
+        let tokens = SymbolicExpr::variable("tokens", 0, 5).unwrap();
+        let (template, input, output, reduced, template_inputs) = projected_family(3);
+        let schedule = crate::schedule_many(&template, &[output, reduced]).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &template,
+            &schedule,
+            &[output, reduced],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![
+                    1usize.into(),
+                    2usize.into(),
+                    tokens.clone().into(),
+                    2usize.into(),
+                ]),
+            )])),
+            &BTreeMap::from([("tokens".into(), 3)]),
+        )
+        .unwrap();
+        let encoded = capture.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap(), encoded);
+        assert!(!decoded.symbolic.as_ref().unwrap().projected.is_empty());
+
+        let mut tampered = decoded.clone();
+        tampered
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .projected
+            .values_mut()
+            .next()
+            .unwrap()
+            .expression =
+            crate::projected_index::ProjectedExpr::Constant(SymbolicExpr::constant(0));
+        tampered.identity = 0;
+        tampered.identity = crate::schedule::artifact::identity(&tampered).unwrap();
+        assert!(matches!(
+            CpuSymbolicProgram::new(tampered),
+            Err(ReplayError::Corrupt(_)) | Err(ReplayError::Symbolic(_))
+        ));
+
+        let mut vanishing_oob = decoded.clone();
+        let map = vanishing_oob
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .projected
+            .values_mut()
+            .next()
+            .unwrap();
+        map.expression = crate::projected_index::ProjectedExpr::binary(
+            crate::uop::Binary::Add,
+            map.expression.clone(),
+            crate::projected_index::ProjectedExpr::Constant(
+                (tokens - SymbolicExpr::constant(3)) * SymbolicExpr::constant(1_000),
+            ),
+        )
+        .unwrap();
+        vanishing_oob.identity = 0;
+        vanishing_oob.identity = crate::schedule::artifact::identity(&vanishing_oob).unwrap();
+        assert!(CpuSymbolicProgram::new(vanishing_oob).is_err());
+
+        let mut missing_sidecar = decoded.clone();
+        missing_sidecar.symbolic.as_mut().unwrap().projected.clear();
+        missing_sidecar.identity = 0;
+        missing_sidecar.identity = crate::schedule::artifact::identity(&missing_sidecar).unwrap();
+        assert!(CpuSymbolicProgram::new(missing_sidecar).is_err());
+
+        let mut wrong_ordinal = decoded.clone();
+        let schema = wrong_ordinal.symbolic.as_mut().unwrap();
+        let (key, value) = schema.projected.pop_first().unwrap();
+        schema
+            .projected
+            .insert((key.0, key.1.checked_add(1).unwrap()), value);
+        wrong_ordinal.identity = 0;
+        wrong_ordinal.identity = crate::schedule::artifact::identity(&wrong_ordinal).unwrap();
+        assert!(CpuSymbolicProgram::new(wrong_ordinal).is_err());
+
+        let one_tokens = SymbolicExpr::variable("tokens", 0, 5).unwrap();
+        let (one_graph, one_input, one_output, one_reduced, _) = projected_family(1);
+        let one_schedule = crate::schedule_many(&one_graph, &[one_output, one_reduced]).unwrap();
+        let one_capture = CapturedSchedule::capture_symbolic(
+            &one_graph,
+            &one_schedule,
+            &[one_output, one_reduced],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                one_input,
+                SymbolicShape::new(vec![
+                    1usize.into(),
+                    2usize.into(),
+                    one_tokens.into(),
+                    2usize.into(),
+                ]),
+            )])),
+            &BTreeMap::from([("tokens".into(), 1)]),
+        )
+        .unwrap();
+        assert!(!one_capture.symbolic.as_ref().unwrap().projected.is_empty());
+        CpuSymbolicProgram::new(one_capture).unwrap();
+
+        let zero_tokens = SymbolicExpr::variable("tokens", 0, 5).unwrap();
+        let (zero_graph, zero_input, zero_output, zero_reduced, _) = projected_family(0);
+        let zero_schedule =
+            crate::schedule_many(&zero_graph, &[zero_output, zero_reduced]).unwrap();
+        assert!(
+            CapturedSchedule::capture_symbolic(
+                &zero_graph,
+                &zero_schedule,
+                &[zero_output, zero_reduced],
+                &SymbolicCaptureSpec::new(BTreeMap::from([(
+                    zero_input,
+                    SymbolicShape::new(vec![
+                        1usize.into(),
+                        2usize.into(),
+                        zero_tokens.into(),
+                        2usize.into(),
+                    ]),
+                )])),
+                &BTreeMap::from([("tokens".into(), 0)]),
+            )
+            .is_err()
+        );
+
+        let program = CpuSymbolicProgram::new(decoded).unwrap();
+        for tokens in [0usize, 1, 3, 5] {
+            let (oracle_graph, _, oracle_output, oracle_reduced, inputs) = projected_family(tokens);
+            let oracle_bindings = inputs.clone().into_iter().collect::<HashMap<_, _>>();
+            let expected_output = CpuBackend
+                .execute(&oracle_graph, oracle_output, &oracle_bindings)
+                .unwrap();
+            let expected_reduced = CpuBackend
+                .execute(&oracle_graph, oracle_reduced, &oracle_bindings)
+                .unwrap();
+            let result = program
+                .run(invocation([("tokens", tokens as i64)], inputs))
+                .unwrap();
+            assert_eq!(
+                result.outputs()[0].to_le_bytes().unwrap(),
+                expected_output.to_le_bytes().unwrap()
+            );
+            assert_eq!(
+                result.outputs()[1].to_le_bytes().unwrap(),
+                expected_reduced.to_le_bytes().unwrap()
+            );
+        }
+        assert_eq!(program.compile_count(), 1);
+
+        assert!(
+            program
+                .run(invocation([("tokens", 3)], template_inputs))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn projected_ordinals_distinguish_two_maps_of_one_source() {
+        let tokens = SymbolicExpr::variable("tokens", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [1, 2, 3, 2], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let first = graph.permute(producer, [0, 2, 1, 3]).unwrap();
+        let first = graph.reshape(first, [1, 3, 4]).unwrap();
+        let second = graph.permute(producer, [0, 2, 1, 3]).unwrap();
+        let second = graph
+            .stride(
+                second,
+                [
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let second = graph.reshape(second, [1, 3, 4]).unwrap();
+        let output = graph.add(first, second).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![
+                    1usize.into(),
+                    2usize.into(),
+                    tokens.into(),
+                    2usize.into(),
+                ]),
+            )])),
+            &BTreeMap::from([("tokens".into(), 3)]),
+        )
+        .unwrap();
+        let projected = &capture.symbolic.as_ref().unwrap().projected;
+        assert_eq!(projected.len(), 2);
+        let keys = projected.keys().copied().collect::<Vec<_>>();
+        assert_eq!(keys[0].0, keys[1].0);
+        assert_ne!(keys[0].1, keys[1].1);
+        let program = CpuSymbolicProgram::new(capture).unwrap();
+        let values = TensorData::new(
+            [1, 2, 3, 2],
+            (0..12).map(|value| value as f32 - 5.0).collect(),
+        )
+        .unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("input".into(), values.clone())]),
+            )
+            .unwrap();
+        let result = program
+            .run(invocation(
+                [("tokens", 3)],
+                BTreeMap::from([("input".into(), values)]),
+            ))
+            .unwrap();
+        assert_eq!(
+            result.outputs()[0].to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap()
+        );
+
+        let empty = TensorData::new([1, 2, 0, 2], Vec::<f32>::new()).unwrap();
+        let result = program
+            .run(invocation(
+                [("tokens", 0)],
+                BTreeMap::from([("input".into(), empty)]),
+            ))
+            .unwrap();
+        assert_eq!(result.outputs()[0].shape(), &Shape::from([1, 0, 4]));
+        assert!(result.outputs()[0].is_empty());
+    }
+
+    #[test]
+    fn projected_reduction_preserves_correlated_square_geometry() {
+        let extent = SymbolicExpr::variable("extent", 1, 3).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let transposed = graph.permute(producer, [1, 0]).unwrap();
+        let flattened = graph.reshape(transposed, [4]).unwrap();
+        let output = graph
+            .reduce_with_output_dtype(
+                flattened,
+                crate::ReduceKind::Sum,
+                Some(vec![0]),
+                false,
+                DType::F32,
+            )
+            .unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![extent.clone().into(), extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap();
+        let schema = capture.symbolic.as_ref().unwrap();
+        assert_eq!(schema.projected.len(), 1);
+        let projected_item = schema.projected.keys().next().unwrap().0;
+        assert!(matches!(
+            schema.item_domains.get(&projected_item),
+            Some(crate::engine::symbolic::SymbolicItemDomain::Reduction { .. })
+        ));
+        let program = CpuSymbolicProgram::new(capture).unwrap();
+        for extent in [1usize, 2, 3] {
+            let values = TensorData::new(
+                [extent, extent],
+                (0..extent * extent)
+                    .map(|index| index as f32 * 0.5 - 1.0)
+                    .collect(),
+            )
+            .unwrap();
+            let mut oracle = Graph::new();
+            let oracle_input = oracle.input_dtype("input", [extent, extent], DType::F32);
+            let oracle_producer = oracle.square(oracle_input).unwrap();
+            let oracle_transposed = oracle.permute(oracle_producer, [1, 0]).unwrap();
+            let oracle_flattened = oracle
+                .reshape(oracle_transposed, [extent * extent])
+                .unwrap();
+            let oracle_output = oracle
+                .reduce_with_output_dtype(
+                    oracle_flattened,
+                    crate::ReduceKind::Sum,
+                    Some(vec![0]),
+                    false,
+                    DType::F32,
+                )
+                .unwrap();
+            let bindings = HashMap::from([("input".into(), values.clone())]);
+            let expected = CpuBackend
+                .execute(&oracle, oracle_output, &bindings)
+                .unwrap();
+            let actual = program
+                .run(invocation(
+                    [("extent", extent as i64)],
+                    BTreeMap::from([("input".into(), values)]),
+                ))
+                .unwrap();
+            assert_eq!(
+                actual.outputs()[0].to_le_bytes().unwrap(),
+                expected.to_le_bytes().unwrap()
+            );
+        }
+        assert_eq!(program.compile_count(), 1);
+    }
+
     #[test]
     fn owned_program_reuses_one_body_for_affine_contiguous_and_reduction() {
         let rows = SymbolicExpr::variable("rows", 0, 8).unwrap();

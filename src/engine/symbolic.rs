@@ -4,10 +4,12 @@
 //! structural evidence. Replay always evaluates this schema into a fresh
 //! concrete schedule before allocation, compilation, or execution.
 use super::capture::{CapturedSchedule, ReplayError};
+use super::symbolic_projected::SymbolicProjectedIndexMap;
 use super::symbolic_view::SymbolicViewMap;
 use crate::{
-    BufferDesc, DType, Graph, IndexValue, MatmulKernelPlan, MatmulValue, NodeId, Op, Operation,
-    ReductionValue, Schedule, Shape, SymbolicDim, SymbolicExpr, SymbolicShape, SymbolicVar, UOp,
+    BufferDesc, DType, Graph, IndexAddressing, IndexValue, MatmulKernelPlan, MatmulValue, NodeId,
+    Op, Operation, ReductionValue, Schedule, Shape, SymbolicDim, SymbolicExpr, SymbolicShape,
+    SymbolicVar, UOp,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -171,6 +173,7 @@ pub(crate) struct SymbolicSchema {
     pub(crate) buffer_shapes: BTreeMap<u64, SymbolicShape>,
     pub(crate) item_domains: BTreeMap<u64, SymbolicItemDomain>,
     pub(crate) views: BTreeMap<(u64, u64), SymbolicViewMap>,
+    pub(crate) projected: BTreeMap<(u64, u32), SymbolicProjectedIndexMap>,
     pub(crate) splat_constants: BTreeSet<u64>,
 }
 
@@ -534,14 +537,15 @@ pub(crate) fn build_schema(
     guards.dedup();
 
     let mut views = BTreeMap::new();
+    let mut projected = BTreeMap::new();
     for item in &schedule.items {
         let mut lowered_views = BTreeSet::new();
         collect_lowered_view_nodes(graph, item.node, &mut lowered_views)?;
-        for node in item
+        let topology = item
             .kernel
             .topological()
-            .map_err(|error| ReplayError::Symbolic(error.to_string()))?
-        {
+            .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+        for node in &topology {
             let Operation::Index(index @ IndexValue::View { buffer, view, .. }) = node.operation()
             else {
                 continue;
@@ -590,6 +594,98 @@ pub(crate) fn build_schema(
             if views.insert(key, symbolic.clone()).is_some() {
                 return Err(ReplayError::Unsupported(
                     "one schedule item uses multiple views of one source buffer".into(),
+                ));
+            }
+        }
+        let projected_nodes = topology
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.operation(),
+                    Operation::Index(IndexValue::Buffer {
+                        addressing: IndexAddressing::Projected,
+                        ..
+                    })
+                )
+            })
+            .collect::<Vec<_>>();
+        for (ordinal, node) in projected_nodes.into_iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                ReplayError::Unsupported("too many projected indices in one schedule item".into())
+            })?;
+            let Operation::Index(index @ IndexValue::Buffer { buffer, .. }) = node.operation()
+            else {
+                unreachable!("projected node filter is authoritative")
+            };
+            let source = usize::try_from(*buffer)
+                .map(NodeId::from_index)
+                .map_err(|_| ReplayError::Symbolic("projected buffer exceeds usize".into()))?;
+            if node.ty()
+                != Some(crate::UType::scalar(
+                    graph
+                        .dtype(source)
+                        .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
+                ))
+            {
+                return Err(ReplayError::Corrupt(
+                    "projected Index dtype disagrees with its graph source".into(),
+                ));
+            }
+            let domain = item_domains.get(&item.id).ok_or_else(|| {
+                ReplayError::Corrupt("symbolic projected item domain is absent".into())
+            })?;
+            let reduction_geometry = reduction_template_geometry(&item.kernel)?;
+            let iteration_shape =
+                symbolic_view_iteration_shape(index, domain, reduction_geometry.as_ref())?.clone();
+            let mut matches = Vec::new();
+            let mut derive_rejection_count = 0usize;
+            let mut derive_rejections = Vec::with_capacity(4);
+            let mut template_mismatch_count = 0usize;
+            let mut template_mismatches = Vec::with_capacity(8);
+            for candidate in lowered_views.iter().copied() {
+                let candidate_map = match SymbolicProjectedIndexMap::derive(
+                    graph,
+                    candidate,
+                    source,
+                    iteration_shape.clone(),
+                    &memo,
+                    &template_environment,
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        derive_rejection_count += 1;
+                        if derive_rejections.len() < 4 {
+                            let reason = format!("{error}").chars().take(160).collect::<String>();
+                            derive_rejections.push((candidate.index(), reason));
+                        }
+                        continue;
+                    }
+                };
+                if candidate_map.matches_template(node, &template_environment)? {
+                    matches.push(candidate_map);
+                } else {
+                    template_mismatch_count += 1;
+                    if template_mismatches.len() < 8 {
+                        template_mismatches.push(candidate.index());
+                    }
+                }
+            }
+            let [candidate] = matches.as_slice() else {
+                return Err(ReplayError::Unsupported(format!(
+                    "captured projected index has {} exact matches; derive rejected {} {:?}; template mismatched {} {:?}",
+                    matches.len(),
+                    derive_rejection_count,
+                    derive_rejections,
+                    template_mismatch_count,
+                    template_mismatches,
+                )));
+            };
+            if projected
+                .insert((item.id, ordinal), candidate.clone())
+                .is_some()
+            {
+                return Err(ReplayError::Corrupt(
+                    "duplicate symbolic projected ordinal".into(),
                 ));
             }
         }
@@ -650,6 +746,11 @@ pub(crate) fn build_schema(
                 .flat_map(SymbolicItemDomain::expressions),
         )
         .chain(views.values().flat_map(SymbolicViewMap::expressions))
+        .chain(
+            projected
+                .values()
+                .flat_map(SymbolicProjectedIndexMap::expressions),
+        )
         .collect::<Vec<_>>();
     let parameters = collect_parameters(&expressions)?;
     let expected = parameters
@@ -678,6 +779,7 @@ pub(crate) fn build_schema(
         buffer_shapes,
         item_domains,
         views,
+        projected,
         splat_constants,
     };
     schema.validate_against(capture)?;
@@ -793,7 +895,12 @@ impl SymbolicSchema {
                     .values()
                     .flat_map(SymbolicItemDomain::expressions),
             )
-            .chain(self.views.values().flat_map(SymbolicViewMap::expressions));
+            .chain(self.views.values().flat_map(SymbolicViewMap::expressions))
+            .chain(
+                self.projected
+                    .values()
+                    .flat_map(SymbolicProjectedIndexMap::expressions),
+            );
         for expression in &mut expressions {
             expression
                 .bounds()
@@ -920,6 +1027,65 @@ impl SymbolicSchema {
                 ));
             }
         }
+        let mut expected_projected = BTreeSet::new();
+        for item in &capture.items {
+            if item.boundary.is_some() {
+                continue;
+            }
+            for (ordinal, _) in projected_index_nodes(&item.kernel)? {
+                expected_projected.insert((item.id, ordinal));
+            }
+        }
+        if self.projected.keys().copied().collect::<BTreeSet<_>>() != expected_projected {
+            return Err(ReplayError::Symbolic(
+                "symbolic projected-index coverage is incomplete".into(),
+            ));
+        }
+        for ((item_id, ordinal), symbolic) in &self.projected {
+            symbolic.validate_bounds()?;
+            let item = capture
+                .items
+                .iter()
+                .find(|item| item.id == *item_id)
+                .ok_or_else(|| ReplayError::Symbolic("symbolic projected item is absent".into()))?;
+            let node = projected_index_nodes(&item.kernel)?
+                .into_iter()
+                .find_map(|(candidate, node)| (candidate == *ordinal).then_some(node))
+                .ok_or_else(|| {
+                    ReplayError::Symbolic("symbolic projected ordinal is absent".into())
+                })?;
+            let plan = crate::projected_index::ProjectedIndexPlan::from_index(&node)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+            let binding = item
+                .input_bindings
+                .iter()
+                .find(|binding| binding.desc.id == plan.buffer)
+                .ok_or_else(|| {
+                    ReplayError::Symbolic("symbolic projected binding is absent".into())
+                })?;
+            let source_shape = self.buffer_shapes.get(&plan.buffer).ok_or_else(|| {
+                ReplayError::Symbolic("symbolic projected source is absent".into())
+            })?;
+            let domain = self.item_domains.get(item_id).ok_or_else(|| {
+                ReplayError::Symbolic("symbolic projected domain is absent".into())
+            })?;
+            let reduction = reduction_template_geometry(&item.kernel)?;
+            let index = match node.operation() {
+                Operation::Index(index) => index,
+                _ => unreachable!("projected ordinal authenticates an Index"),
+            };
+            let output_shape = symbolic_view_iteration_shape(index, domain, reduction.as_ref())?;
+            if source_shape != &symbolic.source_shape
+                || binding.desc.view.is_some()
+                || !binding.desc.read_only
+                || output_shape != &symbolic.output_shape
+                || !symbolic.matches_template(&node, &environment)?
+            {
+                return Err(ReplayError::Symbolic(
+                    "symbolic projected source, domain, or expression is inconsistent".into(),
+                ));
+            }
+        }
         for item in &capture.items {
             for desc in item
                 .inputs
@@ -943,15 +1109,15 @@ impl SymbolicSchema {
                     "symbolic template item domain does not match output".into(),
                 ));
             }
-            if specialize_kernel(
+            let specialized = specialize_kernel(
                 &item.kernel,
                 self,
                 &environment,
                 &domain,
                 item.id,
                 item.primary_output().id,
-            )? != item.kernel
-            {
+            )?;
+            if !projected_kernel_template_eq(&specialized, &item.kernel)? {
                 return Err(ReplayError::Symbolic(
                     "symbolic template UOp does not match its expressions".into(),
                 ));
@@ -1955,6 +2121,85 @@ fn reduction_template_geometry(kernel: &UOp) -> Result<Option<(Shape, Shape)>, R
     )))
 }
 
+fn projected_index_nodes(kernel: &UOp) -> Result<Vec<(u32, UOp)>, ReplayError> {
+    kernel
+        .topological()
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+        .into_iter()
+        .filter(|node| {
+            matches!(
+                node.operation(),
+                Operation::Index(IndexValue::Buffer {
+                    addressing: IndexAddressing::Projected,
+                    ..
+                })
+            )
+        })
+        .enumerate()
+        .map(|(ordinal, node)| {
+            Ok((
+                u32::try_from(ordinal).map_err(|_| {
+                    ReplayError::Unsupported(
+                        "too many projected indices in one schedule item".into(),
+                    )
+                })?,
+                node,
+            ))
+        })
+        .collect()
+}
+
+fn projected_kernel_template_eq(left: &UOp, right: &UOp) -> Result<bool, ReplayError> {
+    projected_kernel_template_eq_with_count(left, right).map(|(matches, _)| matches)
+}
+
+fn projected_kernel_template_eq_with_count(
+    left: &UOp,
+    right: &UOp,
+) -> Result<(bool, usize), ReplayError> {
+    fn compare(
+        left: &UOp,
+        right: &UOp,
+        visited: &mut BTreeSet<(usize, usize)>,
+    ) -> Result<bool, ReplayError> {
+        if !visited.insert((left.node_identity(), right.node_identity())) {
+            return Ok(true);
+        }
+        if left.operation() != right.operation()
+            || left.ty() != right.ty()
+            || left.sources().len() != right.sources().len()
+        {
+            return Ok(false);
+        }
+        if matches!(
+            left.operation(),
+            Operation::Index(IndexValue::Buffer {
+                addressing: IndexAddressing::Projected,
+                ..
+            })
+        ) {
+            if left.sources().len() != 2 || left.sources()[0] != right.sources()[0] {
+                return Ok(false);
+            }
+            let left = crate::projected_index::ProjectedIndexPlan::from_index(left)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+            let right = crate::projected_index::ProjectedIndexPlan::from_index(right)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+            return Ok(left.expression.canonicalized() == right.expression.canonicalized());
+        }
+        for (left, right) in left.sources().iter().zip(right.sources()) {
+            if !compare(left, right, visited)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    let mut visited = BTreeSet::new();
+    let matches = compare(left, right, &mut visited)?;
+    Ok((matches, visited.len()))
+}
+
 fn symbolic_index_iteration_shape<'a>(
     index: &IndexValue,
     domain: &'a BoundDomain,
@@ -1994,6 +2239,10 @@ pub(crate) fn specialize_kernel(
     let nodes = kernel
         .topological()
         .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+    let projected_ordinals = projected_index_nodes(kernel)?
+        .into_iter()
+        .map(|(ordinal, node)| (node, ordinal))
+        .collect::<BTreeMap<_, _>>();
     let reduction_specialization = if domain.reduction.is_some() {
         let (template_input, template_output) =
             reduction_template_geometry(kernel)?.ok_or_else(|| {
@@ -2010,6 +2259,13 @@ pub(crate) fn specialize_kernel(
     let mut range_extents = BTreeMap::new();
     for node in &nodes {
         let (index, range) = match (node.operation(), node.sources().get(1)) {
+            (
+                Operation::Index(IndexValue::Buffer {
+                    addressing: IndexAddressing::Projected,
+                    ..
+                }),
+                _,
+            ) => continue,
             (Operation::Index(index), Some(range)) => (index, range),
             _ => continue,
         };
@@ -2040,6 +2296,51 @@ pub(crate) fn specialize_kernel(
             })
             .collect::<Result<Vec<UOp>, _>>()?;
         let operation = match node.operation() {
+            Operation::Index(
+                index @ IndexValue::Buffer {
+                    buffer,
+                    addressing: IndexAddressing::Projected,
+                    ..
+                },
+            ) => {
+                let input_shape = schema.bind_shape(*buffer, environment)?;
+                let output_shape = symbolic_index_iteration_shape(
+                    index,
+                    domain,
+                    reduction_specialization.as_ref(),
+                )?
+                .clone();
+                let ordinal = projected_ordinals.get(&node).ok_or_else(|| {
+                    ReplayError::Corrupt("symbolic projected ordinal is absent".into())
+                })?;
+                let symbolic = schema.projected.get(&(item_id, *ordinal)).ok_or_else(|| {
+                    ReplayError::Corrupt("symbolic projected expression is absent".into())
+                })?;
+                if symbolic.source_shape != schema.buffer_shapes[buffer]
+                    || symbolic.output_shape
+                        != *symbolic_view_iteration_shape(
+                            index,
+                            schema.item_domains.get(&item_id).ok_or_else(|| {
+                                ReplayError::Corrupt("symbolic item domain is absent".into())
+                            })?,
+                            reduction_template_geometry(kernel)?.as_ref(),
+                        )?
+                {
+                    return Err(ReplayError::Corrupt(
+                        "symbolic projected geometry is inconsistent".into(),
+                    ));
+                }
+                sources[1] = symbolic.specialize_uop(environment)?;
+                Operation::Index(IndexValue::Buffer {
+                    buffer: *buffer,
+                    elements: input_shape
+                        .numel()
+                        .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
+                    input_shape,
+                    output_shape,
+                    addressing: IndexAddressing::Projected,
+                })
+            }
             Operation::Index(
                 index @ IndexValue::Buffer {
                     buffer, addressing, ..
@@ -2201,6 +2502,10 @@ pub(crate) fn specialize_kernel(
         .ok_or_else(|| ReplayError::Corrupt("symbolic UOp root is absent".into()))?;
     root.validate()
         .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    for (_, node) in projected_index_nodes(&root)? {
+        crate::projected_index::ProjectedIndexPlan::from_index(&node)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    }
     if let Some((_, _, _, _, _, _)) = &domain.matmul
         && operation_matmul_plan(root.operation()).is_none()
     {
@@ -2428,6 +2733,23 @@ fn specialize_desc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_template_comparison_visits_shared_dag_pairs_once() {
+        let ty = crate::UType::scalar(DType::I64);
+        let mut diamond = UOp::constant(1, ty);
+        for _ in 0..24 {
+            diamond = UOp::from_operation(
+                Operation::Binary(crate::uop::Binary::Add),
+                Some(ty),
+                vec![diamond.clone(), diamond],
+            );
+        }
+        let (matches, visited) =
+            projected_kernel_template_eq_with_count(&diamond, &diamond).unwrap();
+        assert!(matches);
+        assert_eq!(visited, 25);
+    }
 
     #[test]
     fn reduction_view_domain_is_authenticated_by_index_geometry() {

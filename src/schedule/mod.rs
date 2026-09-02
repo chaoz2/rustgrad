@@ -2109,7 +2109,7 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
 /// Schedules requested graph outputs as a stable producer-aware DAG. Pure
 /// elementwise/view chains are fused until an explicit materialization root.
 pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, ScheduleError> {
-    schedule_many_with_external(graph, outputs, &BTreeSet::new(), true)
+    schedule_many_with_external(graph, outputs, &BTreeSet::new(), SchedulePolicy::ORDINARY)
 }
 
 /// Symbolic families retain explicit computed-affine producer and movement
@@ -2120,7 +2120,7 @@ pub(crate) fn schedule_many_for_symbolic_capture(
     outputs: &[NodeId],
     external: &BTreeSet<usize>,
 ) -> Result<Schedule, ScheduleError> {
-    schedule_many_with_external(graph, outputs, external, false)
+    schedule_many_with_external(graph, outputs, external, SchedulePolicy::SYMBOLIC)
 }
 /// Schedules with explicit caller-owned computed buffers. Only these named
 /// nodes become lowered Load boundaries; ordinary scheduling stays unchanged.
@@ -2239,13 +2239,31 @@ pub fn schedule_with_external_materializations(
             ));
         }
     }
-    schedule_many_with_external(graph, outputs, &external, true)
+    schedule_many_with_external(graph, outputs, &external, SchedulePolicy::ORDINARY)
 }
+
+#[derive(Clone, Copy)]
+struct SchedulePolicy {
+    redirect_contiguous: bool,
+    allow_projected: bool,
+}
+
+impl SchedulePolicy {
+    const ORDINARY: Self = Self {
+        redirect_contiguous: true,
+        allow_projected: true,
+    };
+    const SYMBOLIC: Self = Self {
+        redirect_contiguous: false,
+        allow_projected: true,
+    };
+}
+
 fn schedule_many_with_external(
     graph: &Graph,
     outputs: &[NodeId],
     external: &BTreeSet<usize>,
-    redirect_contiguous: bool,
+    policy: SchedulePolicy,
 ) -> Result<Schedule, ScheduleError> {
     if outputs.is_empty() {
         return Ok(Schedule {
@@ -2814,7 +2832,7 @@ fn schedule_many_with_external(
         .chain(movement_operands.iter().copied())
         .collect::<BTreeSet<_>>();
     let mut scalar_alias_reserved = epilogue_reserved;
-    let scalar_alias_fusions = if redirect_contiguous {
+    let scalar_alias_fusions = if policy.redirect_contiguous {
         // Proposal acceptance and ordinary fallback are both load-bearing.
         // Grow one monotone reservation frontier until every root is evaluated
         // against every other root's exact current load inventory; mutate
@@ -2883,7 +2901,7 @@ fn schedule_many_with_external(
     // observable schedule/output identity; every uncertain ownership or
     // operation-specific producer retains the explicit copy.
     let mut contiguous_redirections = BTreeMap::<usize, ContiguousRedirection>::new();
-    if redirect_contiguous {
+    if policy.redirect_contiguous {
         for contiguous in roots.iter().copied().collect::<Vec<_>>() {
             let node = NodeId::from_index(contiguous);
             if !matches!(
@@ -3121,7 +3139,7 @@ fn schedule_many_with_external(
                     roots: &roots,
                     owner: index,
                     external,
-                    allow_projected: redirect_contiguous,
+                    allow_projected: policy.allow_projected,
                 }
                 .visit(node, &mut leaf_ids, &mut boundary)?,
                 Err(error) => return Err(ScheduleError::Binding(error.to_string())),

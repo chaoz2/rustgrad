@@ -5395,9 +5395,9 @@ fn emit(
                             Ok(register)
                         }
 
-                        fn constant(&mut self, value: i64) -> Result<Self::Value, Self::Error> {
+                        fn constant(&mut self, value: &i64) -> Result<Self::Value, Self::Error> {
                             let register = self.allocate()?;
-                            let literal = if value == i64::MIN {
+                            let literal = if *value == i64::MIN {
                                 "0x8000000000000000".into()
                             } else {
                                 value.to_string()
