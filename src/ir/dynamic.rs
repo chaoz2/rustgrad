@@ -128,6 +128,111 @@ pub(crate) struct DynamicMeanVjpRule {
     dtypes: ReductionDType,
 }
 
+/// Checked graph composition for scattering one exact compacted cotangent
+/// back into its fixed source descriptor.
+///
+/// The dynamic arena owns only the count provenance. Once an upstream with
+/// that exact realized count is available, this rule lowers the inverse
+/// compaction into ordinary graph operations. That keeps row-major placement,
+/// broadcast-mask semantics, and higher-order edges in the existing indexing
+/// and autograd contracts instead of duplicating them in a host-only loop.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DynamicCompactionVjpRule {
+    output: DynamicNodeId,
+    input: DynamicBinding,
+    mask: DynamicBinding,
+}
+
+pub(crate) struct DynamicCompactionVjpGraph {
+    graph: Graph,
+    gradient: NodeId,
+    upstream: NodeId,
+}
+
+impl DynamicCompactionVjpGraph {
+    pub(crate) fn into_parts(self) -> (Graph, NodeId, NodeId) {
+        (self.graph, self.gradient, self.upstream)
+    }
+}
+
+impl DynamicCompactionVjpRule {
+    fn for_output(graph: &Graph, output: DynamicNodeId) -> Result<Self> {
+        let node = graph.dynamic_node(output)?;
+        let DynamicOperation::MaskedSelect { input, mask } = &node.operation else {
+            return Err(Error::DynamicVjp {
+                reason: "dynamic compaction VJP requires masked_select",
+            });
+        };
+        let input = DynamicBinding::from_graph(graph, *input)?;
+        let mask = DynamicBinding::from_graph(graph, *mask)?;
+        if node.output != DynamicOutputShape::count_1d(output)
+            || node.dtype != input.dtype
+            || mask.dtype != DType::Bool
+            || mask.shape.broadcast_with(&input.shape).as_ref() != Ok(&input.shape)
+        {
+            return Err(Error::DynamicVjp {
+                reason: "dynamic compaction descriptor is not canonical",
+            });
+        }
+        Ok(Self {
+            output,
+            input,
+            mask,
+        })
+    }
+
+    pub(crate) fn input(&self) -> NodeId {
+        self.input.node
+    }
+
+    pub(crate) fn lower(
+        &self,
+        graph: &Graph,
+        upstream: &TensorData,
+        target: NodeId,
+    ) -> Result<DynamicCompactionVjpGraph> {
+        if Self::for_output(graph, self.output)? != *self
+            || upstream.shape().rank() != 1
+            || upstream.dtype() != self.input.dtype
+        {
+            return Err(Error::DynamicVjp {
+                reason: "dynamic compaction upstream descriptor mismatch",
+            });
+        }
+        let elements = self.input.shape.numel()?;
+        let end =
+            i64::try_from(elements).map_err(|_| Error::ShapeOverflow(self.input.shape.clone()))?;
+        let selected = upstream.shape().dims()[0];
+        if selected > elements {
+            return Err(Error::DynamicVjp {
+                reason: "dynamic compaction count exceeds source extent",
+            });
+        }
+
+        // Rehearse the complete inverse compaction and any static-boundary VJP
+        // on a clone. A late index, shape, or reverse-rule failure cannot
+        // publish a partial graph into the caller's arena.
+        let mut candidate = graph.clone();
+        let indices = candidate.lazy_arange_default_int(0, end, 1)?;
+        let indices = candidate.reshape(indices, self.input.shape.clone())?;
+        let positions = candidate.masked_select(indices, self.mask.node, selected, Scalar::I(0))?;
+        let upstream = candidate.constant(upstream.clone());
+        let zeros = candidate.zeros_with_dtype([elements], self.input.dtype)?;
+        let scattered = candidate.scatter_add(zeros, positions, upstream, 0)?;
+        let local = candidate.reshape(scattered, self.input.shape.clone())?;
+        let gradient = if self.input.node == target {
+            local
+        } else {
+            candidate.grad_with(self.input.node, target, Some(local), true)?
+        };
+        Ok(DynamicCompactionVjpGraph {
+            graph: candidate,
+            gradient,
+            upstream,
+        })
+    }
+}
+
 impl DynamicMeanVjpRule {
     pub(crate) fn input(self) -> DynamicNodeId {
         self.input
@@ -528,6 +633,13 @@ impl Graph {
         DynamicVjpPlan::for_output(self, output, target)
     }
 
+    pub(crate) fn dynamic_compaction_vjp_rule(
+        &self,
+        output: DynamicNodeId,
+    ) -> Result<DynamicCompactionVjpRule> {
+        DynamicCompactionVjpRule::for_output(self, output)
+    }
+
     pub(crate) fn dynamic_backward_slice_contains(
         &self,
         output: DynamicNodeId,
@@ -747,7 +859,8 @@ impl DynamicNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Op, Scalar, TensorData};
+    use crate::{Backend, CpuBackend, Op, Scalar, TensorData};
+    use std::collections::HashMap;
 
     fn masked_select_plan() -> (Graph, DynamicNodeId) {
         let mut graph = Graph::new();
@@ -871,6 +984,96 @@ mod tests {
         let mut tampered = plan.clone();
         tampered.identity ^= 1;
         assert!(tampered.validate_against(&graph).is_err());
+    }
+
+    #[test]
+    fn compaction_vjp_lowers_to_duplicate_free_graph_scatter_with_higher_order_edges() {
+        let (graph, input, _, output) = dynamic_vjp_graph();
+        let rule = graph.dynamic_compaction_vjp_rule(output).unwrap();
+        let upstream = TensorData::new([4], vec![2.0, 3.0, 5.0, 7.0]).unwrap();
+        let lowered = rule.lower(&graph, &upstream, input).unwrap();
+        let (mut derivative, gradient, upstream_node) = lowered.into_parts();
+        let bindings = HashMap::from([
+            (
+                "input".into(),
+                TensorData::new([2, 3], vec![11.0, 13.0, 17.0, 19.0, 23.0, 29.0]).unwrap(),
+            ),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [1, 3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&derivative, gradient, &bindings)
+                .unwrap(),
+            TensorData::new([2, 3], vec![2.0, 0.0, 3.0, 5.0, 0.0, 7.0]).unwrap()
+        );
+
+        // The compacted cotangent is an ordinary graph value after count
+        // realization. Target slicing therefore differentiates only through
+        // Scatter updates; the Bool mask/index route remains non-value data.
+        let sum = derivative.sum_all(gradient).unwrap();
+        let second = derivative.gradient_default(sum, &[upstream_node]).unwrap()[0];
+        assert_eq!(
+            CpuBackend.execute(&derivative, second, &bindings).unwrap(),
+            TensorData::new([4], vec![1.0; 4]).unwrap()
+        );
+    }
+
+    #[test]
+    fn compaction_vjp_preserves_supported_float_storage_and_rejects_impossible_counts() {
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [3], dtype);
+            let mask = graph.input_dtype("mask", [], DType::Bool);
+            let output = graph.masked_select_dynamic(input, mask).unwrap();
+            let rule = graph.dynamic_compaction_vjp_rule(output).unwrap();
+            let upstream = TensorData::from_scalars(
+                [3],
+                dtype,
+                [Scalar::F(-0.0), Scalar::F(2.0), Scalar::F(f64::NAN)],
+            )
+            .unwrap();
+            let (derivative, gradient, _) =
+                rule.lower(&graph, &upstream, input).unwrap().into_parts();
+            let actual = CpuBackend
+                .execute(
+                    &derivative,
+                    gradient,
+                    &HashMap::from([
+                        (
+                            "input".into(),
+                            TensorData::from_scalars([3], dtype, [Scalar::F(1.0); 3]).unwrap(),
+                        ),
+                        (
+                            "mask".into(),
+                            TensorData::from_scalars([], DType::Bool, [Scalar::Bool(true)])
+                                .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(actual.dtype(), dtype);
+            assert_eq!(actual.shape(), &Shape::from([3]));
+            assert_eq!(actual.scalar_at(1).as_f64(), 2.0);
+            assert!(actual.scalar_at(2).as_f64().is_nan());
+        }
+
+        let (graph, input, _, output) = dynamic_vjp_graph();
+        let rule = graph.dynamic_compaction_vjp_rule(output).unwrap();
+        let too_many = TensorData::from_scalars([7], DType::F32, [Scalar::F(1.0); 7]).unwrap();
+        assert!(matches!(
+            rule.lower(&graph, &too_many, input),
+            Err(Error::DynamicVjp {
+                reason: "dynamic compaction count exceeds source extent"
+            })
+        ));
     }
 
     #[test]

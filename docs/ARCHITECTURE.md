@@ -322,15 +322,21 @@ target descriptor, validates the supported dynamic route, rehearses every
 participating static reverse boundary on a private graph clone, and
 excludes Bool mask/cardinality inputs before CPU work. The shared CPU executor
 requires an upstream with the exact realized output shape, then scatters its
-row-major lanes through broadcast masks into the static source shape. Dynamic
+row-major lanes through broadcast masks into the static source shape. Once
+that exact count is known, `DynamicCompactionVjpRule` clone-rehearses the
+inverse as ordinary lazy arange, fixed masked selection, additive scatter, and
+reshape nodes. The generated fixed graph retains higher-order edges through
+the compacted cotangent while the Bool mask/index route remains non-value
+data. Dynamic
 `Sum` uses that same plan for its implicit one seed. Dynamic `Mean` derives its
 denominator from the immediate input's realized element count, divides at the
 canonical F32/F64 work width, narrows to the input storage, and broadcasts the
 local cotangent over that exact shape; an empty input produces no lanes. Local
 cotangents cross admitted derived static graph boundaries through an explicit cloned-graph
 `grad_with` seed, including the masked value expression and derived scalar
-operands. This owned first-order host result and the runtime schedule still do
-not participate in `Graph::grad` or higher-order dynamic autograd.
+operands. The public result remains an owned first-order host value: dynamic
+handles still do not participate directly in `Graph::grad`, capture, or a
+higher-order dynamic-output arena.
 
 `CpuSession` exposes this same exact ABI without mutable or raw arena-index
 access: `DynamicTensor::shape_expression` carries an opaque graph-local count
