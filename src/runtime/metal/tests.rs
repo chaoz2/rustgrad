@@ -1,9 +1,36 @@
 use super::renderer::{
-    METAL_PORTABLE_BITCAST_RENDERER_VERSION, METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
-    METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION, METAL_PORTABLE_SORT_RENDERER_VERSION,
-    METAL_PORTABLE_THREEFRY_RENDERER_VERSION, METAL_RAW_COPY_RENDERER_VERSION,
-    METAL_STATIC_POSITION_RENDERER_VERSION,
+    METAL_PORTABLE_BITCAST_RENDERER_VERSION, METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+    METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
+    METAL_PORTABLE_SORT_RENDERER_VERSION, METAL_PORTABLE_THREEFRY_RENDERER_VERSION,
+    METAL_RAW_COPY_RENDERER_VERSION, METAL_STATIC_POSITION_RENDERER_VERSION,
 };
+
+#[test]
+fn portable_dense_metal_uses_checked_multi_input_raw_storage_abi() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1, 2], DType::Bool);
+    let rhs = graph.input_dtype("rhs", [1, 1], DType::Bool);
+    let output = graph.concat([lhs, rhs, lhs], 1).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!((rendered.extent, rendered.buffers.len()), (5, 3));
+    assert!(
+        rendered
+            .source
+            .contains(METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("device const uchar* b0"));
+    assert!(rendered.source.contains("device uchar* b2"));
+
+    let empty = graph.input_dtype("empty", [0, 2], DType::F32);
+    let output = graph.pad(empty, [(0, 0), (1, 0)], Scalar::F(-0.0)).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    assert_eq!(renderer.render(&item.kernel).unwrap().extent, 0);
+}
 
 #[test]
 fn portable_bitcast_metal_preserves_raw_payload_and_shape_change() {
@@ -1829,8 +1856,22 @@ fn raw_movement_copy_metal_preserves_zero_domain_and_rejects_other_movements() {
     let pad_input = graph.input_dtype("pad", [2], DType::U64);
     let padded = graph.pad(pad_input, [(1, 1)], Scalar::U(0)).unwrap();
     let padded_item = schedule(&graph, padded).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&padded_item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(padded_item.ordered_inputs())
+        .unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION)
+    );
+    assert_eq!((rendered.extent, rendered.buffers.len()), (4, 2));
+
+    let index = graph.input_dtype("index", [2], DType::I32);
+    let gathered = graph.gather(pad_input, index, 0).unwrap();
+    let gathered_item = schedule(&graph, gathered).unwrap().items.pop().unwrap();
     assert!(matches!(
-        renderer.render(&padded_item.kernel),
+        renderer.render(&gathered_item.kernel),
         Err(MetalError::Unsupported(reason)) if reason.contains("only raw AffineCopy and Contiguous")
     ));
 }

@@ -25,6 +25,8 @@ use std::{
 pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v8";
 pub const OPENCL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-opencl-raw-copy-v1";
 pub const OPENCL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-opencl-portable-bitcast-v1";
+pub const OPENCL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
+    "rustgrad-opencl-portable-dense-materialization-v1";
 pub const OPENCL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-opencl-static-position-v1";
 pub const OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-opencl-portable-f32-matmul-v1";
@@ -103,6 +105,17 @@ impl RenderedOpenCl {
             && matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. })
         {
             crate::movement_plan::PortableBitcast::new(plan)
+                .and_then(|portable| portable.validate_schedule_bindings(bindings))
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Movement(MovementValue::Plan(plan)) = root.operation()
+            && matches!(
+                &plan.kind,
+                crate::MovementKernelKind::Pad { .. } | crate::MovementKernelKind::Concat { .. }
+            )
+        {
+            crate::movement_plan::PortableDenseMaterialization::new(plan)
                 .and_then(|portable| portable.validate_schedule_bindings(bindings))
                 .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
         }
@@ -198,6 +211,15 @@ impl OpenClRenderer {
                     if matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. }) =>
                 {
                     render_portable_bitcast(self, root, plan)
+                }
+                MovementValue::Plan(plan)
+                    if matches!(
+                        &plan.kind,
+                        crate::MovementKernelKind::Pad { .. }
+                            | crate::MovementKernelKind::Concat { .. }
+                    ) =>
+                {
+                    render_portable_dense_materialization(self, root, plan)
                 }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
                 MovementValue::QuantizedRowGather(_) => Err(OpenClError::Unsupported(
@@ -1196,6 +1218,88 @@ fn render_portable_bitcast(
         required_capabilities: OpenClCapabilities::CORE_32,
         transaction: None,
         schedule_inputs: vec![input_abi],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+fn render_portable_dense_materialization(
+    renderer: &OpenClRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedOpenCl, OpenClError> {
+    root.validate()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let portable = crate::movement_plan::PortableDenseMaterialization::new(plan)
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| {
+            Ok(OpenClBufferAbi {
+                id: input.node.index() as u64,
+                dtype: input.dtype,
+                source_shape: input.shape.clone(),
+                elements: input.shape.numel().map_err(|_| OpenClError::Overflow)?,
+                mutable: false,
+                view: None,
+            })
+        })
+        .collect::<Result<Vec<_>, OpenClError>>()?;
+    let schedule_inputs = buffers.clone();
+    buffers.push(OpenClBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.elements(),
+        mutable: true,
+        view: None,
+    });
+    let entry = "rg_opencl_portable_dense_materialization".to_owned();
+    let mut lines = vec![format!(
+        "// {OPENCL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"
+    )];
+    lines.push(format!("__kernel void {entry}("));
+    for (index, _) in portable.inputs().iter().enumerate() {
+        lines.push(format!("    __global const uchar* b{index},"));
+    }
+    lines.push(format!("    __global uchar* b{},", portable.inputs().len()));
+    lines.extend([
+        "    ulong extent) {".into(),
+        "  const ulong gid = (ulong)get_global_id(0);".into(),
+        "  if (gid >= extent) return;".into(),
+    ]);
+    lines.extend(
+        crate::portable_movement::emit_portable_dense_materialization_body(
+            &portable,
+            &crate::portable_movement::CLikePortableDenseDialect {
+                input_address: "__global",
+                output_address: "__global",
+            },
+        ),
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        OPENCL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+        OPENCL_ABI_VERSION,
+        renderer.local_size,
+        renderer.capabilities,
+        portable.plan(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedOpenCl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.elements(),
+        entry,
+        cache_key,
+        required_capabilities: OpenClCapabilities::CORE_32,
+        transaction: None,
+        schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
         ))),

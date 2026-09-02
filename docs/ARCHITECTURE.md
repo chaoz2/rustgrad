@@ -161,6 +161,18 @@ descriptors stay element-typed even though the launch domain is bytes; zero
 bytes allocate and submit nothing. Only renderer-private source/cache versions
 change, and unspecialized symbolic Bitcast remains fail closed.
 
+Materializing Pad and homogeneous Concat likewise retain their existing
+`MovementKernelPlan`, UOp, schedule, capture, and artifact identities. One
+crate-private `PortableDenseMaterialization` projects the validated operation
+into ordered deduplicated inputs and output-driven dense source regions.
+PTX, OpenCL C, Metal, and WGSL renderers only spell that shared address
+program: each lane is copied as raw storage, Pad commits its typed fill bytes,
+and Concat preserves source order. WGSL uses packed atomic byte stores so
+independent lanes sharing one word cannot race. Mixed-promotion Concat,
+Gather/Scatter, dynamic geometry, and unspecialized symbolic execution remain
+separate fail-closed boundaries; renderer-private keys are the only identity
+change.
+
 `reduction_native.rs` is the single checked reduction recurrence boundary for
 CPU, capture, and native renderers. It derives exact source/accumulator/output
 dtypes from one scalar Init→Accumulate→Finalize chain, commits every step at

@@ -278,6 +278,230 @@ pub(crate) struct PortableBitcast<'a> {
     bytes: usize,
 }
 
+/// One output-axis term in a checked dense materialization region.
+///
+/// An output coordinate is inside the region when it is in
+/// `[output_start, output_start + length)`. Subtracting `output_start` and
+/// multiplying by `source_stride` contributes that axis' dense source offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PortableDenseAxis {
+    pub(crate) output_dimension: usize,
+    pub(crate) output_divisor: usize,
+    pub(crate) output_start: usize,
+    pub(crate) length: usize,
+    pub(crate) source_stride: usize,
+}
+
+/// One source-backed hyperrectangle in output coordinates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PortableDenseRegion {
+    pub(crate) input_abi: usize,
+    pub(crate) axes: Vec<PortableDenseAxis>,
+}
+
+impl PortableDenseRegion {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.axes.iter().any(|axis| axis.length == 0)
+    }
+}
+
+/// Checked output-driven projection for dense Pad and homogeneous Concat.
+///
+/// The existing movement kind remains the semantic and serialized authority.
+/// This borrowed view projects it into ordered unique input bindings plus
+/// source regions. Backends only spell coordinate arithmetic and raw-byte
+/// loads/stores; they never rediscover padding, concatenation, or promotion.
+#[derive(Clone, Debug)]
+pub(crate) struct PortableDenseMaterialization<'a> {
+    plan: &'a MovementKernelPlan,
+    inputs: Vec<&'a MovementOperand>,
+    regions: Vec<PortableDenseRegion>,
+    fill_bytes: Option<Vec<u8>>,
+    elements: usize,
+}
+
+impl<'a> PortableDenseMaterialization<'a> {
+    pub(crate) fn new(plan: &'a MovementKernelPlan) -> Result<Self, MovementPlanError> {
+        plan.validate()?;
+        let elements = plan
+            .output_shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        elements
+            .checked_mul(plan.dtype.itemsize())
+            .ok_or(MovementPlanError::Overflow)?;
+        let output_strides = if elements == 0 {
+            vec![0; plan.output_shape.rank()]
+        } else {
+            checked_dense_strides(&plan.output_shape)?
+        };
+        let mut inputs = Vec::<&MovementOperand>::new();
+        let mut regions = Vec::new();
+        let fill_bytes = match &plan.kind {
+            MovementKernelKind::Pad {
+                input,
+                padding,
+                fill_bits,
+            } => {
+                let input_abi = push_unique_dense_input(&mut inputs, input, plan.dtype)?;
+                let source_strides = if elements == 0 {
+                    vec![0; input.shape.rank()]
+                } else {
+                    checked_dense_strides(&input.shape)?
+                };
+                let axes = input
+                    .shape
+                    .dims()
+                    .iter()
+                    .zip(padding)
+                    .enumerate()
+                    .map(|(axis, (&length, &(output_start, _)))| PortableDenseAxis {
+                        output_dimension: plan.output_shape.dims()[axis],
+                        output_divisor: output_strides[axis],
+                        output_start,
+                        length,
+                        source_stride: source_strides[axis],
+                    })
+                    .collect();
+                regions.push(PortableDenseRegion { input_abi, axes });
+                let raw = fill_bits.to_le_bytes();
+                Some(raw[..plan.dtype.itemsize()].to_vec())
+            }
+            MovementKernelKind::Concat {
+                inputs: operands,
+                axis,
+            } => {
+                let mut output_start = 0usize;
+                for input in operands {
+                    let input_abi = push_unique_dense_input(&mut inputs, input, plan.dtype)?;
+                    let source_strides = if elements == 0 {
+                        vec![0; input.shape.rank()]
+                    } else {
+                        checked_dense_strides(&input.shape)?
+                    };
+                    let axes = input
+                        .shape
+                        .dims()
+                        .iter()
+                        .enumerate()
+                        .map(|(position, &length)| PortableDenseAxis {
+                            output_dimension: plan.output_shape.dims()[position],
+                            output_divisor: output_strides[position],
+                            output_start: if position == *axis { output_start } else { 0 },
+                            length,
+                            source_stride: source_strides[position],
+                        })
+                        .collect();
+                    regions.push(PortableDenseRegion { input_abi, axes });
+                    output_start = output_start
+                        .checked_add(input.shape.dims()[*axis])
+                        .ok_or(MovementPlanError::Overflow)?;
+                }
+                None
+            }
+            _ => return Err(MovementPlanError::InvalidGeometry),
+        };
+        if inputs.iter().any(|input| input.node == plan.output) {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        Ok(Self {
+            plan,
+            inputs,
+            regions,
+            fill_bytes,
+            elements,
+        })
+    }
+
+    pub(crate) fn plan(&self) -> &'a MovementKernelPlan {
+        self.plan
+    }
+
+    pub(crate) fn inputs(&self) -> &[&'a MovementOperand] {
+        &self.inputs
+    }
+
+    pub(crate) fn regions(&self) -> &[PortableDenseRegion] {
+        &self.regions
+    }
+
+    pub(crate) fn fill_bytes(&self) -> Option<&[u8]> {
+        self.fill_bytes.as_deref()
+    }
+
+    pub(crate) fn elements(&self) -> usize {
+        self.elements
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.plan.dtype.itemsize()
+    }
+
+    pub(crate) fn validate_schedule_bindings(
+        &self,
+        bindings: &[ScheduleInputBinding],
+    ) -> Result<(), MovementPlanError> {
+        if bindings.len() != self.inputs.len() {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        for (abi_index, (binding, input)) in bindings.iter().zip(&self.inputs).enumerate() {
+            let bytes = input
+                .shape
+                .numel()
+                .map_err(|_| MovementPlanError::Overflow)?
+                .checked_mul(input.dtype.itemsize())
+                .ok_or(MovementPlanError::Overflow)?;
+            if binding.abi_index != abi_index
+                || binding.input_node != input.node
+                || binding.desc.id != input.node.index() as u64
+                || binding.desc.shape != input.shape
+                || binding.desc.dtype != input.dtype
+                || binding.desc.bytes != bytes
+                || !binding.desc.read_only
+                || binding.desc.view.is_some()
+            {
+                return Err(MovementPlanError::InvalidGeometry);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn push_unique_dense_input<'a>(
+    inputs: &mut Vec<&'a MovementOperand>,
+    input: &'a MovementOperand,
+    dtype: DType,
+) -> Result<usize, MovementPlanError> {
+    if input.dtype != dtype {
+        return Err(MovementPlanError::InvalidGeometry);
+    }
+    if let Some((index, established)) = inputs
+        .iter()
+        .enumerate()
+        .find(|(_, established)| established.node == input.node)
+    {
+        if established.shape != input.shape || established.dtype != input.dtype {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        return Ok(index);
+    }
+    inputs.push(input);
+    Ok(inputs.len() - 1)
+}
+
+fn checked_dense_strides(shape: &Shape) -> Result<Vec<usize>, MovementPlanError> {
+    let mut stride = 1usize;
+    let mut reversed = Vec::with_capacity(shape.rank());
+    for &dimension in shape.dims().iter().rev() {
+        reversed.push(stride);
+        stride = stride
+            .checked_mul(dimension)
+            .ok_or(MovementPlanError::Overflow)?;
+    }
+    reversed.reverse();
+    Ok(reversed)
+}
+
 impl<'a> PortableBitcast<'a> {
     pub(crate) fn new(plan: &'a MovementKernelPlan) -> Result<Self, MovementPlanError> {
         let MovementKernelKind::Bitcast { input } = &plan.kind else {
@@ -2383,6 +2607,96 @@ mod tests {
         assert_eq!(padding.as_slice(), [(1, 0), (0, 2)]);
         assert_eq!(*fill_bits, 0x8000);
         assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn portable_dense_materialization_projects_pad_and_homogeneous_concat_once() {
+        let mut pad_graph = Graph::new();
+        let input = pad_graph.input_dtype("input", [1, 2], DType::F16);
+        let output = pad_graph
+            .pad(input, [(1, 0), (0, 2)], Scalar::F(-0.0))
+            .unwrap();
+        let item = crate::schedule(&pad_graph, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = item.kernel.operation()
+        else {
+            panic!("scheduled pad plan")
+        };
+        let portable = PortableDenseMaterialization::new(plan).unwrap();
+        assert_eq!(portable.inputs().len(), 1);
+        assert_eq!(portable.elements(), 8);
+        assert_eq!(portable.elements() * portable.width(), 16);
+        assert_eq!(portable.fill_bytes(), Some([0x00, 0x80].as_slice()));
+        assert_eq!(
+            portable.regions()[0].axes,
+            [
+                PortableDenseAxis {
+                    output_dimension: 2,
+                    output_divisor: 4,
+                    output_start: 1,
+                    length: 1,
+                    source_stride: 2,
+                },
+                PortableDenseAxis {
+                    output_dimension: 4,
+                    output_divisor: 1,
+                    output_start: 0,
+                    length: 2,
+                    source_stride: 1,
+                },
+            ]
+        );
+        portable
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        let mut tampered = item.ordered_inputs().to_vec();
+        tampered[0].desc.bytes -= 1;
+        assert_eq!(
+            portable.validate_schedule_bindings(&tampered),
+            Err(MovementPlanError::InvalidGeometry)
+        );
+
+        let mut concat_graph = Graph::new();
+        let lhs = concat_graph.input_dtype("lhs", [2, 1], DType::U8);
+        let rhs = concat_graph.input_dtype("rhs", [2, 2], DType::U8);
+        let output = concat_graph.concat([lhs, rhs, lhs], 1).unwrap();
+        let item = crate::schedule(&concat_graph, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = item.kernel.operation()
+        else {
+            panic!("scheduled concat plan")
+        };
+        let portable = PortableDenseMaterialization::new(plan).unwrap();
+        assert_eq!(
+            portable
+                .inputs()
+                .iter()
+                .map(|input| input.node)
+                .collect::<Vec<_>>(),
+            [lhs, rhs]
+        );
+        assert_eq!(portable.elements(), 8);
+        assert_eq!(portable.regions().len(), 3);
+        assert_eq!(portable.regions()[0].axes[1].output_start, 0);
+        assert_eq!(portable.regions()[1].axes[1].output_start, 1);
+        assert_eq!(portable.regions()[2].axes[1].output_start, 3);
+        assert_eq!(portable.regions()[2].input_abi, 0);
+
+        let mut mixed = Graph::new();
+        let lhs = mixed.input_dtype("lhs", [1], DType::U8);
+        let rhs = mixed.input_dtype("rhs", [1], DType::U32);
+        let output = mixed.concat([lhs, rhs], 0).unwrap();
+        let plan = MovementKernelPlan::from_graph(&mixed, output).unwrap();
+        assert_eq!(
+            PortableDenseMaterialization::new(&plan).unwrap_err(),
+            MovementPlanError::InvalidGeometry
+        );
     }
 
     #[test]
