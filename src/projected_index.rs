@@ -3,8 +3,8 @@ use crate::uop::{
     UOpError,
 };
 
-const MAX_PROJECTED_INDEX_DEPTH: usize = 256;
-const MAX_PROJECTED_INDEX_NODES: usize = 4096;
+pub(crate) const MAX_PROJECTED_INDEX_DEPTH: usize = 256;
+pub(crate) const MAX_PROJECTED_INDEX_NODES: usize = 4096;
 
 /// One completely validated explicit physical-address expression attached to
 /// an ordinary Buffer index. Historical Buffer indices carry a Range as their
@@ -14,20 +14,203 @@ const MAX_PROJECTED_INDEX_NODES: usize = 4096;
 /// Keeping the expression in the UOp DAG makes its identity and sharing
 /// canonical. This plan is the sole semantic parser used by interpreters and
 /// renderers, so backend code never rediscovers movement-operation policy.
-pub(crate) struct ProjectedIndexPlan<'a> {
+pub(crate) struct ProjectedIndexPlan {
     pub(crate) buffer: u64,
     pub(crate) elements: usize,
     pub(crate) output_elements: usize,
-    pub(crate) expression: &'a UOp,
+    pub(crate) expression: ProjectedExpr<i64>,
     fits_i32: bool,
 }
 
-pub(crate) trait ProjectedIndexEmitter {
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ProjectedExpr<C> {
+    Linear,
+    Constant(C),
+    Binary {
+        operation: Binary,
+        lhs: Box<Self>,
+        rhs: Box<Self>,
+    },
+}
+
+impl<C> ProjectedExpr<C> {
+    pub(crate) fn binary(operation: Binary, lhs: Self, rhs: Self) -> Result<Self, UOpError> {
+        if !matches!(
+            operation,
+            Binary::Add | Binary::Sub | Binary::Mul | Binary::FloorDiv | Binary::Mod
+        ) {
+            return Err(UOpError::InvalidIndex);
+        }
+        Ok(Self::Binary {
+            operation,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        })
+    }
+
+    pub(crate) fn constants(&self) -> Vec<&C> {
+        let mut constants = Vec::new();
+        self.collect_constants(&mut constants);
+        constants
+    }
+
+    pub(crate) fn contains_linear(&self) -> bool {
+        match self {
+            Self::Linear => true,
+            Self::Constant(_) => false,
+            Self::Binary { lhs, rhs, .. } => lhs.contains_linear() || rhs.contains_linear(),
+        }
+    }
+
+    pub(crate) fn validate_size(&self, depth: usize, nodes: &mut usize) -> Result<(), UOpError> {
+        if depth > MAX_PROJECTED_INDEX_DEPTH {
+            return Err(UOpError::InvalidIndex);
+        }
+        *nodes = nodes.checked_add(1).ok_or(UOpError::InvalidIndex)?;
+        if *nodes > MAX_PROJECTED_INDEX_NODES {
+            return Err(UOpError::InvalidIndex);
+        }
+        if let Self::Binary { lhs, rhs, .. } = self {
+            lhs.validate_size(depth + 1, nodes)?;
+            rhs.validate_size(depth + 1, nodes)?;
+        }
+        Ok(())
+    }
+
+    fn collect_constants<'b>(&'b self, out: &mut Vec<&'b C>) {
+        match self {
+            Self::Linear => {}
+            Self::Constant(value) => out.push(value),
+            Self::Binary { lhs, rhs, .. } => {
+                lhs.collect_constants(out);
+                rhs.collect_constants(out);
+            }
+        }
+    }
+
+    pub(crate) fn try_map<D, E>(
+        &self,
+        map: &mut impl FnMut(&C) -> Result<D, E>,
+    ) -> Result<ProjectedExpr<D>, E> {
+        Ok(match self {
+            Self::Linear => ProjectedExpr::Linear,
+            Self::Constant(value) => ProjectedExpr::Constant(map(value)?),
+            Self::Binary {
+                operation,
+                lhs,
+                rhs,
+            } => ProjectedExpr::Binary {
+                operation: *operation,
+                lhs: Box::new(lhs.try_map(map)?),
+                rhs: Box::new(rhs.try_map(map)?),
+            },
+        })
+    }
+
+    pub(crate) fn emit<E: ProjectedIndexEmitter<C>>(
+        &self,
+        emitter: &mut E,
+    ) -> Result<E::Value, E::Error> {
+        match self {
+            Self::Linear => emitter.linear(),
+            Self::Constant(value) => emitter.constant(value),
+            Self::Binary {
+                operation,
+                lhs,
+                rhs,
+            } => {
+                let lhs = lhs.emit(emitter)?;
+                let rhs = rhs.emit(emitter)?;
+                emitter.binary(*operation, lhs, rhs)
+            }
+        }
+    }
+}
+
+impl ProjectedExpr<i64> {
+    pub(crate) fn canonicalized(&self) -> Self {
+        match self {
+            Self::Linear | Self::Constant(_) => self.clone(),
+            Self::Binary {
+                operation,
+                lhs,
+                rhs,
+            } => {
+                let lhs = lhs.canonicalized();
+                let rhs = rhs.canonicalized();
+                if let (Self::Constant(lhs), Self::Constant(rhs)) = (&lhs, &rhs) {
+                    let folded = match operation {
+                        Binary::Add => lhs.checked_add(*rhs),
+                        Binary::Sub => lhs.checked_sub(*rhs),
+                        Binary::Mul => lhs.checked_mul(*rhs),
+                        Binary::FloorDiv if *rhs > 0 => lhs.checked_div_euclid(*rhs),
+                        Binary::Mod if *rhs > 0 => lhs.checked_rem_euclid(*rhs),
+                        _ => None,
+                    };
+                    if let Some(value) = folded {
+                        return Self::Constant(value);
+                    }
+                }
+                match (operation, &lhs, &rhs) {
+                    (Binary::Add | Binary::Sub, _, Self::Constant(0)) => lhs,
+                    (Binary::Add, Self::Constant(0), _) => rhs,
+                    (Binary::Mul, _, Self::Constant(1))
+                    | (Binary::FloorDiv, _, Self::Constant(1)) => lhs,
+                    (Binary::Mul, Self::Constant(1), _) => rhs,
+                    (Binary::Mul, _, Self::Constant(0))
+                    | (Binary::Mul, Self::Constant(0), _)
+                    | (Binary::Mod, _, Self::Constant(1)) => Self::Constant(0),
+                    _ => Self::Binary {
+                        operation: *operation,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                }
+            }
+        }
+    }
+
+    pub(crate) fn to_uop(&self, output_elements: usize) -> Result<UOp, UOpError> {
+        let output_elements = i64::try_from(output_elements).map_err(|_| UOpError::InvalidIndex)?;
+        let ty = crate::UType::scalar(crate::DType::I64);
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(ty),
+            vec![UOp::constant(output_elements, ty)],
+        );
+        if output_elements == 0 {
+            return Ok(UOp::from_operation(
+                Operation::Binary(Binary::Mul),
+                Some(ty),
+                vec![range, UOp::constant(0, ty)],
+            ));
+        }
+        fn build(expression: &ProjectedExpr<i64>, range: &UOp) -> UOp {
+            let ty = crate::UType::scalar(crate::DType::I64);
+            match expression {
+                ProjectedExpr::Linear => range.clone(),
+                ProjectedExpr::Constant(value) => UOp::constant(*value, ty),
+                ProjectedExpr::Binary {
+                    operation,
+                    lhs,
+                    rhs,
+                } => UOp::from_operation(
+                    Operation::Binary(*operation),
+                    Some(ty),
+                    vec![build(lhs, range), build(rhs, range)],
+                ),
+            }
+        }
+        Ok(build(self, &range))
+    }
+}
+
+pub(crate) trait ProjectedIndexEmitter<C = i64> {
     type Value;
     type Error;
 
     fn linear(&mut self) -> Result<Self::Value, Self::Error>;
-    fn constant(&mut self, value: i64) -> Result<Self::Value, Self::Error>;
+    fn constant(&mut self, value: &C) -> Result<Self::Value, Self::Error>;
     fn binary(
         &mut self,
         operation: Binary,
@@ -36,7 +219,7 @@ pub(crate) trait ProjectedIndexEmitter {
     ) -> Result<Self::Value, Self::Error>;
 }
 
-impl<'a> ProjectedIndexPlan<'a> {
+impl ProjectedIndexPlan {
     pub(crate) fn is_projected(index: &UOp) -> bool {
         matches!(
             index.operation(),
@@ -47,7 +230,7 @@ impl<'a> ProjectedIndexPlan<'a> {
         )
     }
 
-    pub(crate) fn from_index(index: &'a UOp) -> Result<Self, UOpError> {
+    pub(crate) fn from_index(index: &UOp) -> Result<Self, UOpError> {
         let Operation::Index(IndexValue::Buffer {
             buffer,
             elements,
@@ -85,12 +268,14 @@ impl<'a> ProjectedIndexPlan<'a> {
             .checked_mul(index_type.scalar.itemsize())
             .and_then(|_| output_elements.checked_mul(index_type.scalar.itemsize()))
             .ok_or(UOpError::InvalidIndex)?;
+        let mut parsed_nodes = 0;
+        let expression = parse_expression(expression, output_elements, 0, &mut parsed_nodes)?;
         let mut state = ValidationState {
             output_elements,
             nodes: 0,
             fits_i32: true,
         };
-        let bounds = validate_expression(expression, 0, &mut state)?;
+        let bounds = validate_expression(&expression, 0, &mut state)?;
         if state.nodes > MAX_PROJECTED_INDEX_NODES {
             return Err(UOpError::InvalidIndex);
         }
@@ -121,7 +306,7 @@ impl<'a> ProjectedIndexPlan<'a> {
         &self,
         emitter: &mut E,
     ) -> Result<E::Value, E::Error> {
-        emit_expression(self.expression, emitter)
+        self.expression.emit(emitter)
     }
 
     pub(crate) fn offset(&self, linear: usize) -> Result<usize, UOpError> {
@@ -138,8 +323,8 @@ impl<'a> ProjectedIndexPlan<'a> {
             fn linear(&mut self) -> Result<Self::Value, Self::Error> {
                 Ok(self.linear)
             }
-            fn constant(&mut self, value: i64) -> Result<Self::Value, Self::Error> {
-                Ok(i128::from(value))
+            fn constant(&mut self, value: &i64) -> Result<Self::Value, Self::Error> {
+                Ok(i128::from(*value))
             }
             fn binary(
                 &mut self,
@@ -170,7 +355,7 @@ impl<'a> ProjectedIndexPlan<'a> {
 }
 
 pub(crate) fn render_infix_projected_index(
-    plan: &ProjectedIndexPlan<'_>,
+    plan: &ProjectedIndexPlan,
     linear: impl Into<String>,
     mut literal: impl FnMut(i64) -> Result<String, UOpError>,
 ) -> Result<String, UOpError> {
@@ -185,8 +370,8 @@ pub(crate) fn render_infix_projected_index(
         fn linear(&mut self) -> Result<Self::Value, Self::Error> {
             Ok(self.linear.clone())
         }
-        fn constant(&mut self, value: i64) -> Result<Self::Value, Self::Error> {
-            (self.literal)(value)
+        fn constant(&mut self, value: &i64) -> Result<Self::Value, Self::Error> {
+            (self.literal)(*value)
         }
         fn binary(
             &mut self,
@@ -211,46 +396,17 @@ pub(crate) fn render_infix_projected_index(
     })
 }
 
-fn emit_expression<E: ProjectedIndexEmitter>(
+fn parse_expression(
     expression: &UOp,
-    emitter: &mut E,
-) -> Result<E::Value, E::Error> {
-    match expression.operation() {
-        Operation::Range(0) => emitter.linear(),
-        Operation::Const(LiteralValue::Int(value)) => emitter.constant(*value),
-        Operation::Binary(operation @ (Binary::Add | Binary::Sub | Binary::Mul)) => {
-            let lhs = emit_expression(&expression.sources()[0], emitter)?;
-            let rhs = emit_expression(&expression.sources()[1], emitter)?;
-            emitter.binary(*operation, lhs, rhs)
-        }
-        Operation::Binary(operation @ (Binary::FloorDiv | Binary::Mod)) => {
-            let lhs = emit_expression(&expression.sources()[0], emitter)?;
-            let rhs = emit_expression(&expression.sources()[1], emitter)?;
-            emitter.binary(*operation, lhs, rhs)
-        }
-        _ => unreachable!("ProjectedIndexPlan validated its expression"),
-    }
-}
-
-struct ValidationState {
     output_elements: usize,
-    nodes: usize,
-    fits_i32: bool,
-}
-
-fn validate_expression(
-    expression: &UOp,
     depth: usize,
-    state: &mut ValidationState,
-) -> Result<Option<(i128, i128)>, UOpError> {
-    if depth > MAX_PROJECTED_INDEX_DEPTH {
-        return Err(UOpError::InvalidIndex);
-    }
-    state.nodes = state.nodes.checked_add(1).ok_or(UOpError::InvalidIndex)?;
-    if state.nodes > MAX_PROJECTED_INDEX_NODES {
-        return Err(UOpError::InvalidIndex);
-    }
-    if expression.ty() != Some(crate::UType::scalar(crate::DType::I64)) {
+    nodes: &mut usize,
+) -> Result<ProjectedExpr<i64>, UOpError> {
+    *nodes = nodes.checked_add(1).ok_or(UOpError::InvalidIndex)?;
+    if depth > MAX_PROJECTED_INDEX_DEPTH
+        || *nodes > MAX_PROJECTED_INDEX_NODES
+        || expression.ty() != Some(crate::UType::scalar(crate::DType::I64))
+    {
         return Err(UOpError::InvalidIndex);
     }
     match expression.operation() {
@@ -261,9 +417,43 @@ fn validate_expression(
             let Operation::Const(LiteralValue::Int(bound)) = bound.operation() else {
                 return Err(UOpError::InvalidIndex);
             };
-            if usize::try_from(*bound).ok() != Some(state.output_elements) {
+            if usize::try_from(*bound).ok() != Some(output_elements) {
                 return Err(UOpError::InvalidIndex);
             }
+            Ok(ProjectedExpr::Linear)
+        }
+        Operation::Const(LiteralValue::Int(value)) if expression.sources().is_empty() => {
+            Ok(ProjectedExpr::Constant(*value))
+        }
+        Operation::Binary(operation) if expression.sources().len() == 2 => ProjectedExpr::binary(
+            *operation,
+            parse_expression(&expression.sources()[0], output_elements, depth + 1, nodes)?,
+            parse_expression(&expression.sources()[1], output_elements, depth + 1, nodes)?,
+        ),
+        _ => Err(UOpError::InvalidIndex),
+    }
+}
+
+struct ValidationState {
+    output_elements: usize,
+    nodes: usize,
+    fits_i32: bool,
+}
+
+fn validate_expression(
+    expression: &ProjectedExpr<i64>,
+    depth: usize,
+    state: &mut ValidationState,
+) -> Result<Option<(i128, i128)>, UOpError> {
+    if depth > MAX_PROJECTED_INDEX_DEPTH {
+        return Err(UOpError::InvalidIndex);
+    }
+    state.nodes = state.nodes.checked_add(1).ok_or(UOpError::InvalidIndex)?;
+    if state.nodes > MAX_PROJECTED_INDEX_NODES {
+        return Err(UOpError::InvalidIndex);
+    }
+    match expression {
+        ProjectedExpr::Linear => {
             if state.output_elements > i32::MAX as usize {
                 state.fits_i32 = false;
             }
@@ -275,14 +465,18 @@ fn validate_expression(
                 )
             }))
         }
-        Operation::Const(LiteralValue::Int(value)) if expression.sources().is_empty() => {
+        ProjectedExpr::Constant(value) => {
             state.fits_i32 &= i32::try_from(*value).is_ok();
             let value = i128::from(*value);
             Ok(Some((value, value)))
         }
-        Operation::Binary(operation) if expression.sources().len() == 2 => {
-            let lhs = validate_expression(&expression.sources()[0], depth + 1, state)?;
-            let rhs = validate_expression(&expression.sources()[1], depth + 1, state)?;
+        ProjectedExpr::Binary {
+            operation,
+            lhs,
+            rhs,
+        } => {
+            let lhs = validate_expression(lhs, depth + 1, state)?;
+            let rhs = validate_expression(rhs, depth + 1, state)?;
             if matches!(operation, Binary::FloorDiv | Binary::Mod)
                 && !matches!(rhs, Some((minimum, maximum)) if minimum == maximum && minimum > 0)
             {
@@ -329,7 +523,6 @@ fn validate_expression(
             state.fits_i32 &= minimum >= i128::from(i32::MIN) && maximum <= i128::from(i32::MAX);
             Ok(Some((minimum, maximum)))
         }
-        _ => Err(UOpError::InvalidIndex),
     }
 }
 
@@ -453,6 +646,19 @@ mod tests {
             ProjectedIndexPlan::from_index(
                 &index(Shape::from([1, 1]), Shape::from([1]), too_deep,)
             )
+            .is_err()
+        );
+
+        let mut shared_diamond = range(1);
+        for _ in 0..13 {
+            shared_diamond = binary(Binary::Add, shared_diamond.clone(), shared_diamond);
+        }
+        assert!(
+            ProjectedIndexPlan::from_index(&index(
+                Shape::from([1]),
+                Shape::from([1]),
+                shared_diamond,
+            ))
             .is_err()
         );
     }

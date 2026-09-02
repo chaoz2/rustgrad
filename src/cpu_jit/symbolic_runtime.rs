@@ -7,14 +7,17 @@
 
 use super::{
     ABI_VERSION, BufferAbi, JitError, KernelAbi, KernelPointerAbi, RenderedC, SymbolicLoadOffsets,
-    ctype, emit_with_substitution, native_cache_key, projected_index_offset,
-    reduction_accumulator_type, reduction_arithmetic_expr, runtime_mean_divisor_expr,
-    scalar_kernel_prologue, scalar_store_expr, scan_commit_expr, scan_store_expr,
+    ctype, emit_with_substitution, native_cache_key, reduction_accumulator_type,
+    reduction_arithmetic_expr, runtime_mean_divisor_expr, scalar_kernel_prologue,
+    scalar_store_expr, scan_commit_expr, scan_store_expr,
 };
 use crate::engine::symbolic::{SymbolicItemDomain, SymbolicSchema};
 use crate::engine::symbolic_view::SymbolicViewMap;
+use crate::projected_index::ProjectedIndexEmitter;
+use crate::uop::Binary;
 use crate::{
-    DType, MatmulValue, MovementValue, Operation, ScheduleItem, SymbolicExpr, SymbolicShape, UOp,
+    DType, IndexAddressing, IndexValue, MatmulValue, MovementValue, Operation, ScheduleItem,
+    SymbolicExpr, SymbolicShape, UOp,
 };
 use std::collections::BTreeMap;
 
@@ -129,12 +132,14 @@ fn render_uop(
     let mut lines = prologue(capture_identity, item.id);
     match domain {
         SymbolicItemDomain::Elementwise { .. } => {
+            let projected_ordinals = projected_ordinals(&item.kernel)?;
             let extent = shape_elements_c(output, schema)?;
             lines.push(format!(
                 "  for (size_t rg_i=0; rg_i<(size_t)({extent}); ++rg_i) {{"
             ));
             let offsets = Offsets {
                 item: item.id,
+                projected_ordinals: &projected_ordinals,
                 schema,
                 domain: output,
             };
@@ -213,6 +218,7 @@ fn render_reduction(
             "runtime-symbolic reduction kind is unsupported".into(),
         ));
     }
+    let projected_ordinals = projected_ordinals(&item.kernel)?;
     if kernel.plan.output_dtype.is_float8() && kernel.has_epilogue() {
         return Err(JitError::Unsupported(
             "runtime-symbolic Float8 reduction epilogues are unsupported".into(),
@@ -230,6 +236,7 @@ fn render_reduction(
     {
         let offsets = Offsets {
             item: item.id,
+            projected_ordinals: &projected_ordinals,
             schema,
             domain: domain.input,
         };
@@ -269,6 +276,7 @@ fn render_reduction(
     ));
     let producer_offsets = Offsets {
         item: item.id,
+        projected_ordinals: &projected_ordinals,
         schema,
         domain: domain.input,
     };
@@ -349,6 +357,7 @@ fn render_reduction(
         lines.push("    size_t rg_i=rg_out;".into());
         let epilogue_offsets = Offsets {
             item: item.id,
+            projected_ordinals: &projected_ordinals,
             schema,
             domain: domain.output,
         };
@@ -563,6 +572,7 @@ fn render_matmul(
 
 struct Offsets<'a> {
     item: u64,
+    projected_ordinals: &'a BTreeMap<UOp, u32>,
     schema: &'a SymbolicSchema,
     domain: &'a SymbolicShape,
 }
@@ -570,7 +580,21 @@ struct Offsets<'a> {
 impl SymbolicLoadOffsets for Offsets<'_> {
     fn offset(&self, index: &UOp, buffer: u64) -> Result<String, JitError> {
         if crate::projected_index::ProjectedIndexPlan::is_projected(index) {
-            return projected_index_offset(index, "((int64_t)rg_i)");
+            let ordinal =
+                self.projected_ordinals.get(index).copied().ok_or_else(|| {
+                    JitError::Symbolic("projected Index ordinal is absent".into())
+                })?;
+            let projected = self
+                .schema
+                .projected
+                .get(&(self.item, ordinal))
+                .ok_or_else(|| {
+                    JitError::Symbolic("symbolic projected expression is absent".into())
+                })?;
+            return projected.render(&mut SymbolicProjectedC {
+                linear: "((int64_t)rg_i)",
+                schema: self.schema,
+            });
         }
         if let Some(view) = self.schema.views.get(&(self.item, buffer)) {
             let logical =
@@ -581,6 +605,68 @@ impl SymbolicLoadOffsets for Offsets<'_> {
                 JitError::Symbolic(format!("symbolic load buffer {buffer} is absent"))
             })?;
             broadcast_offset_c(input, self.domain, "rg_i", self.schema)
+        }
+    }
+}
+
+fn projected_ordinals(kernel: &UOp) -> Result<BTreeMap<UOp, u32>, JitError> {
+    kernel
+        .topological()
+        .map_err(|error| JitError::Symbolic(error.to_string()))?
+        .into_iter()
+        .filter(|node| {
+            matches!(
+                node.operation(),
+                Operation::Index(IndexValue::Buffer {
+                    addressing: IndexAddressing::Projected,
+                    ..
+                })
+            )
+        })
+        .enumerate()
+        .map(|(ordinal, node)| {
+            Ok((
+                node,
+                u32::try_from(ordinal).map_err(|_| {
+                    JitError::Symbolic("too many projected indices in one kernel".into())
+                })?,
+            ))
+        })
+        .collect()
+}
+
+struct SymbolicProjectedC<'a> {
+    linear: &'a str,
+    schema: &'a SymbolicSchema,
+}
+
+impl ProjectedIndexEmitter<SymbolicExpr> for SymbolicProjectedC<'_> {
+    type Value = String;
+    type Error = JitError;
+
+    fn linear(&mut self) -> Result<Self::Value, Self::Error> {
+        Ok(self.linear.into())
+    }
+
+    fn constant(&mut self, value: &SymbolicExpr) -> Result<Self::Value, Self::Error> {
+        expression_c(value, self.schema)
+    }
+
+    fn binary(
+        &mut self,
+        operation: Binary,
+        lhs: Self::Value,
+        rhs: Self::Value,
+    ) -> Result<Self::Value, Self::Error> {
+        match operation {
+            Binary::Add => Ok(format!("(({lhs})+({rhs}))")),
+            Binary::Sub => Ok(format!("(({lhs})-({rhs}))")),
+            Binary::Mul => Ok(format!("(({lhs})*({rhs}))")),
+            Binary::FloorDiv => Ok(format!("rg_floor_div(({lhs}),({rhs}))")),
+            Binary::Mod => Ok(format!("rg_floor_mod(({lhs}),({rhs}))")),
+            _ => Err(JitError::Symbolic(
+                "symbolic projected operation is unsupported".into(),
+            )),
         }
     }
 }

@@ -381,18 +381,26 @@ impl SymbolicViewMap {
     }
 }
 
-fn simplified(expression: SymbolicExpr) -> Result<SymbolicExpr, ReplayError> {
+pub(crate) fn simplified(expression: SymbolicExpr) -> Result<SymbolicExpr, ReplayError> {
     expression
         .simplify()
         .map(|simplified| simplified.expression)
         .map_err(symbolic_error)
 }
 
-fn proven_nonnegative(expression: &SymbolicExpr) -> Result<bool, ReplayError> {
+pub(crate) fn proven_nonnegative(expression: &SymbolicExpr) -> Result<bool, ReplayError> {
     if let Some((minimum, _)) = polynomial_bounds(expression)? {
         return Ok(minimum >= 0);
     }
     Ok(expression.bounds().map_err(symbolic_error)?.min >= 0)
+}
+
+pub(crate) fn proven_equal(left: &SymbolicExpr, right: &SymbolicExpr) -> Result<bool, ReplayError> {
+    let difference = simplified(left.clone() - right.clone())?;
+    if difference.bounds().map_err(symbolic_error)?.constant() == Some(0) {
+        return Ok(true);
+    }
+    Ok(matches!(polynomial_bounds(&difference)?, Some((0, 0))))
 }
 
 type Monomial = Vec<SymbolicVar>;
