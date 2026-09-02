@@ -4325,14 +4325,7 @@ impl Graph {
     ) -> Result<NodeId> {
         let source = self.node(input)?;
         let plan = indexing::StaticIndexPlan::new(source.shape.clone(), specs)?;
-        Ok(self.push(
-            Op::StaticIndex {
-                input,
-                plan: plan.clone(),
-            },
-            plan.output_shape().clone(),
-            source.dtype,
-        ))
+        indexing::lower_static_index_read(self, input, &plan)
     }
 
     pub(crate) fn static_index_grad(

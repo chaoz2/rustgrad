@@ -1,4 +1,4 @@
-use rustgrad::{Backend, CpuBackend, DType, Error, Graph, Scalar, Shape, TensorData};
+use rustgrad::{Backend, CpuBackend, DType, Error, Graph, Scalar, Shape, TensorData, schedule};
 use std::collections::HashMap;
 
 fn f32_data(shape: impl Into<Shape>, values: impl IntoIterator<Item = f32>) -> TensorData {
@@ -63,13 +63,10 @@ fn unfold_matches_tinygrad_window_tables_and_trace() {
             ),
             f32_data(output_shape, expected)
         );
-        assert!(
-            graph
-                .trace(output)
-                .unwrap()
-                .to_string()
-                .contains("static_index")
-        );
+        let trace = graph.trace(output).unwrap().to_string();
+        assert!(trace.contains("gather(") && trace.contains("axis=0"));
+        assert!(!trace.contains("static_index"));
+        schedule(&graph, output).unwrap().validate().unwrap();
     }
 }
 

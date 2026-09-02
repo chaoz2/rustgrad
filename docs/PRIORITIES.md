@@ -425,7 +425,7 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   random-runtime, or sampling/training claim.
 
 - Released static core-parity maintenance covers F16/BF16 F32 sum
-  accumulation, shrink-backed split/chunk and static unfold, variance/std
+  accumulation, shrink-backed split/chunk and schedulable static unfold, variance/std
   composition, typed like-creation and captured randperm helpers, normalized
   static index/update higher-order derivatives, Unicode rearrange identifiers,
   and presentation-whitespace einsum parsing. These are bounded CPU Graph
@@ -441,7 +441,7 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   creates a trainer, runtime, device path, or demonstrated workflow blocker.
 
 - The current static maintenance batch adds only checked Adam/LAMB checkpoint
-  counter exhaustion, `StaticIndex`-lowered diagonal, F32/F64 CPU-JIT `exp2`,
+  counter exhaustion, normalized-static-map `diagonal_static`, F32/F64 CPU-JIT `exp2`,
   and bounded copying-only raw tensor-file reads/writes. It does not promote dynamic
   indexing, broad native transcendental coverage, mmap/lazy storage, device
   execution, or optimizer redesign.

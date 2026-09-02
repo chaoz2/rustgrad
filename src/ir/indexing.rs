@@ -7,7 +7,7 @@
 //! indexing syntax.
 
 use crate::index::DenseIndex;
-use crate::{Error, Graph, NodeId, Result, Shape};
+use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 
 /// A statically-known component of an immutable tensor index.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -49,6 +49,46 @@ impl Graph {
         let specs = unfold_specs(input, &shape, dim, size, step)?;
         self.static_index(input, &specs)
     }
+}
+
+/// Lowers one validated immutable static-index read through the existing dense
+/// Gather substrate. Keeping the normalized coordinate map as the only policy
+/// boundary avoids teaching the scheduler and renderers a second indexing
+/// operation while preserving the historical plan for artifact compatibility.
+pub(crate) fn lower_static_index_read(
+    graph: &mut Graph,
+    input: NodeId,
+    plan: &StaticIndexPlan,
+) -> Result<NodeId> {
+    let source = graph.node(input)?;
+    if source.shape != plan.source {
+        return Err(Error::InvalidIndex);
+    }
+    let source_shape = source.shape.clone();
+    let source_elements = source_shape.numel()?;
+    let output_shape = plan.output_shape().clone();
+    let offsets = plan
+        .source_offsets()?
+        .into_iter()
+        .map(|offset| {
+            i64::try_from(offset)
+                .map(Scalar::I)
+                .map_err(|_| Error::ShapeOverflow(source_shape.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let index_shape = Shape::from([offsets.len()]);
+    let indices = TensorData::from_scalars(index_shape.clone(), DType::I64, offsets)?;
+
+    // Rehearse the complete composition privately. TensorData construction,
+    // reshape geometry, Gather admission, or output projection failures cannot
+    // publish a partial indexing graph.
+    let mut candidate = graph.clone();
+    let flattened = candidate.reshape(input, Shape::from([source_elements]))?;
+    let indices = candidate.constant(indices);
+    let gathered = candidate.gather(flattened, indices, 0)?;
+    let output = candidate.reshape(gathered, output_shape)?;
+    *graph = candidate;
+    Ok(output)
 }
 
 fn unfold_specs(

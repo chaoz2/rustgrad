@@ -411,7 +411,7 @@ fn malformed_models_and_invalid_graph_nodes_fail_closed() {
 }
 
 #[test]
-fn static_index_graph_visualization_preserves_normalized_output_geometry() {
+fn static_index_graph_visualization_preserves_composed_gather_geometry() {
     let mut graph = Graph::new();
     let input = graph.input("input", [3, 4]);
     let indexed = graph
@@ -433,9 +433,11 @@ fn static_index_graph_visualization_preserves_normalized_output_geometry() {
     let first = graph_viz(&graph, &[indexed]).unwrap();
     assert_eq!(first, graph_viz(&graph, &[indexed]).unwrap());
     let dot = first.to_dot();
-    assert!(dot.contains("static_index\\nkind=graph_op"));
-    assert!(dot.contains("index_shape=[2,2]"));
-    assert!(dot.contains("data:0:input"));
+    assert!(dot.contains("gather\\nkind=graph_op"));
+    assert!(dot.contains("axis=0"));
+    assert!(dot.contains("dtype=i64"));
+    assert!(dot.contains("shape=[2,2]"));
+    assert!(!dot.contains("static_index\\nkind=graph_op"));
 }
 
 #[test]

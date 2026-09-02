@@ -3,7 +3,7 @@ use crate::{
     TensorData, UOp, plan_temporary_reuse, schedule, schedule_many,
     schedule_with_external_materializations,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
     BufferDesc {
@@ -143,6 +143,101 @@ fn static_position_movement_owns_exact_schedule_capture_and_native_abi() {
         crate::Operation::Movement(crate::MovementValue::Plan(plan))
             if matches!(&plan.kind, crate::MovementKernelKind::AffineCopy { .. })
     ));
+}
+
+#[test]
+fn compositional_static_index_uses_authenticated_gather_schedule_and_replay() {
+    use crate::ir::indexing::StaticIndex;
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3, 4], DType::F32);
+    let output = graph
+        .static_index(
+            input,
+            &[
+                StaticIndex::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+                StaticIndex::Advanced {
+                    shape: [2].into(),
+                    values: vec![1, 0],
+                },
+                StaticIndex::Advanced {
+                    shape: [2].into(),
+                    values: vec![-1, 1],
+                },
+            ],
+        )
+        .unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    scheduled.validate().unwrap();
+    let gather = scheduled
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kernel.operation(),
+                crate::Operation::Movement(crate::MovementValue::Plan(plan))
+                    if matches!(&plan.kind, crate::MovementKernelKind::Gather { .. })
+            )
+        })
+        .expect("static-index composition must retain one Gather materialization");
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = gather.kernel.operation()
+    else {
+        unreachable!()
+    };
+    let crate::MovementKernelKind::Gather {
+        input: gathered_input,
+        index,
+        axis,
+    } = &plan.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(*axis, 0);
+    assert_ne!(gathered_input.node, input);
+    assert!(matches!(
+        graph.op(gathered_input.node),
+        Ok(crate::Op::Reshape {
+            input: source,
+            shape,
+        }) if *source == input && shape == &Shape::from([24])
+    ));
+    assert_eq!(gathered_input.shape, Shape::from([24]));
+    assert_eq!(index.dtype, DType::I64);
+    assert_eq!(index.shape, Shape::from([4]));
+    let flattened = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == gathered_input.node)
+        .expect("the direct movement operand must own a dense producer");
+    assert!(gather.dependencies.contains(&flattened.id));
+
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let bindings = BTreeMap::from([(
+        "input".into(),
+        TensorData::new([2, 3, 4], (0..24).map(|value| value as f32).collect()).unwrap(),
+    )]);
+    let interpreted = decoded.replay(&bindings).unwrap();
+    assert_eq!(
+        interpreted[0],
+        TensorData::new([2, 2], vec![7.0, 1.0, 19.0, 13.0]).unwrap()
+    );
+    let native = decoded
+        .replay_with_options(
+            &bindings,
+            &crate::CapturedReplayExecutor::default(),
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(native.outputs, interpreted);
 }
 
 #[test]
