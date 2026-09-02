@@ -9,6 +9,7 @@ pub mod mixed_rebinding;
 mod persistent_inputs;
 mod replay_liveness;
 pub(crate) mod symbolic;
+mod symbolic_program;
 pub(crate) mod symbolic_view;
 use crate::backend::{JitBackendError, PreparedScheduleItem, TensorValueStore};
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
@@ -27,6 +28,9 @@ use std::{
     fmt,
 };
 pub use symbolic::{SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter};
+pub use symbolic_program::{
+    CpuSymbolicInvocation, CpuSymbolicProgram, CpuSymbolicResult, CpuSymbolicTrace,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RealizationPolicy {

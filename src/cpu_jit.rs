@@ -22,6 +22,7 @@ use std::{
 };
 #[path = "cpu_jit_random.rs"]
 mod random;
+pub(crate) mod symbolic_runtime;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
@@ -416,7 +417,7 @@ pub struct JitKernel {
     call: unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int,
 }
 impl JitKernel {
-    fn load(r: &RenderedC) -> Result<Self, JitError> {
+    pub(crate) fn load(r: &RenderedC) -> Result<Self, JitError> {
         let path = compile_cached(r)?;
         let (lib, call) = match load_library_call(&path) {
             Ok(loaded) => loaded,
@@ -480,6 +481,65 @@ impl JitKernel {
                 KernelPointerAbi::Quantized(_) => unreachable!("validated dense ABI"),
             })
             .collect();
+        self.invoke_transactional(buffers, &mut ptrs, symbols)
+    }
+
+    /// Calls one authenticated runtime-symbolic kernel. The stable ABI stores
+    /// each buffer's proven maximum extent; the invocation supplies the exact
+    /// bound extent after the symbolic schema and all external descriptors
+    /// have been checked. Native code receives only exact-sized owned buffers
+    /// and the canonical ordered I64 parameter vector.
+    pub(crate) fn call_symbolic(
+        &self,
+        buffers: &mut [JitBuffer],
+        symbols: &[i64],
+        exact_elements: &[usize],
+    ) -> Result<(), JitError> {
+        if !self.abi.quantized_buffers.is_empty() {
+            return Err(JitError::InvalidBuffer(
+                "runtime-symbolic packed resources are unsupported".into(),
+            ));
+        }
+        if buffers.len() != self.abi.buffers.len() || exact_elements.len() != buffers.len() {
+            return Err(JitError::InvalidBuffer(
+                "runtime-symbolic buffer count mismatch".into(),
+            ));
+        }
+        if symbols.len() != self.abi.symbol_count {
+            return Err(JitError::InvalidBuffer(format!(
+                "expected {} symbols, got {}",
+                self.abi.symbol_count,
+                symbols.len()
+            )));
+        }
+        for ((buffer, exact), maximum) in buffers.iter().zip(exact_elements).zip(&self.abi.buffers)
+        {
+            if buffer.dtype != maximum.dtype
+                || buffer.elements != *exact
+                || *exact > maximum.elements
+                || buffer.mutable != maximum.mutable
+                || buffer.bytes.len()
+                    != exact
+                        .checked_mul(maximum.dtype.itemsize())
+                        .ok_or_else(|| JitError::InvalidBuffer("byte length overflow".into()))?
+                || (!buffer.bytes.is_empty()
+                    && (buffer.bytes.as_ptr() as usize) % maximum.dtype.itemsize().max(1) != 0)
+            {
+                return Err(JitError::InvalidBuffer(format!(
+                    "runtime-symbolic buffer {} descriptor mismatch",
+                    maximum.id
+                )));
+            }
+        }
+        let mut ptrs = self
+            .abi
+            .pointer_order
+            .iter()
+            .map(|entry| match entry {
+                KernelPointerAbi::Dense(index) => buffers[*index].bytes.as_mut_ptr().cast(),
+                KernelPointerAbi::Quantized(_) => unreachable!("validated dense ABI"),
+            })
+            .collect::<Vec<_>>();
         self.invoke_transactional(buffers, &mut ptrs, symbols)
     }
 
@@ -892,50 +952,24 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     if let Some(program) = b1_program {
         return render_vector_program(&program, &abi, &ids, extent);
     }
-    let mut lines = vec![
-        "#include <stdint.h>".into(),
-        "#include <stddef.h>".into(),
-        "#include <math.h>".into(),
-        "#include <string.h>".into(),
-        "#include <limits.h>".into(),
-        format!("/* {RENDERER_VERSION} C11 ABI v2; vector lanes={} ({}) linear={linear_key:?} */", plan.lanes, plan.reason),
-        "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
-        "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
-        "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
-        "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
-        "static int64_t rg_sfdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b||(a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;}".into(),
-        "static int64_t rg_srem(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}".into(),
-        "static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}".into(),
-        "static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a%b;}".into(),
-        "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a<<b;}".into(),
-        "static uint64_t rg_shr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a>>b;}".into(),
-        "static int64_t rg_sshr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){uint64_t mask,r,mag;if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}mask=bits==64?UINT64_MAX:((UINT64_C(1)<<bits)-1);r=(a&mask)>>(unsigned)b;if(!((a>>(bits-1))&1))return(int64_t)r;if(b)r|=mask^(mask>>((unsigned)b));mag=(~r+1)&mask;if(bits==64&&mag==(UINT64_C(1)<<63))return INT64_MIN;return-(int64_t)mag;}".into(),
+    let mut lines = scalar_kernel_prologue(
+        format!(
+            "/* {RENDERER_VERSION} C11 ABI v2; vector lanes={} ({}) linear={linear_key:?} */",
+            plan.lanes, plan.reason
+        ),
+        needs_f8_encode,
+        needs_erf,
+        Vec::new(),
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
-        if plan.enabled { format!("  for (size_t rg_base = 0; rg_base + {}u <= {extent}u; rg_base += {}u) {{ for (size_t rg_lane = 0; rg_lane < {}u; ++rg_lane) {{ size_t rg_i = rg_base + rg_lane;", plan.lanes, plan.lanes, plan.lanes) } else { format!("  for (size_t rg_i = 0; rg_i < {extent}u; ++rg_i) {{") },
-    ];
-    lines.splice(6..6, scalar_storage_helpers(false));
-    if needs_f8_encode {
-        let kernel_index = lines
-            .iter()
-            .position(|line| line.starts_with("int rustgrad_kernel"))
-            .expect("renderer always emits the kernel declaration");
-        lines.insert(
-            kernel_index,
-            // Exact Float8Format::encode mirror. The thresholds are f64
-            // payload bits, so conversion is independent of long-double ABI.
-            scalar_float8_encode_helper(),
-        );
-    }
-    if needs_erf {
-        let kernel_index = lines
-            .iter()
-            .position(|line| line.starts_with("int rustgrad_kernel"))
-            .expect("renderer always emits the kernel declaration");
-        lines.insert(
-            kernel_index,
-            "static double rg_erf(double x){double t,p;if(isnan(x))return x;t=1.0/(1.0+0.3275911*fabs(x));p=((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t;return copysign(1.0,x)*(1.0-p*exp((-x)*x));}".into(),
-        );
-    }
+    );
+    lines.push(if plan.enabled {
+        format!(
+            "  for (size_t rg_base = 0; rg_base + {}u <= {extent}u; rg_base += {}u) {{ for (size_t rg_lane = 0; rg_lane < {}u; ++rg_lane) {{ size_t rg_i = rg_base + rg_lane;",
+            plan.lanes, plan.lanes, plan.lanes
+        )
+    } else {
+        format!("  for (size_t rg_i = 0; rg_i < {extent}u; ++rg_i) {{")
+    });
     if let Some(rendered) = render_reduction(store, &abi, &ids, out, &mut lines)? {
         let source = rendered;
         let cache_key = native_cache_key("", &source);
@@ -956,11 +990,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         &mut map,
         &mut lines,
     )?;
-    let store_value: String = match out.dtype {
-        DType::F16 => format!("rg_f32_to_f16({value})"),
-        DType::BF16 => format!("rg_f32_to_bf16({value})"),
-        _ => value,
-    };
+    let store_value = scalar_store_expr(out.dtype, &value);
     lines.push(format!(
         "    (({}*)buffers[{}])[rg_i] = ({});",
         ctype(out.dtype),
@@ -1136,8 +1166,48 @@ fn render_prefix_scan(value: &crate::PrefixScanValue) -> Result<RenderedC, JitEr
     })
 }
 
-/// Shared exact storage codecs for ordinary scalar kernels and operation-
-/// scoped scans. Keeping one source fragment prevents renderer/cache drift.
+/// Shared C11 scalar support for ordinary and runtime-symbolic kernels.
+/// Keeping one ordered source fragment prevents renderer/cache drift.
+pub(crate) fn scalar_kernel_prologue(
+    comment: String,
+    include_float8_encode: bool,
+    include_erf: bool,
+    extra_helpers: Vec<String>,
+    kernel: String,
+) -> Vec<String> {
+    let mut lines = vec![
+        "#include <stdint.h>".into(),
+        "#include <stddef.h>".into(),
+        "#include <math.h>".into(),
+        "#include <string.h>".into(),
+        "#include <limits.h>".into(),
+        comment,
+    ];
+    lines.extend(scalar_storage_helpers(false));
+    lines.extend([
+        "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
+        "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
+        "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
+        "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
+        "static int64_t rg_sfdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b||(a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;}".into(),
+        "static int64_t rg_srem(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}".into(),
+        "static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}".into(),
+        "static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a%b;}".into(),
+        "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a<<b;}".into(),
+        "static uint64_t rg_shr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a>>b;}".into(),
+        "static int64_t rg_sshr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){uint64_t mask,r,mag;if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}mask=bits==64?UINT64_MAX:((UINT64_C(1)<<bits)-1);r=(a&mask)>>(unsigned)b;if(!((a>>(bits-1))&1))return(int64_t)r;if(b)r|=mask^(mask>>((unsigned)b));mag=(~r+1)&mask;if(bits==64&&mag==(UINT64_C(1)<<63))return INT64_MIN;return-(int64_t)mag;}".into(),
+    ]);
+    if include_float8_encode {
+        lines.push(scalar_float8_encode_helper());
+    }
+    if include_erf {
+        lines.push("static double rg_erf(double x){double t,p;if(isnan(x))return x;t=1.0/(1.0+0.3275911*fabs(x));p=((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t;return copysign(1.0,x)*(1.0-p*exp((-x)*x));}".into());
+    }
+    lines.extend(extra_helpers);
+    lines.push(kernel);
+    lines
+}
+
 fn scalar_storage_helpers(include_float8_encode: bool) -> Vec<String> {
     let mut helpers = vec![
         "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
@@ -1211,6 +1281,17 @@ fn scan_store_expr(dtype: DType, value: &str) -> String {
     }
 }
 
+/// Projects the shared scalar emitter's value representation back to storage.
+/// Float8 expressions already carry encoded raw bytes; only F16/BF16 lanes are
+/// widened by loads/arithmetic and therefore require an explicit store commit.
+pub(crate) fn scalar_store_expr(dtype: DType, value: &str) -> String {
+    match dtype {
+        DType::F16 => format!("rg_f32_to_f16({value})"),
+        DType::BF16 => format!("rg_f32_to_bf16({value})"),
+        _ => value.into(),
+    }
+}
+
 fn scan_commit_expr(dtype: DType, value: &str) -> String {
     match dtype {
         DType::F32 => format!("((float)({value}))"),
@@ -1222,6 +1303,12 @@ fn scan_commit_expr(dtype: DType, value: &str) -> String {
         }
         _ => value.into(),
     }
+}
+
+/// Commits a runtime Mean cardinality through the same accumulator-width
+/// boundary as `NativeReductionPlan::mean_divisor`.
+pub(crate) fn runtime_mean_divisor_expr(dtype: DType, count: &str) -> String {
+    scan_commit_expr(dtype, count)
 }
 
 fn scan_strictly_wins_expr(
@@ -2872,6 +2959,7 @@ fn render_reduction(
             &mut map,
             lines,
             Some((kernel.finalize, committed.as_str())),
+            None,
         )?
     } else {
         committed
@@ -2972,15 +3060,33 @@ fn emit(
     map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
 ) -> Result<String, JitError> {
-    emit_with_substitution(n, ids, map, lines, None)
+    emit_with_substitution(n, ids, map, lines, None, None)
 }
 
-fn emit_with_substitution(
+pub(crate) trait SymbolicLoadOffsets {
+    fn offset(&self, index: &UOp, buffer: u64) -> Result<String, JitError>;
+}
+
+pub(crate) fn projected_index_offset(index: &UOp, linear: &str) -> Result<String, JitError> {
+    let plan = crate::projected_index::ProjectedIndexPlan::from_index(index)
+        .map_err(|_| JitError::Unsupported("invalid projected index".into()))?;
+    crate::projected_index::render_infix_projected_index(&plan, linear, |value| {
+        Ok(if value == i64::MIN {
+            "INT64_MIN".into()
+        } else {
+            format!("((int64_t){value}LL)")
+        })
+    })
+    .map_err(|_| JitError::Unsupported("projected index operation".into()))
+}
+
+pub(crate) fn emit_with_substitution(
     n: &UOp,
     ids: &BTreeMap<u64, usize>,
     map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
     substitution: Option<(&UOp, &str)>,
+    symbolic_offsets: Option<&dyn SymbolicLoadOffsets>,
 ) -> Result<String, JitError> {
     if let Some((node, value)) = substitution
         && n.shares_node_with(node)
@@ -2993,7 +3099,16 @@ fn emit_with_substitution(
         .ty()
         .ok_or_else(|| JitError::Unsupported(format!("untyped {:?}", n.operation())))?
         .scalar;
-    let mut s = |i: usize| emit_with_substitution(&n.sources()[i], ids, map, lines, substitution);
+    let mut s = |i: usize| {
+        emit_with_substitution(
+            &n.sources()[i],
+            ids,
+            map,
+            lines,
+            substitution,
+            symbolic_offsets,
+        )
+    };
     match n.operation() {
         Operation::Const(LiteralValue::Int(v)) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
         Operation::Const(LiteralValue::Scalar { dtype, bits })
@@ -3012,46 +3127,11 @@ fn emit_with_substitution(
                 .sources()
                 .first()
                 .ok_or_else(|| JitError::Unsupported("load no index".into()))?;
-            struct CProjectedIndex;
-            impl crate::projected_index::ProjectedIndexEmitter for CProjectedIndex {
-                type Value = String;
-                type Error = JitError;
-
-                fn linear(&mut self) -> Result<Self::Value, Self::Error> {
-                    Ok("((int64_t)rg_i)".into())
-                }
-                fn constant(&mut self, value: i64) -> Result<Self::Value, Self::Error> {
-                    Ok(if value == i64::MIN {
-                        "INT64_MIN".into()
-                    } else {
-                        format!("((int64_t){value}LL)")
-                    })
-                }
-                fn binary(
-                    &mut self,
-                    operation: crate::uop::Binary,
-                    lhs: Self::Value,
-                    rhs: Self::Value,
-                ) -> Result<Self::Value, Self::Error> {
-                    let operator = match operation {
-                        crate::uop::Binary::Add => "+",
-                        crate::uop::Binary::Sub => "-",
-                        crate::uop::Binary::Mul => "*",
-                        crate::uop::Binary::FloorDiv => "/",
-                        crate::uop::Binary::Mod => "%",
-                        _ => return Err(JitError::Unsupported("projected index operation".into())),
-                    };
-                    Ok(format!("(({lhs}) {operator} ({rhs}))"))
-                }
-            }
-            let (buffer, off) = match ix.operation() {
+            let (buffer, concrete_off) = match ix.operation() {
                 Operation::Index(IndexValue::Buffer { buffer, .. })
                     if crate::projected_index::ProjectedIndexPlan::is_projected(ix) =>
                 {
-                    let plan = crate::projected_index::ProjectedIndexPlan::from_index(ix)
-                        .map_err(|_| JitError::Unsupported("invalid projected index".into()))?;
-                    let mut emitter = CProjectedIndex;
-                    (*buffer, plan.emit(&mut emitter)?)
+                    (*buffer, projected_index_offset(ix, "((int64_t)rg_i)")?)
                 }
                 Operation::Index(IndexValue::Buffer {
                     buffer,
@@ -3070,6 +3150,10 @@ fn emit_with_substitution(
                     (*buffer, view_offset(view, &logical))
                 }
                 _ => return Err(JitError::Unsupported("load index".into())),
+            };
+            let off = match symbolic_offsets {
+                Some(offsets) => offsets.offset(ix, buffer)?,
+                None => concrete_off,
             };
             let raw = format!("((uint8_t*)buffers[{}])[{}]", ids[&buffer], off);
             if ty.is_float8() {

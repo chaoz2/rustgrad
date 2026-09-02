@@ -119,7 +119,8 @@ pub use engine::mixed_rebinding::MixedStateRebinding;
 pub use engine::{
     CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
     CapturedItemTrace, CapturedReplayExecutor, CapturedReplayOptions, CapturedReplayResult,
-    CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace, ItemBackend,
+    CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace,
+    CpuSymbolicInvocation, CpuSymbolicProgram, CpuSymbolicResult, CpuSymbolicTrace, ItemBackend,
     ItemTrace, MemoryReuse, RealizationError, RealizationOptions, RealizationPolicy,
     RealizationTrace, Realized, SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter, realize,
     realize_effects_persistent, realize_graph, realize_graph_with_options, realize_mixed_effects,

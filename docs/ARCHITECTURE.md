@@ -1598,7 +1598,10 @@ decode first authenticates the historical envelope over its stored opaque
 keys, validates structure and bindings without comparing them to current keys,
 then rekeys in dependency order and performs the complete current validation;
 v7 authenticates its canonical payload and current keys without rewriting it.
-The related inspection-only RGSO v3 carries the same sidecar while v1--v2
+RGSA v9 removes the former nonsemantic symbolic-reduction buffer word; authenticated
+v8 payloads consume and discard that word, then rekey and re-encode deterministically
+with the current geometry-only reduction schema.
+The related inspection-only RGSO v4 carries the same sidecar while v1--v3
 decode unchanged; mixed/effect RGSM v3 applies
 the same legacy authentication and current-key upgrade rule.
 RGSM deliberately rejects symbolic schemas and specialization provenance until

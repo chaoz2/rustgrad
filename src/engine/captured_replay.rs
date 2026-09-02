@@ -63,7 +63,7 @@ impl ReplayValues {
             },
         );
     }
-    fn requested(&self, requested: &[u64]) -> Result<Vec<TensorData>, ReplayError> {
+    pub(crate) fn requested(&self, requested: &[u64]) -> Result<Vec<TensorData>, ReplayError> {
         requested
             .iter()
             .map(|id| self.tensor(*id, "requested output").cloned())
@@ -995,7 +995,7 @@ fn reject_multi_output_items(capture: &CapturedSchedule) -> Result<(), ReplayErr
     Ok(())
 }
 
-fn validate_inputs(
+pub(crate) fn validate_inputs(
     capture: &CapturedSchedule,
     provided: &BTreeMap<String, TensorData>,
 ) -> Result<(), ReplayError> {
@@ -1037,7 +1037,7 @@ fn validate_inputs(
     Ok(())
 }
 
-fn initial_values(
+pub(crate) fn initial_values(
     capture: &CapturedSchedule,
     provided: &BTreeMap<String, TensorData>,
 ) -> Result<ReplayValues, ReplayError> {

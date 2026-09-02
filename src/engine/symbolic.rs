@@ -113,7 +113,6 @@ pub(crate) enum SymbolicItemDomain {
         output: SymbolicShape,
     },
     Reduction {
-        input_buffer: u64,
         input: SymbolicShape,
         output: SymbolicShape,
         reduction: SymbolicShape,
@@ -186,7 +185,7 @@ pub(crate) struct SpecializedFrom {
 #[derive(Clone, Debug)]
 pub(crate) struct BoundDomain {
     pub output: Shape,
-    pub reduction: Option<(Shape, Shape, u64)>,
+    pub reduction: Option<(Shape, Shape)>,
     pub matmul: Option<(Shape, usize, usize, usize, u64, u64)>,
 }
 
@@ -306,7 +305,6 @@ impl SymbolicSchema {
                 matmul: None,
             }),
             SymbolicItemDomain::Reduction {
-                input_buffer,
                 input,
                 output,
                 reduction,
@@ -315,7 +313,6 @@ impl SymbolicSchema {
                 reduction: Some((
                     bind_shape(input, environment)?,
                     bind_shape(reduction, environment)?,
-                    *input_buffer,
                 )),
                 matmul: None,
             }),
@@ -428,6 +425,9 @@ pub(crate) fn build_schema(
     for item in &schedule.items {
         relevant.insert(item.node);
         relevant.extend(item.input_bindings.iter().map(|binding| binding.input_node));
+        for input in &item.inputs {
+            relevant.insert(symbolic_inventory_node(item, input.id)?);
+        }
     }
     for node in relevant.iter().copied() {
         derive_shape(
@@ -450,63 +450,83 @@ pub(crate) fn build_schema(
 
     let mut buffer_shapes = BTreeMap::new();
     for item in &schedule.items {
-        for binding in &item.input_bindings {
-            buffer_shapes.insert(
-                binding.desc.id,
-                memo.get(&binding.input_node)
-                    .ok_or_else(|| ReplayError::Symbolic("missing derived input shape".into()))?
-                    .clone(),
-            );
+        for input in &item.inputs {
+            let node = symbolic_inventory_node(item, input.id)?;
+            let shape = memo
+                .get(&node)
+                .ok_or_else(|| ReplayError::Symbolic("missing derived input shape".into()))?
+                .clone();
+            if buffer_shapes
+                .insert(input.id, shape.clone())
+                .is_some_and(|existing| existing != shape)
+            {
+                return Err(ReplayError::Symbolic(
+                    "one captured buffer has conflicting symbolic shapes".into(),
+                ));
+            }
         }
-        buffer_shapes.insert(
-            item.primary_output().id,
-            memo.get(&item.node)
-                .ok_or_else(|| ReplayError::Symbolic("missing derived output shape".into()))?
-                .clone(),
-        );
+        let output_shape = memo
+            .get(&item.node)
+            .ok_or_else(|| ReplayError::Symbolic("missing derived output shape".into()))?
+            .clone();
+        if buffer_shapes
+            .insert(item.primary_output().id, output_shape.clone())
+            .is_some_and(|existing| existing != output_shape)
+        {
+            return Err(ReplayError::Symbolic(
+                "one captured buffer has conflicting symbolic shapes".into(),
+            ));
+        }
     }
 
     let mut item_domains = BTreeMap::new();
     for item in &schedule.items {
         let output = memo[&item.node].clone();
-        let domain = match graph
-            .op(item.node)
+        let reductions = item
+            .kernel
+            .topological()
             .map_err(|error| ReplayError::Symbolic(error.to_string()))?
-        {
-            Op::Reduce {
-                input,
-                axes,
-                keepdim: _,
-                ..
-            } => {
-                let input_shape = memo[input].clone();
-                let reduction = SymbolicShape::new(
-                    axes.iter()
-                        .map(|axis| input_shape.dims()[*axis].clone())
-                        .collect::<Vec<_>>(),
-                );
-                SymbolicItemDomain::Reduction {
-                    input_buffer: input.index() as u64,
-                    input: input_shape,
-                    output,
-                    reduction,
-                }
+            .into_iter()
+            .filter_map(|node| match node.operation() {
+                Operation::ReduceInit(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let domain = if let [reduction_plan] = reductions.as_slice() {
+            let input_shape = symbolic_reduction_input(graph, item.node, reduction_plan, &memo)?;
+            let reduction = SymbolicShape::new(
+                reduction_plan
+                    .axes
+                    .iter()
+                    .map(|axis| input_shape.dims()[*axis].clone())
+                    .collect::<Vec<_>>(),
+            );
+            SymbolicItemDomain::Reduction {
+                input: input_shape,
+                output,
+                reduction,
             }
-            Op::Matmul { lhs, rhs } => {
-                let lhs_shape = &memo[lhs];
-                let rhs_shape = &memo[rhs];
-                let geometry = matmul_geometry(lhs_shape, rhs_shape, &mut guards)?;
-                SymbolicItemDomain::Matmul {
-                    lhs_buffer: lhs.index() as u64,
-                    rhs_buffer: rhs.index() as u64,
-                    output,
-                    batch: SymbolicShape::new(geometry.batch),
-                    m: geometry.m,
-                    n: geometry.n,
-                    k: geometry.k,
+        } else {
+            match graph
+                .op(item.node)
+                .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+            {
+                Op::Matmul { lhs, rhs } => {
+                    let lhs_shape = &memo[lhs];
+                    let rhs_shape = &memo[rhs];
+                    let geometry = matmul_geometry(lhs_shape, rhs_shape, &mut guards)?;
+                    SymbolicItemDomain::Matmul {
+                        lhs_buffer: lhs.index() as u64,
+                        rhs_buffer: rhs.index() as u64,
+                        output,
+                        batch: SymbolicShape::new(geometry.batch),
+                        m: geometry.m,
+                        n: geometry.n,
+                        k: geometry.k,
+                    }
                 }
+                _ => SymbolicItemDomain::Elementwise { output },
             }
-            _ => SymbolicItemDomain::Elementwise { output },
         };
         item_domains.insert(item.id, domain);
     }
@@ -522,24 +542,42 @@ pub(crate) fn build_schema(
             .topological()
             .map_err(|error| ReplayError::Symbolic(error.to_string()))?
         {
-            let Operation::Index(IndexValue::View { buffer, view, .. }) = node.operation() else {
+            let Operation::Index(index @ IndexValue::View { buffer, view, .. }) = node.operation()
+            else {
                 continue;
             };
             let mut matches = Vec::new();
+            let source = usize::try_from(*buffer)
+                .map(NodeId::from_index)
+                .map_err(|_| ReplayError::Symbolic("symbolic view buffer exceeds usize".into()))?;
+            let domain = item_domains.get(&item.id).ok_or_else(|| {
+                ReplayError::Corrupt("symbolic view item domain is absent".into())
+            })?;
+            let reduction_geometry = reduction_template_geometry(&item.kernel)?;
+            let iteration_shape =
+                symbolic_view_iteration_shape(index, domain, reduction_geometry.as_ref())?;
             for candidate in lowered_views.iter().copied() {
-                let Ok((source, symbolic)) = super::symbolic_view::derive_view(
+                let Ok(symbolic) = super::symbolic_view::derive_view_from_source(
                     graph,
                     candidate,
+                    source,
                     &memo,
                     &template_environment,
                 ) else {
                     continue;
                 };
-                if source.index() as u64 == *buffer
-                    && symbolic.specialize(&template_environment)? == *view
-                    && !matches.contains(&symbolic)
+                let mut candidates = vec![symbolic.clone()];
+                if let Ok(expanded) = symbolic.expand(iteration_shape.clone())
+                    && expanded != symbolic
                 {
-                    matches.push(symbolic);
+                    candidates.push(expanded);
+                }
+                for candidate in candidates {
+                    if candidate.specialize(&template_environment).ok().as_ref() == Some(view)
+                        && !matches.contains(&candidate)
+                    {
+                        matches.push(candidate);
+                    }
                 }
             }
             let [symbolic] = matches.as_slice() else {
@@ -646,6 +684,70 @@ pub(crate) fn build_schema(
     Ok(schema)
 }
 
+fn symbolic_reduction_input(
+    graph: &Graph,
+    root: NodeId,
+    plan: &ReductionValue,
+    shapes: &BTreeMap<NodeId, SymbolicShape>,
+) -> Result<SymbolicShape, ReplayError> {
+    let mut pending = vec![root];
+    let mut seen = BTreeSet::new();
+    let mut matches = Vec::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        let op = graph
+            .op(node)
+            .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+        if let Op::Reduce {
+            input,
+            axes,
+            keepdim,
+            ..
+        } = op
+        {
+            let input_matches = graph
+                .shape(*input)
+                .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+                == &plan.input_shape;
+            let output_matches = graph
+                .shape(node)
+                .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+                == &plan.output_shape;
+            if axes == &plan.axes && keepdim == &plan.keepdim && input_matches && output_matches {
+                let shape = shapes.get(input).ok_or_else(|| {
+                    ReplayError::Symbolic("symbolic reduction input shape is absent".into())
+                })?;
+                if !matches.contains(shape) {
+                    matches.push(shape.clone());
+                }
+            }
+        }
+        pending.extend(op.value_inputs());
+    }
+    let [input] = matches.as_slice() else {
+        return Err(ReplayError::Unsupported(format!(
+            "captured reduction has {} symbolic graph matches",
+            matches.len()
+        )));
+    };
+    Ok(input.clone())
+}
+
+fn symbolic_inventory_node(item: &crate::ScheduleItem, buffer: u64) -> Result<NodeId, ReplayError> {
+    if let Some(binding) = item
+        .input_bindings
+        .iter()
+        .find(|binding| binding.desc.id == buffer)
+    {
+        return Ok(binding.input_node);
+    }
+    usize::try_from(buffer)
+        .map(NodeId::from_index)
+        .map_err(|_| ReplayError::Symbolic("symbolic input buffer exceeds usize".into()))
+}
+
 impl SymbolicSchema {
     pub(crate) fn validate_against(&self, capture: &CapturedSchedule) -> Result<(), ReplayError> {
         if self.parameters.is_empty()
@@ -715,9 +817,9 @@ impl SymbolicSchema {
             .items
             .iter()
             .flat_map(|item| {
-                item.input_bindings
+                item.inputs
                     .iter()
-                    .map(|binding| binding.desc.id)
+                    .map(|input| input.id)
                     .chain(std::iter::once(item.primary_output().id))
             })
             .collect::<BTreeSet<_>>();
@@ -984,20 +1086,13 @@ impl SymbolicSchema {
                 }
             }
             SymbolicItemDomain::Reduction {
-                input_buffer,
                 input,
                 output,
                 reduction,
             } => {
-                if output != output_shape
-                    || self.buffer_shapes.get(input_buffer) != Some(input)
-                    || !item
-                        .input_bindings
-                        .iter()
-                        .any(|binding| binding.desc.id == *input_buffer)
-                {
+                if output != output_shape {
                     return Err(ReplayError::Symbolic(
-                        "symbolic reduction buffers are inconsistent".into(),
+                        "symbolic reduction output is inconsistent".into(),
                     ));
                 }
                 let payloads = item
@@ -1784,6 +1879,106 @@ fn evaluate_usize(
         .map_err(|_| ReplayError::Symbolic("symbolic value is not a usize".into()))
 }
 
+#[derive(Clone, Copy)]
+enum ReductionIndexDomain {
+    Input,
+    Output,
+}
+
+fn reduction_index_domain(
+    index: &IndexValue,
+    template_input: &Shape,
+    template_output: &Shape,
+    symbolic_domains_equal: bool,
+) -> Result<ReductionIndexDomain, ReplayError> {
+    let output_shape = match index {
+        IndexValue::Buffer { output_shape, .. } | IndexValue::View { output_shape, .. } => {
+            output_shape
+        }
+    };
+    match (
+        output_shape == template_input,
+        output_shape == template_output,
+    ) {
+        (true, false) => Ok(ReductionIndexDomain::Input),
+        (false, true) => Ok(ReductionIndexDomain::Output),
+        (true, true) if symbolic_domains_equal => Ok(ReductionIndexDomain::Output),
+        (true, true) => Err(ReplayError::Unsupported(
+            "symbolic reduction input and output domains are ambiguous".into(),
+        )),
+        (false, false) => Err(ReplayError::Corrupt(
+            "symbolic reduction Index domain is inconsistent".into(),
+        )),
+    }
+}
+
+fn symbolic_view_iteration_shape<'a>(
+    index: &IndexValue,
+    domain: &'a SymbolicItemDomain,
+    reduction: Option<&(Shape, Shape)>,
+) -> Result<&'a SymbolicShape, ReplayError> {
+    match domain {
+        SymbolicItemDomain::Elementwise { output } => Ok(output),
+        SymbolicItemDomain::Reduction { input, output, .. } => {
+            let Some((template_input, template_output)) = reduction else {
+                return Err(ReplayError::Corrupt(
+                    "symbolic reduction recurrence is absent".into(),
+                ));
+            };
+            match reduction_index_domain(index, template_input, template_output, input == output)? {
+                ReductionIndexDomain::Input => Ok(input),
+                ReductionIndexDomain::Output => Ok(output),
+            }
+        }
+        SymbolicItemDomain::Matmul { .. } => Err(ReplayError::Unsupported(
+            "symbolic Matmul view specialization is unavailable".into(),
+        )),
+    }
+}
+
+fn reduction_template_geometry(kernel: &UOp) -> Result<Option<(Shape, Shape)>, ReplayError> {
+    let Some(store) = kernel
+        .sources()
+        .iter()
+        .find(|node| matches!(node.operation(), Operation::Store))
+    else {
+        return Ok(None);
+    };
+    let Some(reduction) = crate::reduction_native::NativeReductionKernel::from_store(store)
+        .map_err(|error| ReplayError::Corrupt(error.into()))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        reduction.plan.geometry.input.clone(),
+        reduction.plan.geometry.output.clone(),
+    )))
+}
+
+fn symbolic_index_iteration_shape<'a>(
+    index: &IndexValue,
+    domain: &'a BoundDomain,
+    reduction: Option<&(Shape, Shape, bool)>,
+) -> Result<&'a Shape, ReplayError> {
+    let Some((input, _)) = &domain.reduction else {
+        return Ok(&domain.output);
+    };
+    let Some((template_input, template_output, symbolic_domains_equal)) = reduction else {
+        return Err(ReplayError::Corrupt(
+            "symbolic reduction geometry is absent".into(),
+        ));
+    };
+    match reduction_index_domain(
+        index,
+        template_input,
+        template_output,
+        *symbolic_domains_equal,
+    )? {
+        ReductionIndexDomain::Input => Ok(input),
+        ReductionIndexDomain::Output => Ok(&domain.output),
+    }
+}
+
 pub(crate) fn specialize_kernel(
     kernel: &UOp,
     schema: &SymbolicSchema,
@@ -1799,25 +1994,27 @@ pub(crate) fn specialize_kernel(
     let nodes = kernel
         .topological()
         .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+    let reduction_specialization = if domain.reduction.is_some() {
+        let (template_input, template_output) =
+            reduction_template_geometry(kernel)?.ok_or_else(|| {
+                ReplayError::Corrupt("symbolic reduction recurrence is absent".into())
+            })?;
+        let symbolic_domains_equal = match schema.item_domains.get(&item_id) {
+            Some(SymbolicItemDomain::Reduction { input, output, .. }) => input == output,
+            _ => false,
+        };
+        Some((template_input, template_output, symbolic_domains_equal))
+    } else {
+        None
+    };
     let mut range_extents = BTreeMap::new();
     for node in &nodes {
-        let (buffer, range) = match (node.operation(), node.sources().get(1)) {
-            (
-                Operation::Index(IndexValue::Buffer { buffer, .. })
-                | Operation::Index(IndexValue::View { buffer, .. }),
-                Some(range),
-            ) => (*buffer, range),
+        let (index, range) = match (node.operation(), node.sources().get(1)) {
+            (Operation::Index(index), Some(range)) => (index, range),
             _ => continue,
         };
-        let iteration_shape = if let Some((input, _, _)) = &domain.reduction {
-            if buffer == output_buffer {
-                &domain.output
-            } else {
-                input
-            }
-        } else {
-            &domain.output
-        };
+        let iteration_shape =
+            symbolic_index_iteration_shape(index, domain, reduction_specialization.as_ref())?;
         let extent = iteration_shape
             .numel()
             .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
@@ -1843,19 +2040,18 @@ pub(crate) fn specialize_kernel(
             })
             .collect::<Result<Vec<UOp>, _>>()?;
         let operation = match node.operation() {
-            Operation::Index(IndexValue::Buffer {
-                buffer, addressing, ..
-            }) => {
+            Operation::Index(
+                index @ IndexValue::Buffer {
+                    buffer, addressing, ..
+                },
+            ) => {
                 let input_shape = schema.bind_shape(*buffer, environment)?;
-                let output_shape = if let Some((reduction_input, _, _)) = &domain.reduction {
-                    if *buffer == output_buffer {
-                        domain.output.clone()
-                    } else {
-                        reduction_input.clone()
-                    }
-                } else {
-                    domain.output.clone()
-                };
+                let output_shape = symbolic_index_iteration_shape(
+                    index,
+                    domain,
+                    reduction_specialization.as_ref(),
+                )?
+                .clone();
                 Operation::Index(IndexValue::Buffer {
                     buffer: *buffer,
                     elements: input_shape
@@ -1866,7 +2062,7 @@ pub(crate) fn specialize_kernel(
                     addressing: *addressing,
                 })
             }
-            Operation::Index(IndexValue::View { buffer, .. }) => {
+            Operation::Index(index @ IndexValue::View { buffer, .. }) => {
                 let source_shape = schema.bind_shape(*buffer, environment)?;
                 let view = schema
                     .views
@@ -1878,11 +2074,12 @@ pub(crate) fn specialize_kernel(
                         "symbolic view source shape disagrees with its buffer".into(),
                     ));
                 }
-                let output_shape = if let Some((reduction_input, _, _)) = &domain.reduction {
-                    reduction_input.clone()
-                } else {
-                    domain.output.clone()
-                };
+                let output_shape = symbolic_index_iteration_shape(
+                    index,
+                    domain,
+                    reduction_specialization.as_ref(),
+                )?
+                .clone();
                 Operation::Index(IndexValue::View {
                     buffer: *buffer,
                     elements: view
@@ -1900,7 +2097,7 @@ pub(crate) fn specialize_kernel(
                 kind,
                 ..
             }) => {
-                let (input_shape, _, _) = domain.reduction.as_ref().ok_or_else(|| {
+                let (input_shape, _) = domain.reduction.as_ref().ok_or_else(|| {
                     ReplayError::Corrupt("reduction payload lacks symbolic domain".into())
                 })?;
                 Operation::ReduceInit(ReductionValue {
@@ -2091,6 +2288,20 @@ pub(crate) fn specialize_capture(
         .as_ref()
         .ok_or_else(|| ReplayError::Symbolic("artifact is already concrete".into()))?;
     schema.validate_against(capture)?;
+    specialize_authenticated_capture(capture, canonical)
+}
+
+/// Specializes a symbolic capture whose complete artifact/schema relationship
+/// was already authenticated by its immutable owner. The resulting concrete
+/// artifact is still fully validated before it can be executed.
+pub(crate) fn specialize_authenticated_capture(
+    capture: &CapturedSchedule,
+    canonical: &[(u64, i64)],
+) -> Result<CapturedSchedule, ReplayError> {
+    let schema = capture
+        .symbolic
+        .as_ref()
+        .ok_or_else(|| ReplayError::Symbolic("artifact is already concrete".into()))?;
     let environment = schema.environment(canonical)?;
     schema.validate_guards(&environment)?;
     let mut concrete = capture.clone();
@@ -2212,4 +2423,82 @@ fn specialize_desc(
         read_only: desc.read_only,
         view,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduction_view_domain_is_authenticated_by_index_geometry() {
+        let rows = SymbolicExpr::variable("rows", 1, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3, 2, 4], DType::F32);
+        let scale = graph.input_dtype("scale", [1, 3], DType::F32);
+        let wide = graph.input_dtype("wide", [3, 2], DType::F32);
+        let viewed_scale = graph.permute(scale, [1, 0]).unwrap();
+        let reduced = graph
+            .reduce(input, crate::ReduceKind::Sum, Some(vec![2]), false)
+            .unwrap();
+        let view_consumer = graph.add(wide, viewed_scale).unwrap();
+        let reduction_kernel = crate::kernel::lower_graph_reduction(&graph, reduced).unwrap();
+        let view_kernel = crate::kernel::lower_graph_elementwise(&graph, view_consumer).unwrap();
+        let nodes = view_kernel.topological().unwrap();
+        assert_eq!(
+            reduction_kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .filter(|node| matches!(node.operation(), Operation::ReduceInit(_)))
+                .count(),
+            1
+        );
+        let index = nodes
+            .iter()
+            .find_map(|node| match node.operation() {
+                Operation::Index(index @ IndexValue::View { buffer, .. })
+                    if *buffer == scale.index() as u64 =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .expect("lowered consumer retains the authenticated scale view");
+        let (template_input, template_output) = reduction_template_geometry(&reduction_kernel)
+            .unwrap()
+            .unwrap();
+        let domain = SymbolicItemDomain::Reduction {
+            input: SymbolicShape::new(vec![rows.clone().into(), 2usize.into(), 4usize.into()]),
+            output: SymbolicShape::new(vec![rows.into(), 2usize.into()]),
+            reduction: SymbolicShape::new(vec![4usize.into()]),
+        };
+        let SymbolicItemDomain::Reduction { output, .. } = &domain else {
+            unreachable!()
+        };
+        assert_eq!(
+            symbolic_view_iteration_shape(
+                index,
+                &domain,
+                Some(&(template_input.clone(), template_output.clone()))
+            )
+            .unwrap(),
+            output
+        );
+        assert!(matches!(
+            symbolic_view_iteration_shape(
+                index,
+                &domain,
+                Some(&(template_output.clone(), template_output.clone()))
+            ),
+            Err(ReplayError::Unsupported(_))
+        ));
+        assert!(matches!(
+            symbolic_view_iteration_shape(
+                index,
+                &domain,
+                Some(&(Shape::from([7]), Shape::from([8])))
+            ),
+            Err(ReplayError::Corrupt(_))
+        ));
+    }
 }

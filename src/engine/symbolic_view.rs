@@ -163,7 +163,7 @@ impl SymbolicViewMap {
         })
     }
 
-    fn expand(&self, shape: SymbolicShape) -> Result<Self, ReplayError> {
+    pub(crate) fn expand(&self, shape: SymbolicShape) -> Result<Self, ReplayError> {
         if self.logical_shape.rank() > shape.rank() {
             return Err(ReplayError::Symbolic(
                 "symbolic expand rank mismatch".into(),
@@ -616,15 +616,6 @@ pub(crate) fn movement_shape(
             "operation is not an affine symbolic movement".into(),
         )),
     }
-}
-
-pub(crate) fn derive_view(
-    graph: &Graph,
-    node: NodeId,
-    shapes: &BTreeMap<NodeId, SymbolicShape>,
-    environment: &BTreeMap<SymbolicVar, i64>,
-) -> Result<(NodeId, SymbolicViewMap), ReplayError> {
-    derive_view_inner(graph, node, None, shapes, environment)
 }
 
 pub(crate) fn derive_view_from_source(
