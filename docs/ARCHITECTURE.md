@@ -943,10 +943,20 @@ Evaluation and zero/unit dropout remain reservation-free. Static empty
 batch and empty time domains retain zero-work outputs. CPU, captured-interpreter,
 and parameter-gradient acceptance use the complete embeddings-plus-two-layer
 path.
-This is the source base BERT composition, not a tokenizer, pretrained-checkpoint
-translator/loader, pooler, masked-language or next-sentence head, question-
-answering head, loss/trainer, downloaded checkpoint differential, dynamic-shape
-implementation, fused kernel, or live-device claim.
+`nn::BertForQuestionAnswering` adds the checked source's `qa_outputs` two-wide
+`Linear` after the complete base model. State traverses under `bert.*` before
+`qa_outputs.weight` and `qa_outputs.bias`; output lowering is the literal
+`logits.chunk(2, -1)`, two `reshape(-1, 1)` views, and default leading-axis
+stack, so start logits precede end logits in `[2, batch*time, 1]`. The wrapper
+rehearses the full base-plus-head graph and reserves the base model's ambient
+dropout streams in the same transaction. Empty batch/time remain zero-work;
+CPU, captured-interpreter, state-order, output-order, and complete-composition
+VJP acceptance are fixture-backed.
+This is the source base BERT and question-answering model composition, not a
+tokenizer, vocabulary workflow, pretrained-checkpoint translator/loader,
+pooler, masked-language or next-sentence head, span loss/decoder, trainer,
+downloaded checkpoint differential, dynamic-shape implementation, fused
+kernel, or live-device claim.
 `nn::LSTM` is a separate typed stateful composition rather than another
 sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
 `cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus

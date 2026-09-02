@@ -78,6 +78,25 @@ impl Linear {
             Ok(output)
         }
     }
+
+    /// Applies checked-in tinygrad's `Tensor.linear` composition while
+    /// retaining this module's conventional `[out, in]` state layout.
+    pub(crate) fn forward_source(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        if graph.shape(input)?.dims().last().copied() != Some(self.in_features) {
+            return Err(Error::InvalidMatmul {
+                lhs: graph.shape(input)?.clone(),
+                rhs: Shape::new([self.out_features, self.in_features]),
+            });
+        }
+        let weight = self.weight.bind(graph)?;
+        let weight = graph.permute(weight, [1, 0])?;
+        let bias = self
+            .bias
+            .as_ref()
+            .map(|bias| bias.bind(graph))
+            .transpose()?;
+        graph.linear(input, weight, bias, None)
+    }
 }
 impl Module for Linear {
     fn visit(&self, prefix: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
