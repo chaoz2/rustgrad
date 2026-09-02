@@ -909,19 +909,17 @@ impl CpuBackend {
                 let expanded = dynamic_mean_vjp_upstream(rule, &value, upstream)?;
                 self.dynamic_vjp(graph, rule.input(), &expanded, wrt, inputs)
             }
-            DynamicOperation::MaskedSelect { input, mask }
+            DynamicOperation::MaskedSelect { input, .. }
                 if graph.backward_slice_contains(input, wrt)? =>
             {
-                let source = self.execute(graph, input, inputs)?;
-                if !source.dtype().is_float() {
+                if !graph.dtype(input)?.is_float() {
                     return Err(Error::NonDifferentiableTarget(input));
                 }
-                let local = dynamic_masked_select_vjp(
-                    &source,
-                    &self.execute(graph, mask, inputs)?,
-                    upstream,
-                )?;
-                self.static_boundary_vjp(graph, input, wrt, &local, inputs)
+                let rule = graph.dynamic_compaction_vjp_rule(output)?;
+                debug_assert_eq!(rule.input(), input);
+                let lowered = rule.lower(graph, upstream, wrt)?;
+                let (derivative_graph, gradient, _) = lowered.into_parts();
+                self.execute(&derivative_graph, gradient, inputs)
             }
             DynamicOperation::MaskedSelect { .. } => Err(Error::NonDifferentiableTarget(wrt)),
             DynamicOperation::Unary { op, input } => {
@@ -3016,27 +3014,6 @@ fn masked_positions(input: &TensorData, mask: &TensorData) -> Result<Vec<usize>>
         }
     }
     Ok(positions)
-}
-
-fn dynamic_masked_select_vjp(
-    input: &TensorData,
-    mask: &TensorData,
-    upstream: &TensorData,
-) -> Result<TensorData> {
-    let positions = masked_positions(input, mask)?;
-    if upstream.shape() != &Shape::from([positions.len()]) || upstream.dtype() != input.dtype() {
-        return Err(Error::InvalidIndex);
-    }
-    let mut output = vec![Scalar::I(0); input.len()];
-    for (upstream_index, position) in positions.into_iter().enumerate() {
-        output[position] = binary_scalar(
-            output[position],
-            upstream.scalar_at(upstream_index),
-            input.dtype(),
-            BinaryOp::Add,
-        );
-    }
-    TensorData::from_scalars(input.shape().clone(), input.dtype(), output)
 }
 
 fn dynamic_mean_vjp_upstream(
