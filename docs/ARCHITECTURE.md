@@ -234,15 +234,20 @@ with a typed visualization error instead of being silently flattened.
 
 `ir::indexing` is the pure static-indexing boundary: it normalizes immutable
 integer/slice/newaxis/ellipsis and constant advanced-index specifications into
-checked shapes and coordinate maps. The narrow `Op::StaticIndex`, functional
-`Op::StaticIndexUpdate`, and their first-order CPU VJPs consume the same plan
-without re-parsing it; the update VJP uses a final-writer map, so duplicate
-coordinates preserve replacement rather than scatter-add semantics. Dynamic
-boolean/nonzero cardinality and mutable aliasing remain outside it.
-`Graph::diagonal` is a checked static convenience lowering that permutes its
+one checked row-major coordinate map. Immutable reads project that map through
+existing reshape, constant-I64 Gather, and reshape primitives after private
+whole-composition rehearsal; scheduling, capture, native CPU execution, and
+reverse mode therefore reuse Gather's typed contracts rather than acquiring a
+parallel indexing taxonomy. The historical `Op::StaticIndex` remains readable
+by the CPU/artifact compatibility paths. `Op::StaticIndexUpdate` and its CPU
+VJPs continue to consume the same plan because replacement updates require its
+final-writer map, so duplicate coordinates preserve replacement rather than
+scatter-add semantics. Dynamic boolean/nonzero cardinality and mutable aliasing
+remain outside it.
+`Graph::diagonal_static` is a checked static convenience lowering that permutes its
 two selected axes last and delegates rectangular, batched, signed-axis, signed-
-offset, zero-domain, and Bool cases to that same `StaticIndex` substrate; it is
-not a dynamic indexing or aliasing path.
+offset, zero-domain, and Bool cases to that same normalized static-index map and
+composed Gather substrate; it is not a dynamic indexing or aliasing path.
 `Graph::diag` is distinct rank-one construction: checked `n + 1` and `n²`
 arithmetic lowers only through existing unsqueeze, typed-zero pad, flatten,
 shrink, and reshape nodes, so it preserves storage and inherits their static

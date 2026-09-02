@@ -46,10 +46,16 @@ fn graph_executes_mixed_static_advanced_indexing_and_traces_it() {
             .trace(output)
             .unwrap()
             .steps
-            .last()
+            .iter()
+            .any(|step| step.operation.starts_with("gather(") && step.operation.contains("axis=0"))
+    );
+    assert!(
+        graph
+            .trace(output)
             .unwrap()
-            .operation
-            .starts_with("static_index")
+            .steps
+            .iter()
+            .all(|step| !step.operation.starts_with("static_index"))
     );
 }
 
@@ -114,6 +120,7 @@ fn static_index_keeps_exact_bool_storage_and_duplicate_gradients_accumulate() {
 fn static_index_rejects_invalid_static_specs() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2, 3]);
+    let before = graph.node_count();
     assert!(graph.static_index(x, &[StaticIndex::Integer(2)]).is_err());
     assert!(
         graph
@@ -137,6 +144,80 @@ fn static_index_rejects_invalid_static_specs() {
                 }]
             )
             .is_err()
+    );
+    assert_eq!(graph.node_count(), before);
+}
+
+#[test]
+fn compositional_static_index_preserves_scalar_empty_and_higher_order_routes() {
+    let mut scalar = Graph::new();
+    let input = scalar.input("input", []);
+    let output = scalar.static_index(input, &[]).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &rustgrad::Shape::new([]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &scalar,
+                output,
+                &HashMap::from([("input".into(), f32_data([], [7.0]))]),
+            )
+            .unwrap(),
+        f32_data([], [7.0])
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input("input", [0, 3]);
+    let output = empty
+        .static_index(
+            input,
+            &[
+                StaticIndex::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+                StaticIndex::Integer(1),
+            ],
+        )
+        .unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &rustgrad::Shape::from([0]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), f32_data([0, 3], []))]),
+            )
+            .unwrap(),
+        f32_data([0], [])
+    );
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", [3]);
+    let selected = graph
+        .static_index(
+            input,
+            &[StaticIndex::Advanced {
+                shape: [2].into(),
+                values: vec![1, 1],
+            }],
+        )
+        .unwrap();
+    let seed = graph.input("seed", [2]);
+    let first = graph.grad_with(selected, input, Some(seed), true).unwrap();
+    let first_sum = graph.sum(first, 0).unwrap();
+    let second = graph.grad(first_sum, seed).unwrap();
+    let bindings = HashMap::from([
+        ("input".into(), f32_data([3], [0.0, 0.0, 0.0])),
+        ("seed".into(), f32_data([2], [2.0, 3.0])),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&graph, first, &bindings).unwrap(),
+        f32_data([3], [0.0, 5.0, 0.0])
+    );
+    assert_eq!(
+        CpuBackend.execute(&graph, second, &bindings).unwrap(),
+        f32_data([2], [1.0, 1.0])
     );
 }
 
