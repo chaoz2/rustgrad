@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:97fabbf64cee03a8",
+  "source_fingerprint": "fnv1a64:03dd54215691bf2b",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -324,7 +324,7 @@
       "subject": "Pattern matching and deterministic rewriting",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Symbolic and UOp typed deterministic match/rewrite drivers record traces. The UOp driver memoizes a bottom-up shared-DAG walk, revisits replacements to convergence, and rejects cycles or bounded-step exhaustion. Every eligible new pure elementwise scheduled kernel normalizes immediately after lowering and before view extraction, ordered input bindings, dependencies, cache identity, or capture publication; symbolic specialization only changes descriptor geometry, and historical artifact decode/replay retains its encoded UOp structure. UPat supports declaration-ordered alternatives, opt-in lazily generated arbitrary-arity source permutations, exact typed operation sets and sources, ordered prefix and repeated-source varargs, composable optional-`UType` and full-`Operation` payload predicates, and branch-isolated structurally consistent named captures. Empty alternatives reject during pattern construction, and an all-identical permuted list emits one candidate. Tinygrad's tag predicates, custom early rejection, and compiled pattern IR remain."
+        "Acceptance requirement": "Symbolic and UOp typed deterministic match/rewrite drivers record traces. The UOp driver memoizes a bottom-up shared-DAG walk, revisits replacements to convergence, and rejects cycles or bounded-step exhaustion. Every eligible new pure elementwise scheduled kernel normalizes immediately after lowering and before view extraction, ordered input bindings, dependencies, cache identity, or capture publication; symbolic specialization only changes descriptor geometry, and historical artifact decode/replay retains its encoded UOp structure. UPat supports declaration-ordered alternatives, opt-in lazily generated arbitrary-arity source permutations, exact typed operation sets and sources, ordered prefix and repeated-source varargs, composable optional-`UType` and full-`Operation` payload predicates, and branch-isolated structurally consistent named captures. The rewrite driver prepares inferred or custom predicate-based direct-source early-rejection requirements once per rule; they preserve direct-match semantics, empty repeated-source admission, rule order, and capture rollback while built-in constant identities skip impossible candidates. Empty alternatives reject during pattern construction, and an all-identical permuted list emits one candidate. Tinygrad's UOp tag predicates and Python-generated compiled pattern IR remain."
       }
     },
     {

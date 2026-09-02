@@ -1337,6 +1337,8 @@ enum SourceConstraint {
     Permuted(Vec<UPat>),
 }
 
+type EarlyRejectPredicates = Vec<fn(&Operation) -> bool>;
+
 #[derive(Clone, Debug)]
 pub struct UPat {
     alternatives: Option<Vec<UPat>>,
@@ -1346,6 +1348,7 @@ pub struct UPat {
     type_predicates: Vec<fn(Option<UType>) -> bool>,
     sources: Option<SourceConstraint>,
     name: Option<String>,
+    custom_early_reject: Option<EarlyRejectPredicates>,
 }
 impl UPat {
     pub fn any() -> Self {
@@ -1357,6 +1360,7 @@ impl UPat {
             type_predicates: vec![],
             sources: None,
             name: None,
+            custom_early_reject: None,
         }
     }
     /// Matches the first successful alternative in declaration order. Rewrite
@@ -1425,6 +1429,17 @@ impl UPat {
     }
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+    /// Overrides inferred direct-source requirements used by the rewrite
+    /// driver to reject impossible candidates before recursive matching. An
+    /// empty list explicitly disables inference. This metadata does not
+    /// change [`UPat::matches`] semantics.
+    pub fn custom_early_reject(
+        mut self,
+        predicates: impl IntoIterator<Item = fn(&Operation) -> bool>,
+    ) -> Self {
+        self.custom_early_reject = Some(predicates.into_iter().collect());
         self
     }
     pub fn matches(&self, node: &UOp) -> Option<Captures> {
@@ -1502,10 +1517,11 @@ impl UPat {
                 if patterns.len() != n.sources().len() {
                     return false;
                 }
-                if patterns
-                    .first()
-                    .is_none_or(|first| patterns.iter().all(|pattern| pattern.same_as(first)))
-                {
+                if patterns.first().is_none_or(|first| {
+                    patterns
+                        .iter()
+                        .all(|pattern| pattern.match_equivalent(first))
+                }) {
                     return Self::visit_ordered_sources(
                         patterns,
                         n.sources(),
@@ -1603,7 +1619,10 @@ impl UPat {
         }
         Some(candidate)
     }
-    fn same_as(&self, other: &Self) -> bool {
+    /// Equality of observable matching behavior. Prepared-only early-reject
+    /// hints are deliberately excluded: they may skip an impossible rule but
+    /// cannot create another permutation candidate.
+    fn match_equivalent(&self, other: &Self) -> bool {
         fn same_operation_predicate(
             left: Option<fn(&Operation) -> bool>,
             right: Option<fn(&Operation) -> bool>,
@@ -1628,7 +1647,7 @@ impl UPat {
                     same_patterns(left, right)
                 }
                 (SourceConstraint::Each(left), SourceConstraint::Each(right)) => {
-                    left.same_as(right)
+                    left.match_equivalent(right)
                 }
                 _ => false,
             }
@@ -1638,7 +1657,7 @@ impl UPat {
                 && left
                     .iter()
                     .zip(right)
-                    .all(|(left, right)| left.same_as(right))
+                    .all(|(left, right)| left.match_equivalent(right))
         }
 
         match (&self.alternatives, &other.alternatives) {
@@ -1663,6 +1682,41 @@ impl UPat {
             }
             && self.name == other.name
     }
+
+    fn possible_root_operations(&self) -> Option<BTreeSet<Operation>> {
+        if let Some(operations) = &self.operations {
+            return Some(operations.clone());
+        }
+        let alternatives = self.alternatives.as_ref()?;
+        let mut operations = BTreeSet::new();
+        for alternative in alternatives {
+            operations.extend(alternative.possible_root_operations()?);
+        }
+        Some(operations)
+    }
+
+    fn direct_source_requirements(&self) -> Vec<DirectSourceRequirement> {
+        if let Some(predicates) = &self.custom_early_reject {
+            return predicates
+                .iter()
+                .copied()
+                .map(DirectSourceRequirement::Predicate)
+                .collect();
+        }
+        let patterns = match &self.sources {
+            Some(SourceConstraint::Exact(patterns))
+            | Some(SourceConstraint::Prefix(patterns))
+            | Some(SourceConstraint::Permuted(patterns)) => patterns,
+            // Repeated-source patterns accept zero sources, so no direct
+            // source operation is structurally mandatory.
+            None | Some(SourceConstraint::Each(_)) => return vec![],
+        };
+        patterns
+            .iter()
+            .filter_map(UPat::possible_root_operations)
+            .map(DirectSourceRequirement::AnyOf)
+            .collect()
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Walk {
@@ -1681,6 +1735,40 @@ pub struct RewriteRule {
 pub struct RewriteTrace {
     pub rules: Vec<&'static str>,
 }
+
+#[derive(Clone)]
+enum DirectSourceRequirement {
+    AnyOf(BTreeSet<Operation>),
+    Predicate(fn(&Operation) -> bool),
+}
+impl DirectSourceRequirement {
+    fn is_satisfied_by(&self, sources: &[UOp]) -> bool {
+        sources.iter().any(|source| match self {
+            Self::AnyOf(operations) => operations.contains(source.operation()),
+            Self::Predicate(predicate) => predicate(source.operation()),
+        })
+    }
+}
+
+struct PreparedRewriteRule<'a> {
+    rule: &'a RewriteRule,
+    direct_source_requirements: Vec<DirectSourceRequirement>,
+}
+impl<'a> PreparedRewriteRule<'a> {
+    fn new(rule: &'a RewriteRule) -> Self {
+        Self {
+            direct_source_requirements: rule.pattern.direct_source_requirements(),
+            rule,
+        }
+    }
+
+    fn admits(&self, node: &UOp) -> bool {
+        self.direct_source_requirements
+            .iter()
+            .all(|requirement| requirement.is_satisfied_by(node.sources()))
+    }
+}
+
 pub fn rewrite(
     root: &UOp,
     rules: &mut [RewriteRule],
@@ -1689,12 +1777,16 @@ pub fn rewrite(
     const STEP_LIMIT: usize = 128;
 
     rules.sort_by_key(|r| r.priority);
+    let rules = rules
+        .iter()
+        .map(PreparedRewriteRule::new)
+        .collect::<Vec<_>>();
     let mut trace = RewriteTrace { rules: vec![] };
     let mut memo = BTreeMap::new();
     let mut active = BTreeSet::new();
     fn go(
         n: &UOp,
-        r: &[RewriteRule],
+        r: &[PreparedRewriteRule<'_>],
         w: Walk,
         m: &mut BTreeMap<UOp, UOp>,
         active: &mut BTreeSet<UOp>,
@@ -1727,12 +1819,16 @@ pub fn rewrite(
             }
 
             for rule in r {
+                if !rule.admits(&x) {
+                    continue;
+                }
                 let mut next = None;
-                rule.pattern
+                rule.rule
+                    .pattern
                     .visit_matches(
                         &x,
                         &Captures::default(),
-                        &mut |captures| match (rule.apply)(&captures, &x) {
+                        &mut |captures| match (rule.rule.apply)(&captures, &x) {
                             Some(candidate) => {
                                 if candidate != x {
                                     next = Some(candidate);
@@ -1747,7 +1843,7 @@ pub fn rewrite(
                         active.remove(n);
                         return Err(UOpError::EffectRewrite);
                     }
-                    t.rules.push(rule.name);
+                    t.rules.push(rule.rule.name);
                     x = next;
                     break;
                 }
@@ -1773,7 +1869,7 @@ pub fn rewrite(
         active.remove(n);
         Err(UOpError::RewriteStepLimit)
     }
-    let x = go(root, rules, walk, &mut memo, &mut active, &mut trace)?;
+    let x = go(root, &rules, walk, &mut memo, &mut active, &mut trace)?;
     Ok((x, trace))
 }
 
@@ -2086,23 +2182,27 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "where-same",
             priority: 3,
-            pattern: UPat::op(Operation::Ternary(Ternary::Where)).sources(vec![
-                // A nonconstant condition can have observable failure or
-                // binding behavior even when both arms are the same value.
-                // Keep only the dependency-free, total constant condition.
-                UPat::operation_predicate(is_const_operation),
-                UPat::any().named("x"),
-                UPat::any().named("x"),
-            ]),
+            pattern: UPat::op(Operation::Ternary(Ternary::Where))
+                .sources(vec![
+                    // A nonconstant condition can have observable failure or
+                    // binding behavior even when both arms are the same value.
+                    // Keep only the dependency-free, total constant condition.
+                    UPat::operation_predicate(is_const_operation),
+                    UPat::any().named("x"),
+                    UPat::any().named("x"),
+                ])
+                .custom_early_reject([is_const_operation as fn(&Operation) -> bool]),
             apply: |c, _| c.get("x").cloned(),
         },
         RewriteRule {
             name: "typed-add-zero-right",
             priority: 3,
-            pattern: UPat::operation_predicate(is_add_operation).sources(vec![
-                UPat::any().named("x"),
-                UPat::operation_predicate(is_const_operation).named("zero"),
-            ]),
+            pattern: UPat::operation_predicate(is_add_operation)
+                .sources(vec![
+                    UPat::any().named("x"),
+                    UPat::operation_predicate(is_const_operation).named("zero"),
+                ])
+                .custom_early_reject([is_const_operation as fn(&Operation) -> bool]),
             apply: |c, operation| {
                 c.get("x")
                     .filter(|_| {
@@ -2115,10 +2215,12 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-add-zero-left",
             priority: 4,
-            pattern: UPat::operation_predicate(is_add_operation).sources(vec![
-                UPat::operation_predicate(is_const_operation).named("zero"),
-                UPat::any().named("x"),
-            ]),
+            pattern: UPat::operation_predicate(is_add_operation)
+                .sources(vec![
+                    UPat::operation_predicate(is_const_operation).named("zero"),
+                    UPat::any().named("x"),
+                ])
+                .custom_early_reject([is_const_operation as fn(&Operation) -> bool]),
             apply: |c, operation| {
                 c.get("x")
                     .filter(|_| {
@@ -2131,10 +2233,12 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-mul-one",
             priority: 5,
-            pattern: UPat::operation_predicate(is_mul_operation).sources(vec![
-                UPat::any().named("x"),
-                UPat::operation_predicate(is_const_operation).named("one"),
-            ]),
+            pattern: UPat::operation_predicate(is_mul_operation)
+                .sources(vec![
+                    UPat::any().named("x"),
+                    UPat::operation_predicate(is_const_operation).named("one"),
+                ])
+                .custom_early_reject([is_const_operation as fn(&Operation) -> bool]),
             apply: |c, operation| {
                 c.get("x")
                     .filter(|x| {
@@ -2148,10 +2252,12 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-mul-one-left",
             priority: 5,
-            pattern: UPat::operation_predicate(is_mul_operation).sources(vec![
-                UPat::operation_predicate(is_const_operation).named("one"),
-                UPat::any().named("x"),
-            ]),
+            pattern: UPat::operation_predicate(is_mul_operation)
+                .sources(vec![
+                    UPat::operation_predicate(is_const_operation).named("one"),
+                    UPat::any().named("x"),
+                ])
+                .custom_early_reject([is_const_operation as fn(&Operation) -> bool]),
             apply: |c, operation| {
                 c.get("x")
                     .filter(|x| {
@@ -2165,10 +2271,12 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-sub-zero",
             priority: 5,
-            pattern: UPat::operation_predicate(is_sub_operation).sources(vec![
-                UPat::any().named("x"),
-                UPat::operation_predicate(is_const_operation).named("zero"),
-            ]),
+            pattern: UPat::operation_predicate(is_sub_operation)
+                .sources(vec![
+                    UPat::any().named("x"),
+                    UPat::operation_predicate(is_const_operation).named("zero"),
+                ])
+                .custom_early_reject([is_const_operation as fn(&Operation) -> bool]),
             apply: |c, operation| {
                 c.get("x")
                     .filter(|x| {
@@ -2182,11 +2290,13 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "typed-where-const",
             priority: 6,
-            pattern: UPat::op(Operation::Ternary(Ternary::Where)).sources(vec![
-                UPat::operation_predicate(is_const_operation).named("gate"),
-                UPat::any().named("on_true"),
-                UPat::any().named("on_false"),
-            ]),
+            pattern: UPat::op(Operation::Ternary(Ternary::Where))
+                .sources(vec![
+                    UPat::operation_predicate(is_const_operation).named("gate"),
+                    UPat::any().named("on_true"),
+                    UPat::any().named("on_false"),
+                ])
+                .custom_early_reject([is_const_operation as fn(&Operation) -> bool]),
             apply: |c, _| {
                 let gate = c.get("gate")?;
                 if exact_bool_literal(gate, true) {
