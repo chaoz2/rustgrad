@@ -10,6 +10,49 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MaskedSelectPlan {
+    dtype: DType,
+    fixed_shape: Option<Shape>,
+}
+
+fn masked_select_plan(
+    graph: &Graph,
+    input: NodeId,
+    mask: NodeId,
+    size: Option<usize>,
+    op: &'static str,
+) -> Result<MaskedSelectPlan> {
+    let source = graph.node(input)?;
+    let mask_node = graph.node(mask)?;
+    if mask_node.dtype != DType::Bool {
+        return Err(Error::InvalidLogicalDType {
+            op,
+            actual: mask_node.dtype,
+        });
+    }
+    if mask_node.shape.broadcast_with(&source.shape).as_ref() != Ok(&source.shape) {
+        return Err(Error::InvalidIndexedShape {
+            op,
+            input: source.shape.clone(),
+            index: mask_node.shape.clone(),
+        });
+    }
+    graph.nbytes(input)?;
+    graph.nbytes(mask)?;
+    let fixed_shape = size.map(|size| Shape::from([size]));
+    if let Some(shape) = &fixed_shape {
+        shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    }
+    Ok(MaskedSelectPlan {
+        dtype: source.dtype,
+        fixed_shape,
+    })
+}
+
 fn nonzero_coordinate_dtype(shape: &Shape) -> Result<DType> {
     let mut dtype = DType::I32;
     for &extent in shape.dims() {
@@ -2180,27 +2223,13 @@ impl Graph {
     /// Unbounded, row-major boolean selection. Unlike [`Self::masked_select`]
     /// this result has runtime shape `[selected_count]`.
     pub fn masked_select_dynamic(&mut self, input: NodeId, mask: NodeId) -> Result<DynamicNodeId> {
-        let source = self.node(input)?;
-        let mask_node = self.node(mask)?;
-        if mask_node.dtype != DType::Bool {
-            return Err(Error::InvalidLogicalDType {
-                op: "masked_select_dynamic",
-                actual: mask_node.dtype,
-            });
-        }
-        if mask_node.shape.broadcast_with(&source.shape).as_ref() != Ok(&source.shape) {
-            return Err(Error::InvalidIndexedShape {
-                op: "masked_select_dynamic",
-                input: source.shape.clone(),
-                index: mask_node.shape.clone(),
-            });
-        }
+        let plan = masked_select_plan(self, input, mask, None, "masked_select_dynamic")?;
         let id = DynamicNodeId {
             graph: self.id,
             index: self.dynamic_nodes.len(),
         };
         self.dynamic_nodes
-            .push(DynamicNode::masked_select(id, input, mask, source.dtype));
+            .push(DynamicNode::masked_select(id, input, mask, plan.dtype));
         Ok(id)
     }
 
@@ -4544,21 +4573,8 @@ impl Graph {
         size: usize,
         fill: Scalar,
     ) -> Result<NodeId> {
-        let source = self.node(input)?;
-        let mask_node = self.node(mask)?;
-        if mask_node.dtype != DType::Bool {
-            return Err(Error::InvalidLogicalDType {
-                op: "masked_select",
-                actual: mask_node.dtype,
-            });
-        }
-        if mask_node.shape.broadcast_with(&source.shape).as_ref() != Ok(&source.shape) {
-            return Err(Error::InvalidIndexedShape {
-                op: "masked_select",
-                input: source.shape.clone(),
-                index: mask_node.shape.clone(),
-            });
-        }
+        let plan = masked_select_plan(self, input, mask, Some(size), "masked_select")?;
+        let output_shape = plan.fixed_shape.expect("fixed masked-select plan");
         Ok(self.push(
             Op::MaskedSelect {
                 input,
@@ -4566,8 +4582,8 @@ impl Graph {
                 size,
                 fill,
             },
-            Shape::from([size]),
-            source.dtype,
+            output_shape,
+            plan.dtype,
         ))
     }
 

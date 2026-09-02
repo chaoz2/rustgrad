@@ -757,13 +757,13 @@ impl CpuBackend {
                     let allocation = allocations
                         .allocation(output)
                         .map_err(dynamic_materialization_error)?;
-                    let value = TensorData::from_scalars(
+                    let mut value = TensorData::from_scalars(
                         allocation.shape.clone(),
                         allocation.dtype,
-                        positions
-                            .into_iter()
-                            .map(|position| source.scalar_at(position)),
+                        std::iter::repeat_n(Scalar::I(0), positions.len()),
                     )?;
+                    let destinations = (0..positions.len()).collect::<Vec<_>>();
+                    value.replace_raw_offsets(&source, &destinations, &positions)?;
                     validate_runtime_value(
                         &allocations,
                         &RuntimeValueDesc::Dynamic(output.clone()),
@@ -2980,23 +2980,11 @@ fn masked_select(
             positions.push(linear);
         }
     }
-    if let Storage::Float8(values) = input.storage() {
-        let mut raw = positions
-            .into_iter()
-            .map(|offset| values.as_raw()[offset])
-            .collect::<Vec<_>>();
-        raw.resize(size, values.format().encode(fill.as_f64()));
-        return TensorData::from_storage(
-            [size],
-            Storage::Float8(Float8Storage::from_raw(values.format(), raw)),
-        );
-    }
-    let mut output = positions
-        .into_iter()
-        .map(|offset| input.scalar_at(offset))
-        .collect::<Vec<_>>();
-    output.resize(size, fill);
-    TensorData::from_scalars([size], input.dtype(), output)
+    let mut output =
+        TensorData::from_scalars([size], input.dtype(), std::iter::repeat_n(fill, size))?;
+    let destinations = (0..positions.len()).collect::<Vec<_>>();
+    output.replace_raw_offsets(input, &destinations, &positions)?;
+    Ok(output)
 }
 
 /// Checked once and consumed by both dynamic count and materialization.
