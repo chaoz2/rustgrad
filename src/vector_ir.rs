@@ -140,14 +140,19 @@ impl VectorProgram {
                 &inst.instruction,
                 LaneInstruction::Index {
                     output: crate::IndexRef {
-                        value: crate::IndexValue::View { .. },
+                        value: crate::IndexValue::View { .. }
+                            | crate::IndexValue::Buffer {
+                                addressing: crate::IndexAddressing::Projected,
+                                ..
+                            },
                         ..
                     },
                     ..
                 }
             ) {
                 return Err(VectorIrError::Unsupported(
-                    "portable vector instruction ABI does not encode affine view offsets".into(),
+                    "portable vector instruction ABI does not encode view or projected offsets"
+                        .into(),
                 ));
             }
             match &inst.instruction {

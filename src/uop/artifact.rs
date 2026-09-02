@@ -20,9 +20,10 @@ const MAGIC: &[u8; 4] = b"RGUA";
 /// v17 adds the CPU-static TensorGuard validation boundary; v18 makes the
 /// prefix-scan source/result buffer ABI and source dtype self-contained.
 /// v19 adds the dependency-bearing live packed-U64 Threefry plan; v20 adds
-/// the checked static-position movement payload.
+/// the checked static-position movement payload; v21 authenticates a Buffer
+/// index whose second source is a checked projected integer address tree.
 /// v15 is retained as the first internal mixed-schedule envelope.
-const VERSION: u8 = 20;
+const VERSION: u8 = 21;
 const PREVIOUS_EFFECT_VERSION: u8 = 15;
 const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
@@ -101,6 +102,12 @@ enum WireArg {
     RangeAxis(u32),
     GepLane(u16),
     BufferIndex {
+        buffer: u64,
+        elements: usize,
+        input_shape: Shape,
+        output_shape: Shape,
+    },
+    ProjectedBufferIndex {
         buffer: u64,
         elements: usize,
         input_shape: Shape,
@@ -295,13 +302,22 @@ fn operation_to_wire(operation: &Operation) -> (WireOpcode, WireArg) {
             elements,
             input_shape,
             output_shape,
+            addressing,
         }) => (
             WireOpcode::Index,
-            WireArg::BufferIndex {
-                buffer: *buffer,
-                elements: *elements,
-                input_shape: input_shape.clone(),
-                output_shape: output_shape.clone(),
+            match addressing {
+                crate::IndexAddressing::Broadcast => WireArg::BufferIndex {
+                    buffer: *buffer,
+                    elements: *elements,
+                    input_shape: input_shape.clone(),
+                    output_shape: output_shape.clone(),
+                },
+                crate::IndexAddressing::Projected => WireArg::ProjectedBufferIndex {
+                    buffer: *buffer,
+                    elements: *elements,
+                    input_shape: input_shape.clone(),
+                    output_shape: output_shape.clone(),
+                },
             },
         ),
         Operation::Index(IndexValue::View {
@@ -540,6 +556,22 @@ fn operation_from_wire(opcode: WireOpcode, arg: WireArg) -> Result<Operation, Ar
             elements,
             input_shape,
             output_shape,
+            addressing: crate::IndexAddressing::Broadcast,
+        }),
+        (
+            WireOpcode::Index,
+            WireArg::ProjectedBufferIndex {
+                buffer,
+                elements,
+                input_shape,
+                output_shape,
+            },
+        ) => Operation::Index(IndexValue::Buffer {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+            addressing: crate::IndexAddressing::Projected,
         }),
         (
             WireOpcode::Index,
@@ -582,20 +614,24 @@ impl std::error::Error for ArtifactError {}
 
 /// Encodes one immutable UOp DAG. Node IDs are dense topological indices and
 /// repeated source IDs preserve shared subgraphs. Historical operation sets
-/// retain the released v19 standalone envelope; only static-position movement
-/// requires v20.
+/// retain their released envelopes; only projected indices require v21.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let nodes = root
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
-    let version = if nodes.iter().any(|node| {
+    let version = if nodes
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    {
+        VERSION
+    } else if nodes.iter().any(|node| {
         matches!(
             node.operation(),
             Operation::Movement(MovementValue::Plan(plan))
                 if matches!(&plan.kind, MovementKernelKind::ScatterPositions { .. })
         )
     }) {
-        VERSION
+        20
     } else {
         // v20 adds no representation for historical operations. Keep their
         // standalone canonical bytes on the released v19 writer envelope.
@@ -610,7 +646,8 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
 /// cache key. Threefry requires the v19 envelope and static-position movement
 /// requires v20; corrected reduction code generation is separated by
 /// renderer-specific source/cache versions without changing its released
-/// logical UOp identity.
+/// logical UOp identity. Projected indices require the v21 envelope because
+/// their existing BufferIndex payload has a new authenticated source meaning.
 pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let nodes = root
         .topological()
@@ -621,7 +658,12 @@ pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactEr
             Operation::EffectStore(_) | Operation::After(_)
         )
     });
-    let version = if nodes.iter().any(|node| {
+    let version = if nodes
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    {
+        21
+    } else if nodes.iter().any(|node| {
         matches!(
             node.operation(),
             Operation::Movement(MovementValue::Plan(plan))
@@ -670,6 +712,9 @@ fn encode_inner(root: &UOp, effects: bool, version: u8) -> Result<Vec<u8>, Artif
     w.u32((nodes.len() - 1) as u32)?;
     for (id, node) in nodes.iter().enumerate() {
         let (kind, arg) = operation_to_wire(node.operation());
+        if version < 21 && matches!(&arg, WireArg::ProjectedBufferIndex { .. }) {
+            return Err(ArtifactError::Format("projected index version"));
+        }
         validate_fields(&kind, node.ty(), &arg, node.sources(), effects)?;
         w.u32(id as u32)?;
         write_kind(&mut w, &kind, effects)?;
@@ -732,6 +777,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             | 17
             | 18
             | 19
+            | 20
             | VERSION
     ) {
         return Err(ArtifactError::Format("version"));
@@ -775,6 +821,15 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("trailing bytes"));
     }
     let root = nodes[root].clone();
+    if version < 21
+        && root
+            .topological()
+            .map_err(|_| ArtifactError::Format("dag"))?
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    {
+        return Err(ArtifactError::Format("projected index version"));
+    }
     root.validate().map_err(|_| ArtifactError::Format("uop"))?;
     if root
         .topological()
@@ -827,6 +882,26 @@ fn validate_fields(
             output_shape,
             ..
         } => validate_index(*elements, input_shape, output_shape, None)?,
+        WireArg::ProjectedBufferIndex {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+        } => {
+            let projected = UOp::from_operation(
+                Operation::Index(IndexValue::Buffer {
+                    buffer: *buffer,
+                    elements: *elements,
+                    input_shape: input_shape.clone(),
+                    output_shape: output_shape.clone(),
+                    addressing: crate::IndexAddressing::Projected,
+                }),
+                ty,
+                sources.to_vec(),
+            );
+            crate::projected_index::ProjectedIndexPlan::from_index(&projected)
+                .map_err(|_| ArtifactError::Format("projected index"))?;
+        }
         WireArg::ViewBufferIndex {
             elements,
             input_shape,
@@ -1338,6 +1413,18 @@ fn write_arg(w: &mut Writer, arg: &WireArg, effects: bool) -> Result<(), Artifac
             write_shape(w, input_shape)?;
             write_shape(w, output_shape)
         }
+        WireArg::ProjectedBufferIndex {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+        } => {
+            w.u8(24)?;
+            w.u64(*buffer)?;
+            w.usize(*elements)?;
+            write_shape(w, input_shape)?;
+            write_shape(w, output_shape)
+        }
         WireArg::ViewBufferIndex {
             buffer,
             elements,
@@ -1530,6 +1617,12 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<WireArg, ArtifactError> {
         6 => WireArg::RangeAxis(r.u32()?),
         7 => WireArg::GepLane(r.u16()?),
         8 => WireArg::BufferIndex {
+            buffer: r.u64()?,
+            elements: r.usize()?,
+            input_shape: read_shape(r)?,
+            output_shape: read_shape(r)?,
+        },
+        24 => WireArg::ProjectedBufferIndex {
             buffer: r.u64()?,
             elements: r.usize()?,
             input_shape: read_shape(r)?,
@@ -3072,6 +3165,28 @@ mod tests {
         w
     }
 
+    fn encode_unvalidated_v21(root: &UOp) -> Vec<u8> {
+        let nodes = root.topological().unwrap();
+        let ids = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.clone(), index as u32))
+            .collect::<BTreeMap<_, _>>();
+        let mut writer = header(nodes.len() as u32, (nodes.len() - 1) as u32);
+        for (index, node) in nodes.iter().enumerate() {
+            let (kind, arg) = operation_to_wire(node.operation());
+            writer.u32(index as u32).unwrap();
+            write_kind(&mut writer, &kind, false).unwrap();
+            write_type(&mut writer, node.ty()).unwrap();
+            write_arg(&mut writer, &arg, false).unwrap();
+            writer.u32(node.sources().len() as u32).unwrap();
+            for source in node.sources() {
+                writer.u32(*ids.get(source).unwrap()).unwrap();
+            }
+        }
+        finish(writer)
+    }
+
     #[test]
     fn reduction_mean_wire_projection_is_private_and_fail_closed() {
         let reduction_arg = |kind, mean| WireArg::Reduction {
@@ -3556,6 +3671,128 @@ mod tests {
         );
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
+
+        let mut projected_graph = crate::Graph::new();
+        let input = projected_graph.input_dtype("input", [1, 2, 2, 2], DType::F32);
+        let producer = projected_graph.square(input).unwrap();
+        let permuted = projected_graph.permute(producer, [0, 2, 1, 3]).unwrap();
+        let reshaped = projected_graph.reshape(permuted, [1, 2, 4]).unwrap();
+        let output = projected_graph.relu(reshaped).unwrap();
+        let scheduled = crate::schedule(&projected_graph, output).unwrap();
+        let root = scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap()
+            .kernel
+            .clone();
+        assert!(
+            root.topological()
+                .unwrap()
+                .iter()
+                .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+        );
+        let bytes = encode(&root).unwrap();
+        assert_eq!(bytes[4], 21);
+        assert_eq!(decode(&bytes).unwrap(), root);
+        assert_eq!(encode_schedule_identity(&root).unwrap()[4], 21);
+
+        let mut same_shape_graph = crate::Graph::new();
+        let input = same_shape_graph.input_dtype("input", [2, 3, 4], DType::F32);
+        let producer = same_shape_graph.square(input).unwrap();
+        let permuted = same_shape_graph.permute(producer, [0, 2, 1]).unwrap();
+        let reshaped = same_shape_graph.reshape(permuted, [2, 3, 4]).unwrap();
+        let output = same_shape_graph.relu(reshaped).unwrap();
+        let scheduled = crate::schedule(&same_shape_graph, output).unwrap();
+        let root = scheduled
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap()
+            .kernel
+            .clone();
+        assert!(
+            root.topological()
+                .unwrap()
+                .iter()
+                .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+        );
+        let same_shape_bytes = encode(&root).unwrap();
+        assert_eq!(same_shape_bytes[4], 21);
+        assert_eq!(decode(&same_shape_bytes).unwrap(), root);
+        assert!(matches!(
+            encode_inner(&root, false, 20),
+            Err(ArtifactError::Format("projected index version"))
+        ));
+        let projected_store_index = root
+            .topological()
+            .unwrap()
+            .into_iter()
+            .find(crate::projected_index::ProjectedIndexPlan::is_projected)
+            .unwrap();
+        let projected_store = UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![
+                projected_store_index,
+                UOp::scalar_constant(
+                    DType::F32,
+                    0.0_f32.to_bits() as u64,
+                    UType::scalar(DType::F32),
+                ),
+            ],
+        );
+        let mut invalid_sources = vec![projected_store];
+        invalid_sources.extend(
+            root.sources()
+                .iter()
+                .filter(|source| matches!(source.operation(), Operation::EndRange))
+                .cloned(),
+        );
+        let projected_store_root = UOp::sink(invalid_sources);
+        assert_eq!(
+            projected_store_root.validate(),
+            Err(crate::UOpError::InvalidIndex)
+        );
+        assert!(encode(&projected_store_root).is_err());
+        assert!(matches!(
+            decode(&encode_unvalidated_v21(&projected_store_root)),
+            Err(ArtifactError::Format("uop"))
+        ));
+
+        let mut ordinary_graph = crate::Graph::new();
+        let input = ordinary_graph.input_dtype("input", [2], DType::F32);
+        let output = ordinary_graph.relu(input).unwrap();
+        let ordinary = crate::schedule(&ordinary_graph, output).unwrap().items[0]
+            .kernel
+            .clone();
+        let mut historical_v20 = encode(&ordinary).unwrap();
+        assert_eq!(historical_v20[4], 19);
+        historical_v20[4] = 20;
+        let body_len = historical_v20.len() - 4;
+        let sum = checksum(&historical_v20[..body_len]);
+        historical_v20[body_len..].copy_from_slice(&sum.to_le_bytes());
+        let decoded = decode(&historical_v20).unwrap();
+        assert_eq!(decoded, ordinary);
+        assert!(decoded.topological().unwrap().iter().all(|node| {
+            !matches!(
+                node.operation(),
+                Operation::Index(IndexValue::Buffer {
+                    addressing: crate::IndexAddressing::Projected,
+                    ..
+                })
+            )
+        }));
+
+        let mut forged_v20 = bytes.clone();
+        forged_v20[4] = 20;
+        let body_len = forged_v20.len() - 4;
+        let sum = checksum(&forged_v20[..body_len]);
+        forged_v20[body_len..].copy_from_slice(&sum.to_le_bytes());
+        assert!(matches!(
+            decode(&forged_v20),
+            Err(ArtifactError::Format("projected index version"))
+        ));
     }
 
     #[test]

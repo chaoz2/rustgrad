@@ -2781,6 +2781,7 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
                 elements: 1,
                 input_shape: shape.clone(),
                 output_shape: shape,
+                addressing: crate::IndexAddressing::Broadcast,
             }),
             Some(ty),
             vec![address, range.clone()],

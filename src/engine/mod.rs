@@ -1540,6 +1540,7 @@ mod tests {
                             elements: *elements,
                             input_shape: input_shape.clone(),
                             output_shape: output_shape.clone(),
+                            addressing: crate::IndexAddressing::Broadcast,
                         }),
                         Some(crate::UType::scalar(DType::F32)),
                         vec![address, index.sources()[1].clone()],

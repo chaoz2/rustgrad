@@ -262,6 +262,7 @@ impl MetalRenderer {
             elements: extent,
             input_shape: output_shape,
             output_shape: store_shape,
+            addressing: crate::IndexAddressing::Broadcast,
         }) = output_index.operation()
         else {
             return Err(MetalError::Unsupported(
@@ -400,6 +401,15 @@ impl MetalRenderer {
             output_position,
             buffers[output_position].source_shape.clone(),
         )?;
+        if transaction.is_some()
+            && nodes
+                .iter()
+                .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+        {
+            return Err(MetalError::Unsupported(
+                "guarded projected indexing is outside the exact Metal subset".into(),
+            ));
+        }
         let entry = format!("rg_metal_e{}_b{}", extent, buffers.len());
         let mut lines = vec![
             "#include <metal_stdlib>".into(),
@@ -1914,6 +1924,33 @@ fn emit_expr_with_substitution(
                 .first()
                 .ok_or_else(|| MetalError::Unsupported("load has no index".into()))?;
             let (buffer, input_shape, output_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                    if crate::projected_index::ProjectedIndexPlan::is_projected(index) =>
+                {
+                    let plan = crate::projected_index::ProjectedIndexPlan::from_index(index)
+                        .map_err(|_| MetalError::Unsupported("invalid projected index".into()))?;
+                    let offset = crate::projected_index::render_infix_projected_index(
+                        &plan,
+                        format!("((long)({linear}))"),
+                        |value| {
+                            Ok(if value == i64::MIN {
+                                "((-9223372036854775807l) - 1l)".into()
+                            } else {
+                                format!("((long){value}l)")
+                            })
+                        },
+                    )
+                    .map_err(|_| MetalError::Unsupported("invalid projected index".into()))?;
+                    let position = ids.get(buffer).ok_or_else(|| {
+                        MetalError::InvalidBinding("load buffer absent from ABI".into())
+                    })?;
+                    let raw = format!("b{position}[{offset}]");
+                    return if dtype == DType::Bool {
+                        Ok(format!("(({raw}) != 0)"))
+                    } else {
+                        Ok(raw)
+                    };
+                }
                 Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,

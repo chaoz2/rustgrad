@@ -270,6 +270,7 @@ impl OpenClRenderer {
             elements: extent,
             input_shape: output_shape,
             output_shape: store_shape,
+            addressing: crate::IndexAddressing::Broadcast,
         }) = output_index.operation()
         else {
             return Err(OpenClError::Unsupported(
@@ -437,9 +438,21 @@ impl OpenClRenderer {
                 },
             )?
         };
+        if transaction.is_some()
+            && nodes
+                .iter()
+                .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+        {
+            return Err(OpenClError::Unsupported(
+                "guarded projected indexing is outside the exact OpenCL subset".into(),
+            ));
+        }
 
         let entry = format!("rg_opencl_e{}_b{}", extent, buffers.len());
         let mut required_capabilities = required_capabilities(&buffers, uses_f16 || uses_bf16);
+        required_capabilities.int64 |= nodes
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_projected);
         if let Some(reduction) = &reduction {
             validate_dtype(
                 &reduction.plan,
@@ -1899,6 +1912,35 @@ fn emit_expr_with_substitution(
                 .first()
                 .ok_or_else(|| OpenClError::Unsupported("load has no index".into()))?;
             let (buffer, input_shape, output_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                    if crate::projected_index::ProjectedIndexPlan::is_projected(index) =>
+                {
+                    let plan = crate::projected_index::ProjectedIndexPlan::from_index(index)
+                        .map_err(|_| OpenClError::Unsupported("invalid projected index".into()))?;
+                    let offset = crate::projected_index::render_infix_projected_index(
+                        &plan,
+                        format!("((long)({linear}))"),
+                        |value| {
+                            Ok(if value == i64::MIN {
+                                "((-9223372036854775807l) - 1l)".into()
+                            } else {
+                                format!("((long){value}l)")
+                            })
+                        },
+                    )
+                    .map_err(|_| OpenClError::Unsupported("invalid projected index".into()))?;
+                    let position = ids.get(buffer).ok_or_else(|| {
+                        OpenClError::InvalidBinding("load buffer absent from ABI".into())
+                    })?;
+                    let raw = format!("b{position}[{offset}]");
+                    return if dtype == DType::Bool {
+                        Ok(format!("(({raw}) != 0)"))
+                    } else if narrow::is_narrow(dtype) {
+                        Ok(narrow::decode(dtype, raw).expect("validated narrow load"))
+                    } else {
+                        Ok(raw)
+                    };
+                }
                 Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,

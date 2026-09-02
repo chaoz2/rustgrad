@@ -608,6 +608,18 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
             .into(),
         });
     }
+    if root
+        .topological()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    {
+        return Ok(VectorPlan {
+            lanes: 1,
+            enabled: false,
+            reason: "projected indices use the checked scalar address dialect".into(),
+        });
+    }
     let linear = crate::LinearKernel::from_uop(root)
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
     linear
@@ -655,6 +667,10 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     let nodes = root
         .topological()
         .map_err(|e| JitError::Unsupported(e.to_string()))?;
+    let request_vector = request_vector
+        && !nodes
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_projected);
     let needs_erf = nodes.iter().any(|node| {
         matches!(
             node.operation(),
@@ -2996,7 +3012,47 @@ fn emit_with_substitution(
                 .sources()
                 .first()
                 .ok_or_else(|| JitError::Unsupported("load no index".into()))?;
+            struct CProjectedIndex;
+            impl crate::projected_index::ProjectedIndexEmitter for CProjectedIndex {
+                type Value = String;
+                type Error = JitError;
+
+                fn linear(&mut self) -> Result<Self::Value, Self::Error> {
+                    Ok("((int64_t)rg_i)".into())
+                }
+                fn constant(&mut self, value: i64) -> Result<Self::Value, Self::Error> {
+                    Ok(if value == i64::MIN {
+                        "INT64_MIN".into()
+                    } else {
+                        format!("((int64_t){value}LL)")
+                    })
+                }
+                fn binary(
+                    &mut self,
+                    operation: crate::uop::Binary,
+                    lhs: Self::Value,
+                    rhs: Self::Value,
+                ) -> Result<Self::Value, Self::Error> {
+                    let operator = match operation {
+                        crate::uop::Binary::Add => "+",
+                        crate::uop::Binary::Sub => "-",
+                        crate::uop::Binary::Mul => "*",
+                        crate::uop::Binary::FloorDiv => "/",
+                        crate::uop::Binary::Mod => "%",
+                        _ => return Err(JitError::Unsupported("projected index operation".into())),
+                    };
+                    Ok(format!("(({lhs}) {operator} ({rhs}))"))
+                }
+            }
             let (buffer, off) = match ix.operation() {
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                    if crate::projected_index::ProjectedIndexPlan::is_projected(ix) =>
+                {
+                    let plan = crate::projected_index::ProjectedIndexPlan::from_index(ix)
+                        .map_err(|_| JitError::Unsupported("invalid projected index".into()))?;
+                    let mut emitter = CProjectedIndex;
+                    (*buffer, plan.emit(&mut emitter)?)
+                }
                 Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,

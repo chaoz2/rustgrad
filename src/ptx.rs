@@ -572,12 +572,14 @@ impl PtxRenderer {
                     elements: input_elements,
                     input_shape,
                     output_shape: input_output_shape,
+                    addressing: crate::IndexAddressing::Broadcast,
                 }),
                 Operation::Index(IndexValue::Buffer {
                     buffer: output_buffer,
                     elements: output_elements,
                     input_shape: output_input_shape,
                     output_shape,
+                    addressing: crate::IndexAddressing::Broadcast,
                 }),
             ) = (input_index.operation(), output_index.operation())
             else {
@@ -993,6 +995,14 @@ fn render(
         // declaration in renderer identity so no older artifact is reused.
         "  .reg .f64 %fd<32>;".into(),
     ]);
+    if nodes
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    {
+        // A distinct register namespace prevents projected addresses from
+        // colliding with pointer parameters or typed scalar value IDs.
+        lines.push("  .reg .s64 %rgi<128>;".into());
+    }
     for n in 0..buffers.len() {
         lines.push(format!("  ld.param.u64 %rd{}0, [p{n}];", n + 1));
     }
@@ -5360,27 +5370,114 @@ fn emit(
                 .sources()
                 .first()
                 .ok_or_else(|| PtxError::Unsupported("Load without index".into()))?;
-            let (buffer, input_shape, output_shape, view) = match ix.operation() {
+            let (buffer, input_shape, output_shape, view, projected) = match ix.operation() {
                 Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,
                     output_shape,
                     ..
-                }) => (buffer, input_shape, output_shape, None),
+                }) if crate::projected_index::ProjectedIndexPlan::is_projected(ix) => {
+                    let plan = crate::projected_index::ProjectedIndexPlan::from_index(ix)
+                        .map_err(|_| PtxError::InvalidBinding("invalid projected index".into()))?;
+                    struct PtxProjectedIndex<'a> {
+                        lines: &'a mut Vec<String>,
+                        linear: &'a str,
+                        next: usize,
+                    }
+                    impl crate::projected_index::ProjectedIndexEmitter for PtxProjectedIndex<'_> {
+                        type Value = String;
+                        type Error = PtxError;
+
+                        fn linear(&mut self) -> Result<Self::Value, Self::Error> {
+                            let register = self.allocate()?;
+                            self.lines
+                                .push(format!("  cvt.s64.u32 {register}, {};", self.linear));
+                            Ok(register)
+                        }
+
+                        fn constant(&mut self, value: i64) -> Result<Self::Value, Self::Error> {
+                            let register = self.allocate()?;
+                            let literal = if value == i64::MIN {
+                                "0x8000000000000000".into()
+                            } else {
+                                value.to_string()
+                            };
+                            self.lines.push(format!("  mov.s64 {register}, {literal};"));
+                            Ok(register)
+                        }
+
+                        fn binary(
+                            &mut self,
+                            operation: crate::uop::Binary,
+                            lhs: Self::Value,
+                            rhs: Self::Value,
+                        ) -> Result<Self::Value, Self::Error> {
+                            let mnemonic = match operation {
+                                crate::uop::Binary::Add => "add.s64",
+                                crate::uop::Binary::Sub => "sub.s64",
+                                crate::uop::Binary::Mul => "mul.lo.s64",
+                                crate::uop::Binary::FloorDiv => "div.s64",
+                                crate::uop::Binary::Mod => "rem.s64",
+                                _ => {
+                                    return Err(PtxError::Unsupported(
+                                        "projected index operation".into(),
+                                    ));
+                                }
+                            };
+                            let register = self.allocate()?;
+                            self.lines
+                                .push(format!("  {mnemonic} {register}, {lhs}, {rhs};"));
+                            Ok(register)
+                        }
+                    }
+                    impl PtxProjectedIndex<'_> {
+                        fn allocate(&mut self) -> Result<String, PtxError> {
+                            // The generic renderer reserves a distinct rgi
+                            // namespace for the closed projected-index dialect.
+                            // Larger address trees remain valid UOps but fail
+                            // closed on PTX.
+                            if self.next >= 128 {
+                                return Err(PtxError::Unsupported(
+                                    "projected index exceeds PTX register budget".into(),
+                                ));
+                            }
+                            let register = format!("%rgi{}", self.next);
+                            self.next += 1;
+                            Ok(register)
+                        }
+                    }
+                    let mut emitter = PtxProjectedIndex {
+                        lines,
+                        linear,
+                        next: 0,
+                    };
+                    let offset = plan.emit(&mut emitter)?;
+                    (buffer, input_shape, output_shape, None, Some(offset))
+                }
+                Operation::Index(IndexValue::Buffer {
+                    buffer,
+                    input_shape,
+                    output_shape,
+                    ..
+                }) => (buffer, input_shape, output_shape, None, None),
                 Operation::Index(IndexValue::View {
                     buffer,
                     input_shape,
                     output_shape,
                     view,
                     ..
-                }) => (buffer, input_shape, output_shape, Some(view)),
+                }) => (buffer, input_shape, output_shape, Some(view), None),
                 _ => return Err(PtxError::Unsupported("Load index".into())),
             };
             let b = ids[buffer] + 1;
-            let off = broadcast_offset(input_shape.dims(), output_shape.dims(), linear)?;
-            lines.extend(off);
-            if let Some(view) = view {
-                lines.extend(view_offset(view)?);
+            if let Some(offset) = projected {
+                lines.push(format!("  mov.s64 %rd28, {offset};"));
+            } else {
+                let off = broadcast_offset(input_shape.dims(), output_shape.dims(), linear)?;
+                lines.extend(off);
+                if let Some(view) = view {
+                    lines.extend(view_offset(view)?);
+                }
             }
             // All affine maps address elements.  Convert only after the signed
             // map has been proven in-range by its immutable descriptor.
@@ -6698,6 +6795,14 @@ fn render_reduction(
         "  .reg .f32 %f<96>;".into(),
         "  .reg .f64 %fd<96>;".into(),
     ]);
+    if store
+        .topological()
+        .map_err(|_| PtxError::Unsupported("reduction DAG".into()))?
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    {
+        lines.push("  .reg .s64 %rgi<128>;".into());
+    }
     for index in 0..buffers.len() {
         lines.push(format!("  ld.param.u64 %rd{}0, [p{index}];", index + 1));
     }
@@ -9218,6 +9323,7 @@ mod tests {
                 elements: 4,
                 input_shape: crate::Shape::new(vec![4]),
                 output_shape: crate::Shape::new(vec![4]),
+                addressing: crate::IndexAddressing::Broadcast,
             }),
             Some(UType::scalar(dtype)),
             vec![addr, range],
@@ -9247,6 +9353,7 @@ mod tests {
                 elements,
                 input_shape: shape.clone(),
                 output_shape: shape,
+                addressing: crate::IndexAddressing::Broadcast,
             }),
             Some(UType::scalar(dtype)),
             vec![global(dtype, 1), range],
@@ -9275,6 +9382,7 @@ mod tests {
                     elements: input_shape.numel().unwrap(),
                     input_shape,
                     output_shape: crate::Shape::new(vec![2, 2]),
+                    addressing: crate::IndexAddressing::Broadcast,
                 }),
                 Some(UType::scalar(dtype)),
                 vec![global(dtype, buffer), range.clone()],
@@ -9323,6 +9431,7 @@ mod tests {
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape,
+                addressing: crate::IndexAddressing::Broadcast,
             }),
             Some(UType::scalar(dtype)),
             vec![global(dtype, 2), range],
@@ -9351,6 +9460,7 @@ mod tests {
                     elements: shape.iter().product(),
                     input_shape: crate::Shape::new(shape),
                     output_shape: crate::Shape::new(vec![2, 2]),
+                    addressing: crate::IndexAddressing::Broadcast,
                 }),
                 Some(UType::scalar(dtype)),
                 vec![global(dtype, buffer), range.clone()],
@@ -9405,6 +9515,7 @@ mod tests {
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape,
+                addressing: crate::IndexAddressing::Broadcast,
             }),
             Some(UType::scalar(dtype)),
             vec![global(dtype, 3), range],
