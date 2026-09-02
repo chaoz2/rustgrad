@@ -1817,30 +1817,72 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .iter()
         .find(|item| item.node == output)
         .unwrap();
-    let projected = output_item
-        .kernel
-        .topological()
-        .unwrap()
-        .into_iter()
-        .find(crate::projected_index::ProjectedIndexPlan::is_projected)
-        .unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert!(scheduled.requested_passthroughs.is_empty());
+    assert_eq!(output_item.primary_output().shape, Shape::from([0, 2, 4]));
+    assert_eq!(output_item.primary_output().bytes, 0);
+    assert!(output_item.dependencies.is_empty());
     assert_eq!(
-        crate::projected_index::ProjectedIndexPlan::from_index(&projected)
-            .unwrap()
-            .output_elements,
-        0
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input]
+    );
+    assert_eq!(output_item.ordered_inputs()[0].desc.bytes, 0);
+    let indices = output_item.kernel.topological().unwrap();
+    assert!(
+        indices
+            .iter()
+            .all(|index| !crate::projected_index::ProjectedIndexPlan::is_projected(index))
+    );
+    let views = indices
+        .iter()
+        .filter_map(|index| match index.operation() {
+            crate::Operation::Index(crate::IndexValue::View { buffer, view, .. }) => {
+                Some((*buffer, view))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].0, input.index() as u64);
+    assert_eq!(views[0].1.source_shape, Shape::from([0, 2, 2, 2]));
+    assert_eq!(views[0].1.logical_shape, Shape::from([0, 2, 4]));
+    assert_eq!(views[0].1.offset, 0);
+    assert!(views[0].1.strides.iter().all(|stride| *stride == 0));
+    assert_eq!(
+        output_item.ordered_inputs()[0].desc.view.as_ref(),
+        Some(views[0].1)
     );
     let capture = crate::CapturedSchedule::capture(&empty, &scheduled, &[output]).unwrap();
-    assert_eq!(
-        capture
-            .replay(&BTreeMap::from([(
-                "input".into(),
-                TensorData::new([0, 2, 2, 2], Vec::<f32>::new()).unwrap(),
-            )]))
-            .unwrap()[0]
-            .shape(),
-        &Shape::from([0, 2, 4])
-    );
+    let bytes = capture.to_bytes().unwrap();
+    let capture = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(capture.to_bytes().unwrap(), bytes);
+    let bindings = BTreeMap::from([(
+        "input".into(),
+        TensorData::new([0, 2, 2, 2], Vec::<f32>::new()).unwrap(),
+    )]);
+    let interpreted = capture.replay(&bindings).unwrap();
+    assert_eq!(interpreted[0].shape(), &Shape::from([0, 2, 4]));
+    assert!(interpreted[0].is_empty());
+    let executor = crate::CapturedReplayExecutor::default();
+    let native = capture
+        .replay_with_options(
+            &bindings,
+            &executor,
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(native.outputs, interpreted);
+    assert_eq!(native.trace.items.len(), 1);
+    assert_eq!(native.trace.items[0].reason, "native zero-domain skip");
+    assert!(native.trace.items[0].native_cache_key.is_none());
+    assert_eq!(native.trace.items[0].vector_main, 0);
+    assert_eq!(native.trace.items[0].vector_tail, 0);
 }
 
 #[test]

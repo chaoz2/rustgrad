@@ -1188,7 +1188,9 @@ fn backend_error(error: JitBackendError) -> ReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, Storage};
+    use crate::{
+        Backend, CpuBackend, DType, Float8Format, Float8Storage, Graph, Scalar, Shape, Storage,
+    };
     use std::collections::HashMap;
 
     fn captured(graph: &Graph, requested: &[crate::NodeId]) -> CapturedSchedule {
@@ -1312,6 +1314,203 @@ mod tests {
         );
     }
 
+    fn assert_captured_diagonal(
+        name: &str,
+        shape: Shape,
+        offset: i64,
+        axes: (isize, isize),
+        input_value: TensorData,
+        expected: TensorData,
+    ) {
+        assert_eq!(input_value.shape(), &shape, "{name} input shape");
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", shape, input_value.dtype());
+        let output = graph.diagonal(input, offset, axes.0, axes.1).unwrap();
+        assert_eq!(
+            graph.shape(output).unwrap(),
+            expected.shape(),
+            "{name} shape"
+        );
+        assert_eq!(
+            graph.dtype(output).unwrap(),
+            expected.dtype(),
+            "{name} dtype"
+        );
+
+        let requested = [output, output];
+        let scheduled = crate::schedule_many(&graph, &requested).unwrap();
+        scheduled.validate().unwrap();
+        assert_eq!(scheduled.requested_passthroughs.len(), 1, "{name}");
+        let alias = &scheduled.requested_passthroughs[0];
+        assert_eq!(alias.requested, output, "{name}");
+        assert_eq!(alias.desc.dtype, expected.dtype(), "{name}");
+        let view = alias.desc.view.as_ref().expect("diagonal alias view");
+        assert_eq!(&view.source_shape, &alias.desc.shape, "{name}");
+        assert_eq!(&view.logical_shape, expected.shape(), "{name}");
+        assert!(scheduled.items.iter().all(|item| {
+            item.outputs
+                .iter()
+                .all(|descriptor| descriptor.id != output.index() as u64)
+        }));
+        let materialized = !expected.is_empty();
+        if materialized {
+            assert_eq!(scheduled.items.len(), 2, "{name}");
+            let (pad, pad_input) = scheduled
+                .items
+                .iter()
+                .find_map(|item| {
+                    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+                        item.kernel.operation()
+                    else {
+                        return None;
+                    };
+                    let crate::MovementKernelKind::Pad { input, .. } = &plan.kind else {
+                        return None;
+                    };
+                    Some((item, input))
+                })
+                .expect("nonempty diagonal retains its Pad producer");
+            assert_eq!(alias.source, pad.node, "{name}");
+            let copied = scheduled
+                .items
+                .iter()
+                .find(|item| item.node == pad_input.node)
+                .expect("nonempty diagonal materializes the exact Pad operand");
+            assert_ne!(copied.id, pad.id, "{name}");
+            assert!(matches!(copied.kernel.operation(), crate::Operation::Sink));
+            assert_eq!(copied.primary_output().id, pad_input.node.index() as u64);
+            assert_eq!(&copied.primary_output().shape, &pad_input.shape);
+            assert_eq!(copied.primary_output().dtype, pad_input.dtype);
+            assert_eq!(
+                copied
+                    .ordered_inputs()
+                    .iter()
+                    .map(|binding| binding.input_node)
+                    .collect::<Vec<_>>(),
+                vec![input],
+                "{name}"
+            );
+            assert_eq!(pad.dependencies, vec![copied.id], "{name}");
+            assert_eq!(pad.ordered_inputs().len(), 1, "{name}");
+            assert_eq!(pad.ordered_inputs()[0].input_node, copied.node, "{name}");
+            assert!(pad.ordered_inputs()[0].desc.view.is_none(), "{name}");
+        } else {
+            assert!(scheduled.items.is_empty(), "{name}");
+            assert_eq!(alias.source, input, "{name}");
+            if !input_value.is_empty() {
+                // tinygrad returns an empty reshape when a positive offset is
+                // exactly the rectangular column boundary. The canonical
+                // zero-stride view retains the graph's physical source but
+                // has no reachable address or executable item.
+                assert_eq!(view.offset, 0, "{name}");
+                assert!(view.strides.iter().all(|stride| *stride == 0), "{name}");
+                let crate::Op::Reshape {
+                    input: cropped,
+                    shape: output_shape,
+                } = graph.op(output).unwrap()
+                else {
+                    panic!("{name} boundary diagonal must end in Reshape")
+                };
+                assert_eq!(output_shape, expected.shape(), "{name}");
+                let crate::Op::Shrink {
+                    input: source,
+                    bounds,
+                } = graph.op(*cropped).unwrap()
+                else {
+                    panic!("{name} boundary diagonal must retain its Shrink")
+                };
+                assert_eq!(*source, input, "{name}");
+                assert_eq!(axes, (0, 1), "{name}");
+                let column_start = usize::try_from(offset).expect("positive boundary offset");
+                assert_eq!(column_start, input_value.shape().dims()[1], "{name}");
+                assert_eq!(
+                    bounds.as_slice(),
+                    &[
+                        (0, input_value.shape().dims()[0]),
+                        (column_start, input_value.shape().dims()[1]),
+                    ],
+                    "{name}"
+                );
+            }
+        }
+
+        let capture = CapturedSchedule::capture(&graph, &scheduled, &requested).unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let capture = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(capture.to_bytes().unwrap(), bytes, "{name}");
+        assert_eq!(capture.requested, vec![output.index() as u64; 2], "{name}");
+        let bindings = BTreeMap::from([("input".into(), input_value.clone())]);
+        let oracle = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("input".into(), input_value)]),
+            )
+            .unwrap();
+        let expected_bytes = expected.to_le_bytes().unwrap();
+        assert_eq!(
+            oracle.to_le_bytes().unwrap(),
+            expected_bytes,
+            "{name} oracle"
+        );
+
+        let executor = CapturedReplayExecutor::default();
+        let interpreted = executor
+            .replay(&capture, &bindings, CapturedReplayOptions::default())
+            .unwrap();
+        assert_eq!(
+            interpreted.trace.items.len(),
+            scheduled.items.len(),
+            "{name}"
+        );
+        for actual in &interpreted.outputs {
+            assert_eq!(
+                actual.to_le_bytes().unwrap(),
+                expected_bytes,
+                "{name} interpreter"
+            );
+        }
+        let native_options = CapturedReplayOptions {
+            backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+        };
+        let first = executor
+            .replay(&capture, &bindings, native_options)
+            .unwrap();
+        let second = executor
+            .replay(&capture, &bindings, native_options)
+            .unwrap();
+        for actual in first.outputs.iter().chain(&second.outputs) {
+            assert_eq!(
+                actual.to_le_bytes().unwrap(),
+                expected_bytes,
+                "{name} native"
+            );
+        }
+        if materialized {
+            assert_eq!(first.trace.items.len(), scheduled.items.len(), "{name}");
+            assert_eq!(second.trace.items.len(), scheduled.items.len(), "{name}");
+            assert!(
+                first
+                    .trace
+                    .items
+                    .iter()
+                    .all(|item| { item.backend == ItemBackend::NativeJit && !item.cache_hit })
+            );
+            assert!(
+                second
+                    .trace
+                    .items
+                    .iter()
+                    .all(|item| { item.backend == ItemBackend::NativeJit && item.cache_hit })
+            );
+            assert_eq!(executor.compile_cache_len(false), scheduled.items.len());
+        } else {
+            assert!(first.trace.items.is_empty(), "{name}");
+            assert!(second.trace.items.is_empty(), "{name}");
+            assert_eq!(executor.compile_cache_len(false), 0);
+        }
+    }
+
     #[test]
     fn captured_computed_affine_reads_match_interpreter_and_native() {
         let mut broadcast = Graph::new();
@@ -1370,17 +1569,110 @@ mod tests {
                 ),
             ]),
         );
+    }
 
-        let mut diagonal = Graph::new();
-        let input = diagonal.input_dtype("input", [3, 3], DType::F32);
-        let output = diagonal.diagonal_default(input).unwrap();
-        assert_computed_affine_replay(
-            &diagonal,
-            output,
-            BTreeMap::from([(
-                "input".into(),
-                TensorData::new([3, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap(),
-            )]),
+    #[test]
+    fn captured_diagonal_matches_tinygrad_geometry_and_exact_native_storage() {
+        let mut f32_values = (0..15).map(|value| value as f32).collect::<Vec<_>>();
+        f32_values[2] = f32::from_bits(0x8000_0000);
+        f32_values[8] = f32::from_bits(0x7fc0_1234);
+        f32_values[14] = f32::INFINITY;
+        assert_captured_diagonal(
+            "positive rectangular F32 offset",
+            Shape::from([3, 5]),
+            2,
+            (0, 1),
+            TensorData::from_storage([3, 5], Storage::F32(f32_values)).unwrap(),
+            TensorData::from_storage(
+                [3],
+                Storage::F32(vec![
+                    f32::from_bits(0x8000_0000),
+                    f32::from_bits(0x7fc0_1234),
+                    f32::INFINITY,
+                ]),
+            )
+            .unwrap(),
+        );
+
+        let mut i64_values = (0_i64..12).collect::<Vec<_>>();
+        i64_values[3] = i64::MIN;
+        i64_values[7] = -1;
+        i64_values[11] = i64::MAX;
+        assert_captured_diagonal(
+            "negative rectangular I64 offset",
+            Shape::from([4, 3]),
+            -1,
+            (0, 1),
+            TensorData::from_storage([4, 3], Storage::I64(i64_values)).unwrap(),
+            TensorData::from_storage([3], Storage::I64(vec![i64::MIN, -1, i64::MAX])).unwrap(),
+        );
+
+        let bool_values = (0..24).map(|value| value % 3 != 0).collect::<Vec<_>>();
+        assert_captured_diagonal(
+            "batched signed-axis Bool offset",
+            Shape::from([2, 3, 4]),
+            1,
+            (-2, -1),
+            TensorData::from_storage([2, 3, 4], Storage::Bool(bool_values)).unwrap(),
+            TensorData::from_storage(
+                [2, 3],
+                Storage::Bool(vec![true, false, true, true, false, true]),
+            )
+            .unwrap(),
+        );
+
+        let mut f16_values = vec![0; 12];
+        f16_values[0] = 0x8000;
+        f16_values[5] = 0x7e01;
+        f16_values[10] = 0x7c00;
+        assert_captured_diagonal(
+            "raw F16 payload",
+            Shape::from([3, 4]),
+            0,
+            (0, 1),
+            TensorData::from_storage([3, 4], Storage::F16(f16_values)).unwrap(),
+            TensorData::from_storage([3], Storage::F16(vec![0x8000, 0x7e01, 0x7c00])).unwrap(),
+        );
+
+        let mut float8_values = vec![0; 12];
+        float8_values[0] = 0x80;
+        float8_values[5] = 0x7f;
+        float8_values[10] = 0x55;
+        assert_captured_diagonal(
+            "raw Float8 payload",
+            Shape::from([3, 4]),
+            0,
+            (0, 1),
+            TensorData::from_storage(
+                [3, 4],
+                Storage::Float8(Float8Storage::from_raw(Float8Format::E4M3, float8_values)),
+            )
+            .unwrap(),
+            TensorData::from_storage(
+                [3],
+                Storage::Float8(Float8Storage::from_raw(
+                    Float8Format::E4M3,
+                    vec![0x80, 0x7f, 0x55],
+                )),
+            )
+            .unwrap(),
+        );
+
+        assert_captured_diagonal(
+            "zero source extent",
+            Shape::from([2, 0, 4]),
+            0,
+            (1, 2),
+            TensorData::from_storage([2, 0, 4], Storage::I16(vec![])).unwrap(),
+            TensorData::from_storage([2, 0], Storage::I16(vec![])).unwrap(),
+        );
+        assert_captured_diagonal(
+            "offset at rectangular boundary",
+            Shape::from([2, 3]),
+            3,
+            (0, 1),
+            TensorData::from_storage([2, 3], Storage::U32(vec![1, 2, 3, 4, 5, 6])).unwrap(),
+            TensorData::from_storage([0], Storage::U32(vec![])).unwrap(),
         );
     }
 

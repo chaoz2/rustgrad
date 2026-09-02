@@ -503,6 +503,9 @@ impl TensorData {
         }
         view.validate_read().map_err(|_| Error::InvalidIndex)?;
         let logical_len = view.logical_shape.numel()?;
+        if logical_len == 0 {
+            return Self::zeros_with_dtype(view.logical_shape.clone(), self.dtype());
+        }
         let offsets = (0..logical_len)
             .map(|index| {
                 view.element_offset(index)

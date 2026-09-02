@@ -244,13 +244,31 @@ impl AffineView {
         Ok(out)
     }
     /// Reshapes a read map when the physical addressing remains provably
-    /// affine. Dense positive-stride maps retain the general `ViewMap`
-    /// reshape contract. Non-contiguous and signed maps may only insert or
-    /// remove singleton axes, which never changes a logical coordinate or its
-    /// source address.
+    /// affine. Empty maps are first validated, then canonicalized to offset
+    /// zero and zero strides because they have no reachable address. Dense
+    /// positive-stride maps retain the general `ViewMap` reshape contract.
+    /// Non-contiguous and signed nonempty maps may only insert or remove
+    /// singleton axes, which never changes a logical coordinate or its source
+    /// address.
     pub fn reshape_read(&self, shape: Shape) -> Result<Self, UOpError> {
-        if self.logical_shape.numel().ok() != shape.numel().ok() {
+        let source_elements = self
+            .logical_shape
+            .numel()
+            .map_err(|_| UOpError::InvalidIndex)?;
+        let output_elements = shape.numel().map_err(|_| UOpError::InvalidIndex)?;
+        if source_elements != output_elements {
             return Err(UOpError::InvalidIndex);
+        }
+        if output_elements == 0 {
+            self.validate_read()?;
+            let out = Self {
+                source_shape: self.source_shape.clone(),
+                strides: vec![0; shape.rank()],
+                logical_shape: shape,
+                offset: 0,
+            };
+            out.validate_read()?;
+            return Ok(out);
         }
         if let Ok(view) = self.as_unsigned()
             && let Ok(reshaped) = view.reshape(shape.clone())
