@@ -1321,8 +1321,8 @@ unbound symbolic expression can reach CPU allocation or an existing graph node.
 Captured symbolic families use a separate immutable artifact schema. Capture
 records stable variable identities and names, I64 domains and template values,
 equality/divisibility guards, symbolic buffer shapes, the symbolic output,
-reduction, or matmul domain for every schedule item, and source-backed affine
-view source/logical shapes, strides, and offsets. Symbolic constants are opt-in
+reduction, or matmul domain for every schedule item, and authenticated signed
+affine-view source/logical shapes, strides, and offsets. Symbolic constants are opt-in
 and resize only when their nonempty template storage is one exact repeated raw
 scalar pattern. Artifact decoding validates all expression references,
 conservative shape/view bounds, storage policy, schedule coverage, and template
@@ -1340,11 +1340,12 @@ template-valid shape cannot conceal an invalid in-range specialization. Gather
 and Scatter variable extents require a conservative all-domain inequality proof;
 the source reshape/expand-to-Gather embedding composition consequently replays
 variable token counts through dense materialized Gather operands without
-rebuilding a Graph. A Contiguous plan over a source-backed affine view reuses
-that authenticated symbolic view metadata while keeping its input descriptor
-physical; computed affine copies still lack symbolic provenance, and
-shape-changing bitcasts still need byte-divisibility proofs, so both remain
-fail-closed.
+rebuilding a Graph. A source-backed input view or direct/Contiguous-backed
+computed `AffineCopy` reuses that authenticated symbolic view metadata while
+keeping its input descriptor physical. Construction stops only at the exact
+scheduled source; signed endpoint expressions are proved across the declared
+domain before specialization. Shape-changing bitcasts still need
+byte-divisibility proofs and remain fail-closed.
 Specialization changes descriptor geometry, not scalar algebra: eligible newly
 captured elementwise kernels were already normalized before publication, while
 a decoded historical artifact keeps its original UOp structure for
@@ -1633,11 +1634,13 @@ atomics for 8/16-bit lanes and raw words for 32/64-bit lanes. Operation-specific
 renderer versions isolate these new source/cache identities without changing
 RGUA/RGSA movement bytes or generic elementwise identities. The fixed-schema
 static executors can therefore retain computed producers and materialized
-outputs on device. Symbolic capture deliberately rebuilds the explicit
-Contiguous movement boundary before authenticating its specialization schema;
-symbolic computed views, effects, non-affine reshape, broader producer-output
-redirection, other movement kinds, and live-device validation remain
-fail-closed or unclaimed.
+outputs on device. Guarded static-rank symbolic capture retains the explicit
+producer and movement boundary, authenticates its exact source, and specializes
+contiguous/singleton reshape, permute, zero-stride expand, stable shrink, and
+full reverse maps through the same signed `AffineView`. Effects,
+coordinate-div/mod reshape, ambiguous stride signs, dynamic rank/cardinality,
+broader producer-output redirection, other movement kinds, and live-device
+validation remain fail-closed or unclaimed.
 
 `StaticPositionMap` is the single crate-private geometry proof for the existing
 `ScatterPositions` graph adjoint and its `ScatterPositionsVjp` reverse read. It
@@ -1678,7 +1681,8 @@ including vector tails, zero-sized domains, broadcast batches, materialized
 dependencies, aligned contiguous views, legal strided scalar views, and vector
 scalar splats. Symbolic specialization covers static-rank dense elementwise
 broadcasting, static-axis reductions, generalized matmul, source-backed affine
-movement chains, and exact-splat constant resizing. Non-affine or misaligned
+movement chains, direct or Contiguous-backed computed affine copies, and
+exact-splat constant resizing. Non-affine or misaligned
 vector views require the explicit fallback policy or return an
 error. Rank or output-cardinality changes, arbitrary constant resizing, mutation
 aliases, control flow, device launch expressions, and native cache serialization
@@ -1690,8 +1694,8 @@ chains into a deterministic canonical `AffineView` before kernel lowering.
 For a computed base, the scheduler materializes that producer exactly once and
 uses the same affine descriptor for a fresh dense read-copy output; source-backed
 views remain direct addressing or passthrough values. Pad validity, unsupported
-signed reshape compositions, symbolic computed views, and non-affine composition
-remain explicit boundaries rather than hidden host materializations.
+coordinate-div/mod or multi-map compositions, dynamic rank, and non-affine
+composition remain explicit boundaries rather than hidden host materializations.
 
 ## Static-graph autograd lifecycle
 

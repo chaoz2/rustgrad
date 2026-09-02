@@ -2,7 +2,7 @@
 //! Graph-free concrete specialization.
 use super::{capture::ReplayError, symbolic::SymbolicGuard};
 use crate::{
-    Graph, NodeId, Op, Shape, SymbolicDim, SymbolicExpr, SymbolicShape, SymbolicVar, ViewMap,
+    AffineView, Graph, NodeId, Op, Shape, SymbolicDim, SymbolicExpr, SymbolicShape, SymbolicVar,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -77,14 +77,64 @@ impl SymbolicViewMap {
     }
 
     fn reshape(&self, shape: SymbolicShape) -> Result<Self, ReplayError> {
-        if self.strides != contiguous_strides(&self.logical_shape)? {
+        if self.strides == contiguous_strides(&self.logical_shape)? {
+            return Ok(Self {
+                source_shape: self.source_shape.clone(),
+                strides: contiguous_strides(&shape)?,
+                logical_shape: shape,
+                offset: self.offset.clone(),
+            });
+        }
+
+        let mut source_axes = Vec::new();
+        for (dimension, stride) in self.logical_shape.dims().iter().zip(&self.strides) {
+            if !is_one(dimension)? {
+                source_axes.push((dimension.expression(), stride));
+            }
+        }
+        let mut target_axes = Vec::new();
+        for dimension in shape.dims() {
+            if !is_one(dimension)? {
+                target_axes.push(dimension.expression());
+            }
+        }
+        if source_axes
+            .iter()
+            .map(|(dimension, _)| *dimension)
+            .collect::<Vec<_>>()
+            != target_axes
+        {
             return Err(ReplayError::Unsupported(
-                "symbolic reshape requires a contiguous affine input view".into(),
+                "symbolic reshape requires contiguous or singleton-only affine axes".into(),
+            ));
+        }
+        let mut source_axes = source_axes.into_iter();
+        let strides = shape
+            .dims()
+            .iter()
+            .map(|dimension| {
+                if is_one(dimension)? {
+                    Ok(SymbolicExpr::constant(0))
+                } else {
+                    source_axes
+                        .next()
+                        .map(|(_, stride)| stride.clone())
+                        .ok_or_else(|| {
+                            ReplayError::Unsupported(
+                                "symbolic reshape axis mapping is incomplete".into(),
+                            )
+                        })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if source_axes.next().is_some() {
+            return Err(ReplayError::Unsupported(
+                "symbolic reshape axis mapping is incomplete".into(),
             ));
         }
         Ok(Self {
             source_shape: self.source_shape.clone(),
-            strides: contiguous_strides(&shape)?,
+            strides,
             logical_shape: shape,
             offset: self.offset.clone(),
         })
@@ -171,9 +221,21 @@ impl SymbolicViewMap {
             .zip(&self.strides)
             .enumerate()
         {
+            if slice.step == 1 && slice.start.is_none() && slice.stop.is_none() {
+                logical.push(dim.clone());
+                strides.push(stride.clone());
+                continue;
+            }
+            if slice.step == -1 && slice.start.is_none() && slice.stop.is_none() {
+                let start = dim.expression().clone() - SymbolicExpr::constant(1);
+                offset = offset + start * stride.clone();
+                logical.push(dim.clone());
+                strides.push(-stride.clone());
+                continue;
+            }
             if slice.step <= 0 {
                 return Err(ReplayError::Unsupported(
-                    "symbolic affine views require positive strides".into(),
+                    "symbolic affine views only admit positive slices or a full reverse".into(),
                 ));
             }
             let step = i64::try_from(slice.step)
@@ -251,21 +313,29 @@ impl SymbolicViewMap {
     pub(crate) fn specialize(
         &self,
         environment: &BTreeMap<SymbolicVar, i64>,
-    ) -> Result<ViewMap, ReplayError> {
+    ) -> Result<AffineView, ReplayError> {
         let source_shape = bind_shape(&self.source_shape, environment)?;
         let logical_shape = bind_shape(&self.logical_shape, environment)?;
         let strides = self
             .strides
             .iter()
-            .map(|stride| evaluate_usize(stride, environment))
+            .map(|stride| evaluate(stride, environment))
             .collect::<Result<Vec<_>, _>>()?;
-        let view = ViewMap {
+        let mut offset = evaluate(&self.offset, environment)?;
+        if logical_shape
+            .numel()
+            .map_err(|_| ReplayError::Symbolic("symbolic view extent overflows".into()))?
+            == 0
+        {
+            offset = 0;
+        }
+        let view = AffineView {
             source_shape,
             logical_shape,
             strides,
-            offset: evaluate_usize(&self.offset, environment)?,
+            offset,
         };
-        crate::uop::artifact::validate_view(&view)
+        view.validate_read()
             .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
         Ok(view)
     }
@@ -274,55 +344,201 @@ impl SymbolicViewMap {
         for expression in self.expressions() {
             expression.bounds().map_err(symbolic_error)?;
         }
-        let offset_bounds = self.offset.bounds().map_err(symbolic_error)?;
-        if self.strides.len() != self.logical_shape.rank()
-            || offset_bounds.min < 0
-            || self.strides.iter().try_fold(false, |invalid, stride| {
-                Ok::<_, ReplayError>(invalid || stride.bounds().map_err(symbolic_error)?.min < 0)
-            })?
-        {
+        if self.strides.len() != self.logical_shape.rank() {
             return Err(ReplayError::Symbolic(
-                "symbolic view rank, offset, or stride is malformed".into(),
+                "symbolic view rank is malformed".into(),
             ));
         }
         validate_shape_bounds(&self.source_shape)?;
         validate_shape_bounds(&self.logical_shape)?;
-        let source_max = self
-            .source_shape
-            .numel()
-            .map_err(symbolic_error)?
-            .bounds()
-            .map_err(symbolic_error)?
-            .max;
-        let logical_max = self
-            .logical_shape
-            .numel()
-            .map_err(symbolic_error)?
-            .bounds()
-            .map_err(symbolic_error)?
-            .max;
-        let mut address_max = offset_bounds.max;
+        let source_elements = simplified(self.source_shape.numel().map_err(symbolic_error)?)?;
+        let mut address_min = self.offset.clone();
+        let mut address_max = self.offset.clone();
         for (dimension, stride) in self.logical_shape.dims().iter().zip(&self.strides) {
-            let dimension = dimension.expression().bounds().map_err(symbolic_error)?.max;
-            let stride = stride.bounds().map_err(symbolic_error)?.max;
-            address_max =
-                address_max
-                    .checked_add(dimension.saturating_sub(1).checked_mul(stride).ok_or_else(
-                        || ReplayError::Symbolic("symbolic view address overflows i64".into()),
-                    )?)
-                    .ok_or_else(|| {
-                        ReplayError::Symbolic("symbolic view address overflows i64".into())
-                    })?;
+            let stride_bounds = stride.bounds().map_err(symbolic_error)?;
+            let endpoint =
+                (dimension.expression().clone() - SymbolicExpr::constant(1)) * stride.clone();
+            if stride_bounds.min >= 0 {
+                address_max = address_max + endpoint;
+            } else if stride_bounds.max <= 0 {
+                address_min = address_min + endpoint;
+            } else {
+                return Err(ReplayError::Unsupported(
+                    "symbolic affine stride sign is ambiguous".into(),
+                ));
+            }
         }
-        if (source_max == 0 && (logical_max != 0 || address_max != 0))
-            || logical_max != 0 && address_max >= source_max
-        {
+        let address_min = simplified(address_min)?;
+        let address_max = simplified(address_max)?;
+        let upper_margin =
+            simplified(source_elements - SymbolicExpr::constant(1) - address_max.clone())?;
+        if !proven_nonnegative(&address_min)? || !proven_nonnegative(&upper_margin)? {
             return Err(ReplayError::Symbolic(
                 "symbolic view address exceeds its source extent".into(),
             ));
         }
         Ok(())
     }
+}
+
+fn simplified(expression: SymbolicExpr) -> Result<SymbolicExpr, ReplayError> {
+    expression
+        .simplify()
+        .map(|simplified| simplified.expression)
+        .map_err(symbolic_error)
+}
+
+fn proven_nonnegative(expression: &SymbolicExpr) -> Result<bool, ReplayError> {
+    if let Some((minimum, _)) = polynomial_bounds(expression)? {
+        return Ok(minimum >= 0);
+    }
+    Ok(expression.bounds().map_err(symbolic_error)?.min >= 0)
+}
+
+type Monomial = Vec<SymbolicVar>;
+type Polynomial = BTreeMap<Monomial, i128>;
+
+fn polynomial_bounds(expression: &SymbolicExpr) -> Result<Option<(i128, i128)>, ReplayError> {
+    let Some(polynomial) = polynomial(expression)? else {
+        return Ok(None);
+    };
+    let mut minimum = 0i128;
+    let mut maximum = 0i128;
+    for (variables, coefficient) in polynomial {
+        let mut term_min = 1i128;
+        let mut term_max = 1i128;
+        for variable in variables {
+            let (left, right) = variable.bounds();
+            let candidates = [
+                term_min.checked_mul(i128::from(left)),
+                term_min.checked_mul(i128::from(right)),
+                term_max.checked_mul(i128::from(left)),
+                term_max.checked_mul(i128::from(right)),
+            ];
+            let candidates = candidates
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| ReplayError::Symbolic("symbolic polynomial overflows".into()))?;
+            term_min = *candidates.iter().min().unwrap();
+            term_max = *candidates.iter().max().unwrap();
+        }
+        let candidates = [
+            term_min.checked_mul(coefficient),
+            term_max.checked_mul(coefficient),
+        ];
+        let candidates = candidates
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ReplayError::Symbolic("symbolic polynomial overflows".into()))?;
+        minimum = minimum
+            .checked_add(*candidates.iter().min().unwrap())
+            .ok_or_else(|| ReplayError::Symbolic("symbolic polynomial overflows".into()))?;
+        maximum = maximum
+            .checked_add(*candidates.iter().max().unwrap())
+            .ok_or_else(|| ReplayError::Symbolic("symbolic polynomial overflows".into()))?;
+    }
+    Ok(Some((minimum, maximum)))
+}
+
+fn polynomial(expression: &SymbolicExpr) -> Result<Option<Polynomial>, ReplayError> {
+    const MAX_TERMS: usize = 256;
+    let one = |coefficient: i128| Polynomial::from([(Monomial::new(), coefficient)]);
+    let out = match expression {
+        SymbolicExpr::Const(value) => one(i128::from(*value)),
+        SymbolicExpr::Var(variable) => BTreeMap::from([(vec![variable.clone()], 1)]),
+        SymbolicExpr::Add(terms) => {
+            let mut out = Polynomial::new();
+            for term in terms {
+                let Some(term) = polynomial(term)? else {
+                    return Ok(None);
+                };
+                for (monomial, coefficient) in term {
+                    let updated = out
+                        .get(&monomial)
+                        .copied()
+                        .unwrap_or(0i128)
+                        .checked_add(coefficient)
+                        .ok_or_else(|| {
+                            ReplayError::Symbolic("symbolic polynomial overflows".into())
+                        })?;
+                    if updated == 0 {
+                        out.remove(&monomial);
+                    } else {
+                        out.insert(monomial, updated);
+                    }
+                }
+                if out.len() > MAX_TERMS {
+                    return Ok(None);
+                }
+            }
+            out
+        }
+        SymbolicExpr::Neg(term) => {
+            let Some(term) = polynomial(term)? else {
+                return Ok(None);
+            };
+            term.into_iter()
+                .map(|(monomial, coefficient)| {
+                    coefficient
+                        .checked_neg()
+                        .map(|coefficient| (monomial, coefficient))
+                        .ok_or_else(|| {
+                            ReplayError::Symbolic("symbolic polynomial overflows".into())
+                        })
+                })
+                .collect::<Result<Polynomial, _>>()?
+        }
+        SymbolicExpr::Mul(factors) => {
+            let mut out = one(1);
+            for factor in factors {
+                let Some(factor) = polynomial(factor)? else {
+                    return Ok(None);
+                };
+                let mut product = Polynomial::new();
+                for (left_monomial, left_coefficient) in &out {
+                    for (right_monomial, right_coefficient) in &factor {
+                        let mut monomial = left_monomial.clone();
+                        monomial.extend(right_monomial.iter().cloned());
+                        monomial.sort();
+                        let coefficient = left_coefficient
+                            .checked_mul(*right_coefficient)
+                            .ok_or_else(|| {
+                                ReplayError::Symbolic("symbolic polynomial overflows".into())
+                            })?;
+                        let updated = product
+                            .get(&monomial)
+                            .copied()
+                            .unwrap_or(0i128)
+                            .checked_add(coefficient)
+                            .ok_or_else(|| {
+                                ReplayError::Symbolic("symbolic polynomial overflows".into())
+                            })?;
+                        if updated == 0 {
+                            product.remove(&monomial);
+                        } else {
+                            product.insert(monomial, updated);
+                        }
+                    }
+                }
+                if product.len() > MAX_TERMS {
+                    return Ok(None);
+                }
+                out = product;
+            }
+            out
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(out))
+}
+
+fn is_one(dimension: &SymbolicDim) -> Result<bool, ReplayError> {
+    Ok(dimension
+        .expression()
+        .bounds()
+        .map_err(symbolic_error)?
+        .constant()
+        == Some(1))
 }
 
 pub(crate) fn movement_shape(
@@ -408,39 +624,75 @@ pub(crate) fn derive_view(
     shapes: &BTreeMap<NodeId, SymbolicShape>,
     environment: &BTreeMap<SymbolicVar, i64>,
 ) -> Result<(NodeId, SymbolicViewMap), ReplayError> {
+    derive_view_inner(graph, node, None, shapes, environment)
+}
+
+pub(crate) fn derive_view_from_source(
+    graph: &Graph,
+    node: NodeId,
+    source: NodeId,
+    shapes: &BTreeMap<NodeId, SymbolicShape>,
+    environment: &BTreeMap<SymbolicVar, i64>,
+) -> Result<SymbolicViewMap, ReplayError> {
+    let (derived_source, view) = derive_view_inner(graph, node, Some(source), shapes, environment)?;
+    if derived_source != source {
+        return Err(ReplayError::Symbolic(
+            "symbolic affine view resolved to the wrong source".into(),
+        ));
+    }
+    Ok(view)
+}
+
+fn derive_view_inner(
+    graph: &Graph,
+    node: NodeId,
+    source: Option<NodeId>,
+    shapes: &BTreeMap<NodeId, SymbolicShape>,
+    environment: &BTreeMap<SymbolicVar, i64>,
+) -> Result<(NodeId, SymbolicViewMap), ReplayError> {
     let shape = || {
         shapes
             .get(&node)
             .cloned()
             .ok_or_else(|| ReplayError::Symbolic("symbolic view shape is absent".into()))
     };
+    if source == Some(node) {
+        return Ok((node, SymbolicViewMap::identity(shape()?)?));
+    }
     match graph
         .op(node)
         .map_err(|error| ReplayError::Symbolic(error.to_string()))?
     {
-        Op::Input { .. } | Op::Constant(_) => Ok((node, SymbolicViewMap::identity(shape()?)?)),
+        Op::Input { .. } | Op::Constant(_) if source.is_none() => {
+            Ok((node, SymbolicViewMap::identity(shape()?)?))
+        }
         Op::Shrink { input, bounds } => {
-            let (source, view) = derive_view(graph, *input, shapes, environment)?;
-            Ok((source, view.shrink(bounds, environment)?))
+            let (derived_source, view) =
+                derive_view_inner(graph, *input, source, shapes, environment)?;
+            Ok((derived_source, view.shrink(bounds, environment)?))
         }
         Op::Reshape { input, .. } => {
-            let (source, view) = derive_view(graph, *input, shapes, environment)?;
-            Ok((source, view.reshape(shape()?)?))
+            let (derived_source, view) =
+                derive_view_inner(graph, *input, source, shapes, environment)?;
+            Ok((derived_source, view.reshape(shape()?)?))
         }
         Op::Permute { input, axes } => {
-            let (source, view) = derive_view(graph, *input, shapes, environment)?;
-            Ok((source, view.permute(axes)?))
+            let (derived_source, view) =
+                derive_view_inner(graph, *input, source, shapes, environment)?;
+            Ok((derived_source, view.permute(axes)?))
         }
         Op::Expand { input, .. } => {
-            let (source, view) = derive_view(graph, *input, shapes, environment)?;
-            Ok((source, view.expand(shape()?)?))
+            let (derived_source, view) =
+                derive_view_inner(graph, *input, source, shapes, environment)?;
+            Ok((derived_source, view.expand(shape()?)?))
         }
         Op::Stride { input, slices } => {
-            let (source, view) = derive_view(graph, *input, shapes, environment)?;
-            Ok((source, view.stride(slices, environment)?))
+            let (derived_source, view) =
+                derive_view_inner(graph, *input, source, shapes, environment)?;
+            Ok((derived_source, view.stride(slices, environment)?))
         }
         _ => Err(ReplayError::Unsupported(
-            "symbolic view source is computed or non-affine".into(),
+            "symbolic view does not reach its authenticated affine source".into(),
         )),
     }
 }
@@ -572,4 +824,88 @@ fn validate_shape_bounds(shape: &SymbolicShape) -> Result<(), ReplayError> {
 
 fn symbolic_error(error: crate::SymbolicError) -> ReplayError {
     ReplayError::Symbolic(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_symbolic_view_proves_reverse_and_normalizes_empty_specialization() {
+        let extent = SymbolicExpr::variable("extent", 0, 8).unwrap();
+        let shape = SymbolicShape::new(vec![extent.clone().into()]);
+        let view = SymbolicViewMap::identity(shape)
+            .unwrap()
+            .stride(
+                &[crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+                &BTreeMap::from([(extent.variables().into_iter().next().unwrap(), 3)]),
+            )
+            .unwrap();
+        view.validate_bounds().unwrap();
+
+        let variable = extent.variables().into_iter().next().unwrap();
+        let concrete = view
+            .specialize(&BTreeMap::from([(variable.clone(), 4)]))
+            .unwrap();
+        assert_eq!(concrete.strides, vec![-1]);
+        assert_eq!(concrete.offset, 3);
+        let empty = view.specialize(&BTreeMap::from([(variable, 0)])).unwrap();
+        assert_eq!(empty.logical_shape, Shape::new([0]));
+        assert_eq!(empty.offset, 0);
+    }
+
+    #[test]
+    fn symbolic_view_rejects_an_unproven_stride_sign() {
+        let extent = SymbolicExpr::variable("extent", 1, 8).unwrap();
+        let stride = SymbolicExpr::variable("stride", -1, 1).unwrap();
+        let view = SymbolicViewMap {
+            source_shape: SymbolicShape::new(vec![extent.clone().into()]),
+            logical_shape: SymbolicShape::new(vec![extent.into()]),
+            strides: vec![stride],
+            offset: SymbolicExpr::constant(0),
+        };
+        assert!(matches!(
+            view.validate_bounds(),
+            Err(ReplayError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn symbolic_view_rejects_template_valid_non_template_out_of_bounds_geometry() {
+        let extent = SymbolicExpr::variable("extent", 1, 8).unwrap();
+        let view = SymbolicViewMap {
+            source_shape: SymbolicShape::new(vec![extent.clone().into()]),
+            logical_shape: SymbolicShape::new(vec![extent.clone().into()]),
+            strides: vec![extent],
+            offset: SymbolicExpr::constant(0),
+        };
+        assert!(matches!(
+            view.validate_bounds(),
+            Err(ReplayError::Symbolic(_))
+        ));
+    }
+
+    #[test]
+    fn singleton_only_symbolic_reshape_preserves_signed_axis() {
+        let extent = SymbolicExpr::variable("extent", 1, 8).unwrap();
+        let variable = extent.variables().into_iter().next().unwrap();
+        let source = SymbolicShape::new(vec![extent.clone().into()]);
+        let view = SymbolicViewMap {
+            source_shape: source.clone(),
+            logical_shape: source,
+            strides: vec![SymbolicExpr::constant(-1)],
+            offset: extent.clone() - SymbolicExpr::constant(1),
+        }
+        .reshape(SymbolicShape::new(vec![1usize.into(), extent.into()]))
+        .unwrap();
+        view.validate_bounds().unwrap();
+        let concrete = view.specialize(&BTreeMap::from([(variable, 4)])).unwrap();
+        assert_eq!(concrete.logical_shape, Shape::new([1, 4]));
+        assert_eq!(concrete.strides, vec![0, -1]);
+        assert_eq!(concrete.offset, 3);
+    }
 }

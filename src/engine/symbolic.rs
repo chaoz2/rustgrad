@@ -536,7 +536,7 @@ pub(crate) fn build_schema(
                     continue;
                 };
                 if source.index() as u64 == *buffer
-                    && crate::AffineView::from(symbolic.specialize(&template_environment)?) == *view
+                    && symbolic.specialize(&template_environment)? == *view
                     && !matches.contains(&symbolic)
                 {
                     matches.push(symbolic);
@@ -558,24 +558,26 @@ pub(crate) fn build_schema(
         if let Operation::Movement(crate::MovementValue::Plan(plan)) = item.kernel.operation()
             && let crate::MovementKernelKind::AffineCopy { input, view } = &plan.kind
         {
-            let Op::Contiguous { input: viewed } = graph
+            let viewed = match graph
                 .op(item.node)
                 .map_err(|error| ReplayError::Symbolic(error.to_string()))?
-            else {
-                return Err(ReplayError::Unsupported(
-                    "symbolic computed affine-copy specialization is unavailable".into(),
-                ));
-            };
-            let (source, symbolic) =
-                super::symbolic_view::derive_view(graph, *viewed, &memo, &template_environment)?;
-            if source != input.node
-                || crate::AffineView::from(symbolic.specialize(&template_environment)?) != *view
             {
+                Op::Contiguous { input } => *input,
+                _ => item.node,
+            };
+            let symbolic = super::symbolic_view::derive_view_from_source(
+                graph,
+                viewed,
+                input.node,
+                &memo,
+                &template_environment,
+            )?;
+            if symbolic.specialize(&template_environment)? != *view {
                 return Err(ReplayError::Symbolic(
-                    "symbolic contiguous affine view disagrees with its movement plan".into(),
+                    "symbolic affine view disagrees with its movement plan".into(),
                 ));
             }
-            let key = (item.id, source.index() as u64);
+            let key = (item.id, input.node.index() as u64);
             if views.insert(key, symbolic).is_some() {
                 return Err(ReplayError::Unsupported(
                     "one schedule item uses multiple views of one source buffer".into(),
@@ -793,7 +795,7 @@ impl SymbolicSchema {
                 .iter()
                 .find(|binding| binding.desc.id == *buffer)
                 .ok_or_else(|| ReplayError::Symbolic("symbolic view buffer is absent".into()))?;
-            let concrete = crate::AffineView::from(symbolic.specialize(&environment)?);
+            let concrete = symbolic.specialize(&environment)?;
             let affine_copy = match item.kernel.operation() {
                 Operation::Movement(crate::MovementValue::Plan(plan)) => match &plan.kind {
                     crate::MovementKernelKind::AffineCopy { input, view }
@@ -1476,7 +1478,7 @@ fn symbolic_movement_output(
     };
     match &plan.kind {
         crate::MovementKernelKind::AffineCopy { .. } => Err(ReplayError::Unsupported(
-            "symbolic computed affine-copy specialization is unavailable".into(),
+            "symbolic static-position affine-copy specialization is unavailable".into(),
         )),
         crate::MovementKernelKind::Pad { input, padding, .. } => {
             let input = shape(input)?;
@@ -1886,7 +1888,7 @@ pub(crate) fn specialize_kernel(
                         .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
                     input_shape: view.logical_shape.clone(),
                     output_shape,
-                    view: view.into(),
+                    view,
                 })
             }
             Operation::ReduceInit(ReductionValue {
@@ -2041,12 +2043,10 @@ fn specialize_movement_plan(
             .views
             .get(&(item_id, input.node.index() as u64))
             .ok_or_else(|| {
-                ReplayError::Unsupported(
-                    "symbolic computed affine-copy specialization is unavailable".into(),
-                )
+                ReplayError::Unsupported("symbolic affine-copy view is absent".into())
             })?;
         let input_shape = schema.bind_shape(input.node.index() as u64, environment)?;
-        let view = crate::AffineView::from(symbolic.specialize(environment)?);
+        let view = symbolic.specialize(environment)?;
         return plan
             .specialize_affine_view(input_shape, output_shape, view)
             .map_err(|error| ReplayError::Symbolic(error.to_string()));
@@ -2181,13 +2181,8 @@ fn specialize_desc(
                 .iter()
                 .filter(|((_, buffer), _)| *buffer == desc.id)
                 .filter_map(|(_, view)| {
-                    (view
-                        .specialize(&template_environment)
-                        .ok()
-                        .map(crate::AffineView::from)
-                        .as_ref()
-                        == Some(template))
-                    .then_some(view)
+                    (view.specialize(&template_environment).ok().as_ref() == Some(template))
+                        .then_some(view)
                 })
                 .collect::<Vec<_>>();
             matches.dedup();
@@ -2212,6 +2207,6 @@ fn specialize_desc(
         bytes,
         alignment: desc.alignment,
         read_only: desc.read_only,
-        view: view.map(Into::into),
+        view,
     })
 }

@@ -3675,6 +3675,276 @@ mod tests {
         );
     }
 
+    fn symbolic_computed_permute_family(
+        extent: usize,
+        contiguous: bool,
+    ) -> (
+        Graph,
+        crate::NodeId,
+        crate::NodeId,
+        crate::NodeId,
+        BTreeMap<String, TensorData>,
+    ) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [extent, 2], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let viewed = graph.permute(producer, [1, 0]).unwrap();
+        let output = if contiguous {
+            graph.contiguous(viewed).unwrap()
+        } else {
+            viewed
+        };
+        let values = (0..extent * 2)
+            .map(|index| index as f32 - 2.0)
+            .collect::<Vec<_>>();
+        (
+            graph,
+            input,
+            producer,
+            output,
+            BTreeMap::from([(
+                "input".into(),
+                TensorData::new([extent, 2], values).unwrap(),
+            )]),
+        )
+    }
+
+    #[test]
+    fn symbolic_computed_affine_copy_specializes_direct_and_contiguous_outputs() {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        for contiguous in [false, true] {
+            let (template, input, producer, output, _) =
+                symbolic_computed_permute_family(3, contiguous);
+            let requested = if contiguous {
+                vec![producer, output]
+            } else {
+                vec![output]
+            };
+            let schedule = crate::schedule_many(&template, &requested).unwrap();
+            assert_eq!(schedule.items.len(), 2);
+            let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+                schedule.items[1].kernel.operation()
+            else {
+                panic!("computed view must retain its affine copy boundary")
+            };
+            let crate::MovementKernelKind::AffineCopy { input: operand, .. } = &plan.kind else {
+                panic!("computed view must retain its affine copy plan")
+            };
+            assert_eq!(operand.node, producer);
+            let capture = CapturedSchedule::capture_symbolic(
+                &template,
+                &schedule,
+                &requested,
+                &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                    input,
+                    crate::SymbolicShape::new(vec![extent.clone().into(), 2usize.into()]),
+                )])),
+                &BTreeMap::from([("extent".into(), 3)]),
+            )
+            .unwrap();
+            let bytes = capture.to_bytes().unwrap();
+            let capture = CapturedSchedule::from_bytes(&bytes).unwrap();
+            assert_eq!(capture.to_bytes().unwrap(), bytes);
+
+            let executor = CapturedReplayExecutor::default();
+            for rebound in [0usize, 1, 3, 8] {
+                let (oracle_graph, _, _, oracle_output, bindings) =
+                    symbolic_computed_permute_family(rebound, contiguous);
+                let replayed = executor
+                    .replay_symbolic(
+                        &capture,
+                        &BTreeMap::from([("extent".into(), rebound as i64)]),
+                        &bindings,
+                        CapturedReplayOptions {
+                            backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                        },
+                    )
+                    .unwrap();
+                let oracle = CpuBackend
+                    .execute(
+                        &oracle_graph,
+                        oracle_output,
+                        &bindings.into_iter().collect::<HashMap<_, _>>(),
+                    )
+                    .unwrap();
+                let output = replayed.outputs.last().unwrap();
+                assert_eq!(output.storage(), oracle.storage(), "{rebound}");
+                assert_eq!(output.shape(), oracle.shape(), "{rebound}");
+            }
+
+            let mut tampered = capture.clone();
+            let view = tampered
+                .symbolic
+                .as_mut()
+                .unwrap()
+                .views
+                .values_mut()
+                .next()
+                .unwrap();
+            view.strides[0] = crate::SymbolicExpr::constant(99);
+            tampered.identity = 0;
+            tampered.identity = crate::schedule::artifact::identity(&tampered).unwrap();
+            assert!(crate::schedule::artifact::validate_capture(&tampered).is_err());
+        }
+    }
+
+    fn symbolic_computed_reverse_family(
+        extent: usize,
+    ) -> (
+        Graph,
+        crate::NodeId,
+        crate::NodeId,
+        BTreeMap<String, TensorData>,
+    ) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [extent], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let output = graph.flip(producer, [0]).unwrap();
+        let values = (0..extent)
+            .map(|index| index as f32 + 1.0)
+            .collect::<Vec<_>>();
+        (
+            graph,
+            input,
+            output,
+            BTreeMap::from([("input".into(), TensorData::new([extent], values).unwrap())]),
+        )
+    }
+
+    #[test]
+    fn symbolic_computed_full_reverse_specializes_signed_affine_copy() {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        let (template, input, output, _) = symbolic_computed_reverse_family(3);
+        let schedule = crate::schedule(&template, output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &template,
+            &schedule,
+            &[output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                crate::SymbolicShape::new(vec![extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 3)]),
+        )
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        for rebound in [0usize, 1, 3, 8] {
+            let (oracle_graph, _, oracle_output, bindings) =
+                symbolic_computed_reverse_family(rebound);
+            let specialized = executor
+                .specialize(
+                    &capture,
+                    &BTreeMap::from([("extent".into(), rebound as i64)]),
+                )
+                .unwrap();
+            let affine = specialized
+                .capture()
+                .items
+                .iter()
+                .find_map(|item| match item.kernel.operation() {
+                    crate::Operation::Movement(crate::MovementValue::Plan(plan)) => {
+                        match &plan.kind {
+                            crate::MovementKernelKind::AffineCopy { view, .. } => Some(view),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                affine.offset,
+                if rebound == 0 { 0 } else { rebound as i64 - 1 }
+            );
+            assert_eq!(affine.strides, vec![-1]);
+            let replayed = executor
+                .replay_symbolic(
+                    &capture,
+                    &BTreeMap::from([("extent".into(), rebound as i64)]),
+                    &bindings,
+                    CapturedReplayOptions::default(),
+                )
+                .unwrap();
+            let oracle = CpuBackend
+                .execute(
+                    &oracle_graph,
+                    oracle_output,
+                    &bindings.into_iter().collect::<HashMap<_, _>>(),
+                )
+                .unwrap();
+            assert_eq!(replayed.outputs[0].storage(), oracle.storage(), "{rebound}");
+        }
+    }
+
+    fn symbolic_computed_broadcast_shrink_family(
+        extent: usize,
+    ) -> (
+        Graph,
+        crate::NodeId,
+        crate::NodeId,
+        BTreeMap<String, TensorData>,
+    ) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [extent], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let reshaped = graph.reshape(producer, [extent, 1]).unwrap();
+        let expanded = graph.expand(reshaped, [extent, 3]).unwrap();
+        let output = graph.shrink(expanded, [(0, extent), (0, 2)]).unwrap();
+        let values = (0..extent)
+            .map(|index| index as f32 - 1.0)
+            .collect::<Vec<_>>();
+        (
+            graph,
+            input,
+            output,
+            BTreeMap::from([("input".into(), TensorData::new([extent], values).unwrap())]),
+        )
+    }
+
+    #[test]
+    fn symbolic_computed_reshape_expand_and_shrink_share_one_affine_copy() {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        // Keep the template extent distinct from the fixed expanded width so
+        // shape lifting does not have two source-exact interpretations.
+        let (template, input, output, _) = symbolic_computed_broadcast_shrink_family(2);
+        let schedule = crate::schedule(&template, output).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        let capture = CapturedSchedule::capture_symbolic(
+            &template,
+            &schedule,
+            &[output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                crate::SymbolicShape::new(vec![extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        for rebound in [0usize, 1, 2, 3, 8] {
+            let (oracle_graph, _, oracle_output, bindings) =
+                symbolic_computed_broadcast_shrink_family(rebound);
+            let replayed = executor
+                .replay_symbolic(
+                    &capture,
+                    &BTreeMap::from([("extent".into(), rebound as i64)]),
+                    &bindings,
+                    CapturedReplayOptions {
+                        backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                    },
+                )
+                .unwrap();
+            let oracle = CpuBackend
+                .execute(
+                    &oracle_graph,
+                    oracle_output,
+                    &bindings.into_iter().collect::<HashMap<_, _>>(),
+                )
+                .unwrap();
+            assert_eq!(replayed.outputs[0].storage(), oracle.storage(), "{rebound}");
+            assert_eq!(replayed.outputs[0].shape(), &Shape::new([rebound, 2]));
+        }
+    }
+
     #[test]
     fn symbolic_rebind_failure_does_not_publish_a_specialization() {
         let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
@@ -4483,7 +4753,7 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_movement_fails_closed_when_shape_metadata_is_insufficient() {
+    fn symbolic_computed_affine_is_admitted_but_shape_changing_bitcast_fails_closed() {
         let rows = crate::SymbolicExpr::variable("rows", 0, 8).unwrap();
 
         let mut affine = Graph::new();
@@ -4491,19 +4761,18 @@ mod tests {
         let computed = affine.square(input).unwrap();
         let output = affine.permute(computed, [1, 0]).unwrap();
         let schedule = crate::schedule(&affine, output).unwrap();
-        assert!(matches!(
-            CapturedSchedule::capture_symbolic(
-                &affine,
-                &schedule,
-                &[output],
-                &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
-                    input,
-                    crate::SymbolicShape::new(vec![rows.clone().into(), 3usize.into()]),
-                )])),
-                &BTreeMap::from([("rows".into(), 2)]),
-            ),
-            Err(ReplayError::Unsupported(_))
-        ));
+        let capture = CapturedSchedule::capture_symbolic(
+            &affine,
+            &schedule,
+            &[output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                crate::SymbolicShape::new(vec![rows.clone().into(), 3usize.into()]),
+            )])),
+            &BTreeMap::from([("rows".into(), 2)]),
+        )
+        .unwrap();
+        assert_eq!(capture.symbolic.as_ref().unwrap().views.len(), 1);
 
         let mut bitcast = Graph::new();
         let input = bitcast.input_dtype("input", [2, 1], DType::F32);
