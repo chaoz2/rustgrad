@@ -29,7 +29,8 @@ const MAGIC: &[u8; 4] = b"RGSA";
 /// v9 removes the nonsemantic symbolic Reduction input-buffer word while
 /// retaining authenticated v8 decode and deterministic current re-encoding.
 /// v10 authenticates binding-independent projected-index expressions.
-const VERSION: u8 = 10;
+/// v11 authenticates symbolic source-owned requested affine views.
+const VERSION: u8 = 11;
 const LAST_OPAQUE_KEY_VERSION: u8 = 6;
 const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 // The executable envelope supports ordered outputs; the inspection-only
@@ -38,7 +39,8 @@ const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 /// distinct magic and identity domain from the released single-output
 /// executable artifact above.
 const MULTI_MAGIC: &[u8; 4] = b"RGSO";
-const MULTI_VERSION: u8 = 5;
+/// v6 mirrors the v11 symbolic requested-view sidecar while preserving v1-v5.
+const MULTI_VERSION: u8 = 6;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -308,6 +310,25 @@ fn write_payload_v9(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     write_requested_passthroughs(w, &c.requested_passthroughs)
 }
 
+#[cfg(test)]
+fn write_payload_v10(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_base(w, c, true, true, true)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema_v10(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    write_requested_passthroughs(w, &c.requested_passthroughs)
+}
+
 fn write_requested_passthroughs(
     w: &mut Writer,
     passthroughs: &[crate::RequestedPassthrough],
@@ -499,6 +520,43 @@ fn write_scheduled_outputs_payload_v4(
     write_requested_passthroughs(w, &c.requested_passthroughs)
 }
 
+#[cfg(test)]
+fn write_scheduled_outputs_payload_v5(
+    w: &mut Writer,
+    c: &CapturedSchedule,
+) -> Result<(), ArtifactError> {
+    write_len(w, c.items.len(), MAX_ITEMS)?;
+    for item in &c.items {
+        write_scheduled_outputs_item(w, item)?;
+    }
+    write_len(w, c.inputs.len(), MAX_BINDINGS)?;
+    for input in &c.inputs {
+        w.string(&input.name)?;
+        w.u64(input.node.index() as u64)?;
+        write_desc_inner(w, &input.desc, false)?;
+    }
+    write_len(w, c.constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.constants {
+        w.u64(*id)?;
+        tensor_artifact::encode_into(w, value)?;
+    }
+    write_u64s(w, &c.requested)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema_v10(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    write_requested_passthroughs(w, &c.requested_passthroughs)
+}
+
 fn read_payload(
     r: &mut Reader<'_>,
     identity: u64,
@@ -536,6 +594,7 @@ fn read_payload(
             version,
             version <= 8,
             version >= 10,
+            version >= 11,
         )?)
     } else {
         None
@@ -608,7 +667,13 @@ fn read_scheduled_outputs_payload(
     }
     let requested = read_u64s(r)?;
     let symbolic = if r.bool()? {
-        Some(read_symbolic_schema(r, 4, version <= 3, version >= 5)?)
+        Some(read_symbolic_schema(
+            r,
+            4,
+            version <= 3,
+            version >= 5,
+            version >= 6,
+        )?)
     } else {
         None
     };
@@ -1359,11 +1424,6 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
         .chain(passthrough_requested.iter().copied())
         .collect::<BTreeSet<_>>();
     validate_requested_ids(&c.requested, &replay_values)?;
-    if !c.requested_passthroughs.is_empty()
-        && (c.symbolic.is_some() || c.specialized_from.is_some())
-    {
-        return Err(ArtifactError::Format("symbolic requested passthrough"));
-    }
     if c.symbolic.is_some() && c.specialized_from.is_some() {
         return Err(ArtifactError::Format("symbolic specialization state"));
     }
@@ -1593,37 +1653,38 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
 
 fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
     write_symbolic_schema_core(w, schema, None)?;
-    write_symbolic_schema_sidecars(w, schema, true)
+    write_symbolic_schema_sidecars(w, schema, true, true)
 }
 
 #[cfg(test)]
 fn write_symbolic_schema_v8(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
     write_symbolic_schema_core(w, schema, Some(0xfeed_face_dead_beef))?;
-    write_symbolic_schema_sidecars(w, schema, false)
+    write_symbolic_schema_sidecars(w, schema, false, false)
 }
 
 #[cfg(test)]
 fn write_symbolic_schema_v9(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
     write_symbolic_schema_core(w, schema, None)?;
-    write_symbolic_schema_sidecars(w, schema, false)
+    write_symbolic_schema_sidecars(w, schema, false, false)
+}
+
+#[cfg(test)]
+fn write_symbolic_schema_v10(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
+    write_symbolic_schema_core(w, schema, None)?;
+    write_symbolic_schema_sidecars(w, schema, true, false)
 }
 
 fn write_symbolic_schema_sidecars(
     w: &mut Writer,
     schema: &SymbolicSchema,
     projected: bool,
+    requested_views: bool,
 ) -> Result<(), ArtifactError> {
     write_len(w, schema.views.len(), MAX_BINDINGS)?;
     for ((item, buffer), view) in &schema.views {
         w.u64(*item)?;
         w.u64(*buffer)?;
-        write_symbolic_shape(w, &view.source_shape)?;
-        write_symbolic_shape(w, &view.logical_shape)?;
-        write_len(w, view.strides.len(), MAX_BINDINGS)?;
-        for stride in &view.strides {
-            write_symbolic(w, stride, 0)?;
-        }
-        write_symbolic(w, &view.offset, 0)?;
+        write_symbolic_view_map(w, view)?;
     }
     write_len(w, schema.splat_constants.len(), MAX_BINDINGS)?;
     for buffer in &schema.splat_constants {
@@ -1640,7 +1701,24 @@ fn write_symbolic_schema_sidecars(
             write_projected_expr(w, &map.expression, 0, &mut nodes)?;
         }
     }
+    if requested_views {
+        write_len(w, schema.requested_views.len(), MAX_BINDINGS)?;
+        for (requested, view) in &schema.requested_views {
+            w.u64(*requested)?;
+            write_symbolic_view_map(w, view)?;
+        }
+    }
     Ok(())
+}
+
+fn write_symbolic_view_map(w: &mut Writer, view: &SymbolicViewMap) -> Result<(), ArtifactError> {
+    write_symbolic_shape(w, &view.source_shape)?;
+    write_symbolic_shape(w, &view.logical_shape)?;
+    write_len(w, view.strides.len(), MAX_BINDINGS)?;
+    for stride in &view.strides {
+        write_symbolic(w, stride, 0)?;
+    }
+    write_symbolic(w, &view.offset, 0)
 }
 
 #[cfg(test)]
@@ -1733,6 +1811,7 @@ fn read_symbolic_schema(
     version: u8,
     legacy_reduction_buffer: bool,
     projected_sidecar: bool,
+    requested_view_sidecar: bool,
 ) -> Result<SymbolicSchema, ArtifactError> {
     let count = r.count(MAX_BINDINGS)?;
     let mut parameters = Vec::with_capacity(count);
@@ -1805,6 +1884,7 @@ fn read_symbolic_schema(
     let mut views = BTreeMap::new();
     let mut splat_constants = BTreeSet::new();
     let mut projected = BTreeMap::new();
+    let mut requested_views = BTreeMap::new();
     if version >= 3 {
         let count = r.count(MAX_BINDINGS)?;
         let mut previous = None;
@@ -1814,18 +1894,7 @@ fn read_symbolic_schema(
                 return Err(ArtifactError::Format("symbolic view order"));
             }
             previous = Some(key);
-            let source_shape = read_symbolic_shape(r)?;
-            let logical_shape = read_symbolic_shape(r)?;
-            let stride_count = r.count(MAX_BINDINGS)?;
-            let strides = (0..stride_count)
-                .map(|_| read_symbolic(r, 0))
-                .collect::<Result<Vec<_>, _>>()?;
-            let view = SymbolicViewMap {
-                source_shape,
-                logical_shape,
-                strides,
-                offset: read_symbolic(r, 0)?,
-            };
+            let view = read_symbolic_view_map(r)?;
             if views.insert(key, view).is_some() {
                 return Err(ArtifactError::Format("duplicate symbolic view"));
             }
@@ -1861,6 +1930,21 @@ fn read_symbolic_schema(
             }
         }
     }
+    if requested_view_sidecar {
+        let count = r.count(MAX_BINDINGS)?;
+        let mut previous = None;
+        for _ in 0..count {
+            let requested = r.u64()?;
+            if previous.is_some_and(|previous| requested <= previous) {
+                return Err(ArtifactError::Format("symbolic requested-view order"));
+            }
+            previous = Some(requested);
+            let view = read_symbolic_view_map(r)?;
+            if requested_views.insert(requested, view).is_some() {
+                return Err(ArtifactError::Format("duplicate symbolic requested view"));
+            }
+        }
+    }
     Ok(SymbolicSchema {
         parameters,
         template_values,
@@ -1868,8 +1952,24 @@ fn read_symbolic_schema(
         buffer_shapes,
         item_domains,
         views,
+        requested_views,
         projected,
         splat_constants,
+    })
+}
+
+fn read_symbolic_view_map(r: &mut Reader<'_>) -> Result<SymbolicViewMap, ArtifactError> {
+    let source_shape = read_symbolic_shape(r)?;
+    let logical_shape = read_symbolic_shape(r)?;
+    let stride_count = r.count(MAX_BINDINGS)?;
+    let strides = (0..stride_count)
+        .map(|_| read_symbolic(r, 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SymbolicViewMap {
+        source_shape,
+        logical_shape,
+        strides,
+        offset: read_symbolic(r, 0)?,
     })
 }
 
@@ -2122,6 +2222,20 @@ mod tests {
         writer.out
     }
 
+    fn legacy_scheduled_outputs_v5(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_scheduled_outputs_payload_v5(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MULTI_MAGIC).unwrap();
+        writer.u8(5).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
     fn legacy_v1(capture: &CapturedSchedule) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
@@ -2190,6 +2304,20 @@ mod tests {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
         writer.u8(9).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
+    fn legacy_v10(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_payload_v10(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(10).unwrap();
         writer.u64(identity).unwrap();
         writer.bytes(&payload.out).unwrap();
         let sum = checksum(&writer.out);
@@ -2583,6 +2711,26 @@ mod tests {
     }
 
     #[test]
+    fn historical_v10_symbolic_schema_decodes_empty_requested_views_and_reencodes_v11() {
+        let capture = symbolic_fixture();
+        let historical = legacy_v10(&capture);
+        assert_eq!(historical[4], 10);
+        let upgraded = decode(&historical).unwrap();
+        assert!(
+            upgraded
+                .symbolic
+                .as_ref()
+                .unwrap()
+                .requested_views
+                .is_empty()
+        );
+        assert_eq!(upgraded.symbolic, capture.symbolic);
+        let current = encode(&upgraded).unwrap();
+        assert_eq!(current[4], VERSION);
+        assert_eq!(encode(&decode(&current).unwrap()).unwrap(), current);
+    }
+
+    #[test]
     fn historical_rgso_v3_symbolic_reduction_rekeys_and_reencodes_current() {
         let capture = symbolic_reduction_fixture();
         let historical = legacy_scheduled_outputs_v3(&capture);
@@ -2612,6 +2760,28 @@ mod tests {
         assert_eq!(historical[4], 4);
         let upgraded = decode_scheduled_outputs(&historical).unwrap();
         assert_eq!(upgraded.symbolic, capture.symbolic);
+        let current = encode_scheduled_outputs(&upgraded).unwrap();
+        assert_eq!(current[4], MULTI_VERSION);
+        assert_eq!(
+            encode_scheduled_outputs(&decode_scheduled_outputs(&current).unwrap()).unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn historical_rgso_v5_symbolic_schema_decodes_empty_requested_views_and_reencodes_v6() {
+        let capture = symbolic_fixture();
+        let historical = legacy_scheduled_outputs_v5(&capture);
+        assert_eq!(historical[4], 5);
+        let upgraded = decode_scheduled_outputs(&historical).unwrap();
+        assert!(
+            upgraded
+                .symbolic
+                .as_ref()
+                .unwrap()
+                .requested_views
+                .is_empty()
+        );
         let current = encode_scheduled_outputs(&upgraded).unwrap();
         assert_eq!(current[4], MULTI_VERSION);
         assert_eq!(

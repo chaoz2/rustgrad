@@ -1834,7 +1834,15 @@ backend-specific boundary. `StaticSymbolicProgram<B>` adds a sealed pure-plan,
 prepare, mutable-execute adapter over that projection. It stages exact input
 bytes through `CapturedStaticExecution` before planning and retains at most one
 last-successful concrete specialization keyed by the authenticated concrete
-capture identity. A miss is installed only after execution and final ordered
+capture identity. RGSA v11/RGSO v6 add one ordered symbolic-view sidecar for
+requested reshape, permute, expand, stable-shrink, and full-reverse chains
+whose physical source is an Input or Constant. Capture authenticates the map
+against the graph and template descriptor; specialization proves its bounds
+and emits the existing concrete `RequestedPassthrough`. The source remains the
+only storage owner, so alias-only CPU/CUDA invocations project exact raw lanes
+without a fake kernel, device allocation, or launch. Historical RGSA v10 and
+RGSO v5 decode with an empty requested-view map; computed requested aliases
+remain explicit materialization boundaries. A miss is installed only after execution and final ordered
 duplicate projection succeed; any cached execution failure evicts the entry.
 The first public adapter is `CudaSymbolicProgram`, which reuses
 `CudaGraphPrefixPlan`, `PreparedCudaGraphPrefix`, stable leases, and existing
@@ -1857,10 +1865,7 @@ model while keeping RustGrad's static topology and typed schedule proof
 explicit. The existing concurrent PTX cache may be program-owned or explicitly
 shared. No
 operation, UOp, schedule, artifact, or renderer identity changes, and symbolic
-OpenCL/Metal/WebGPU execution remains unclaimed. Directly requested symbolic
-Inputs project from their authenticated source ownership, but affine requested
-passthroughs remain rejected because the symbolic artifact has no view sidecar
-for them.
+OpenCL/Metal/WebGPU execution remains unclaimed.
 
 `StaticPositionMap` is the single crate-private geometry proof for the existing
 `ScatterPositions` graph adjoint and its `ScatterPositionsVjp` reverse read. It

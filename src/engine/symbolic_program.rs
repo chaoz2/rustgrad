@@ -2024,6 +2024,195 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_requested_affine_view_preserves_alias_geometry_and_raw_storage() {
+        let rows = SymbolicExpr::variable("rows", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 4], DType::F32);
+        let reshaped = graph.reshape(input, [2, 1, 4]).unwrap();
+        // Keep the fixed expansion distinct from the rows=2 template binding.
+        let expanded = graph.expand(reshaped, [2, 3, 4]).unwrap();
+        let permuted = graph.permute(expanded, [1, 0, 2]).unwrap();
+        let shrunk = graph.shrink(permuted, [(0, 1), (0, 2), (0, 4)]).unwrap();
+        let reversed = graph
+            .stride(
+                shrunk,
+                [
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                ],
+            )
+            .unwrap();
+        let schedule = crate::schedule_many(&graph, &[reversed, reversed]).unwrap();
+        assert!(schedule.items.is_empty());
+        assert_eq!(schedule.requested_passthroughs.len(), 1);
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[reversed, reversed],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![rows.into(), 4usize.into()]),
+            )])),
+            &BTreeMap::from([("rows".into(), 2)]),
+        )
+        .unwrap();
+        assert!(capture.items.is_empty());
+        assert_eq!(capture.symbolic.as_ref().unwrap().requested_views.len(), 1);
+        let bytes = capture.to_bytes().unwrap();
+        let capture = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(capture.to_bytes().unwrap(), bytes);
+
+        let variable = capture.symbolic_parameters()[0].variable().id();
+        let empty =
+            crate::engine::symbolic::specialize_capture(&capture, &[(variable, 0)]).unwrap();
+        let populated =
+            crate::engine::symbolic::specialize_capture(&capture, &[(variable, 1)]).unwrap();
+        assert_ne!(empty.identity, populated.identity);
+        assert_eq!(
+            empty.requested_passthroughs[0].desc.shape,
+            Shape::from([0, 4])
+        );
+        assert_eq!(
+            empty.requested_passthroughs[0]
+                .desc
+                .view
+                .as_ref()
+                .unwrap()
+                .logical_shape,
+            Shape::from([1, 0, 4])
+        );
+
+        let lanes = vec![
+            f32::from_bits(0x7fc0_1234),
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let result = CpuSymbolicProgram::new(capture.clone())
+            .unwrap()
+            .run(invocation(
+                [("rows", 1)],
+                BTreeMap::from([(
+                    "input".into(),
+                    TensorData::from_storage([1, 4], crate::Storage::F32(lanes)).unwrap(),
+                )]),
+            ))
+            .unwrap();
+        assert_eq!(result.outputs().len(), 2);
+        let expected = [
+            f32::NEG_INFINITY.to_bits(),
+            f32::INFINITY.to_bits(),
+            (-0.0f32).to_bits(),
+            0x7fc0_1234,
+        ];
+        for output in result.outputs() {
+            let crate::Storage::F32(actual) = output.storage() else {
+                panic!("requested view must retain F32 storage")
+            };
+            assert_eq!(
+                actual.iter().map(|lane| lane.to_bits()).collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        let empty_result = CpuSymbolicProgram::new(capture.clone())
+            .unwrap()
+            .run(invocation(
+                [("rows", 0)],
+                BTreeMap::from([(
+                    "input".into(),
+                    TensorData::from_storage([0, 4], crate::Storage::F32(vec![])).unwrap(),
+                )]),
+            ))
+            .unwrap();
+        assert_eq!(empty_result.outputs()[0].shape(), &Shape::from([1, 0, 4]));
+        assert!(empty_result.outputs()[0].to_le_bytes().unwrap().is_empty());
+
+        let mut missing = capture.clone();
+        missing.symbolic.as_mut().unwrap().requested_views.clear();
+        missing.identity = 0;
+        missing.identity = crate::schedule::artifact::identity(&missing).unwrap();
+        assert!(missing.to_bytes().is_err());
+
+        let mut tampered = capture;
+        tampered
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .requested_views
+            .values_mut()
+            .next()
+            .unwrap()
+            .offset = SymbolicExpr::constant(1);
+        tampered.identity = 0;
+        tampered.identity = crate::schedule::artifact::identity(&tampered).unwrap();
+        assert!(tampered.to_bytes().is_err());
+        assert!(CpuSymbolicProgram::new(tampered).is_err());
+    }
+
+    #[test]
+    fn symbolic_requested_constant_view_resizes_only_exact_splat_storage() {
+        let rows = SymbolicExpr::variable("rows", 0, 3).unwrap();
+        let mut graph = Graph::new();
+        let source = graph.constant(
+            TensorData::from_storage(
+                [2, 1],
+                crate::Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E4M3,
+                    vec![0x80; 2],
+                )),
+            )
+            .unwrap(),
+        );
+        // Keep the fixed expansion distinct from the rows=2 template binding.
+        let expanded = graph.expand(source, [2, 3]).unwrap();
+        let output = graph.permute(expanded, [1, 0]).unwrap();
+        let scalar_source = graph
+            .constant(TensorData::from_storage([1], crate::Storage::U16(vec![0x7e01])).unwrap());
+        let scalar = graph.reshape(scalar_source, Shape::new([])).unwrap();
+        let schedule = crate::schedule_many(&graph, &[output, scalar]).unwrap();
+        assert!(schedule.items.is_empty());
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output, scalar],
+            &SymbolicCaptureSpec::new(BTreeMap::new())
+                .with_constant_shape(source, SymbolicShape::new(vec![rows.into(), 1usize.into()])),
+            &BTreeMap::from([("rows".into(), 2)]),
+        )
+        .unwrap();
+        let outputs = CpuSymbolicProgram::new(capture)
+            .unwrap()
+            .run(invocation([("rows", 1)], BTreeMap::new()))
+            .unwrap()
+            .into_outputs();
+        let output = &outputs[0];
+        assert_eq!(output.shape(), &Shape::from([3, 1]));
+        assert_eq!(
+            output.storage(),
+            &crate::Storage::Float8(crate::Float8Storage::from_raw(
+                crate::Float8Format::E4M3,
+                vec![0x80; 3],
+            ))
+        );
+        assert_eq!(outputs[1].shape(), &Shape::new([]));
+        assert_eq!(outputs[1].storage(), &crate::Storage::U16(vec![0x7e01]));
+    }
+
+    #[test]
     fn computed_affine_view_keeps_its_logical_shape_before_consumer_broadcast() {
         let columns = SymbolicExpr::variable("columns", 0, 4).unwrap();
         let mut graph = Graph::new();
