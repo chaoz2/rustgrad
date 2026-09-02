@@ -1485,14 +1485,21 @@ store interpreter for pure elementwise graphs. Bindings clone `TensorData` at
 the execution boundary, so the UOp runtime cannot borrow or alias caller
 storage. The CPU backend remains the differential semantic oracle.
 
-`UOpNode` stores one typed `Operation`, its result type, and its sources. Each
+`UOpNode` stores one typed `Operation`, its result type, its sources, and an
+optional immutable `UOpTag`. Tags are a small canonical value algebra covering
+the checked-in compiler uses: text, signed integers, concrete `DType` values,
+and recursively composed tuples. They are rewrite metadata, not operation
+kinds; unsupported arbitrary Python objects have no Rust representation. Each
 `Operation` variant owns its payload, removing the former invalid cross-product
 of an independently stored kind and untyped argument. The enum is declared
 directly and is the sole in-memory operation taxonomy. DAG validation, rewrite
 purity, interpretation, schedules, and renderers match it explicitly where
 their semantic policies differ. Artifact encoding alone projects operations to
-a private wire opcode and payload; the existing numeric tags and version gates
-are unchanged and cannot leak back into the DAG.
+a private wire opcode and payload. Untagged DAGs retain their historical writer
+envelopes and schedule/cache identities. Standalone tagged DAGs use RGUA v22;
+every admitted pre-v22 artifact decodes with no tag metadata. Executable
+schedule identity rejects a tag until a rewrite explicitly removes it, so
+compilation cannot silently discard metadata or perturb historical cache keys.
 
 Eligible pure elementwise schedules run typed UPat rules bottom-up immediately
 after kernel lowering. The memoized walk preserves shared DAG nodes, revisits a
@@ -1518,15 +1525,17 @@ declared minimum and ignore only trailing sources, and repeated varargs apply on
 child pattern to every source, including an empty list. Non-capturing function
 pointers refine the complete optional `UType` and payload-bearing `Operation`;
 type and operation predicates compose with exact dtype constraints and do not
-create a second kind/argument taxonomy. Every alternative and permutation owns
+create a second kind/argument taxonomy. Exact tag and tag-set constraints test
+membership against the node's immutable tag before any source capture is
+published. Every alternative and permutation owns
 its candidate capture map, so a failed branch cannot leak a partial named
 capture. Named children keep structural-equality semantics across repeated
 matches, while a named parent exposes the complete variadic source list to a
 rewrite. Operation/type/source builders on an alternative are a deliberate outer
 intersection applied uniformly to every branch; an outer name captures the node
 only after its selected branch and source constraints succeed. These matcher-only
-capabilities do not change UOp nodes, artifact tags, schedule keys, or decoded
-historical DAGs.
+constraints retain priority, early-rejection, and convergence behavior; generic
+source rebuilding preserves a node tag.
 
 The rewrite driver prepares each rule once with direct-source early-rejection
 requirements. Exact, prefix, and permuted source constraints safely infer

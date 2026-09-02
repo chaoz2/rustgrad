@@ -39,6 +39,47 @@ impl UType {
         self.scalar == DType::Bool
     }
 }
+/// Canonical immutable metadata used by rewrite patterns without introducing
+/// another operation taxonomy.  The variants cover the tag values used by the
+/// checked-in tinygrad compiler rules; Python's arbitrary `Any` tags remain an
+/// explicit boundary.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum UOpTag {
+    Text(String),
+    Int(i64),
+    DType(DType),
+    Tuple(Vec<UOpTag>),
+}
+
+impl From<&str> for UOpTag {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_owned())
+    }
+}
+
+impl From<String> for UOpTag {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<i64> for UOpTag {
+    fn from(value: i64) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl From<DType> for UOpTag {
+    fn from(value: DType) -> Self {
+        Self::DType(value)
+    }
+}
+
+impl From<(i64, DType)> for UOpTag {
+    fn from((lane, dtype): (i64, DType)) -> Self {
+        Self::Tuple(vec![Self::Int(lane), Self::DType(dtype)])
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Unary {
     Neg,
@@ -595,16 +636,26 @@ struct UOpNode {
     operation: Operation,
     ty: Option<UType>,
     sources: Vec<UOp>,
+    tag: Option<UOpTag>,
 }
 /// Immutable and structurally hashable. Cloning preserves DAG sharing.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct UOp(Arc<UOpNode>);
 impl UOp {
     pub fn from_operation(operation: Operation, ty: Option<UType>, sources: Vec<UOp>) -> Self {
+        Self::from_parts(operation, ty, sources, None)
+    }
+    fn from_parts(
+        operation: Operation,
+        ty: Option<UType>,
+        sources: Vec<UOp>,
+        tag: Option<UOpTag>,
+    ) -> Self {
         Self(Arc::new(UOpNode {
             operation,
             ty,
             sources,
+            tag,
         }))
     }
     pub(crate) fn shares_node_with(&self, other: &Self) -> bool {
@@ -621,6 +672,30 @@ impl UOp {
     }
     pub fn sources(&self) -> &[UOp] {
         &self.0.sources
+    }
+    pub fn tag(&self) -> Option<&UOpTag> {
+        self.0.tag.as_ref()
+    }
+    /// Returns the same immutable operation with replacement rewrite metadata.
+    /// `None` is the source-aligned operation for removing a tag.
+    pub fn retag(&self, tag: Option<UOpTag>) -> Self {
+        if self.tag() == tag.as_ref() {
+            return self.clone();
+        }
+        Self::from_parts(
+            self.operation().clone(),
+            self.ty(),
+            self.sources().to_vec(),
+            tag,
+        )
+    }
+    fn replace_sources(&self, sources: Vec<UOp>) -> Self {
+        Self::from_parts(
+            self.operation().clone(),
+            self.ty(),
+            sources,
+            self.tag().cloned(),
+        )
     }
     pub fn constant(value: i64, ty: UType) -> Self {
         Self::from_operation(Operation::Const(LiteralValue::Int(value)), Some(ty), vec![])
@@ -891,6 +966,9 @@ impl fmt::Display for UOp {
                 write!(f, "{s}")?
             }
             write!(f, "]")?
+        }
+        if let Some(tag) = self.tag() {
+            write!(f, "@{tag:?}")?
         }
         Ok(())
     }
@@ -1346,6 +1424,7 @@ pub struct UPat {
     operation_predicate: Option<fn(&Operation) -> bool>,
     ty: Option<UType>,
     type_predicates: Vec<fn(Option<UType>) -> bool>,
+    tags: Option<BTreeSet<UOpTag>>,
     sources: Option<SourceConstraint>,
     name: Option<String>,
     custom_early_reject: Option<EarlyRejectPredicates>,
@@ -1358,6 +1437,7 @@ impl UPat {
             operation_predicate: None,
             ty: None,
             type_predicates: vec![],
+            tags: None,
             sources: None,
             name: None,
             custom_early_reject: None,
@@ -1399,6 +1479,20 @@ impl UPat {
     /// deterministic data and cannot retain mutable matching state.
     pub fn type_predicate(mut self, predicate: fn(Option<UType>) -> bool) -> Self {
         self.type_predicates.push(predicate);
+        self
+    }
+    /// Matches one exact immutable UOp tag.
+    pub fn tag(mut self, tag: impl Into<UOpTag>) -> Self {
+        self.tags = Some([tag.into()].into());
+        self
+    }
+    /// Matches membership in the declared set of exact immutable UOp tags.
+    /// An empty set deliberately matches no node.
+    pub fn tags<T>(mut self, tags: impl IntoIterator<Item = T>) -> Self
+    where
+        T: Into<UOpTag>,
+    {
+        self.tags = Some(tags.into_iter().map(Into::into).collect());
         self
     }
     pub fn sources(mut self, s: Vec<UPat>) -> Self {
@@ -1473,6 +1567,13 @@ impl UPat {
             .type_predicates
             .iter()
             .any(|predicate| !predicate(n.ty()))
+        {
+            return false;
+        }
+        if self
+            .tags
+            .as_ref()
+            .is_some_and(|tags| n.tag().is_none_or(|tag| !tags.contains(tag)))
         {
             return false;
         }
@@ -1675,6 +1776,7 @@ impl UPat {
                 .copied()
                 .zip(other.type_predicates.iter().copied())
                 .all(|(left, right)| same_type_predicate(left, right))
+            && self.tags == other.tags
             && match (&self.sources, &other.sources) {
                 (None, None) => true,
                 (Some(left), Some(right)) => same_sources(left, right),
@@ -1814,7 +1916,7 @@ pub fn rewrite(
                     .map(|source| go(source, r, w, m, active, t))
                     .collect::<Result<Vec<_>, _>>()?;
                 if sources.as_slice() != x.sources() {
-                    x = UOp::from_operation(x.operation().clone(), x.ty(), sources);
+                    x = x.replace_sources(sources);
                 }
             }
 
@@ -1856,7 +1958,7 @@ pub fn rewrite(
                     .map(|source| go(source, r, w, m, active, t))
                     .collect::<Result<Vec<_>, _>>()?;
                 if sources.as_slice() != x.sources() {
-                    x = UOp::from_operation(x.operation().clone(), x.ty(), sources);
+                    x = x.replace_sources(sources);
                 }
             }
 

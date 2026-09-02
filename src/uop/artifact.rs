@@ -2,7 +2,7 @@
 use super::{
     AddressSpace, AddressValue, AffineView, Binary, IndexValue, LiteralValue, MatmulValue,
     MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue, TensorGuardValue,
-    ThreefryValue, UOp, UType, Unary, VariableValue, ViewMap, graph_unary_type_is_valid,
+    ThreefryValue, UOp, UOpTag, UType, Unary, VariableValue, ViewMap, graph_unary_type_is_valid,
 };
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
@@ -21,9 +21,10 @@ const MAGIC: &[u8; 4] = b"RGUA";
 /// prefix-scan source/result buffer ABI and source dtype self-contained.
 /// v19 adds the dependency-bearing live packed-U64 Threefry plan; v20 adds
 /// the checked static-position movement payload; v21 authenticates a Buffer
-/// index whose second source is a checked projected integer address tree.
+/// index whose second source is a checked projected integer address tree. v22
+/// adds canonical rewrite tags to standalone UOp DAGs.
 /// v15 is retained as the first internal mixed-schedule envelope.
-const VERSION: u8 = 21;
+const VERSION: u8 = 22;
 const PREVIOUS_EFFECT_VERSION: u8 = 15;
 const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
@@ -32,6 +33,8 @@ const MAX_SOURCES: usize = 1 << 20;
 const MAX_COLLECTION: usize = 1 << 20;
 const MAX_STRING: usize = 1 << 20;
 const MAX_SYMBOLIC_DEPTH: usize = 256;
+const MAX_TAG_DEPTH: usize = 64;
+const MAX_TAG_VALUES: usize = 1 << 12;
 
 /// Private RGUA opcode vocabulary. It exists only while encoding or decoding
 /// stable wire tags and is never stored in a UOp node.
@@ -614,16 +617,19 @@ impl std::error::Error for ArtifactError {}
 
 /// Encodes one immutable UOp DAG. Node IDs are dense topological indices and
 /// repeated source IDs preserve shared subgraphs. Historical operation sets
-/// retain their released envelopes; only projected indices require v21.
+/// retain their released envelopes; projected indices require v21 and tagged
+/// DAGs require v22.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let nodes = root
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
-    let version = if nodes
+    let version = if nodes.iter().any(|node| node.tag().is_some()) {
+        VERSION
+    } else if nodes
         .iter()
         .any(crate::projected_index::ProjectedIndexPlan::is_projected)
     {
-        VERSION
+        21
     } else if nodes.iter().any(|node| {
         matches!(
             node.operation(),
@@ -652,6 +658,13 @@ pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactEr
     let nodes = root
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
+    // Tags are transient compiler metadata. A tagged executable kernel must be
+    // explicitly stripped before scheduling rather than changing durable cache
+    // identities or silently discarding metadata.
+    if nodes.iter().any(|node| node.tag().is_some()) {
+        root.validate().map_err(|_| ArtifactError::Format("uop"))?;
+        return Err(ArtifactError::Unsupported);
+    }
     let effects = nodes.iter().any(|node| {
         matches!(
             node.operation(),
@@ -720,6 +733,12 @@ fn encode_inner(root: &UOp, effects: bool, version: u8) -> Result<Vec<u8>, Artif
         write_kind(&mut w, &kind, effects)?;
         write_type(&mut w, node.ty())?;
         write_arg(&mut w, &arg, effects)?;
+        if version < VERSION && node.tag().is_some() {
+            return Err(ArtifactError::Format("tag version"));
+        }
+        if version >= VERSION {
+            write_tag(&mut w, node.tag())?;
+        }
         if node.sources().len() > MAX_SOURCES {
             return Err(ArtifactError::Format("source limit"));
         }
@@ -778,6 +797,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             | 18
             | 19
             | 20
+            | 21
             | VERSION
     ) {
         return Err(ArtifactError::Format("version"));
@@ -798,6 +818,11 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         let kind = read_kind(&mut r, version)?;
         let ty = read_type(&mut r)?;
         let arg = read_arg(&mut r, version)?;
+        let tag = if version >= VERSION {
+            read_tag(&mut r)?
+        } else {
+            None
+        };
         let source_count = r.count(MAX_SOURCES)?;
         let mut sources = Vec::with_capacity(source_count);
         for _ in 0..source_count {
@@ -815,7 +840,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION,
         )?;
         let operation = operation_from_wire(kind, arg)?;
-        nodes.push(UOp::from_operation(operation, ty, sources));
+        nodes.push(UOp::from_parts(operation, ty, sources, tag));
     }
     if !r.done() {
         return Err(ArtifactError::Format("trailing bytes"));
@@ -1254,6 +1279,82 @@ fn read_type(r: &mut Reader<'_>) -> Result<Option<UType>, ArtifactError> {
             }
         }
         _ => Err(ArtifactError::Format("type tag")),
+    }
+}
+
+fn write_tag(w: &mut Writer, tag: Option<&UOpTag>) -> Result<(), ArtifactError> {
+    w.bool(tag.is_some())?;
+    if let Some(tag) = tag {
+        let mut remaining = MAX_TAG_VALUES;
+        write_tag_value(w, tag, 0, &mut remaining)?;
+    }
+    Ok(())
+}
+
+fn write_tag_value(
+    w: &mut Writer,
+    tag: &UOpTag,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<(), ArtifactError> {
+    if depth >= MAX_TAG_DEPTH || *remaining == 0 {
+        return Err(ArtifactError::Format("tag limit"));
+    }
+    *remaining -= 1;
+    match tag {
+        UOpTag::Text(value) => {
+            w.u8(0)?;
+            w.string(value)
+        }
+        UOpTag::Int(value) => {
+            w.u8(1)?;
+            w.i64(*value)
+        }
+        UOpTag::DType(value) => {
+            w.u8(2)?;
+            w.u8(dtype_tag(*value))
+        }
+        UOpTag::Tuple(values) => {
+            w.u8(3)?;
+            w.u32_len(values.len())?;
+            for value in values {
+                write_tag_value(w, value, depth + 1, remaining)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn read_tag(r: &mut Reader<'_>) -> Result<Option<UOpTag>, ArtifactError> {
+    if !r.bool()? {
+        return Ok(None);
+    }
+    let mut remaining = MAX_TAG_VALUES;
+    read_tag_value(r, 0, &mut remaining).map(Some)
+}
+
+fn read_tag_value(
+    r: &mut Reader<'_>,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<UOpTag, ArtifactError> {
+    if depth >= MAX_TAG_DEPTH || *remaining == 0 {
+        return Err(ArtifactError::Format("tag limit"));
+    }
+    *remaining -= 1;
+    match r.u8()? {
+        0 => Ok(UOpTag::Text(r.string()?)),
+        1 => Ok(UOpTag::Int(r.i64()?)),
+        2 => Ok(UOpTag::DType(dtype(r.u8()?)?)),
+        3 => {
+            let count = r.count(MAX_TAG_VALUES)?;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(read_tag_value(r, depth + 1, remaining)?);
+            }
+            Ok(UOpTag::Tuple(values))
+        }
+        _ => Err(ArtifactError::Format("tag kind")),
     }
 }
 
@@ -3167,7 +3268,9 @@ mod tests {
     fn header(count: u32, root: u32) -> Writer {
         let mut w = Writer::new();
         w.bytes(MAGIC).unwrap();
-        w.u8(VERSION).unwrap();
+        // Existing malformed-fixture helpers exercise the released v21 node
+        // layout, which has no per-node tag field.
+        w.u8(21).unwrap();
         w.u32(count).unwrap();
         w.u32(root).unwrap();
         w
@@ -3193,6 +3296,74 @@ mod tests {
             }
         }
         finish(writer)
+    }
+
+    #[test]
+    fn canonical_uop_tags_use_v22_without_changing_historical_identities() {
+        let tuple = UOpTag::Tuple(vec![UOpTag::Int(1), UOpTag::DType(DType::I64)]);
+        let source =
+            UOp::constant(7, UType::scalar(DType::I64)).retag(Some(UOpTag::Text("lane".into())));
+        let tagged = UOp::binary(
+            Binary::Add,
+            source,
+            UOp::constant(1, UType::scalar(DType::I64)),
+        )
+        .retag(Some(tuple));
+        let bytes = encode(&tagged).unwrap();
+        assert_eq!(bytes[4], VERSION);
+        assert_eq!(decode(&bytes).unwrap(), tagged);
+        assert_eq!(
+            encode_schedule_identity(&tagged),
+            Err(ArtifactError::Unsupported)
+        );
+        assert_eq!(
+            encode_inner(&tagged, false, 21),
+            Err(ArtifactError::Format("tag version"))
+        );
+
+        let untagged = UOp::constant(7, UType::scalar(DType::I64));
+        let canonical = encode(&untagged).unwrap();
+        assert_eq!(canonical[4], 19);
+        assert_eq!(encode_schedule_identity(&untagged).unwrap()[4], 18);
+        for version in (2..=13).chain(15..=21) {
+            let mut historical = canonical.clone();
+            historical[4] = version;
+            let body_len = historical.len() - 4;
+            let sum = checksum(&historical[..body_len]);
+            historical[body_len..].copy_from_slice(&sum.to_le_bytes());
+            let decoded = decode(&historical).unwrap();
+            assert_eq!(decoded.tag(), None, "v{version}");
+            assert_eq!(encode(&decoded).unwrap(), canonical, "v{version}");
+        }
+    }
+
+    #[test]
+    fn v22_tag_payloads_are_bounded_and_authenticated() {
+        let mut deep = UOpTag::Int(0);
+        for _ in 0..MAX_TAG_DEPTH {
+            deep = UOpTag::Tuple(vec![deep]);
+        }
+        let root = UOp::constant(0, UType::scalar(DType::I64)).retag(Some(deep));
+        assert_eq!(encode(&root), Err(ArtifactError::Format("tag limit")));
+
+        let root = UOp::constant(0, UType::scalar(DType::I64));
+        let (kind, arg) = operation_to_wire(root.operation());
+        let mut malformed = Writer::new();
+        malformed.bytes(MAGIC).unwrap();
+        malformed.u8(VERSION).unwrap();
+        malformed.u32(1).unwrap();
+        malformed.u32(0).unwrap();
+        malformed.u32(0).unwrap();
+        write_kind(&mut malformed, &kind, false).unwrap();
+        write_type(&mut malformed, root.ty()).unwrap();
+        write_arg(&mut malformed, &arg, false).unwrap();
+        malformed.bool(true).unwrap();
+        malformed.u8(0xff).unwrap();
+        malformed.u32(0).unwrap();
+        assert_eq!(
+            decode(&finish(malformed)),
+            Err(ArtifactError::Format("tag kind"))
+        );
     }
 
     #[test]
