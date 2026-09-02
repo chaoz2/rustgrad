@@ -1777,6 +1777,29 @@ and any operation outside a renderer's existing static subset still reject
 before device work. RGSA, UOp, schedule, and renderer/cache identities are
 unchanged.
 
+`AuthenticatedSymbolicBody` is the shared immutable schema/capture owner used by
+CPU and static-device symbolic programs. It authenticates the body once, then
+each invocation validates canonical I64 bindings and guards, specializes the
+ordinary concrete capture, and checks all named input descriptors before a
+backend-specific boundary. `StaticSymbolicProgram<B>` adds a sealed pure-plan,
+prepare, mutable-execute adapter over that projection. It stages exact input
+bytes through `CapturedStaticExecution` before planning and retains at most one
+last-successful concrete specialization keyed by the authenticated concrete
+capture identity. A miss is installed only after execution and final ordered
+duplicate projection succeed; any cached execution failure evicts the entry.
+The first public adapter is `CudaSymbolicProgram`, which reuses
+`CudaGraphPrefixPlan`, `PreparedCudaGraphPrefix`, stable leases, and existing
+fence/poison/quarantine behavior. It does not update CUDA graph node parameters
+across bindings: a different successful nonzero-work binding prepares a new
+concrete graph, while a successful zero-work binding caches a resource-free
+specialization. The existing concurrent PTX cache may be program-owned or
+explicitly shared. No
+operation, UOp, schedule, artifact, or renderer identity changes, and symbolic
+OpenCL/Metal/WebGPU execution remains unclaimed. Directly requested symbolic
+Inputs project from their authenticated source ownership, but affine requested
+passthroughs remain rejected because the symbolic artifact has no view sidecar
+for them.
+
 `StaticPositionMap` is the single crate-private geometry proof for the existing
 `ScatterPositions` graph adjoint and its `ScatterPositionsVjp` reverse read. It
 validates rank, checked byte geometry, nonzero steps and both endpoints in

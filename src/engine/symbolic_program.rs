@@ -15,16 +15,16 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-/// One owned invocation of a [`CpuSymbolicProgram`]. Both namespaces are
+/// One owned invocation of a bounded symbolic program. Both namespaces are
 /// intentionally explicit: tensor names bind captured external storage, while
 /// symbolic names bind canonical checked I64 shape parameters.
 #[derive(Clone, Debug, Default)]
-pub struct CpuSymbolicInvocation {
+pub struct SymbolicInvocation {
     symbols: BTreeMap<String, i64>,
     inputs: BTreeMap<String, TensorData>,
 }
 
-impl CpuSymbolicInvocation {
+impl SymbolicInvocation {
     pub fn new() -> Self {
         Self::default()
     }
@@ -45,6 +45,101 @@ impl CpuSymbolicInvocation {
 
     pub fn inputs(&self) -> &BTreeMap<String, TensorData> {
         &self.inputs
+    }
+}
+
+/// Backward-compatible CPU spelling for the shared symbolic invocation ABI.
+pub type CpuSymbolicInvocation = SymbolicInvocation;
+
+/// Authenticated immutable symbolic body shared by CPU and static-device
+/// execution. Backend-specific rendering and preparation happen only after
+/// [`Self::bind`] has validated the complete invocation.
+#[derive(Clone)]
+pub(crate) struct AuthenticatedSymbolicBody {
+    capture: Arc<CapturedSchedule>,
+    output_order: Vec<usize>,
+}
+
+pub(crate) struct AuthenticatedSymbolicInvocation {
+    pub(crate) concrete: CapturedSchedule,
+    pub(crate) canonical: Vec<(u64, i64)>,
+    pub(crate) inputs: BTreeMap<String, TensorData>,
+}
+
+impl AuthenticatedSymbolicBody {
+    pub(crate) fn new(
+        capture: CapturedSchedule,
+        output_order: Vec<usize>,
+        diagnostic_name: &str,
+    ) -> Result<Self, ReplayError> {
+        crate::schedule::artifact::validate_capture(&capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        if let Some(position) = output_order
+            .iter()
+            .find(|position| **position >= capture.requested.len())
+        {
+            return Err(ReplayError::Descriptor(format!(
+                "{diagnostic_name} output position {position} is absent"
+            )));
+        }
+        capture.symbolic.as_ref().ok_or_else(|| {
+            ReplayError::Symbolic(format!(
+                "{diagnostic_name} program requires a symbolic capture"
+            ))
+        })?;
+        if capture.items.iter().any(|item| !item.outputs.is_single()) {
+            return Err(ReplayError::Unsupported(format!(
+                "{diagnostic_name} program requires single-output schedule items"
+            )));
+        }
+        if capture.items.iter().any(|item| {
+            item.boundary.is_some()
+                || item.is_effect()
+                || matches!(item.kernel.operation(), crate::Operation::TensorGuard(_))
+        }) {
+            return Err(ReplayError::Unsupported(format!(
+                "{diagnostic_name} program requires an effect-free pure value schedule"
+            )));
+        }
+        if !capture.quantized_constants.is_empty() {
+            return Err(ReplayError::Unsupported(format!(
+                "{diagnostic_name} program does not own packed resources"
+            )));
+        }
+        Ok(Self {
+            capture: Arc::new(capture),
+            output_order,
+        })
+    }
+
+    pub(crate) fn capture(&self) -> &CapturedSchedule {
+        &self.capture
+    }
+
+    pub(crate) fn schema(&self) -> &crate::engine::symbolic::SymbolicSchema {
+        self.capture
+            .symbolic
+            .as_ref()
+            .expect("authenticated symbolic body")
+    }
+
+    pub(crate) fn output_order(&self) -> &[usize] {
+        &self.output_order
+    }
+
+    pub(crate) fn bind(
+        &self,
+        invocation: SymbolicInvocation,
+    ) -> Result<AuthenticatedSymbolicInvocation, ReplayError> {
+        let canonical = self.schema().canonical_bindings(&invocation.symbols)?;
+        let concrete =
+            super::symbolic::specialize_authenticated_capture(&self.capture, &canonical)?;
+        validate_inputs(&concrete, &invocation.inputs)?;
+        Ok(AuthenticatedSymbolicInvocation {
+            concrete,
+            canonical,
+            inputs: invocation.inputs,
+        })
     }
 }
 
@@ -120,8 +215,7 @@ struct PreparedProgram {
 /// Construction authenticates and renders the complete pure schedule without
 /// compiling or allocating backend resources.
 pub struct CpuSymbolicProgram {
-    capture: Arc<CapturedSchedule>,
-    output_order: Vec<usize>,
+    body: AuthenticatedSymbolicBody,
     rendered: Vec<crate::RenderedC>,
     prepared: Mutex<Option<Arc<PreparedProgram>>>,
     compile_count: AtomicUsize,
@@ -140,38 +234,9 @@ impl CpuSymbolicProgram {
         capture: CapturedSchedule,
         output_order: Vec<usize>,
     ) -> Result<Self, ReplayError> {
-        crate::schedule::artifact::validate_capture(&capture)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        if let Some(position) = output_order
-            .iter()
-            .find(|position| **position >= capture.requested.len())
-        {
-            return Err(ReplayError::Descriptor(format!(
-                "CPU symbolic output position {position} is absent"
-            )));
-        }
-        let schema = capture.symbolic.as_ref().ok_or_else(|| {
-            ReplayError::Symbolic("CPU symbolic program requires a symbolic capture".into())
-        })?;
-        if capture.items.iter().any(|item| !item.outputs.is_single()) {
-            return Err(ReplayError::Unsupported(
-                "CPU symbolic program requires single-output schedule items".into(),
-            ));
-        }
-        if capture.items.iter().any(|item| {
-            item.boundary.is_some()
-                || item.is_effect()
-                || matches!(item.kernel.operation(), crate::Operation::TensorGuard(_))
-        }) {
-            return Err(ReplayError::Unsupported(
-                "CPU symbolic program requires an effect-free pure value schedule".into(),
-            ));
-        }
-        if !capture.quantized_constants.is_empty() {
-            return Err(ReplayError::Unsupported(
-                "CPU symbolic program does not own packed resources".into(),
-            ));
-        }
+        let body = AuthenticatedSymbolicBody::new(capture, output_order, "CPU symbolic")?;
+        let capture = body.capture();
+        let schema = body.schema();
         let rendered = capture
             .items
             .iter()
@@ -180,10 +245,9 @@ impl CpuSymbolicProgram {
                     .map_err(|error| ReplayError::Unsupported(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        preflight_runtime_abis(&capture, &rendered, schema.parameters.len())?;
+        preflight_runtime_abis(capture, &rendered, schema.parameters.len())?;
         Ok(Self {
-            capture: Arc::new(capture),
-            output_order,
+            body,
             rendered,
             prepared: Mutex::new(None),
             compile_count: AtomicUsize::new(0),
@@ -191,7 +255,7 @@ impl CpuSymbolicProgram {
     }
 
     pub fn body_identity(&self) -> u64 {
-        self.capture.identity
+        self.body.capture().identity
     }
 
     pub fn compile_count(&self) -> usize {
@@ -199,50 +263,39 @@ impl CpuSymbolicProgram {
     }
 
     pub fn inputs(&self) -> &[crate::ReplayInput] {
-        &self.capture.inputs
+        &self.body.capture().inputs
     }
 
     pub fn parameters(&self) -> impl ExactSizeIterator<Item = &crate::SymbolicParameter> {
-        self.capture
-            .symbolic
-            .as_ref()
-            .expect("validated symbolic program")
-            .parameters
-            .iter()
+        self.body.schema().parameters().iter()
     }
 
     pub fn output_count(&self) -> usize {
-        self.output_order.len()
+        self.body.output_order().len()
     }
 
     pub fn output_order(&self) -> &[usize] {
-        &self.output_order
+        self.body.output_order()
     }
 
     pub fn run(&self, invocation: CpuSymbolicInvocation) -> Result<CpuSymbolicResult, ReplayError> {
-        let schema = self
-            .capture
-            .symbolic
-            .as_ref()
-            .expect("validated symbolic program");
+        let schema = self.body.schema();
         // The exact order is observable: parameter namespace/range/guards,
         // concrete specialization, external descriptors, memory planning,
         // compilation publication, then private execution.
-        let canonical = schema.canonical_bindings(&invocation.symbols)?;
-        let concrete =
-            super::symbolic::specialize_authenticated_capture(&self.capture, &canonical)?;
-        validate_inputs(&concrete, &invocation.inputs)?;
-        let memory = preflight_memory(&concrete)?;
-        preflight_runtime_abis(&concrete, &self.rendered, schema.parameters.len())?;
+        let bound = self.body.bind(invocation)?;
+        let memory = preflight_memory(&bound.concrete)?;
+        preflight_runtime_abis(&bound.concrete, &self.rendered, schema.parameters.len())?;
         let (prepared, compiled_now) = self.prepare()?;
-        let symbols = canonical
+        let symbols = bound
+            .canonical
             .iter()
             .map(|(_, value)| *value)
             .collect::<Vec<_>>();
         let execution = execute(
-            &concrete,
-            &self.output_order,
-            &invocation.inputs,
+            &bound.concrete,
+            self.body.output_order(),
+            &bound.inputs,
             &prepared,
             &symbols,
             &memory,
@@ -250,8 +303,8 @@ impl CpuSymbolicProgram {
         Ok(CpuSymbolicResult {
             outputs: execution.outputs,
             trace: CpuSymbolicTrace {
-                body_identity: self.capture.identity,
-                bindings: canonical,
+                body_identity: self.body.capture().identity,
+                bindings: bound.canonical,
                 compiled_now,
                 native_cache_keys: prepared.cache_keys.clone(),
                 peak_temporary_allocations: execution.peak_temporary_allocations,
