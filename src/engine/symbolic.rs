@@ -1843,7 +1843,9 @@ pub(crate) fn specialize_kernel(
             })
             .collect::<Result<Vec<UOp>, _>>()?;
         let operation = match node.operation() {
-            Operation::Index(IndexValue::Buffer { buffer, .. }) => {
+            Operation::Index(IndexValue::Buffer {
+                buffer, addressing, ..
+            }) => {
                 let input_shape = schema.bind_shape(*buffer, environment)?;
                 let output_shape = if let Some((reduction_input, _, _)) = &domain.reduction {
                     if *buffer == output_buffer {
@@ -1861,6 +1863,7 @@ pub(crate) fn specialize_kernel(
                         .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
                     input_shape,
                     output_shape,
+                    addressing: *addressing,
                 })
             }
             Operation::Index(IndexValue::View { buffer, .. }) => {

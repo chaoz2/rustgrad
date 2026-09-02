@@ -20,6 +20,12 @@ pub struct AddressValue {
     pub element: UType,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum IndexAddressing {
+    Broadcast,
+    Projected,
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IndexValue {
     Buffer {
@@ -27,6 +33,7 @@ pub enum IndexValue {
         elements: usize,
         input_shape: Shape,
         output_shape: Shape,
+        addressing: IndexAddressing,
     },
     View {
         buffer: u64,

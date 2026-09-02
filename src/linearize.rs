@@ -853,12 +853,14 @@ impl LinearKernel {
                 indexed_output,
                 offset,
                 contiguous,
+                projected,
             ) = match node.operation() {
                 Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements,
                     input_shape,
                     output_shape,
+                    addressing,
                 }) => (
                     *buffer,
                     *elements,
@@ -867,6 +869,7 @@ impl LinearKernel {
                     output_shape.clone(),
                     0usize,
                     true,
+                    *addressing == crate::IndexAddressing::Projected,
                 ),
                 Operation::Index(IndexValue::View {
                     buffer,
@@ -892,6 +895,7 @@ impl LinearKernel {
                         output_shape.clone(),
                         usize::try_from(view.offset).map_err(|_| LinearizeError::Overflow)?,
                         contiguous,
+                        false,
                     )
                 }
                 _ => continue,
@@ -901,6 +905,10 @@ impl LinearKernel {
                 .ok_or(LinearizeError::Overflow)?;
             let access = if buffer == output_buffer {
                 LinearAccess::ContiguousVector
+            } else if projected {
+                enabled = false;
+                reason = "projected index requires scalar address evaluation".into();
+                LinearAccess::ScalarOnly(reason.clone())
             } else if physical_count == 1 {
                 LinearAccess::ScalarSplat
             } else if logical_count == 1
@@ -1453,6 +1461,7 @@ mod tests {
                 elements: 1,
                 input_shape: Shape::from([1]),
                 output_shape: Shape::from([1]),
+                addressing: crate::IndexAddressing::Broadcast,
             }),
             Some(f32_type),
             vec![address, range.clone()],
@@ -1471,6 +1480,61 @@ mod tests {
         ])
     }
 
+    fn projected_scalar_expand_kernel() -> UOp {
+        let f32_type = UType::scalar(DType::F32);
+        let i64_type = UType::scalar(DType::I64);
+        let input_address = UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
+                space: AddressSpace::Global,
+                name: "b0".into(),
+                element: f32_type,
+            }),
+            Some(f32_type),
+            vec![],
+        );
+        let projected = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
+                buffer: 0,
+                elements: 1,
+                input_shape: Shape::from([1]),
+                output_shape: Shape::from([4]),
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(f32_type),
+            vec![input_address, UOp::constant(0, i64_type)],
+        );
+        let load = UOp::from_operation(Operation::Load, Some(f32_type), vec![projected]);
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(i64_type),
+            vec![UOp::constant(4, i64_type)],
+        );
+        let output_address = UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
+                space: AddressSpace::Global,
+                name: "b1".into(),
+                element: f32_type,
+            }),
+            Some(f32_type),
+            vec![],
+        );
+        let output = UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
+                buffer: 1,
+                elements: 4,
+                input_shape: Shape::from([4]),
+                output_shape: Shape::from([4]),
+                addressing: crate::IndexAddressing::Broadcast,
+            }),
+            Some(f32_type),
+            vec![output_address, range.clone()],
+        );
+        UOp::sink(vec![
+            UOp::from_operation(Operation::Store, None, vec![output, load]),
+            UOp::from_operation(Operation::EndRange, None, vec![range]),
+        ])
+    }
+
     #[test]
     fn rejects_invalid_source_uop_before_linearization() {
         let valid = scalar_copy_kernel(AddressSpace::Global);
@@ -1483,6 +1547,31 @@ mod tests {
         assert!(matches!(
             LinearKernel::from_uop(&invalid),
             Err(LinearizeError::Invalid(reason)) if reason.contains("InvalidArgument")
+        ));
+    }
+
+    #[test]
+    fn projected_scalar_expand_stays_outside_portable_lane_plans() {
+        let source = projected_scalar_expand_kernel();
+        source.validate().unwrap();
+        let linear = LinearKernel::from_uop(&source).unwrap();
+        assert!(!linear.enabled);
+        assert!(linear.reason.contains("projected index"));
+        assert!(matches!(
+            &linear
+                .buffers
+                .iter()
+                .find(|buffer| buffer.buffer == 0)
+                .unwrap()
+                .access,
+            LinearAccess::ScalarOnly(reason) if reason.contains("projected index")
+        ));
+        let spaces = crate::MemorySpacePlan::from_linear(&linear).unwrap();
+        let vector = crate::VectorProgram::from_linear(&linear, &spaces).unwrap();
+        assert!(matches!(
+            vector.b1_eligibility(),
+            Err(crate::VectorIrError::Unsupported(reason))
+                if reason.contains("projected index")
         ));
     }
 

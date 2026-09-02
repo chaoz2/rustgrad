@@ -1,4 +1,5 @@
-use crate::{AffineView, Graph, NodeId, Op, Shape, ViewMap};
+use crate::uop::{Binary, Operation, UOp};
+use crate::{AffineView, DType, Graph, NodeId, Op, Shape, UType, ViewMap};
 use std::{
     collections::hash_map::DefaultHasher,
     fmt,
@@ -10,6 +11,12 @@ pub(crate) struct RangeifiedView {
     pub source: NodeId,
     pub view: AffineView,
     pub cache_key: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RangeifiedProjection {
+    pub source: NodeId,
+    pub expression: UOp,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RangeifyError {
@@ -239,6 +246,261 @@ pub(crate) fn computed_broadcast_view(
     Ok(view)
 }
 
+fn iconstant(value: i64) -> UOp {
+    UOp::constant(value, UType::scalar(DType::I64))
+}
+
+fn ibinary(operation: Binary, lhs: UOp, rhs: UOp) -> UOp {
+    UOp::from_operation(
+        Operation::Binary(operation),
+        Some(UType::scalar(DType::I64)),
+        vec![lhs, rhs],
+    )
+}
+
+fn checked_i64(value: usize) -> Result<i64, RangeifyError> {
+    i64::try_from(value).map_err(|_| RangeifyError::Invalid)
+}
+
+fn zero_from(range: &UOp) -> UOp {
+    ibinary(Binary::Mul, range.clone(), iconstant(0))
+}
+
+fn logical_coordinates(
+    logical: &Shape,
+    output: &Shape,
+    range: &UOp,
+) -> Result<Vec<UOp>, RangeifyError> {
+    if logical.rank() > output.rank() {
+        return Err(RangeifyError::Invalid);
+    }
+    let rank_delta = output.rank() - logical.rank();
+    let output_strides = output.contiguous_strides();
+    let zero = zero_from(range);
+    logical
+        .dims()
+        .iter()
+        .enumerate()
+        .map(|(axis, logical_dim)| {
+            let output_axis = axis + rank_delta;
+            let output_dim = output.dims()[output_axis];
+            if *logical_dim != 1 && logical_dim != &output_dim {
+                return Err(RangeifyError::Invalid);
+            }
+            if *logical_dim == 1 || output_dim == 0 {
+                return Ok(zero.clone());
+            }
+            let divisor = output_strides[output_axis];
+            let divided = if divisor == 1 {
+                range.clone()
+            } else {
+                ibinary(
+                    Binary::FloorDiv,
+                    range.clone(),
+                    iconstant(checked_i64(divisor)?),
+                )
+            };
+            Ok(if output_dim == 1 {
+                zero.clone()
+            } else {
+                ibinary(Binary::Mod, divided, iconstant(checked_i64(output_dim)?))
+            })
+        })
+        .collect()
+}
+
+fn linearize_coordinates(
+    shape: &Shape,
+    coordinates: &[UOp],
+    range: &UOp,
+) -> Result<UOp, RangeifyError> {
+    if coordinates.len() != shape.rank() {
+        return Err(RangeifyError::Invalid);
+    }
+    let strides = shape.contiguous_strides();
+    let mut expression = zero_from(range);
+    for (coordinate, stride) in coordinates.iter().zip(strides) {
+        let term = if stride == 1 {
+            coordinate.clone()
+        } else {
+            ibinary(
+                Binary::Mul,
+                coordinate.clone(),
+                iconstant(checked_i64(stride)?),
+            )
+        };
+        expression = ibinary(Binary::Add, expression, term);
+    }
+    Ok(expression)
+}
+
+fn decompose_linear(shape: &Shape, linear: UOp, range: &UOp) -> Result<Vec<UOp>, RangeifyError> {
+    let strides = shape.contiguous_strides();
+    let zero = zero_from(range);
+    shape
+        .dims()
+        .iter()
+        .zip(strides)
+        .map(|(dim, stride)| {
+            if *dim == 0 || stride == 0 {
+                return Ok(zero.clone());
+            }
+            let divided = if stride == 1 {
+                linear.clone()
+            } else {
+                ibinary(
+                    Binary::FloorDiv,
+                    linear.clone(),
+                    iconstant(checked_i64(stride)?),
+                )
+            };
+            Ok(if *dim == 1 {
+                zero.clone()
+            } else {
+                ibinary(Binary::Mod, divided, iconstant(checked_i64(*dim)?))
+            })
+        })
+        .collect()
+}
+
+/// Builds an explicit concrete output-linear to source-linear address for a
+/// movement chain that cannot collapse to one AffineView. The chain terminates
+/// at the first dense source or computed producer; ownership remains a
+/// scheduler decision and this function never invents a materialization.
+pub(crate) fn projected_view(
+    graph: &Graph,
+    node: NodeId,
+    output_shape: &Shape,
+    range: &UOp,
+) -> Result<RangeifiedProjection, RangeifyError> {
+    fn go(
+        graph: &Graph,
+        node: NodeId,
+        coordinates: Vec<UOp>,
+        range: &UOp,
+    ) -> Result<(NodeId, UOp), RangeifyError> {
+        match graph.op(node).map_err(|_| RangeifyError::Invalid)? {
+            Op::Shrink { input, bounds } => {
+                let coordinates = coordinates
+                    .into_iter()
+                    .zip(bounds)
+                    .map(|(coordinate, (start, _))| {
+                        if *start == 0 {
+                            Ok(coordinate)
+                        } else {
+                            Ok(ibinary(
+                                Binary::Add,
+                                coordinate,
+                                iconstant(checked_i64(*start)?),
+                            ))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, RangeifyError>>()?;
+                go(graph, *input, coordinates, range)
+            }
+            Op::Reshape { input, .. } => {
+                let output_shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
+                let input_shape = graph.shape(*input).map_err(|_| RangeifyError::Invalid)?;
+                let linear = linearize_coordinates(output_shape, &coordinates, range)?;
+                let coordinates = decompose_linear(input_shape, linear, range)?;
+                go(graph, *input, coordinates, range)
+            }
+            Op::Permute { input, axes } => {
+                let mut input_coordinates = vec![zero_from(range); axes.len()];
+                for (output_axis, input_axis) in axes.iter().copied().enumerate() {
+                    input_coordinates[input_axis] = coordinates
+                        .get(output_axis)
+                        .cloned()
+                        .ok_or(RangeifyError::Invalid)?;
+                }
+                go(graph, *input, input_coordinates, range)
+            }
+            Op::Expand { input, .. } => {
+                let input_shape = graph.shape(*input).map_err(|_| RangeifyError::Invalid)?;
+                if input_shape.rank() > coordinates.len() {
+                    return Err(RangeifyError::Invalid);
+                }
+                let delta = coordinates.len() - input_shape.rank();
+                let zero = zero_from(range);
+                let input_coordinates = input_shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .map(|(axis, dim)| {
+                        if *dim == 1 {
+                            zero.clone()
+                        } else {
+                            coordinates[axis + delta].clone()
+                        }
+                    })
+                    .collect();
+                go(graph, *input, input_coordinates, range)
+            }
+            Op::Stride { input, slices } => {
+                let input_shape = graph.shape(*input).map_err(|_| RangeifyError::Invalid)?;
+                let coordinates = coordinates
+                    .into_iter()
+                    .zip(slices)
+                    .zip(input_shape.dims())
+                    .enumerate()
+                    .map(|(axis, ((coordinate, slice), dim))| {
+                        let (start, _, step, _) = crate::ir::normalized_slice(*dim, *slice, axis)
+                            .map_err(|_| RangeifyError::Invalid)?;
+                        let scaled = if step == 1 {
+                            coordinate
+                        } else {
+                            ibinary(
+                                Binary::Mul,
+                                coordinate,
+                                iconstant(i64::try_from(step).map_err(|_| RangeifyError::Invalid)?),
+                            )
+                        };
+                        Ok(if start == 0 {
+                            scaled
+                        } else {
+                            ibinary(
+                                Binary::Add,
+                                scaled,
+                                iconstant(
+                                    i64::try_from(start).map_err(|_| RangeifyError::Invalid)?,
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, RangeifyError>>()?;
+                go(graph, *input, coordinates, range)
+            }
+            Op::Input { .. } | Op::Constant(_) => {
+                let shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
+                Ok((node, linearize_coordinates(shape, &coordinates, range)?))
+            }
+            _ => {
+                let shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
+                Ok((node, linearize_coordinates(shape, &coordinates, range)?))
+            }
+        }
+    }
+
+    let logical_shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
+    let coordinates = logical_coordinates(logical_shape, output_shape, range)?;
+    let (source, expression) = go(graph, node, coordinates, range)?;
+    Ok(RangeifiedProjection { source, expression })
+}
+
+pub(crate) fn projected_source(
+    graph: &Graph,
+    node: NodeId,
+    output_shape: &Shape,
+) -> Result<NodeId, RangeifyError> {
+    let extent = output_shape.numel().map_err(|_| RangeifyError::Invalid)?;
+    let range = UOp::from_operation(
+        Operation::Range(0),
+        Some(UType::scalar(DType::I64)),
+        vec![iconstant(checked_i64(extent)?)],
+    );
+    projected_view(graph, node, output_shape, &range).map(|projection| projection.source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +719,106 @@ mod tests {
                 graph.shape(row).unwrap().clone(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn projected_view_composes_permute_then_non_affine_reshape() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [1, 2, 2, 2], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let permuted = graph.permute(producer, [0, 2, 1, 3]).unwrap();
+        let reshaped = graph.reshape(permuted, [1, 2, 4]).unwrap();
+        assert!(computed_view(&graph, reshaped).is_err());
+
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(8)],
+        );
+        let projected = projected_view(&graph, reshaped, &Shape::from([1, 2, 4]), &range).unwrap();
+        assert_eq!(projected.source, producer);
+        let source_shape = graph.shape(producer).unwrap().clone();
+        let ty = UType::scalar(DType::F32);
+        let address = UOp::from_operation(
+            Operation::DefineGlobal(crate::uop::AddressValue {
+                space: crate::uop::AddressSpace::Global,
+                name: format!("b{}", producer.index()),
+                element: ty,
+            }),
+            Some(ty),
+            vec![],
+        );
+        let index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: producer.index() as u64,
+                elements: 8,
+                input_shape: source_shape,
+                output_shape: Shape::from([1, 2, 4]),
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(ty),
+            vec![address, projected.expression],
+        );
+        let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).unwrap();
+        assert_eq!(
+            (0..8)
+                .map(|linear| plan.offset(linear).unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 4, 5, 2, 3, 6, 7]
+        );
+
+        let reversed = graph
+            .stride(
+                reshaped,
+                [
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                ],
+            )
+            .unwrap();
+        let projected = projected_view(&graph, reversed, &Shape::from([1, 2, 4]), &range).unwrap();
+        let index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: producer.index() as u64,
+                elements: 8,
+                input_shape: graph.shape(producer).unwrap().clone(),
+                output_shape: Shape::from([1, 2, 4]),
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(ty),
+            vec![
+                UOp::from_operation(
+                    Operation::DefineGlobal(crate::uop::AddressValue {
+                        space: crate::uop::AddressSpace::Global,
+                        name: format!("b{}", producer.index()),
+                        element: ty,
+                    }),
+                    Some(ty),
+                    vec![],
+                ),
+                projected.expression,
+            ],
+        );
+        let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).unwrap();
+        assert_eq!(
+            (0..8)
+                .map(|linear| plan.offset(linear).unwrap())
+                .collect::<Vec<_>>(),
+            vec![5, 4, 1, 0, 7, 6, 3, 2]
         );
     }
 }

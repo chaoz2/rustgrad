@@ -43,6 +43,7 @@ pub mod optim;
 mod portable_movement;
 mod portable_sort;
 mod portable_threefry;
+mod projected_index;
 pub mod ptx;
 mod rangeify;
 pub mod runtime;
@@ -282,9 +283,9 @@ pub use torch::{
 pub use trace::{CompileTrace, TraceStep};
 pub use training_checkpoint::{PortableTrainingCheckpoint, TrainingCheckpoint};
 pub use uop::{
-    AddressSpace, AddressValue, AffineView, Binary as UBinary, IndexValue, LiteralValue,
-    MatmulValue, MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue,
-    TensorGuardValue, ThreefryValue, UOp, UOpError, UPat, UType, VariableValue, ViewMap,
+    AddressSpace, AddressValue, AffineView, Binary as UBinary, IndexAddressing, IndexValue,
+    LiteralValue, MatmulValue, MovementValue, Operation, PrefixScanValue, ReductionValue,
+    SortValue, TensorGuardValue, ThreefryValue, UOp, UOpError, UPat, UType, VariableValue, ViewMap,
 };
 pub use vector_ir::{VectorIrError, VectorOperand, VectorProgram};
 pub use viz::{

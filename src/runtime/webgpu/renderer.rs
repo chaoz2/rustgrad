@@ -783,6 +783,7 @@ impl WgslRenderer {
             elements: extent,
             input_shape: output_shape,
             output_shape: store_shape,
+            addressing: crate::IndexAddressing::Broadcast,
         }) = output_index.operation()
         else {
             return Err(WebGpuError::Unsupported(
@@ -937,6 +938,15 @@ impl WgslRenderer {
         }
         let transaction =
             WebGpuTransactionAbi::analyze(value, output_position, store_shape.clone())?;
+        if transaction.is_some()
+            && nodes
+                .iter()
+                .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+        {
+            return Err(WebGpuError::Unsupported(
+                "guarded projected indexing is outside the exact WGSL subset".into(),
+            ));
+        }
         if transaction.is_some()
             && buffers.len() + 1 > self.capabilities.max_storage_buffers_per_shader_stage as usize
         {
@@ -3091,6 +3101,52 @@ fn emit_expr_with_substitution(
                 .first()
                 .ok_or_else(|| WebGpuError::Unsupported("load has no index".into()))?;
             let (buffer, input_shape, output_shape, view) = match index.operation() {
+                Operation::Index(IndexValue::Buffer { buffer, .. })
+                    if crate::projected_index::ProjectedIndexPlan::is_projected(index) =>
+                {
+                    let plan = crate::projected_index::ProjectedIndexPlan::from_index(index)
+                        .map_err(|_| WebGpuError::Unsupported("invalid projected index".into()))?;
+                    if !plan.fits_i32()
+                        || plan.elements > i32::MAX as usize
+                        || plan.output_elements > i32::MAX as usize
+                    {
+                        return Err(WebGpuError::Unsupported(
+                            "projected index exceeds WGSL signed address range".into(),
+                        ));
+                    }
+                    let signed = crate::projected_index::render_infix_projected_index(
+                        &plan,
+                        format!("i32({linear})"),
+                        |value| {
+                            i32::try_from(value)
+                                .map(|value| {
+                                    if value == i32::MIN {
+                                        "((-2147483647i) - 1i)".into()
+                                    } else {
+                                        format!("{value}i")
+                                    }
+                                })
+                                .map_err(|_| crate::UOpError::InvalidIndex)
+                        },
+                    )
+                    .map_err(|_| WebGpuError::Unsupported("invalid projected index".into()))?;
+                    let offset = format!("u32({signed})");
+                    let position = ids.get(buffer).ok_or_else(|| {
+                        WebGpuError::InvalidBinding("load buffer absent from ABI".into())
+                    })?;
+                    return if dtype == DType::Bool {
+                        Ok(format!(
+                            "(((b{position}[({offset}) >> 2u] >> ((({offset}) & 3u) * 8u)) & 0xffu) != 0u)"
+                        ))
+                    } else if narrow::is_narrow(dtype) {
+                        let raw = format!(
+                            "((b{position}[({offset}) >> 1u] >> ((({offset}) & 1u) * 16u)) & 0xffffu)"
+                        );
+                        Ok(narrow::decode(dtype, raw).expect("validated narrow load"))
+                    } else {
+                        Ok(format!("b{position}[{offset}]"))
+                    };
+                }
                 Operation::Index(IndexValue::Buffer {
                     buffer,
                     input_shape,

@@ -799,6 +799,7 @@ fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
             elements: 5,
             input_shape: Shape::from([2, 3]),
             output_shape: Shape::from([3]),
+            addressing: crate::IndexAddressing::Broadcast,
         }),
         Some(i64t()),
         vec![base, range.clone()],

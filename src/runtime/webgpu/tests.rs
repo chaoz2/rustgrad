@@ -2789,6 +2789,7 @@ fn narrow_scalar_literals_preserve_raw_bits_at_the_storage_boundary() {
                 elements: 1,
                 input_shape: shape.clone(),
                 output_shape: shape,
+                addressing: crate::IndexAddressing::Broadcast,
             }),
             Some(ty),
             vec![address, range.clone()],

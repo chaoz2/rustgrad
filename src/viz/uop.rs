@@ -126,11 +126,13 @@ fn operation_fields(operation: &Operation) -> BTreeMap<String, String> {
             elements,
             input_shape,
             output_shape,
+            addressing,
         }) => {
             out.insert("buffer".into(), buffer.to_string());
             out.insert("elements".into(), elements.to_string());
             out.insert("input_shape".into(), shape_name(input_shape));
             out.insert("output_shape".into(), shape_name(output_shape));
+            out.insert("addressing".into(), format!("{addressing:?}"));
         }
         Operation::Index(IndexValue::View {
             buffer,

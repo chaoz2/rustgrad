@@ -263,6 +263,7 @@ pub(crate) fn validate_item_output_bindings(item: &ScheduleItem) -> Result<(), S
             elements,
             input_shape,
             output_shape,
+            addressing: crate::IndexAddressing::Broadcast,
         }) = index.operation()
         else {
             return Err(ScheduleError::Binding(
@@ -1305,7 +1306,7 @@ struct ContiguousRedirection {
     kernel: UOp,
 }
 
-struct AffineScalarFusion {
+struct ScalarAliasFusion {
     removed_roots: BTreeSet<usize>,
     load_nodes: BTreeSet<usize>,
     kernel: UOp,
@@ -1379,30 +1380,35 @@ fn rehearse_reduction_epilogue(
 }
 
 #[derive(Default)]
-struct AffineScalarCandidates {
-    maps: BTreeMap<usize, BTreeSet<crate::AffineView>>,
+struct ScalarAliasCandidates {
+    affine_maps: BTreeMap<usize, BTreeSet<crate::AffineView>>,
     direct_roots: BTreeSet<usize>,
-    view_roots: BTreeMap<usize, BTreeSet<usize>>,
+    affine_view_roots: BTreeMap<usize, BTreeSet<usize>>,
+    projected_view_roots: BTreeMap<usize, BTreeSet<usize>>,
 }
 
-struct AffineCandidateCollector<'a> {
+struct ScalarAliasCollector<'a> {
     graph: &'a Graph,
     output: NodeId,
     output_shape: &'a Shape,
     roots: &'a BTreeSet<usize>,
     external: &'a BTreeSet<usize>,
     requested: &'a BTreeSet<usize>,
-    candidates: AffineScalarCandidates,
+    candidates: ScalarAliasCandidates,
     seen: BTreeSet<NodeId>,
 }
 
-impl AffineCandidateCollector<'_> {
-    fn record_view_roots(&mut self, terminal: NodeId, source: NodeId) -> Result<(), ScheduleError> {
+impl ScalarAliasCollector<'_> {
+    fn record_affine_view_roots(
+        &mut self,
+        terminal: NodeId,
+        source: NodeId,
+    ) -> Result<(), ScheduleError> {
         let mut cursor = terminal;
         while cursor != source {
             if self.roots.contains(&cursor.index()) {
                 self.candidates
-                    .view_roots
+                    .affine_view_roots
                     .entry(source.index())
                     .or_default()
                     .insert(cursor.index());
@@ -1441,7 +1447,7 @@ impl AffineCandidateCollector<'_> {
             && let Ok(view) = planned.view.expand(self.output_shape.clone())
         {
             self.candidates
-                .maps
+                .affine_maps
                 .entry(planned.source.index())
                 .or_default()
                 .insert(view);
@@ -1450,7 +1456,27 @@ impl AffineCandidateCollector<'_> {
             // an accepted scalar owner removes the complete physical chain,
             // including a shared intermediate view hidden below two equivalent
             // terminal maps.
-            self.record_view_roots(node, planned.source)?;
+            self.record_affine_view_roots(node, planned.source)?;
+            return Ok(());
+        }
+        if is_view
+            && self.roots.contains(&node.index())
+            && !self.requested.contains(&node.index())
+            && !self.external.contains(&node.index())
+            && let Ok(source) =
+                crate::rangeify::projected_source(self.graph, node, self.output_shape)
+            && (self.roots.contains(&source.index())
+                || self.external.contains(&source.index())
+                || matches!(
+                    self.graph.op(source),
+                    Ok(Op::Input { .. } | Op::Constant(_))
+                ))
+        {
+            self.candidates
+                .projected_view_roots
+                .entry(source.index())
+                .or_default()
+                .insert(node.index());
             return Ok(());
         }
         if node != self.output && self.roots.contains(&node.index()) {
@@ -1468,7 +1494,7 @@ impl AffineCandidateCollector<'_> {
     }
 }
 
-impl AffineScalarCandidates {
+impl ScalarAliasCandidates {
     fn collect(
         graph: &Graph,
         output: NodeId,
@@ -1477,7 +1503,7 @@ impl AffineScalarCandidates {
         requested: &BTreeSet<usize>,
     ) -> Result<Self, ScheduleError> {
         let output_shape = graph.shape(output).map_err(ScheduleError::Graph)?;
-        let mut collector = AffineCandidateCollector {
+        let mut collector = ScalarAliasCollector {
             graph,
             output,
             output_shape,
@@ -1533,6 +1559,7 @@ fn checked_scalar_sink(
         elements,
         input_shape,
         output_shape,
+        addressing: crate::IndexAddressing::Broadcast,
     }) = store_index.operation()
     else {
         return Ok(None);
@@ -1605,16 +1632,36 @@ fn graph_node_uses(graph: &Graph, output: NodeId, target: NodeId) -> Result<usiz
     visit(graph, output, target, &mut BTreeSet::new())
 }
 
-fn exclusive_affine_group(
+fn scalar_aliases_are_exclusive(
+    graph: &Graph,
+    output: NodeId,
+    aliases: &BTreeSet<usize>,
+    external: &BTreeSet<usize>,
+    requested: &BTreeSet<usize>,
+    consumers: &[usize],
+) -> Result<bool, ScheduleError> {
+    for alias in aliases {
+        if requested.contains(alias)
+            || external.contains(alias)
+            || graph_node_uses(graph, output, NodeId::from_index(*alias))?
+                != consumers.get(*alias).copied().unwrap_or(0)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn exclusive_affine_alias_group(
     graph: &Graph,
     output: NodeId,
     source: usize,
-    candidates: &AffineScalarCandidates,
+    candidates: &ScalarAliasCandidates,
     external: &BTreeSet<usize>,
     requested: &BTreeSet<usize>,
     consumers: &[usize],
 ) -> Result<Option<BTreeSet<usize>>, ScheduleError> {
-    let Some(maps) = candidates.maps.get(&source) else {
+    let Some(maps) = candidates.affine_maps.get(&source) else {
         return Ok(None);
     };
     if maps.len() != 1
@@ -1627,20 +1674,44 @@ fn exclusive_affine_group(
         return Ok(None);
     }
     let mut group = BTreeSet::from([source]);
-    for view in candidates.view_roots.get(&source).into_iter().flatten() {
-        if requested.contains(view)
-            || external.contains(view)
-            || graph_node_uses(graph, output, NodeId::from_index(*view))?
-                != consumers.get(*view).copied().unwrap_or(0)
-        {
-            return Ok(None);
-        }
-        group.insert(*view);
+    let views = candidates
+        .affine_view_roots
+        .get(&source)
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if !scalar_aliases_are_exclusive(graph, output, &views, external, requested, consumers)? {
+        return Ok(None);
     }
+    group.extend(views);
     Ok(Some(group))
 }
 
-fn scalar_fusion_materialized(
+/// Returns projected alias roots owned wholly by one scalar output. Unlike an
+/// affine producer fusion, the dense source remains materialized: removing
+/// only these aliases lets ordinary lowering attach the checked projected
+/// address to the source Load. Rehearsal below remains the authority for the
+/// resulting Store and complete input ABI.
+fn exclusive_projected_alias_group(
+    graph: &Graph,
+    output: NodeId,
+    source: usize,
+    candidates: &ScalarAliasCandidates,
+    external: &BTreeSet<usize>,
+    requested: &BTreeSet<usize>,
+    consumers: &[usize],
+) -> Result<Option<BTreeSet<usize>>, ScheduleError> {
+    let Some(views) = candidates.projected_view_roots.get(&source) else {
+        return Ok(None);
+    };
+    if !scalar_aliases_are_exclusive(graph, output, views, external, requested, consumers)? {
+        return Ok(None);
+    }
+    Ok(Some(views.clone()))
+}
+
+fn scalar_alias_materialized(
     output: NodeId,
     roots: &BTreeSet<usize>,
     external: &BTreeSet<usize>,
@@ -1654,15 +1725,15 @@ fn scalar_fusion_materialized(
         .collect()
 }
 
-fn rehearse_affine_scalar_fusion(
+fn rehearse_scalar_alias_fusion(
     graph: &Graph,
     output: NodeId,
     roots: &BTreeSet<usize>,
     external: &BTreeSet<usize>,
     removed: &BTreeSet<usize>,
 ) -> Result<Option<(UOp, BTreeSet<usize>)>, ScheduleError> {
-    let materialized = scalar_fusion_materialized(output, roots, external, removed);
-    let kernel = match crate::kernel::lower_graph_elementwise_with_affine_sources(
+    let materialized = scalar_alias_materialized(output, roots, external, removed);
+    let kernel = match crate::kernel::lower_graph_elementwise_with_owned_aliases(
         graph,
         output,
         &materialized,
@@ -1674,7 +1745,7 @@ fn rehearse_affine_scalar_fusion(
     checked_scalar_sink(graph, output, kernel, &materialized, removed)
 }
 
-fn affine_scalar_output(op: &Op) -> bool {
+fn scalar_alias_output(op: &Op) -> bool {
     matches!(
         op,
         Op::Cast { .. }
@@ -1688,7 +1759,7 @@ fn affine_scalar_output(op: &Op) -> bool {
     )
 }
 
-fn checked_affine_scalar_fusion(
+fn checked_scalar_alias_fusion(
     graph: &Graph,
     output: NodeId,
     roots: &BTreeSet<usize>,
@@ -1696,14 +1767,14 @@ fn checked_affine_scalar_fusion(
     requested: &BTreeSet<usize>,
     consumers: &[usize],
     protected: &BTreeSet<usize>,
-) -> Result<Option<AffineScalarFusion>, ScheduleError> {
-    if !affine_scalar_output(graph.op(output).map_err(ScheduleError::Graph)?) {
+) -> Result<Option<ScalarAliasFusion>, ScheduleError> {
+    if !scalar_alias_output(graph.op(output).map_err(ScheduleError::Graph)?) {
         return Ok(None);
     }
-    let candidates = AffineScalarCandidates::collect(graph, output, roots, external, requested)?;
+    let candidates = ScalarAliasCandidates::collect(graph, output, roots, external, requested)?;
     let mut accepted = BTreeSet::new();
-    for source in candidates.maps.keys().copied() {
-        let Some(group) = exclusive_affine_group(
+    for source in candidates.affine_maps.keys().copied() {
+        let Some(group) = exclusive_affine_alias_group(
             graph,
             output,
             source,
@@ -1718,7 +1789,27 @@ fn checked_affine_scalar_fusion(
         if !group.is_disjoint(protected) {
             continue;
         }
-        if rehearse_affine_scalar_fusion(graph, output, roots, external, &group)?.is_some() {
+        if rehearse_scalar_alias_fusion(graph, output, roots, external, &group)?.is_some() {
+            accepted.extend(group);
+        }
+    }
+    for source in candidates.projected_view_roots.keys().copied() {
+        let Some(group) = exclusive_projected_alias_group(
+            graph,
+            output,
+            source,
+            &candidates,
+            external,
+            requested,
+            consumers,
+        )?
+        else {
+            continue;
+        };
+        if !group.is_disjoint(protected) {
+            continue;
+        }
+        if rehearse_scalar_alias_fusion(graph, output, roots, external, &group)?.is_some() {
             accepted.extend(group);
         }
     }
@@ -1726,27 +1817,27 @@ fn checked_affine_scalar_fusion(
         return Ok(None);
     }
     let Some((kernel, load_nodes)) =
-        rehearse_affine_scalar_fusion(graph, output, roots, external, &accepted)?
+        rehearse_scalar_alias_fusion(graph, output, roots, external, &accepted)?
     else {
         return Ok(None);
     };
-    Ok(Some(AffineScalarFusion {
+    Ok(Some(ScalarAliasFusion {
         removed_roots: accepted,
         load_nodes,
         kernel,
     }))
 }
 
-fn ordinary_affine_fallback_loads(
+fn ordinary_scalar_fallback_loads(
     graph: &Graph,
     output: NodeId,
     roots: &BTreeSet<usize>,
     external: &BTreeSet<usize>,
 ) -> Result<BTreeSet<usize>, ScheduleError> {
-    if !affine_scalar_output(graph.op(output).map_err(ScheduleError::Graph)?) {
+    if !scalar_alias_output(graph.op(output).map_err(ScheduleError::Graph)?) {
         return Ok(BTreeSet::new());
     }
-    let materialized = scalar_fusion_materialized(output, roots, external, &BTreeSet::new());
+    let materialized = scalar_alias_materialized(output, roots, external, &BTreeSet::new());
     let kernel =
         crate::kernel::lower_graph_elementwise_with_materialized(graph, output, &materialized)
             .map_err(ScheduleError::UOp)?;
@@ -1897,6 +1988,7 @@ fn checked_contiguous_redirection(
         elements,
         input_shape,
         output_shape,
+        addressing: crate::IndexAddressing::Broadcast,
     }) = store_index.operation()
     else {
         return Ok(None);
@@ -2441,9 +2533,19 @@ fn schedule_many_with_external(
                     | Op::Expand { .. }
                     | Op::Stride { .. })
             )
-            .then(|| crate::rangeify::computed_view(graph, id).ok())
+            .then(|| {
+                crate::rangeify::computed_view(graph, id)
+                    .map(|view| view.source)
+                    .or_else(|_| {
+                        let shape = graph
+                            .shape(id)
+                            .map_err(|_| crate::rangeify::RangeifyError::Invalid)?;
+                        crate::rangeify::projected_source(graph, id, shape)
+                    })
+                    .ok()
+            })
             .flatten()
-            .map(|view| view.source.index())
+            .map(|source| source.index())
         })
         .collect::<BTreeSet<_>>();
     // A computed affine alias of a caller-owned materialization does not own
@@ -2467,9 +2569,17 @@ fn schedule_many_with_external(
                 && !movement_operands.contains(index)
         })
         .filter_map(|index| {
-            crate::rangeify::computed_view(graph, NodeId::from_index(*index))
+            let id = NodeId::from_index(*index);
+            crate::rangeify::computed_view(graph, id)
+                .map(|view| view.source)
+                .or_else(|_| {
+                    let shape = graph
+                        .shape(id)
+                        .map_err(|_| crate::rangeify::RangeifyError::Invalid)?;
+                    crate::rangeify::projected_source(graph, id, shape)
+                })
                 .ok()
-                .filter(|view| external.contains(&view.source.index()))
+                .filter(|source| external.contains(&source.index()))
                 .map(|_| *index)
         })
         .collect::<BTreeSet<_>>();
@@ -2680,11 +2790,13 @@ fn schedule_many_with_external(
         fused_epilogues.insert(root, fusion);
     }
 
-    // An ordinary scalar consumer may absorb branch-local computed affine
-    // producer roots when every graph use is owned by that consumer and all
-    // occurrences share one exact map. The normalized trial Sink remains the
-    // ABI authority; uncertain or multi-map cases retain their roots.
-    let mut affine_loads = fused_epilogues
+    // An ordinary scalar consumer may absorb branch-local computed aliases
+    // when every graph use is owned by that consumer. Affine producer aliases
+    // still require one exact map; projected aliases retain their dense source
+    // and remove only the redundant view root. The normalized trial Sink
+    // remains the ABI authority, so uncertain or multi-owner cases retain
+    // their roots.
+    let mut scalar_alias_loads = fused_epilogues
         .values()
         .flat_map(|fusion| fusion.load_nodes.iter().copied())
         .chain(matmul_operands.iter().copied())
@@ -2692,35 +2804,35 @@ fn schedule_many_with_external(
         .chain(sort_operands.iter().copied())
         .chain(threefry_operands.iter().copied())
         .collect::<BTreeSet<_>>();
-    let epilogue_reserved = affine_loads
+    let epilogue_reserved = scalar_alias_loads
         .iter()
         .copied()
         .chain(fused_epilogues.keys().copied())
-        // Movement operands remain protected from unrelated reduction/affine
+        // Movement operands remain protected from unrelated reduction/scalar
         // ownership, but are not hard loads against their own checked
         // Contiguous redirection. Its sole-use proof is the exact exception.
         .chain(movement_operands.iter().copied())
         .collect::<BTreeSet<_>>();
-    let mut affine_reserved = epilogue_reserved;
-    let affine_scalar_fusions = if redirect_contiguous {
+    let mut scalar_alias_reserved = epilogue_reserved;
+    let scalar_alias_fusions = if redirect_contiguous {
         // Proposal acceptance and ordinary fallback are both load-bearing.
         // Grow one monotone reservation frontier until every root is evaluated
         // against every other root's exact current load inventory; mutate
         // ownership only after that fixed point is stable.
         loop {
-            let mut next_reserved = affine_reserved.clone();
-            let mut next_loads = affine_loads.clone();
+            let mut next_reserved = scalar_alias_reserved.clone();
+            let mut next_loads = scalar_alias_loads.clone();
             let mut next_fusions = BTreeMap::new();
             for root in roots.iter().copied() {
                 let node = NodeId::from_index(root);
-                if let Some(fusion) = checked_affine_scalar_fusion(
+                if let Some(fusion) = checked_scalar_alias_fusion(
                     graph,
                     node,
                     &roots,
                     external,
                     &requested,
                     &consumers,
-                    &affine_reserved,
+                    &scalar_alias_reserved,
                 )? {
                     next_reserved.insert(root);
                     next_reserved.extend(fusion.load_nodes.iter().copied());
@@ -2736,7 +2848,7 @@ fn schedule_many_with_external(
                 if next_fusions.contains_key(&root) || proposed_removals.contains(&root) {
                     continue;
                 }
-                let loads = ordinary_affine_fallback_loads(
+                let loads = ordinary_scalar_fallback_loads(
                     graph,
                     NodeId::from_index(root),
                     &roots,
@@ -2748,17 +2860,17 @@ fn schedule_many_with_external(
                     next_loads.extend(loads.iter().copied());
                 }
             }
-            if next_reserved == affine_reserved {
-                affine_loads = next_loads;
+            if next_reserved == scalar_alias_reserved {
+                scalar_alias_loads = next_loads;
                 break next_fusions;
             }
-            affine_reserved = next_reserved;
-            affine_loads = next_loads;
+            scalar_alias_reserved = next_reserved;
+            scalar_alias_loads = next_loads;
         }
     } else {
         BTreeMap::new()
     };
-    for fusion in affine_scalar_fusions.values() {
+    for fusion in scalar_alias_fusions.values() {
         for removed in &fusion.removed_roots {
             roots.remove(removed);
         }
@@ -2789,7 +2901,7 @@ fn schedule_many_with_external(
             else {
                 continue;
             };
-            if affine_loads.contains(&redirection.producer) {
+            if scalar_alias_loads.contains(&redirection.producer) {
                 continue;
             }
             contiguous_redirections.insert(contiguous, redirection);
@@ -2809,141 +2921,180 @@ fn schedule_many_with_external(
             node_to_item.insert(sibling.index(), item as u64);
         }
     }
-    fn leaves(
-        g: &Graph,
-        id: NodeId,
-        roots: &BTreeSet<usize>,
-        here: usize,
-        out: &mut BTreeSet<usize>,
-        boundary: &mut Option<ScheduleBoundary>,
-        external: &BTreeSet<usize>,
-    ) -> Result<(), ScheduleError> {
-        if id.index() != here && roots.contains(&id.index()) {
-            out.insert(id.index());
-            return Ok(());
-        }
-        if external.contains(&id.index()) {
-            out.insert(id.index());
-            return Ok(());
-        }
-        let op = g.op(id).map_err(ScheduleError::Graph)?;
-        if !supported(op) {
-            *boundary = Some(ScheduleBoundary::Unsupported(
-                "operation requires materialization",
-            ));
-            if id.index() != here {
+    struct LeafTraversal<'a> {
+        graph: &'a Graph,
+        roots: &'a BTreeSet<usize>,
+        owner: usize,
+        external: &'a BTreeSet<usize>,
+        allow_projected: bool,
+    }
+    impl LeafTraversal<'_> {
+        fn visit(
+            &self,
+            id: NodeId,
+            out: &mut BTreeSet<usize>,
+            boundary: &mut Option<ScheduleBoundary>,
+        ) -> Result<(), ScheduleError> {
+            if id.index() != self.owner && self.roots.contains(&id.index()) {
                 out.insert(id.index());
+                return Ok(());
             }
-            return Ok(());
-        }
-        match op {
-            Op::Input { .. } | Op::Constant(_) => {
+            if self.external.contains(&id.index()) {
                 out.insert(id.index());
+                return Ok(());
             }
-            Op::Random { .. } => {}
-            Op::Cast { input, .. }
-            | Op::Bitcast { input, .. }
-            | Op::Contiguous { input }
-            | Op::ContiguousBackward { input }
-            | Op::Detach { input }
-            | Op::Unary { input, .. }
-            | Op::Reduce { input, .. }
-            | Op::PrefixScan { input, .. }
-            | Op::TensorGuard { input, .. }
-            | Op::Sort { input, .. }
-            | Op::Pad { input, .. }
-            | Op::ScatterPositions { input, .. } => {
-                leaves(g, *input, roots, here, out, boundary, external)?
-            }
-            Op::ScatterPositionsVjp { cotangent, .. } => {
-                leaves(g, *cotangent, roots, here, out, boundary, external)?
-            }
-            Op::Shrink { input, .. }
-            | Op::Reshape { input, .. }
-            | Op::Permute { input, .. }
-            | Op::Expand { input, .. }
-            | Op::Stride { input, .. } => match crate::rangeify::static_view(g, id) {
-                Ok(view) => {
-                    out.insert(view.source.index());
+            let op = self.graph.op(id).map_err(ScheduleError::Graph)?;
+            if !supported(op) {
+                *boundary = Some(ScheduleBoundary::Unsupported(
+                    "operation requires materialization",
+                ));
+                if id.index() != self.owner {
+                    out.insert(id.index());
                 }
-                Err(_) => match crate::rangeify::computed_view(g, id) {
+                return Ok(());
+            }
+            match op {
+                Op::Input { .. } | Op::Constant(_) => {
+                    out.insert(id.index());
+                }
+                Op::Random { .. } => {}
+                Op::Cast { input, .. }
+                | Op::Bitcast { input, .. }
+                | Op::Contiguous { input }
+                | Op::ContiguousBackward { input }
+                | Op::Detach { input }
+                | Op::Unary { input, .. }
+                | Op::Reduce { input, .. }
+                | Op::PrefixScan { input, .. }
+                | Op::TensorGuard { input, .. }
+                | Op::Sort { input, .. }
+                | Op::Pad { input, .. }
+                | Op::ScatterPositions { input, .. } => self.visit(*input, out, boundary)?,
+                Op::ScatterPositionsVjp { cotangent, .. } => {
+                    self.visit(*cotangent, out, boundary)?
+                }
+                Op::Shrink { input, .. }
+                | Op::Reshape { input, .. }
+                | Op::Permute { input, .. }
+                | Op::Expand { input, .. }
+                | Op::Stride { input, .. } => match crate::rangeify::static_view(self.graph, id) {
                     Ok(view) => {
                         out.insert(view.source.index());
                     }
-                    Err(_) => {
-                        *boundary = Some(ScheduleBoundary::Unsupported(
-                            "view is outside static owned affine materialization",
-                        ));
-                        out.insert(input.index());
-                    }
+                    Err(_) => match crate::rangeify::computed_view(self.graph, id) {
+                        Ok(view) => {
+                            out.insert(view.source.index());
+                        }
+                        Err(_) if self.allow_projected => {
+                            match self.graph.shape(id).map_err(ScheduleError::Graph).and_then(
+                                |shape| {
+                                    crate::rangeify::projected_source(self.graph, id, shape)
+                                        .map_err(|_| {
+                                            ScheduleError::Binding(
+                                                "view is outside static owned index projection"
+                                                    .into(),
+                                            )
+                                        })
+                                },
+                            ) {
+                                Ok(source) => {
+                                    out.insert(source.index());
+                                }
+                                Err(_) => {
+                                    *boundary = Some(ScheduleBoundary::Unsupported(
+                                        "view is outside static owned index projection",
+                                    ));
+                                    out.insert(input.index());
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            *boundary = Some(ScheduleBoundary::Unsupported(
+                                "projected indexing is outside symbolic capture",
+                            ));
+                            // Preserve a complete producer inventory even though
+                            // symbolic capture rejects the projected address. The
+                            // unsupported boundary must not manufacture a binding
+                            // to an unscheduled intermediate movement node.
+                            let source = self
+                                .graph
+                                .shape(id)
+                                .ok()
+                                .and_then(|shape| {
+                                    crate::rangeify::projected_source(self.graph, id, shape).ok()
+                                })
+                                .unwrap_or(*input);
+                            out.insert(source.index());
+                        }
+                    },
                 },
-            },
-            Op::Binary { lhs, rhs, .. }
-            | Op::Compare { lhs, rhs, .. }
-            | Op::Threefry {
-                counter: lhs,
-                key: rhs,
-            }
-            | Op::Matmul { lhs, rhs } => {
-                leaves(g, *lhs, roots, here, out, boundary, external)?;
-                leaves(g, *rhs, roots, here, out, boundary, external)?;
-            }
-            Op::Conv2d {
-                input,
-                weight,
-                bias,
-                ..
-            } => {
-                leaves(g, *input, roots, here, out, boundary, external)?;
-                leaves(g, *weight, roots, here, out, boundary, external)?;
-                if let Some(bias) = bias {
-                    leaves(g, *bias, roots, here, out, boundary, external)?;
+                Op::Binary { lhs, rhs, .. }
+                | Op::Compare { lhs, rhs, .. }
+                | Op::Threefry {
+                    counter: lhs,
+                    key: rhs,
                 }
-            }
-            Op::Concat { inputs, .. } => {
-                for input in inputs {
-                    leaves(g, *input, roots, here, out, boundary, external)?;
+                | Op::Matmul { lhs, rhs } => {
+                    self.visit(*lhs, out, boundary)?;
+                    self.visit(*rhs, out, boundary)?;
                 }
-            }
-            Op::Gather { input, index, .. } => {
-                leaves(g, *input, roots, here, out, boundary, external)?;
-                leaves(g, *index, roots, here, out, boundary, external)?;
-            }
-            Op::Scatter {
-                base,
-                index,
-                updates,
-                ..
-            } => {
-                leaves(g, *base, roots, here, out, boundary, external)?;
-                leaves(g, *index, roots, here, out, boundary, external)?;
-                leaves(g, *updates, roots, here, out, boundary, external)?;
-            }
-            Op::Logical { lhs, rhs, .. } => {
-                leaves(g, *lhs, roots, here, out, boundary, external)?;
-                if let Some(rhs) = rhs {
-                    leaves(g, *rhs, roots, here, out, boundary, external)?;
+                Op::Conv2d {
+                    input,
+                    weight,
+                    bias,
+                    ..
+                } => {
+                    self.visit(*input, out, boundary)?;
+                    self.visit(*weight, out, boundary)?;
+                    if let Some(bias) = bias {
+                        self.visit(*bias, out, boundary)?;
+                    }
                 }
-            }
-            Op::Select {
-                condition,
-                on_true,
-                on_false,
-            } => {
-                leaves(g, *condition, roots, here, out, boundary, external)?;
-                leaves(g, *on_true, roots, here, out, boundary, external)?;
-                leaves(g, *on_false, roots, here, out, boundary, external)?;
-            }
-            _ => unreachable!(),
-        };
-        Ok(())
+                Op::Concat { inputs, .. } => {
+                    for input in inputs {
+                        self.visit(*input, out, boundary)?;
+                    }
+                }
+                Op::Gather { input, index, .. } => {
+                    self.visit(*input, out, boundary)?;
+                    self.visit(*index, out, boundary)?;
+                }
+                Op::Scatter {
+                    base,
+                    index,
+                    updates,
+                    ..
+                } => {
+                    self.visit(*base, out, boundary)?;
+                    self.visit(*index, out, boundary)?;
+                    self.visit(*updates, out, boundary)?;
+                }
+                Op::Logical { lhs, rhs, .. } => {
+                    self.visit(*lhs, out, boundary)?;
+                    if let Some(rhs) = rhs {
+                        self.visit(*rhs, out, boundary)?;
+                    }
+                }
+                Op::Select {
+                    condition,
+                    on_true,
+                    on_false,
+                } => {
+                    self.visit(*condition, out, boundary)?;
+                    self.visit(*on_true, out, boundary)?;
+                    self.visit(*on_false, out, boundary)?;
+                }
+                _ => unreachable!(),
+            };
+            Ok(())
+        }
     }
     let mut items = Vec::with_capacity(roots.len());
     for &index in &roots {
         let node = NodeId::from_index(index);
         let redirection = contiguous_redirections.get(&index);
-        let affine_fusion = affine_scalar_fusions.get(&index);
-        let mut leaf_ids = match (redirection, affine_fusion) {
+        let alias_fusion = scalar_alias_fusions.get(&index);
+        let mut leaf_ids = match (redirection, alias_fusion) {
             (Some(value), _) => value.load_nodes.clone(),
             (None, Some(value)) => value.load_nodes.clone(),
             (None, None) => fused_epilogues
@@ -2952,7 +3103,7 @@ fn schedule_many_with_external(
                 .unwrap_or_default(),
         };
         let mut boundary = None;
-        if redirection.is_none() && affine_fusion.is_none() && !fused_epilogues.contains_key(&index)
+        if redirection.is_none() && alias_fusion.is_none() && !fused_epilogues.contains_key(&index)
         {
             match crate::MovementKernelPlan::from_scheduled_graph(graph, node) {
                 Ok(plan) => {
@@ -2965,15 +3116,14 @@ fn schedule_many_with_external(
                             .map(|input| input.node.index()),
                     );
                 }
-                Err(crate::MovementPlanError::NotMovement) => leaves(
+                Err(crate::MovementPlanError::NotMovement) => LeafTraversal {
                     graph,
-                    node,
-                    &roots,
-                    index,
-                    &mut leaf_ids,
-                    &mut boundary,
+                    roots: &roots,
+                    owner: index,
                     external,
-                )?,
+                    allow_projected: redirect_contiguous,
+                }
+                .visit(node, &mut leaf_ids, &mut boundary)?,
                 Err(error) => return Err(ScheduleError::Binding(error.to_string())),
             }
         }
@@ -2997,7 +3147,7 @@ fn schedule_many_with_external(
         let kernel = if boundary.is_none() {
             if let Some(redirection) = contiguous_redirections.get(&index) {
                 redirection.kernel.clone()
-            } else if let Some(fusion) = affine_scalar_fusions.get(&index) {
+            } else if let Some(fusion) = scalar_alias_fusions.get(&index) {
                 fusion.kernel.clone()
             } else if let Some(fusion) = fused_epilogues.get(&index) {
                 fusion.kernel.clone()

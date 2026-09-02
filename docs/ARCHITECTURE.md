@@ -434,9 +434,11 @@ external-model differential validation remain outside this boundary.
 Source-backed affine shrink, contiguous reshape, permutation, expansion, and
 signed-stride chains lower as canonical `AffineView`/`ViewBufferIndex` through
 scheduling, interpretation, native CPU execution, and PTX rendering. Computed
-value and non-affine chains stay explicit lowering boundaries; OpenCL, Metal,
-and WebGPU consume validated signed affine maps with target-native signed
-address arithmetic. `CpuJitBackend` is an
+static non-affine movement chains consumed by ordinary elementwise or typed
+reduction kernels may instead lower through the checked projected-index address
+dialect; specialized, dynamic, symbolic, effectful, and unsupported chains stay
+explicit materialization boundaries. OpenCL, Metal, and WebGPU consume validated
+signed affine maps with target-native signed address arithmetic. `CpuJitBackend` is an
 internal cached native-execution boundary with validated `ScheduleItem`
 preparation and invocation; replay never reconstructs a Graph.
 
@@ -1823,9 +1825,24 @@ static shrink, contiguous reshape, permutation, expansion, and signed-stride
 chains into a deterministic canonical `AffineView` before kernel lowering.
 For a computed base, the scheduler materializes that producer exactly once and
 uses the same affine descriptor for a fresh dense read-copy output; source-backed
-views remain direct addressing or passthrough values. Pad validity, unsupported
-coordinate-div/mod or multi-map compositions, dynamic rank, and non-affine
-composition remain explicit boundaries rather than hidden host materializations.
+views remain direct addressing or passthrough values. A static movement chain
+whose reshape-after-permute coordinates cannot collapse to one affine map may
+instead retain its existing core I64 `Range`/constant/Add/Sub/Mul/FloorDiv/Mod
+address tree in a Buffer index declared with `IndexAddressing::Projected`.
+Historical Buffer indices decode as `IndexAddressing::Broadcast`. One
+`ProjectedIndexPlan` authenticates the exact source/output descriptors, byte
+extents, bounded expression depth, positive divisors, and all-domain source
+bounds; the interpreter and C11, PTX, OpenCL, Metal, and WGSL renderers consume
+that plan through one scalar emitter dialect. Projected addressing is valid only
+as a `Load` index; output Stores remain dense Broadcast indices, and portable
+lane/vector planning stays fail-closed rather than discarding the address tree.
+This removes only the avoidable view copy: the computed producer remains an
+owned dependency and the consumer retains a fresh dense output. RGUA v21 is the
+first envelope that admits the typed projected-address declaration;
+older operation bytes and schedule keys remain pinned. Dynamic/symbolic shapes,
+effects and guarded fault transactions, unsupported index operations, excessive
+backend address width/depth, and specialized dense-operand kernels remain
+explicit boundaries rather than hidden host materializations.
 
 ## Static-graph autograd lifecycle
 

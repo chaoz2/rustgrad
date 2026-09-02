@@ -419,14 +419,15 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
     )
 }
 
-/// Lowers one ordinary scalar root while absorbing the exact computed affine
-/// producer roots selected by the scheduler. Each absorbed source is evaluated
-/// under its branch-local read map; all other roots remain typed buffer loads.
-pub(crate) fn lower_graph_elementwise_with_affine_sources(
+/// Lowers one ordinary scalar root while absorbing exact computed aliases
+/// selected by the scheduler. Affine producer roots are evaluated under their
+/// branch-local read maps; projected aliases expose their dense source through
+/// the ordinary projected-load path. All other roots remain typed buffer loads.
+pub(crate) fn lower_graph_elementwise_with_owned_aliases(
     graph: &Graph,
     output: NodeId,
     materialized: &std::collections::BTreeSet<usize>,
-    affine_sources: &std::collections::BTreeSet<usize>,
+    owned_aliases: &std::collections::BTreeSet<usize>,
 ) -> std::result::Result<UOp, UOpError> {
     lower_graph_elementwise_with_substitutions(
         graph,
@@ -435,7 +436,7 @@ pub(crate) fn lower_graph_elementwise_with_affine_sources(
         materialized,
         &HashMap::new(),
         None,
-        affine_sources,
+        owned_aliases,
     )
 }
 
@@ -644,6 +645,7 @@ fn lower_graph_elementwise_with_substitutions(
                 elements,
                 input_shape: shape,
                 output_shape: out.clone(),
+                addressing: crate::IndexAddressing::Broadcast,
             }),
             (None, Some(iteration)) => {
                 let view = iteration.project(graph, shape, out)?;
@@ -663,6 +665,7 @@ fn lower_graph_elementwise_with_substitutions(
                 elements,
                 input_shape: shape,
                 output_shape: out.clone(),
+                addressing: crate::IndexAddressing::Broadcast,
             }),
         };
         let index = UOp::from_operation(operation, Some(ty), vec![address, range.clone()]);
@@ -726,40 +729,92 @@ fn lower_graph_elementwise_with_substitutions(
                 | Op::Permute { .. }
                 | Op::Expand { .. }
                 | Op::Stride { .. } => {
-                    let planned = crate::rangeify::static_view(graph, id)
+                    match crate::rangeify::static_view(graph, id)
                         .or_else(|_| crate::rangeify::computed_view(graph, id))
-                        .map_err(|_| UOpError::InvalidArgument)?;
-                    if context.materialized.contains(&planned.source.index()) {
-                        load(
-                            graph,
-                            planned.source,
-                            out,
-                            range,
-                            Some(planned.view),
-                            context.iteration,
-                        )?
-                    } else if context.iteration.is_none()
-                        && context.affine_sources.contains(&planned.source.index())
                     {
-                        let nested = ElementwiseLowering {
-                            materialized: context.materialized,
-                            substitutions: context.substitutions,
-                            iteration: Some(AffineIteration {
-                                producer: planned.source,
-                                movement: id,
-                            }),
-                            affine_sources: context.affine_sources,
-                        };
-                        lower(graph, planned.source, out, range, memo, &nested)?
-                    } else {
-                        load(
-                            graph,
-                            planned.source,
-                            out,
-                            range,
-                            Some(planned.view),
-                            context.iteration,
-                        )?
+                        Ok(planned) => {
+                            if context.materialized.contains(&planned.source.index()) {
+                                load(
+                                    graph,
+                                    planned.source,
+                                    out,
+                                    range,
+                                    Some(planned.view),
+                                    context.iteration,
+                                )?
+                            } else if context.iteration.is_none()
+                                && context.affine_sources.contains(&planned.source.index())
+                            {
+                                let nested = ElementwiseLowering {
+                                    materialized: context.materialized,
+                                    substitutions: context.substitutions,
+                                    iteration: Some(AffineIteration {
+                                        producer: planned.source,
+                                        movement: id,
+                                    }),
+                                    affine_sources: context.affine_sources,
+                                };
+                                lower(graph, planned.source, out, range, memo, &nested)?
+                            } else {
+                                load(
+                                    graph,
+                                    planned.source,
+                                    out,
+                                    range,
+                                    Some(planned.view),
+                                    context.iteration,
+                                )?
+                            }
+                        }
+                        Err(_) if context.iteration.is_none() => {
+                            let projected = crate::rangeify::projected_view(graph, id, out, range)
+                                .map_err(|_| UOpError::InvalidArgument)?;
+                            if !context.materialized.contains(&projected.source.index())
+                                && !matches!(
+                                    graph.op(projected.source),
+                                    Ok(Op::Input { .. } | Op::Constant(_))
+                                )
+                            {
+                                return Err(UOpError::InvalidArgument);
+                            }
+                            let source_shape = graph
+                                .shape(projected.source)
+                                .map_err(|_| UOpError::UseBeforeDefinition)?
+                                .clone();
+                            let elements = source_shape
+                                .numel()
+                                .map_err(|_| UOpError::InvalidArgument)?;
+                            let source_ty = UType::scalar(
+                                graph
+                                    .dtype(projected.source)
+                                    .map_err(|_| UOpError::UseBeforeDefinition)?,
+                            );
+                            if source_ty != ty {
+                                return Err(UOpError::InvalidArgument);
+                            }
+                            let address = UOp::from_operation(
+                                Operation::DefineGlobal(AddressValue {
+                                    space: crate::AddressSpace::Global,
+                                    name: format!("b{}", projected.source.index()),
+                                    element: source_ty,
+                                }),
+                                Some(source_ty),
+                                vec![],
+                            );
+                            let index = UOp::from_operation(
+                                Operation::Index(IndexValue::Buffer {
+                                    buffer: projected.source.index() as u64,
+                                    elements,
+                                    input_shape: source_shape,
+                                    output_shape: out.clone(),
+                                    addressing: crate::IndexAddressing::Projected,
+                                }),
+                                Some(source_ty),
+                                vec![address, projected.expression],
+                            );
+                            UOp::from_operation(Operation::Load, Some(source_ty), vec![index])
+                        }
+                        Err(_) => return Err(UOpError::InvalidArgument),
                     }
                 }
                 Op::Cast { input, .. } => {
@@ -854,6 +909,7 @@ fn lower_graph_elementwise_with_substitutions(
             elements: extent,
             input_shape: output_shape.clone(),
             output_shape,
+            addressing: crate::IndexAddressing::Broadcast,
         }),
         Some(output_ty),
         vec![address, range.clone()],
@@ -1342,6 +1398,7 @@ pub(crate) fn lower_graph_reduction_with_materialized(
             elements: extent,
             input_shape: output_shape.clone(),
             output_shape,
+            addressing: crate::IndexAddressing::Broadcast,
         }),
         Some(output_ty),
         vec![address, range.clone()],
@@ -1599,6 +1656,12 @@ fn direct_f32_to_bf16(
         return Ok(None);
     }
     let index = load.sources().first().ok_or(Error::InvalidIndex)?;
+    if crate::projected_index::ProjectedIndexPlan::is_projected(index) {
+        // The direct BF16 transport shortcut understands dense broadcast and
+        // affine View addressing only. Projected reads use the authoritative
+        // scalar evaluator below so their raw F32 lane is addressed exactly.
+        return Ok(None);
+    }
     let (buffer, input_shape, view) = match index.operation() {
         Operation::Index(IndexValue::Buffer {
             buffer,
@@ -1840,6 +1903,18 @@ fn eval(
         }
         Operation::Load => {
             let index = n.sources().first().ok_or(Error::InvalidIndex)?;
+            if crate::projected_index::ProjectedIndexPlan::is_projected(index) {
+                let projected = crate::projected_index::ProjectedIndexPlan::from_index(index)
+                    .map_err(|_| Error::InvalidIndex)?;
+                let offset = projected.offset(linear).map_err(|_| Error::InvalidIndex)?;
+                return Ok(FusedValue::from_storage(
+                    bindings
+                        .get(projected.buffer)
+                        .ok_or(Error::InvalidIndex)?
+                        .storage(),
+                    offset,
+                ));
+            }
             let (buffer, input_shape, view) = match index.operation() {
                 Operation::Index(IndexValue::Buffer {
                     buffer,

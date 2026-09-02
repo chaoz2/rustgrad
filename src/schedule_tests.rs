@@ -487,6 +487,7 @@ fn sole_use_contiguous_redirects_ordinary_producer_into_owned_output() {
         elements,
         input_shape,
         output_shape,
+        addressing,
     }) = index.operation()
     else {
         panic!("redirected Store must use a dense output index")
@@ -507,6 +508,7 @@ fn sole_use_contiguous_redirects_ordinary_producer_into_owned_output() {
             elements: *elements,
             input_shape: input_shape.clone(),
             output_shape: output_shape.clone(),
+            addressing: *addressing,
         }),
         index.ty(),
         vec![wrong_address, index.sources()[1].clone()],
@@ -1219,7 +1221,7 @@ fn scalar_consumer_fuses_independent_computed_affine_branches() {
 }
 
 #[test]
-fn scalar_affine_fusion_shares_one_map_and_rejects_two_maps() {
+fn scalar_alias_fusion_shares_one_affine_map_and_rejects_two_maps() {
     let mut shared_graph = Graph::new();
     let x = shared_graph.input_dtype("x", [2, 3], DType::F32);
     let producer = shared_graph.square(x).unwrap();
@@ -1272,7 +1274,525 @@ fn scalar_affine_fusion_shares_one_map_and_rejects_two_maps() {
 }
 
 #[test]
-fn scalar_affine_fusion_owns_shared_intermediate_equivalent_view_paths() {
+fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
+    fn graph_with_projected_view() -> (Graph, crate::NodeId, crate::NodeId, crate::NodeId) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [1, 2, 2, 2], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let permuted = graph.permute(producer, [0, 2, 1, 3]).unwrap();
+        let reshaped = graph.reshape(permuted, [1, 2, 4]).unwrap();
+        (graph, input, producer, reshaped)
+    }
+
+    let (mut elementwise, _, producer, reshaped) = graph_with_projected_view();
+    let output = elementwise.relu(reshaped).unwrap();
+    let scheduled = schedule(&elementwise, output).unwrap();
+    scheduled.validate().unwrap();
+    let producer_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == producer)
+        .unwrap();
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(output_item.dependencies, vec![producer_item.id]);
+    assert_eq!(
+        output_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![producer]
+    );
+    assert!(scheduled.items.iter().all(|item| item.node != reshaped));
+
+    let requested_schedule = crate::schedule_many(&elementwise, &[reshaped, output]).unwrap();
+    requested_schedule.validate().unwrap();
+    let requested_view = requested_schedule
+        .items
+        .iter()
+        .find(|item| item.node == reshaped)
+        .unwrap();
+    assert!(
+        requested_view
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    );
+    let requested_output = requested_schedule
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert_eq!(requested_output.dependencies, vec![requested_view.id]);
+
+    let (mut direct, _, direct_producer, direct_view) = graph_with_projected_view();
+    let rhs = direct.input_dtype("rhs", [4, 3], DType::F32);
+    let product = direct.matmul(direct_view, rhs).unwrap();
+    let direct_schedule = schedule(&direct, product).unwrap();
+    direct_schedule.validate().unwrap();
+    let direct_view_item = direct_schedule
+        .items
+        .iter()
+        .find(|item| item.node == direct_view)
+        .unwrap();
+    assert!(
+        direct_view_item
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    );
+    assert_eq!(
+        direct_view_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![direct_producer]
+    );
+    let product_item = direct_schedule
+        .items
+        .iter()
+        .find(|item| item.node == product)
+        .unwrap();
+    assert!(product_item.dependencies.contains(&direct_view_item.id));
+    crate::MemoryPlan::from_schedule(&scheduled, &[output], true).unwrap();
+    let capture = crate::CapturedSchedule::capture(&elementwise, &scheduled, &[output]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    let replayed = decoded
+        .replay(&BTreeMap::from([(
+            "input".into(),
+            TensorData::new(
+                [1, 2, 2, 2],
+                vec![-1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0, 8.0],
+            )
+            .unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(
+        replayed[0].storage(),
+        &crate::Storage::F32(vec![1.0, 4.0, 25.0, 36.0, 9.0, 16.0, 49.0, 64.0])
+    );
+    let native = decoded
+        .replay_with_options(
+            &BTreeMap::from([(
+                "input".into(),
+                TensorData::new(
+                    [1, 2, 2, 2],
+                    vec![-1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0, 8.0],
+                )
+                .unwrap(),
+            )]),
+            &crate::CapturedReplayExecutor::default(),
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(native.outputs, replayed);
+    assert_eq!(
+        output_item
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .filter(|node| crate::projected_index::ProjectedIndexPlan::is_projected(node))
+            .count(),
+        1
+    );
+    assert!(
+        crate::CpuJit::render(&output_item.kernel)
+            .unwrap()
+            .source
+            .contains("int64_t")
+    );
+    let ptx = crate::PtxRenderer::new(80)
+        .unwrap()
+        .render(&output_item.kernel)
+        .unwrap();
+    assert!(ptx.source.contains(".reg .s64 %rgi<128>"));
+    crate::runtime::opencl::OpenClRenderer::default()
+        .render(&output_item.kernel)
+        .unwrap();
+    crate::runtime::metal::MetalRenderer::new(
+        1,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: usize::MAX,
+            unified_memory: false,
+            family: "projected-index-test".into(),
+        },
+    )
+    .unwrap()
+    .render(&output_item.kernel)
+    .unwrap();
+
+    let symbolic = crate::schedule::schedule_many_for_symbolic_capture(
+        &elementwise,
+        &[output],
+        &std::collections::BTreeSet::new(),
+    )
+    .unwrap();
+    symbolic.validate().unwrap();
+    assert_eq!(
+        symbolic
+            .items
+            .iter()
+            .map(|item| item.node)
+            .collect::<Vec<_>>(),
+        vec![producer, reshaped, output]
+    );
+    let symbolic_producer = symbolic
+        .items
+        .iter()
+        .find(|item| item.node == producer)
+        .unwrap();
+    let symbolic_projected = symbolic
+        .items
+        .iter()
+        .find(|item| item.node == reshaped)
+        .unwrap();
+    let symbolic_output = symbolic
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    assert!(matches!(
+        &symbolic_projected.boundary,
+        Some(crate::ScheduleBoundary::Unsupported(
+            "projected indexing is outside symbolic capture"
+        ))
+    ));
+    assert!(symbolic_projected.ordered_inputs().is_empty());
+    assert_eq!(
+        symbolic_projected
+            .inputs
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        vec![producer.index() as u64]
+    );
+    assert_eq!(symbolic_projected.dependencies, vec![symbolic_producer.id]);
+    assert!(symbolic_output.boundary.is_none());
+    assert_eq!(
+        symbolic_output
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![reshaped]
+    );
+    assert_eq!(symbolic_output.dependencies, vec![symbolic_projected.id]);
+    crate::runtime::webgpu::WgslRenderer::new(
+        1,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: usize::MAX,
+            max_storage_buffers_per_shader_stage: u32::MAX,
+            max_compute_workgroup_size_x: 1,
+            max_compute_workgroups_per_dimension: u32::MAX,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap()
+    .render(&output_item.kernel)
+    .unwrap();
+
+    // Descriptor compatibility is not an address-semantic tag: this
+    // permute-then-reshape returns to the source descriptor while retaining a
+    // non-identity projected address map.
+    let mut same_shape = Graph::new();
+    let same_input = same_shape.input_dtype("input", [2, 3, 4], DType::F32);
+    let same_producer = same_shape.square(same_input).unwrap();
+    let same_permuted = same_shape.permute(same_producer, [0, 2, 1]).unwrap();
+    let same_reshaped = same_shape.reshape(same_permuted, [2, 3, 4]).unwrap();
+    let same_output = same_shape.relu(same_reshaped).unwrap();
+    let same_schedule = schedule(&same_shape, same_output).unwrap();
+    same_schedule.validate().unwrap();
+    let same_item = same_schedule
+        .items
+        .iter()
+        .find(|item| item.node == same_output)
+        .unwrap();
+    assert!(
+        same_schedule
+            .items
+            .iter()
+            .all(|item| item.node != same_reshaped)
+    );
+    assert_eq!(
+        same_item
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .filter(|node| crate::projected_index::ProjectedIndexPlan::is_projected(node))
+            .count(),
+        1
+    );
+    let same_linear = crate::LinearKernel::from_uop(&same_item.kernel).unwrap();
+    assert!(!same_linear.enabled);
+    assert!(same_linear.reason.contains("projected index"));
+    assert!(same_linear.buffers.iter().any(|buffer| {
+        buffer.buffer == same_producer.index() as u64
+            && matches!(
+                &buffer.access,
+                crate::LinearAccess::ScalarOnly(reason) if reason.contains("projected index")
+            )
+    }));
+    let same_capture =
+        crate::CapturedSchedule::capture(&same_shape, &same_schedule, &[same_output]).unwrap();
+    let same_bytes = same_capture.to_bytes().unwrap();
+    let same_decoded = crate::CapturedSchedule::from_bytes(&same_bytes).unwrap();
+    assert_eq!(same_decoded.to_bytes().unwrap(), same_bytes);
+    let same_values = same_decoded
+        .replay(&BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2, 3, 4], (1..=24).map(|value| value as f32).collect()).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(
+        same_values[0].storage(),
+        &crate::Storage::F32(vec![
+            1.0, 25.0, 81.0, 4.0, 36.0, 100.0, 9.0, 49.0, 121.0, 16.0, 64.0, 144.0, 169.0, 289.0,
+            441.0, 196.0, 324.0, 484.0, 225.0, 361.0, 529.0, 256.0, 400.0, 576.0,
+        ])
+    );
+    crate::CpuJit::render(&same_item.kernel).unwrap();
+    crate::PtxRenderer::new(80)
+        .unwrap()
+        .render(&same_item.kernel)
+        .unwrap();
+    crate::runtime::opencl::OpenClRenderer::default()
+        .render(&same_item.kernel)
+        .unwrap();
+    crate::runtime::metal::MetalRenderer::new(
+        1,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: usize::MAX,
+            unified_memory: false,
+            family: "projected-index-same-shape-test".into(),
+        },
+    )
+    .unwrap()
+    .render(&same_item.kernel)
+    .unwrap();
+    crate::runtime::webgpu::WgslRenderer::new(
+        1,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: usize::MAX,
+            max_storage_buffers_per_shader_stage: u32::MAX,
+            max_compute_workgroup_size_x: 1,
+            max_compute_workgroups_per_dimension: u32::MAX,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap()
+    .render(&same_item.kernel)
+    .unwrap();
+
+    let (mut reduced_graph, _, reduced_producer, reduced_view) = graph_with_projected_view();
+    let reduced = reduced_graph
+        .reduce(reduced_view, crate::ReduceKind::Sum, Some(vec![2]), false)
+        .unwrap();
+    let reduced_schedule = schedule(&reduced_graph, reduced).unwrap();
+    reduced_schedule.validate().unwrap();
+    let reduced_item = reduced_schedule
+        .items
+        .iter()
+        .find(|item| item.node == reduced)
+        .unwrap();
+    assert!(
+        reduced_schedule
+            .items
+            .iter()
+            .all(|item| item.node != reduced_view)
+    );
+    assert_eq!(
+        reduced_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![reduced_producer]
+    );
+    assert!(
+        reduced_item
+            .kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_projected)
+    );
+    crate::CpuJit::render(&reduced_item.kernel).unwrap();
+    crate::PtxRenderer::new(80)
+        .unwrap()
+        .render(&reduced_item.kernel)
+        .unwrap();
+    crate::runtime::opencl::OpenClRenderer::default()
+        .render(&reduced_item.kernel)
+        .unwrap();
+    crate::runtime::metal::MetalRenderer::new(
+        1,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: usize::MAX,
+            unified_memory: false,
+            family: "projected-index-reduction-test".into(),
+        },
+    )
+    .unwrap()
+    .render(&reduced_item.kernel)
+    .unwrap();
+    crate::runtime::webgpu::WgslRenderer::new(
+        1,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: usize::MAX,
+            max_storage_buffers_per_shader_stage: u32::MAX,
+            max_compute_workgroup_size_x: 1,
+            max_compute_workgroups_per_dimension: u32::MAX,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap()
+    .render(&reduced_item.kernel)
+    .unwrap();
+
+    let (mut many, _, _, view) = graph_with_projected_view();
+    let mut many_output = view;
+    for index in 0..9 {
+        let extra = many.input_dtype(format!("extra{index}"), [1, 2, 4], DType::F32);
+        many_output = many.add(many_output, extra).unwrap();
+    }
+    let many_schedule = schedule(&many, many_output).unwrap();
+    let many_item = many_schedule
+        .items
+        .iter()
+        .find(|item| item.node == many_output)
+        .unwrap();
+    assert_eq!(many_item.ordered_inputs().len(), 10);
+    let ptx = crate::PtxRenderer::new(80)
+        .unwrap()
+        .render(&many_item.kernel)
+        .unwrap();
+    assert!(ptx.source.contains("ld.param.u64 %rd100, [p9]"));
+    assert!(ptx.source.contains("%rgi0"));
+
+    let mut raw = Graph::new();
+    let condition = raw.input_dtype("condition", [1, 2, 2, 2], DType::Bool);
+    let payload = raw.input_dtype("payload", [1, 2, 2, 2], DType::F32);
+    let alternative = raw.input_dtype("alternative", [1, 2, 2, 2], DType::F32);
+    let selected = raw.select(condition, payload, alternative).unwrap();
+    let selected = raw.permute(selected, [0, 2, 1, 3]).unwrap();
+    let selected = raw.reshape(selected, [1, 2, 4]).unwrap();
+    let scheduled = schedule(&raw, selected).unwrap();
+    let capture = crate::CapturedSchedule::capture(&raw, &scheduled, &[selected]).unwrap();
+    let payload_bits = [
+        0x8000_0000,
+        0x7fc0_0001,
+        0x7f80_0000,
+        0x3f80_0000,
+        0xff80_0000,
+        0x0000_0000,
+        0xbf80_0000,
+        0x7fc0_1234,
+    ];
+    let replayed = capture
+        .replay(&BTreeMap::from([
+            (
+                "condition".into(),
+                TensorData::from_storage([1, 2, 2, 2], crate::Storage::Bool(vec![true; 8]))
+                    .unwrap(),
+            ),
+            (
+                "payload".into(),
+                TensorData::from_storage(
+                    [1, 2, 2, 2],
+                    crate::Storage::F32(
+                        payload_bits
+                            .into_iter()
+                            .map(f32::from_bits)
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+                .unwrap(),
+            ),
+            (
+                "alternative".into(),
+                TensorData::new([1, 2, 2, 2], vec![0.0; 8]).unwrap(),
+            ),
+        ]))
+        .unwrap();
+    let crate::Storage::F32(values) = replayed[0].storage() else {
+        panic!("projected raw-lane fixture")
+    };
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        vec![
+            payload_bits[0],
+            payload_bits[1],
+            payload_bits[4],
+            payload_bits[5],
+            payload_bits[2],
+            payload_bits[3],
+            payload_bits[6],
+            payload_bits[7],
+        ]
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2, 2, 2], DType::F32);
+    let producer = empty.square(input).unwrap();
+    let permuted = empty.permute(producer, [0, 2, 1, 3]).unwrap();
+    let reshaped = empty.reshape(permuted, [0, 2, 4]).unwrap();
+    let output = empty.relu(reshaped).unwrap();
+    let scheduled = schedule(&empty, output).unwrap();
+    scheduled.validate().unwrap();
+    let output_item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == output)
+        .unwrap();
+    let projected = output_item
+        .kernel
+        .topological()
+        .unwrap()
+        .into_iter()
+        .find(crate::projected_index::ProjectedIndexPlan::is_projected)
+        .unwrap();
+    assert_eq!(
+        crate::projected_index::ProjectedIndexPlan::from_index(&projected)
+            .unwrap()
+            .output_elements,
+        0
+    );
+    let capture = crate::CapturedSchedule::capture(&empty, &scheduled, &[output]).unwrap();
+    assert_eq!(
+        capture
+            .replay(&BTreeMap::from([(
+                "input".into(),
+                TensorData::new([0, 2, 2, 2], Vec::<f32>::new()).unwrap(),
+            )]))
+            .unwrap()[0]
+            .shape(),
+        &Shape::from([0, 2, 4])
+    );
+}
+
+#[test]
+fn scalar_alias_fusion_owns_shared_intermediate_equivalent_view_paths() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [2, 3], DType::F32);
     let producer = graph.square(input).unwrap();
@@ -1317,7 +1837,7 @@ fn scalar_affine_fusion_owns_shared_intermediate_equivalent_view_paths() {
 }
 
 #[test]
-fn scalar_affine_fusion_uses_normalized_loads_and_exact_materialized_dependencies() {
+fn scalar_alias_fusion_uses_normalized_loads_and_exact_materialized_dependencies() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [2, 3], DType::F32);
     let lhs = graph.input_dtype("lhs", [1, 2], DType::F32);
@@ -1401,7 +1921,7 @@ fn scalar_affine_fusion_uses_normalized_loads_and_exact_materialized_dependencie
 }
 
 #[test]
-fn scalar_affine_fusion_preserves_observable_faulting_and_specialized_roots() {
+fn scalar_alias_fusion_preserves_observable_faulting_and_specialized_roots() {
     fn mapped_output(graph: &mut Graph) -> (crate::NodeId, crate::NodeId) {
         let input = graph.input_dtype("input", [2, 3], DType::F32);
         let producer = graph.square(input).unwrap();
