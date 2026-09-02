@@ -260,6 +260,109 @@ fn upat_rewrites_are_prioritized_shared_and_pure() {
 }
 
 #[test]
+fn upat_varargs_and_typed_payload_predicates_drive_rewrites() {
+    fn scalar_i32(ty: Option<UType>) -> bool {
+        ty == Some(i32t())
+    }
+    fn positive_int(operation: &Operation) -> bool {
+        matches!(operation, Operation::Const(LiteralValue::Int(value)) if *value > 0)
+    }
+    fn select_first(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
+        if captures.get("vector")?.sources().len() < 2 {
+            return None;
+        }
+        captures.get("first").cloned()
+    }
+
+    let one = UOp::constant(1, i32t());
+    let two = UOp::constant(2, i32t());
+    let three = UOp::constant(3, i32t());
+    let vector = UOp::from_operation(
+        Operation::Vectorize,
+        Some(i32t()),
+        vec![one.clone(), two.clone(), three.clone()],
+    );
+    vector.validate().unwrap();
+
+    // Exact sources retain their old arity contract. Prefix varargs match the
+    // declared ordered prefix, while repeated varargs validate every source.
+    assert!(
+        UPat::op(Operation::Vectorize)
+            .sources(vec![UPat::any()])
+            .matches(&vector)
+            .is_none()
+    );
+    let prefix = UPat::op(Operation::Vectorize)
+        .type_predicate(scalar_i32)
+        .sources_prefix(vec![
+            UPat::operation_predicate(positive_int)
+                .type_predicate(scalar_i32)
+                .named("first"),
+        ])
+        .named("vector");
+    let captures = prefix.matches(&vector).unwrap();
+    assert_eq!(captures.get("first"), Some(&one));
+    assert_eq!(captures.get("vector"), Some(&vector));
+    assert!(
+        UPat::op(Operation::Vectorize)
+            .sources_prefix(vec![UPat::any(), UPat::any(), UPat::any(), UPat::any()])
+            .matches(&vector)
+            .is_none()
+    );
+    assert!(
+        UPat::op(Operation::Vectorize)
+            .sources_varargs(UPat::any().type_predicate(scalar_i32))
+            .matches(&vector)
+            .is_some()
+    );
+
+    let mixed = UOp::from_operation(
+        Operation::Vectorize,
+        Some(i32t()),
+        vec![one.clone(), UOp::constant(4, UType::scalar(DType::I64))],
+    );
+    assert!(
+        UPat::op(Operation::Vectorize)
+            .sources_varargs(UPat::any().type_predicate(scalar_i32))
+            .matches(&mixed)
+            .is_none()
+    );
+
+    // A named repeated child retains the existing structural-equality rule.
+    let duplicated = UOp::from_operation(
+        Operation::Vectorize,
+        Some(i32t()),
+        vec![one.clone(), one.clone()],
+    );
+    let all_same = UPat::op(Operation::Vectorize).sources_varargs(UPat::any().named("same"));
+    assert!(all_same.matches(&duplicated).is_some());
+    assert!(all_same.matches(&vector).is_none());
+
+    let encoded = uop::artifact::encode(&vector).unwrap();
+    let mut rules = vec![uop::RewriteRule {
+        name: "select-first-vararg",
+        priority: 0,
+        pattern: prefix,
+        apply: select_first,
+    }];
+    let (rewritten, trace) = uop::rewrite(&vector, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, one);
+    assert_eq!(trace.rules, vec!["select-first-vararg"]);
+    assert_eq!(uop::artifact::encode(&vector).unwrap(), encoded);
+
+    // Repeated-source varargs admit an empty list, matching tinygrad's
+    // repeated-source pattern contract without weakening UOp validation.
+    let source_free = UOp::from_operation(Operation::Special("source-free".into()), None, vec![]);
+    source_free.validate().unwrap();
+    assert!(
+        UPat::op(Operation::Special("source-free".into()))
+            .sources_varargs(UPat::any())
+            .matches(&source_free)
+            .is_some()
+    );
+}
+
+#[test]
 fn scheduled_normalization_converges_across_replacement_chains() {
     let two = UOp::scalar_constant(DType::I32, 2, i32t());
     let three = UOp::scalar_constant(DType::I32, 3, i32t());

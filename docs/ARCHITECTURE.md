@@ -1462,6 +1462,18 @@ unfolded because signed zero, NaN ordering, and payload behavior are observable.
 Conditional control, guards, reductions, effects, and artifact decoding stay
 outside this normalization boundary.
 
+UPat source matching uses one internal exact/prefix/repeated representation.
+Exact patterns retain fixed-arity matching, ordered prefix varargs require their
+declared minimum and ignore only the trailing sources, and repeated varargs apply
+one child pattern to every source, including an empty list. Non-capturing
+function pointers can refine the complete optional `UType` and the
+payload-bearing `Operation`; type and operation predicates compose with exact
+dtype constraints and do not create a second kind/argument taxonomy. Named
+children keep structural-equality
+capture semantics across repeated matches, while a named parent exposes the
+complete variadic source list to a rewrite. These matcher-only capabilities do
+not change UOp nodes, artifact tags, schedule keys, or decoded historical DAGs.
+
 Validation also binds address semantics to the defining operation:
 `DefineGlobal`, `DefineLocal`, and `DefineRegister` require the matching embedded
 `AddressValue` memory space. `LinearKernel::from_uop` validates the complete
