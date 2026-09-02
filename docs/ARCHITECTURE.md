@@ -1522,10 +1522,12 @@ callers opt in only for operations whose roles are semantically interchangeable,
 and an all-identical pattern list emits one candidate. Exact
 patterns retain fixed-arity matching, ordered prefix varargs require their
 declared minimum and ignore only trailing sources, and repeated varargs apply one
-child pattern to every source, including an empty list. Non-capturing function
-pointers refine the complete optional `UType` and payload-bearing `Operation`;
-type and operation predicates compose with exact dtype constraints and do not
-create a second kind/argument taxonomy. Exact tag and tag-set constraints test
+child pattern to every source, including an empty list. Exact `UType` and
+`UType`-set constraints distinguish scalar and vector lanes, and an empty set
+matches no result. Non-capturing function pointers refine the complete optional
+`UType` and payload-bearing `Operation`; type and operation predicates compose
+with exact type membership and do not create a second kind/argument taxonomy.
+Exact tag and tag-set constraints test
 membership against the node's immutable tag before any source capture is
 published. Every alternative and permutation owns
 its candidate capture map, so a failed branch cannot leak a partial named

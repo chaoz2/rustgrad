@@ -365,6 +365,103 @@ fn upat_varargs_and_typed_payload_predicates_drive_rewrites() {
 }
 
 #[test]
+fn upat_exact_dtype_sets_are_lane_aware_and_transactional() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    fn count_and_decline(_: &uop::Captures, _: &UOp) -> Option<UOp> {
+        ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    let narrow = UOp::constant(1, i32t());
+    let wide = UOp::constant(2, i64t());
+    let float = UOp::constant(3, f32t());
+    let vector_ty = UType::vector(DType::I32, 2).unwrap();
+    let vector_value = UOp::from_operation(
+        Operation::Special("vector-value".into()),
+        Some(vector_ty),
+        vec![],
+    );
+    vector_value.validate().unwrap();
+    let vector = UOp::from_operation(
+        Operation::Vectorize,
+        Some(i32t()),
+        vec![narrow.clone(), narrow.clone()],
+    );
+    vector.validate().unwrap();
+
+    let integral = UPat::any().dtypes([i32t(), i64t()]);
+    assert!(integral.matches(&narrow).is_some());
+    assert!(integral.matches(&wide).is_some());
+    assert!(integral.matches(&float).is_none());
+    assert!(integral.matches(&vector_value).is_none());
+    assert!(
+        UPat::any()
+            .dtypes([vector_ty])
+            .matches(&vector_value)
+            .is_some()
+    );
+    assert!(
+        UPat::any()
+            .dtypes(Vec::<UType>::new())
+            .matches(&narrow)
+            .is_none()
+    );
+    // Exact Operation membership already carries typed payload equality; no
+    // parallel Python-style argument field is needed.
+    assert!(
+        UPat::op(Operation::Const(LiteralValue::Int(1)))
+            .matches(&narrow)
+            .is_some()
+    );
+    assert!(
+        UPat::op(Operation::Const(LiteralValue::Int(2)))
+            .matches(&narrow)
+            .is_none()
+    );
+
+    let root = UOp::sink(vec![narrow.clone(), wide.clone()]);
+    root.validate().unwrap();
+    assert!(integral.matches(&root).is_none());
+    let alternatives = UPat::any_of([
+        UPat::op(Operation::Sink).sources(vec![
+            UPat::any().dtypes([i32t()]).named("leaked"),
+            UPat::any().dtypes([f32t()]),
+        ]),
+        UPat::op(Operation::Sink).sources_permuted(vec![
+            UPat::any().dtypes([i64t()]).named("wide"),
+            UPat::any().dtypes([i32t()]).named("narrow"),
+        ]),
+    ])
+    .unwrap();
+    let encoded = uop::artifact::encode(&root).unwrap();
+    let captures = alternatives.matches(&root).unwrap();
+    assert!(captures.get("leaked").is_none());
+    assert_eq!(captures.get("narrow"), Some(&narrow));
+    assert_eq!(captures.get("wide"), Some(&wide));
+
+    assert_eq!(uop::artifact::encode(&root).unwrap(), encoded);
+
+    // Set ordering is not observable matching metadata: equal membership sets
+    // still collapse the all-identical permutation to one callback candidate.
+    ATTEMPTS.store(0, Ordering::Relaxed);
+    let mut rules = vec![uop::RewriteRule {
+        name: "dtype-set-all-same",
+        priority: 0,
+        pattern: UPat::op(Operation::Vectorize).sources_permuted(vec![
+            UPat::any().dtypes([i32t(), i64t()]),
+            UPat::any().dtypes([i64t(), i32t()]),
+        ]),
+        apply: count_and_decline,
+    }];
+    let (unchanged, trace) = uop::rewrite(&vector, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(unchanged, vector);
+    assert!(trace.rules.is_empty());
+    assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn upat_early_rejection_is_prepared_direct_source_metadata() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

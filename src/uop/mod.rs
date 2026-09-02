@@ -1422,7 +1422,7 @@ pub struct UPat {
     alternatives: Option<Vec<UPat>>,
     operations: Option<BTreeSet<Operation>>,
     operation_predicate: Option<fn(&Operation) -> bool>,
-    ty: Option<UType>,
+    types: Option<BTreeSet<UType>>,
     type_predicates: Vec<fn(Option<UType>) -> bool>,
     tags: Option<BTreeSet<UOpTag>>,
     sources: Option<SourceConstraint>,
@@ -1435,7 +1435,7 @@ impl UPat {
             alternatives: None,
             operations: None,
             operation_predicate: None,
-            ty: None,
+            types: None,
             type_predicates: vec![],
             tags: None,
             sources: None,
@@ -1471,7 +1471,14 @@ impl UPat {
         x
     }
     pub fn dtype(mut self, ty: UType) -> Self {
-        self.ty = Some(ty);
+        self.types = Some([ty].into());
+        self
+    }
+    /// Matches membership in the declared set of exact UOp result types.
+    /// Scalar and vector types are distinct, and an empty set deliberately
+    /// matches no node.
+    pub fn dtypes(mut self, types: impl IntoIterator<Item = UType>) -> Self {
+        self.types = Some(types.into_iter().collect());
         self
     }
     /// Adds a predicate over the complete optional UOp result type. This is
@@ -1560,7 +1567,11 @@ impl UPat {
         {
             return false;
         }
-        if self.ty.is_some_and(|x| n.ty() != Some(x)) {
+        if self
+            .types
+            .as_ref()
+            .is_some_and(|types| n.ty().is_none_or(|ty| !types.contains(&ty)))
+        {
             return false;
         }
         if self
@@ -1768,7 +1779,7 @@ impl UPat {
         }
         self.operations == other.operations
             && same_operation_predicate(self.operation_predicate, other.operation_predicate)
-            && self.ty == other.ty
+            && self.types == other.types
             && self.type_predicates.len() == other.type_predicates.len()
             && self
                 .type_predicates
@@ -2108,8 +2119,11 @@ fn is_graph_compare_operation(operation: &Operation) -> bool {
     matches!(operation, Operation::GraphCompare(_))
 }
 
-fn is_scalar_integral_type(ty: Option<UType>) -> bool {
-    ty.is_some_and(|ty| ty.lanes == 1 && (ty.scalar.is_integer() || ty.scalar == DType::Bool))
+fn scalar_integral_types() -> impl Iterator<Item = UType> {
+    DType::INTS
+        .into_iter()
+        .chain([DType::Bool])
+        .map(UType::scalar)
 }
 
 fn exact_storage_carrier(dtype: DType) -> Option<DType> {
@@ -2414,26 +2428,18 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
             name: "fold-integral-unary",
             priority: 7,
             pattern: UPat::operation_predicate(is_foldable_integral_unary_operation)
-                .type_predicate(is_scalar_integral_type)
-                .sources(vec![
-                    UPat::any()
-                        .type_predicate(is_scalar_integral_type)
-                        .named("x"),
-                ]),
+                .dtypes(scalar_integral_types())
+                .sources(vec![UPat::any().dtypes(scalar_integral_types()).named("x")]),
             apply: fold_integral_unary,
         },
         RewriteRule {
             name: "fold-integral-binary",
             priority: 7,
             pattern: UPat::operation_predicate(is_foldable_integral_binary_operation)
-                .type_predicate(is_scalar_integral_type)
+                .dtypes(scalar_integral_types())
                 .sources(vec![
-                    UPat::any()
-                        .type_predicate(is_scalar_integral_type)
-                        .named("lhs"),
-                    UPat::any()
-                        .type_predicate(is_scalar_integral_type)
-                        .named("rhs"),
+                    UPat::any().dtypes(scalar_integral_types()).named("lhs"),
+                    UPat::any().dtypes(scalar_integral_types()).named("rhs"),
                 ]),
             apply: fold_integral_binary,
         },
