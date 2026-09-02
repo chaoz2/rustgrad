@@ -52,7 +52,6 @@ struct BertGeometry {
     time: usize,
     attention_head_size: usize,
     all_head_size: usize,
-    score_shape: Shape,
 }
 
 /// One checked-in tinygrad BERT encoder layer.
@@ -81,8 +80,7 @@ pub struct BertEncoderLayer {
 }
 
 impl BertEncoderLayer {
-    /// Creates graph-independent deterministic parameters for one encoder layer.
-    pub fn new_static(config: BertEncoderLayerConfig, seed: u64) -> Result<Self> {
+    pub(crate) fn validate_config(config: BertEncoderLayerConfig) -> Result<()> {
         if config.hidden_size == 0
             || config.intermediate_size == 0
             || config.num_attention_heads == 0
@@ -92,7 +90,12 @@ impl BertEncoderLayer {
             });
         }
         validate_dropout_probability(config.attention_dropout)?;
-        validate_dropout_probability(config.hidden_dropout)?;
+        validate_dropout_probability(config.hidden_dropout)
+    }
+
+    /// Creates graph-independent deterministic parameters for one encoder layer.
+    pub fn new_static(config: BertEncoderLayerConfig, seed: u64) -> Result<Self> {
+        Self::validate_config(config)?;
         let attention_head_size = config.hidden_size / config.num_attention_heads;
         let all_head_size = config.num_attention_heads * attention_head_size;
         Ok(Self {
@@ -185,8 +188,83 @@ impl BertEncoderLayer {
             time,
             attention_head_size,
             all_head_size,
-            score_shape,
         })
+    }
+
+    fn active_dropout_slots(&self) -> [bool; 3] {
+        [
+            self.config.attention_dropout > 0.0 && self.config.attention_dropout < 1.0,
+            self.config.hidden_dropout > 0.0 && self.config.hidden_dropout < 1.0,
+            self.config.hidden_dropout > 0.0 && self.config.hidden_dropout < 1.0,
+        ]
+    }
+
+    pub(crate) fn ambient_dropout_requests(
+        &self,
+        hidden_shape: &Shape,
+    ) -> Result<Vec<(Shape, DType)>> {
+        if hidden_shape.rank() != 3 || hidden_shape.dims()[2] != self.config.hidden_size {
+            return Err(Error::InvalidAttention {
+                reason: "BERT hidden states must have shape [batch, time, hidden]",
+            });
+        }
+        let batch = hidden_shape.dims()[0];
+        let time = hidden_shape.dims()[1];
+        let shapes = [
+            Shape::new([batch, self.config.num_attention_heads, time, time]),
+            hidden_shape.clone(),
+            hidden_shape.clone(),
+        ];
+        shapes[0].numel()?;
+        Ok(self
+            .active_dropout_slots()
+            .into_iter()
+            .zip(shapes)
+            .filter(|(active, _)| *active)
+            .map(|(_, shape)| (shape, DType::F32))
+            .collect())
+    }
+
+    pub(crate) fn lower_explicit(
+        &self,
+        graph: &mut Graph,
+        hidden_states: NodeId,
+        attention_mask: NodeId,
+        mode: Mode,
+    ) -> Result<NodeId> {
+        let dropout = match mode {
+            Mode::Eval => BertDropout::Eval,
+            Mode::Training => BertDropout::Seeded(self.dropout_seeds),
+        };
+        self.lower(graph, hidden_states, attention_mask, dropout)
+    }
+
+    pub(crate) fn lower_ambient_reserved(
+        &self,
+        graph: &mut Graph,
+        hidden_states: NodeId,
+        attention_mask: NodeId,
+        streams: &[RandomStream],
+    ) -> Result<NodeId> {
+        let active = self.active_dropout_slots();
+        if streams.len() != active.into_iter().filter(|active| *active).count() {
+            return Err(Error::InvalidRandom {
+                reason: "BERT ambient dropout stream count mismatch",
+            });
+        }
+        let mut next = streams.iter().copied();
+        let mut reserved = [None; 3];
+        for (slot, active) in active.into_iter().enumerate() {
+            if active {
+                reserved[slot] = next.next();
+            }
+        }
+        self.lower(
+            graph,
+            hidden_states,
+            attention_mask,
+            BertDropout::Ambient(reserved),
+        )
     }
 
     fn heads(
@@ -341,11 +419,7 @@ impl BertEncoderLayer {
         mode: Mode,
     ) -> Result<ModeForwardOutput<'a>> {
         let mut candidate = graph.clone();
-        let dropout = match mode {
-            Mode::Eval => BertDropout::Eval,
-            Mode::Training => BertDropout::Seeded(self.dropout_seeds),
-        };
-        let output = self.lower(&mut candidate, hidden_states, attention_mask, dropout)?;
+        let output = self.lower_explicit(&mut candidate, hidden_states, attention_mask, mode)?;
         *graph = candidate;
         Ok(ModeForwardOutput {
             output,
@@ -360,26 +434,11 @@ impl BertEncoderLayer {
         hidden_states: NodeId,
         attention_mask: NodeId,
     ) -> Result<ModeForwardOutput<'a>> {
-        let geometry = self.geometry(graph, hidden_states, attention_mask)?;
+        self.geometry(graph, hidden_states, attention_mask)?;
         if !TrainingContext::is_training() {
             return self.forward_mode(graph, hidden_states, attention_mask, Mode::Eval);
         }
-        let active = [
-            self.config.attention_dropout > 0.0 && self.config.attention_dropout < 1.0,
-            self.config.hidden_dropout > 0.0 && self.config.hidden_dropout < 1.0,
-            self.config.hidden_dropout > 0.0 && self.config.hidden_dropout < 1.0,
-        ];
-        let shapes = [
-            geometry.score_shape,
-            graph.shape(hidden_states)?.clone(),
-            graph.shape(hidden_states)?.clone(),
-        ];
-        let requests = active
-            .iter()
-            .zip(&shapes)
-            .filter(|(active, _)| **active)
-            .map(|(_, shape)| (shape.clone(), DType::F32))
-            .collect::<Vec<_>>();
+        let requests = self.ambient_dropout_requests(graph.shape(hidden_states)?)?;
         let output = if requests.is_empty() {
             let mut candidate = graph.clone();
             let output = self.lower(
@@ -392,20 +451,7 @@ impl BertEncoderLayer {
             output
         } else {
             graph.with_implicit_uniform_streams(requests, 0, |candidate, streams| {
-                let mut reserved = [None; 3];
-                let mut next = 0;
-                for (slot, active) in active.into_iter().enumerate() {
-                    if active {
-                        reserved[slot] = Some(streams[next]);
-                        next += 1;
-                    }
-                }
-                self.lower(
-                    candidate,
-                    hidden_states,
-                    attention_mask,
-                    BertDropout::Ambient(reserved),
-                )
+                self.lower_ambient_reserved(candidate, hidden_states, attention_mask, streams)
             })?
         };
         Ok(ModeForwardOutput {

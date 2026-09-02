@@ -7,6 +7,7 @@
 
 mod activation;
 mod bert;
+mod bert_model;
 mod conv;
 mod embedding;
 mod init;
@@ -26,6 +27,7 @@ mod transformer;
 
 pub use activation::{ActivationFn, GELU, GeluApproximation, ReLU, SiLU, Sigmoid, Tanh};
 pub use bert::{BertEncoderLayer, BertEncoderLayerConfig};
+pub use bert_model::{BertEmbeddings, BertEncoder, BertModel, BertModelConfig};
 pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
 pub use embedding::Embedding;
 pub use linear::Linear;
