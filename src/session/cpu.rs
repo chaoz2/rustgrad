@@ -598,6 +598,40 @@ impl CpuSession {
         self.handle(node)
     }
 
+    /// Builds tinygrad-style lazy gradients for an ordered target set.
+    ///
+    /// The loss, targets from left to right, and optional explicit seed are
+    /// authenticated before any reverse graph is built. One shared
+    /// [`Graph::gradient`] traversal then returns results in request order;
+    /// repeated targets retain one graph-node identity and disconnected or
+    /// frozen floating targets inherit the graph transform's typed-zero
+    /// policy. The complete session is staged privately, including returned
+    /// handle construction, so failure publishes neither a seed nor a partial
+    /// derivative graph. Successful results remain lazy session tensors and
+    /// may participate in higher-order transforms.
+    pub fn gradient(
+        &mut self,
+        loss: &Tensor,
+        targets: &[&Tensor],
+        gradient: Option<&Tensor>,
+    ) -> Result<Vec<Tensor>> {
+        let loss = self.node(loss)?;
+        let targets = targets
+            .iter()
+            .map(|target| self.node(target))
+            .collect::<Result<Vec<_>>>()?;
+        let gradient = gradient.map(|value| self.node(value)).transpose()?;
+
+        let mut candidate = self.transaction_candidate();
+        let gradients = candidate.graph.gradient(loss, &targets, gradient)?;
+        let handles = gradients
+            .into_iter()
+            .map(|node| candidate.handle(node))
+            .collect::<Result<Vec<_>>>()?;
+        *self = candidate;
+        Ok(handles)
+    }
+
     /// Creates an empty detached gradient store owned by this session.
     pub fn gradient_store(&self) -> CpuGradientStore {
         CpuGradientStore {
@@ -1395,6 +1429,136 @@ mod literal_tests {
         ));
         assert_eq!(session.graph.node_count(), node_count);
         assert_eq!(session.bindings, bindings);
+    }
+
+    #[test]
+    fn lazy_session_gradient_batches_one_traversal_and_retains_higher_order_edges() {
+        let mut session = CpuSession::new();
+        let x = session.variable([3], [2.0, 3.0, 5.0]).unwrap();
+        let y = session.tensor([3], [7.0, 11.0, 13.0]).unwrap();
+        let unused = session
+            .constant(TensorData::zeros_with_dtype([0], DType::F16).unwrap())
+            .unwrap();
+        let square = session.mul(&x, &x).unwrap();
+        let cross = session.mul(&x, &y).unwrap();
+        let combined = session.add(&square, &cross).unwrap();
+        let loss = session.sum_all(&combined).unwrap();
+        let before = session.graph.node_count();
+
+        let gradients = session
+            .gradient(&loss, &[&x, &y, &x, &unused], None)
+            .unwrap();
+        assert_eq!(gradients.len(), 4);
+        assert_eq!(gradients[0].node, gradients[2].node);
+        assert_eq!(gradients[3].shape(), &Shape::new([0]));
+        assert_eq!(gradients[3].dtype(), DType::F16);
+        assert_eq!(
+            (before..session.graph.node_count())
+                .map(NodeId)
+                .filter(|node| {
+                    matches!(
+                        session.graph.op(*node).unwrap(),
+                        Op::Constant(value)
+                            if value.shape() == &Shape::new([])
+                                && value.dtype() == DType::F32
+                                && value.to_vec_f64() == [1.0]
+                    )
+                })
+                .count(),
+            1,
+            "the batch must own one implicit typed seed"
+        );
+
+        let realized = session
+            .realize_many(&gradients.iter().collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(realized[0].to_vec_f64(), vec![11.0, 17.0, 23.0]);
+        assert_eq!(realized[1].to_vec_f64(), vec![2.0, 3.0, 5.0]);
+        assert_eq!(realized[0], realized[2]);
+        assert_eq!(realized[3].shape(), &Shape::new([0]));
+        assert_eq!(realized[3].dtype(), DType::F16);
+
+        let first_sum = session.sum_all(&gradients[0]).unwrap();
+        let second = session.gradient(&first_sum, &[&y], None).unwrap();
+        assert_eq!(
+            session.realize(&second[0]).unwrap().to_vec_f64(),
+            vec![1.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn lazy_session_gradient_authenticates_in_order_and_commits_atomically() {
+        let mut session = CpuSession::new();
+        let x = session.variable([2], [2.0, 3.0]).unwrap();
+        let output = session.mul(&x, &x).unwrap();
+        let seed = session.tensor([2], [3.0, 4.0]).unwrap();
+        let bad_seed = session.tensor([3], [1.0, 1.0, 1.0]).unwrap();
+        let integer = session
+            .tensor_with_dtype([2], DType::I32, [Scalar::I(1), Scalar::I(2)])
+            .unwrap();
+
+        let node_count = session.graph.node_count();
+        let bindings = session.bindings.clone();
+        assert!(matches!(
+            session.gradient(&output, &[&x], Some(&bad_seed)),
+            Err(Error::GradientShape { output, upstream })
+                if output == Shape::new([2]) && upstream == Shape::new([3])
+        ));
+        assert_eq!(session.graph.node_count(), node_count);
+        assert_eq!(session.bindings, bindings);
+        assert!(matches!(
+            session.gradient(&output, &[&integer], Some(&seed)),
+            Err(Error::NonDifferentiableTarget(node)) if node == integer.node
+        ));
+        assert_eq!(session.graph.node_count(), node_count);
+
+        let mut target_session = CpuSession::new();
+        let foreign_target = target_session.variable([2], [5.0, 7.0]).unwrap();
+        let mut seed_session = CpuSession::new();
+        let foreign_seed = seed_session.tensor([2], [1.0, 1.0]).unwrap();
+        assert!(matches!(
+            session.gradient(&foreign_target, &[&x], Some(&foreign_seed)),
+            Err(Error::SessionHandleMismatch { actual, .. })
+                if actual == foreign_target.session
+        ));
+        assert!(matches!(
+            session.gradient(&output, &[&x, &foreign_target], Some(&foreign_seed)),
+            Err(Error::SessionHandleMismatch { actual, .. })
+                if actual == foreign_target.session
+        ));
+        assert!(matches!(
+            session.gradient(&output, &[&x], Some(&foreign_seed)),
+            Err(Error::SessionHandleMismatch { actual, .. })
+                if actual == foreign_seed.session
+        ));
+        assert_eq!(session.graph.node_count(), node_count);
+        assert_eq!(session.bindings, bindings);
+
+        assert!(matches!(
+            session.gradient(&output, &[], None),
+            Err(Error::NonScalarLoss(shape)) if shape == Shape::new([2])
+        ));
+        assert!(
+            session
+                .gradient(&output, &[], Some(&bad_seed))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(session.graph.node_count(), node_count);
+
+        let gradients = session.gradient(&output, &[&x], Some(&seed)).unwrap();
+        assert_eq!(
+            session.realize(&gradients[0]).unwrap().to_vec_f64(),
+            vec![12.0, 24.0]
+        );
+        let scalar = session.sum_all(&output).unwrap();
+        let scalar_seed = session.tensor([], [5.0]).unwrap();
+        let before_identity = session.graph.node_count();
+        let identity = session
+            .gradient(&scalar, &[&scalar], Some(&scalar_seed))
+            .unwrap();
+        assert_eq!(identity[0].node, scalar_seed.node);
+        assert_eq!(session.graph.node_count(), before_identity);
     }
 
     #[test]

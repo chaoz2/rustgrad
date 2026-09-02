@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:1f0478217c50c91c",
+  "source_fingerprint": "fnv1a64:560c5339f63bdb15",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -378,7 +378,7 @@
       "subject": "Reverse-mode graph transform",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "IR-to-IR transform covers current ALU, movement, reductions and first-order dedicated primitives. Source-facing `Graph::gradient` / `gradient_default` and legacy `Graph::grad_with` share one reverse-edge projection and visit only the root-to-requested-target slice, so unrelated nondifferentiable value branches and predicate/index/control edges do not participate. The source-facing batch preserves ordered duplicate result aliases, admits connected concrete floating targets independently of RustGrad's leaf tracking bit, and returns one shared typed `const_like(0)` fallback per disconnected target. Its established explicit-seed policy keeps an exact loss descriptor, reshapes equal-element-count descriptors, or expands only when ordinary broadcasting produces the loss descriptor; implicit seeds require a rank-zero loss. An empty target request retains loss and explicit-seed ownership admission plus the implicit rank-zero requirement, but publishes no seed or reverse nodes. Both entry points build and validate the entire transform on a cloned candidate before atomically replacing the live graph while preserving its no-grad mode. `grad_with` retains its distinct target `requires_grad`, descriptor-exact upstream, `NoGradient`, one-element implicit-seed, and `create_graph` contracts."
+        "Acceptance requirement": "IR-to-IR transform covers current ALU, movement, reductions and first-order dedicated primitives. Source-facing `Graph::gradient` / `gradient_default` and legacy `Graph::grad_with` share one reverse-edge projection and visit only the root-to-requested-target slice, so unrelated nondifferentiable value branches and predicate/index/control edges do not participate. The source-facing batch preserves ordered duplicate result aliases, admits connected concrete floating targets independently of RustGrad's leaf tracking bit, and returns one shared typed `const_like(0)` fallback per disconnected target. Its established explicit-seed policy keeps an exact loss descriptor, reshapes equal-element-count descriptors, or expands only when ordinary broadcasting produces the loss descriptor; implicit seeds require a rank-zero loss. An empty target request retains loss and explicit-seed ownership admission plus the implicit rank-zero requirement, but publishes no seed or reverse nodes. Both entry points build and validate the entire transform on a cloned candidate before atomically replacing the live graph while preserving its no-grad mode. `CpuSession::gradient` projects that same one-traversal batch into ordered lazy session tensors: loss, targets left-to-right, and optional seed authenticate before a private whole-session candidate commits; duplicate results retain one graph-node identity, failures publish nothing, and successful outputs remain higher-order graph values. `grad_with` retains its distinct target `requires_grad`, descriptor-exact upstream, `NoGradient`, one-element implicit-seed, and `create_graph` contracts."
       }
     },
     {
