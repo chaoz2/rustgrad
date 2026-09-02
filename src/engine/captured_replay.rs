@@ -1054,6 +1054,22 @@ fn initial_values(
                 .ok_or_else(|| ReplayError::Missing(input.name.clone()))?,
         );
     }
+    for passthrough in &capture.requested_passthroughs {
+        let source = values
+            .tensor(
+                passthrough.source.index() as u64,
+                "requested passthrough source",
+            )?
+            .clone();
+        let view =
+            passthrough.desc.view.as_ref().ok_or_else(|| {
+                ReplayError::Corrupt("requested passthrough view is absent".into())
+            })?;
+        let projected = source
+            .affine_read(view)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        values.insert_tensor(passthrough.requested.index() as u64, projected);
+    }
     Ok(values)
 }
 

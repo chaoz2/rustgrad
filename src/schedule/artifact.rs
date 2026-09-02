@@ -22,7 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAGIC: &[u8; 4] = b"RGSA";
 /// v7 replaces implementation-selected `DefaultHasher` item/specialization
 /// keys with the canonical versioned schedule-key codec.
-const VERSION: u8 = 7;
+/// v8 adds authenticated zero-kernel requested affine passthroughs while
+/// preserving every v1-v7 decoder and payload.
+const VERSION: u8 = 8;
 const LAST_OPAQUE_KEY_VERSION: u8 = 6;
 const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 // The executable envelope supports ordered outputs; the inspection-only
@@ -31,7 +33,7 @@ const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 /// distinct magic and identity domain from the released single-output
 /// executable artifact above.
 const MULTI_MAGIC: &[u8; 4] = b"RGSO";
-const MULTI_VERSION: u8 = 2;
+const MULTI_VERSION: u8 = 3;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -102,6 +104,12 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         // Never claim a current process can reproduce the old key state:
         // discard it and derive the current canonical identities instead.
         rekey_current(&mut capture)?;
+    }
+    if version < VERSION {
+        // The stored envelope identity authenticates the exact historical
+        // payload above.  Current validation must instead use the identity
+        // of the upgraded payload, including fields appended by newer
+        // versions such as the v8 requested-passthrough sidecar.
         capture.identity = identity(&capture)?;
     }
     validate_capture(&capture)?;
@@ -152,7 +160,7 @@ pub fn decode_scheduled_outputs(bytes: &[u8]) -> Result<CapturedSchedule, Artifa
         return Err(ArtifactError::Format("scheduled-output version"));
     }
     let stored_identity = r.u64()?;
-    let mut capture = read_scheduled_outputs_payload(&mut r, stored_identity)?;
+    let mut capture = read_scheduled_outputs_payload(&mut r, stored_identity, version)?;
     if !r.done() {
         return Err(ArtifactError::Format("schedule trailing bytes"));
     }
@@ -215,6 +223,7 @@ fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactErr
         w.u64(*id)?;
         write_quantized_data(w, value)?;
     }
+    write_requested_passthroughs(w, &c.requested_passthroughs)?;
     Ok(())
 }
 
@@ -233,6 +242,38 @@ fn write_payload_v5(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     for (id, value) in &c.quantized_constants {
         w.u64(*id)?;
         write_quantized_data(w, value)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_payload_v7(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_base(w, c, true, true, true)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    Ok(())
+}
+
+fn write_requested_passthroughs(
+    w: &mut Writer,
+    passthroughs: &[crate::RequestedPassthrough],
+) -> Result<(), ArtifactError> {
+    write_len(w, passthroughs.len(), MAX_BINDINGS)?;
+    for passthrough in passthroughs {
+        w.u64(passthrough.requested.index() as u64)?;
+        w.u64(passthrough.source.index() as u64)?;
+        write_desc_inner(w, &passthrough.desc, true)?;
     }
     Ok(())
 }
@@ -328,6 +369,44 @@ fn write_scheduled_outputs_payload(
         w.u64(*id)?;
         write_quantized_data(w, value)?;
     }
+    write_requested_passthroughs(w, &c.requested_passthroughs)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_scheduled_outputs_payload_v2(
+    w: &mut Writer,
+    c: &CapturedSchedule,
+) -> Result<(), ArtifactError> {
+    write_len(w, c.items.len(), MAX_ITEMS)?;
+    for item in &c.items {
+        write_scheduled_outputs_item(w, item)?;
+    }
+    write_len(w, c.inputs.len(), MAX_BINDINGS)?;
+    for input in &c.inputs {
+        w.string(&input.name)?;
+        w.u64(input.node.index() as u64)?;
+        write_desc_inner(w, &input.desc, false)?;
+    }
+    write_len(w, c.constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.constants {
+        w.u64(*id)?;
+        tensor_artifact::encode_into(w, value)?;
+    }
+    write_u64s(w, &c.requested)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
     Ok(())
 }
 
@@ -385,11 +464,17 @@ fn read_payload(
             }
         }
     }
+    let requested_passthroughs = if version >= 8 {
+        read_requested_passthroughs(r)?
+    } else {
+        Vec::new()
+    };
     Ok(CapturedSchedule {
         items,
         inputs,
         constants,
         quantized_constants,
+        requested_passthroughs,
         requested,
         identity,
         symbolic,
@@ -400,6 +485,7 @@ fn read_payload(
 fn read_scheduled_outputs_payload(
     r: &mut Reader<'_>,
     identity: u64,
+    version: u8,
 ) -> Result<CapturedSchedule, ArtifactError> {
     let n = r.count(MAX_ITEMS)?;
     let mut items = Vec::with_capacity(n);
@@ -448,16 +534,37 @@ fn read_scheduled_outputs_payload(
             return Err(ArtifactError::Format("duplicate quantized constant"));
         }
     }
+    let requested_passthroughs = if version >= 3 {
+        read_requested_passthroughs(r)?
+    } else {
+        Vec::new()
+    };
     Ok(CapturedSchedule {
         items,
         inputs,
         constants,
         quantized_constants,
+        requested_passthroughs,
         requested,
         identity,
         symbolic,
         specialized_from,
     })
+}
+
+fn read_requested_passthroughs(
+    r: &mut Reader<'_>,
+) -> Result<Vec<crate::RequestedPassthrough>, ArtifactError> {
+    let n = r.count(MAX_BINDINGS)?;
+    let mut passthroughs = Vec::with_capacity(n);
+    for _ in 0..n {
+        passthroughs.push(crate::RequestedPassthrough {
+            requested: node(r.u64()?)?,
+            source: node(r.u64()?)?,
+            desc: read_desc_inner(r, true)?,
+        });
+    }
+    Ok(passthroughs)
 }
 
 #[cfg(test)]
@@ -918,6 +1025,7 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
         || c.quantized_constants.len() > MAX_BINDINGS
+        || c.requested_passthroughs.len() > MAX_BINDINGS
     {
         return Err(ArtifactError::Format("schedule limit"));
     }
@@ -1017,6 +1125,53 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
             return Err(ArtifactError::Format("replay input"));
         }
     }
+    let mut passthrough_requested = BTreeSet::new();
+    let mut passthrough_sources = BTreeSet::new();
+    for passthrough in &c.requested_passthroughs {
+        passthrough
+            .validate()
+            .map_err(|_| ArtifactError::Format("requested passthrough"))?;
+        let requested = passthrough.requested.index() as u64;
+        let source = passthrough.source.index() as u64;
+        if !passthrough_requested.insert(requested)
+            || !c.requested.contains(&requested)
+            || output_ids.contains(&requested)
+            || output_ids.contains(&source)
+        {
+            return Err(ArtifactError::Format("requested passthrough ownership"));
+        }
+        passthrough_sources.insert(source);
+        let mut physical = passthrough.desc.clone();
+        physical.view = None;
+        let input_owner = c
+            .inputs
+            .iter()
+            .filter(|input| input.desc.id == source)
+            .count();
+        let constant_owner = if c.constants.contains_key(&source) {
+            1
+        } else {
+            0
+        };
+        if input_owner + constant_owner != 1
+            || c.inputs
+                .iter()
+                .find(|input| input.desc.id == source)
+                .is_some_and(|input| {
+                    input.desc.id != physical.id
+                        || input.desc.shape != physical.shape
+                        || input.desc.dtype != physical.dtype
+                        || input.desc.bytes != physical.bytes
+                        || input.desc.alignment != physical.alignment
+                        || !input.desc.read_only
+                })
+            || c.constants.get(&source).is_some_and(|value| {
+                value.shape() != &physical.shape || value.dtype() != physical.dtype
+            })
+        {
+            return Err(ArtifactError::Format("requested passthrough source"));
+        }
+    }
     for (id, value) in &c.constants {
         if value.shape().numel().is_err() || value.len() != value.shape().numel().unwrap() {
             return Err(ArtifactError::Format("constant tensor"));
@@ -1031,7 +1186,7 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
             if value.shape() != &desc.shape || value.dtype() != desc.dtype {
                 return Err(ArtifactError::Format("constant descriptor"));
             }
-        } else if !c.requested.contains(id) {
+        } else if !c.requested.contains(id) && !passthrough_sources.contains(id) {
             return Err(ArtifactError::Format("unbound constant"));
         }
     }
@@ -1078,6 +1233,7 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
             .map(|binding| binding.input_node.index() as u64)
     }));
     used.extend(c.requested.iter().copied());
+    used.extend(passthrough_sources.iter().copied());
     if c.inputs.iter().any(|x| !used.contains(&x.desc.id)) {
         return Err(ArtifactError::Format("unused replay input"));
     }
@@ -1095,12 +1251,18 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
         .copied()
         .chain(c.constants.keys().copied())
         .chain(outputs.iter().copied())
+        .chain(passthrough_requested.iter().copied())
         .collect::<BTreeSet<_>>();
     if c.requested
         .iter()
         .any(|x| !requested.insert(*x) || !replay_values.contains(x))
     {
         return Err(ArtifactError::Format("requested value"));
+    }
+    if !c.requested_passthroughs.is_empty()
+        && (c.symbolic.is_some() || c.specialized_from.is_some())
+    {
+        return Err(ArtifactError::Format("symbolic requested passthrough"));
     }
     if c.symbolic.is_some() && c.specialized_from.is_some() {
         return Err(ArtifactError::Format("symbolic specialization state"));
@@ -1169,6 +1331,7 @@ fn validate_scheduled_outputs(
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
         || c.quantized_constants.len() > MAX_BINDINGS
+        || c.requested_passthroughs.len() > MAX_BINDINGS
     {
         return Err(ArtifactError::Format("schedule limit"));
     }
@@ -1217,14 +1380,22 @@ fn validate_scheduled_outputs(
     }
 
     let mut requested = BTreeSet::new();
-    let passthrough_ids = c
+    let source_ids = c
         .inputs
         .iter()
         .map(|input| input.desc.id)
         .chain(c.constants.keys().copied())
         .collect::<BTreeSet<_>>();
+    let passthrough_ids = c
+        .requested_passthroughs
+        .iter()
+        .map(|passthrough| passthrough.requested.index() as u64)
+        .collect::<BTreeSet<_>>();
     if c.requested.iter().any(|id| {
-        !requested.insert(*id) || (!output_ids.contains(id) && !passthrough_ids.contains(id))
+        !requested.insert(*id)
+            || (!output_ids.contains(id)
+                && !source_ids.contains(id)
+                && !passthrough_ids.contains(id))
     }) {
         return Err(ArtifactError::Format("requested value"));
     }
@@ -1249,9 +1420,9 @@ fn validate_scheduled_outputs(
         .iter()
         .map(|item| item.primary_output().id)
         .collect::<BTreeSet<_>>();
-    projected
-        .requested
-        .retain(|id| primary_ids.contains(id) || passthrough_ids.contains(id));
+    projected.requested.retain(|id| {
+        primary_ids.contains(id) || source_ids.contains(id) || passthrough_ids.contains(id)
+    });
     let provenance = projected.specialized_from.clone();
     for item in &mut projected.items {
         let primary = item.primary_output().clone();
@@ -1666,25 +1837,32 @@ mod tests {
     }
 
     fn unchecked(capture: &CapturedSchedule) -> Vec<u8> {
+        unchecked_with_identity(capture, identity(capture).unwrap())
+    }
+
+    fn unchecked_with_identity(capture: &CapturedSchedule, stored_identity: u64) -> Vec<u8> {
         let mut w = Writer::new();
         w.bytes(MAGIC).unwrap();
         w.u8(VERSION).unwrap();
-        w.u64(identity(capture).unwrap()).unwrap();
+        w.u64(stored_identity).unwrap();
         write_payload(&mut w, capture).unwrap();
         let sum = checksum(&w.out);
         w.u32(sum).unwrap();
         w.out
     }
 
-    fn unchecked_scheduled_outputs(capture: &CapturedSchedule) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.bytes(MULTI_MAGIC).unwrap();
-        w.u8(MULTI_VERSION).unwrap();
-        w.u64(scheduled_outputs_identity(capture).unwrap()).unwrap();
-        write_scheduled_outputs_payload(&mut w, capture).unwrap();
-        let sum = checksum(&w.out);
-        w.u32(sum).unwrap();
-        w.out
+    fn legacy_scheduled_outputs_v2(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_scheduled_outputs_payload_v2(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MULTI_MAGIC).unwrap();
+        writer.u8(2).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
     }
 
     fn legacy_v1(capture: &CapturedSchedule) -> Vec<u8> {
@@ -1715,6 +1893,20 @@ mod tests {
         writer.u8(5).unwrap();
         writer.u64(identity_v5(capture).unwrap()).unwrap();
         write_payload_v5(&mut writer, capture).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
+    fn legacy_v7(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_payload_v7(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(7).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
         let sum = checksum(&writer.out);
         writer.u32(sum).unwrap();
         writer.out
@@ -1799,6 +1991,15 @@ mod tests {
         assert_eq!(encode(&upgraded_v2).unwrap()[4], VERSION);
         let upgraded_v5 = decode(&legacy_v5(&capture)).unwrap();
         assert_eq!(encode(&upgraded_v5).unwrap()[4], VERSION);
+        let upgraded_v7 = decode(&legacy_v7(&capture)).unwrap();
+        assert!(upgraded_v7.requested_passthroughs.is_empty());
+        assert_eq!(upgraded_v7.identity, identity(&upgraded_v7).unwrap());
+        let reencoded_v7 = encode(&upgraded_v7).unwrap();
+        assert_eq!(reencoded_v7[4], VERSION);
+        assert_eq!(
+            encode(&decode(&reencoded_v7).unwrap()).unwrap(),
+            reencoded_v7
+        );
     }
 
     #[test]
@@ -1877,15 +2078,64 @@ mod tests {
         assert_eq!(bytes[4], VERSION);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(encode(&decoded).unwrap(), bytes);
-        let view = decoded.items[0]
-            .inputs
-            .iter()
-            .find_map(|input| input.view.as_ref())
-            .expect("stride input binding retains its affine view");
+        assert!(decoded.items.is_empty());
+        let view = decoded.requested_passthroughs[0]
+            .desc
+            .view
+            .as_ref()
+            .expect("stride passthrough retains its affine view");
         assert_eq!(view.logical_shape.dims(), &[2, 2]);
         assert_eq!(view.strides, vec![-3, 2]);
         assert_eq!(view.offset, 3);
         assert!(validate_for_replay(&decoded).is_ok());
+    }
+
+    #[test]
+    fn requested_passthrough_ownership_is_authenticated_in_v8() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::I32);
+        let alternate = graph.input_dtype("alternate", [2, 3], DType::I32);
+        let output = graph.permute(input, [1, 0]).unwrap();
+        let requested = [output, input, alternate];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        let capture = CapturedSchedule::capture(&graph, &schedule, &requested).unwrap();
+        let bytes = encode(&capture).unwrap();
+        assert_eq!(bytes[4], 8);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.requested_passthroughs,
+            capture.requested_passthroughs
+        );
+        assert_eq!(encode(&decoded).unwrap(), bytes);
+        let ordered = encode_scheduled_outputs(&capture).unwrap();
+        assert_eq!(ordered[4], 3);
+        let ordered = decode_scheduled_outputs(&ordered).unwrap();
+        assert_eq!(
+            ordered.requested_passthroughs,
+            capture.requested_passthroughs
+        );
+
+        let mut stale_ownership = capture.clone();
+        stale_ownership.requested_passthroughs[0].source = alternate;
+        stale_ownership.requested_passthroughs[0].desc.id = alternate.index() as u64;
+        let tampered = unchecked_with_identity(&stale_ownership, capture.identity);
+        assert!(matches!(
+            decode(&tampered),
+            Err(ArtifactError::Format("schedule identity"))
+        ));
+
+        let mut out_of_bounds = capture;
+        out_of_bounds.requested_passthroughs[0]
+            .desc
+            .view
+            .as_mut()
+            .unwrap()
+            .offset = i64::MAX;
+        assert!(matches!(
+            identity(&out_of_bounds),
+            Err(ArtifactError::Format("buffer descriptor"))
+        ));
+        assert!(encode(&out_of_bounds).is_err());
     }
 
     #[test]
@@ -2090,12 +2340,8 @@ mod tests {
 
         let mut opaque = capture.clone();
         opaque.items[0].cache_key = 0x8877_6655_4433_2211;
-        let mut v1 = unchecked_scheduled_outputs(&opaque);
-        v1[4] = 1;
-        let body = v1.len() - 4;
-        let sum = checksum(&v1[..body]);
-        v1[body..].copy_from_slice(&sum.to_le_bytes());
-        let upgraded = decode_scheduled_outputs(&v1).unwrap();
+        let v2 = legacy_scheduled_outputs_v2(&opaque);
+        let upgraded = decode_scheduled_outputs(&v2).unwrap();
         assert_eq!(
             encode_scheduled_outputs(&upgraded).unwrap()[4],
             MULTI_VERSION

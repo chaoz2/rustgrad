@@ -262,6 +262,55 @@ fn requested_source_values_are_passthroughs_not_schedule_producers() {
 }
 
 #[test]
+fn requested_source_affine_aliases_are_zero_kernel_passthroughs() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", Shape::from([2, 3]), DType::F32);
+    let transposed = graph.permute(input, [1, 0]).unwrap();
+    let computed = graph.neg(transposed).unwrap();
+    let scalar = graph.input_dtype("scalar", Shape::new([]), DType::I32);
+    let scalar_identity = graph.permute(scalar, []).unwrap();
+    let identity = graph.permute(input, [0, 1]).unwrap();
+    assert_eq!(scalar_identity, scalar);
+    assert_eq!(identity, input);
+
+    let alias_only = schedule(&graph, transposed).unwrap();
+    alias_only.validate().unwrap();
+    assert!(alias_only.items.is_empty());
+    let [passthrough] = alias_only.requested_passthroughs.as_slice() else {
+        panic!("one requested affine passthrough")
+    };
+    assert_eq!(passthrough.requested, transposed);
+    assert_eq!(passthrough.source, input);
+    assert_eq!(passthrough.desc.id, input.index() as u64);
+    assert!(passthrough.desc.read_only);
+    assert_eq!(
+        passthrough.desc.view.as_ref().unwrap().logical_shape,
+        Shape::from([3, 2])
+    );
+
+    let mixed = schedule_many(&graph, &[transposed, computed, scalar_identity]).unwrap();
+    mixed.validate().unwrap();
+    assert_eq!(mixed.requested_passthroughs, vec![passthrough.clone()]);
+    assert_eq!(mixed.items.len(), 1);
+    assert_eq!(mixed.items[0].node, computed);
+    assert_eq!(
+        mixed.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.desc.id)
+            .collect::<Vec<_>>(),
+        vec![input.index() as u64]
+    );
+
+    let mut malformed = alias_only.clone();
+    malformed.requested_passthroughs[0].desc.id = transposed.index() as u64;
+    assert!(matches!(
+        malformed.validate(),
+        Err(crate::ScheduleError::Binding(_))
+    ));
+}
+
+#[test]
 fn sole_use_contiguous_redirects_ordinary_producer_into_owned_output() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [3], DType::F32);
@@ -1848,6 +1897,7 @@ fn scheduled_outputs_are_nonempty_ordered_and_define_cache_identity() {
 
     let live = crate::Schedule {
         items: vec![single],
+        requested_passthroughs: vec![],
         value_bindings: vec![],
         state_bindings: vec![],
     };

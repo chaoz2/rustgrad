@@ -462,6 +462,7 @@ impl CapturedMixedSchedule {
         validate(self, true)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
+            requested_passthroughs: self.schedule.requested_passthroughs.clone(),
             value_bindings: self.value_bindings.clone(),
             state_bindings: self.state_bindings.clone(),
         };
@@ -559,6 +560,7 @@ impl CapturedMixedSchedule {
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
         let schedule = Schedule {
             items: self.schedule.items.clone(),
+            requested_passthroughs: self.schedule.requested_passthroughs.clone(),
             value_bindings: self.value_bindings.clone(),
             state_bindings: self.state_bindings.clone(),
         };
@@ -715,6 +717,7 @@ impl CapturedMixedSchedule {
             inputs,
             constants,
             quantized_constants: BTreeMap::new(),
+            requested_passthroughs: Vec::new(),
             requested,
             identity: 0,
             symbolic: None,
@@ -775,6 +778,7 @@ impl CapturedMixedSchedule {
         }
         let schedule = Schedule {
             items: self.schedule.items.clone(),
+            requested_passthroughs: self.schedule.requested_passthroughs.clone(),
             value_bindings: self.value_bindings.clone(),
             state_bindings: self.state_bindings.clone(),
         };
@@ -880,6 +884,7 @@ impl CapturedMixedSchedule {
         let native_trace = self.native_replay_trace(vectorized)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
+            requested_passthroughs: self.schedule.requested_passthroughs.clone(),
             value_bindings: self.value_bindings.clone(),
             state_bindings: self.state_bindings.clone(),
         };
@@ -1227,6 +1232,7 @@ fn recurrent_initial_frontier(
 ) -> Result<Vec<BufferState>, ReplayError> {
     let schedule = Schedule {
         items: capture.schedule.items.clone(),
+        requested_passthroughs: capture.schedule.requested_passthroughs.clone(),
         value_bindings: capture.value_bindings.clone(),
         state_bindings: capture.state_bindings.clone(),
     };
@@ -1818,6 +1824,7 @@ mod tests {
             inputs: vec![],
             constants: BTreeMap::new(),
             quantized_constants: BTreeMap::new(),
+            requested_passthroughs: vec![],
             requested: vec![],
             identity: 0,
             symbolic: None,
@@ -1857,6 +1864,7 @@ mod tests {
         let base = captured_effect();
         let mixed = Schedule {
             items: base.schedule.items.clone(),
+            requested_passthroughs: base.schedule.requested_passthroughs.clone(),
             value_bindings: base.value_bindings.clone(),
             state_bindings: base.state_bindings.clone(),
         };
@@ -1995,6 +2003,7 @@ mod tests {
                 inputs: vec![],
                 constants: BTreeMap::new(),
                 quantized_constants: BTreeMap::new(),
+                requested_passthroughs: vec![],
                 requested: vec![],
                 identity: 0,
                 symbolic: None,
@@ -2431,8 +2440,14 @@ fn validate(value: &CapturedMixedSchedule, validate_keys: bool) -> Result<(), Re
             "RGSM does not encode symbolic schemas or specialization provenance".into(),
         ));
     }
+    if !value.schedule.requested_passthroughs.is_empty() {
+        return Err(ReplayError::Unsupported(
+            "RGSM does not encode requested passthroughs".into(),
+        ));
+    }
     let schedule = Schedule {
         items: value.schedule.items.clone(),
+        requested_passthroughs: value.schedule.requested_passthroughs.clone(),
         value_bindings: value.value_bindings.clone(),
         state_bindings: value.state_bindings.clone(),
     };

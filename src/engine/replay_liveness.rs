@@ -33,6 +33,12 @@ impl ReplayLivenessPlan {
             .iter()
             .map(|input| input.desc.id)
             .chain(capture.constants.keys().copied())
+            .chain(
+                capture
+                    .requested_passthroughs
+                    .iter()
+                    .map(|passthrough| passthrough.requested.index() as u64),
+            )
             .collect::<BTreeSet<_>>();
         let produced_requested = capture
             .items
@@ -126,6 +132,7 @@ mod tests {
             inputs: vec![],
             constants: Default::default(),
             quantized_constants: Default::default(),
+            requested_passthroughs: vec![],
             requested: vec![7],
             identity: 0,
             symbolic: None,
@@ -159,6 +166,7 @@ mod tests {
                 crate::TensorData::zeros_with_dtype([2], crate::DType::F32).unwrap(),
             )]),
             quantized_constants: Default::default(),
+            requested_passthroughs: vec![],
             requested: vec![3, 4],
             identity: 0,
             symbolic: None,

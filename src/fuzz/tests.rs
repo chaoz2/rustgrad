@@ -3726,16 +3726,9 @@ fn general_permute_captures_identity_and_affine_views_for_all_dtypes() {
                 built.graph.op(built.output).unwrap(),
                 Op::Permute { axes, .. } if axes == &vec![1, 0]
             ));
-            assert_eq!(scheduled.items.len(), 1);
-            let nodes = scheduled.items[0].kernel.topological().unwrap();
-            assert!(
-                nodes.iter().any(|node| matches!(
-                    node.operation(),
-                    Operation::Index(IndexValue::View { .. })
-                ))
-            );
-            assert!(CpuJit::render(&scheduled.items[0].kernel).is_ok());
-            assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+            assert!(scheduled.items.is_empty());
+            assert_eq!(scheduled.requested_passthroughs.len(), 1);
+            assert_eq!(scheduled.requested_passthroughs[0].requested, built.output);
         }
         let capture = CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = capture.to_bytes().unwrap();
@@ -3754,7 +3747,7 @@ fn general_permute_captures_identity_and_affine_views_for_all_dtypes() {
             )
             .unwrap();
         assert_eq!(replay.outputs[0].storage(), oracle.storage());
-        assert_eq!(replay.trace.items.is_empty(), axes == [0, 1]);
+        assert!(replay.trace.items.is_empty());
     }
 
     let scalar = FuzzCase::Permute {
@@ -3873,15 +3866,9 @@ fn signed_stride_captures_affine_views_for_all_dtypes_and_preserves_raw_order() 
                 if actual.iter().map(|slice| slice.step).eq([-1, 2])
         ));
         let scheduled = schedule(&built.graph, built.output).unwrap();
-        assert_eq!(scheduled.items.len(), 1);
-        let nodes = scheduled.items[0].kernel.topological().unwrap();
-        assert!(
-            nodes
-                .iter()
-                .any(|node| matches!(node.operation(), Operation::Index(IndexValue::View { .. })))
-        );
-        assert!(CpuJit::render(&scheduled.items[0].kernel).is_ok());
-        assert!(CpuJit::render_vectorized(&scheduled.items[0].kernel).is_ok());
+        assert!(scheduled.items.is_empty());
+        assert_eq!(scheduled.requested_passthroughs.len(), 1);
+        assert_eq!(scheduled.requested_passthroughs[0].requested, built.output);
         let captured =
             CapturedSchedule::capture(&built.graph, &scheduled, &[built.output]).unwrap();
         let bytes = captured.to_bytes().unwrap();
@@ -3900,6 +3887,7 @@ fn signed_stride_captures_affine_views_for_all_dtypes_and_preserves_raw_order() 
             )
             .unwrap();
         assert_eq!(replay.outputs[0].storage(), oracle.storage());
+        assert!(replay.trace.items.is_empty());
     }
 
     let special = FuzzCase::Stride {

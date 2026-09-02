@@ -163,6 +163,7 @@ mod tests {
                 inputs: vec![],
                 constants: BTreeMap::new(),
                 quantized_constants: BTreeMap::new(),
+                requested_passthroughs: vec![],
                 requested: vec![],
                 identity: 0,
                 symbolic: None,
