@@ -5383,15 +5383,16 @@ fn emit(
                         lines: &'a mut Vec<String>,
                         linear: &'a str,
                         next: usize,
+                        free: Vec<usize>,
                     }
                     impl crate::projected_index::ProjectedIndexEmitter for PtxProjectedIndex<'_> {
-                        type Value = String;
+                        type Value = usize;
                         type Error = PtxError;
 
                         fn linear(&mut self) -> Result<Self::Value, Self::Error> {
                             let register = self.allocate()?;
                             self.lines
-                                .push(format!("  cvt.s64.u32 {register}, {};", self.linear));
+                                .push(format!("  cvt.s64.u32 %rgi{register}, {};", self.linear));
                             Ok(register)
                         }
 
@@ -5402,7 +5403,8 @@ fn emit(
                             } else {
                                 value.to_string()
                             };
-                            self.lines.push(format!("  mov.s64 {register}, {literal};"));
+                            self.lines
+                                .push(format!("  mov.s64 %rgi{register}, {literal};"));
                             Ok(register)
                         }
 
@@ -5424,24 +5426,30 @@ fn emit(
                                     ));
                                 }
                             };
-                            let register = self.allocate()?;
                             self.lines
-                                .push(format!("  {mnemonic} {register}, {lhs}, {rhs};"));
-                            Ok(register)
+                                .push(format!("  {mnemonic} %rgi{lhs}, %rgi{lhs}, %rgi{rhs};"));
+                            self.free.push(rhs);
+                            Ok(lhs)
                         }
                     }
                     impl PtxProjectedIndex<'_> {
-                        fn allocate(&mut self) -> Result<String, PtxError> {
+                        fn allocate(&mut self) -> Result<usize, PtxError> {
                             // The generic renderer reserves a distinct rgi
                             // namespace for the closed projected-index dialect.
-                            // Larger address trees remain valid UOps but fail
-                            // closed on PTX.
+                            // Post-order values are move-only: each binary
+                            // operation overwrites its left register and
+                            // releases its right. The fixed budget therefore
+                            // bounds live expression depth rather than total
+                            // authenticated tree nodes.
+                            if let Some(register) = self.free.pop() {
+                                return Ok(register);
+                            }
                             if self.next >= 128 {
                                 return Err(PtxError::Unsupported(
                                     "projected index exceeds PTX register budget".into(),
                                 ));
                             }
-                            let register = format!("%rgi{}", self.next);
+                            let register = self.next;
                             self.next += 1;
                             Ok(register)
                         }
@@ -5450,8 +5458,9 @@ fn emit(
                         lines,
                         linear,
                         next: 0,
+                        free: Vec::new(),
                     };
-                    let offset = plan.emit(&mut emitter)?;
+                    let offset = format!("%rgi{}", plan.emit(&mut emitter)?);
                     (buffer, input_shape, output_shape, None, Some(offset))
                 }
                 Operation::Index(IndexValue::Buffer {

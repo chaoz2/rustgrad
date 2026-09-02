@@ -3,13 +3,14 @@
 use crate::cuda::PrimaryGraphExec;
 use crate::runtime::static_schedule::{
     Sealed, StaticPlanAdapter, StaticRendered, StaticRenderedBuffer, StaticSchedulePlan,
-    bind_rendered_buffers,
+    StaticSymbolicBackend, StaticSymbolicProgram, bind_rendered_buffers,
 };
 use crate::{
-    ConcurrentPtxCache, PrimaryBufferLease, PrimaryContext, PrimaryPtxKernel, PtxBinding, PtxError,
-    PtxRenderer, RenderedPtx, ScheduleItem, Stream, TensorData,
+    CapturedSchedule, ConcurrentPtxCache, PrimaryBufferLease, PrimaryContext, PrimaryPtxKernel,
+    PtxBinding, PtxError, PtxRenderer, RenderedPtx, ReplayError, ReplayInput, ScheduleItem, Stream,
+    SymbolicInvocation, SymbolicParameter, TensorData,
 };
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+use std::{collections::BTreeMap, fmt, num::NonZeroUsize, sync::Arc};
 
 struct CudaGraphPlanAdapter {
     renderer: PtxRenderer,
@@ -381,10 +382,264 @@ impl CapturedCudaGraphPrefix {
     }
 }
 
+/// Error returned by authenticated symbolic CUDA program construction or execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CudaSymbolicError {
+    Replay(ReplayError),
+    Ptx(PtxError),
+}
+
+impl fmt::Display for CudaSymbolicError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Replay(error) => error.fmt(f),
+            Self::Ptx(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for CudaSymbolicError {}
+
+impl From<ReplayError> for CudaSymbolicError {
+    fn from(value: ReplayError) -> Self {
+        Self::Replay(value)
+    }
+}
+
+impl From<PtxError> for CudaSymbolicError {
+    fn from(value: PtxError) -> Self {
+        Self::Ptx(value)
+    }
+}
+
+struct CudaSymbolicBackend {
+    primary: PrimaryContext,
+    renderer: PtxRenderer,
+    cache: Arc<ConcurrentPtxCache>,
+}
+
+impl Sealed for CudaSymbolicBackend {}
+
+impl StaticSymbolicBackend for CudaSymbolicBackend {
+    type Error = CudaSymbolicError;
+    type Plan = CudaGraphPrefixPlan;
+    type Prepared = PreparedCudaGraphPrefix;
+
+    fn replay_error(error: ReplayError) -> Self::Error {
+        error.into()
+    }
+
+    fn invalid_binding(reason: String) -> Self::Error {
+        PtxError::InvalidBinding(reason).into()
+    }
+
+    fn internal_error(reason: String) -> Self::Error {
+        PtxError::Unsupported(reason).into()
+    }
+
+    fn plan(
+        &self,
+        capture: &CapturedSchedule,
+        retained: &[u64],
+    ) -> Result<Self::Plan, Self::Error> {
+        CudaGraphPrefixPlan::plan_for_outputs(&capture.items, retained, self.renderer)
+            .map_err(Into::into)
+    }
+
+    fn prepare(&self, plan: Self::Plan) -> Result<Self::Prepared, Self::Error> {
+        PreparedCudaGraphPrefix::from_plan(self.primary.clone(), plan, &self.cache)
+            .map_err(Into::into)
+    }
+
+    fn execute(
+        &self,
+        prepared: &mut Self::Prepared,
+        values: &mut BTreeMap<u64, TensorData>,
+    ) -> Result<(), Self::Error> {
+        prepared.execute(values).map_err(Into::into)
+    }
+
+    fn cache_keys(&self, prepared: &Self::Prepared) -> Vec<String> {
+        prepared.kernel_cache_keys()
+    }
+}
+
+/// Successful CUDA symbolic invocation provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaSymbolicTrace {
+    body_identity: u64,
+    concrete_identity: u64,
+    bindings: Vec<(u64, i64)>,
+    prepared_now: bool,
+    kernel_cache_keys: Vec<String>,
+}
+
+impl CudaSymbolicTrace {
+    pub fn body_identity(&self) -> u64 {
+        self.body_identity
+    }
+
+    pub fn concrete_identity(&self) -> u64 {
+        self.concrete_identity
+    }
+
+    pub fn bindings(&self) -> &[(u64, i64)] {
+        &self.bindings
+    }
+
+    pub fn prepared_now(&self) -> bool {
+        self.prepared_now
+    }
+
+    pub fn kernel_cache_keys(&self) -> &[String] {
+        &self.kernel_cache_keys
+    }
+}
+
+/// Detached ordered outputs from one successful CUDA symbolic invocation.
+#[derive(Clone, Debug)]
+pub struct CudaSymbolicResult {
+    outputs: Vec<TensorData>,
+    trace: CudaSymbolicTrace,
+}
+
+impl CudaSymbolicResult {
+    pub fn outputs(&self) -> &[TensorData] {
+        &self.outputs
+    }
+
+    pub fn into_outputs(self) -> Vec<TensorData> {
+        self.outputs
+    }
+
+    pub fn into_parts(self) -> (Vec<TensorData>, CudaSymbolicTrace) {
+        (self.outputs, self.trace)
+    }
+
+    pub fn trace(&self) -> &CudaSymbolicTrace {
+        &self.trace
+    }
+}
+
+/// Owned bounded-symbolic CUDA program with a one-entry last-successful
+/// concrete specialization cache. A cache miss prepares device resources only
+/// after the complete symbolic invocation and pure PTX/static plan validate.
+pub struct CudaSymbolicProgram {
+    inner: StaticSymbolicProgram<CudaSymbolicBackend>,
+}
+
+impl CudaSymbolicProgram {
+    pub fn new(
+        primary: PrimaryContext,
+        capture: CapturedSchedule,
+        renderer: PtxRenderer,
+    ) -> Result<Self, CudaSymbolicError> {
+        let output_order = (0..capture.requested.len()).collect();
+        Self::build(
+            primary,
+            capture,
+            output_order,
+            renderer,
+            Arc::new(ConcurrentPtxCache::new()),
+        )
+    }
+
+    /// Creates a program using a caller-owned concurrent PTX cache. The
+    /// program retains the cache; compiled modules may therefore be shared
+    /// across independently owned symbolic programs on the same context.
+    pub fn with_cache(
+        primary: PrimaryContext,
+        capture: CapturedSchedule,
+        renderer: PtxRenderer,
+        cache: Arc<ConcurrentPtxCache>,
+    ) -> Result<Self, CudaSymbolicError> {
+        let output_order = (0..capture.requested.len()).collect();
+        Self::build(primary, capture, output_order, renderer, cache)
+    }
+
+    /// Creates a program whose detached result selects captured outputs by
+    /// position. Repeated positions produce independent owned values.
+    pub fn with_output_order(
+        primary: PrimaryContext,
+        capture: CapturedSchedule,
+        output_order: Vec<usize>,
+        renderer: PtxRenderer,
+    ) -> Result<Self, CudaSymbolicError> {
+        Self::build(
+            primary,
+            capture,
+            output_order,
+            renderer,
+            Arc::new(ConcurrentPtxCache::new()),
+        )
+    }
+
+    fn build(
+        primary: PrimaryContext,
+        capture: CapturedSchedule,
+        output_order: Vec<usize>,
+        renderer: PtxRenderer,
+        cache: Arc<ConcurrentPtxCache>,
+    ) -> Result<Self, CudaSymbolicError> {
+        let body =
+            crate::engine::AuthenticatedSymbolicBody::new(capture, output_order, "CUDA symbolic")?;
+        Ok(Self {
+            inner: StaticSymbolicProgram::new(
+                body,
+                CudaSymbolicBackend {
+                    primary,
+                    renderer,
+                    cache,
+                },
+            ),
+        })
+    }
+
+    pub fn body_identity(&self) -> u64 {
+        self.inner.body().capture().identity
+    }
+
+    pub fn inputs(&self) -> &[ReplayInput] {
+        &self.inner.body().capture().inputs
+    }
+
+    pub fn parameters(&self) -> impl ExactSizeIterator<Item = &SymbolicParameter> {
+        self.inner.body().schema().parameters().iter()
+    }
+
+    pub fn output_count(&self) -> usize {
+        self.inner.body().output_order().len()
+    }
+
+    pub fn output_order(&self) -> &[usize] {
+        self.inner.body().output_order()
+    }
+
+    pub fn run(
+        &self,
+        invocation: SymbolicInvocation,
+    ) -> Result<CudaSymbolicResult, CudaSymbolicError> {
+        let result = self.inner.run(invocation)?;
+        Ok(CudaSymbolicResult {
+            outputs: result.outputs,
+            trace: CudaSymbolicTrace {
+                body_identity: result.body_identity,
+                concrete_identity: result.concrete_identity,
+                bindings: result.bindings,
+                prepared_now: result.prepared_now,
+                kernel_cache_keys: result.cache_keys,
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Driver, Graph, Shape, Storage, schedule_many};
+    use crate::{
+        CpuSymbolicProgram, Driver, Graph, Shape, Storage, SymbolicCaptureSpec, SymbolicExpr,
+        SymbolicShape, schedule_many,
+    };
 
     fn make_primary() -> (Arc<crate::cuda::tests::Mock>, PrimaryContext) {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
@@ -962,5 +1217,528 @@ mod tests {
                     | "graph_launch"
             )
         }));
+    }
+
+    fn projected_reduction_capture() -> CapturedSchedule {
+        let extent = SymbolicExpr::variable("extent", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], crate::DType::F32);
+        let producer = graph.square(input).unwrap();
+        let transposed = graph.permute(producer, [1, 0]).unwrap();
+        let flattened = graph.reshape(transposed, [4]).unwrap();
+        let output = graph
+            .reduce_with_output_dtype(
+                flattened,
+                crate::ReduceKind::Sum,
+                Some(vec![0]),
+                false,
+                crate::DType::F32,
+            )
+            .unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![extent.clone().into(), extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap()
+    }
+
+    fn symbolic_input(extent: usize) -> SymbolicInvocation {
+        SymbolicInvocation::new()
+            .with_symbol("extent", extent as i64)
+            .with_input(
+                "input",
+                TensorData::new(
+                    [extent, extent],
+                    (0..extent * extent)
+                        .map(|index| index as f32 - 2.0)
+                        .collect(),
+                )
+                .unwrap(),
+            )
+    }
+
+    fn matmul_capture() -> CapturedSchedule {
+        let rows = SymbolicExpr::variable("rows", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], crate::DType::F32);
+        let weight = graph.constant(TensorData::new([2, 2], vec![2.0, -1.0, 0.5, 3.0]).unwrap());
+        let output = graph.matmul(input, weight).unwrap();
+        let schedule = schedule_many(&graph, &[input, output]).unwrap();
+        CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[input, output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![rows.into(), 2usize.into()]),
+            )])),
+            &BTreeMap::from([("rows".into(), 2)]),
+        )
+        .unwrap()
+    }
+
+    fn matmul_input(rows: usize) -> SymbolicInvocation {
+        SymbolicInvocation::new()
+            .with_symbol("rows", rows as i64)
+            .with_input(
+                "input",
+                TensorData::new(
+                    [rows, 2],
+                    (0..rows * 2)
+                        .map(|index| index as f32 * 0.25 - 1.0)
+                        .collect(),
+                )
+                .unwrap(),
+            )
+    }
+
+    fn sequence_capture() -> CapturedSchedule {
+        let time = SymbolicExpr::variable("time", 1, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("tokens", [1, 2, 3, 2], crate::DType::F32);
+        let source = graph.square(input).unwrap();
+        let transposed = graph.permute(source, [0, 2, 1, 3]).unwrap();
+        let merged = graph.reshape(transposed, [1, 3, 4]).unwrap();
+        let merged = graph.relu(merged).unwrap();
+        let weight = graph.constant(
+            TensorData::new(
+                [4, 4],
+                vec![
+                    0.5, -0.25, 0.125, 0.75, -1.0, 0.5, 0.25, -0.125, 0.375, 0.625, -0.5, 0.25,
+                    0.125, -0.75, 1.0, 0.5,
+                ],
+            )
+            .unwrap(),
+        );
+        let projected = graph.matmul(merged, weight).unwrap();
+        let squared = graph.square(projected).unwrap();
+        let energy = graph
+            .reduce_with_output_dtype(
+                squared,
+                crate::ReduceKind::Sum,
+                Some(vec![2]),
+                true,
+                crate::DType::F32,
+            )
+            .unwrap();
+        let energy = graph.expand(energy, [1, 3, 4]).unwrap();
+        let output = graph.add(projected, energy).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![
+                    1usize.into(),
+                    2usize.into(),
+                    time.into(),
+                    2usize.into(),
+                ]),
+            )])),
+            &BTreeMap::from([("time".into(), 3)]),
+        )
+        .unwrap();
+        let schema = capture.symbolic.as_ref().unwrap();
+        assert!(!schema.projected.is_empty());
+        assert!(capture.items.iter().any(|item| {
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|node| matches!(node.operation(), crate::Operation::ReduceInit(_)))
+        }));
+        assert!(capture.items.iter().any(|item| {
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|node| matches!(node.operation(), crate::Operation::Matmul(_)))
+        }));
+        capture
+    }
+
+    fn sequence_input(time: usize) -> SymbolicInvocation {
+        SymbolicInvocation::new()
+            .with_symbol("time", time as i64)
+            .with_input(
+                "tokens",
+                TensorData::new(
+                    [1, 2, time, 2],
+                    (0..time * 4)
+                        .map(|index| index as f32 * 0.0625 - 0.375)
+                        .collect(),
+                )
+                .unwrap(),
+            )
+    }
+
+    fn assert_f32_close(actual: &TensorData, expected: &TensorData, tolerance: f64) {
+        assert_eq!(actual.shape(), expected.shape());
+        assert_eq!(actual.dtype(), crate::DType::F32);
+        assert_eq!(expected.dtype(), crate::DType::F32);
+        for (index, (actual, expected)) in actual
+            .to_vec_f64()
+            .into_iter()
+            .zip(expected.to_vec_f64())
+            .enumerate()
+        {
+            assert!(
+                actual.is_finite() && expected.is_finite(),
+                "lane {index}: non-finite sequence result"
+            );
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "lane {index}: expected {expected}, got {actual} (tolerance {tolerance})"
+            );
+        }
+    }
+
+    #[test]
+    fn symbolic_cuda_matches_cpu_and_caches_only_one_successful_specialization() {
+        let capture = projected_reduction_capture();
+        let cpu = CpuSymbolicProgram::with_output_order(capture.clone(), vec![0, 0]).unwrap();
+        let (mock, primary) = make_primary();
+        let cuda = CudaSymbolicProgram::with_output_order(
+            primary,
+            capture,
+            vec![0, 0],
+            PtxRenderer::new(80).unwrap(),
+        )
+        .unwrap();
+
+        for (extent, prepared_now) in [(2, true), (2, false), (3, true), (2, true)] {
+            let expected = cpu.run(symbolic_input(extent)).unwrap();
+            let actual = cuda.run(symbolic_input(extent)).unwrap();
+            assert_eq!(actual.outputs().len(), 2);
+            assert_eq!(
+                actual.outputs()[0].to_le_bytes().unwrap(),
+                expected.outputs()[0].to_le_bytes().unwrap()
+            );
+            assert_eq!(
+                actual.outputs()[1].to_le_bytes().unwrap(),
+                actual.outputs()[0].to_le_bytes().unwrap()
+            );
+            assert_eq!(actual.trace().prepared_now(), prepared_now);
+            assert_eq!(actual.trace().body_identity(), cuda.body_identity());
+            assert_ne!(actual.trace().concrete_identity(), 0);
+            assert!(!actual.trace().kernel_cache_keys().is_empty());
+        }
+        assert_eq!(cuda.output_order(), [0, 0]);
+        assert!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_launch")
+                .count()
+                >= 4
+        );
+    }
+
+    #[test]
+    fn symbolic_cuda_matmul_preserves_requested_source_constant_and_duplicate_order() {
+        let capture = matmul_capture();
+        assert_eq!(capture.constants.len(), 1);
+        assert_eq!(capture.requested.len(), 2);
+        assert!(capture.requested_passthroughs.is_empty());
+        let cpu = CpuSymbolicProgram::with_output_order(capture.clone(), vec![1, 0, 1]).unwrap();
+        let (_, primary) = make_primary();
+        let cuda = CudaSymbolicProgram::with_output_order(
+            primary,
+            capture,
+            vec![1, 0, 1],
+            PtxRenderer::new(80).unwrap(),
+        )
+        .unwrap();
+
+        let first = cuda.run(matmul_input(2)).unwrap();
+        let expected = cpu.run(matmul_input(2)).unwrap();
+        assert!(first.trace().prepared_now());
+        assert_eq!(first.outputs().len(), 3);
+        for (actual, expected) in first.outputs().iter().zip(expected.outputs()) {
+            assert_eq!(
+                actual.to_le_bytes().unwrap(),
+                expected.to_le_bytes().unwrap()
+            );
+        }
+        assert_eq!(
+            first.outputs()[0].to_le_bytes().unwrap(),
+            first.outputs()[2].to_le_bytes().unwrap()
+        );
+        assert_eq!(first.outputs()[1].shape(), &Shape::from([2, 2]));
+
+        let reused = cuda.run(matmul_input(2)).unwrap();
+        assert!(!reused.trace().prepared_now());
+        assert_eq!(
+            reused.trace().concrete_identity(),
+            first.trace().concrete_identity()
+        );
+        let replacement = cuda.run(matmul_input(3)).unwrap();
+        assert!(replacement.trace().prepared_now());
+        assert_ne!(
+            replacement.trace().concrete_identity(),
+            first.trace().concrete_identity()
+        );
+        assert!(cuda.run(matmul_input(2)).unwrap().trace().prepared_now());
+    }
+
+    #[test]
+    fn symbolic_cuda_runs_one_bounded_sequence_body_across_time_bindings() {
+        let capture = sequence_capture();
+        let body_identity = capture.identity;
+        let cpu = CpuSymbolicProgram::new(capture.clone()).unwrap();
+        let (_, primary) = make_primary();
+        let cuda =
+            CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
+
+        let mut identities = BTreeMap::new();
+        for (time, prepared_now) in [(1usize, true), (3, true), (3, false), (4, true)] {
+            let expected = cpu.run(sequence_input(time)).unwrap();
+            let actual = cuda.run(sequence_input(time)).unwrap();
+            assert_eq!(actual.outputs()[0].shape(), &Shape::from([1, time, 4]));
+            assert_f32_close(&actual.outputs()[0], &expected.outputs()[0], 1e-5);
+            assert_eq!(actual.trace().body_identity(), body_identity);
+            assert_eq!(actual.trace().prepared_now(), prepared_now);
+            if let Some(previous) = identities.insert(time, actual.trace().concrete_identity()) {
+                assert_eq!(actual.trace().concrete_identity(), previous);
+            }
+        }
+        assert_ne!(identities[&1], identities[&3]);
+        assert_ne!(identities[&3], identities[&4]);
+    }
+
+    #[test]
+    fn symbolic_cuda_rejects_invocation_and_ptx_capability_before_resources() {
+        let capture = projected_reduction_capture();
+        let (mock, primary) = make_primary();
+        let calls = mock.calls();
+        let mut tampered = capture.clone();
+        tampered.identity ^= 1;
+        assert!(matches!(
+            CudaSymbolicProgram::new(primary.clone(), tampered, PtxRenderer::new(80).unwrap()),
+            Err(CudaSymbolicError::Replay(ReplayError::Corrupt(_)))
+        ));
+        assert_eq!(mock.calls(), calls);
+        let program =
+            CudaSymbolicProgram::new(primary.clone(), capture, PtxRenderer::new(80).unwrap())
+                .unwrap();
+        let calls = mock.calls();
+        assert!(matches!(
+            program.run(SymbolicInvocation::new()),
+            Err(CudaSymbolicError::Replay(ReplayError::Missing(name))) if name == "extent"
+        ));
+        assert_eq!(mock.calls(), calls);
+        assert!(matches!(
+            program.run(
+                symbolic_input(2).with_symbol("unexpected", 1)
+            ),
+            Err(CudaSymbolicError::Replay(ReplayError::Extra(name))) if name == "unexpected"
+        ));
+        assert_eq!(mock.calls(), calls);
+        assert!(matches!(
+            program.run(symbolic_input(5)),
+            Err(CudaSymbolicError::Replay(ReplayError::Symbolic(_)))
+        ));
+        assert_eq!(mock.calls(), calls);
+        let wrong = SymbolicInvocation::new()
+            .with_symbol("extent", 2)
+            .with_input("input", TensorData::new([1], vec![1.0]).unwrap());
+        assert!(matches!(
+            program.run(wrong),
+            Err(CudaSymbolicError::Replay(ReplayError::Descriptor(name))) if name == "input"
+        ));
+        assert_eq!(mock.calls(), calls);
+        assert!(matches!(
+            program.run(
+                symbolic_input(2).with_input(
+                    "unexpected",
+                    TensorData::new([1], vec![1.0]).unwrap()
+                )
+            ),
+            Err(CudaSymbolicError::Replay(ReplayError::Extra(name))) if name == "unexpected"
+        ));
+        assert_eq!(mock.calls(), calls);
+
+        let guarded_extent = SymbolicExpr::variable("guarded_extent", 0, 4).unwrap();
+        let mut guarded_graph = Graph::new();
+        let guarded_input = guarded_graph.input_dtype("guarded", [2], crate::DType::F32);
+        let guarded_output = guarded_graph.square(guarded_input).unwrap();
+        let guarded_schedule = crate::schedule(&guarded_graph, guarded_output).unwrap();
+        let guarded_capture = CapturedSchedule::capture_symbolic(
+            &guarded_graph,
+            &guarded_schedule,
+            &[guarded_output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                guarded_input,
+                SymbolicShape::new(vec![guarded_extent.clone().into()]),
+            )]))
+            .with_guard(crate::SymbolicGuard::divisible(guarded_extent, 2).unwrap()),
+            &BTreeMap::from([("guarded_extent".into(), 2)]),
+        )
+        .unwrap();
+        let guarded = CudaSymbolicProgram::new(
+            primary.clone(),
+            guarded_capture,
+            PtxRenderer::new(80).unwrap(),
+        )
+        .unwrap();
+        let calls = mock.calls();
+        assert!(matches!(
+            guarded.run(
+                SymbolicInvocation::new()
+                    .with_symbol("guarded_extent", 3)
+                    .with_input("guarded", TensorData::new([3], vec![1.0; 3]).unwrap())
+            ),
+            Err(CudaSymbolicError::Replay(ReplayError::Symbolic(_)))
+        ));
+        assert_eq!(mock.calls(), calls);
+
+        let extent = SymbolicExpr::variable("extent", 1, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], crate::DType::F32);
+        let output = graph.exp(input).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let unsupported = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap();
+        let unsupported =
+            CudaSymbolicProgram::new(primary, unsupported, PtxRenderer::new(80).unwrap()).unwrap();
+        let calls = mock.calls();
+        assert!(matches!(
+            unsupported.run(
+                SymbolicInvocation::new()
+                    .with_symbol("extent", 2)
+                    .with_input("input", TensorData::new([2], vec![1.0, 2.0]).unwrap())
+            ),
+            Err(CudaSymbolicError::Ptx(PtxError::Unsupported(_)))
+        ));
+        assert_eq!(mock.calls(), calls);
+    }
+
+    #[test]
+    fn symbolic_cuda_zero_domain_uses_no_device_resources() {
+        let extent = SymbolicExpr::variable("extent", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], crate::DType::F32);
+        let output = graph.square(input).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap();
+        let (mock, primary) = make_primary();
+        let program =
+            CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
+        let calls = mock.calls();
+        let result = program
+            .run(
+                SymbolicInvocation::new()
+                    .with_symbol("extent", 0)
+                    .with_input(
+                        "input",
+                        TensorData::from_storage([0], Storage::F32(vec![])).unwrap(),
+                    ),
+            )
+            .unwrap();
+        assert_eq!(result.outputs()[0].storage(), &Storage::F32(vec![]));
+        assert_eq!(mock.calls(), calls);
+    }
+
+    #[test]
+    fn symbolic_cuda_binds_exact_external_materialized_view_source() {
+        let rows = SymbolicExpr::variable("rows", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("unused_source", [2, 3], crate::DType::F32);
+        let producer = graph.square(input).unwrap();
+        let view = graph.permute(producer, [1, 0]).unwrap();
+        let output = graph.contiguous(view).unwrap();
+        let schedule =
+            crate::schedule_with_external_materializations(&graph, &[output], &[producer]).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![rows.into(), 3usize.into()]),
+            )])),
+            &BTreeMap::from([("rows".into(), 2)]),
+        )
+        .unwrap();
+        let external_name = format!("@materialized/{}", producer.index());
+        assert_eq!(capture.inputs[0].name, external_name);
+        let (_, primary) = make_primary();
+        let result = CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap())
+            .unwrap()
+            .run(SymbolicInvocation::new().with_symbol("rows", 1).with_input(
+                external_name,
+                TensorData::new([1, 3], vec![1.0, 2.0, 3.0]).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(result.outputs()[0].shape(), &Shape::from([3, 1]));
+        assert_eq!(result.outputs()[0].values(), &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn symbolic_cuda_evicts_failed_cached_execution_and_retries_fresh() {
+        let capture = projected_reduction_capture();
+        let (mock, primary) = make_primary();
+        let program =
+            CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
+        assert!(
+            program
+                .run(symbolic_input(2))
+                .unwrap()
+                .trace()
+                .prepared_now()
+        );
+        mock.set_allocation_failure(true);
+        assert!(program.run(symbolic_input(3)).is_err());
+        mock.set_allocation_failure(false);
+        assert!(
+            !program
+                .run(symbolic_input(2))
+                .unwrap()
+                .trace()
+                .prepared_now(),
+            "a failed candidate must not replace the last successful specialization"
+        );
+        mock.fail_graph_launch_after(0, 1);
+        assert!(program.run(symbolic_input(3)).is_err());
+        assert!(
+            !program
+                .run(symbolic_input(2))
+                .unwrap()
+                .trace()
+                .prepared_now(),
+            "a failed candidate execution must preserve the prior entry"
+        );
+        mock.fail_graph_launch_after(0, 1);
+        mock.fail_stream_sync_after(0, 1);
+        assert!(program.run(symbolic_input(2)).is_err());
+        let retried = program.run(symbolic_input(2)).unwrap();
+        assert!(retried.trace().prepared_now());
     }
 }

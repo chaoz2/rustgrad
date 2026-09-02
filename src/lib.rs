@@ -122,9 +122,9 @@ pub use engine::{
     CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace,
     CpuSymbolicInvocation, CpuSymbolicProgram, CpuSymbolicResult, CpuSymbolicTrace, ItemBackend,
     ItemTrace, MemoryReuse, RealizationError, RealizationOptions, RealizationPolicy,
-    RealizationTrace, Realized, SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter, realize,
-    realize_effects_persistent, realize_graph, realize_graph_with_options, realize_mixed_effects,
-    realize_with_options,
+    RealizationTrace, Realized, SymbolicCaptureSpec, SymbolicGuard, SymbolicInvocation,
+    SymbolicParameter, realize, realize_effects_persistent, realize_graph,
+    realize_graph_with_options, realize_mixed_effects, realize_with_options,
 };
 pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
 pub use fuzz::{
@@ -210,7 +210,10 @@ pub use ptx::{
     PrimaryLinkedRenderedKernel, PrimaryLinkedRenderedKernelCache, PrimaryPtxKernel, PtxBinding,
     PtxCache, PtxError, PtxKernel, PtxLaunchGeometry, PtxRenderer, RenderedPtx,
 };
-pub use runtime::cuda_graph::{CudaGraphPrefixPlan, PreparedCudaGraphPrefix};
+pub use runtime::cuda_graph::{
+    CudaGraphPrefixPlan, CudaSymbolicError, CudaSymbolicProgram, CudaSymbolicResult,
+    CudaSymbolicTrace, PreparedCudaGraphPrefix,
+};
 pub use runtime::mapped::{MappedBackingId, MappedTensor, MappedTensorError, MappedTensorPolicy};
 pub use runtime::mapped_mut::{MutableMappedFile, MutableMappedFileError};
 pub use safetensors::{

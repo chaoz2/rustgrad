@@ -29,8 +29,10 @@ use std::{
     fmt,
 };
 pub use symbolic::{SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter};
+pub(crate) use symbolic_program::{AuthenticatedSymbolicBody, AuthenticatedSymbolicInvocation};
 pub use symbolic_program::{
     CpuSymbolicInvocation, CpuSymbolicProgram, CpuSymbolicResult, CpuSymbolicTrace,
+    SymbolicInvocation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

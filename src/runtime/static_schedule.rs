@@ -5,11 +5,13 @@
 //! Metal, WebGPU, and fixed-schema CUDA graph paths.
 
 use crate::{
-    CapturedSchedule, DType, Operation, ReplayInput, RequestedPassthrough, ScheduleInputBinding,
-    ScheduleItem, Shape, TensorData,
+    CapturedSchedule, DType, Operation, ReplayError, ReplayInput, RequestedPassthrough,
+    ScheduleInputBinding, ScheduleItem, Shape, SymbolicInvocation, TensorData,
+    engine::{AuthenticatedSymbolicBody, AuthenticatedSymbolicInvocation},
     memory_plan::{ExactSlotPolicy, ExactSlotRequest, assign_exact_slots},
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 mod sealed {
     pub trait Sealed {}
@@ -208,6 +210,153 @@ impl<P> CapturedStaticPrefix<P> {
         self.capture.transact(provided, invalid_binding, |values| {
             execute(&mut self.prepared, values)
         })
+    }
+}
+
+/// Sealed device adapter for one concrete specialization of an authenticated
+/// symbolic body. Planning must be pure; `prepare` is the first method allowed
+/// to create device resources.
+pub(crate) trait StaticSymbolicBackend: sealed::Sealed {
+    type Error;
+    type Plan;
+    type Prepared;
+
+    fn replay_error(error: ReplayError) -> Self::Error;
+    fn invalid_binding(reason: String) -> Self::Error;
+    fn internal_error(reason: String) -> Self::Error;
+    fn plan(&self, capture: &CapturedSchedule, retained: &[u64])
+    -> Result<Self::Plan, Self::Error>;
+    fn prepare(&self, plan: Self::Plan) -> Result<Self::Prepared, Self::Error>;
+    fn execute(
+        &self,
+        prepared: &mut Self::Prepared,
+        values: &mut BTreeMap<u64, TensorData>,
+    ) -> Result<(), Self::Error>;
+    fn cache_keys(&self, prepared: &Self::Prepared) -> Vec<String>;
+}
+
+struct CachedStaticSpecialization<P> {
+    identity: u64,
+    prepared: P,
+}
+
+/// Shared invocation transaction for a bounded symbolic body and one static
+/// device backend. The cache intentionally retains only the most recent fully
+/// successful concrete specialization.
+pub(crate) struct StaticSymbolicProgram<B: StaticSymbolicBackend> {
+    body: AuthenticatedSymbolicBody,
+    backend: B,
+    cached: Mutex<Option<CachedStaticSpecialization<B::Prepared>>>,
+}
+
+pub(crate) struct StaticSymbolicRun {
+    pub(crate) outputs: Vec<TensorData>,
+    pub(crate) body_identity: u64,
+    pub(crate) concrete_identity: u64,
+    pub(crate) bindings: Vec<(u64, i64)>,
+    pub(crate) prepared_now: bool,
+    pub(crate) cache_keys: Vec<String>,
+}
+
+impl<B: StaticSymbolicBackend> StaticSymbolicProgram<B> {
+    pub(crate) fn new(body: AuthenticatedSymbolicBody, backend: B) -> Self {
+        Self {
+            body,
+            backend,
+            cached: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn body(&self) -> &AuthenticatedSymbolicBody {
+        &self.body
+    }
+
+    pub(crate) fn run(
+        &self,
+        invocation: SymbolicInvocation,
+    ) -> Result<StaticSymbolicRun, B::Error> {
+        let bound = self.body.bind(invocation).map_err(B::replay_error)?;
+        self.run_bound(bound)
+    }
+
+    fn run_bound(
+        &self,
+        bound: AuthenticatedSymbolicInvocation,
+    ) -> Result<StaticSymbolicRun, B::Error> {
+        // Staging authenticates exact descriptors and byte lengths before the
+        // pure renderer/static-plan capability gate or any device allocation.
+        let projection =
+            CapturedStaticExecution::new(&bound.concrete).map_err(B::invalid_binding)?;
+        let mut values = projection
+            .stage(&bound.inputs)
+            .map_err(B::invalid_binding)?;
+        let plan = self.backend.plan(&bound.concrete, projection.retained())?;
+        let concrete_identity = bound.concrete.identity;
+        let mut cached = self
+            .cached
+            .lock()
+            .map_err(|_| B::internal_error("static symbolic cache lock poisoned".into()))?;
+
+        let (outputs, prepared_now, cache_keys) = if let Some(entry) = cached
+            .as_mut()
+            .filter(|entry| entry.identity == concrete_identity)
+        {
+            let result = self
+                .backend
+                .execute(&mut entry.prepared, &mut values)
+                .and_then(|()| projection.project(&values).map_err(B::invalid_binding))
+                .and_then(|outputs| self.order_outputs(outputs));
+            match result {
+                Ok(outputs) => {
+                    let cache_keys = self.backend.cache_keys(&entry.prepared);
+                    (outputs, false, cache_keys)
+                }
+                Err(error) => {
+                    // A backend failure may have uncertain device
+                    // completion. Drop the entry after its backend has
+                    // fenced/quarantined as required; a retry prepares a
+                    // fresh transaction.
+                    *cached = None;
+                    return Err(error);
+                }
+            }
+        } else {
+            let mut candidate = self.backend.prepare(plan)?;
+            self.backend.execute(&mut candidate, &mut values)?;
+            let outputs = projection
+                .project(&values)
+                .map_err(B::invalid_binding)
+                .and_then(|outputs| self.order_outputs(outputs))?;
+            let cache_keys = self.backend.cache_keys(&candidate);
+            *cached = Some(CachedStaticSpecialization {
+                identity: concrete_identity,
+                prepared: candidate,
+            });
+            (outputs, true, cache_keys)
+        };
+
+        Ok(StaticSymbolicRun {
+            outputs,
+            body_identity: self.body.capture().identity,
+            concrete_identity,
+            bindings: bound.canonical,
+            prepared_now,
+            cache_keys,
+        })
+    }
+
+    fn order_outputs(&self, outputs: Vec<TensorData>) -> Result<Vec<TensorData>, B::Error> {
+        self.body
+            .output_order()
+            .iter()
+            .map(|position| {
+                outputs.get(*position).cloned().ok_or_else(|| {
+                    B::invalid_binding(format!(
+                        "symbolic requested output position {position} is absent"
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
