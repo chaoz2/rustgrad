@@ -363,6 +363,203 @@ fn upat_varargs_and_typed_payload_predicates_drive_rewrites() {
 }
 
 #[test]
+fn upat_alternatives_and_permuted_sources_preserve_candidate_isolation() {
+    fn select_named(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
+        captures.get("selected").cloned()
+    }
+    fn keep_first_or_select(captures: &uop::Captures, node: &UOp) -> Option<UOp> {
+        captures
+            .get("first")
+            .map(|_| node.clone())
+            .or_else(|| captures.get("selected").cloned())
+    }
+    fn remove_zero(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
+        captures.get("value").cloned()
+    }
+
+    assert!(matches!(
+        UPat::any_of(Vec::<UPat>::new()),
+        Err(crate::UOpError::InvalidArgument)
+    ));
+
+    let one = UOp::constant(1, i32t());
+    let two = UOp::constant(2, i32t());
+    let add = UOp::binary(Binary::Add, one.clone(), two.clone());
+    let alternatives = UPat::any_of([
+        UPat::op(Operation::Binary(Binary::Add))
+            .sources(vec![UPat::any().named("first"), UPat::any()]),
+        UPat::op(Operation::Binary(Binary::Add))
+            .sources(vec![UPat::any(), UPat::any().named("selected")]),
+    ])
+    .unwrap()
+    .named("root");
+    let first = alternatives.matches(&add).unwrap();
+    assert_eq!(first.get("first"), Some(&one));
+    assert!(first.get("selected").is_none());
+    assert_eq!(first.get("root"), Some(&add));
+
+    // The first structural match is allowed to decline the rewrite. Candidate
+    // captures are isolated, so the second alternative can then apply without
+    // inheriting `first`.
+    let encoded = uop::artifact::encode(&add).unwrap();
+    let mut rules = vec![uop::RewriteRule {
+        name: "select-second-alternative",
+        priority: 0,
+        pattern: alternatives.clone(),
+        apply: select_named,
+    }];
+    let (rewritten, trace) = uop::rewrite(&add, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, two);
+    assert_eq!(trace.rules, vec!["select-second-alternative"]);
+    assert_eq!(uop::artifact::encode(&add).unwrap(), encoded);
+
+    // Returning the original node accepts the first candidate but performs no
+    // rewrite; only `None` asks the matcher to try the next alternative.
+    let mut rules = vec![uop::RewriteRule {
+        name: "keep-first-alternative",
+        priority: 0,
+        pattern: alternatives,
+        apply: keep_first_or_select,
+    }];
+    let (unchanged, trace) = uop::rewrite(&add, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(unchanged, add);
+    assert!(trace.rules.is_empty());
+
+    let partial_failure = UPat::any_of([
+        UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+            UPat::any().named("leaked"),
+            UPat::op(Operation::Const(LiteralValue::Int(99))),
+        ]),
+        UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+            UPat::op(Operation::Const(LiteralValue::Int(1))),
+            UPat::any().named("selected"),
+        ]),
+    ])
+    .unwrap();
+    let captures = partial_failure.matches(&add).unwrap();
+    assert!(captures.get("leaked").is_none());
+    assert_eq!(captures.get("selected"), Some(&two));
+
+    let zero = UOp::constant(0, i32t());
+    let left = UOp::binary(Binary::Add, zero.clone(), one.clone());
+    let right = UOp::binary(Binary::Add, one.clone(), zero);
+    let commutative = UPat::op(Operation::Binary(Binary::Add)).sources_permuted(vec![
+        UPat::op(Operation::Const(LiteralValue::Int(0))),
+        UPat::any().named("value"),
+    ]);
+    assert!(
+        commutative
+            .clone()
+            .matches(&UOp::sink(vec![one.clone()]))
+            .is_none()
+    );
+    let mut rules = vec![uop::RewriteRule {
+        name: "commutative-add-zero",
+        priority: 0,
+        pattern: commutative,
+        apply: remove_zero,
+    }];
+    let (rewritten, trace) =
+        uop::rewrite(&UOp::sink(vec![left, right]), &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(rewritten.sources(), &[one.clone(), one.clone()]);
+    assert_eq!(
+        trace.rules,
+        vec!["commutative-add-zero", "commutative-add-zero"]
+    );
+
+    let same_role = UPat::op(Operation::Binary(Binary::Add))
+        .sources_permuted(vec![UPat::any().named("same"), UPat::any().named("same")]);
+    assert!(same_role.matches(&add).is_none());
+    assert!(
+        same_role
+            .matches(&UOp::binary(Binary::Add, one.clone(), one.clone()))
+            .is_some()
+    );
+
+    fn choose_three(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
+        captures.get("three").cloned()
+    }
+    let three = UOp::constant(3, i32t());
+    let vector = UOp::from_operation(
+        Operation::Vectorize,
+        Some(i32t()),
+        vec![one.clone(), two.clone(), three.clone()],
+    );
+    let arbitrary_arity = UPat::op(Operation::Vectorize).sources_permuted(vec![
+        UPat::op(Operation::Const(LiteralValue::Int(3))).named("three"),
+        UPat::op(Operation::Const(LiteralValue::Int(1))),
+        UPat::op(Operation::Const(LiteralValue::Int(2))),
+    ]);
+    let mut rules = vec![uop::RewriteRule {
+        name: "permuted-vector-sources",
+        priority: 0,
+        pattern: arbitrary_arity,
+        apply: choose_three,
+    }];
+    let (rewritten, trace) = uop::rewrite(&vector, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, three);
+    assert_eq!(trace.rules, vec!["permuted-vector-sources"]);
+
+    let permutation_rollback = UPat::op(Operation::Vectorize).sources_permuted(vec![
+        UPat::any().named("first"),
+        UPat::op(Operation::Const(LiteralValue::Int(2))),
+        UPat::op(Operation::Const(LiteralValue::Int(1))),
+    ]);
+    let captures = permutation_rollback.matches(&vector).unwrap();
+    assert_eq!(captures.get("first"), Some(&three));
+
+    let declared_first = UPat::op(Operation::Binary(Binary::Add)).sources_permuted(vec![
+        UPat::any().named("declared_first"),
+        UPat::any().named("declared_second"),
+    ]);
+    let captures = declared_first.matches(&add).unwrap();
+    assert_eq!(captures.get("declared_first"), Some(&one));
+    assert_eq!(captures.get("declared_second"), Some(&two));
+
+    static ALL_SAME_ATTEMPTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    fn count_and_decline(_: &uop::Captures, _: &UOp) -> Option<UOp> {
+        ALL_SAME_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+    ALL_SAME_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let all_same = UPat::op(Operation::Vectorize).sources_permuted(vec![
+        UPat::any(),
+        UPat::any(),
+        UPat::any(),
+    ]);
+    let mut rules = vec![uop::RewriteRule {
+        name: "all-same-permutation",
+        priority: 0,
+        pattern: all_same,
+        apply: count_and_decline,
+    }];
+    let (unchanged, trace) = uop::rewrite(&vector, &mut rules, Walk::BottomUp).unwrap();
+    assert_eq!(unchanged, vector);
+    assert!(trace.rules.is_empty());
+    assert_eq!(
+        ALL_SAME_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // Outer constraints intentionally intersect every alternative rather than
+    // being copied into or applied after only one branch.
+    let outer_type = UPat::any_of([
+        UPat::op(Operation::Binary(Binary::Add)),
+        UPat::op(Operation::Binary(Binary::Mul)),
+    ])
+    .unwrap()
+    .dtype(i32t());
+    assert!(outer_type.matches(&add).is_some());
+    let float_add = UOp::binary(
+        Binary::Add,
+        UOp::constant(1, f32t()),
+        UOp::constant(2, f32t()),
+    );
+    assert!(outer_type.matches(&float_add).is_none());
+}
+
+#[test]
 fn scheduled_normalization_converges_across_replacement_chains() {
     let two = UOp::scalar_constant(DType::I32, 2, i32t());
     let three = UOp::scalar_constant(DType::I32, 3, i32t());

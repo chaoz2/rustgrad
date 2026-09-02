@@ -1309,10 +1309,12 @@ enum SourceConstraint {
     Exact(Vec<UPat>),
     Prefix(Vec<UPat>),
     Each(Box<UPat>),
+    Permuted(Vec<UPat>),
 }
 
 #[derive(Clone, Debug)]
 pub struct UPat {
+    alternatives: Option<Vec<UPat>>,
     operations: Option<BTreeSet<Operation>>,
     operation_predicate: Option<fn(&Operation) -> bool>,
     ty: Option<UType>,
@@ -1323,6 +1325,7 @@ pub struct UPat {
 impl UPat {
     pub fn any() -> Self {
         Self {
+            alternatives: None,
             operations: None,
             operation_predicate: None,
             ty: None,
@@ -1330,6 +1333,18 @@ impl UPat {
             sources: None,
             name: None,
         }
+    }
+    /// Matches the first successful alternative in declaration order. Rewrite
+    /// callbacks may reject that capture candidate, in which case the driver
+    /// continues with the next successful alternative.
+    pub fn any_of(alternatives: impl IntoIterator<Item = UPat>) -> Result<Self, UOpError> {
+        let alternatives = alternatives.into_iter().collect::<Vec<_>>();
+        if alternatives.is_empty() {
+            return Err(UOpError::InvalidArgument);
+        }
+        let mut x = Self::any();
+        x.alternatives = Some(alternatives);
+        Ok(x)
     }
     pub fn op(operation: Operation) -> Self {
         let mut x = Self::any();
@@ -1375,15 +1390,32 @@ impl UPat {
         self.sources = Some(SourceConstraint::Each(Box::new(pattern)));
         self
     }
+    /// Matches every declaration-ordered permutation of an exact source list.
+    /// Callers use this only when the operation's operand roles are
+    /// semantically interchangeable. Permutations are generated lazily, and an
+    /// all-identical pattern list has only one candidate.
+    pub fn sources_permuted(mut self, patterns: Vec<UPat>) -> Self {
+        self.sources = Some(SourceConstraint::Permuted(patterns));
+        self
+    }
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
     pub fn matches(&self, node: &UOp) -> Option<Captures> {
-        let mut c = Captures::default();
-        self.match_into(node, &mut c).then_some(c)
+        let mut found = None;
+        self.visit_matches(node, &Captures::default(), &mut |captures| {
+            found = Some(captures);
+            true
+        });
+        found
     }
-    fn match_into(&self, n: &UOp, c: &mut Captures) -> bool {
+    fn visit_matches(
+        &self,
+        n: &UOp,
+        captures: &Captures,
+        visitor: &mut dyn FnMut(Captures) -> bool,
+    ) -> bool {
         if self
             .operations
             .as_ref()
@@ -1404,44 +1436,207 @@ impl UPat {
         {
             return false;
         }
-        let mut candidate = c.clone();
-        if let Some(patterns) = &self.sources {
-            let (patterns, exact) = match patterns {
-                SourceConstraint::Exact(patterns) => (patterns.as_slice(), true),
-                SourceConstraint::Prefix(patterns) => (patterns.as_slice(), false),
-                SourceConstraint::Each(pattern) => {
-                    for source in n.sources() {
-                        if !pattern.match_into(source, &mut candidate) {
-                            return false;
-                        }
-                    }
-                    return self.commit_capture(n, c, candidate);
+
+        if let Some(alternatives) = &self.alternatives {
+            for alternative in alternatives {
+                let mut after_alternative =
+                    |candidate| self.visit_sources_and_capture(n, candidate, visitor);
+                if alternative.visit_matches(n, captures, &mut after_alternative) {
+                    return true;
                 }
-            };
-            if (exact && patterns.len() != n.sources().len()) || patterns.len() > n.sources().len()
-            {
-                return false;
             }
-            for (p, s) in patterns.iter().zip(n.sources()) {
-                if !p.match_into(s, &mut candidate) {
+            false
+        } else {
+            self.visit_sources_and_capture(n, captures.clone(), visitor)
+        }
+    }
+    fn visit_sources_and_capture(
+        &self,
+        n: &UOp,
+        captures: Captures,
+        visitor: &mut dyn FnMut(Captures) -> bool,
+    ) -> bool {
+        let mut finish = |candidate| match self.with_capture(n, candidate) {
+            Some(candidate) => visitor(candidate),
+            None => false,
+        };
+        match &self.sources {
+            None => finish(captures),
+            Some(SourceConstraint::Exact(patterns)) => {
+                patterns.len() == n.sources().len()
+                    && Self::visit_ordered_sources(patterns, n.sources(), 0, captures, &mut finish)
+            }
+            Some(SourceConstraint::Prefix(patterns)) => {
+                patterns.len() <= n.sources().len()
+                    && Self::visit_ordered_sources(patterns, n.sources(), 0, captures, &mut finish)
+            }
+            Some(SourceConstraint::Each(pattern)) => {
+                Self::visit_repeated_source(pattern, n.sources(), 0, captures, &mut finish)
+            }
+            Some(SourceConstraint::Permuted(patterns)) => {
+                if patterns.len() != n.sources().len() {
                     return false;
                 }
+                if patterns
+                    .first()
+                    .is_none_or(|first| patterns.iter().all(|pattern| pattern.same_as(first)))
+                {
+                    return Self::visit_ordered_sources(
+                        patterns,
+                        n.sources(),
+                        0,
+                        captures,
+                        &mut finish,
+                    );
+                }
+                let mut used_patterns = vec![false; patterns.len()];
+                Self::visit_permuted_sources(
+                    patterns,
+                    n.sources(),
+                    0,
+                    &mut used_patterns,
+                    captures,
+                    &mut finish,
+                )
             }
         }
-        self.commit_capture(n, c, candidate)
     }
-    fn commit_capture(&self, n: &UOp, c: &mut Captures, mut candidate: Captures) -> bool {
+    fn visit_ordered_sources(
+        patterns: &[UPat],
+        sources: &[UOp],
+        index: usize,
+        captures: Captures,
+        visitor: &mut dyn FnMut(Captures) -> bool,
+    ) -> bool {
+        if index == patterns.len() {
+            return visitor(captures);
+        }
+        patterns[index].visit_matches(&sources[index], &captures, &mut |candidate| {
+            Self::visit_ordered_sources(patterns, sources, index + 1, candidate, visitor)
+        })
+    }
+    fn visit_repeated_source(
+        pattern: &UPat,
+        sources: &[UOp],
+        index: usize,
+        captures: Captures,
+        visitor: &mut dyn FnMut(Captures) -> bool,
+    ) -> bool {
+        if index == sources.len() {
+            return visitor(captures);
+        }
+        pattern.visit_matches(&sources[index], &captures, &mut |candidate| {
+            Self::visit_repeated_source(pattern, sources, index + 1, candidate, visitor)
+        })
+    }
+    fn visit_permuted_sources(
+        patterns: &[UPat],
+        sources: &[UOp],
+        source_index: usize,
+        used_patterns: &mut [bool],
+        captures: Captures,
+        visitor: &mut dyn FnMut(Captures) -> bool,
+    ) -> bool {
+        if source_index == sources.len() {
+            return visitor(captures);
+        }
+        for pattern_index in 0..patterns.len() {
+            if used_patterns[pattern_index] {
+                continue;
+            }
+            used_patterns[pattern_index] = true;
+            let matched = patterns[pattern_index].visit_matches(
+                &sources[source_index],
+                &captures,
+                &mut |candidate| {
+                    Self::visit_permuted_sources(
+                        patterns,
+                        sources,
+                        source_index + 1,
+                        used_patterns,
+                        candidate,
+                        visitor,
+                    )
+                },
+            );
+            used_patterns[pattern_index] = false;
+            if matched {
+                return true;
+            }
+        }
+        false
+    }
+    fn with_capture(&self, n: &UOp, mut candidate: Captures) -> Option<Captures> {
         if let Some(name) = &self.name {
             if let Some(old) = candidate.0.get(name) {
                 if old != n {
-                    return false;
+                    return None;
                 }
             } else {
                 candidate.0.insert(name.clone(), n.clone());
             }
         }
-        *c = candidate;
-        true
+        Some(candidate)
+    }
+    fn same_as(&self, other: &Self) -> bool {
+        fn same_operation_predicate(
+            left: Option<fn(&Operation) -> bool>,
+            right: Option<fn(&Operation) -> bool>,
+        ) -> bool {
+            match (left, right) {
+                (None, None) => true,
+                (Some(left), Some(right)) => std::ptr::fn_addr_eq(left, right),
+                _ => false,
+            }
+        }
+        fn same_type_predicate(
+            left: fn(Option<UType>) -> bool,
+            right: fn(Option<UType>) -> bool,
+        ) -> bool {
+            std::ptr::fn_addr_eq(left, right)
+        }
+        fn same_sources(left: &SourceConstraint, right: &SourceConstraint) -> bool {
+            match (left, right) {
+                (SourceConstraint::Exact(left), SourceConstraint::Exact(right))
+                | (SourceConstraint::Prefix(left), SourceConstraint::Prefix(right))
+                | (SourceConstraint::Permuted(left), SourceConstraint::Permuted(right)) => {
+                    same_patterns(left, right)
+                }
+                (SourceConstraint::Each(left), SourceConstraint::Each(right)) => {
+                    left.same_as(right)
+                }
+                _ => false,
+            }
+        }
+        fn same_patterns(left: &[UPat], right: &[UPat]) -> bool {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| left.same_as(right))
+        }
+
+        match (&self.alternatives, &other.alternatives) {
+            (None, None) => {}
+            (Some(left), Some(right)) if same_patterns(left, right) => {}
+            _ => return false,
+        }
+        self.operations == other.operations
+            && same_operation_predicate(self.operation_predicate, other.operation_predicate)
+            && self.ty == other.ty
+            && self.type_predicates.len() == other.type_predicates.len()
+            && self
+                .type_predicates
+                .iter()
+                .copied()
+                .zip(other.type_predicates.iter().copied())
+                .all(|(left, right)| same_type_predicate(left, right))
+            && match (&self.sources, &other.sources) {
+                (None, None) => true,
+                (Some(left), Some(right)) => same_sources(left, right),
+                _ => false,
+            }
+            && self.name == other.name
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1507,10 +1702,22 @@ pub fn rewrite(
             }
 
             for rule in r {
-                if let Some(captures) = rule.pattern.matches(&x)
-                    && let Some(next) = (rule.apply)(&captures, &x)
-                    && next != x
-                {
+                let mut next = None;
+                rule.pattern
+                    .visit_matches(
+                        &x,
+                        &Captures::default(),
+                        &mut |captures| match (rule.apply)(&captures, &x) {
+                            Some(candidate) => {
+                                if candidate != x {
+                                    next = Some(candidate);
+                                }
+                                true
+                            }
+                            None => false,
+                        },
+                    );
+                if let Some(next) = next {
                     if !x.is_pure() || !next.is_pure() {
                         active.remove(n);
                         return Err(UOpError::EffectRewrite);
