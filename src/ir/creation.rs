@@ -3406,64 +3406,120 @@ impl Graph {
         device: u32,
         build: impl Fn(&mut Graph, RandomStream) -> Result<NodeId>,
     ) -> Result<NodeId> {
-        if !dtype.is_float() {
+        self.with_implicit_uniform_streams(vec![(shape, dtype)], device, |graph, streams| {
+            build(graph, streams[0])
+        })
+    }
+
+    /// Rehearses a composition around several source-ordered implicit uniform
+    /// streams, then publishes the graph and every reservation together.
+    ///
+    /// This is the multi-draw companion to [`Self::with_implicit_uniform_stream`].
+    /// It is intentionally crate-private: public random helpers retain their
+    /// one-request APIs, while higher-level compositions can prevent a later
+    /// validation failure from consuming an earlier ambient draw.
+    pub(crate) fn with_implicit_uniform_streams(
+        &mut self,
+        requests: Vec<(Shape, DType)>,
+        device: u32,
+        build: impl Fn(&mut Graph, &[RandomStream]) -> Result<NodeId>,
+    ) -> Result<NodeId> {
+        if requests.is_empty() {
             return Err(Error::InvalidRandom {
-                reason: "implicit uniform requires a floating point dtype",
+                reason: "implicit uniform transaction requires a stream",
             });
         }
-        let words = stream_words(&shape, dtype, 1)?;
-        let placeholder = RandomStream {
-            device,
-            key: [device_key(device), 0],
-            counter: [0, 0],
+        let mut words = Vec::with_capacity(requests.len());
+        let mut total_words = 0u64;
+        for (shape, dtype) in &requests {
+            if !dtype.is_float() {
+                return Err(Error::InvalidRandom {
+                    reason: "implicit uniform requires a floating point dtype",
+                });
+            }
+            let request_words = stream_words(shape, *dtype, 1)?;
+            total_words = total_words
+                .checked_add(request_words)
+                .ok_or(Error::InvalidRandom {
+                    reason: "implicit random stream counter overflow",
+                })?;
+            words.push(request_words);
+        }
+
+        let streams_from = |counter: [u32; 2], seed: u32| -> Vec<RandomStream> {
+            let mut next = counter;
+            words
+                .iter()
+                .map(|word_count| RandomStream {
+                    device,
+                    key: [device_key(device), seed],
+                    counter: reserve(&mut next, *word_count),
+                })
+                .collect()
         };
         let original_nodes = self.node_count();
-        let validate_reservation = |graph: &Graph, stream: RandomStream| -> Result<()> {
-            let matching = graph.nodes[original_nodes..]
-                .iter()
-                .filter(|node| {
-                    node.shape == shape
-                        && node.dtype == dtype
-                        && matches!(
-                            &node.op,
-                            Op::Random {
-                                kind: RandomKind::Uniform {
-                                    low: 0.0,
-                                    high: 1.0
-                                },
-                                stream: candidate
-                            } if *candidate == stream
-                        )
-                })
-                .count();
-            if matching != 1 {
-                return Err(Error::InvalidRandom {
-                    reason: "implicit uniform transaction must consume its stream exactly once",
-                });
+        let validate_reservations = |graph: &Graph, streams: &[RandomStream]| -> Result<()> {
+            let mut expected = Vec::<(Shape, DType, RandomStream, usize)>::new();
+            for ((shape, dtype), stream) in requests.iter().zip(streams) {
+                if let Some((_, _, _, count)) = expected.iter_mut().find(
+                    |(candidate_shape, candidate_dtype, candidate_stream, _)| {
+                        candidate_shape == shape
+                            && candidate_dtype == dtype
+                            && candidate_stream == stream
+                    },
+                ) {
+                    *count += 1;
+                } else {
+                    expected.push((shape.clone(), *dtype, *stream, 1));
+                }
+            }
+            for (shape, dtype, stream, expected_count) in expected {
+                let actual = graph.nodes[original_nodes..]
+                    .iter()
+                    .filter(|node| {
+                        node.shape == shape
+                            && node.dtype == dtype
+                            && matches!(
+                                &node.op,
+                                Op::Random {
+                                    kind: RandomKind::Uniform {
+                                        low: 0.0,
+                                        high: 1.0
+                                    },
+                                    stream: candidate
+                                } if *candidate == stream
+                            )
+                    })
+                    .count();
+                if actual != expected_count {
+                    return Err(Error::InvalidRandom {
+                        reason: "implicit uniform transaction must consume every stream exactly once",
+                    });
+                }
             }
             Ok(())
         };
+
+        let placeholders = streams_from([0, 0], 0);
         let mut rehearsal = self.clone();
-        build(&mut rehearsal, placeholder)?;
-        validate_reservation(&rehearsal, placeholder)?;
+        build(&mut rehearsal, &placeholders)?;
+        validate_reservations(&rehearsal, &placeholders)?;
 
         let mut registry = stream_registry()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let seed = registry.seed as u32;
         let counter = *registry.counters.get(&device).unwrap_or(&[0, 0]);
-        checked_counter_end(counter, words)?;
-        let stream = RandomStream {
-            device,
-            key: [device_key(device), seed],
-            counter,
-        };
+        checked_counter_end(counter, total_words)?;
+        let streams = streams_from(counter, seed);
         let mut staged = self.clone();
-        let output = build(&mut staged, stream)?;
-        validate_reservation(&staged, stream)?;
+        let output = build(&mut staged, &streams)?;
+        validate_reservations(&staged, &streams)?;
         let current = registry.counters.entry(device).or_insert([0, 0]);
         debug_assert_eq!(*current, counter);
-        reserve(current, words);
+        for word_count in words {
+            reserve(current, word_count);
+        }
         *self = staged;
         Ok(output)
     }

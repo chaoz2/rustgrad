@@ -21,8 +21,9 @@ mod sequential;
 mod shape;
 mod softmax;
 mod state;
+mod transformer;
 
-pub use activation::{GELU, GeluApproximation, ReLU, SiLU, Sigmoid, Tanh};
+pub use activation::{ActivationFn, GELU, GeluApproximation, ReLU, SiLU, Sigmoid, Tanh};
 pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
 pub use embedding::Embedding;
 pub use linear::Linear;
@@ -47,6 +48,7 @@ pub use state::{
     ModuleForward, PendingModeEffects, RealizedBatchNormStats, StateDict, StateKind,
     StrictStateLoadLimits, get_parameters, get_state_dict,
 };
+pub use transformer::TransformerBlock;
 
 pub(crate) use parameter::{ParameterRestore, next_version, restore_parameters};
 

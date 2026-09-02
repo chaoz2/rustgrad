@@ -803,7 +803,7 @@ impl Graph {
         self.dropout_tinygrad(input, 0.5)
     }
 
-    fn lower_ambient_dropout(
+    pub(crate) fn lower_ambient_dropout(
         &mut self,
         input: NodeId,
         dropout_p: f64,
