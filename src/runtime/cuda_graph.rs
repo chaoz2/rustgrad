@@ -1,9 +1,9 @@
 //! Fixed-schema, single-primary-context CUDA graph replay for pure prefixes.
 
-use crate::cuda::PrimaryGraphExec;
+use crate::cuda::{PrimaryGraphExec, PrimaryKernelNodeLaunch, PrimaryUpdatableGraphExec};
 use crate::runtime::static_schedule::{
     Sealed, StaticPlanAdapter, StaticRendered, StaticRenderedBuffer, StaticSchedulePlan,
-    StaticSymbolicBackend, StaticSymbolicProgram, bind_rendered_buffers,
+    StaticSymbolicBackend, StaticSymbolicProgram, StaticSymbolicRebind, bind_rendered_buffers,
 };
 use crate::{
     CapturedSchedule, ConcurrentPtxCache, PrimaryBufferLease, PrimaryContext, PrimaryPtxKernel,
@@ -71,6 +71,91 @@ pub struct CudaGraphPrefixPlan {
     renderer: PtxRenderer,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CudaGraphTopology {
+    active_items: Vec<usize>,
+    dependencies: Vec<Vec<usize>>,
+}
+
+impl CudaGraphTopology {
+    fn from_plan(plan: &StaticSchedulePlan<RenderedPtx>) -> Self {
+        let items = plan.items().collect::<Vec<_>>();
+        let active_items = items
+            .iter()
+            .enumerate()
+            .filter_map(|(position, item)| (item.extent() != 0).then_some(position))
+            .collect::<Vec<_>>();
+        let active_positions = active_items
+            .iter()
+            .enumerate()
+            .map(|(node, item)| (*item, node))
+            .collect::<BTreeMap<_, _>>();
+        let dependencies = active_items
+            .iter()
+            .enumerate()
+            .map(|(node, item)| {
+                let mut dependencies = items[*item]
+                    .dependencies()
+                    .iter()
+                    .filter_map(|dependency| active_positions.get(dependency).copied())
+                    .collect::<Vec<_>>();
+                // Static slot reuse is proven over canonical schedule order.
+                // Stream capture serialized that order implicitly; explicit
+                // graph nodes retain it so disjoint logical lifetimes cannot
+                // overlap on one reused physical lease.
+                if node != 0 && !dependencies.contains(&(node - 1)) {
+                    dependencies.push(node - 1);
+                    dependencies.sort_unstable();
+                }
+                dependencies
+            })
+            .collect();
+        Self {
+            active_items,
+            dependencies,
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        !self.active_items.is_empty()
+    }
+}
+
+enum PreparedCudaGraph {
+    Captured(PrimaryGraphExec),
+    Updatable {
+        executable: PrimaryUpdatableGraphExec,
+        topology: CudaGraphTopology,
+    },
+}
+
+impl PreparedCudaGraph {
+    fn launch(&self, stream: &Stream) -> Result<(), crate::CudaError> {
+        match self {
+            Self::Captured(graph) => graph.launch(stream),
+            Self::Updatable { executable, .. } => executable.launch(stream),
+        }
+    }
+
+    fn abandon_uncertain(&mut self) {
+        match self {
+            Self::Captured(graph) => graph.abandon_uncertain(),
+            Self::Updatable { executable, .. } => executable.abandon_uncertain(),
+        }
+    }
+}
+
+struct CudaGraphBinding {
+    launches: Vec<PrimaryKernelNodeLaunch>,
+    leases: Vec<Arc<PrimaryBufferLease>>,
+    logical_slots: BTreeMap<u64, usize>,
+    buffer_plans: BTreeMap<u64, crate::runtime::static_schedule::StaticBufferPlan>,
+    external_inputs: Vec<u64>,
+    retained_outputs: Vec<u64>,
+    kernel_cache_keys: Vec<String>,
+    keepalives: Vec<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
 impl CudaGraphPrefixPlan {
     pub fn plan(items: &[ScheduleItem], renderer: PtxRenderer) -> Result<Self, PtxError> {
         Self::plan_with_retained(items, None, renderer)
@@ -104,7 +189,8 @@ impl CudaGraphPrefixPlan {
 /// Reusable fixed-pointer CUDA graph. Host inputs may change only within the
 /// exact planned dtype/shape/byte schema.
 pub struct PreparedCudaGraphPrefix {
-    graph: Option<PrimaryGraphExec>,
+    primary: PrimaryContext,
+    graph: Option<PreparedCudaGraph>,
     stream: Option<Stream>,
     leases: Vec<Arc<PrimaryBufferLease>>,
     logical_slots: BTreeMap<u64, usize>,
@@ -219,12 +305,13 @@ impl PreparedCudaGraphPrefix {
                 kernel.enqueue_captured(&mut capture, &bindings)?;
             }
             let graph = capture.finish()?.instantiate_primary_owned()?;
-            (Some(stream), Some(graph))
+            (Some(stream), Some(PreparedCudaGraph::Captured(graph)))
         } else {
             (None, None)
         };
 
         Ok(Self {
+            primary: primary.clone(),
             graph,
             stream,
             leases,
@@ -240,6 +327,201 @@ impl PreparedCudaGraphPrefix {
             fence_attached: false,
             poisoned: false,
         })
+    }
+
+    fn from_rebindable_plan(
+        primary: PrimaryContext,
+        planned: CudaGraphPrefixPlan,
+        cache: &ConcurrentPtxCache,
+    ) -> Result<Self, PtxError> {
+        let topology = CudaGraphTopology::from_plan(&planned.plan);
+        Self::validate_rebindable_plan(&primary, &planned, &topology)?;
+        let mut binding = Self::prepare_rebindable_binding(&primary, &planned, cache, &topology)?;
+        let (stream, graph, completion_fence) = if topology.has_work() {
+            let stream = primary.stream()?;
+            let graph = PrimaryUpdatableGraphExec::new(
+                primary.clone(),
+                &mut binding.launches,
+                &topology.dependencies,
+                std::mem::take(&mut binding.keepalives),
+            )?;
+            let fence = Arc::new(primary.event_fence()?);
+            (
+                Some(stream),
+                Some(PreparedCudaGraph::Updatable {
+                    executable: graph,
+                    topology,
+                }),
+                Some(fence),
+            )
+        } else {
+            (None, None, None)
+        };
+        Ok(Self {
+            primary: primary.clone(),
+            graph,
+            stream,
+            leases: binding.leases,
+            logical_slots: binding.logical_slots,
+            buffer_plans: binding.buffer_plans,
+            external_inputs: binding.external_inputs,
+            retained_outputs: binding.retained_outputs,
+            kernel_cache_keys: binding.kernel_cache_keys,
+            completion_fence,
+            fence_attached: false,
+            poisoned: false,
+        })
+    }
+
+    fn validate_rebindable_plan(
+        primary: &PrimaryContext,
+        planned: &CudaGraphPrefixPlan,
+        topology: &CudaGraphTopology,
+    ) -> Result<(), PtxError> {
+        if !topology.has_work() {
+            return Ok(());
+        }
+        if !primary.supports_graph_node_updates() {
+            return Err(PtxError::Cuda(crate::CudaError::MissingSymbol(
+                "cuGraphAddKernelNode",
+            )));
+        }
+        let items = planned.plan.items().collect::<Vec<_>>();
+        for item in &topology.active_items {
+            let config = items[*item]
+                .rendered()
+                .launch_config(planned.renderer.block_size)?;
+            primary.validate_launch_config(config)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_rebindable_binding(
+        primary: &PrimaryContext,
+        planned: &CudaGraphPrefixPlan,
+        cache: &ConcurrentPtxCache,
+        topology: &CudaGraphTopology,
+    ) -> Result<CudaGraphBinding, PtxError> {
+        let plan = &planned.plan;
+        let items = plan.items().collect::<Vec<_>>();
+        let mut kernels = Vec::with_capacity(topology.active_items.len());
+        for item_index in &topology.active_items {
+            let item = items[*item_index];
+            kernels.push(cache.get_or_load(
+                primary,
+                item.rendered().clone(),
+                planned.renderer.block_size,
+            )?);
+        }
+
+        let allocator = primary.allocator();
+        let mut leases = Vec::with_capacity(plan.allocations().slots().len());
+        for (slot, allocation) in plan.allocations().slots().iter().enumerate() {
+            let bytes = NonZeroUsize::new(allocation.bytes).ok_or_else(|| {
+                PtxError::Unsupported(format!(
+                    "nonzero CUDA graph item requires zero-byte physical slot {slot}"
+                ))
+            })?;
+            leases.push(Arc::new(allocator.allocate(bytes)?));
+        }
+        let logical_slots = plan.allocations().logical_slots().clone();
+        let mut launches = Vec::with_capacity(kernels.len());
+        for (item_index, kernel) in topology.active_items.iter().zip(&kernels) {
+            let item = items[*item_index];
+            let bindings = item
+                .buffer_ids()
+                .iter()
+                .zip(&item.rendered().buffers)
+                .map(|(id, abi)| {
+                    Ok(PtxBinding {
+                        buffer: logical_slots
+                            .get(id)
+                            .and_then(|slot| leases.get(*slot))
+                            .ok_or_else(|| {
+                                PtxError::InvalidBinding(format!(
+                                    "CUDA graph buffer {id} is absent"
+                                ))
+                            })?
+                            .view()?,
+                        dtype: abi.dtype,
+                        mutable: abi.mutable,
+                    })
+                })
+                .collect::<Result<Vec<_>, PtxError>>()?;
+            launches.push(kernel.kernel_node_launch(&bindings)?);
+        }
+        let mut keepalives = leases
+            .iter()
+            .cloned()
+            .map(|lease| -> Arc<dyn std::any::Any + Send + Sync> { lease })
+            .collect::<Vec<_>>();
+        keepalives.extend(
+            kernels
+                .into_iter()
+                .map(|kernel| -> Arc<dyn std::any::Any + Send + Sync> { kernel }),
+        );
+        Ok(CudaGraphBinding {
+            launches,
+            leases,
+            logical_slots,
+            buffer_plans: plan.buffers().clone(),
+            external_inputs: plan.external_inputs().to_vec(),
+            retained_outputs: plan.retained_outputs().to_vec(),
+            kernel_cache_keys: plan.compiled_cache_keys(),
+            keepalives,
+        })
+    }
+
+    fn rebind_symbolic(
+        &mut self,
+        planned: CudaGraphPrefixPlan,
+        cache: &ConcurrentPtxCache,
+    ) -> StaticSymbolicRebind<CudaGraphPrefixPlan, PtxError> {
+        let topology = CudaGraphTopology::from_plan(&planned.plan);
+        let compatible = match (&self.graph, topology.has_work()) {
+            (Some(PreparedCudaGraph::Updatable { topology: old, .. }), true) => old == &topology,
+            (None, false) => true,
+            _ => false,
+        };
+        if !compatible {
+            return StaticSymbolicRebind::Prepare(planned);
+        }
+        if let Err(error) = Self::validate_rebindable_plan(&self.primary, &planned, &topology) {
+            return StaticSymbolicRebind::Failed {
+                error,
+                cached_valid: true,
+            };
+        }
+        let mut binding =
+            match Self::prepare_rebindable_binding(&self.primary, &planned, cache, &topology) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    return StaticSymbolicRebind::Failed {
+                        error,
+                        cached_valid: true,
+                    };
+                }
+            };
+        if let Some(PreparedCudaGraph::Updatable { executable, .. }) = self.graph.as_mut()
+            && let Err(error) = executable.update(
+                &mut binding.launches,
+                std::mem::take(&mut binding.keepalives),
+            )
+        {
+            self.poisoned = true;
+            return StaticSymbolicRebind::Failed {
+                error: error.into(),
+                cached_valid: false,
+            };
+        }
+        self.leases = binding.leases;
+        self.logical_slots = binding.logical_slots;
+        self.buffer_plans = binding.buffer_plans;
+        self.external_inputs = binding.external_inputs;
+        self.retained_outputs = binding.retained_outputs;
+        self.kernel_cache_keys = binding.kernel_cache_keys;
+        self.fence_attached = false;
+        StaticSymbolicRebind::Rebound
     }
 
     pub fn kernel_cache_keys(&self) -> Vec<String> {
@@ -447,8 +729,26 @@ impl StaticSymbolicBackend for CudaSymbolicBackend {
     }
 
     fn prepare(&self, plan: Self::Plan) -> Result<Self::Prepared, Self::Error> {
-        PreparedCudaGraphPrefix::from_plan(self.primary.clone(), plan, &self.cache)
+        PreparedCudaGraphPrefix::from_rebindable_plan(self.primary.clone(), plan, &self.cache)
             .map_err(Into::into)
+    }
+
+    fn rebind(
+        &self,
+        prepared: &mut Self::Prepared,
+        plan: Self::Plan,
+    ) -> StaticSymbolicRebind<Self::Plan, Self::Error> {
+        match prepared.rebind_symbolic(plan, &self.cache) {
+            StaticSymbolicRebind::Rebound => StaticSymbolicRebind::Rebound,
+            StaticSymbolicRebind::Prepare(plan) => StaticSymbolicRebind::Prepare(plan),
+            StaticSymbolicRebind::Failed {
+                error,
+                cached_valid,
+            } => StaticSymbolicRebind::Failed {
+                error: error.into(),
+                cached_valid,
+            },
+        }
     }
 
     fn execute(
@@ -487,6 +787,9 @@ impl CudaSymbolicTrace {
         &self.bindings
     }
 
+    /// Whether this call activated a different concrete specialization. On a
+    /// compatible positive-work binding CUDA may update the existing graph
+    /// executable in place instead of allocating another executable.
     pub fn prepared_now(&self) -> bool {
         self.prepared_now
     }
@@ -522,8 +825,10 @@ impl CudaSymbolicResult {
 }
 
 /// Owned bounded-symbolic CUDA program with a one-entry last-successful
-/// concrete specialization cache. A cache miss prepares device resources only
-/// after the complete symbolic invocation and pure PTX/static plan validate.
+/// concrete specialization cache. A compatible cache miss updates exact CUDA
+/// kernel-node parameters in place; incompatible and zero/nonzero topology
+/// transitions prepare a replacement only after complete symbolic and static
+/// plan validation.
 pub struct CudaSymbolicProgram {
     inner: StaticSymbolicProgram<CudaSymbolicBackend>,
 }
@@ -1433,6 +1738,23 @@ mod tests {
             assert!(!actual.trace().kernel_cache_keys().is_empty());
         }
         assert_eq!(cuda.output_order(), [0, 0]);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_create")
+                .count(),
+            1,
+            "positive compatible bindings reuse one explicit CUDA graph"
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_instantiate")
+                .count(),
+            1
+        );
+        assert!(mock.calls().contains(&"graph_exec_set_kernel"));
+        assert!(!mock.calls().contains(&"capture_begin"));
         assert!(
             mock.calls()
                 .iter()
@@ -1449,7 +1771,7 @@ mod tests {
         assert_eq!(capture.requested.len(), 2);
         assert!(capture.requested_passthroughs.is_empty());
         let cpu = CpuSymbolicProgram::with_output_order(capture.clone(), vec![1, 0, 1]).unwrap();
-        let (_, primary) = make_primary();
+        let (mock, primary) = make_primary();
         let cuda = CudaSymbolicProgram::with_output_order(
             primary,
             capture,
@@ -1477,6 +1799,14 @@ mod tests {
         let reused = cuda.run(matmul_input(2)).unwrap();
         assert!(!reused.trace().prepared_now());
         assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_exec_set_kernel")
+                .count(),
+            0,
+            "an identical concrete identity does not rewrite graph nodes"
+        );
+        assert_eq!(
             reused.trace().concrete_identity(),
             first.trace().concrete_identity()
         );
@@ -1487,6 +1817,14 @@ mod tests {
             first.trace().concrete_identity()
         );
         assert!(cuda.run(matmul_input(2)).unwrap().trace().prepared_now());
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_instantiate")
+                .count(),
+            1,
+            "both positive row bindings reuse one graph executable"
+        );
     }
 
     #[test]
@@ -1494,7 +1832,7 @@ mod tests {
         let capture = sequence_capture();
         let body_identity = capture.identity;
         let cpu = CpuSymbolicProgram::new(capture.clone()).unwrap();
-        let (_, primary) = make_primary();
+        let (mock, primary) = make_primary();
         let cuda =
             CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
 
@@ -1512,6 +1850,14 @@ mod tests {
         }
         assert_ne!(identities[&1], identities[&3]);
         assert_ne!(identities[&3], identities[&4]);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_instantiate")
+                .count(),
+            1,
+            "the bounded sequence body updates one compatible graph executable"
+        );
     }
 
     #[test]
@@ -1631,6 +1977,23 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_cuda_requires_node_update_capability_before_resource_work() {
+        let capture = projected_reduction_capture();
+        let (mock, primary) = make_primary();
+        mock.set_graph_update_supported(false);
+        let program =
+            CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
+        let calls = mock.calls();
+        assert!(matches!(
+            program.run(symbolic_input(2)),
+            Err(CudaSymbolicError::Ptx(PtxError::Cuda(
+                crate::CudaError::MissingSymbol("cuGraphAddKernelNode")
+            )))
+        ));
+        assert_eq!(mock.calls(), calls);
+    }
+
+    #[test]
     fn symbolic_cuda_zero_domain_uses_no_device_resources() {
         let extent = SymbolicExpr::variable("extent", 0, 4).unwrap();
         let mut graph = Graph::new();
@@ -1664,6 +2027,125 @@ mod tests {
             .unwrap();
         assert_eq!(result.outputs()[0].storage(), &Storage::F32(vec![]));
         assert_eq!(mock.calls(), calls);
+    }
+
+    #[test]
+    fn symbolic_cuda_rebuilds_only_across_zero_work_topology_transitions() {
+        let extent = SymbolicExpr::variable("extent", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], crate::DType::F32);
+        let output = graph.square(input).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap();
+        let (mock, primary) = make_primary();
+        let program =
+            CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
+        for extent in [0usize, 2, 3, 0, 0, 2] {
+            let result = program
+                .run(
+                    SymbolicInvocation::new()
+                        .with_symbol("extent", extent as i64)
+                        .with_input(
+                            "input",
+                            TensorData::new(
+                                [extent],
+                                (0..extent).map(|index| index as f32).collect(),
+                            )
+                            .unwrap(),
+                        ),
+                )
+                .unwrap();
+            assert_eq!(result.outputs()[0].shape(), &Shape::from([extent]));
+        }
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_instantiate")
+                .count(),
+            2,
+            "zero/nonzero transitions replace; positive bindings update in place"
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_create")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn symbolic_cuda_retains_node_graph_until_executable_destruction() {
+        let capture = projected_reduction_capture();
+        let (mock, primary) = make_primary();
+        let program =
+            CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
+        program.run(symbolic_input(2)).unwrap();
+        program.run(symbolic_input(3)).unwrap();
+        let calls = mock.calls();
+        assert!(!calls.contains(&"graph_destroy"));
+        assert!(
+            !calls.contains(&"free"),
+            "successful rebind retains the source generation's pointer owners"
+        );
+        assert!(
+            !calls.contains(&"module_unload"),
+            "successful rebind retains the source generation's modules"
+        );
+        drop(program);
+        let calls = mock.calls();
+        let exec_destroy = calls
+            .iter()
+            .position(|call| *call == "graph_exec_destroy")
+            .unwrap();
+        let graph_destroy = calls
+            .iter()
+            .position(|call| *call == "graph_destroy")
+            .unwrap();
+        let first_free = calls.iter().position(|call| *call == "free").unwrap();
+        let first_module_unload = calls
+            .iter()
+            .position(|call| *call == "module_unload")
+            .unwrap();
+        assert!(exec_destroy < graph_destroy);
+        assert!(graph_destroy < first_free);
+        assert!(graph_destroy < first_module_unload);
+    }
+
+    #[test]
+    fn symbolic_cuda_partial_node_update_releases_pointer_owners_after_exec() {
+        let capture = sequence_capture();
+        assert!(capture.items.len() > 1);
+        let (mock, primary) = make_primary();
+        let program =
+            CudaSymbolicProgram::new(primary, capture, PtxRenderer::new(80).unwrap()).unwrap();
+        program.run(sequence_input(1)).unwrap();
+        mock.fail_graph_update_after(1, 1);
+        assert!(program.run(sequence_input(3)).is_err());
+        let calls = mock.calls();
+        let exec_destroy = calls
+            .iter()
+            .position(|call| *call == "graph_exec_destroy")
+            .unwrap();
+        let first_free = calls.iter().position(|call| *call == "free").unwrap();
+        assert!(exec_destroy < first_free);
+        assert!(
+            program
+                .run(sequence_input(1))
+                .unwrap()
+                .trace()
+                .prepared_now()
+        );
     }
 
     #[test]
@@ -1725,15 +2207,38 @@ mod tests {
                 .prepared_now(),
             "a failed candidate must not replace the last successful specialization"
         );
-        mock.fail_graph_launch_after(0, 1);
+        mock.fail_graph_update_after(0, 1);
+        let launches = mock
+            .calls()
+            .iter()
+            .filter(|call| **call == "graph_launch")
+            .count();
         assert!(program.run(symbolic_input(3)).is_err());
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_launch")
+                .count(),
+            launches,
+            "a failed node update never launches"
+        );
         assert!(
-            !program
+            program
                 .run(symbolic_input(2))
                 .unwrap()
                 .trace()
                 .prepared_now(),
-            "a failed candidate execution must preserve the prior entry"
+            "an uncertain executable update evicts the cached graph"
+        );
+        mock.fail_graph_launch_after(0, 1);
+        assert!(program.run(symbolic_input(3)).is_err());
+        assert!(
+            program
+                .run(symbolic_input(2))
+                .unwrap()
+                .trace()
+                .prepared_now(),
+            "a failed rebound execution evicts the mutated executable"
         );
         mock.fail_graph_launch_after(0, 1);
         mock.fail_stream_sync_after(0, 1);

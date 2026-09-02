@@ -38,6 +38,30 @@ type CuJitInputType = c_uint;
 type CuFunction = *mut c_void;
 type CuGraph = *mut c_void;
 type CuGraphExec = *mut c_void;
+type CuGraphNode = *mut c_void;
+
+/// Typed kernel-node arguments for CUDA graph construction and executable
+/// rebinding. Argument storage is borrowed only for the synchronous Driver
+/// call; CUDA copies each pointed-to value into the graph node.
+pub struct GraphKernelNodeArgs<'a> {
+    function: CuFunction,
+    config: LaunchConfig,
+    parameters: &'a mut [*mut c_void],
+}
+
+impl GraphKernelNodeArgs<'_> {
+    pub fn function(&self) -> *mut c_void {
+        self.function
+    }
+
+    pub fn config(&self) -> LaunchConfig {
+        self.config
+    }
+
+    pub fn parameters_mut(&mut self) -> &mut [*mut c_void] {
+        self.parameters
+    }
+}
 /// Typed internal `cuLinkAddData` arguments.  `Dispatch` is public for
 /// alternate drivers, so this record must be visible at the same boundary;
 /// its fields stay private to preserve the fixed CUDA ABI ordering.
@@ -742,6 +766,26 @@ pub trait Dispatch: Send + Sync + 'static {
     fn graph_instantiate(&self, _exec: &mut CuGraphExec, _graph: CuGraph) -> CuResult {
         801
     }
+    fn graph_create(&self, _graph: &mut CuGraph, _flags: c_uint) -> CuResult {
+        801
+    }
+    fn graph_add_kernel_node(
+        &self,
+        _node: &mut CuGraphNode,
+        _graph: CuGraph,
+        _dependencies: &[CuGraphNode],
+        _args: &mut GraphKernelNodeArgs<'_>,
+    ) -> CuResult {
+        801
+    }
+    fn graph_exec_kernel_node_set_params(
+        &self,
+        _exec: CuGraphExec,
+        _node: CuGraphNode,
+        _args: &mut GraphKernelNodeArgs<'_>,
+    ) -> CuResult {
+        801
+    }
     fn graph_launch(&self, _exec: CuGraphExec, _stream: CuStream) -> CuResult {
         801
     }
@@ -752,6 +796,9 @@ pub trait Dispatch: Send + Sync + 'static {
         801
     }
     fn supports_graphs(&self) -> bool {
+        false
+    }
+    fn supports_graph_node_updates(&self) -> bool {
         false
     }
     fn stream_create(&self, out: &mut CuStream, flags: c_uint) -> CuResult;
@@ -1129,6 +1176,13 @@ impl PrimaryContext {
     }
     pub(crate) fn supports_graphs(&self) -> bool {
         self.0.driver.0.dispatch.supports_graphs()
+    }
+    pub(crate) fn supports_graph_node_updates(&self) -> bool {
+        self.0.driver.0.dispatch.supports_graph_node_updates()
+    }
+    pub(crate) fn validate_launch_config(&self, config: LaunchConfig) -> Result<(), CudaError> {
+        let device = self.0.driver.device(self.device())?;
+        config.validate(device.capability()?.max_threads_per_block)
     }
     /// Stable, crate-private owner identity used to partition concurrent JIT caches.
     pub(crate) fn identity(&self) -> usize {
@@ -2325,6 +2379,12 @@ enum PrimaryQuarantine {
     },
     GraphExec {
         raw: usize,
+        primary: PrimaryContext,
+        keepalives: Vec<Arc<dyn Any + Send + Sync>>,
+    },
+    UpdatableGraphExec {
+        graph: Option<usize>,
+        exec: Option<usize>,
         primary: PrimaryContext,
         keepalives: Vec<Arc<dyn Any + Send + Sync>>,
     },
@@ -3737,6 +3797,33 @@ pub(crate) struct PrimaryGraphExec {
     raw: Option<CuGraphExec>,
     keepalives: Vec<Arc<dyn Any + Send + Sync>>,
 }
+
+/// One validated primary-context kernel launch used to construct or update a
+/// CUDA graph node. It owns the kernel module behind the raw function handle.
+pub(crate) struct PrimaryKernelNodeLaunch {
+    primary: PrimaryContext,
+    function: usize,
+    config: LaunchConfig,
+    words: Vec<u64>,
+    #[allow(dead_code)] // owns the function's module through every Driver call.
+    kernel: Arc<dyn Any + Send + Sync>,
+}
+
+/// Explicit CUDA graph whose kernel-node handles remain owned and authenticated
+/// so a compatible symbolic specialization can update its launch parameters.
+pub(crate) struct PrimaryUpdatableGraphExec {
+    primary: PrimaryContext,
+    graph: Option<CuGraph>,
+    exec: Option<CuGraphExec>,
+    nodes: Vec<CuGraphNode>,
+    // `cuGraphExecKernelNodeSetParams` updates only the executable. The source
+    // graph retains its original node parameters until `cuGraphDestroy`, so
+    // their modules and pointer owners must remain immutable for its lifetime.
+    source_keepalives: Vec<Arc<dyn Any + Send + Sync>>,
+    // The executable may instead refer to the latest successful update (or to
+    // multiple generations after a partial failure).
+    exec_keepalives: Vec<Arc<dyn Any + Send + Sync>>,
+}
 impl<'a> Capture<'a> {
     /// Retains the logical view itself, so the originating lease cannot be
     /// released while a captured graph or graph executable can replay it.
@@ -4038,6 +4125,193 @@ impl PrimaryGraphExec {
 impl Drop for PrimaryGraphExec {
     fn drop(&mut self) {
         if self.raw.is_some() && self.close().is_err() {
+            self.abandon_uncertain();
+        }
+    }
+}
+
+impl PrimaryKernelNodeLaunch {
+    fn with_args<T>(&mut self, callback: impl FnOnce(&mut GraphKernelNodeArgs<'_>) -> T) -> T {
+        let mut parameters = self
+            .words
+            .iter_mut()
+            .map(|word| (word as *mut u64).cast())
+            .collect::<Vec<_>>();
+        callback(&mut GraphKernelNodeArgs {
+            function: self.function as CuFunction,
+            config: self.config,
+            parameters: &mut parameters,
+        })
+    }
+}
+
+impl PrimaryUpdatableGraphExec {
+    pub(crate) fn new(
+        primary: PrimaryContext,
+        launches: &mut [PrimaryKernelNodeLaunch],
+        dependencies: &[Vec<usize>],
+        keepalives: Vec<Arc<dyn Any + Send + Sync>>,
+    ) -> Result<Self, CudaError> {
+        if launches.is_empty()
+            || launches.len() != dependencies.len()
+            || launches
+                .iter()
+                .any(|launch| launch.primary.identity() != primary.identity())
+        {
+            return Err(CudaError::InvalidArgument(
+                "CUDA graph kernel-node topology mismatch",
+            ));
+        }
+        if !primary.supports_graph_node_updates() {
+            return Err(CudaError::MissingSymbol("cuGraphAddKernelNode"));
+        }
+        let _guard = primary.enter()?;
+        let dispatch = primary.0.driver.0.dispatch.as_ref();
+        let source_keepalives = keepalives.clone();
+        let mut result = Self {
+            primary: primary.clone(),
+            graph: None,
+            exec: None,
+            nodes: Vec::with_capacity(launches.len()),
+            source_keepalives,
+            exec_keepalives: keepalives,
+        };
+        let mut graph = ptr::null_mut();
+        let created = dispatch.graph_create(&mut graph, 0);
+        if !graph.is_null() {
+            result.graph = Some(graph);
+        }
+        check(dispatch, created)?;
+        if graph.is_null() {
+            return Err(CudaError::InvalidArgument(
+                "graph create returned null graph",
+            ));
+        }
+        for (position, (launch, dependency_positions)) in
+            launches.iter_mut().zip(dependencies).enumerate()
+        {
+            if dependency_positions
+                .iter()
+                .any(|dependency| *dependency >= position)
+                || dependency_positions
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+            {
+                return Err(CudaError::InvalidArgument(
+                    "CUDA graph kernel-node dependency is not topological",
+                ));
+            }
+            let dependency_nodes = dependency_positions
+                .iter()
+                .map(|dependency| result.nodes[*dependency])
+                .collect::<Vec<_>>();
+            let mut node = ptr::null_mut();
+            let status = launch.with_args(|args| {
+                dispatch.graph_add_kernel_node(&mut node, graph, &dependency_nodes, args)
+            });
+            check(dispatch, status)?;
+            if node.is_null() {
+                return Err(CudaError::InvalidArgument(
+                    "graph add kernel returned null node",
+                ));
+            }
+            result.nodes.push(node);
+        }
+        let mut exec = ptr::null_mut();
+        let instantiated = dispatch.graph_instantiate(&mut exec, graph);
+        if !exec.is_null() {
+            result.exec = Some(exec);
+        }
+        check(dispatch, instantiated)?;
+        if exec.is_null() {
+            return Err(CudaError::InvalidArgument(
+                "instantiate returned null graph exec",
+            ));
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        launches: &mut [PrimaryKernelNodeLaunch],
+        mut keepalives: Vec<Arc<dyn Any + Send + Sync>>,
+    ) -> Result<(), CudaError> {
+        // The symbolic-program cache mutex serializes this with replay, whose
+        // completion fence is always waited before success is published.
+        if launches.len() != self.nodes.len()
+            || launches
+                .iter()
+                .any(|launch| launch.primary.identity() != self.primary.identity())
+        {
+            return Err(CudaError::InvalidArgument(
+                "CUDA graph kernel-node update mismatch",
+            ));
+        }
+        let exec = self.exec.ok_or(CudaError::Closed("graph exec"))?;
+        let _guard = self.primary.enter()?;
+        let dispatch = self.primary.0.driver.0.dispatch.as_ref();
+        for (launch, node) in launches.iter_mut().zip(&self.nodes) {
+            let status = launch
+                .with_args(|args| dispatch.graph_exec_kernel_node_set_params(exec, *node, args));
+            if let Err(error) = check(dispatch, status) {
+                // An earlier node may already refer to the replacement. Keep
+                // both generations alive until this unusable executable is
+                // destroyed by the caller's cache eviction.
+                self.exec_keepalives.append(&mut keepalives);
+                return Err(error);
+            }
+        }
+        self.exec_keepalives = keepalives;
+        Ok(())
+    }
+
+    pub(crate) fn launch(&self, stream: &Stream) -> Result<(), CudaError> {
+        if !stream.belongs_to_primary(&self.primary) {
+            return Err(CudaError::ContextMismatch);
+        }
+        let exec = self.exec.ok_or(CudaError::Closed("graph exec"))?;
+        let _guard = self.primary.enter()?;
+        let dispatch = self.primary.0.driver.0.dispatch.as_ref();
+        check(dispatch, dispatch.graph_launch(exec, stream.raw))
+    }
+
+    pub(crate) fn close(&mut self) -> Result<(), CudaError> {
+        let _guard = self.primary.enter()?;
+        let dispatch = self.primary.0.driver.0.dispatch.as_ref();
+        if let Some(exec) = self.exec {
+            check(dispatch, dispatch.graph_exec_destroy(exec))?;
+            self.exec = None;
+        }
+        if let Some(graph) = self.graph {
+            check(dispatch, dispatch.graph_destroy(graph))?;
+            self.graph = None;
+        }
+        self.nodes.clear();
+        self.source_keepalives.clear();
+        self.exec_keepalives.clear();
+        Ok(())
+    }
+
+    /// Retains source graph, executable, and both old/new pointer owners when
+    /// launch completion or destruction is unknowable.
+    pub(crate) fn abandon_uncertain(&mut self) {
+        if self.graph.is_some() || self.exec.is_some() {
+            let mut keepalives = std::mem::take(&mut self.source_keepalives);
+            keepalives.append(&mut self.exec_keepalives);
+            retain_primary_quarantine(PrimaryQuarantine::UpdatableGraphExec {
+                graph: self.graph.take().map(|graph| graph as usize),
+                exec: self.exec.take().map(|exec| exec as usize),
+                primary: self.primary.clone(),
+                keepalives,
+            });
+            self.nodes.clear();
+        }
+    }
+}
+
+impl Drop for PrimaryUpdatableGraphExec {
+    fn drop(&mut self) {
+        if (self.graph.is_some() || self.exec.is_some()) && self.close().is_err() {
             self.abandon_uncertain();
         }
     }
@@ -4612,6 +4886,25 @@ impl Function {
     pub(crate) fn identity(&self) -> usize {
         self.raw as usize
     }
+    pub(crate) fn primary_kernel_node_launch(
+        &self,
+        primary: &PrimaryContext,
+        config: LaunchConfig,
+        words: Vec<u64>,
+        kernel: Arc<dyn Any + Send + Sync>,
+    ) -> Result<PrimaryKernelNodeLaunch, CudaError> {
+        if !matches!(&self.owner, Owner::Primary(owner) if Arc::ptr_eq(&owner.0, &primary.0)) {
+            return Err(CudaError::ContextMismatch);
+        }
+        config.validate(self.owner.device_capability_threads()?)?;
+        Ok(PrimaryKernelNodeLaunch {
+            primary: primary.clone(),
+            function: self.raw as usize,
+            config,
+            words,
+            kernel,
+        })
+    }
     /// `args` owns the pointed-to argument values through this synchronous call.
     pub fn launch(
         &self,
@@ -4696,6 +4989,51 @@ struct NativeGraphTable {
     launch: Option<unsafe extern "C" fn(CuGraphExec, CuStream) -> CuResult>,
     destroy: Option<unsafe extern "C" fn(CuGraph) -> CuResult>,
     exec_destroy: Option<unsafe extern "C" fn(CuGraphExec) -> CuResult>,
+    create: Option<unsafe extern "C" fn(*mut CuGraph, c_uint) -> CuResult>,
+    add_kernel: Option<
+        unsafe extern "C" fn(
+            *mut CuGraphNode,
+            CuGraph,
+            *const CuGraphNode,
+            usize,
+            *const NativeKernelNodeParams,
+        ) -> CuResult,
+    >,
+    set_kernel: Option<
+        unsafe extern "C" fn(CuGraphExec, CuGraphNode, *const NativeKernelNodeParams) -> CuResult,
+    >,
+}
+
+#[repr(C)]
+struct NativeKernelNodeParams {
+    function: CuFunction,
+    grid_x: c_uint,
+    grid_y: c_uint,
+    grid_z: c_uint,
+    block_x: c_uint,
+    block_y: c_uint,
+    block_z: c_uint,
+    shared_bytes: c_uint,
+    parameters: *mut *mut c_void,
+    extra: *mut *mut c_void,
+}
+
+impl NativeKernelNodeParams {
+    fn from_args(args: &mut GraphKernelNodeArgs<'_>) -> Self {
+        let config = args.config;
+        Self {
+            function: args.function,
+            grid_x: config.grid[0],
+            grid_y: config.grid[1],
+            grid_z: config.grid[2],
+            block_x: config.block[0],
+            block_y: config.block[1],
+            block_z: config.block[2],
+            shared_bytes: config.shared_bytes,
+            parameters: args.parameters.as_mut_ptr(),
+            extra: ptr::null_mut(),
+        }
+    }
 }
 macro_rules! table { ($($n:ident : $t:ty),* $(,)?) => { struct NativeTable { $($n: $t,)* } }; }
 table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, memcpy_htod_async: Option<unsafe extern "C" fn(CuDevicePtr,*const c_void,usize,CuStream)->CuResult>, memcpy_dtoh_async: Option<unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize,CuStream)->CuResult>, memcpy_dtod_async: Option<unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize,CuStream)->CuResult>, mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void,usize,c_uint)->CuResult>, mem_free_host: Option<unsafe extern "C" fn(*mut c_void)->CuResult>, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: Option<unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult>, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, link_create: Option<unsafe extern "C" fn(c_uint,*mut u32,*mut *mut c_void,*mut CuLinkState)->CuResult>, link_add_data: Option<unsafe extern "C" fn(CuLinkState,CuJitInputType,*mut c_void,usize,*const c_char,c_uint,*mut u32,*mut *mut c_void)->CuResult>, link_complete: Option<unsafe extern "C" fn(CuLinkState,*mut *mut c_void,*mut usize)->CuResult>, link_destroy: Option<unsafe extern "C" fn(CuLinkState)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
@@ -4995,6 +5333,18 @@ impl NativeDispatch {
                 .symbol(b"cuGraphExecDestroy\0")
                 .ok()
                 .map(|p| unsafe { std::mem::transmute(p) }),
+            create: library
+                .symbol(b"cuGraphCreate\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            add_kernel: library
+                .symbol(b"cuGraphAddKernelNode\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            set_kernel: library
+                .symbol(b"cuGraphExecKernelNodeSetParams\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
         };
         Ok(Self {
             _library: library,
@@ -5152,6 +5502,15 @@ impl Dispatch for NativeDispatch {
             && self.graph.destroy.is_some()
             && self.graph.exec_destroy.is_some()
     }
+    fn supports_graph_node_updates(&self) -> bool {
+        self.graph.create.is_some()
+            && self.graph.add_kernel.is_some()
+            && self.graph.set_kernel.is_some()
+            && self.graph.instantiate.is_some()
+            && self.graph.launch.is_some()
+            && self.graph.destroy.is_some()
+            && self.graph.exec_destroy.is_some()
+    }
     fn stream_begin_capture(&self, s: CuStream, mode: c_uint) -> CuResult {
         self.graph.begin.map_or(801, |f| unsafe { f(s, mode) })
     }
@@ -5162,6 +5521,39 @@ impl Dispatch for NativeDispatch {
         self.graph.instantiate.map_or(801, |f| unsafe {
             f(e, g, ptr::null_mut(), ptr::null_mut(), 0)
         })
+    }
+    fn graph_create(&self, graph: &mut CuGraph, flags: c_uint) -> CuResult {
+        self.graph
+            .create
+            .map_or(801, |f| unsafe { f(graph, flags) })
+    }
+    fn graph_add_kernel_node(
+        &self,
+        node: &mut CuGraphNode,
+        graph: CuGraph,
+        dependencies: &[CuGraphNode],
+        args: &mut GraphKernelNodeArgs<'_>,
+    ) -> CuResult {
+        let params = NativeKernelNodeParams::from_args(args);
+        let dependency_ptr = if dependencies.is_empty() {
+            ptr::null()
+        } else {
+            dependencies.as_ptr()
+        };
+        self.graph.add_kernel.map_or(801, |f| unsafe {
+            f(node, graph, dependency_ptr, dependencies.len(), &params)
+        })
+    }
+    fn graph_exec_kernel_node_set_params(
+        &self,
+        exec: CuGraphExec,
+        node: CuGraphNode,
+        args: &mut GraphKernelNodeArgs<'_>,
+    ) -> CuResult {
+        let params = NativeKernelNodeParams::from_args(args);
+        self.graph
+            .set_kernel
+            .map_or(801, |f| unsafe { f(exec, node, &params) })
     }
     fn graph_launch(&self, e: CuGraphExec, s: CuStream) -> CuResult {
         self.graph.launch.map_or(801, |f| unsafe { f(e, s) })
@@ -5482,7 +5874,9 @@ pub(crate) mod tests {
         generic_kernels: Mutex<HashMap<(usize, usize), Arc<crate::ptx::GenericKernelSemantics>>>,
         captured_graph_launches: Mutex<Vec<MockGraphLaunch>>,
         graphs: Mutex<HashMap<usize, Vec<MockGraphLaunch>>>,
+        graph_nodes: Mutex<HashMap<usize, (usize, usize)>>,
         graph_execs: Mutex<HashMap<usize, Vec<MockGraphLaunch>>>,
+        graph_exec_sources: Mutex<HashMap<usize, usize>>,
         link_states: Mutex<HashSet<usize>>,
         link_input_types: Mutex<Vec<CuJitInputType>>,
         link_add_gate: Mutex<Option<(bool, bool)>>,
@@ -5497,6 +5891,7 @@ pub(crate) mod tests {
         next_link_state: AtomicUsize,
         next_graph: AtomicUsize,
         next_graph_exec: AtomicUsize,
+        next_graph_node: AtomicUsize,
         launch_result: AtomicI32,
         launch_fail_after: AtomicUsize,
         launch_fail_result: AtomicI32,
@@ -5508,6 +5903,9 @@ pub(crate) mod tests {
         graph_destroy_result: AtomicI32,
         graph_exec_destroy_after: AtomicUsize,
         graph_exec_destroy_result: AtomicI32,
+        graph_update_after: AtomicUsize,
+        graph_update_result: AtomicI32,
+        graph_update_supported: AtomicBool,
         generic_sync_after: AtomicUsize,
         generic_sync_result: AtomicI32,
         fail_alloc: AtomicBool,
@@ -5572,7 +5970,9 @@ pub(crate) mod tests {
                 generic_kernels: Mutex::new(HashMap::new()),
                 captured_graph_launches: Mutex::new(Vec::new()),
                 graphs: Mutex::new(HashMap::new()),
+                graph_nodes: Mutex::new(HashMap::new()),
                 graph_execs: Mutex::new(HashMap::new()),
+                graph_exec_sources: Mutex::new(HashMap::new()),
                 link_states: Mutex::new(HashSet::new()),
                 link_input_types: Mutex::new(vec![]),
                 link_add_gate: Mutex::new(None),
@@ -5587,6 +5987,7 @@ pub(crate) mod tests {
                 next_link_state: AtomicUsize::new(0x66),
                 next_graph: AtomicUsize::new(0x99),
                 next_graph_exec: AtomicUsize::new(0xaa),
+                next_graph_node: AtomicUsize::new(0xbb),
                 launch_result: AtomicI32::new(0),
                 launch_fail_after: AtomicUsize::new(usize::MAX),
                 launch_fail_result: AtomicI32::new(0),
@@ -5598,6 +5999,9 @@ pub(crate) mod tests {
                 graph_destroy_result: AtomicI32::new(0),
                 graph_exec_destroy_after: AtomicUsize::new(usize::MAX),
                 graph_exec_destroy_result: AtomicI32::new(0),
+                graph_update_after: AtomicUsize::new(usize::MAX),
+                graph_update_result: AtomicI32::new(0),
+                graph_update_supported: AtomicBool::new(true),
                 generic_sync_after: AtomicUsize::new(usize::MAX),
                 generic_sync_result: AtomicI32::new(0),
                 fail_alloc: AtomicBool::new(false),
@@ -6270,6 +6674,15 @@ pub(crate) mod tests {
             self.graph_exec_destroy_after
                 .store(successful_calls, Ordering::Release);
         }
+        pub(crate) fn fail_graph_update_after(&self, successful_calls: usize, result: CuResult) {
+            self.graph_update_result.store(result, Ordering::Release);
+            self.graph_update_after
+                .store(successful_calls, Ordering::Release);
+        }
+        pub(crate) fn set_graph_update_supported(&self, supported: bool) {
+            self.graph_update_supported
+                .store(supported, Ordering::Release);
+        }
         pub(crate) fn fail_generic_kernel_sync_after(
             &self,
             successful_calls: usize,
@@ -6838,6 +7251,151 @@ pub(crate) mod tests {
         fn supports_graphs(&self) -> bool {
             true
         }
+        fn supports_graph_node_updates(&self) -> bool {
+            self.graph_update_supported.load(Ordering::Acquire)
+        }
+        fn graph_create(&self, out: &mut CuGraph, _: c_uint) -> CuResult {
+            self.call("graph_create");
+            if self.current_primary().is_none() {
+                return Self::INVALID_MEMORY;
+            }
+            let raw = self.next_graph.fetch_add(1, Ordering::AcqRel);
+            self.graphs.lock().unwrap().insert(raw, Vec::new());
+            *out = raw as CuGraph;
+            CUDA_SUCCESS
+        }
+        fn graph_add_kernel_node(
+            &self,
+            out: &mut CuGraphNode,
+            graph: CuGraph,
+            dependencies: &[CuGraphNode],
+            args: &mut GraphKernelNodeArgs<'_>,
+        ) -> CuResult {
+            self.call("graph_add_kernel");
+            let Some(owner) = self.current_primary() else {
+                return Self::INVALID_MEMORY;
+            };
+            let graph_id = graph as usize;
+            if dependencies.iter().any(|node| {
+                self.graph_nodes
+                    .lock()
+                    .unwrap()
+                    .get(&(*node as usize))
+                    .is_none_or(|(owner, _)| *owner != graph_id)
+            }) {
+                return Self::INVALID_MEMORY;
+            }
+            let function = args.function() as usize;
+            let Some(buffer_count) = self
+                .generic_kernels
+                .lock()
+                .unwrap()
+                .get(&(owner.identity, function))
+                .map(|semantics| semantics.buffers.len())
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            if args.parameters_mut().len() != buffer_count + 1 {
+                return Self::INVALID_MEMORY;
+            }
+            let words = args
+                .parameters_mut()
+                .iter()
+                .map(|parameter| {
+                    (!parameter.is_null()).then(|| unsafe { *(*parameter as *const u64) })
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(words) = words else {
+                return Self::INVALID_MEMORY;
+            };
+            let mut graphs = self.graphs.lock().unwrap();
+            let Some(launches) = graphs.get_mut(&graph_id) else {
+                return Self::INVALID_MEMORY;
+            };
+            let position = launches.len();
+            launches.push(MockGraphLaunch {
+                owner,
+                function,
+                words,
+            });
+            let node = self.next_graph_node.fetch_add(1, Ordering::AcqRel);
+            self.graph_nodes
+                .lock()
+                .unwrap()
+                .insert(node, (graph_id, position));
+            *out = node as CuGraphNode;
+            CUDA_SUCCESS
+        }
+        fn graph_exec_kernel_node_set_params(
+            &self,
+            exec: CuGraphExec,
+            node: CuGraphNode,
+            args: &mut GraphKernelNodeArgs<'_>,
+        ) -> CuResult {
+            self.call("graph_exec_set_kernel");
+            if let Some(result) =
+                Self::one_shot_failure(&self.graph_update_after, &self.graph_update_result)
+            {
+                return result;
+            }
+            let Some(owner) = self.current_primary() else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some((graph, position)) = self
+                .graph_nodes
+                .lock()
+                .unwrap()
+                .get(&(node as usize))
+                .copied()
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            if self
+                .graph_exec_sources
+                .lock()
+                .unwrap()
+                .get(&(exec as usize))
+                != Some(&graph)
+            {
+                return Self::INVALID_MEMORY;
+            }
+            let function = args.function() as usize;
+            let Some(buffer_count) = self
+                .generic_kernels
+                .lock()
+                .unwrap()
+                .get(&(owner.identity, function))
+                .map(|semantics| semantics.buffers.len())
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            if args.parameters_mut().len() != buffer_count + 1 {
+                return Self::INVALID_MEMORY;
+            }
+            let words = args
+                .parameters_mut()
+                .iter()
+                .map(|parameter| {
+                    (!parameter.is_null()).then(|| unsafe { *(*parameter as *const u64) })
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(words) = words else {
+                return Self::INVALID_MEMORY;
+            };
+            let mut execs = self.graph_execs.lock().unwrap();
+            let Some(launch) = execs
+                .get_mut(&(exec as usize))
+                .and_then(|launches| launches.get_mut(position))
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            *launch = MockGraphLaunch {
+                owner,
+                function,
+                words,
+            };
+            CUDA_SUCCESS
+        }
         fn stream_begin_capture(&self, _: CuStream, _: c_uint) -> CuResult {
             self.call("capture_begin");
             if self.current_primary().is_none() {
@@ -6887,6 +7445,10 @@ pub(crate) mod tests {
                     return Self::INVALID_MEMORY;
                 };
                 self.graph_execs.lock().unwrap().insert(raw, launches);
+                self.graph_exec_sources
+                    .lock()
+                    .unwrap()
+                    .insert(raw, graph as usize);
                 raw as CuGraphExec
             };
             0
@@ -6937,11 +7499,16 @@ pub(crate) mod tests {
             {
                 return result;
             }
-            self.graphs
-                .lock()
-                .unwrap()
-                .remove(&(graph as usize))
-                .map_or(Self::INVALID_MEMORY, |_| CUDA_SUCCESS)
+            let removed = self.graphs.lock().unwrap().remove(&(graph as usize));
+            if removed.is_some() {
+                self.graph_nodes
+                    .lock()
+                    .unwrap()
+                    .retain(|_, (owner, _)| *owner != graph as usize);
+                CUDA_SUCCESS
+            } else {
+                Self::INVALID_MEMORY
+            }
         }
         fn graph_exec_destroy(&self, exec: CuGraphExec) -> CuResult {
             self.call("graph_exec_destroy");
@@ -6954,11 +7521,12 @@ pub(crate) mod tests {
             ) {
                 return result;
             }
-            self.graph_execs
+            let removed = self.graph_execs.lock().unwrap().remove(&(exec as usize));
+            self.graph_exec_sources
                 .lock()
                 .unwrap()
-                .remove(&(exec as usize))
-                .map_or(Self::INVALID_MEMORY, |_| CUDA_SUCCESS)
+                .remove(&(exec as usize));
+            removed.map_or(Self::INVALID_MEMORY, |_| CUDA_SUCCESS)
         }
         fn stream_create(&self, out: &mut CuStream, _: c_uint) -> CuResult {
             self.call("stream_create");
