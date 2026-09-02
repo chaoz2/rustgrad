@@ -591,6 +591,92 @@ fn upat_early_rejection_is_prepared_direct_source_metadata() {
 }
 
 #[test]
+fn context_rewrites_share_one_deterministic_compiler_state() {
+    #[derive(Default)]
+    struct RenameContext {
+        next: usize,
+        attempts: Vec<&'static str>,
+    }
+
+    fn rename_special(context: &mut RenameContext, _: &uop::Captures, _: &UOp) -> Option<UOp> {
+        let ordinal = context.next;
+        context.next += 1;
+        Some(UOp::from_operation(
+            Operation::Special(format!("bound-{ordinal}")),
+            None,
+            vec![],
+        ))
+    }
+
+    fn decline_first_then_select(
+        context: &mut RenameContext,
+        captures: &uop::Captures,
+        _: &UOp,
+    ) -> Option<UOp> {
+        if captures.get("first").is_some() {
+            context.attempts.push("first");
+            return None;
+        }
+        context.attempts.push("second");
+        captures.get("selected").cloned()
+    }
+
+    // Context-dependent range/name allocation in tinygrad is a shared-DAG
+    // rewrite: one structurally shared node consumes one ordinal even when it
+    // has multiple parents.
+    let unbound = UOp::from_operation(Operation::Special("unbound".into()), None, vec![]);
+    let root = UOp::sink(vec![unbound.clone(), unbound]);
+    root.validate().unwrap();
+    let encoded = uop::artifact::encode(&root).unwrap();
+    let mut context = RenameContext::default();
+    let mut rules = vec![uop::ContextRewriteRule {
+        name: "bind-special-ordinal",
+        priority: 0,
+        pattern: UPat::op(Operation::Special("unbound".into())),
+        apply: rename_special,
+    }];
+    let (rewritten, trace) =
+        uop::rewrite_with_context(&root, &mut rules, Walk::BottomUp, &mut context).unwrap();
+    assert_eq!(context.next, 1);
+    assert_eq!(trace.rules, vec!["bind-special-ordinal"]);
+    assert_eq!(rewritten.sources()[0], rewritten.sources()[1]);
+    assert_eq!(
+        rewritten.sources()[0].operation(),
+        &Operation::Special("bound-0".into())
+    );
+    assert_eq!(uop::artifact::encode(&root).unwrap(), encoded);
+
+    // A declined alternative may update explicit compiler state, but partial
+    // captures remain isolated and the next declaration-ordered candidate
+    // receives only its own complete capture map.
+    let one = UOp::constant(1, i32t());
+    let two = UOp::constant(2, i32t());
+    let add = UOp::binary(Binary::Add, one.clone(), two.clone());
+    let pattern = UPat::any_of([
+        UPat::op(Operation::Binary(Binary::Add)).sources(vec![
+            UPat::any().named("leaked"),
+            UPat::op(Operation::Const(LiteralValue::Int(99))),
+        ]),
+        UPat::op(Operation::Binary(Binary::Add))
+            .sources(vec![UPat::any().named("first"), UPat::any()]),
+        UPat::op(Operation::Binary(Binary::Add))
+            .sources(vec![UPat::any(), UPat::any().named("selected")]),
+    ])
+    .unwrap();
+    let mut rules = vec![uop::ContextRewriteRule {
+        name: "context-alternative-order",
+        priority: 0,
+        pattern,
+        apply: decline_first_then_select,
+    }];
+    let (rewritten, trace) =
+        uop::rewrite_with_context(&add, &mut rules, Walk::BottomUp, &mut context).unwrap();
+    assert_eq!(rewritten, two);
+    assert_eq!(trace.rules, vec!["context-alternative-order"]);
+    assert_eq!(context.attempts, vec!["first", "second"]);
+}
+
+#[test]
 fn upat_alternatives_and_permuted_sources_preserve_candidate_isolation() {
     fn select_named(captures: &uop::Captures, _: &UOp) -> Option<UOp> {
         captures.get("selected").cloned()

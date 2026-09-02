@@ -1844,6 +1844,21 @@ pub struct RewriteRule {
     pub pattern: UPat,
     pub apply: RewriteFn,
 }
+/// One rewrite callback with caller-owned mutable state.
+///
+/// This is the Rust counterpart of tinygrad's context-bearing matcher rules:
+/// the pattern remains immutable data, while the callback can consult or
+/// update one explicitly borrowed compiler context. The rewrite driver still
+/// owns traversal, candidate ordering, capture rollback, convergence, and
+/// cycle detection.
+pub type ContextRewriteFn<C> = fn(&mut C, &Captures, &UOp) -> Option<UOp>;
+#[derive(Clone)]
+pub struct ContextRewriteRule<C> {
+    pub name: &'static str,
+    pub priority: i32,
+    pub pattern: UPat,
+    pub apply: ContextRewriteFn<C>,
+}
 #[derive(Clone, Debug)]
 pub struct RewriteTrace {
     pub rules: Vec<&'static str>,
@@ -1863,18 +1878,54 @@ impl DirectSourceRequirement {
     }
 }
 
-struct PreparedRewriteRule<'a> {
-    rule: &'a RewriteRule,
-    direct_source_requirements: Vec<DirectSourceRequirement>,
+trait RewriteRuleSpec<C> {
+    fn name(&self) -> &'static str;
+    fn priority(&self) -> i32;
+    fn pattern(&self) -> &UPat;
+    fn apply(&self, context: &mut C, captures: &Captures, node: &UOp) -> Option<UOp>;
 }
-impl<'a> PreparedRewriteRule<'a> {
-    fn new(rule: &'a RewriteRule) -> Self {
-        Self {
-            direct_source_requirements: rule.pattern.direct_source_requirements(),
-            rule,
-        }
+
+impl RewriteRuleSpec<()> for RewriteRule {
+    fn name(&self) -> &'static str {
+        self.name
     }
 
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    fn pattern(&self) -> &UPat {
+        &self.pattern
+    }
+
+    fn apply(&self, _: &mut (), captures: &Captures, node: &UOp) -> Option<UOp> {
+        (self.apply)(captures, node)
+    }
+}
+
+impl<C> RewriteRuleSpec<C> for ContextRewriteRule<C> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    fn pattern(&self) -> &UPat {
+        &self.pattern
+    }
+
+    fn apply(&self, context: &mut C, captures: &Captures, node: &UOp) -> Option<UOp> {
+        (self.apply)(context, captures, node)
+    }
+}
+
+struct PreparedRewriteRule<'a, R> {
+    rule: &'a R,
+    direct_source_requirements: Vec<DirectSourceRequirement>,
+}
+impl<R> PreparedRewriteRule<'_, R> {
     fn admits(&self, node: &UOp) -> bool {
         self.direct_source_requirements
             .iter()
@@ -1887,23 +1938,51 @@ pub fn rewrite(
     rules: &mut [RewriteRule],
     walk: Walk,
 ) -> Result<(UOp, RewriteTrace), UOpError> {
+    rewrite_rules(root, rules, walk, &mut ())
+}
+
+/// Rewrites one shared UOp DAG with one explicitly borrowed compiler context.
+///
+/// Context callbacks run only after a complete pattern candidate succeeds and
+/// therefore never observe partial named captures. They run in the same stable
+/// priority, walk, and alternative/permutation order as [`rewrite`]. A shared
+/// UOp is memoized once, so its context callback is likewise invoked once.
+pub fn rewrite_with_context<C>(
+    root: &UOp,
+    rules: &mut [ContextRewriteRule<C>],
+    walk: Walk,
+    context: &mut C,
+) -> Result<(UOp, RewriteTrace), UOpError> {
+    rewrite_rules(root, rules, walk, context)
+}
+
+fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
+    root: &UOp,
+    rules: &mut [R],
+    walk: Walk,
+    context: &mut C,
+) -> Result<(UOp, RewriteTrace), UOpError> {
     const STEP_LIMIT: usize = 128;
 
-    rules.sort_by_key(|r| r.priority);
+    rules.sort_by_key(|rule| rule.priority());
     let rules = rules
         .iter()
-        .map(PreparedRewriteRule::new)
+        .map(|rule| PreparedRewriteRule {
+            direct_source_requirements: rule.pattern().direct_source_requirements(),
+            rule,
+        })
         .collect::<Vec<_>>();
     let mut trace = RewriteTrace { rules: vec![] };
     let mut memo = BTreeMap::new();
     let mut active = BTreeSet::new();
-    fn go(
+    fn go<C, R: RewriteRuleSpec<C>>(
         n: &UOp,
-        r: &[PreparedRewriteRule<'_>],
+        r: &[PreparedRewriteRule<'_, R>],
         w: Walk,
         m: &mut BTreeMap<UOp, UOp>,
         active: &mut BTreeSet<UOp>,
         t: &mut RewriteTrace,
+        context: &mut C,
     ) -> Result<UOp, UOpError> {
         if let Some(x) = m.get(n) {
             return Ok(x.clone());
@@ -1924,7 +2003,7 @@ pub fn rewrite(
                 let sources = x
                     .sources()
                     .iter()
-                    .map(|source| go(source, r, w, m, active, t))
+                    .map(|source| go(source, r, w, m, active, t, context))
                     .collect::<Result<Vec<_>, _>>()?;
                 if sources.as_slice() != x.sources() {
                     x = x.replace_sources(sources);
@@ -1937,26 +2016,25 @@ pub fn rewrite(
                 }
                 let mut next = None;
                 rule.rule
-                    .pattern
-                    .visit_matches(
-                        &x,
-                        &Captures::default(),
-                        &mut |captures| match (rule.rule.apply)(&captures, &x) {
-                            Some(candidate) => {
-                                if candidate != x {
-                                    next = Some(candidate);
-                                }
-                                true
+                    .pattern()
+                    .visit_matches(&x, &Captures::default(), &mut |captures| match rule
+                        .rule
+                        .apply(context, &captures, &x)
+                    {
+                        Some(candidate) => {
+                            if candidate != x {
+                                next = Some(candidate);
                             }
-                            None => false,
-                        },
-                    );
+                            true
+                        }
+                        None => false,
+                    });
                 if let Some(next) = next {
                     if !x.is_pure() || !next.is_pure() {
                         active.remove(n);
                         return Err(UOpError::EffectRewrite);
                     }
-                    t.rules.push(rule.rule.name);
+                    t.rules.push(rule.rule.name());
                     x = next;
                     break;
                 }
@@ -1966,7 +2044,7 @@ pub fn rewrite(
                 let sources = x
                     .sources()
                     .iter()
-                    .map(|source| go(source, r, w, m, active, t))
+                    .map(|source| go(source, r, w, m, active, t, context))
                     .collect::<Result<Vec<_>, _>>()?;
                 if sources.as_slice() != x.sources() {
                     x = x.replace_sources(sources);
@@ -1982,7 +2060,15 @@ pub fn rewrite(
         active.remove(n);
         Err(UOpError::RewriteStepLimit)
     }
-    let x = go(root, &rules, walk, &mut memo, &mut active, &mut trace)?;
+    let x = go(
+        root,
+        &rules,
+        walk,
+        &mut memo,
+        &mut active,
+        &mut trace,
+        context,
+    )?;
     Ok((x, trace))
 }
 
