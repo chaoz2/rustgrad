@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:4c2507ce9da7c276",
+  "source_fingerprint": "fnv1a64:c40c2a948c465a46",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -333,7 +333,7 @@
       "subject": "Constant folding and algebraic simplification",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Scheduled normalization uses the interpreter's shared scalar evaluator to fold only exact Bool/integer `GraphUnary`/`GraphBinary` constants, homogeneous Bool/integral `GraphCompare`, Bool `GraphLogical`, same-type `Cast`, constant-Bool `Where`, and exact Bool/integer zero/one identities. Floating arithmetic identities/reassociation, division/remainder, transcendentals, loads/stores/addresses, conditional control/guards, reductions/effects, and backend approximations remain unchanged and fail closed; tinygrad's modular-congruence and broader transcendental rewrite suites remain."
+        "Acceptance requirement": "Scheduled normalization uses the interpreter's shared scalar evaluator to fold only exact Bool/integer `GraphUnary`/`GraphBinary` constants, homogeneous Bool/integral `GraphCompare`, Bool `GraphLogical`, same-type `Cast`, constant-Bool `Where`, and exact Bool/integer zero/one identities. Authenticated projected Buffer addresses additionally canonicalize their closed I64 Range algebra before schedule/cache identity: checked constants and neutral terms, repeated positive division/remainder, exact quotient/remainder reconstruction, and Range division/modulo by its own positive output extent. The same declared UPat rule runs for elementwise and reduction kernels, revalidates the rebuilt `ProjectedIndexPlan`, retains addressless zero-domain markers, and never rewrites standalone artifacts during decode. Floating arithmetic identities/reassociation, general graph division/remainder, transcendentals, loads/stores, conditional control/guards, reduction recurrences/effects, and backend approximations remain unchanged and fail closed; tinygrad's broader modular-congruence and transcendental rewrite suites remain."
       }
     },
     {

@@ -2077,6 +2077,8 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
 /// historical encoded UOp tables retain their exact node and byte identity.
 pub(crate) fn normalize_kernel(root: &UOp) -> Result<UOp, UOpError> {
     root.validate()?;
+    let (root, _) = rewrite(root, &mut projected_index_rules(), Walk::BottomUp)?;
+    root.validate()?;
     let nodes = root.topological()?;
     if !matches!(root.operation(), Operation::Sink)
         || nodes.iter().any(|node| {
@@ -2101,11 +2103,53 @@ pub(crate) fn normalize_kernel(root: &UOp) -> Result<UOp, UOpError> {
                 | Operation::TensorGuard(_)
         )
     }) {
-        return Ok(root.clone());
+        return Ok(root);
     }
-    let (normalized, _) = rewrite(root, &mut builtin_rules(), Walk::BottomUp)?;
+    let (normalized, _) = rewrite(&root, &mut builtin_rules(), Walk::BottomUp)?;
     normalized.validate()?;
     Ok(normalized)
+}
+
+fn is_projected_index_operation(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Index(IndexValue::Buffer {
+            addressing: IndexAddressing::Projected,
+            ..
+        })
+    )
+}
+
+fn canonicalize_projected_index(_: &Captures, index: &UOp) -> Option<UOp> {
+    let plan = crate::projected_index::ProjectedIndexPlan::from_index(index).ok()?;
+    if plan.output_elements == 0
+        || index.sources()[1]
+            .topological()
+            .ok()?
+            .iter()
+            .any(|node| node.tag().is_some())
+    {
+        return None;
+    }
+    let expression = plan.canonical_expression();
+    if expression == plan.expression {
+        return None;
+    }
+    let candidate = index.replace_sources(vec![
+        index.sources()[0].clone(),
+        expression.to_uop(plan.output_elements).ok()?,
+    ]);
+    crate::projected_index::ProjectedIndexPlan::from_index(&candidate).ok()?;
+    Some(candidate)
+}
+
+fn projected_index_rules() -> Vec<RewriteRule> {
+    vec![RewriteRule {
+        name: "canonicalize-projected-index",
+        priority: 0,
+        pattern: UPat::operation_predicate(is_projected_index_operation),
+        apply: canonicalize_projected_index,
+    }]
 }
 
 /// Returns whether `literal` is an exact raw scalar identity for the result

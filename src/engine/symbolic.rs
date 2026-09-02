@@ -2294,7 +2294,7 @@ fn projected_kernel_template_eq_with_count(
                 .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
             let right = crate::projected_index::ProjectedIndexPlan::from_index(right)
                 .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-            return Ok(left.expression.canonicalized() == right.expression.canonicalized());
+            return Ok(left.canonical_expression() == right.canonical_expression());
         }
         for (left, right) in left.sources().iter().zip(right.sources()) {
             if !compare(left, right, visited)? {
