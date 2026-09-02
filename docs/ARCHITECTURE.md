@@ -927,9 +927,26 @@ RustGrad rejects during clone rehearsal without graph publication instead of
 inventing an earlier divisibility rule. When `hidden < heads`, the derived head
 width is zero and attention scale validation rejects earlier under that same
 atomic rehearsal boundary.
-This is one reusable encoder layer, not a BERT embedding/encoder stack,
-tokenizer, checkpoint-name translator, task head, training pipeline, dynamic
-shape implementation, fused kernel, or live-device claim.
+`nn::BertEmbeddings`, `nn::BertEncoder`, and `nn::BertModel` compose the next
+checked source boundary without adding a new Graph operation. The embeddings
+own word, position, and token-type tables plus `LayerNorm(eps=1e-12)`, derive
+position IDs from the static `[batch,time]` input-ID shape, and admit integer
+token-type IDs that broadcast to it. The encoder owns an ordered
+`layer.{index}` stack, including the source's valid zero-layer identity. The
+base model converts its Bool or numeric attention mask through the literal
+`(1-mask)*-10000` path before the embeddings and encoder. Traversal therefore
+retains `embeddings.*` and `encoder.layer.{index}.*` checkpoint names. Explicit
+mode clone-rehearses the complete composition; ambient training reserves the
+embedding draw followed by each layer's three source-ordered draws in one
+transaction, so a lowering failure publishes neither graph nodes nor RNG state.
+Evaluation and zero/unit dropout remain reservation-free. Static empty
+batch and empty time domains retain zero-work outputs. CPU, captured-interpreter,
+and parameter-gradient acceptance use the complete embeddings-plus-two-layer
+path.
+This is the source base BERT composition, not a tokenizer, pretrained-checkpoint
+translator/loader, pooler, masked-language or next-sentence head, question-
+answering head, loss/trainer, downloaded checkpoint differential, dynamic-shape
+implementation, fused kernel, or live-device claim.
 `nn::LSTM` is a separate typed stateful composition rather than another
 sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
 `cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus
