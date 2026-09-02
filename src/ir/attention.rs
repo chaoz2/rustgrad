@@ -1052,6 +1052,45 @@ impl Graph {
         )
     }
 
+    /// Lowers source-facing attention against a stream reserved by a larger
+    /// graph transaction. Higher-level compositions use this to make several
+    /// ordered dropout draws publish atomically without duplicating attention
+    /// lowering or consuming ambient state during rehearsal.
+    pub(crate) fn scaled_dot_product_attention_with_stream(
+        &mut self,
+        query: NodeId,
+        key: NodeId,
+        value: NodeId,
+        attn_mask: Option<NodeId>,
+        options: AmbientAttentionOptions,
+        stream: RandomStream,
+    ) -> Result<NodeId> {
+        if !options.dropout_p.is_finite() || options.dropout_p <= 0.0 || options.dropout_p >= 1.0 {
+            return Err(Error::InvalidAttention {
+                reason: "reserved attention dropout requires probability strictly between zero and one",
+            });
+        }
+        let request = AttentionRequest {
+            query,
+            key,
+            value,
+            attn_mask,
+            scale: None,
+            is_causal: options.is_causal,
+            enable_gqa: options.enable_gqa,
+        };
+        let plan = attention_plan(self, request)?;
+        let mut staged = self.clone();
+        let output = staged.lower_attention(
+            request,
+            options.dropout_p,
+            &plan,
+            AttentionDropout::Ambient(stream),
+        )?;
+        *self = staged;
+        Ok(output)
+    }
+
     fn lower_attention(
         &mut self,
         request: AttentionRequest,
