@@ -1,10 +1,174 @@
 use super::renderer::{
     OPENCL_ABI_VERSION, OPENCL_PORTABLE_BITCAST_RENDERER_VERSION,
+    OPENCL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
     OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION, OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
     OPENCL_PORTABLE_SORT_RENDERER_VERSION, OPENCL_PORTABLE_THREEFRY_RENDERER_VERSION,
     OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
     OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
 };
+
+#[test]
+fn portable_dense_opencl_preserves_pad_fill_concat_order_and_raw_bytes() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::U8);
+    let padded = graph.pad(input, [(1, 2)], Scalar::U(0x80)).unwrap();
+    let item = schedule(&graph, padded).unwrap().items.pop().unwrap();
+    let mut malformed = item.clone();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.extent, 5);
+    assert!(
+        rendered
+            .source
+            .contains(OPENCL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("rg_input"));
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage([2], Storage::U8(vec![0x7f, 0xff])).unwrap(),
+        )]),
+    );
+    assert_eq!(actual, [0x80, 0x7f, 0xff, 0x80, 0x80]);
+
+    malformed.input_bindings[0].desc.bytes -= 1;
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let owner = context.owner_id();
+    let before = mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(context, &[malformed], renderer),
+        Err(OpenClError::InvalidBinding(_))
+    ));
+    assert_eq!(
+        &mock.calls()[before.len()..],
+        &[format!("context_release:{owner}")]
+    );
+
+    let rhs = graph.input_dtype("rhs", [1], DType::U8);
+    let concatenated = graph.concat([input, rhs, input], 0).unwrap();
+    let item = schedule(&graph, concatenated).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert_eq!(rendered.buffers.len(), 3, "repeated lhs has one ABI slot");
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([
+            (
+                input.index() as u64,
+                TensorData::from_storage([2], Storage::U8(vec![0, 0xff])).unwrap(),
+            ),
+            (
+                rhs.index() as u64,
+                TensorData::from_storage([1], Storage::U8(vec![0x80])).unwrap(),
+            ),
+        ]),
+    );
+    assert_eq!(actual, [0, 0xff, 0x80, 0, 0xff]);
+
+    let float8 = graph.input_dtype("float8", [2], DType::F8E4M3);
+    let float8_output = graph.pad(float8, [(1, 0)], Scalar::F(1.0)).unwrap();
+    let item = schedule(&graph, float8_output)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(
+            float8.index() as u64,
+            TensorData::from_storage(
+                [2],
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    crate::Float8Format::E4M3,
+                    vec![0x7f, 0x80],
+                )),
+            )
+            .unwrap(),
+        )]),
+    );
+    assert_eq!(actual, [0x38, 0x7f, 0x80]);
+
+    let empty = graph.input_dtype("empty", [0, 2], DType::Bool);
+    let empty_output = graph
+        .pad(empty, [(0, 0), (1, 1)], Scalar::Bool(true))
+        .unwrap();
+    let items = schedule(&graph, empty_output).unwrap().items;
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let before = mock.calls();
+    let prefix = PreparedOpenClPrefix::prepare(context, &items, renderer).unwrap();
+    let mut values = BTreeMap::from([(
+        empty.index() as u64,
+        TensorData::from_storage([0, 2], Storage::Bool(Vec::new())).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    assert!(values[&(empty_output.index() as u64)].is_empty());
+    assert!(!mock.calls()[before.len()..].iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("queue_create:")
+            || call.starts_with("launch:")
+    }));
+}
+
+#[test]
+fn portable_dense_opencl_keeps_computed_prefix_and_consumer_device_resident() {
+    let renderer = OpenClRenderer::default();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let padded = graph.pad(producer, [(1, 1)], Scalar::F(-0.0)).unwrap();
+    let one_value = TensorData::new([4], vec![1.0; 4]).unwrap();
+    let one = graph.constant(one_value.clone());
+    let output = graph.add(padded, one).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 3);
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let plan = OpenClPrefixPlan::plan_for_outputs(
+        context.clone(),
+        &scheduled.items,
+        &[output.index() as u64],
+        renderer,
+    )
+    .unwrap();
+    let prefix = PreparedOpenClPrefix::from_plan(context, plan).unwrap();
+    let before = mock.calls();
+    let mut values = BTreeMap::from([
+        (
+            input.index() as u64,
+            TensorData::new([2], vec![2.0, -3.0]).unwrap(),
+        ),
+        (one.index() as u64, one_value),
+    ]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![1.0, 5.0, 10.0, 1.0])
+    );
+    let calls = &mock.calls()[before.len()..];
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("launch:"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1
+    );
+}
 
 #[test]
 fn portable_bitcast_opencl_preserves_raw_bytes_and_bool_normalization() {
@@ -2004,8 +2168,22 @@ fn raw_movement_copy_opencl_covers_computed_dense_empty_and_fail_closed_kinds() 
 
     let padded = graph.pad(input, [(1, 1), (0, 0)], Scalar::I(0)).unwrap();
     let padded_item = schedule(&graph, padded).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&padded_item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(padded_item.ordered_inputs())
+        .unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(OPENCL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION)
+    );
+    assert_eq!((rendered.extent, rendered.buffers.len()), (4, 2));
+
+    let index = graph.input_dtype("index", [2, 1], DType::I32);
+    let gathered = graph.gather(input, index, 0).unwrap();
+    let gathered_item = schedule(&graph, gathered).unwrap().items.pop().unwrap();
     assert!(matches!(
-        renderer.render(&padded_item.kernel),
+        renderer.render(&gathered_item.kernel),
         Err(OpenClError::Unsupported(reason)) if reason.contains("only raw AffineCopy and Contiguous")
     ));
 

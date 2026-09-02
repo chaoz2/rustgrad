@@ -18,6 +18,8 @@ use std::{
 pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v6";
 pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-metal-portable-bitcast-v1";
+pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
+    "rustgrad-metal-portable-dense-materialization-v1";
 pub const METAL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-metal-static-position-v1";
 pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-f32-matmul-v1";
@@ -119,6 +121,17 @@ impl RenderedMetal {
                 .and_then(|portable| portable.validate_schedule_bindings(bindings))
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
         }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Movement(MovementValue::Plan(plan)) = root.operation()
+            && matches!(
+                &plan.kind,
+                crate::MovementKernelKind::Pad { .. } | crate::MovementKernelKind::Concat { .. }
+            )
+        {
+            crate::movement_plan::PortableDenseMaterialization::new(plan)
+                .and_then(|portable| portable.validate_schedule_bindings(bindings))
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(MetalError::InvalidBinding(
                 "schedule/Metal input count mismatch".into(),
@@ -196,6 +209,15 @@ impl MetalRenderer {
                     if matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. }) =>
                 {
                     render_portable_bitcast(self, root, plan)
+                }
+                MovementValue::Plan(plan)
+                    if matches!(
+                        &plan.kind,
+                        crate::MovementKernelKind::Pad { .. }
+                            | crate::MovementKernelKind::Concat { .. }
+                    ) =>
+                {
+                    render_portable_dense_materialization(self, root, plan)
                 }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
                 MovementValue::QuantizedRowGather(_) => Err(MetalError::Unsupported(
@@ -1197,6 +1219,101 @@ fn render_portable_bitcast(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         schedule_inputs: vec![input_abi],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+fn render_portable_dense_materialization(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let portable = crate::movement_plan::PortableDenseMaterialization::new(plan)
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    if portable.elements() > u32::MAX as usize {
+        return Err(MetalError::Unsupported(
+            "portable dense materialization exceeds uint thread indexing".into(),
+        ));
+    }
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| {
+            Ok(MetalBufferAbi {
+                id: input.node.index() as u64,
+                dtype: input.dtype,
+                source_shape: input.shape.clone(),
+                elements: input.shape.numel().map_err(|_| MetalError::Overflow)?,
+                mutable: false,
+                view: None,
+            })
+        })
+        .collect::<Result<Vec<_>, MetalError>>()?;
+    let schedule_inputs = buffers.clone();
+    buffers.push(MetalBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.elements(),
+        mutable: true,
+        view: None,
+    });
+    let entry = "rg_metal_portable_dense_materialization".to_owned();
+    let mut lines = vec![
+        format!(
+            "// {METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"
+        ),
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        format!("kernel void {entry}("),
+    ];
+    for (index, _) in portable.inputs().iter().enumerate() {
+        lines.push(format!(
+            "    device const uchar* b{index} [[buffer({index})]],"
+        ));
+    }
+    let output = portable.inputs().len();
+    lines.extend([
+        format!("    device uchar* b{output} [[buffer({output})]],"),
+        format!("    constant ulong& extent [[buffer({})]],", output + 1),
+        "    uint rg_gid [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = (ulong)rg_gid;".into(),
+        "  if (gid >= extent) return;".into(),
+    ]);
+    lines.extend(
+        crate::portable_movement::emit_portable_dense_materialization_body(
+            &portable,
+            &crate::portable_movement::CLikePortableDenseDialect {
+                input_address: "device",
+                output_address: "device",
+            },
+        ),
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.plan(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.elements(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
         ))),

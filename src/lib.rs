@@ -40,6 +40,7 @@ pub mod movement_plan;
 pub mod nn;
 pub mod onnx;
 pub mod optim;
+mod portable_movement;
 mod portable_sort;
 mod portable_threefry;
 pub mod ptx;

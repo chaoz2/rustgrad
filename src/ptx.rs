@@ -36,6 +36,8 @@ pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1"
 /// Separate identity for dense raw storage-width materialization.
 pub const PTX_CONTIGUOUS_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-contiguous-copy-v1";
 pub const PTX_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-ptx-portable-bitcast-v1";
+pub const PTX_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
+    "rustgrad-ptx-portable-dense-materialization-v1";
 /// Separate identity for output-driven raw static placement.
 pub const PTX_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-ptx-static-position-v1";
 pub const PTX_THREEFRY_RENDERER_VERSION: &str = "rustgrad-ptx-live-threefry-v1";
@@ -174,6 +176,46 @@ impl RenderedPtx {
         {
             plan.validate()
                 .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+            if matches!(
+                &plan.kind,
+                MovementKernelKind::Pad { .. } | MovementKernelKind::Concat { .. }
+            ) {
+                let portable = crate::movement_plan::PortableDenseMaterialization::new(plan)
+                    .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+                if self.launch != PtxLaunchGeometry::Linear
+                    || self.extent != portable.elements()
+                    || self.buffers.len() != portable.inputs().len() + 1
+                {
+                    return Err(PtxError::InvalidBinding(
+                        "portable dense PTX launch disagrees with its movement plan".into(),
+                    ));
+                }
+                for (position, input) in portable.inputs().iter().enumerate() {
+                    let abi = &self.buffers[position];
+                    if abi.id != input.node.index() as u64
+                        || abi.dtype != input.dtype
+                        || abi.source_shape != input.shape
+                        || abi.elements != input.shape.numel().map_err(|_| PtxError::Overflow)?
+                        || abi.mutable
+                    {
+                        return Err(PtxError::InvalidBinding(
+                            "portable dense PTX input ABI mismatch".into(),
+                        ));
+                    }
+                }
+                let output = self.buffers.last().expect("checked nonempty above");
+                if output.id != plan.output.index() as u64
+                    || output.dtype != plan.dtype
+                    || output.source_shape != plan.output_shape
+                    || output.elements != portable.elements()
+                    || !output.mutable
+                {
+                    return Err(PtxError::InvalidBinding(
+                        "portable dense PTX output ABI mismatch".into(),
+                    ));
+                }
+                return Ok(());
+            }
             let input = match &plan.kind {
                 MovementKernelKind::AffineCopy { input, .. }
                 | MovementKernelKind::Contiguous { input }
@@ -372,6 +414,17 @@ impl RenderedPtx {
             && matches!(&plan.kind, MovementKernelKind::Bitcast { .. })
         {
             crate::movement_plan::PortableBitcast::new(plan)
+                .and_then(|portable| portable.validate_schedule_bindings(bindings))
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+        }
+        if let Some(KernelSemanticProgram::UOp(program)) = &self.semantic_program
+            && let Operation::Movement(MovementValue::Plan(plan)) = program.operation()
+            && matches!(
+                &plan.kind,
+                MovementKernelKind::Pad { .. } | MovementKernelKind::Concat { .. }
+            )
+        {
+            crate::movement_plan::PortableDenseMaterialization::new(plan)
                 .and_then(|portable| portable.validate_schedule_bindings(bindings))
                 .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
         }
@@ -706,6 +759,14 @@ fn render(
                 if matches!(&plan.kind, MovementKernelKind::Bitcast { .. }) =>
             {
                 render_portable_bitcast(renderer, root, plan)
+            }
+            MovementValue::Plan(plan)
+                if matches!(
+                    &plan.kind,
+                    MovementKernelKind::Pad { .. } | MovementKernelKind::Concat { .. }
+                ) =>
+            {
+                render_portable_dense_materialization(renderer, root, plan)
             }
             MovementValue::Plan(plan) => render_affine_copy(renderer, root, plan),
             MovementValue::QuantizedRowGather(_) => Err(PtxError::Unsupported(
@@ -1086,6 +1147,192 @@ fn render_portable_bitcast(
         source_map: BTreeMap::new(),
         buffers,
         extent: portable.bytes(),
+        cache_key,
+        entry,
+        launch: PtxLaunchGeometry::Linear,
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
+    };
+    rendered.validate()?;
+    Ok(rendered)
+}
+
+struct PtxPortableDenseDialect {
+    region: std::cell::Cell<usize>,
+}
+
+impl crate::portable_movement::PortableDenseMaterializationDialect for PtxPortableDenseDialect {
+    fn begin(&self, _: &crate::movement_plan::PortableDenseMaterialization<'_>) -> Vec<String> {
+        vec![
+            "  mov.u32 %r5, 4294967295;".into(),
+            "  mov.u64 %rd4, 0;".into(),
+        ]
+    }
+
+    fn select_region(
+        &self,
+        _: &crate::movement_plan::PortableDenseMaterialization<'_>,
+        region: &crate::movement_plan::PortableDenseRegion,
+        _: bool,
+    ) -> Vec<String> {
+        let index = self.region.get();
+        self.region.set(index + 1);
+        let done = format!("RG_REGION_{index}_DONE");
+        let mut lines = Vec::new();
+        for axis in &region.axes {
+            lines.extend([
+                format!("  div.u64 %rd5, %rd3, {};", axis.output_divisor),
+                format!("  rem.u64 %rd5, %rd5, {};", axis.output_dimension),
+                format!("  setp.ge.u64 %p1, %rd5, {};", axis.output_start),
+                format!("  @!%p1 bra {done};"),
+                format!(
+                    "  setp.lt.u64 %p1, %rd5, {};",
+                    axis.output_start + axis.length
+                ),
+                format!("  @!%p1 bra {done};"),
+            ]);
+        }
+        lines.extend([
+            format!("  mov.u32 %r5, {};", region.input_abi),
+            "  mov.u64 %rd4, 0;".into(),
+        ]);
+        for axis in &region.axes {
+            if axis.source_stride == 0 {
+                continue;
+            }
+            lines.extend([
+                format!("  div.u64 %rd5, %rd3, {};", axis.output_divisor),
+                format!("  rem.u64 %rd5, %rd5, {};", axis.output_dimension),
+                format!("  sub.u64 %rd5, %rd5, {};", axis.output_start),
+                format!("  mul.lo.u64 %rd8, %rd5, {};", axis.source_stride),
+                "  add.u64 %rd4, %rd4, %rd8;".into(),
+            ]);
+        }
+        lines.push(format!("{done}:"));
+        lines
+    }
+
+    fn store(&self, plan: &crate::movement_plan::PortableDenseMaterialization<'_>) -> Vec<String> {
+        let mut lines = Vec::new();
+        let output_base = 10 + plan.inputs().len();
+        for lane in 0..plan.width() {
+            let store = format!("RG_BYTE_{lane}_STORE");
+            let fill = plan.fill_bytes().map_or(0, |bytes| bytes[lane]);
+            lines.push(format!("  mov.u32 %r4, {fill};"));
+            for input in 0..plan.inputs().len() {
+                let next = format!("RG_BYTE_{lane}_INPUT_{input}_NEXT");
+                lines.extend([
+                    format!("  setp.ne.u32 %p1, %r5, {input};"),
+                    format!("  @%p1 bra {next};"),
+                    format!("  mul.lo.u64 %rd5, %rd4, {};", plan.width()),
+                    format!("  add.u64 %rd5, %rd5, {lane};"),
+                    format!("  add.u64 %rd6, %rd{}, %rd5;", 10 + input),
+                    "  ld.global.u8 %r4, [%rd6];".into(),
+                    format!("  bra {store};"),
+                    format!("{next}:"),
+                ]);
+            }
+            lines.extend([
+                format!("{store}:"),
+                format!("  mul.lo.u64 %rd5, %rd3, {};", plan.width()),
+                format!("  add.u64 %rd5, %rd5, {lane};"),
+                format!("  add.u64 %rd7, %rd{output_base}, %rd5;"),
+                "  st.global.u8 [%rd7], %r4;".into(),
+            ]);
+        }
+        lines
+    }
+}
+
+fn render_portable_dense_materialization(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedPtx, PtxError> {
+    root.validate()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    let portable = crate::movement_plan::PortableDenseMaterialization::new(plan)
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    if portable.elements() > u32::MAX as usize {
+        return Err(PtxError::Unsupported(
+            "portable dense materialization exceeds u32 thread indexing".into(),
+        ));
+    }
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| {
+            Ok(PtxBufferAbi {
+                id: input.node.index() as u64,
+                dtype: input.dtype,
+                source_shape: input.shape.clone(),
+                elements: input.shape.numel().map_err(|_| PtxError::Overflow)?,
+                mutable: false,
+            })
+        })
+        .collect::<Result<Vec<_>, PtxError>>()?;
+    buffers.push(PtxBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.elements(),
+        mutable: true,
+    });
+    let entry = "rg_portable_dense_materialization".to_owned();
+    let mut lines = vec![
+        format!("// {PTX_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        String::new(),
+        format!(".visible .entry {entry}("),
+    ];
+    for index in 0..buffers.len() {
+        lines.push(format!("  .param .u64 p{index},"));
+    }
+    lines.extend([
+        "  .param .u64 extent".into(),
+        ")".into(),
+        "{".into(),
+        "  .reg .pred %p<3>;".into(),
+        "  .reg .b32 %r<8>;".into(),
+        format!("  .reg .b64 %rd<{}>;", 16 + buffers.len()),
+    ]);
+    for index in 0..buffers.len() {
+        lines.push(format!("  ld.param.u64 %rd{}, [p{index}];", 10 + index));
+    }
+    lines.extend([
+        "  ld.param.u64 %rd0, [extent];".into(),
+        "  mov.u32 %r0, %ctaid.x;".into(),
+        "  mov.u32 %r1, %ntid.x;".into(),
+        "  mov.u32 %r2, %tid.x;".into(),
+        "  mad.lo.u32 %r3, %r0, %r1, %r2;".into(),
+        "  cvt.u64.u32 %rd3, %r3;".into(),
+        "  setp.ge.u64 %p0, %rd3, %rd0;".into(),
+        "  @%p0 bra DONE;".into(),
+    ]);
+    lines.extend(
+        crate::portable_movement::emit_portable_dense_materialization_body(
+            &portable,
+            &PtxPortableDenseDialect {
+                region: std::cell::Cell::new(0),
+            },
+        ),
+    );
+    lines.extend(["DONE:".into(), "  ret;".into(), "}".into()]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        PTX_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+        PTX_ABI_VERSION,
+        renderer.sm,
+        portable.plan(),
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedPtx {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.elements(),
         cache_key,
         entry,
         launch: PtxLaunchGeometry::Linear,
@@ -7879,6 +8126,52 @@ mod tests {
     }
 
     #[test]
+    fn portable_dense_ptx_projects_pad_and_concat_without_numeric_conversion() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2], DType::F8E4M3);
+        let padded = graph.pad(lhs, [(1, 1)], Scalar::F(-0.0)).unwrap();
+        let item = crate::schedule(&graph, padded)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert_eq!((rendered.extent, rendered.buffers.len()), (4, 2));
+        assert!(
+            rendered
+                .source
+                .contains(PTX_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION)
+        );
+        assert!(rendered.source.contains("ld.global.u8"));
+        assert!(rendered.source.contains("st.global.u8"));
+
+        let rhs = graph.input_dtype("rhs", [1], DType::F8E4M3);
+        let output = graph.concat([lhs, rhs, lhs], 0).unwrap();
+        let item = crate::schedule(&graph, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert_eq!(rendered.buffers.len(), 3, "repeated lhs is deduplicated");
+
+        let empty = graph.input_dtype("empty", [0, 2], DType::Bool);
+        let output = graph
+            .pad(empty, [(0, 0), (1, 0)], Scalar::Bool(true))
+            .unwrap();
+        let item = crate::schedule(&graph, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        assert_eq!(renderer.render(&item.kernel).unwrap().extent, 0);
+    }
+
+    #[test]
     fn reduction_epilogue_renders_one_ptx_kernel() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("x", [2, 3], DType::F32);
@@ -8272,8 +8565,26 @@ mod tests {
             .into_iter()
             .find(|item| item.node == output)
             .unwrap();
+        let rendered = PtxRenderer::new(80).unwrap().render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert!(
+            rendered
+                .source
+                .contains(PTX_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION)
+        );
+        assert_eq!((rendered.extent, rendered.buffers.len()), (4, 2));
+
+        let index = graph.input_dtype("index", [2], DType::I32);
+        let gathered = graph.gather(input, index, 0).unwrap();
+        let gathered_item = crate::schedule(&graph, gathered)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
         assert!(matches!(
-            PtxRenderer::new(80).unwrap().render(&item.kernel),
+            PtxRenderer::new(80).unwrap().render(&gathered_item.kernel),
             Err(PtxError::Unsupported(reason)) if reason.contains("only raw affine and contiguous")
         ));
 

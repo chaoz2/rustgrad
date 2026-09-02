@@ -1,9 +1,36 @@
 use super::renderer::{
-    WGSL_PORTABLE_BITCAST_RENDERER_VERSION, WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
-    WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION, WGSL_PORTABLE_SORT_RENDERER_VERSION,
-    WGSL_PORTABLE_THREEFRY_RENDERER_VERSION, WGSL_RAW_COPY_RENDERER_VERSION,
-    WGSL_STATIC_POSITION_RENDERER_VERSION,
+    WGSL_PORTABLE_BITCAST_RENDERER_VERSION, WGSL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+    WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION, WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
+    WGSL_PORTABLE_SORT_RENDERER_VERSION, WGSL_PORTABLE_THREEFRY_RENDERER_VERSION,
+    WGSL_RAW_COPY_RENDERER_VERSION, WGSL_STATIC_POSITION_RENDERER_VERSION,
 };
+
+#[test]
+fn portable_dense_wgsl_uses_checked_regions_and_atomic_byte_writes() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::U8);
+    let output = graph.pad(input, [(1, 1)], Scalar::U(0xff)).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!((rendered.extent, rendered.buffers.len()), (4, 2));
+    assert!(
+        rendered
+            .source
+            .contains(WGSL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("atomicAnd(&b1"));
+    assert!(rendered.source.contains("atomicOr(&b1"));
+
+    let rhs = graph.input_dtype("rhs", [1], DType::U8);
+    let output = graph.concat([input, rhs], 0).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert_eq!((rendered.extent, rendered.schedule_inputs.len()), (3, 2));
+}
 
 #[test]
 fn portable_bitcast_wgsl_preserves_packed_raw_payload_and_bool_bytes() {
@@ -1765,8 +1792,22 @@ fn raw_movement_copy_wgsl_preserves_zero_domain_and_rejects_other_movements() {
     let pad_input = graph.input_dtype("pad", [2], DType::I32);
     let padded = graph.pad(pad_input, [(1, 1)], Scalar::I(0)).unwrap();
     let padded_item = schedule(&graph, padded).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&padded_item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(padded_item.ordered_inputs())
+        .unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(WGSL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION)
+    );
+    assert_eq!((rendered.extent, rendered.buffers.len()), (4, 2));
+
+    let index = graph.input_dtype("index", [2], DType::I32);
+    let gathered = graph.gather(pad_input, index, 0).unwrap();
+    let gathered_item = schedule(&graph, gathered).unwrap().items.pop().unwrap();
     assert!(matches!(
-        renderer.render(&padded_item.kernel),
+        renderer.render(&gathered_item.kernel),
         Err(WebGpuError::Unsupported(reason)) if reason.contains("only raw AffineCopy and Contiguous")
     ));
 }

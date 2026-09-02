@@ -22,6 +22,8 @@ use std::{
 pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v7";
 pub const WGSL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-wgsl-raw-copy-v1";
 pub const WGSL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-bitcast-v1";
+pub const WGSL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
+    "rustgrad-wgsl-portable-dense-materialization-v1";
 pub const WGSL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-wgsl-static-position-v1";
 pub const WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-f32-matmul-v1";
 pub const WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
@@ -141,6 +143,17 @@ impl RenderedWgsl {
             && matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. })
         {
             crate::movement_plan::PortableBitcast::new(plan)
+                .and_then(|portable| portable.validate_schedule_bindings(bindings))
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Movement(MovementValue::Plan(plan)) = root.operation()
+            && matches!(
+                &plan.kind,
+                crate::MovementKernelKind::Pad { .. } | crate::MovementKernelKind::Concat { .. }
+            )
+        {
+            crate::movement_plan::PortableDenseMaterialization::new(plan)
                 .and_then(|portable| portable.validate_schedule_bindings(bindings))
                 .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
         }
@@ -297,7 +310,18 @@ impl RenderedWgsl {
                 } else {
                     false
                 };
-                if !raw_copy && !static_position && !bitcast {
+                let dense_materialization = if matches!(
+                    &plan.kind,
+                    crate::MovementKernelKind::Pad { .. }
+                        | crate::MovementKernelKind::Concat { .. }
+                ) {
+                    crate::movement_plan::PortableDenseMaterialization::new(plan)
+                        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+                    true
+                } else {
+                    false
+                };
+                if !raw_copy && !static_position && !bitcast && !dense_materialization {
                     return Err(WebGpuError::Unsupported(
                         "movement plan is outside raw WGSL lowering".into(),
                     ));
@@ -311,8 +335,26 @@ impl RenderedWgsl {
             .map(crate::movement_plan::PortableBitcast::new)
             .transpose()
             .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        let portable_dense = raw_movement
+            .filter(|plan| {
+                matches!(
+                    &plan.kind,
+                    crate::MovementKernelKind::Pad { .. }
+                        | crate::MovementKernelKind::Concat { .. }
+                )
+            })
+            .map(crate::movement_plan::PortableDenseMaterialization::new)
+            .transpose()
+            .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
         if let Some(portable) = portable_bitcast.as_ref() {
             validate_portable_serial_launch(portable.bytes(), self.local_size, &self.capabilities)?;
+        }
+        if let Some(portable) = portable_dense.as_ref() {
+            validate_portable_serial_launch(
+                portable.elements(),
+                self.local_size,
+                &self.capabilities,
+            )?;
         }
         let expected_mutable = if portable_sort.is_some() { 2 } else { 1 };
         if self.buffers.is_empty()
@@ -537,6 +579,46 @@ impl RenderedWgsl {
             return Ok(());
         }
         if let Some(plan) = raw_movement {
+            if let Some(portable) = portable_dense {
+                if self.transaction.is_some()
+                    || self.extent != portable.elements()
+                    || self.schedule_inputs.len() != portable.inputs().len()
+                    || self.buffers.len() != portable.inputs().len() + 1
+                {
+                    return Err(WebGpuError::InvalidBinding(
+                        "portable dense materialization ABI mismatch".into(),
+                    ));
+                }
+                for (position, input) in portable.inputs().iter().enumerate() {
+                    let abi = &self.buffers[position];
+                    let elements = input.shape.numel().map_err(|_| WebGpuError::Overflow)?;
+                    if abi.id != input.node.index() as u64
+                        || abi.dtype != input.dtype
+                        || abi.source_shape != input.shape
+                        || abi.elements != elements
+                        || abi.mutable
+                        || abi.view.is_some()
+                        || &self.schedule_inputs[position] != abi
+                    {
+                        return Err(WebGpuError::InvalidBinding(
+                            "portable dense materialization input ABI mismatch".into(),
+                        ));
+                    }
+                }
+                let output = self.buffers.last().expect("checked nonempty above");
+                if output.id != plan.output.index() as u64
+                    || output.dtype != plan.dtype
+                    || output.source_shape != plan.output_shape
+                    || output.elements != portable.elements()
+                    || !output.mutable
+                    || output.view.is_some()
+                {
+                    return Err(WebGpuError::InvalidBinding(
+                        "portable dense materialization output ABI mismatch".into(),
+                    ));
+                }
+                return Ok(());
+            }
             let inputs = plan.input_operands();
             let [input] = inputs.as_slice() else {
                 return Err(WebGpuError::InvalidBinding(
@@ -648,6 +730,15 @@ impl WgslRenderer {
                     if matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. }) =>
                 {
                     render_portable_bitcast(self, root, plan)
+                }
+                MovementValue::Plan(plan)
+                    if matches!(
+                        &plan.kind,
+                        crate::MovementKernelKind::Pad { .. }
+                            | crate::MovementKernelKind::Concat { .. }
+                    ) =>
+                {
+                    render_portable_dense_materialization(self, root, plan)
                 }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
                 MovementValue::QuantizedRowGather(_) => Err(WebGpuError::Unsupported(
@@ -2096,6 +2187,149 @@ fn render_portable_bitcast(
         local_size: renderer.local_size,
         transaction: None,
         schedule_inputs: vec![input_abi],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    };
+    rendered.validate_artifact()?;
+    Ok(rendered)
+}
+
+fn render_portable_dense_materialization(
+    renderer: &WgslRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedWgsl, WebGpuError> {
+    root.validate()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let portable = crate::movement_plan::PortableDenseMaterialization::new(plan)
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let extent = u32::try_from(portable.elements()).map_err(|_| {
+        WebGpuError::Unsupported(
+            "portable dense materialization extent exceeds u32 indexing".into(),
+        )
+    })?;
+    validate_portable_serial_launch(
+        portable.elements(),
+        renderer.local_size,
+        &renderer.capabilities,
+    )?;
+    if portable.elements() != 0 {
+        for region in portable.regions() {
+            for axis in &region.axes {
+                for value in [
+                    axis.output_dimension,
+                    axis.output_divisor,
+                    axis.output_start,
+                    axis.length,
+                    axis.source_stride,
+                ] {
+                    u32::try_from(value).map_err(|_| {
+                        WebGpuError::Unsupported(
+                            "portable dense materialization address exceeds u32 indexing".into(),
+                        )
+                    })?;
+                }
+                u32::try_from(
+                    axis.output_start
+                        .checked_add(axis.length)
+                        .ok_or(WebGpuError::Overflow)?,
+                )
+                .map_err(|_| {
+                    WebGpuError::Unsupported(
+                        "portable dense materialization address exceeds u32 indexing".into(),
+                    )
+                })?;
+            }
+        }
+    }
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| {
+            Ok(WgslBufferAbi {
+                id: input.node.index() as u64,
+                dtype: input.dtype,
+                source_shape: input.shape.clone(),
+                elements: input.shape.numel().map_err(|_| WebGpuError::Overflow)?,
+                mutable: false,
+                view: None,
+            })
+        })
+        .collect::<Result<Vec<_>, WebGpuError>>()?;
+    let schedule_inputs = buffers.clone();
+    buffers.push(WgslBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.elements(),
+        mutable: true,
+        view: None,
+    });
+    if buffers.len() > renderer.capabilities.max_storage_buffers_per_shader_stage as usize {
+        return Err(WebGpuError::Unsupported(
+            "portable dense materialization bindings exceed adapter limit".into(),
+        ));
+    }
+    for buffer in &buffers {
+        if buffer.physical_bytes()? > renderer.capabilities.max_buffer_size {
+            return Err(WebGpuError::Unsupported(
+                "portable dense materialization binding exceeds adapter limit".into(),
+            ));
+        }
+    }
+    let entry = "rg_wgsl_portable_dense_materialization".to_owned();
+    let mut lines = vec![format!(
+        "// {WGSL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION}"
+    )];
+    for (index, _) in portable.inputs().iter().enumerate() {
+        lines.push(format!(
+            "@group(0) @binding({index}) var<storage, read> b{index}: array<u32>;"
+        ));
+    }
+    let output = portable.inputs().len();
+    lines.extend([
+        format!(
+            "@group(0) @binding({output}) var<storage, read_write> b{output}: array<atomic<u32>>;"
+        ),
+        "struct RustGradExtent { value: u32, };".into(),
+        format!(
+            "@group(0) @binding({}) var<uniform> rg_extent: RustGradExtent;",
+            output + 1
+        ),
+        format!("@compute @workgroup_size({}, 1, 1)", renderer.local_size),
+        format!("fn {entry}(@builtin(global_invocation_id) rg_global: vec3<u32>) {{"),
+        "  let gid: u32 = rg_global.x;".into(),
+        "  if (gid >= rg_extent.value) { return; }".into(),
+    ]);
+    lines.extend(
+        crate::portable_movement::emit_portable_dense_materialization_body(
+            &portable,
+            &crate::portable_movement::WgslPortableDenseDialect,
+        ),
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        WGSL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+        WEBGPU_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.plan(),
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedWgsl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: extent as usize,
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        local_size: renderer.local_size,
+        transaction: None,
+        schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
         ))),

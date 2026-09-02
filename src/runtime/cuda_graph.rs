@@ -467,6 +467,41 @@ mod tests {
     }
 
     #[test]
+    fn cuda_graph_prefix_plan_executes_portable_pad_without_identity_drift() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], crate::DType::U8);
+        let output = graph.pad(input, [(1, 2)], crate::Scalar::U(0x80)).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let [item] = schedule.items.as_slice() else {
+            panic!("pad must remain one scheduled item")
+        };
+        let schedule_identity = item.cache_key;
+        assert_eq!(
+            crate::uop::artifact::encode_schedule_identity(&item.kernel).unwrap()[4],
+            18
+        );
+        let renderer = PtxRenderer::new(80).unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert_eq!((rendered.extent, rendered.buffers.len()), (5, 2));
+        let rendered_identity = rendered.cache_key.clone();
+        let planned = CudaGraphPrefixPlan::plan(&schedule.items, renderer).unwrap();
+        assert_eq!(planned.kernel_cache_keys(), vec![rendered_identity]);
+        assert_eq!(schedule.items[0].cache_key, schedule_identity);
+
+        let (_, primary) = make_primary();
+        let mut prepared = prepare_outputs(primary, &schedule, &[output.index() as u64]);
+        let mut realized = BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage([2], Storage::U8(vec![0x7f, 0xff])).unwrap(),
+        )]);
+        prepared.execute(&mut realized).unwrap();
+        assert_eq!(
+            realized[&(output.index() as u64)].storage(),
+            &Storage::U8(vec![0x80, 0x7f, 0xff, 0x80, 0x80])
+        );
+    }
+
+    #[test]
     fn cuda_graph_executes_both_portable_sort_outputs_without_identity_drift() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2, 3], crate::DType::F32);
