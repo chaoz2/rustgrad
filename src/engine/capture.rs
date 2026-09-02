@@ -129,6 +129,32 @@ impl CapturedSchedule {
             }
             let mut source_desc = passthrough.desc.clone();
             source_desc.view = None;
+            if produced.contains(&source_desc.id) {
+                source_desc.read_only = false;
+                let (producer, output) = schedule
+                    .items
+                    .iter()
+                    .flat_map(|item| item.outputs.iter().map(move |output| (item, output)))
+                    .find(|(_, output)| output.id == source_desc.id)
+                    .ok_or_else(|| {
+                        ReplayError::Corrupt(
+                            "requested passthrough producer descriptor is absent".into(),
+                        )
+                    })?;
+                let owns_source = match producer.kernel.operation() {
+                    crate::Operation::Sort(_) => {
+                        super::canonical_sort_item_owns(graph, producer, passthrough.source)
+                            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+                    }
+                    _ => producer.node == passthrough.source,
+                };
+                if !owns_source || output != &source_desc {
+                    return Err(ReplayError::Corrupt(
+                        "requested passthrough producer descriptor is inconsistent".into(),
+                    ));
+                }
+                continue;
+            }
             match graph
                 .op(passthrough.source)
                 .map_err(|error| ReplayError::Corrupt(error.to_string()))?
@@ -150,11 +176,9 @@ impl CapturedSchedule {
                 }
             }
         }
-        // A source-owned requested value has no scheduled producer. Preserve
-        // it in the existing replay input/constant ownership tables so replay
-        // can return the exact caller value without fabricating an aliasing
-        // kernel item. Any computed requested value still requires one unique
-        // scheduled producer and fails closed below.
+        // A requested alias has no producer of its own. Its immutable source
+        // stays in the replay input/constant tables, while a computed source is
+        // authenticated above against its one existing schedule producer.
         for node in requested {
             let id = node.index() as u64;
             if produced.contains(&id) {
@@ -731,6 +755,53 @@ mod tests {
         let mut malformed = decoded;
         malformed.requested_passthroughs[0].source = input_view;
         assert!(matches!(malformed.to_bytes(), Err(ReplayError::Corrupt(_))));
+    }
+
+    #[test]
+    fn computed_affine_alias_roundtrips_without_a_second_output_buffer() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3, 3], DType::F32);
+        let diagonal = graph.diagonal_default(input).unwrap();
+        let requested = [diagonal, diagonal];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        assert_eq!(schedule.requested_passthroughs.len(), 1);
+        let source = schedule.requested_passthroughs[0].source;
+        assert!(schedule.items.iter().any(|item| item.node == source));
+        assert!(schedule.items.iter().all(|item| {
+            item.outputs
+                .iter()
+                .all(|output| output.id != diagonal.index() as u64)
+        }));
+
+        let capture = CapturedSchedule::capture(&graph, &schedule, &requested).unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+        assert_eq!(decoded.requested, vec![diagonal.index() as u64; 2]);
+        assert_eq!(decoded.requested_passthroughs[0].source, source);
+        let values = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([3, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap(),
+        )]);
+        for backend in [
+            crate::CapturedBackendPolicy::Interpreter,
+            crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+        ] {
+            let replay = crate::CapturedReplayExecutor::default()
+                .replay(&decoded, &values, crate::CapturedReplayOptions { backend })
+                .unwrap();
+            assert_eq!(replay.trace.items.len(), 2);
+            assert_eq!(replay.outputs[0].to_vec_f64(), vec![1.0, 5.0, 9.0]);
+            assert_eq!(replay.outputs[1].storage(), replay.outputs[0].storage());
+        }
+
+        let mut malformed = decoded;
+        malformed.requested_passthroughs[0].source = diagonal;
+        malformed.requested_passthroughs[0].desc.id = diagonal.index() as u64;
+        malformed.identity = 0;
+        malformed.identity = crate::schedule::artifact::identity(&malformed).unwrap();
+        assert!(malformed.to_bytes().is_err());
     }
 
     #[test]

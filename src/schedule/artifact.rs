@@ -30,7 +30,9 @@ const MAGIC: &[u8; 4] = b"RGSA";
 /// retaining authenticated v8 decode and deterministic current re-encoding.
 /// v10 authenticates binding-independent projected-index expressions.
 /// v11 authenticates symbolic source-owned requested affine views.
-const VERSION: u8 = 11;
+/// v12 admits a scheduled producer as the physical owner of a requested
+/// affine alias without changing the passthrough payload.
+const VERSION: u8 = 12;
 const LAST_OPAQUE_KEY_VERSION: u8 = 6;
 const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 // The executable envelope supports ordered outputs; the inspection-only
@@ -40,13 +42,14 @@ const HEADER_LEN: usize = MAGIC.len() + 1 + std::mem::size_of::<u64>();
 /// executable artifact above.
 const MULTI_MAGIC: &[u8; 4] = b"RGSO";
 /// v6 mirrors the v11 symbolic requested-view sidecar while preserving v1-v5.
-const MULTI_VERSION: u8 = 6;
+/// v7 mirrors the v12 computed-owner admission without changing its payload.
+const MULTI_VERSION: u8 = 7;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
 
 pub fn encode(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
-    validate(capture, true)?;
+    validate(capture, true, true)?;
     let identity = identity(capture)?;
     let mut w = Writer::new();
     w.bytes(MAGIC)?;
@@ -96,9 +99,9 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         // Historical item keys are authenticated bytes, not values the
         // current process can reproduce. Validate every other executable
         // field first while deliberately skipping only current-key equality.
-        validate(&capture, false)?;
+        validate(&capture, false, version >= 12)?;
     } else {
-        validate(&capture, true)?;
+        validate(&capture, true, version >= 12)?;
         let decoded_identity = fnv1a64(&bytes[HEADER_LEN..body]);
         if decoded_identity != stored_identity {
             return Err(ArtifactError::Format("schedule identity"));
@@ -127,7 +130,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
 /// collection. It is intentionally not accepted by the executable replay
 /// validation path: coupled producers have not been introduced yet.
 pub fn encode_scheduled_outputs(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
-    validate_scheduled_outputs(capture, true)?;
+    validate_scheduled_outputs(capture, true, true)?;
     let identity = scheduled_outputs_identity(capture)?;
     let mut w = Writer::new();
     w.bytes(MULTI_MAGIC)?;
@@ -171,14 +174,14 @@ pub fn decode_scheduled_outputs(bytes: &[u8]) -> Result<CapturedSchedule, Artifa
     if !r.done() {
         return Err(ArtifactError::Format("schedule trailing bytes"));
     }
-    validate_scheduled_outputs(&capture, version == MULTI_VERSION)?;
+    validate_scheduled_outputs(&capture, version == MULTI_VERSION, version >= MULTI_VERSION)?;
     if fnv1a64(&bytes[HEADER_LEN..body]) != stored_identity {
         return Err(ArtifactError::Format("scheduled-output identity"));
     }
     if version < MULTI_VERSION {
         rekey_current(&mut capture)?;
         capture.identity = scheduled_outputs_identity(&capture)?;
-        validate_scheduled_outputs(&capture, true)?;
+        validate_scheduled_outputs(&capture, true, true)?;
     }
     Ok(capture)
 }
@@ -1191,7 +1194,11 @@ fn validate_requested_ids(
     Ok(())
 }
 
-fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactError> {
+fn validate(
+    c: &CapturedSchedule,
+    validate_keys: bool,
+    allow_computed_passthroughs: bool,
+) -> Result<(), ArtifactError> {
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
@@ -1307,7 +1314,6 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
         if !passthrough_requested.insert(requested)
             || !c.requested.contains(&requested)
             || output_ids.contains(&requested)
-            || output_ids.contains(&source)
         {
             return Err(ArtifactError::Format("requested passthrough ownership"));
         }
@@ -1324,7 +1330,16 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
         } else {
             0
         };
-        if input_owner + constant_owner != 1
+        let producer_output = c
+            .items
+            .iter()
+            .flat_map(|item| item.outputs.iter())
+            .find(|output| output.id == source);
+        if producer_output.is_some() && !allow_computed_passthroughs {
+            return Err(ArtifactError::Format("requested passthrough ownership"));
+        }
+        let producer_owner = usize::from(producer_output.is_some());
+        if input_owner + constant_owner + producer_owner != 1
             || c.inputs
                 .iter()
                 .find(|input| input.desc.id == source)
@@ -1338,6 +1353,11 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
                 })
             || c.constants.get(&source).is_some_and(|value| {
                 value.shape() != &physical.shape || value.dtype() != physical.dtype
+            })
+            || producer_output.is_some_and(|output| {
+                let mut producer = physical.clone();
+                producer.read_only = false;
+                output != &producer
             })
         {
             return Err(ArtifactError::Format("requested passthrough source"));
@@ -1486,6 +1506,7 @@ fn upgrade_legacy_storeless_sinks(capture: &mut CapturedSchedule) {
 fn validate_scheduled_outputs(
     c: &CapturedSchedule,
     validate_keys: bool,
+    allow_computed_passthroughs: bool,
 ) -> Result<(), ArtifactError> {
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
@@ -1550,6 +1571,11 @@ fn validate_scheduled_outputs(
         .iter()
         .map(|passthrough| passthrough.requested.index() as u64)
         .collect::<BTreeSet<_>>();
+    let passthrough_source_ids = c
+        .requested_passthroughs
+        .iter()
+        .map(|passthrough| passthrough.source.index() as u64)
+        .collect::<BTreeSet<_>>();
     let requested_values = output_ids
         .iter()
         .copied()
@@ -1569,9 +1595,11 @@ fn validate_scheduled_outputs(
     }
 
     // Retain every established descriptor ABI, reciprocal DAG, state/effect,
-    // constant, and symbolic validation rule through an exact primary-only
-    // projection. Its cache keys must be projected too because legacy keys are
-    // intentionally byte-for-byte unchanged for singleton items.
+    // constant, and symbolic validation rule through the smallest ownership
+    // projection: every primary plus any coupled secondary output used as a
+    // requested passthrough source. Its cache keys must be projected too
+    // because legacy keys are intentionally byte-for-byte unchanged for
+    // singleton items.
     let mut projected = c.clone();
     let primary_ids = projected
         .items
@@ -1583,8 +1611,17 @@ fn validate_scheduled_outputs(
     });
     let provenance = projected.specialized_from.clone();
     for item in &mut projected.items {
-        let primary = item.primary_output().clone();
-        item.outputs = ScheduledOutputs::single(primary);
+        let primary = item.primary_output().id;
+        item.outputs = ScheduledOutputs::new(
+            item.outputs
+                .iter()
+                .filter(|output| {
+                    output.id == primary || passthrough_source_ids.contains(&output.id)
+                })
+                .cloned()
+                .collect(),
+        )
+        .map_err(|_| ArtifactError::Format("scheduled-output projection"))?;
         item.cache_key = if let Some(provenance) = &provenance {
             super::specialized_item_cache_key(
                 item,
@@ -1596,7 +1633,7 @@ fn validate_scheduled_outputs(
         }
         .map_err(|_| ArtifactError::Format("item cache identity"))?;
     }
-    validate(&projected, true)?;
+    validate(&projected, true, allow_computed_passthroughs)?;
 
     let input_ids = c
         .inputs
@@ -1644,7 +1681,7 @@ pub(crate) fn validate_for_replay(c: &CapturedSchedule) -> Result<(), ArtifactEr
 }
 
 pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    validate(c, true)?;
+    validate(c, true, true)?;
     if identity(c)? != c.identity {
         return Err(ArtifactError::Format("schedule identity"));
     }
@@ -2236,6 +2273,20 @@ mod tests {
         writer.out
     }
 
+    fn legacy_scheduled_outputs_v6(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_scheduled_outputs_payload(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MULTI_MAGIC).unwrap();
+        writer.u8(6).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
     fn legacy_v1(capture: &CapturedSchedule) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
@@ -2318,6 +2369,20 @@ mod tests {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
         writer.u8(10).unwrap();
+        writer.u64(identity).unwrap();
+        writer.bytes(&payload.out).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
+    fn legacy_v11(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut payload = Writer::new();
+        write_payload(&mut payload, capture).unwrap();
+        let identity = fnv1a64(&payload.out);
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(11).unwrap();
         writer.u64(identity).unwrap();
         writer.bytes(&payload.out).unwrap();
         let sum = checksum(&writer.out);
@@ -2573,6 +2638,63 @@ mod tests {
     }
 
     #[test]
+    fn computed_requested_alias_uses_the_versioned_owner_admission() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3, 3], DType::F32);
+        let requested = graph.diagonal_default(input).unwrap();
+        let schedule = crate::schedule(&graph, requested).unwrap();
+        let capture = CapturedSchedule::capture(&graph, &schedule, &[requested]).unwrap();
+        assert_eq!(capture.items.len(), 2);
+        assert_eq!(capture.requested_passthroughs.len(), 1);
+        assert_eq!(
+            capture.requested_passthroughs[0].source,
+            capture
+                .items
+                .iter()
+                .find(|item| item.node == capture.requested_passthroughs[0].source)
+                .unwrap()
+                .node
+        );
+
+        let executable = encode(&capture).unwrap();
+        assert_eq!(executable[4], 12);
+        assert_eq!(encode(&decode(&executable).unwrap()).unwrap(), executable);
+        let inspection = encode_scheduled_outputs(&capture).unwrap();
+        assert_eq!(inspection[4], 7);
+        assert_eq!(
+            encode_scheduled_outputs(&decode_scheduled_outputs(&inspection).unwrap()).unwrap(),
+            inspection
+        );
+
+        assert!(matches!(
+            decode(&legacy_v11(&capture)),
+            Err(ArtifactError::Format("requested passthrough ownership"))
+        ));
+        assert!(matches!(
+            decode_scheduled_outputs(&legacy_scheduled_outputs_v6(&capture)),
+            Err(ArtifactError::Format("requested passthrough ownership"))
+        ));
+
+        let source_owned = symbolic_view_fixture();
+        let upgraded = decode(&legacy_v11(&source_owned)).unwrap();
+        assert_eq!(
+            upgraded.requested_passthroughs,
+            source_owned.requested_passthroughs
+        );
+        assert_eq!(encode(&upgraded).unwrap()[4], VERSION);
+        let ordered_upgraded =
+            decode_scheduled_outputs(&legacy_scheduled_outputs_v6(&source_owned)).unwrap();
+        assert_eq!(
+            ordered_upgraded.requested_passthroughs,
+            source_owned.requested_passthroughs
+        );
+        assert_eq!(
+            encode_scheduled_outputs(&ordered_upgraded).unwrap()[4],
+            MULTI_VERSION
+        );
+    }
+
+    #[test]
     fn ordered_outputs_round_trip_but_replay_fails_closed() {
         let mut capture = fixture();
         let item = &mut capture.items[0];
@@ -2711,7 +2833,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_v10_symbolic_schema_decodes_empty_requested_views_and_reencodes_v11() {
+    fn historical_v10_symbolic_schema_decodes_empty_requested_views_and_reencodes_current() {
         let capture = symbolic_fixture();
         let historical = legacy_v10(&capture);
         assert_eq!(historical[4], 10);
@@ -2769,7 +2891,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_rgso_v5_symbolic_schema_decodes_empty_requested_views_and_reencodes_v6() {
+    fn historical_rgso_v5_symbolic_schema_decodes_empty_requested_views_and_reencodes_current() {
         let capture = symbolic_fixture();
         let historical = legacy_scheduled_outputs_v5(&capture);
         assert_eq!(historical[4], 5);
@@ -2903,6 +3025,54 @@ mod tests {
         assert_eq!(bytes, encode_scheduled_outputs(&decoded).unwrap());
         assert_eq!(decoded.items[0].outputs.len(), 2);
         assert!(decoded.replay(&BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn scheduled_output_envelope_preserves_requested_sort_secondary_aliases() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let (values, indices) = graph.sort_default(input).unwrap();
+        let transposed = graph.permute(indices, [1, 0]).unwrap();
+        let requested = [transposed, values, transposed];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        schedule.validate().unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.items[0].outputs.len(), 2);
+        assert_eq!(schedule.requested_passthroughs.len(), 1);
+        assert_eq!(schedule.requested_passthroughs[0].source, indices);
+
+        let capture = CapturedSchedule::capture(&graph, &schedule, &requested).unwrap();
+        let bytes = encode_scheduled_outputs(&capture).unwrap();
+        let decoded = decode_scheduled_outputs(&bytes).unwrap();
+        assert_eq!(encode_scheduled_outputs(&decoded).unwrap(), bytes);
+        assert_eq!(
+            decoded.requested,
+            vec![
+                transposed.index() as u64,
+                values.index() as u64,
+                transposed.index() as u64
+            ]
+        );
+        assert_eq!(decoded.items[0].outputs.len(), 2);
+        assert_eq!(decoded.requested_passthroughs[0].source, indices);
+
+        let realized = crate::engine::realize(
+            &graph,
+            &schedule,
+            &requested,
+            &std::collections::HashMap::from([(
+                "input".into(),
+                TensorData::new([2, 2], vec![3.0, 1.0, 4.0, 2.0]).unwrap(),
+            )]),
+            crate::engine::RealizationPolicy::Interpreter,
+        )
+        .unwrap();
+        assert_eq!(
+            realized.outputs[0].storage(),
+            &crate::Storage::I32(vec![1, 1, 0, 0])
+        );
+        assert_eq!(realized.outputs[1].to_vec_f64(), vec![1.0, 3.0, 2.0, 4.0]);
+        assert_eq!(realized.outputs[2].storage(), realized.outputs[0].storage());
     }
 
     #[test]

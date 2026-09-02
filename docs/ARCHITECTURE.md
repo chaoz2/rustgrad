@@ -1854,16 +1854,17 @@ for those fixed-schema executors. `CapturedStaticPrefix<P>` pairs that
 projection with a prepared backend prefix so raw prepared executors have no
 optional or runtime-invalid capture mode. The projection first authenticates the complete concrete,
 pure `CapturedSchedule`, then seeds its owned constants and exact named inputs,
-reconstructs source-owned affine passthroughs, and identifies only produced
-requested IDs as device-retained outputs. Prepared OpenCL, Metal, WebGPU, and
+and identifies the physical owner behind every direct or affine requested
+value. Prepared OpenCL, Metal, WebGPU, and
 CUDA prefixes consume that same projection and publish detached values only
 after their existing transaction succeeds. Logical request order and repeated
 IDs are preserved while each physical produced buffer is retained once;
 external-materialization bindings are reused without parsing capture metadata
 in a renderer. Symbolic schemas, effects or boundaries, quantized bindings,
 and any operation outside a renderer's existing static subset still reject
-before device work. RGSA, UOp, schedule, and renderer/cache identities are
-unchanged.
+before device work. Capture payload, UOp, schedule, and renderer/cache
+identities are unchanged; RGSA/RGSO bump only their ownership-admission
+envelopes as described below.
 
 `AuthenticatedSymbolicBody` is the shared immutable schema/capture owner used by
 CPU and static-device symbolic programs. It authenticates the body once, then
@@ -1880,8 +1881,12 @@ against the graph and template descriptor; specialization proves its bounds
 and emits the existing concrete `RequestedPassthrough`. The source remains the
 only storage owner, so alias-only CPU/CUDA invocations project exact raw lanes
 without a fake kernel, device allocation, or launch. Historical RGSA v10 and
-RGSO v5 decode with an empty requested-view map; computed requested aliases
-remain explicit materialization boundaries. A miss is installed only after execution and final ordered
+RGSO v5 decode with an empty requested-view map. RGSA v12/RGSO v7 reuse the
+same passthrough record while admitting a scheduled producer as its physical
+owner: concrete and specialized computed affine requests retain that one
+producer buffer and project raw lanes only after successful execution, rather
+than inventing an alias output or copy kernel. Older versions retain their
+source-only ownership gate. A miss is installed only after execution and final ordered
 duplicate projection succeed; any cached execution failure evicts the entry.
 The first public adapter is `CudaSymbolicProgram`, which reuses
 `CudaGraphPrefixPlan`, `PreparedCudaGraphPrefix`, stable leases, and existing

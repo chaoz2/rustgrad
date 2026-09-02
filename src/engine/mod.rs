@@ -100,13 +100,14 @@ pub struct Realized {
 ///
 /// Scheduled values retain their producer-owned buffers. Requested graph
 /// inputs and constants have no producer item, so the transaction retains
-/// their exact owned storage here. Requested static affine aliases project
-/// those same immutable sources without fabricating output ownership. The
-/// ordered IDs deliberately preserve duplicate requests without scheduling or
-/// materializing the value twice.
+/// their exact owned storage here. Requested static affine aliases project an
+/// immutable source or retained scheduled producer without fabricating output
+/// ownership. The ordered IDs deliberately preserve duplicate requests
+/// without scheduling or materializing the value twice.
 struct RequestedOutputPlan {
     ordered: Vec<u64>,
     retained_sources: HashMap<u64, TensorData>,
+    aliases: BTreeMap<u64, crate::RequestedPassthrough>,
 }
 
 impl RequestedOutputPlan {
@@ -132,6 +133,7 @@ impl RequestedOutputPlan {
             .collect::<BTreeMap<_, _>>();
         let mut ordered = Vec::with_capacity(requested.len());
         let mut retained_sources = HashMap::new();
+        let mut aliases = BTreeMap::new();
         for &node in requested {
             let shape = graph
                 .shape(node)
@@ -164,26 +166,46 @@ impl RequestedOutputPlan {
                     .op(passthrough.source)
                     .map_err(|error| RealizationError::Schedule(error.to_string()))?
                 {
-                    Op::Input { name } => inputs.get(name).ok_or_else(|| {
+                    Op::Input { name } => Some(inputs.get(name).ok_or_else(|| {
                         RealizationError::Execution(format!("missing input {name}"))
-                    })?,
-                    Op::Constant(value) => value,
-                    _ => {
-                        return Err(RealizationError::Schedule(format!(
-                            "requested passthrough {id} has no immutable source"
+                    })?),
+                    Op::Constant(value) => Some(value),
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    let mut physical = passthrough.desc.clone();
+                    physical.view = None;
+                    if source.shape() != &physical.shape || source.dtype() != physical.dtype {
+                        return Err(RealizationError::Execution(format!(
+                            "requested passthrough {id} source descriptor mismatch"
                         )));
                     }
-                };
-                let view = passthrough.desc.view.as_ref().expect("validated view");
-                let value = source
-                    .affine_read(view)
-                    .map_err(|error| RealizationError::Execution(error.to_string()))?;
-                if value.shape() != &shape || value.dtype() != dtype {
-                    return Err(RealizationError::Execution(format!(
-                        "requested passthrough {id} descriptor mismatch"
-                    )));
+                    retained_sources
+                        .entry(passthrough.source.index() as u64)
+                        .or_insert_with(|| source.clone());
+                } else {
+                    let source_id = passthrough.source.index() as u64;
+                    let Some((item, output)) = produced.get(&source_id) else {
+                        return Err(RealizationError::Schedule(format!(
+                            "requested passthrough {id} computed source has no producer"
+                        )));
+                    };
+                    let owns_source = match item.kernel.operation() {
+                        crate::Operation::Sort(_) => {
+                            canonical_sort_item_owns(graph, item, passthrough.source)?
+                        }
+                        _ => item.node == passthrough.source,
+                    };
+                    let mut physical = passthrough.desc.clone();
+                    physical.view = None;
+                    physical.read_only = false;
+                    if !owns_source || *output != &physical {
+                        return Err(RealizationError::Schedule(format!(
+                            "requested passthrough {id} computed source is inconsistent"
+                        )));
+                    }
                 }
-                retained_sources.entry(id).or_insert(value);
+                aliases.insert(id, (*passthrough).clone());
                 continue;
             }
             if matches!(op, Op::Input { .. } | Op::Constant(_)) {
@@ -237,7 +259,31 @@ impl RequestedOutputPlan {
         Ok(Self {
             ordered,
             retained_sources,
+            aliases,
         })
+    }
+
+    fn project(
+        &self,
+        values: &HashMap<u64, TensorData>,
+    ) -> Result<Vec<TensorData>, RealizationError> {
+        self.ordered
+            .iter()
+            .map(|id| {
+                if let Some(alias) = self.aliases.get(id) {
+                    let source = values
+                        .get(&(alias.source.index() as u64))
+                        .ok_or(RealizationError::MissingBuffer(alias.source.index() as u64))?;
+                    return alias
+                        .project(source)
+                        .map_err(|error| RealizationError::Execution(error.to_string()));
+                }
+                values
+                    .get(id)
+                    .cloned()
+                    .ok_or(RealizationError::MissingBuffer(*id))
+            })
+            .collect()
     }
 }
 
@@ -677,7 +723,7 @@ pub fn realize_with_options(
     }
     let policy = options.backend;
     validate_realization_inputs(graph, schedule, inputs)?;
-    let requested_plan = RequestedOutputPlan::new(graph, schedule, requested, inputs)?;
+    let mut requested_plan = RequestedOutputPlan::new(graph, schedule, requested, inputs)?;
     let memory_plan = MemoryPlan::from_schedule(
         schedule,
         requested,
@@ -701,10 +747,16 @@ pub fn realize_with_options(
         .ordered
         .iter()
         .copied()
+        .chain(
+            requested_plan
+                .aliases
+                .values()
+                .map(|alias| alias.source.index() as u64),
+        )
         .collect::<std::collections::BTreeSet<_>>();
     // Only retained outputs live here. Internal values are reachable solely
     // through non-cloneable, generation-checked pool leases.
-    let mut values = requested_plan.retained_sources;
+    let mut values = std::mem::take(&mut requested_plan.retained_sources);
     let mut leases: HashMap<u64, HostBufferLease> = HashMap::new();
     let pool = HostSlotPool::new();
     let mut trace = RealizationTrace::default();
@@ -874,16 +926,7 @@ pub fn realize_with_options(
             lease.release().map_err(RealizationError::Host)?;
         }
     }
-    let outputs = requested_plan
-        .ordered
-        .iter()
-        .map(|id| {
-            values
-                .get(id)
-                .cloned()
-                .ok_or(RealizationError::MissingBuffer(*id))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let outputs = requested_plan.project(&values)?;
     if pool.physical_slots().map_err(RealizationError::Host)? != memory_plan.peak_allocations {
         return Err(RealizationError::Schedule(
             "host pool slot count diverges from memory plan".into(),
@@ -1450,6 +1493,77 @@ mod tests {
             ),
             Err(RealizationError::Schedule(_))
         ));
+    }
+
+    #[test]
+    fn computed_affine_alias_projects_after_its_one_retained_producer() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3, 3], DType::F32);
+        let diagonal = graph.diagonal_default(input).unwrap();
+        let requested = [diagonal, diagonal];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        assert_eq!(schedule.requested_passthroughs.len(), 1);
+        let source = schedule.requested_passthroughs[0].source;
+        assert!(schedule.items.iter().any(|item| item.node == source));
+        let memory = crate::MemoryPlan::from_schedule(&schedule, &requested, true).unwrap();
+        assert_eq!(memory.temporaries.len(), 1);
+        assert_ne!(memory.temporaries[0].buffer_id, source.index() as u64);
+
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::from_storage(
+                [3, 3],
+                Storage::F32(vec![
+                    -0.0,
+                    2.0,
+                    3.0,
+                    4.0,
+                    f32::from_bits(0x7fc0_1234),
+                    6.0,
+                    7.0,
+                    8.0,
+                    f32::NEG_INFINITY,
+                ]),
+            )
+            .unwrap(),
+        )]);
+        let mut realized = realize_with_options(
+            &graph,
+            &schedule,
+            &requested,
+            &bindings,
+            RealizationOptions {
+                backend: RealizationPolicy::Interpreter,
+                memory_reuse: MemoryReuse::Enabled,
+            },
+        )
+        .unwrap();
+        assert_eq!(realized.trace.items.len(), 2);
+        let expected = vec![
+            (-0.0f32).to_bits(),
+            0x7fc0_1234,
+            f32::NEG_INFINITY.to_bits(),
+        ];
+        for output in &realized.outputs {
+            let Storage::F32(values) = output.storage() else {
+                panic!("computed diagonal alias must retain F32 storage")
+            };
+            assert_eq!(
+                values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        realized.outputs[0]
+            .replace(&TensorData::new([3], vec![1.0, 2.0, 3.0]).unwrap())
+            .unwrap();
+        let Storage::F32(second) = realized.outputs[1].storage() else {
+            unreachable!("fixture is F32")
+        };
+        assert_eq!(second[0].to_bits(), (-0.0f32).to_bits());
     }
 
     #[test]

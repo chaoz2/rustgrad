@@ -27,7 +27,7 @@ mod sealed {
 pub(crate) struct CapturedStaticExecution {
     inputs: Vec<ReplayInput>,
     constants: BTreeMap<u64, TensorData>,
-    passthroughs: Vec<RequestedPassthrough>,
+    passthroughs: BTreeMap<u64, RequestedPassthrough>,
     requested: Vec<u64>,
     retained: Vec<u64>,
 }
@@ -60,11 +60,23 @@ impl CapturedStaticExecution {
             .flat_map(|item| item.outputs.iter().map(|output| output.id))
             .collect::<BTreeSet<_>>();
         let mut retained_seen = BTreeSet::new();
+        let aliases = capture
+            .requested_passthroughs
+            .iter()
+            .map(|alias| (alias.requested.index() as u64, alias.source.index() as u64))
+            .collect::<BTreeMap<_, _>>();
         let retained = capture
             .requested
             .iter()
-            .copied()
-            .filter(|id| produced.contains(id) && retained_seen.insert(*id))
+            .filter_map(|id| {
+                produced.contains(id).then_some(*id).or_else(|| {
+                    aliases
+                        .get(id)
+                        .copied()
+                        .filter(|source| produced.contains(source))
+                })
+            })
+            .filter(|id| retained_seen.insert(*id))
             .collect::<Vec<_>>();
         if !capture.items.is_empty() && retained.is_empty() {
             return Err("captured static prefix has no produced requested output".into());
@@ -72,7 +84,12 @@ impl CapturedStaticExecution {
         Ok(Self {
             inputs: capture.inputs.clone(),
             constants: capture.constants.clone(),
-            passthroughs: capture.requested_passthroughs.clone(),
+            passthroughs: capture
+                .requested_passthroughs
+                .iter()
+                .cloned()
+                .map(|alias| (alias.requested.index() as u64, alias))
+                .collect(),
             requested: capture.requested.clone(),
             retained,
         })
@@ -124,25 +141,6 @@ impl CapturedStaticExecution {
                 ));
             }
         }
-        for passthrough in &self.passthroughs {
-            let source = values
-                .get(&(passthrough.source.index() as u64))
-                .ok_or_else(|| "captured static passthrough source is absent".to_string())?;
-            let view = passthrough
-                .desc
-                .view
-                .as_ref()
-                .ok_or_else(|| "captured static passthrough view is absent".to_string())?;
-            let value = source
-                .affine_read(view)
-                .map_err(|error| format!("captured static passthrough: {error}"))?;
-            if values
-                .insert(passthrough.requested.index() as u64, value)
-                .is_some()
-            {
-                return Err("captured static passthrough aliases another value".into());
-            }
-        }
         Ok(values)
     }
 
@@ -153,6 +151,14 @@ impl CapturedStaticExecution {
         self.requested
             .iter()
             .map(|id| {
+                if let Some(alias) = self.passthroughs.get(id) {
+                    let source = values.get(&(alias.source.index() as u64)).ok_or_else(|| {
+                        "captured static passthrough source is absent".to_string()
+                    })?;
+                    return alias
+                        .project(source)
+                        .map_err(|error| format!("captured static passthrough: {error}"));
+                }
                 values
                     .get(id)
                     .cloned()
@@ -2339,5 +2345,50 @@ mod tests {
             projected[0].to_le_bytes().unwrap(),
             projected[1].to_le_bytes().unwrap()
         );
+    }
+
+    #[test]
+    fn captured_static_projection_retains_computed_alias_source_only() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [4], DType::F32);
+        let producer = graph.square(input).unwrap();
+        let alias = graph
+            .stride(
+                producer,
+                [crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        let schedule = schedule_many(&graph, &[alias, alias]).unwrap();
+        let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[alias, alias]).unwrap();
+        let projection = CapturedStaticExecution::new(&capture).unwrap();
+        assert_eq!(projection.retained(), &[producer.index() as u64]);
+        let plan = StaticSchedulePlan::build(
+            &FakeAdapter(Rc::new(RefCell::new(Calls::default()))),
+            &capture.items,
+            Some(projection.retained()),
+        )
+        .unwrap();
+        assert_eq!(plan.retained_outputs(), &[producer.index() as u64]);
+        assert!(!plan.buffers.contains_key(&(alias.index() as u64)));
+
+        let mut values = projection
+            .stage(&BTreeMap::from([(
+                "x".into(),
+                TensorData::new([4], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            )]))
+            .unwrap();
+        assert!(!values.contains_key(&(alias.index() as u64)));
+        values.insert(
+            producer.index() as u64,
+            TensorData::new([4], vec![1.0, 4.0, 9.0, 16.0]).unwrap(),
+        );
+        let outputs = projection.project(&values).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].to_vec_f64(), vec![16.0, 9.0, 4.0, 1.0]);
+        assert_eq!(outputs[1].storage(), outputs[0].storage());
     }
 }

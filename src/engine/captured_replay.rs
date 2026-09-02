@@ -69,6 +69,34 @@ impl ReplayValues {
             .map(|id| self.tensor(*id, "requested output").cloned())
             .collect()
     }
+
+    pub(crate) fn project_requested_aliases(
+        &mut self,
+        aliases: &[crate::RequestedPassthrough],
+    ) -> Result<(), ReplayError> {
+        let projected = aliases
+            .iter()
+            .map(|alias| {
+                let source = self.tensor(alias.source.index() as u64, "requested alias source")?;
+                let projected = alias
+                    .project(source)
+                    .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+                Ok((alias.requested.index() as u64, projected))
+            })
+            .collect::<Result<Vec<_>, ReplayError>>()?;
+        for (requested, value) in projected {
+            if self
+                .0
+                .insert(requested, ReplayValue::Materialized(value))
+                .is_some()
+            {
+                return Err(ReplayError::Corrupt(
+                    "requested alias shadows an existing value".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 #[allow(dead_code)]
 impl TensorValueStore for ReplayValues {
@@ -811,6 +839,7 @@ impl CapturedReplayExecutor {
                 .map_err(backend_error)?;
             values.insert_tensor(item.primary_output().id, value);
         }
+        values.project_requested_aliases(&capture.requested_passthroughs)?;
         Ok(values)
     }
 }
@@ -931,6 +960,7 @@ fn execute_invocation(
             reason,
         });
     }
+    values.project_requested_aliases(&capture.requested_passthroughs)?;
     let outputs = values.requested(&capture.requested)?;
     Ok(CapturedReplayResult {
         outputs,
@@ -970,6 +1000,7 @@ pub(crate) fn replay_interpreter_items(
         })?;
         values.insert_tensor(item.primary_output().id, value);
     }
+    values.project_requested_aliases(&capture.requested_passthroughs)?;
     Ok(values)
 }
 
@@ -1053,22 +1084,6 @@ pub(crate) fn initial_values(
                 .cloned()
                 .ok_or_else(|| ReplayError::Missing(input.name.clone()))?,
         );
-    }
-    for passthrough in &capture.requested_passthroughs {
-        let source = values
-            .tensor(
-                passthrough.source.index() as u64,
-                "requested passthrough source",
-            )?
-            .clone();
-        let view =
-            passthrough.desc.view.as_ref().ok_or_else(|| {
-                ReplayError::Corrupt("requested passthrough view is absent".into())
-            })?;
-        let projected = source
-            .affine_read(view)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        values.insert_tensor(passthrough.requested.index() as u64, projected);
     }
     Ok(values)
 }
@@ -3726,7 +3741,7 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_computed_affine_copy_specializes_direct_and_contiguous_outputs() {
+    fn symbolic_computed_affine_alias_and_contiguous_copy_specialize_together() {
         let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
         for contiguous in [false, true] {
             let (template, input, producer, output, _) =
@@ -3737,16 +3752,25 @@ mod tests {
                 vec![output]
             };
             let schedule = crate::schedule_many(&template, &requested).unwrap();
-            assert_eq!(schedule.items.len(), 2);
-            let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
-                schedule.items[1].kernel.operation()
-            else {
-                panic!("computed view must retain its affine copy boundary")
-            };
-            let crate::MovementKernelKind::AffineCopy { input: operand, .. } = &plan.kind else {
-                panic!("computed view must retain its affine copy plan")
-            };
-            assert_eq!(operand.node, producer);
+            if contiguous {
+                assert_eq!(schedule.items.len(), 2);
+                let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+                    schedule.items[1].kernel.operation()
+                else {
+                    panic!("contiguous view must retain its affine copy boundary")
+                };
+                let crate::MovementKernelKind::AffineCopy { input: operand, .. } = &plan.kind
+                else {
+                    panic!("contiguous view must retain its affine copy plan")
+                };
+                assert_eq!(operand.node, producer);
+                assert!(schedule.requested_passthroughs.is_empty());
+            } else {
+                assert_eq!(schedule.items.len(), 1);
+                assert_eq!(schedule.items[0].node, producer);
+                assert_eq!(schedule.requested_passthroughs.len(), 1);
+                assert_eq!(schedule.requested_passthroughs[0].source, producer);
+            }
             let capture = CapturedSchedule::capture_symbolic(
                 &template,
                 &schedule,
@@ -3789,14 +3813,12 @@ mod tests {
             }
 
             let mut tampered = capture.clone();
-            let view = tampered
-                .symbolic
-                .as_mut()
-                .unwrap()
-                .views
-                .values_mut()
-                .next()
-                .unwrap();
+            let schema = tampered.symbolic.as_mut().unwrap();
+            let view = if contiguous {
+                schema.views.values_mut().next().unwrap()
+            } else {
+                schema.requested_views.values_mut().next().unwrap()
+            };
             view.strides[0] = crate::SymbolicExpr::constant(99);
             tampered.identity = 0;
             tampered.identity = crate::schedule::artifact::identity(&tampered).unwrap();
@@ -3828,10 +3850,12 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_computed_full_reverse_specializes_signed_affine_copy() {
+    fn symbolic_computed_full_reverse_specializes_signed_requested_alias() {
         let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
         let (template, input, output, _) = symbolic_computed_reverse_family(3);
         let schedule = crate::schedule(&template, output).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.requested_passthroughs.len(), 1);
         let capture = CapturedSchedule::capture_symbolic(
             &template,
             &schedule,
@@ -3853,19 +3877,10 @@ mod tests {
                     &BTreeMap::from([("extent".into(), rebound as i64)]),
                 )
                 .unwrap();
-            let affine = specialized
-                .capture()
-                .items
-                .iter()
-                .find_map(|item| match item.kernel.operation() {
-                    crate::Operation::Movement(crate::MovementValue::Plan(plan)) => {
-                        match &plan.kind {
-                            crate::MovementKernelKind::AffineCopy { view, .. } => Some(view),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                })
+            let affine = specialized.capture().requested_passthroughs[0]
+                .desc
+                .view
+                .as_ref()
                 .unwrap();
             assert_eq!(
                 affine.offset,
@@ -3917,13 +3932,14 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_computed_reshape_expand_and_shrink_share_one_affine_copy() {
+    fn symbolic_computed_reshape_expand_and_shrink_share_one_requested_alias() {
         let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
         // Keep the template extent distinct from the fixed expanded width so
         // shape lifting does not have two source-exact interpretations.
         let (template, input, output, _) = symbolic_computed_broadcast_shrink_family(2);
         let schedule = crate::schedule(&template, output).unwrap();
-        assert_eq!(schedule.items.len(), 2);
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(schedule.requested_passthroughs.len(), 1);
         let capture = CapturedSchedule::capture_symbolic(
             &template,
             &schedule,
@@ -4788,7 +4804,15 @@ mod tests {
             &BTreeMap::from([("rows".into(), 2)]),
         )
         .unwrap();
-        assert_eq!(capture.symbolic.as_ref().unwrap().views.len(), 1);
+        let schema = capture.symbolic.as_ref().unwrap();
+        assert!(schema.views.is_empty());
+        assert_eq!(schema.requested_views.len(), 1);
+        assert!(
+            schema
+                .requested_views
+                .contains_key(&(output.index() as u64))
+        );
+        assert_eq!(capture.requested_passthroughs[0].source, computed);
 
         let mut bitcast = Graph::new();
         let input = bitcast.input_dtype("input", [2, 1], DType::F32);

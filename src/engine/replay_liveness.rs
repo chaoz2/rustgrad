@@ -17,11 +17,17 @@ impl ReplayLivenessPlan {
     pub(crate) fn analyze(capture: &CapturedSchedule) -> Result<Self, ReplayError> {
         let mut demanded = BTreeSet::new();
         let requested = capture.requested.iter().copied().collect::<BTreeSet<_>>();
+        let requested_alias_sources = capture
+            .requested_passthroughs
+            .iter()
+            .map(|alias| alias.source.index() as u64)
+            .collect::<BTreeSet<_>>();
         for item in &capture.items {
             // Requested values, boundaries, and effects are externally
             // observable or have ordering semantics. Keep them as roots even
             // when their output domain is empty.
             if requested.contains(&item.primary_output().id)
+                || requested_alias_sources.contains(&item.primary_output().id)
                 || item.boundary.is_some()
                 || item.is_effect()
             {
