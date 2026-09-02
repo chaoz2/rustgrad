@@ -24,6 +24,7 @@ use std::{
 
 pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v8";
 pub const OPENCL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-opencl-raw-copy-v1";
+pub const OPENCL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-opencl-portable-bitcast-v1";
 pub const OPENCL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-opencl-static-position-v1";
 pub const OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-opencl-portable-f32-matmul-v1";
@@ -95,6 +96,14 @@ impl RenderedOpenCl {
             crate::portable_threefry::PortableThreefry::new(value)
                 .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
                 .validate_schedule_bindings(bindings)
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Movement(MovementValue::Plan(plan)) = root.operation()
+            && matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. })
+        {
+            crate::movement_plan::PortableBitcast::new(plan)
+                .and_then(|portable| portable.validate_schedule_bindings(bindings))
                 .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
         }
         if bindings.len() != self.schedule_inputs.len() {
@@ -184,6 +193,11 @@ impl OpenClRenderer {
                     ) =>
                 {
                     render_static_positions(self, root, plan)
+                }
+                MovementValue::Plan(plan)
+                    if matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. }) =>
+                {
+                    render_portable_bitcast(self, root, plan)
                 }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
                 MovementValue::QuantizedRowGather(_) => Err(OpenClError::Unsupported(
@@ -1109,6 +1123,79 @@ fn render_portable_f32_matmul(
         required_capabilities: OpenClCapabilities::CORE_32,
         transaction: None,
         schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+fn render_portable_bitcast(
+    renderer: &OpenClRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedOpenCl, OpenClError> {
+    root.validate()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let portable = crate::movement_plan::PortableBitcast::new(plan)
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let input = portable.input();
+    let input_abi = OpenClBufferAbi {
+        id: input.node.index() as u64,
+        dtype: input.dtype,
+        source_shape: input.shape.clone(),
+        elements: portable.input_elements(),
+        mutable: false,
+        view: None,
+    };
+    let buffers = vec![
+        input_abi.clone(),
+        OpenClBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: plan.dtype,
+            source_shape: plan.output_shape.clone(),
+            elements: portable.output_elements(),
+            mutable: true,
+            view: None,
+        },
+    ];
+    let entry = "rg_opencl_portable_bitcast".to_owned();
+    let stored = if portable.normalizes_bool() {
+        "b0[gid] != (uchar)0"
+    } else {
+        "b0[gid]"
+    };
+    let source = [
+        format!("// {OPENCL_PORTABLE_BITCAST_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
+        format!("__kernel void {entry}("),
+        "    __global const uchar* b0,".into(),
+        "    __global uchar* b1,".into(),
+        "    ulong extent) {".into(),
+        "  const ulong gid = (ulong)get_global_id(0);".into(),
+        "  if (gid >= extent) return;".into(),
+        format!("  b1[gid] = (uchar)({stored});"),
+        "}".into(),
+    ]
+    .join("\n")
+        + "\n";
+    let cache_key = stable_key(&(
+        OPENCL_PORTABLE_BITCAST_RENDERER_VERSION,
+        OPENCL_ABI_VERSION,
+        renderer.local_size,
+        renderer.capabilities,
+        portable.plan(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedOpenCl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.bytes(),
+        entry,
+        cache_key,
+        required_capabilities: OpenClCapabilities::CORE_32,
+        transaction: None,
+        schedule_inputs: vec![input_abi],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
         ))),

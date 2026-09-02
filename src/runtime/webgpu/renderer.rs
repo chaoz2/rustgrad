@@ -21,6 +21,7 @@ use std::{
 /// Deterministic renderer/source identity.
 pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v7";
 pub const WGSL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-wgsl-raw-copy-v1";
+pub const WGSL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-bitcast-v1";
 pub const WGSL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-wgsl-static-position-v1";
 pub const WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-f32-matmul-v1";
 pub const WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
@@ -77,9 +78,9 @@ pub struct RenderedWgsl {
     /// Ordered inputs followed by the ordered output bindings.
     pub buffers: Vec<WgslBufferAbi>,
     /// Exact launch work-item count supplied through the final uniform.
-    /// This equals the logical output extent for ordinary kernels; a serial
-    /// PrefixScan and coupled Sort launch one item per independent
-    /// `(row, inner)` lane.
+    /// This equals the logical output extent for ordinary kernels; PrefixScan
+    /// and coupled Sort launch per independent lane, while Bitcast launches
+    /// per raw byte.
     pub extent: usize,
     /// Generated compute entry point.
     pub entry: String,
@@ -133,6 +134,14 @@ impl RenderedWgsl {
             crate::portable_threefry::PortableThreefry::new(value)
                 .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
                 .validate_schedule_bindings(bindings)
+                .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Movement(MovementValue::Plan(plan)) = root.operation()
+            && matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. })
+        {
+            crate::movement_plan::PortableBitcast::new(plan)
+                .and_then(|portable| portable.validate_schedule_bindings(bindings))
                 .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
         }
         if bindings.len() != self.schedule_inputs.len() {
@@ -281,7 +290,14 @@ impl RenderedWgsl {
                     .static_position_write()
                     .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
                     .is_some();
-                if !raw_copy && !static_position {
+                let bitcast = if matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. }) {
+                    crate::movement_plan::PortableBitcast::new(plan)
+                        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+                    true
+                } else {
+                    false
+                };
+                if !raw_copy && !static_position && !bitcast {
                     return Err(WebGpuError::Unsupported(
                         "movement plan is outside raw WGSL lowering".into(),
                     ));
@@ -290,6 +306,14 @@ impl RenderedWgsl {
             }
             _ => None,
         };
+        let portable_bitcast = raw_movement
+            .filter(|plan| matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. }))
+            .map(crate::movement_plan::PortableBitcast::new)
+            .transpose()
+            .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        if let Some(portable) = portable_bitcast.as_ref() {
+            validate_portable_serial_launch(portable.bytes(), self.local_size, &self.capabilities)?;
+        }
         let expected_mutable = if portable_sort.is_some() { 2 } else { 1 };
         if self.buffers.is_empty()
             || self.buffers.iter().filter(|buffer| buffer.mutable).count() != expected_mutable
@@ -395,6 +419,7 @@ impl RenderedWgsl {
             .map(|scan| scan.launch_extent())
             .or_else(|| portable_sort.as_ref().map(|sort| sort.launch_extent()))
             .or_else(|| portable_threefry.as_ref().map(|plan| plan.elements()))
+            .or_else(|| portable_bitcast.as_ref().map(|plan| plan.bytes()))
             .unwrap_or_else(|| {
                 self.buffers
                     .last()
@@ -523,8 +548,17 @@ impl RenderedWgsl {
                 .output_shape
                 .numel()
                 .map_err(|_| WebGpuError::Overflow)?;
+            let expected_extent = if matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. })
+            {
+                crate::movement_plan::PortableBitcast::new(plan)
+                    .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
+                    .bytes()
+            } else {
+                output_elements
+            };
             if self.buffers.len() != 2
                 || self.transaction.is_some()
+                || self.extent != expected_extent
                 || self.buffers[0].id != input.node.index() as u64
                 || self.buffers[0].dtype != input.dtype
                 || self.buffers[0].source_shape != input.shape
@@ -609,6 +643,11 @@ impl WgslRenderer {
                     ) =>
                 {
                     render_static_positions(self, root, plan)
+                }
+                MovementValue::Plan(plan)
+                    if matches!(&plan.kind, crate::MovementKernelKind::Bitcast { .. }) =>
+                {
+                    render_portable_bitcast(self, root, plan)
                 }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
                 MovementValue::QuantizedRowGather(_) => Err(WebGpuError::Unsupported(
@@ -1953,6 +1992,110 @@ fn render_portable_f32_matmul(
         local_size: renderer.local_size,
         transaction: None,
         schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    };
+    rendered.validate_artifact()?;
+    Ok(rendered)
+}
+
+fn render_portable_bitcast(
+    renderer: &WgslRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedWgsl, WebGpuError> {
+    root.validate()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let portable = crate::movement_plan::PortableBitcast::new(plan)
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+    let extent = u32::try_from(portable.bytes()).map_err(|_| {
+        WebGpuError::Unsupported("portable Bitcast byte extent exceeds u32 indexing".into())
+    })?;
+    validate_portable_serial_launch(
+        portable.bytes(),
+        renderer.local_size,
+        &renderer.capabilities,
+    )?;
+    let input = portable.input();
+    let input_abi = WgslBufferAbi {
+        id: input.node.index() as u64,
+        dtype: input.dtype,
+        source_shape: input.shape.clone(),
+        elements: portable.input_elements(),
+        mutable: false,
+        view: None,
+    };
+    let buffers = vec![
+        input_abi.clone(),
+        WgslBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: plan.dtype,
+            source_shape: plan.output_shape.clone(),
+            elements: portable.output_elements(),
+            mutable: true,
+            view: None,
+        },
+    ];
+    for buffer in &buffers {
+        if buffer.physical_bytes()? > renderer.capabilities.max_buffer_size {
+            return Err(WebGpuError::Unsupported(
+                "portable Bitcast binding exceeds adapter buffer limit".into(),
+            ));
+        }
+    }
+    if buffers.len() > renderer.capabilities.max_storage_buffers_per_shader_stage as usize {
+        return Err(WebGpuError::Unsupported(
+            "portable Bitcast bindings exceed adapter limit".into(),
+        ));
+    }
+    let entry = "rg_wgsl_portable_bitcast".to_owned();
+    let stored = if portable.normalizes_bool() {
+        "select(0u, 1u, rg_bits != 0u)"
+    } else {
+        "rg_bits"
+    };
+    let source = [
+        format!("// {WGSL_PORTABLE_BITCAST_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION}"),
+        "struct RustGradExtent { value: u32, };".into(),
+        "@group(0) @binding(0) var<storage, read> b0: array<u32>;".into(),
+        "@group(0) @binding(1) var<storage, read_write> b1: array<atomic<u32>>;".into(),
+        "@group(0) @binding(2) var<uniform> rg_extent: RustGradExtent;".into(),
+        format!("@compute @workgroup_size({}, 1, 1)", renderer.local_size),
+        format!("fn {entry}(@builtin(global_invocation_id) rg_global: vec3<u32>) {{"),
+        "  let gid: u32 = rg_global.x;".into(),
+        "  if (gid >= rg_extent.value) { return; }".into(),
+        "  let rg_word: u32 = gid >> 2u;".into(),
+        "  let rg_shift: u32 = (gid & 3u) * 8u;".into(),
+        "  let rg_bits: u32 = (b0[rg_word] >> rg_shift) & 0xffu;".into(),
+        format!("  let rg_stored: u32 = {stored};"),
+        "  atomicAnd(&b1[rg_word], ~(0xffu << rg_shift));".into(),
+        "  atomicOr(&b1[rg_word], rg_stored << rg_shift);".into(),
+        "}".into(),
+    ]
+    .join("\n")
+        + "\n";
+    let cache_key = stable_key(&(
+        WGSL_PORTABLE_BITCAST_RENDERER_VERSION,
+        WEBGPU_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.plan(),
+        extent,
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedWgsl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.bytes(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        local_size: renderer.local_size,
+        transaction: None,
+        schedule_inputs: vec![input_abi],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
         ))),

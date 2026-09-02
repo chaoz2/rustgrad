@@ -151,6 +151,16 @@ checked integer conversion semantics. They therefore never add a weak `DType`,
 storage, UOp, artifact, or cache-identity variant.
 None adds a runtime, IR, backend, dynamic-shape, or device path.
 
+Materializing Bitcast retains its existing `MovementKernelPlan` and durable
+schedule/artifact identity. A crate-private `PortableBitcast` revalidates the
+final-axis shape rule, exact equal byte extent, dense two-buffer ownership, and
+ordered source binding once. Static PTX, OpenCL C, Metal, and WGSL renderers
+then launch one work item per byte: non-Bool output is an exact raw copy, while
+Bool output canonicalizes every nonzero source byte to one. Logical buffer
+descriptors stay element-typed even though the launch domain is bytes; zero
+bytes allocate and submit nothing. Only renderer-private source/cache versions
+change, and unspecialized symbolic Bitcast remains fail closed.
+
 `reduction_native.rs` is the single checked reduction recurrence boundary for
 CPU, capture, and native renderers. It derives exact source/accumulator/output
 dtypes from one scalar Init→Accumulate→Finalize chain, commits every step at

@@ -1,6 +1,7 @@
 //! Immutable contracts and pure execution for materializing movement kernels.
 use crate::{
-    AffineView, DType, Graph, NodeId, Op, Scalar, Shape, Storage, TensorData, index::DenseIndex,
+    AffineView, DType, Graph, NodeId, Op, Scalar, ScheduleInputBinding, Shape, Storage, TensorData,
+    index::DenseIndex,
 };
 use std::{
     collections::hash_map::DefaultHasher,
@@ -261,6 +262,98 @@ pub(crate) struct RawCopyView<'a> {
     input_bytes: usize,
     elements: usize,
     bytes: usize,
+}
+
+/// Borrowed, fully checked projection of the existing materializing Bitcast.
+///
+/// Bitcast remains one movement kind and one schedule/artifact payload. This
+/// projection owns its dense two-buffer ABI and exact byte launch domain so
+/// accelerator renderers only spell raw byte loads and stores.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PortableBitcast<'a> {
+    plan: &'a MovementKernelPlan,
+    input: &'a MovementOperand,
+    input_elements: usize,
+    output_elements: usize,
+    bytes: usize,
+}
+
+impl<'a> PortableBitcast<'a> {
+    pub(crate) fn new(plan: &'a MovementKernelPlan) -> Result<Self, MovementPlanError> {
+        let MovementKernelKind::Bitcast { input } = &plan.kind else {
+            return Err(MovementPlanError::InvalidGeometry);
+        };
+        plan.validate()?;
+        let input_elements = input
+            .shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let output_elements = plan
+            .output_shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let input_bytes = input_elements
+            .checked_mul(input.dtype.itemsize())
+            .ok_or(MovementPlanError::Overflow)?;
+        let bytes = output_elements
+            .checked_mul(plan.dtype.itemsize())
+            .ok_or(MovementPlanError::Overflow)?;
+        if input_bytes != bytes || input.node == plan.output {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        Ok(Self {
+            plan,
+            input,
+            input_elements,
+            output_elements,
+            bytes,
+        })
+    }
+
+    pub(crate) fn plan(&self) -> &'a MovementKernelPlan {
+        self.plan
+    }
+
+    pub(crate) fn input(&self) -> &'a MovementOperand {
+        self.input
+    }
+
+    pub(crate) fn input_elements(&self) -> usize {
+        self.input_elements
+    }
+
+    pub(crate) fn output_elements(&self) -> usize {
+        self.output_elements
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn normalizes_bool(&self) -> bool {
+        self.plan.dtype == DType::Bool
+    }
+
+    pub(crate) fn validate_schedule_bindings(
+        &self,
+        bindings: &[ScheduleInputBinding],
+    ) -> Result<(), MovementPlanError> {
+        let [binding] = bindings else {
+            return Err(MovementPlanError::InvalidGeometry);
+        };
+        if binding.abi_index != 0
+            || binding.input_node != self.input.node
+            || binding.desc.id != self.input.node.index() as u64
+            || binding.desc.shape != self.input.shape
+            || binding.desc.dtype != self.input.dtype
+            || binding.desc.bytes != self.bytes
+            || !binding.desc.read_only
+            || binding.desc.view.is_some()
+        {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        Ok(())
+    }
 }
 
 /// One active term in the checked row-major output-to-source address map.
@@ -2323,6 +2416,65 @@ mod tests {
             malformed.validate(),
             Err(MovementPlanError::InvalidGeometry)
         );
+
+        let item = crate::schedule(&graph, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let crate::Operation::Movement(crate::MovementValue::Plan(scheduled)) =
+            item.kernel.operation()
+        else {
+            panic!("scheduled bitcast plan")
+        };
+        let portable = PortableBitcast::new(scheduled).unwrap();
+        assert_eq!(portable.input_elements(), 8);
+        assert_eq!(portable.output_elements(), 2);
+        assert_eq!(portable.bytes(), 8);
+        assert!(!portable.normalizes_bool());
+        portable
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        let mut tampered = item.ordered_inputs().to_vec();
+        tampered[0].desc.bytes -= 1;
+        assert_eq!(
+            portable.validate_schedule_bindings(&tampered),
+            Err(MovementPlanError::InvalidGeometry)
+        );
+
+        let mut bool_graph = Graph::new();
+        let input = bool_graph.input_dtype("bytes", [4], DType::U8);
+        let output = bool_graph.bitcast(input, DType::Bool).unwrap();
+        let plan = MovementKernelPlan::from_graph(&bool_graph, output).unwrap();
+        let portable = PortableBitcast::new(&plan).unwrap();
+        assert!(portable.normalizes_bool());
+        let result = plan
+            .execute(&[TensorData::from_storage([4], Storage::U8(vec![0, 2, 0x80, 1])).unwrap()])
+            .unwrap();
+        assert_eq!(
+            result.storage(),
+            &Storage::Bool(vec![false, true, true, true])
+        );
+
+        for dtype in DType::ALL {
+            let target = match dtype.itemsize() {
+                1 if dtype != DType::U8 => DType::U8,
+                1 => DType::I8,
+                2 if dtype != DType::U16 => DType::U16,
+                2 => DType::I16,
+                4 if dtype != DType::U32 => DType::U32,
+                4 => DType::I32,
+                8 if dtype != DType::U64 => DType::U64,
+                8 => DType::I64,
+                _ => unreachable!("concrete dtype width"),
+            };
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let output = graph.bitcast(input, target).unwrap();
+            let plan = MovementKernelPlan::from_graph(&graph, output).unwrap();
+            let portable = PortableBitcast::new(&plan).unwrap();
+            assert_eq!(portable.bytes(), 2 * dtype.itemsize(), "{dtype:?}");
+        }
     }
 
     #[test]

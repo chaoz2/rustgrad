@@ -35,6 +35,7 @@ pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v31";
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 /// Separate identity for dense raw storage-width materialization.
 pub const PTX_CONTIGUOUS_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-contiguous-copy-v1";
+pub const PTX_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-ptx-portable-bitcast-v1";
 /// Separate identity for output-driven raw static placement.
 pub const PTX_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-ptx-static-position-v1";
 pub const PTX_THREEFRY_RENDERER_VERSION: &str = "rustgrad-ptx-live-threefry-v1";
@@ -176,7 +177,8 @@ impl RenderedPtx {
             let input = match &plan.kind {
                 MovementKernelKind::AffineCopy { input, .. }
                 | MovementKernelKind::Contiguous { input }
-                | MovementKernelKind::ScatterPositions { input, .. } => input,
+                | MovementKernelKind::ScatterPositions { input, .. }
+                | MovementKernelKind::Bitcast { input } => input,
                 _ => {
                     return Err(PtxError::Unsupported(
                         "movement plan is outside raw PTX lowering".into(),
@@ -185,8 +187,15 @@ impl RenderedPtx {
             };
             let input_elements = input.shape.numel().map_err(|_| PtxError::Overflow)?;
             let output_elements = plan.output_shape.numel().map_err(|_| PtxError::Overflow)?;
+            let expected_extent = if matches!(&plan.kind, MovementKernelKind::Bitcast { .. }) {
+                crate::movement_plan::PortableBitcast::new(plan)
+                    .map_err(|error| PtxError::InvalidBinding(error.to_string()))?
+                    .bytes()
+            } else {
+                output_elements
+            };
             if self.launch != PtxLaunchGeometry::Linear
-                || self.extent != output_elements
+                || self.extent != expected_extent
                 || self.buffers.len() != 2
                 || self.buffers[0].id != input.node.index() as u64
                 || self.buffers[0].dtype != input.dtype
@@ -356,6 +365,14 @@ impl RenderedPtx {
             crate::portable_sort::PortableSortPair::new(value)
                 .map_err(|error| PtxError::InvalidBinding(error.to_string()))?
                 .validate_schedule_bindings(bindings)
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+        }
+        if let Some(KernelSemanticProgram::UOp(program)) = &self.semantic_program
+            && let Operation::Movement(MovementValue::Plan(plan)) = program.operation()
+            && matches!(&plan.kind, MovementKernelKind::Bitcast { .. })
+        {
+            crate::movement_plan::PortableBitcast::new(plan)
+                .and_then(|portable| portable.validate_schedule_bindings(bindings))
                 .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
         }
         for (index, binding) in bindings.iter().enumerate() {
@@ -685,6 +702,11 @@ fn render(
             {
                 render_static_positions(renderer, root, plan)
             }
+            MovementValue::Plan(plan)
+                if matches!(&plan.kind, MovementKernelKind::Bitcast { .. }) =>
+            {
+                render_portable_bitcast(renderer, root, plan)
+            }
             MovementValue::Plan(plan) => render_affine_copy(renderer, root, plan),
             MovementValue::QuantizedRowGather(_) => Err(PtxError::Unsupported(
                 "quantized row gather is outside affine-copy PTX lowering".into(),
@@ -970,6 +992,107 @@ fn render(
         launch: PtxLaunchGeometry::Linear,
         semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
     })
+}
+
+/// Renders one validated materializing Bitcast as raw bytes. Numeric decode is
+/// absent; only Bool destinations canonicalize nonzero source bytes to one.
+fn render_portable_bitcast(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedPtx, PtxError> {
+    root.validate()
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    let portable = crate::movement_plan::PortableBitcast::new(plan)
+        .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+    if portable.bytes() > u32::MAX as usize {
+        return Err(PtxError::Unsupported(
+            "portable Bitcast byte extent exceeds u32 thread indexing".into(),
+        ));
+    }
+    let input = portable.input();
+    let buffers = vec![
+        PtxBufferAbi {
+            id: input.node.index() as u64,
+            dtype: input.dtype,
+            source_shape: input.shape.clone(),
+            elements: portable.input_elements(),
+            mutable: false,
+        },
+        PtxBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: plan.dtype,
+            source_shape: plan.output_shape.clone(),
+            elements: portable.output_elements(),
+            mutable: true,
+        },
+    ];
+    let entry = "rg_portable_bitcast".to_owned();
+    let normalize = if portable.normalizes_bool() {
+        vec![
+            "  setp.ne.u32 %p1, %r4, 0;".into(),
+            "  selp.u32 %r4, 1, 0, %p1;".into(),
+        ]
+    } else {
+        Vec::new()
+    };
+    let mut lines = vec![
+        format!("// {PTX_PORTABLE_BITCAST_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        String::new(),
+        format!(".visible .entry {entry}("),
+        "  .param .u64 p0,".into(),
+        "  .param .u64 p1,".into(),
+        "  .param .u64 extent".into(),
+        ")".into(),
+        "{".into(),
+        "  .reg .pred %p<3>;".into(),
+        "  .reg .b32 %r<8>;".into(),
+        "  .reg .b64 %rd<16>;".into(),
+        "  ld.param.u64 %rd10, [p0];".into(),
+        "  ld.param.u64 %rd11, [p1];".into(),
+        "  ld.param.u64 %rd0, [extent];".into(),
+        "  mov.u32 %r0, %ctaid.x;".into(),
+        "  mov.u32 %r1, %ntid.x;".into(),
+        "  mov.u32 %r2, %tid.x;".into(),
+        "  mad.lo.u32 %r3, %r0, %r1, %r2;".into(),
+        "  cvt.u64.u32 %rd3, %r3;".into(),
+        "  setp.ge.u64 %p0, %rd3, %rd0;".into(),
+        "  @%p0 bra DONE;".into(),
+        "  add.u64 %rd6, %rd10, %rd3;".into(),
+        "  add.u64 %rd7, %rd11, %rd3;".into(),
+        "  ld.global.u8 %r4, [%rd6];".into(),
+    ];
+    lines.extend(normalize);
+    lines.extend([
+        "  st.global.u8 [%rd7], %r4;".into(),
+        "DONE:".into(),
+        "  ret;".into(),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        PTX_PORTABLE_BITCAST_RENDERER_VERSION,
+        PTX_ABI_VERSION,
+        renderer.sm,
+        portable.plan(),
+        &source,
+        &buffers,
+    ));
+    let rendered = RenderedPtx {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.bytes(),
+        cache_key,
+        entry,
+        launch: PtxLaunchGeometry::Linear,
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
+    };
+    rendered.validate()?;
+    Ok(rendered)
 }
 
 /// Renders a checked dense owned copy as raw storage words. Numeric decode is
@@ -7708,6 +7831,51 @@ mod tests {
             .unwrap()
             .retain_primary_context()
             .unwrap()
+    }
+
+    #[test]
+    fn portable_bitcast_ptx_uses_byte_domain_and_exact_storage_abi() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("bytes", [2, 4], DType::U8);
+        let output = graph.bitcast(input, DType::U32).unwrap();
+        let item = crate::schedule(&graph, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert_eq!(rendered.extent, 8);
+        assert_eq!(rendered.buffers[0].elements, 8);
+        assert_eq!(rendered.buffers[1].elements, 2);
+        assert!(
+            rendered
+                .source
+                .contains(PTX_PORTABLE_BITCAST_RENDERER_VERSION)
+        );
+        assert!(rendered.source.contains("ld.global.u8"));
+        assert!(rendered.source.contains("st.global.u8"));
+
+        let bool_output = graph.bitcast(input, DType::Bool).unwrap();
+        let item = crate::schedule(&graph, bool_output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert!(rendered.source.contains("setp.ne.u32 %p1, %r4, 0"));
+
+        let empty = graph.input_dtype("empty", [0, 4], DType::U8);
+        let empty_output = graph.bitcast(empty, DType::U32).unwrap();
+        let item = crate::schedule(&graph, empty_output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        assert_eq!(renderer.render(&item.kernel).unwrap().extent, 0);
     }
 
     #[test]

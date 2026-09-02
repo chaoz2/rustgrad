@@ -1,8 +1,52 @@
 use super::renderer::{
-    WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION, WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
-    WGSL_PORTABLE_SORT_RENDERER_VERSION, WGSL_PORTABLE_THREEFRY_RENDERER_VERSION,
-    WGSL_RAW_COPY_RENDERER_VERSION, WGSL_STATIC_POSITION_RENDERER_VERSION,
+    WGSL_PORTABLE_BITCAST_RENDERER_VERSION, WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
+    WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION, WGSL_PORTABLE_SORT_RENDERER_VERSION,
+    WGSL_PORTABLE_THREEFRY_RENDERER_VERSION, WGSL_RAW_COPY_RENDERER_VERSION,
+    WGSL_STATIC_POSITION_RENDERER_VERSION,
 };
+
+#[test]
+fn portable_bitcast_wgsl_preserves_packed_raw_payload_and_bool_bytes() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("bytes", [2, 4], DType::U8);
+    let output = graph.bitcast(input, DType::U32).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!((rendered.extent, rendered.buffers[1].elements), (8, 2));
+    assert!(
+        rendered
+            .source
+            .contains(WGSL_PORTABLE_BITCAST_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("atomicAnd(&b1[rg_word]"));
+    let (actual, _) = execute_mock(
+        &graph,
+        output,
+        &HashMap::from([(
+            "bytes".into(),
+            TensorData::from_storage([2, 4], Storage::U8(vec![1, 2, 3, 4, 0, 0x80, 0xff, 1]))
+                .unwrap(),
+        )]),
+    );
+    assert_eq!(
+        actual.storage(),
+        &Storage::U32(vec![0x0403_0201, 0x01ff_8000])
+    );
+
+    let bool_output = graph.bitcast(input, DType::Bool).unwrap();
+    let item = schedule(&graph, bool_output).unwrap().items.pop().unwrap();
+    assert!(
+        renderer
+            .render(&item.kernel)
+            .unwrap()
+            .source
+            .contains("select(0u, 1u, rg_bits != 0u)")
+    );
+}
 
 #[test]
 fn portable_threefry_wgsl_uses_packed_u32_and_executes_exact_bits() {
