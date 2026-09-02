@@ -145,6 +145,33 @@ use std::{
 };
 
 #[test]
+fn captured_static_webgpu_zero_domain_has_no_submission_or_physical_storage() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [0], DType::F32);
+    let output = graph.square(input).unwrap();
+    let schedule = schedule(&graph, output).unwrap();
+    let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let before = mock.calls();
+    let prepared = PreparedWebGpuPrefix::prepare_capture(device, &capture, renderer).unwrap();
+    let outputs = prepared
+        .execute(&BTreeMap::from([(
+            "x".into(),
+            TensorData::from_storage([0], Storage::F32(Vec::new())).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].is_empty());
+    assert!(!mock.calls()[before.len()..].iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("queue_create:")
+            || call.starts_with("dispatch:")
+    }));
+}
+
+#[test]
 fn portable_sort_webgpu_executes_pairs_and_uses_atomic_bool_storage() {
     let renderer = WgslRenderer::new(8, capabilities()).unwrap();
     for dtype in [DType::Bool, DType::I32, DType::U32, DType::F32] {

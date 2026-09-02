@@ -187,6 +187,9 @@ pub struct PreparedMetalPrefix {
     inner: PreparedStaticSchedule<MetalStaticAdapter>,
 }
 
+/// An authenticated captured schedule bound to one prepared Metal prefix.
+pub type CapturedMetalPrefix = crate::runtime::CapturedStaticPrefix<PreparedMetalPrefix>;
+
 impl PreparedMetalPrefix {
     pub fn prepare(
         device: MetalDevice,
@@ -195,6 +198,22 @@ impl PreparedMetalPrefix {
     ) -> Result<Self, MetalError> {
         let plan = MetalPrefixPlan::plan(items, renderer)?;
         Self::from_plan(device, plan)
+    }
+
+    /// Prepares one authenticated concrete captured schedule for Metal execution.
+    pub fn prepare_capture(
+        device: MetalDevice,
+        capture: &crate::CapturedSchedule,
+        renderer: MetalRenderer,
+    ) -> Result<CapturedMetalPrefix, MetalError> {
+        let projection = crate::runtime::static_schedule::CapturedStaticExecution::new(capture)
+            .map_err(MetalError::InvalidBinding)?;
+        let plan =
+            MetalPrefixPlan::plan_for_outputs(&capture.items, projection.retained(), renderer)?;
+        let prepared = Self::from_plan(device, plan)?;
+        Ok(crate::runtime::CapturedStaticPrefix::new(
+            prepared, projection,
+        ))
     }
 
     pub fn from_plan(device: MetalDevice, plan: MetalPrefixPlan) -> Result<Self, MetalError> {
@@ -214,5 +233,17 @@ impl PreparedMetalPrefix {
     }
     pub fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), MetalError> {
         self.inner.execute(values)
+    }
+}
+
+impl CapturedMetalPrefix {
+    /// Executes the capture transaction and returns detached outputs in request order.
+    pub fn execute(
+        &self,
+        inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<Vec<TensorData>, MetalError> {
+        self.transact(inputs, MetalError::InvalidBinding, |prepared, values| {
+            prepared.execute(values)
+        })
     }
 }

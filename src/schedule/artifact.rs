@@ -1020,6 +1020,18 @@ fn read_quantized_data(r: &mut Reader<'_>) -> Result<QuantizedTensorData, Artifa
     Ok(value)
 }
 
+fn validate_requested_ids(
+    requested: &[u64],
+    available: &BTreeSet<u64>,
+) -> Result<(), ArtifactError> {
+    // `requested` is a logical ordered projection, not an ownership set.
+    // Repeated IDs are authenticated by the payload and materialized once.
+    if requested.iter().any(|id| !available.contains(id)) {
+        return Err(ArtifactError::Format("requested value"));
+    }
+    Ok(())
+}
+
 fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactError> {
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
@@ -1240,7 +1252,6 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
     if c.quantized_constants.keys().any(|id| !used.contains(id)) {
         return Err(ArtifactError::Format("unused quantized constant"));
     }
-    let mut requested = BTreeSet::new();
     let outputs = c
         .items
         .iter()
@@ -1253,12 +1264,7 @@ fn validate(c: &CapturedSchedule, validate_keys: bool) -> Result<(), ArtifactErr
         .chain(outputs.iter().copied())
         .chain(passthrough_requested.iter().copied())
         .collect::<BTreeSet<_>>();
-    if c.requested
-        .iter()
-        .any(|x| !requested.insert(*x) || !replay_values.contains(x))
-    {
-        return Err(ArtifactError::Format("requested value"));
-    }
+    validate_requested_ids(&c.requested, &replay_values)?;
     if !c.requested_passthroughs.is_empty()
         && (c.symbolic.is_some() || c.specialized_from.is_some())
     {
@@ -1379,7 +1385,6 @@ fn validate_scheduled_outputs(
         }
     }
 
-    let mut requested = BTreeSet::new();
     let source_ids = c
         .inputs
         .iter()
@@ -1391,14 +1396,13 @@ fn validate_scheduled_outputs(
         .iter()
         .map(|passthrough| passthrough.requested.index() as u64)
         .collect::<BTreeSet<_>>();
-    if c.requested.iter().any(|id| {
-        !requested.insert(*id)
-            || (!output_ids.contains(id)
-                && !source_ids.contains(id)
-                && !passthrough_ids.contains(id))
-    }) {
-        return Err(ArtifactError::Format("requested value"));
-    }
+    let requested_values = output_ids
+        .iter()
+        .copied()
+        .chain(source_ids.iter().copied())
+        .chain(passthrough_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    validate_requested_ids(&c.requested, &requested_values)?;
     if c.inputs
         .iter()
         .any(|input| output_ids.contains(&input.desc.id))
