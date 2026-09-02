@@ -527,9 +527,13 @@ are unchanged; the fused graph intentionally has one schedule item and
 therefore a different item/cache identity. Only the affected renderer/source
 cache versions advance.
 
-Prepared OpenCL, Metal, and WebGPU pure prefixes then project those validated
-bindings into one crate-private static residency plan. The plan renders and
-validates the complete prefix plus its canonical physical buffer inventory
+Prepared OpenCL, Metal, and WebGPU pure prefixes, plus the fixed-schema CUDA
+graph path, then project those validated bindings into one crate-private static
+residency plan. Rendered writable pointers carry ordered output ordinals; the
+plan proves that they bijectively match every `ScheduledOutputs` descriptor
+before deriving producers, dependencies, lifetimes, or resources. The plan
+renders and validates the complete prefix plus its canonical physical buffer
+inventory
 before queue, cache, compilation, or allocation work. Execution uploads each
 external logical buffer once, retains producer outputs on device across ordered
 consumers (whose affine views remain renderer-local addressing metadata), and
@@ -1482,9 +1486,15 @@ device rendering retain their own capability boundaries. A separate
 call `primary_output()` explicitly. Historical artifact codecs privately
 project the first descriptor to preserve and validate released RGSA/RGSM/RGSO
 bytes, while a coupled static `Sort` owns one value descriptor and one I32 index
-descriptor. The CPU interpreter is the sole multi-output consumer; all
-other executors reject the pair before cache, allocation, source generation, or
-launch. `argsort` chooses the index descriptor and `top_k` composes only checked
+descriptor. The CPU interpreter remains its oracle. One checked
+`PortableSortPair` projects dense Bool/I32/U32/F32 Sort onto a serial tinygrad
+bitonic network plus occurrence-count index reconstruction for PTX, OpenCL,
+Metal, and WebGPU prepared execution. Equal and unordered comparisons retain
+the left lane, so padding, NaN/signed-zero payload selection, and stable
+duplicate indices stay source-aligned. Unsupported storage/views/symbolic
+plans and serialized executable capture remain closed; renderer-private keys
+separate generated source without an Op/UOp/schedule/artifact identity change.
+`argsort` chooses the index descriptor and `top_k` composes only checked
 slices over the same stable ordered pair. `TensorGuard` is a typed value
 passthrough schedule root with finite/nonnegative/positive-row-total metadata.
 It authorizes a session-owned pending Threefry reservation only after CPU

@@ -58,12 +58,19 @@ impl StaticPlanAdapter for MetalStaticAdapter {
         }
         let buffers = bind_rendered_buffers(
             item,
-            rendered.buffers.iter().map(|abi| StaticRenderedBuffer {
-                id: abi.id,
-                dtype: abi.dtype,
-                source_shape: abi.source_shape.clone(),
-                elements: abi.elements,
-                mutable: abi.mutable,
+            rendered.buffers.iter().scan(0usize, |ordinal, abi| {
+                let output_ordinal = abi.mutable.then(|| {
+                    let current = *ordinal;
+                    *ordinal += 1;
+                    current
+                });
+                Some(StaticRenderedBuffer {
+                    id: abi.id,
+                    dtype: abi.dtype,
+                    source_shape: abi.source_shape.clone(),
+                    elements: abi.elements,
+                    output_ordinal,
+                })
             }),
             MetalError::InvalidBinding,
             || MetalError::Overflow,

@@ -5891,13 +5891,16 @@ pub(crate) mod tests {
             if semantics.extent == 0 {
                 return CUDA_SUCCESS;
             }
-            let output_index = match &semantics.program {
+            let output_ids = match &semantics.program {
                 crate::ptx::KernelSemanticProgram::UOp(program) => match program.operation() {
-                    crate::Operation::Random(plan) => plan.output.index() as u64,
-                    crate::Operation::PrefixScan(plan) => plan.destination.index() as u64,
-                    crate::Operation::Threefry(plan) => plan.output.index() as u64,
+                    crate::Operation::Random(plan) => vec![plan.output.index() as u64],
+                    crate::Operation::PrefixScan(plan) => vec![plan.destination.index() as u64],
+                    crate::Operation::Sort(plan) => {
+                        vec![plan.values.index() as u64, plan.indices.index() as u64]
+                    }
+                    crate::Operation::Threefry(plan) => vec![plan.output.index() as u64],
                     crate::Operation::Movement(crate::MovementValue::Plan(plan)) => {
-                        plan.output.index() as u64
+                        vec![plan.output.index() as u64]
                     }
                     crate::Operation::Movement(_) => return Self::INVALID_MEMORY,
                     _ => match program
@@ -5909,21 +5912,23 @@ pub(crate) mod tests {
                     {
                         Some(crate::Operation::Index(crate::IndexValue::Buffer {
                             buffer, ..
-                        })) => *buffer,
+                        })) => vec![*buffer],
                         _ => return Self::INVALID_MEMORY,
                     },
                 },
-                crate::ptx::KernelSemanticProgram::Matmul(plan) => plan.output.index() as u64,
+                crate::ptx::KernelSemanticProgram::Matmul(plan) => {
+                    vec![plan.output.index() as u64]
+                }
                 crate::ptx::KernelSemanticProgram::TiledMatmul(payload) => {
-                    payload.matmul.output.index() as u64
+                    vec![payload.matmul.output.index() as u64]
                 }
                 crate::ptx::KernelSemanticProgram::TensorCoreMatmul(payload) => {
-                    payload.matmul.output.index() as u64
+                    vec![payload.matmul.output.index() as u64]
                 }
             };
             let mut bindings = crate::KernelBindings::default();
             let mut values = Vec::new();
-            let mut output = None;
+            let mut outputs: Vec<(u64, usize, usize, CuDevicePtr, u64)> = Vec::new();
             {
                 let all = self.allocations.lock().unwrap();
                 let Some(records) = all.get(&owner.identity) else {
@@ -5944,10 +5949,13 @@ pub(crate) mod tests {
                         return Self::INVALID_MEMORY;
                     };
                     if abi.mutable {
-                        if abi.id != output_index || output.is_some() {
+                        if !output_ids.contains(&abi.id)
+                            || outputs.iter().any(|(id, ..)| *id == abi.id)
+                        {
                             return Self::INVALID_MEMORY;
                         }
-                        output = Some((
+                        outputs.push((
+                            abi.id,
                             record,
                             offset,
                             records[record].base,
@@ -5980,9 +5988,9 @@ pub(crate) mod tests {
                     }
                 }
             }
-            let Some((out_record, out_offset, out_base, out_generation)) = output else {
+            if outputs.len() != output_ids.len() {
                 return Self::INVALID_MEMORY;
-            };
+            }
             // Do not give the test evaluator memmove-like alias semantics:
             // generic local kernels have distinct input/output bindings.
             for (abi, pointer) in semantics.buffers.iter().zip(&words) {
@@ -5993,16 +6001,32 @@ pub(crate) mod tests {
                     Some(bytes) => bytes,
                     None => return Self::INVALID_MEMORY,
                 };
-                if *pointer == words[semantics.buffers.iter().position(|x| x.mutable).unwrap()]
-                    && bytes != 0
+                if bytes != 0
+                    && semantics
+                        .buffers
+                        .iter()
+                        .zip(&words)
+                        .any(|(output, output_pointer)| output.mutable && pointer == output_pointer)
                 {
                     return Self::INVALID_MEMORY;
                 }
             }
-            let result = match &semantics.program {
-                crate::ptx::KernelSemanticProgram::UOp(program) => {
-                    crate::kernel::execute_lowered_elementwise(program, &bindings)
-                }
+            let results = match &semantics.program {
+                crate::ptx::KernelSemanticProgram::UOp(program) => match program.operation() {
+                    crate::Operation::Sort(value) => {
+                        let Some(input) = bindings.get(value.input.index() as u64) else {
+                            return Self::INVALID_MEMORY;
+                        };
+                        match crate::portable_sort::PortableSortPair::new(value)
+                            .and_then(|plan| plan.execute(input))
+                        {
+                            Ok((values, indices)) => Ok(vec![values, indices]),
+                            Err(_) => Err(crate::Error::InvalidIndex),
+                        }
+                    }
+                    _ => crate::kernel::execute_lowered_elementwise(program, &bindings)
+                        .map(|value| vec![value]),
+                },
                 crate::ptx::KernelSemanticProgram::Matmul(plan) => {
                     if semantics.buffers.len() != 3
                         || semantics.buffers[0].id != plan.lhs.index() as u64
@@ -6012,6 +6036,7 @@ pub(crate) mod tests {
                         return Self::INVALID_MEMORY;
                     }
                     plan.execute(&values[0], &values[1])
+                        .map(|value| vec![value])
                         .map_err(|_| crate::Error::InvalidIndex)
                 }
                 crate::ptx::KernelSemanticProgram::TiledMatmul(payload) => {
@@ -6025,6 +6050,7 @@ pub(crate) mod tests {
                     }
                     payload
                         .simulate(&values[0], &values[1])
+                        .map(|value| vec![value])
                         .map_err(|_| crate::Error::InvalidIndex)
                 }
                 crate::ptx::KernelSemanticProgram::TensorCoreMatmul(payload) => {
@@ -6038,42 +6064,54 @@ pub(crate) mod tests {
                     }
                     payload
                         .simulate(&values[0], &values[1])
+                        .map(|value| vec![value])
                         .map_err(|_| crate::Error::InvalidIndex)
                 }
             };
-            let Ok(result) = result else {
+            let Ok(results) = results else {
                 return Self::INVALID_MEMORY;
             };
-            let Ok(result_bytes) = result.to_le_bytes() else {
-                return Self::INVALID_MEMORY;
-            };
-            let Some(output_abi) = semantics.buffers.iter().find(|abi| abi.mutable) else {
-                return Self::INVALID_MEMORY;
-            };
-            let Some(expected) = output_abi.elements.checked_mul(output_abi.dtype.itemsize())
-            else {
-                return Self::INVALID_MEMORY;
-            };
-            if result.dtype() != output_abi.dtype || result_bytes.len() != expected {
+            if results.len() != outputs.len() {
                 return Self::INVALID_MEMORY;
             }
             let mut all = self.allocations.lock().unwrap();
             let Some(records) = all.get_mut(&owner.identity) else {
                 return Self::INVALID_MEMORY;
             };
-            let Some(record) = records.get_mut(out_record) else {
-                return Self::INVALID_MEMORY;
-            };
-            if !record.alive || record.base != out_base || record.generation != out_generation {
-                return Self::INVALID_MEMORY;
+            for (result, (id, out_record, out_offset, out_base, out_generation)) in
+                results.into_iter().zip(outputs)
+            {
+                let Some(output_abi) = semantics
+                    .buffers
+                    .iter()
+                    .find(|abi| abi.mutable && abi.id == id)
+                else {
+                    return Self::INVALID_MEMORY;
+                };
+                let Some(expected) = output_abi.elements.checked_mul(output_abi.dtype.itemsize())
+                else {
+                    return Self::INVALID_MEMORY;
+                };
+                let Ok(result_bytes) = result.to_le_bytes() else {
+                    return Self::INVALID_MEMORY;
+                };
+                if result.dtype() != output_abi.dtype || result_bytes.len() != expected {
+                    return Self::INVALID_MEMORY;
+                }
+                let Some(record) = records.get_mut(out_record) else {
+                    return Self::INVALID_MEMORY;
+                };
+                if !record.alive || record.base != out_base || record.generation != out_generation {
+                    return Self::INVALID_MEMORY;
+                }
+                let Some(end) = out_offset.checked_add(result_bytes.len()) else {
+                    return Self::INVALID_MEMORY;
+                };
+                if end > record.bytes {
+                    return Self::INVALID_MEMORY;
+                }
+                record.data[out_offset..end].copy_from_slice(&result_bytes);
             }
-            let Some(end) = out_offset.checked_add(result_bytes.len()) else {
-                return Self::INVALID_MEMORY;
-            };
-            if end > record.bytes {
-                return Self::INVALID_MEMORY;
-            }
-            record.data[out_offset..end].copy_from_slice(&result_bytes);
             CUDA_SUCCESS
         }
         pub(crate) fn calls(&self) -> Vec<&'static str> {

@@ -29,6 +29,7 @@ pub const OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-opencl-portable-f32-matmul-v1";
 pub const OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
     "rustgrad-opencl-portable-prefix-scan-v1";
+pub const OPENCL_PORTABLE_SORT_RENDERER_VERSION: &str = "rustgrad-opencl-portable-sort-v1";
 pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -78,6 +79,14 @@ impl RenderedOpenCl {
                 &portable, bindings,
             )
             .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Sort(value) = root.operation()
+        {
+            crate::portable_sort::PortableSortPair::new(value)
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
         }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(OpenClError::InvalidBinding(
@@ -151,6 +160,9 @@ impl OpenClRenderer {
         if let Operation::PrefixScan(value) = root.operation() {
             return render_portable_prefix_scan(self, root, value);
         }
+        if let Operation::Sort(value) = root.operation() {
+            return render_portable_sort(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -172,10 +184,10 @@ impl OpenClRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::Sort(_) | Operation::TensorGuard(_) | Operation::Threefry(_)
+            Operation::TensorGuard(_) | Operation::Threefry(_)
         ) {
             return Err(OpenClError::Unsupported(
-                "sort pairs, guards, and live Threefry are outside OpenCL lowering".into(),
+                "guards and live Threefry are outside OpenCL lowering".into(),
             ));
         }
         root.validate()
@@ -501,6 +513,114 @@ impl OpenClRenderer {
             ))),
         })
     }
+}
+
+fn render_portable_sort(
+    renderer: &OpenClRenderer,
+    root: &UOp,
+    value: &crate::SortValue,
+) -> Result<RenderedOpenCl, OpenClError> {
+    root.validate()
+        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::portable_sort::PortableSortPair::new(value).map_err(|error| match error {
+            crate::portable_sort::PortableSortError::Unsupported(reason) => {
+                OpenClError::Unsupported(reason.into())
+            }
+            crate::portable_sort::PortableSortError::Overflow => OpenClError::Overflow,
+            other => OpenClError::InvalidBinding(other.to_string()),
+        })?;
+    let elements = portable.elements();
+    let input = OpenClBufferAbi {
+        id: value.input.index() as u64,
+        dtype: value.dtype,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: false,
+        view: None,
+    };
+    let values = OpenClBufferAbi {
+        id: value.values.index() as u64,
+        dtype: value.dtype,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: true,
+        view: None,
+    };
+    let indices = OpenClBufferAbi {
+        id: value.indices.index() as u64,
+        dtype: DType::I32,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input.clone(), values, indices];
+    let scalar_type = cl_type(value.dtype);
+    let padding = match (value.dtype, value.descending) {
+        (DType::Bool, true) => "(uchar)0".into(),
+        (DType::Bool, false) => "(uchar)1".into(),
+        (DType::I32, true) => "as_int(0x80000000u)".into(),
+        (DType::I32, false) => "as_int(0x7fffffffu)".into(),
+        (DType::U32, true) => "0u".into(),
+        (DType::U32, false) => "0xffffffffu".into(),
+        (DType::F32, true) => "as_float(0xff800000u)".into(),
+        (DType::F32, false) => "as_float(0x7f800000u)".into(),
+        _ => unreachable!("portable sort validated storage"),
+    };
+    let entry = format!(
+        "rg_opencl_sort_{:?}_a{}_n{}",
+        value.dtype,
+        value.axis,
+        portable.elements()
+    )
+    .to_ascii_lowercase();
+    let mut lines = vec![
+        "#pragma OPENCL FP_CONTRACT OFF".into(),
+        format!("// {OPENCL_PORTABLE_SORT_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
+        format!("__kernel void {entry}("),
+        format!("    __global const {scalar_type}* b0,"),
+        format!("    __global {scalar_type}* b1,"),
+        "    __global int* b2,".into(),
+        "    ulong extent) {".into(),
+        "  const ulong gid = (ulong)get_global_id(0);".into(),
+        "  if (gid >= extent) return;".into(),
+    ];
+    lines.extend(
+        crate::portable_sort::emit_portable_sort_body(
+            &portable,
+            &crate::portable_sort::CLikePortableSortDialect {
+                scalar_type,
+                padding,
+            },
+        )
+        .map_err(|error| OpenClError::Unsupported(error.to_string()))?,
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        OPENCL_PORTABLE_SORT_RENDERER_VERSION,
+        OPENCL_ABI_VERSION,
+        renderer.local_size,
+        renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedOpenCl {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.launch_extent(),
+        entry,
+        cache_key,
+        required_capabilities: OpenClCapabilities::CORE_32,
+        transaction: None,
+        schedule_inputs: vec![input],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
 }
 
 fn render_portable_prefix_scan(

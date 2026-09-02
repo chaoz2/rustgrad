@@ -22,6 +22,7 @@ pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-f32-matmul-v1";
 pub const METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-prefix-scan-v1";
+pub const METAL_PORTABLE_SORT_RENDERER_VERSION: &str = "rustgrad-metal-portable-sort-v1";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -35,7 +36,8 @@ pub struct MetalBufferAbi {
     pub source_shape: Shape,
     /// Physical source-storage element count.
     pub elements: usize,
-    /// Whether this entry is the unique output pointer.
+    /// Whether this entry is an output pointer. Mutable entries are ordered
+    /// by their scheduled output ordinal.
     pub mutable: bool,
     /// Optional source-backed affine logical mapping.
     pub view: Option<AffineView>,
@@ -48,11 +50,12 @@ pub struct RenderedMetal {
     pub source: String,
     /// UOp expression IDs to one-based generated source lines.
     pub source_map: BTreeMap<usize, usize>,
-    /// Ordered input pointers followed by the output pointer.
+    /// Ordered input pointers followed by the ordered output pointers.
     pub buffers: Vec<MetalBufferAbi>,
     /// Exact launch work-item count supplied as the final scalar ABI value.
     /// This equals the logical output extent for ordinary kernels; a serial
-    /// PrefixScan launches one item per independent `(row, inner)` lane.
+    /// PrefixScan and coupled Sort launch one item per independent
+    /// `(row, inner)` lane.
     pub extent: usize,
     /// Generated MSL entry-point name.
     pub entry: String,
@@ -89,6 +92,14 @@ impl RenderedMetal {
                 &portable, bindings,
             )
             .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Sort(value) = root.operation()
+        {
+            crate::portable_sort::PortableSortPair::new(value)
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
+                .validate_schedule_bindings(bindings)
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
         }
         if bindings.len() != self.schedule_inputs.len() {
             return Err(MetalError::InvalidBinding(
@@ -147,6 +158,9 @@ impl MetalRenderer {
         if let Operation::PrefixScan(value) = root.operation() {
             return render_portable_prefix_scan(self, root, value);
         }
+        if let Operation::Sort(value) = root.operation() {
+            return render_portable_sort(self, root, value);
+        }
         if let Operation::Movement(value) = root.operation() {
             return match value {
                 MovementValue::Plan(plan)
@@ -168,10 +182,10 @@ impl MetalRenderer {
         }
         if matches!(
             root.operation(),
-            Operation::Sort(_) | Operation::TensorGuard(_) | Operation::Threefry(_)
+            Operation::TensorGuard(_) | Operation::Threefry(_)
         ) {
             return Err(MetalError::Unsupported(
-                "sort pairs, guards, and live Threefry are outside Metal lowering".into(),
+                "guards and live Threefry are outside Metal lowering".into(),
             ));
         }
         root.validate()
@@ -438,6 +452,128 @@ impl MetalRenderer {
             ))),
         })
     }
+}
+
+fn render_portable_sort(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    value: &crate::SortValue,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let portable =
+        crate::portable_sort::PortableSortPair::new(value).map_err(|error| match error {
+            crate::portable_sort::PortableSortError::Unsupported(reason) => {
+                MetalError::Unsupported(reason.into())
+            }
+            crate::portable_sort::PortableSortError::Overflow => MetalError::Overflow,
+            other => MetalError::InvalidBinding(other.to_string()),
+        })?;
+    let elements = portable.elements();
+    let input = MetalBufferAbi {
+        id: value.input.index() as u64,
+        dtype: value.dtype,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: false,
+        view: None,
+    };
+    let values = MetalBufferAbi {
+        id: value.values.index() as u64,
+        dtype: value.dtype,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: true,
+        view: None,
+    };
+    let indices = MetalBufferAbi {
+        id: value.indices.index() as u64,
+        dtype: DType::I32,
+        source_shape: value.input_shape.clone(),
+        elements,
+        mutable: true,
+        view: None,
+    };
+    let buffers = vec![input.clone(), values, indices];
+    for buffer in &buffers {
+        let bytes = buffer
+            .elements
+            .checked_mul(buffer.dtype.itemsize())
+            .ok_or(MetalError::Overflow)?;
+        if bytes > renderer.capabilities.max_buffer_length {
+            return Err(MetalError::Unsupported(
+                "portable sort binding exceeds device buffer limit".into(),
+            ));
+        }
+    }
+    let scalar_type = metal_storage_type(value.dtype);
+    let padding = match (value.dtype, value.descending) {
+        (DType::Bool, true) => "(uchar)0".into(),
+        (DType::Bool, false) => "(uchar)1".into(),
+        (DType::I32, true) => "as_type<int>(0x80000000u)".into(),
+        (DType::I32, false) => "as_type<int>(0x7fffffffu)".into(),
+        (DType::U32, true) => "0u".into(),
+        (DType::U32, false) => "0xffffffffu".into(),
+        (DType::F32, true) => "as_type<float>(0xff800000u)".into(),
+        (DType::F32, false) => "as_type<float>(0x7f800000u)".into(),
+        _ => unreachable!("portable sort validated storage"),
+    };
+    let entry = format!(
+        "rg_metal_sort_{:?}_a{}_n{}",
+        value.dtype,
+        value.axis,
+        portable.elements()
+    )
+    .to_ascii_lowercase();
+    let mut lines = vec![
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        "#pragma clang fp contract(off)".into(),
+        format!("// {METAL_PORTABLE_SORT_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        format!("kernel void {entry}("),
+        format!("    device const {scalar_type}* b0 [[buffer(0)]],"),
+        format!("    device {scalar_type}* b1 [[buffer(1)]],"),
+        "    device int* b2 [[buffer(2)]],".into(),
+        "    constant ulong& extent [[buffer(3)]],".into(),
+        "    uint gid32 [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = (ulong)gid32;".into(),
+        "  if (gid >= extent) return;".into(),
+    ];
+    lines.extend(
+        crate::portable_sort::emit_portable_sort_body(
+            &portable,
+            &crate::portable_sort::CLikePortableSortDialect {
+                scalar_type,
+                padding,
+            },
+        )
+        .map_err(|error| MetalError::Unsupported(error.to_string()))?,
+    );
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_PORTABLE_SORT_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.value(),
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.launch_extent(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        schedule_inputs: vec![input],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
 }
 
 fn render_portable_prefix_scan(

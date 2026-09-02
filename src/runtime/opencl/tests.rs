@@ -1,8 +1,161 @@
 use super::renderer::{
     OPENCL_ABI_VERSION, OPENCL_PORTABLE_F32_MATMUL_RENDERER_VERSION,
-    OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION, OPENCL_RAW_COPY_RENDERER_VERSION,
-    OPENCL_RENDERER_VERSION, OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
+    OPENCL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION, OPENCL_PORTABLE_SORT_RENDERER_VERSION,
+    OPENCL_RAW_COPY_RENDERER_VERSION, OPENCL_RENDERER_VERSION,
+    OPENCL_STATIC_POSITION_RENDERER_VERSION, OpenClScalarDialect,
 };
+
+#[test]
+fn portable_sort_opencl_executes_coupled_outputs_and_zero_domain_atomically() {
+    let renderer = OpenClRenderer::default();
+    for dtype in [DType::Bool, DType::I32, DType::U32, DType::F32] {
+        let mut matrix = Graph::new();
+        let input = matrix.input_dtype("x", [2, 3, 2], dtype);
+        let (values, indices) = matrix.sort(input, 1, true).unwrap();
+        let item = crate::schedule_many(&matrix, &[values, indices])
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert_eq!(rendered.extent, 4);
+    }
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F32);
+    let (values_id, indices_id) = graph.sort(input, 1, false).unwrap();
+    let items = crate::schedule_many(&graph, &[values_id, indices_id])
+        .unwrap()
+        .items;
+    assert_eq!(items.len(), 1);
+    let rendered = renderer.render(&items[0].kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(items[0].ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.extent, 2);
+    assert_eq!(rendered.buffers.len(), 3);
+    assert!(
+        rendered
+            .source
+            .contains(OPENCL_PORTABLE_SORT_RENDERER_VERSION)
+    );
+    assert_eq!(
+        rendered
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.mutable)
+            .map(|buffer| buffer.id)
+            .collect::<Vec<_>>(),
+        vec![values_id.index() as u64, indices_id.index() as u64]
+    );
+    let mut swapped = items.clone();
+    let swapped_outputs = crate::ScheduledOutputs::new(vec![
+        swapped[0].outputs.iter().nth(1).unwrap().clone(),
+        swapped[0].outputs.primary().clone(),
+    ])
+    .unwrap();
+    swapped[0].outputs = swapped_outputs;
+    let tamper_mock = Arc::new(MockDispatch::default());
+    let (tamper_context, _) = setup(tamper_mock.clone());
+    let before = tamper_mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(tamper_context.clone(), &swapped, renderer),
+        Err(OpenClError::InvalidBinding(_))
+    ));
+    assert_eq!(tamper_mock.calls(), before);
+    let mut viewed = items.clone();
+    let input_shape = viewed[0].input_bindings[0].desc.shape.clone();
+    viewed[0].input_bindings[0].desc.view = Some(crate::AffineView::identity(input_shape));
+    let view_mock = Arc::new(MockDispatch::default());
+    let (view_context, _) = setup(view_mock.clone());
+    let before = view_mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(view_context.clone(), &viewed, renderer),
+        Err(OpenClError::InvalidBinding(_))
+    ));
+    assert_eq!(view_mock.calls(), before);
+    let input_value = TensorData::from_storage(
+        [2, 3],
+        Storage::F32(vec![-0.0, 0.0, f32::NAN, 3.0, 1.0, 1.0]),
+    )
+    .unwrap();
+    let expected = crate::backend::stable_sort_pair(&input_value, 1, false).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let prefix = PreparedOpenClPrefix::prepare(context, &items, renderer).unwrap();
+    let mut realized = BTreeMap::from([(input.index() as u64, input_value)]);
+    mock.set_launch_failure(-6);
+    assert!(matches!(
+        prefix.execute(&mut realized),
+        Err(OpenClError::Driver {
+            operation: "launch",
+            code: -6
+        })
+    ));
+    assert!(!realized.contains_key(&(values_id.index() as u64)));
+    assert!(!realized.contains_key(&(indices_id.index() as u64)));
+    mock.clear_failures();
+    prefix.execute(&mut realized).unwrap();
+    assert_eq!(
+        realized[&(values_id.index() as u64)].to_le_bytes().unwrap(),
+        expected.0.to_le_bytes().unwrap()
+    );
+    assert_eq!(
+        realized[&(indices_id.index() as u64)]
+            .to_le_bytes()
+            .unwrap(),
+        expected.1.to_le_bytes().unwrap()
+    );
+
+    let mut empty = Graph::new();
+    // Keep the sorted axis populated so Graph::sort publishes the coupled
+    // Sort producer; the leading zero still makes its launch domain empty.
+    let input = empty.input_dtype("x", [0, 2, 3], DType::Bool);
+    let (values_id, indices_id) = empty.sort(input, 1, false).unwrap();
+    let items = crate::schedule_many(&empty, &[values_id, indices_id])
+        .unwrap()
+        .items;
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let before = mock.calls();
+    let prefix = PreparedOpenClPrefix::prepare(context, &items, renderer).unwrap();
+    let after_prepare = mock.calls();
+    let mut missing = BTreeMap::new();
+    assert!(matches!(
+        prefix.execute(&mut missing),
+        Err(OpenClError::InvalidBinding(reason)) if reason.contains("missing prefix input")
+    ));
+    assert!(!missing.contains_key(&(values_id.index() as u64)));
+    assert!(!missing.contains_key(&(indices_id.index() as u64)));
+    assert_eq!(mock.calls(), after_prepare);
+    let mut realized = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([0, 2, 3], Storage::Bool(Vec::new())).unwrap(),
+    )]);
+    prefix.execute(&mut realized).unwrap();
+    assert!(realized[&(values_id.index() as u64)].is_empty());
+    assert!(realized[&(indices_id.index() as u64)].is_empty());
+    assert!(!mock.calls()[before.len()..].iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("queue_create:")
+            || call.starts_with("launch:")
+    }));
+
+    let mut unsupported = Graph::new();
+    let input = unsupported.input_dtype("x", [3], DType::F64);
+    let (values, indices) = unsupported.sort(input, 0, false).unwrap();
+    let item = crate::schedule_many(&unsupported, &[values, indices])
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("Bool/I32/U32/F32")
+    ));
+}
 
 #[test]
 fn portable_prefix_scan_opencl_uses_lane_extent_and_executes_first_match_indices() {
@@ -1209,7 +1362,7 @@ impl Dispatch for MockDispatch {
             None
         };
         let mut bindings = KernelBindings::default();
-        let mut output = None;
+        let mut outputs = Vec::new();
         for (index, abi) in semantics.buffers.iter().enumerate() {
             let Some(Arg::Buffer(raw)) = args.get(index) else {
                 return Err(OpenClError::InvalidBinding(format!(
@@ -1249,7 +1402,7 @@ impl Dispatch for MockDispatch {
                 .insert(&desc, data)
                 .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
             if abi.mutable {
-                output = Some((raw, expected));
+                outputs.push((raw, expected));
             }
         }
         if let Some(transaction) = &semantics.transaction {
@@ -1301,26 +1454,44 @@ impl Dispatch for MockDispatch {
                 return Ok(Self::event(&mut state, owner));
             }
         }
-        let result = match semantics.program.as_ref() {
-            dispatch::KernelSemanticProgram::UOp(program) => {
-                execute_lowered_elementwise(program, &bindings)
-                    .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
-            }
-            dispatch::KernelSemanticProgram::Random(plan) => plan
-                .execute()
-                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?,
+        let results = match semantics.program.as_ref() {
+            dispatch::KernelSemanticProgram::UOp(program) => match program.operation() {
+                crate::Operation::Sort(value) => {
+                    let input = bindings.get(value.input.index() as u64).ok_or_else(|| {
+                        OpenClError::InvalidBinding("sort semantic input absent".into())
+                    })?;
+                    let (values, indices) = crate::portable_sort::PortableSortPair::new(value)
+                        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
+                        .execute(input)
+                        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+                    vec![values, indices]
+                }
+                _ => vec![
+                    execute_lowered_elementwise(program, &bindings)
+                        .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?,
+                ],
+            },
+            dispatch::KernelSemanticProgram::Random(plan) => vec![
+                plan.execute()
+                    .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?,
+            ],
         };
-        let result = result
-            .to_le_bytes()
-            .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
-        let (raw, expected) =
-            output.ok_or_else(|| OpenClError::InvalidBinding("mutable output absent".into()))?;
-        if result.len() != expected {
+        if outputs.is_empty() || results.len() != outputs.len() {
             return Err(OpenClError::InvalidBinding(
-                "semantic output size mismatch".into(),
+                "mutable output ABI mismatch".into(),
             ));
         }
-        state.buffers.get_mut(&(owner, raw.0)).unwrap()[..expected].copy_from_slice(&result);
+        for (result, (raw, expected)) in results.into_iter().zip(outputs) {
+            let result = result
+                .to_le_bytes()
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+            if result.len() != expected {
+                return Err(OpenClError::InvalidBinding(
+                    "semantic output size mismatch".into(),
+                ));
+            }
+            state.buffers.get_mut(&(owner, raw.0)).unwrap()[..expected].copy_from_slice(&result);
+        }
         state.calls.push(format!("launch:{owner}:{global}:{local}"));
         Ok(Self::event(&mut state, owner))
     }
