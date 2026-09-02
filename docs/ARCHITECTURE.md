@@ -1550,6 +1550,18 @@ capture behavior are unchanged. Built-in constant identities use this path to
 avoid entering source matching when no direct constant exists. This is Rust's
 compiled dispatch metadata, not another operation kind or serialized matcher IR.
 
+`rewrite_with_context` runs that same prepared matcher and shared-DAG traversal
+with one caller-owned mutable compiler context. Context is passed only after a
+complete capture candidate succeeds, so failed source/alternative/permutation
+matches cannot expose partial captures; a callback returning `None` advances to
+the next candidate in declaration order. Memoization invokes the callback once
+for one structurally shared UOp, while priority ordering, top-down/bottom-up
+walks, convergence limits, cycle checks, effect rejection, source rebuilding,
+and rewrite traces remain the same as the context-free `rewrite` entry point.
+This is the typed analogue of checked-in tinygrad's context-bearing rangeify,
+validation, and renderer rules. Callback-owned context effects are explicit and
+are not implicitly cloned or rolled back after the callback is invoked.
+
 Validation also binds address semantics to the defining operation:
 `DefineGlobal`, `DefineLocal`, and `DefineRegister` require the matching embedded
 `AddressValue` memory space. `LinearKernel::from_uop` validates the complete
