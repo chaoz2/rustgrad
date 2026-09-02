@@ -4,7 +4,7 @@ use crate::Scalar;
 use crate::nn::{AdaptiveAvgPool2d, Conv2d, Flatten, Linear, ReLU, Sequential};
 use crate::{
     Backend, CpuBackend, DType, Error, Graph, NodeId, Result, Shape, Storage, TensorData,
-    infer_module_cpu,
+    TrainingContext, infer_module_cpu,
 };
 use std::collections::HashMap;
 
@@ -137,6 +137,50 @@ fn pending_mode_effects_commit_batchnorm_buffers_atomically_and_retry() -> Resul
         effects.commit_batchnorm(Vec::new()),
         Err(Error::BatchNormToken { .. })
     ));
+    Ok(())
+}
+
+#[test]
+fn ambient_batchnorm_keeps_state_commit_explicit_atomic_and_retryable() -> Result<()> {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 2, 1e-5, false, true, 0.1)?;
+    let input = graph.input("x", [2, 2]);
+    let training = TrainingContext::training();
+    let forward = norm.forward_ambient(&mut graph, input)?;
+    drop(training);
+    assert_eq!(forward.pending.batchnorm_stat_nodes().len(), 1);
+
+    let mut bindings = norm.input_bindings(&graph)?;
+    bindings.insert(
+        "x".into(),
+        TensorData::new([2, 2], vec![1.0, 2.0, 3.0, 6.0])?,
+    );
+    let stats = forward
+        .pending
+        .batchnorm_stat_nodes()
+        .into_iter()
+        .map(|(mean, variance)| {
+            Ok(RealizedBatchNormStats {
+                mean: CpuBackend.execute(&graph, mean, &bindings)?,
+                variance: CpuBackend.execute(&graph, variance, &bindings)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let before = norm.state_dict()?;
+    assert!(matches!(
+        forward
+            .pending
+            .commit_batchnorm(vec![RealizedBatchNormStats {
+                mean: TensorData::scalar(0.0),
+                variance: stats[0].variance.clone(),
+            }]),
+        Err(Error::BatchNormToken { .. })
+    ));
+    assert_eq!(norm.state_dict()?, before);
+
+    forward.pending.commit_batchnorm(stats)?;
+    assert_ne!(norm.state_dict()?, before);
+    assert_eq!(norm.num_batches_tracked.value()?.scalar_at(0).as_u64(), 1);
     Ok(())
 }
 

@@ -837,11 +837,15 @@ delegates graph composition to each entry, preserving deterministic numeric
 state-path traversal without runtime type-name dispatch. Modules with distinct
 multi-input, multi-output, or explicit-mode lifecycles remain outside this
 container rather than being coerced into a hidden calling convention.
-`nn::ModeSequential` is the separate explicit-mode companion: it stores
+`nn::ModeSequential` is the separate mode-aware companion: it stores
 `ModeModuleForward` entries, admits ordinary stateless leaves through their
 state-free forwarding implementation, and returns output plus the ordered
-pending-effect collection. It deliberately does not make BatchNorm eligible
-for ordinary `Sequential` or invent a global training flag.
+pending-effect collection. `forward_mode` remains the authoritative explicit
+route. The default `forward_ambient` adapter instead reads the scoped,
+thread-local `TrainingContext`, rehearses the complete module composition on a
+cloned graph, and publishes only a successful candidate. BatchNorm running
+statistics remain explicit `PendingModeEffects`; the adapter neither commits
+state nor makes BatchNorm eligible for ordinary `Sequential`.
 `nn::LSTM` is a separate typed stateful composition rather than another
 sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
 `cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus
