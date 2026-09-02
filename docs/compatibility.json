@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:eff07f2fe1fd4edb",
+  "source_fingerprint": "fnv1a64:dc1485444865bd69",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -324,7 +324,7 @@
       "subject": "Pattern matching and deterministic rewriting",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Symbolic and UOp typed deterministic match/rewrite drivers record traces. The UOp driver memoizes a bottom-up shared-DAG walk, revisits replacements to convergence, and rejects cycles or bounded-step exhaustion. Every eligible new pure elementwise scheduled kernel normalizes immediately after lowering and before view extraction, ordered input bindings, dependencies, cache identity, or capture publication; symbolic specialization only changes descriptor geometry, and historical artifact decode/replay retains its encoded UOp structure. UPat supports exact typed operation sets, operation predicates, dtypes, source patterns and named captures. Full tinygrad UPat varargs, predicates and compiler-pattern IR remain."
+        "Acceptance requirement": "Symbolic and UOp typed deterministic match/rewrite drivers record traces. The UOp driver memoizes a bottom-up shared-DAG walk, revisits replacements to convergence, and rejects cycles or bounded-step exhaustion. Every eligible new pure elementwise scheduled kernel normalizes immediately after lowering and before view extraction, ordered input bindings, dependencies, cache identity, or capture publication; symbolic specialization only changes descriptor geometry, and historical artifact decode/replay retains its encoded UOp structure. UPat supports exact typed operation sets and sources, ordered prefix and repeated-source varargs, composable optional-`UType` and full-`Operation` payload predicates, and structurally consistent named captures. Tinygrad's source permutations/alternatives, tag predicates, custom early rejection, and compiled pattern IR remain."
       }
     },
     {

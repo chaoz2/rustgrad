@@ -1303,14 +1303,22 @@ impl Captures {
         self.0.get(name)
     }
 }
+
+#[derive(Clone, Debug)]
+enum SourceConstraint {
+    Exact(Vec<UPat>),
+    Prefix(Vec<UPat>),
+    Each(Box<UPat>),
+}
+
 #[derive(Clone, Debug)]
 pub struct UPat {
     operations: Option<BTreeSet<Operation>>,
     operation_predicate: Option<fn(&Operation) -> bool>,
     ty: Option<UType>,
-    sources: Option<Vec<UPat>>,
+    type_predicates: Vec<fn(Option<UType>) -> bool>,
+    sources: Option<SourceConstraint>,
     name: Option<String>,
-    any: bool,
 }
 impl UPat {
     pub fn any() -> Self {
@@ -1318,35 +1326,53 @@ impl UPat {
             operations: None,
             operation_predicate: None,
             ty: None,
+            type_predicates: vec![],
             sources: None,
             name: None,
-            any: true,
         }
     }
     pub fn op(operation: Operation) -> Self {
         let mut x = Self::any();
         x.operations = Some([operation].into());
-        x.any = false;
         x
     }
     pub fn ops(operations: impl IntoIterator<Item = Operation>) -> Self {
         let mut x = Self::any();
         x.operations = Some(operations.into_iter().collect());
-        x.any = false;
         x
     }
     pub fn operation_predicate(predicate: fn(&Operation) -> bool) -> Self {
         let mut x = Self::any();
         x.operation_predicate = Some(predicate);
-        x.any = false;
         x
     }
     pub fn dtype(mut self, ty: UType) -> Self {
         self.ty = Some(ty);
         self
     }
+    /// Adds a predicate over the complete optional UOp result type. This is
+    /// intentionally a function pointer: patterns remain cloneable,
+    /// deterministic data and cannot retain mutable matching state.
+    pub fn type_predicate(mut self, predicate: fn(Option<UType>) -> bool) -> Self {
+        self.type_predicates.push(predicate);
+        self
+    }
     pub fn sources(mut self, s: Vec<UPat>) -> Self {
-        self.sources = Some(s);
+        self.sources = Some(SourceConstraint::Exact(s));
+        self
+    }
+    /// Matches the ordered source prefix and permits any number of trailing
+    /// sources. The named parent pattern can inspect the complete source list
+    /// in its rewrite callback.
+    pub fn sources_prefix(mut self, prefix: Vec<UPat>) -> Self {
+        self.sources = Some(SourceConstraint::Prefix(prefix));
+        self
+    }
+    /// Applies one pattern to every source, including an empty source list.
+    /// A name on the repeated child therefore requires every source to be the
+    /// same structural UOp, matching ordinary named-capture semantics.
+    pub fn sources_varargs(mut self, pattern: UPat) -> Self {
+        self.sources = Some(SourceConstraint::Each(Box::new(pattern)));
         self
     }
     pub fn named(mut self, name: impl Into<String>) -> Self {
@@ -1358,39 +1384,63 @@ impl UPat {
         self.match_into(node, &mut c).then_some(c)
     }
     fn match_into(&self, n: &UOp, c: &mut Captures) -> bool {
-        if !self.any
-            && (self
-                .operations
-                .as_ref()
-                .is_some_and(|operations| !operations.contains(n.operation()))
-                || self
-                    .operation_predicate
-                    .is_some_and(|predicate| !predicate(n.operation())))
+        if self
+            .operations
+            .as_ref()
+            .is_some_and(|operations| !operations.contains(n.operation()))
+            || self
+                .operation_predicate
+                .is_some_and(|predicate| !predicate(n.operation()))
         {
             return false;
         }
         if self.ty.is_some_and(|x| n.ty() != Some(x)) {
             return false;
         }
-        if let Some(ps) = &self.sources {
-            if ps.len() != n.sources().len() {
+        if self
+            .type_predicates
+            .iter()
+            .any(|predicate| !predicate(n.ty()))
+        {
+            return false;
+        }
+        let mut candidate = c.clone();
+        if let Some(patterns) = &self.sources {
+            let (patterns, exact) = match patterns {
+                SourceConstraint::Exact(patterns) => (patterns.as_slice(), true),
+                SourceConstraint::Prefix(patterns) => (patterns.as_slice(), false),
+                SourceConstraint::Each(pattern) => {
+                    for source in n.sources() {
+                        if !pattern.match_into(source, &mut candidate) {
+                            return false;
+                        }
+                    }
+                    return self.commit_capture(n, c, candidate);
+                }
+            };
+            if (exact && patterns.len() != n.sources().len()) || patterns.len() > n.sources().len()
+            {
                 return false;
             }
-            for (p, s) in ps.iter().zip(n.sources()) {
-                if !p.match_into(s, c) {
+            for (p, s) in patterns.iter().zip(n.sources()) {
+                if !p.match_into(s, &mut candidate) {
                     return false;
                 }
             }
         }
+        self.commit_capture(n, c, candidate)
+    }
+    fn commit_capture(&self, n: &UOp, c: &mut Captures, mut candidate: Captures) -> bool {
         if let Some(name) = &self.name {
-            if let Some(old) = c.0.get(name) {
+            if let Some(old) = candidate.0.get(name) {
                 if old != n {
                     return false;
                 }
             } else {
-                c.0.insert(name.clone(), n.clone());
+                candidate.0.insert(name.clone(), n.clone());
             }
         }
+        *c = candidate;
         true
     }
 }
@@ -1587,16 +1637,49 @@ fn is_sub_operation(operation: &Operation) -> bool {
     )
 }
 
-fn is_graph_unary_operation(operation: &Operation) -> bool {
-    matches!(operation, Operation::GraphUnary(_))
+fn is_foldable_integral_unary_operation(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::GraphUnary(
+            crate::UnaryOp::Neg
+                | crate::UnaryOp::Abs
+                | crate::UnaryOp::Relu
+                | crate::UnaryOp::Step
+                | crate::UnaryOp::Square
+                | crate::UnaryOp::Floor
+                | crate::UnaryOp::Ceil
+                | crate::UnaryOp::Trunc
+                | crate::UnaryOp::Round
+                | crate::UnaryOp::Sign
+                | crate::UnaryOp::IsNan
+                | crate::UnaryOp::IsInf
+                | crate::UnaryOp::IsFinite
+        )
+    )
 }
 
-fn is_graph_binary_operation(operation: &Operation) -> bool {
-    matches!(operation, Operation::GraphBinary(_))
+fn is_foldable_integral_binary_operation(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::GraphBinary(
+            crate::BinaryOp::Add
+                | crate::BinaryOp::Sub
+                | crate::BinaryOp::Mul
+                | crate::BinaryOp::Maximum
+                | crate::BinaryOp::Minimum
+                | crate::BinaryOp::BitAnd
+                | crate::BinaryOp::BitOr
+                | crate::BinaryOp::BitXor
+        )
+    )
 }
 
 fn is_graph_compare_operation(operation: &Operation) -> bool {
     matches!(operation, Operation::GraphCompare(_))
+}
+
+fn is_scalar_integral_type(ty: Option<UType>) -> bool {
+    ty.is_some_and(|ty| ty.lanes == 1 && (ty.scalar.is_integer() || ty.scalar == DType::Bool))
 }
 
 fn exact_storage_carrier(dtype: DType) -> Option<DType> {
@@ -1648,22 +1731,7 @@ fn fold_integral_unary(captures: &Captures, node: &UOp) -> Option<UOp> {
     {
         return None;
     }
-    if !matches!(
-        operation,
-        crate::UnaryOp::Neg
-            | crate::UnaryOp::Abs
-            | crate::UnaryOp::Relu
-            | crate::UnaryOp::Step
-            | crate::UnaryOp::Square
-            | crate::UnaryOp::Floor
-            | crate::UnaryOp::Ceil
-            | crate::UnaryOp::Trunc
-            | crate::UnaryOp::Round
-            | crate::UnaryOp::Sign
-            | crate::UnaryOp::IsNan
-            | crate::UnaryOp::IsInf
-            | crate::UnaryOp::IsFinite
-    ) {
+    if !is_foldable_integral_unary_operation(node.operation()) {
         return None;
     }
     let value = crate::kernel::evaluate_constant_unary(value, dtype, *operation).ok()?;
@@ -1684,17 +1752,7 @@ fn fold_integral_binary(captures: &Captures, node: &UOp) -> Option<UOp> {
     {
         return None;
     }
-    if !matches!(
-        operation,
-        crate::BinaryOp::Add
-            | crate::BinaryOp::Sub
-            | crate::BinaryOp::Mul
-            | crate::BinaryOp::Maximum
-            | crate::BinaryOp::Minimum
-            | crate::BinaryOp::BitAnd
-            | crate::BinaryOp::BitOr
-            | crate::BinaryOp::BitXor
-    ) {
+    if !is_foldable_integral_binary_operation(node.operation()) {
         return None;
     }
     let value =
@@ -1911,15 +1969,28 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "fold-integral-unary",
             priority: 7,
-            pattern: UPat::operation_predicate(is_graph_unary_operation)
-                .sources(vec![UPat::any().named("x")]),
+            pattern: UPat::operation_predicate(is_foldable_integral_unary_operation)
+                .type_predicate(is_scalar_integral_type)
+                .sources(vec![
+                    UPat::any()
+                        .type_predicate(is_scalar_integral_type)
+                        .named("x"),
+                ]),
             apply: fold_integral_unary,
         },
         RewriteRule {
             name: "fold-integral-binary",
             priority: 7,
-            pattern: UPat::operation_predicate(is_graph_binary_operation)
-                .sources(vec![UPat::any().named("lhs"), UPat::any().named("rhs")]),
+            pattern: UPat::operation_predicate(is_foldable_integral_binary_operation)
+                .type_predicate(is_scalar_integral_type)
+                .sources(vec![
+                    UPat::any()
+                        .type_predicate(is_scalar_integral_type)
+                        .named("lhs"),
+                    UPat::any()
+                        .type_predicate(is_scalar_integral_type)
+                        .named("rhs"),
+                ]),
             apply: fold_integral_binary,
         },
         RewriteRule {
