@@ -128,7 +128,19 @@ impl<C> ProjectedExpr<C> {
 }
 
 impl ProjectedExpr<i64> {
-    pub(crate) fn canonicalized(&self) -> Self {
+    /// Canonicalizes one authenticated projected address with its exact
+    /// iteration extent. This is deliberately narrower than general UOp
+    /// algebra: projected indices admit only total core integer operations,
+    /// positive divisors, and a proved in-bounds result.
+    pub(crate) fn canonicalized_for_output(&self, output_elements: usize) -> Self {
+        if output_elements == 0 {
+            self.clone()
+        } else {
+            self.canonicalized_inner(Some(output_elements))
+        }
+    }
+
+    fn canonicalized_inner(&self, output_elements: Option<usize>) -> Self {
         match self {
             Self::Linear | Self::Constant(_) => self.clone(),
             Self::Binary {
@@ -136,8 +148,8 @@ impl ProjectedExpr<i64> {
                 lhs,
                 rhs,
             } => {
-                let lhs = lhs.canonicalized();
-                let rhs = rhs.canonicalized();
+                let mut lhs = lhs.canonicalized_inner(output_elements);
+                let mut rhs = rhs.canonicalized_inner(output_elements);
                 if let (Self::Constant(lhs), Self::Constant(rhs)) = (&lhs, &rhs) {
                     let folded = match operation {
                         Binary::Add => lhs.checked_add(*rhs),
@@ -151,22 +163,156 @@ impl ProjectedExpr<i64> {
                         return Self::Constant(value);
                     }
                 }
+                if let Some(extent) = output_elements.and_then(|extent| i64::try_from(extent).ok())
+                    && extent > 0
+                    && matches!(operation, Binary::FloorDiv | Binary::Mod)
+                    && matches!(&lhs, Self::Linear)
+                    && matches!(&rhs, Self::Constant(value) if *value == extent)
+                {
+                    return if matches!(operation, Binary::FloorDiv) {
+                        Self::Constant(0)
+                    } else {
+                        Self::Linear
+                    };
+                }
                 match (operation, &lhs, &rhs) {
-                    (Binary::Add | Binary::Sub, _, Self::Constant(0)) => lhs,
-                    (Binary::Add, Self::Constant(0), _) => rhs,
+                    (Binary::Add | Binary::Sub, _, Self::Constant(0)) => return lhs,
+                    (Binary::Add, Self::Constant(0), _) => return rhs,
                     (Binary::Mul, _, Self::Constant(1))
-                    | (Binary::FloorDiv, _, Self::Constant(1)) => lhs,
-                    (Binary::Mul, Self::Constant(1), _) => rhs,
+                    | (Binary::FloorDiv, _, Self::Constant(1)) => return lhs,
+                    (Binary::Mul, Self::Constant(1), _) => return rhs,
                     (Binary::Mul, _, Self::Constant(0))
                     | (Binary::Mul, Self::Constant(0), _)
-                    | (Binary::Mod, _, Self::Constant(1)) => Self::Constant(0),
-                    _ => Self::Binary {
-                        operation: *operation,
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(rhs),
-                    },
+                    | (Binary::Mod, _, Self::Constant(1)) => return Self::Constant(0),
+                    _ => {}
+                }
+
+                // tinygrad's active symbolic rules keep repeated division and
+                // remainder chains compact. Positive constant divisors are an
+                // authenticated property of this closed address dialect.
+                if matches!(operation, Binary::Mod)
+                    && let Self::Binary {
+                        operation: Binary::Mod,
+                        lhs: _,
+                        rhs: inner_divisor,
+                    } = &lhs
+                    && inner_divisor.as_ref() == &rhs
+                {
+                    return lhs;
+                }
+                if matches!(operation, Binary::FloorDiv)
+                    && let Self::Binary {
+                        operation: Binary::FloorDiv,
+                        lhs: numerator,
+                        rhs: inner_divisor,
+                    } = &lhs
+                    && let (Self::Constant(inner), Self::Constant(outer)) =
+                        (inner_divisor.as_ref(), &rhs)
+                    && *inner > 0
+                    && *outer > 0
+                    && let Some(divisor) = inner.checked_mul(*outer)
+                {
+                    return if divisor == 1 {
+                        numerator.as_ref().clone()
+                    } else {
+                        Self::Binary {
+                            operation: Binary::FloorDiv,
+                            lhs: numerator.clone(),
+                            rhs: Box::new(Self::Constant(divisor)),
+                        }
+                    };
+                }
+
+                if matches!(operation, Binary::Add)
+                    && let Some(value) = Self::recombined_divmod(&lhs, &rhs)
+                        .or_else(|| Self::recombined_divmod(&rhs, &lhs))
+                {
+                    return value;
+                }
+
+                // Constants have one deterministic position, which exposes
+                // adjacent associative literals to one checked fold without
+                // reordering nonconstant address terms.
+                if matches!(operation, Binary::Add | Binary::Mul)
+                    && matches!(&lhs, Self::Constant(_))
+                    && !matches!(&rhs, Self::Constant(_))
+                {
+                    std::mem::swap(&mut lhs, &mut rhs);
+                }
+                if matches!(operation, Binary::Add | Binary::Mul)
+                    && let Self::Constant(outer) = &rhs
+                    && let Self::Binary {
+                        operation: inner_operation,
+                        lhs: inner_lhs,
+                        rhs: inner_rhs,
+                    } = &lhs
+                    && *inner_operation == *operation
+                    && let Self::Constant(inner) = inner_rhs.as_ref()
+                {
+                    let combined = match operation {
+                        Binary::Add => inner.checked_add(*outer),
+                        Binary::Mul => inner.checked_mul(*outer),
+                        _ => None,
+                    };
+                    if let Some(combined) = combined {
+                        return match (operation, combined) {
+                            (Binary::Add, 0) | (Binary::Mul, 1) => inner_lhs.as_ref().clone(),
+                            (Binary::Mul, 0) => Self::Constant(0),
+                            _ => Self::Binary {
+                                operation: *operation,
+                                lhs: inner_lhs.clone(),
+                                rhs: Box::new(Self::Constant(combined)),
+                            },
+                        };
+                    }
+                }
+
+                Self::Binary {
+                    operation: *operation,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
                 }
             }
+        }
+    }
+
+    fn recombined_divmod(product: &Self, remainder: &Self) -> Option<Self> {
+        let Self::Binary {
+            operation: Binary::Mod,
+            lhs: remainder_numerator,
+            rhs: remainder_divisor,
+        } = remainder
+        else {
+            return None;
+        };
+        let Self::Binary {
+            operation: Binary::Mul,
+            lhs,
+            rhs,
+        } = product
+        else {
+            return None;
+        };
+        let quotient = [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())]
+            .into_iter()
+            .find_map(|(quotient, multiplier)| {
+                let Self::Binary {
+                    operation: Binary::FloorDiv,
+                    lhs: numerator,
+                    rhs: divisor,
+                } = quotient
+                else {
+                    return None;
+                };
+                (multiplier == divisor.as_ref()).then_some((numerator.as_ref(), divisor.as_ref()))
+            })?;
+        if matches!(quotient.1, Self::Constant(divisor) if *divisor > 0)
+            && quotient.0 == remainder_numerator.as_ref()
+            && quotient.1 == remainder_divisor.as_ref()
+        {
+            Some(quotient.0.clone())
+        } else {
+            None
         }
     }
 
@@ -300,6 +446,15 @@ impl ProjectedIndexPlan {
 
     pub(crate) fn fits_i32(&self) -> bool {
         self.fits_i32
+    }
+
+    /// Returns the canonical address under this plan's authenticated output
+    /// extent. Schema authentication and schedule normalization must use the
+    /// same extent-aware form so specialization cannot disagree with the
+    /// canonical template while preserving identical lane addresses.
+    pub(crate) fn canonical_expression(&self) -> ProjectedExpr<i64> {
+        self.expression
+            .canonicalized_for_output(self.output_elements)
     }
 
     pub(crate) fn emit<E: ProjectedIndexEmitter>(
@@ -661,5 +816,133 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn canonicalizes_authenticated_divmod_and_associative_index_algebra() {
+        let linear = ProjectedExpr::Linear;
+        let four = ProjectedExpr::Constant(4);
+        let quotient =
+            ProjectedExpr::binary(Binary::FloorDiv, linear.clone(), four.clone()).unwrap();
+        let product = ProjectedExpr::binary(Binary::Mul, four.clone(), quotient).unwrap();
+        let remainder = ProjectedExpr::binary(Binary::Mod, linear.clone(), four.clone()).unwrap();
+        let reconstructed = ProjectedExpr::binary(Binary::Add, remainder, product).unwrap();
+        let canonical_reconstruction = reconstructed.canonicalized_for_output(8);
+        assert_eq!(canonical_reconstruction, linear);
+        let raw_plan = ProjectedIndexPlan::from_index(&index(
+            Shape::from([8]),
+            Shape::from([8]),
+            reconstructed.to_uop(8).unwrap(),
+        ))
+        .unwrap();
+        let canonical_plan = ProjectedIndexPlan::from_index(&index(
+            Shape::from([8]),
+            Shape::from([8]),
+            canonical_reconstruction.to_uop(8).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            (0..8)
+                .map(|lane| raw_plan.offset(lane).unwrap())
+                .collect::<Vec<_>>(),
+            (0..8)
+                .map(|lane| canonical_plan.offset(lane).unwrap())
+                .collect::<Vec<_>>()
+        );
+
+        let reverse = ProjectedExpr::binary(
+            Binary::Sub,
+            ProjectedExpr::Constant(7),
+            ProjectedExpr::binary(
+                Binary::Mul,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let reverse_plan = ProjectedIndexPlan::from_index(&index(
+            Shape::from([8]),
+            Shape::from([8]),
+            reverse.canonicalized_for_output(8).to_uop(8).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            (0..8)
+                .map(|lane| reverse_plan.offset(lane).unwrap())
+                .collect::<Vec<_>>(),
+            (0..8_usize).rev().collect::<Vec<_>>()
+        );
+
+        let nested_division = ProjectedExpr::binary(
+            Binary::FloorDiv,
+            ProjectedExpr::binary(Binary::FloorDiv, ProjectedExpr::Linear, four.clone()).unwrap(),
+            ProjectedExpr::Constant(2),
+        )
+        .unwrap();
+        assert_eq!(
+            nested_division.canonicalized_for_output(16),
+            ProjectedExpr::binary(
+                Binary::FloorDiv,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(8),
+            )
+            .unwrap()
+        );
+
+        let nested_remainder = ProjectedExpr::binary(
+            Binary::Mod,
+            ProjectedExpr::binary(Binary::Mod, ProjectedExpr::Linear, four.clone()).unwrap(),
+            four,
+        )
+        .unwrap();
+        assert_eq!(
+            nested_remainder.canonicalized_for_output(8),
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(4),
+            )
+            .unwrap()
+        );
+
+        let constants = ProjectedExpr::binary(
+            Binary::Add,
+            ProjectedExpr::binary(
+                Binary::Add,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(1),
+            )
+            .unwrap(),
+            ProjectedExpr::Constant(2),
+        )
+        .unwrap();
+        assert_eq!(
+            constants.canonicalized_for_output(4),
+            ProjectedExpr::binary(
+                Binary::Add,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(3),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(8),
+            )
+            .unwrap()
+            .canonicalized_for_output(8),
+            ProjectedExpr::Linear
+        );
+
+        let empty_marker = ProjectedExpr::binary(
+            Binary::Mul,
+            ProjectedExpr::Linear,
+            ProjectedExpr::Constant(0),
+        )
+        .unwrap();
+        assert_eq!(empty_marker.canonicalized_for_output(0), empty_marker);
     }
 }

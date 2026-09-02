@@ -1164,6 +1164,109 @@ fn artifact_decode_preserves_historical_unnormalized_uops() {
 }
 
 #[test]
+fn projected_index_normalization_is_checked_and_decode_remains_literal() {
+    let range = UOp::from_operation(
+        Operation::Range(0),
+        Some(i64t()),
+        vec![UOp::constant(8, i64t())],
+    );
+    let divisor = UOp::constant(4, i64t());
+    let quotient = UOp::binary(Binary::FloorDiv, range.clone(), divisor.clone());
+    let product = UOp::binary(Binary::Mul, divisor.clone(), quotient);
+    let remainder = UOp::binary(Binary::Mod, range.clone(), divisor);
+    let expression = UOp::binary(Binary::Add, remainder, product);
+    let address = UOp::from_operation(
+        Operation::DefineGlobal(AddressValue {
+            space: crate::AddressSpace::Global,
+            name: "b7".into(),
+            element: f32t(),
+        }),
+        Some(f32t()),
+        vec![],
+    );
+    let index = UOp::from_operation(
+        Operation::Index(IndexValue::Buffer {
+            buffer: 7,
+            elements: 8,
+            input_shape: Shape::from([8]),
+            output_shape: Shape::from([8]),
+            addressing: crate::IndexAddressing::Projected,
+        }),
+        Some(f32t()),
+        vec![address, expression],
+    );
+    let root = UOp::sink(vec![
+        UOp::from_operation(Operation::Load, Some(f32t()), vec![index]),
+        UOp::from_operation(Operation::EndRange, None, vec![range]),
+    ]);
+    root.validate().unwrap();
+
+    // Standalone RGUA decode is literal and byte-stable; normalization is an
+    // explicit live-compilation phase rather than an artifact migration.
+    let bytes = uop::artifact::encode(&root).unwrap();
+    let decoded = uop::artifact::decode(&bytes).unwrap();
+    assert_eq!(uop::artifact::encode(&decoded).unwrap(), bytes);
+    assert_eq!(decoded, root);
+
+    let normalized = uop::normalize_kernel(&decoded).unwrap();
+    normalized.validate().unwrap();
+    let canonical = normalized
+        .topological()
+        .unwrap()
+        .into_iter()
+        .find(crate::projected_index::ProjectedIndexPlan::is_projected)
+        .unwrap();
+    let plan = crate::projected_index::ProjectedIndexPlan::from_index(&canonical).unwrap();
+    assert_eq!(
+        plan.expression,
+        crate::projected_index::ProjectedExpr::Linear
+    );
+    assert_ne!(normalized, decoded);
+    assert_eq!(uop::artifact::encode(&decoded).unwrap(), bytes);
+
+    // The addressless zero-domain marker must remain a Range expression: a
+    // plain constant address is not an authenticated empty projection.
+    let empty_range = UOp::from_operation(
+        Operation::Range(0),
+        Some(i64t()),
+        vec![UOp::constant(0, i64t())],
+    );
+    let empty_expression = UOp::binary(Binary::Mul, empty_range.clone(), UOp::constant(0, i64t()));
+    let empty_address = UOp::from_operation(
+        Operation::DefineGlobal(AddressValue {
+            space: crate::AddressSpace::Global,
+            name: "b8".into(),
+            element: f32t(),
+        }),
+        Some(f32t()),
+        vec![],
+    );
+    let empty_index = UOp::from_operation(
+        Operation::Index(IndexValue::Buffer {
+            buffer: 8,
+            elements: 0,
+            input_shape: Shape::from([0]),
+            output_shape: Shape::from([0]),
+            addressing: crate::IndexAddressing::Projected,
+        }),
+        Some(f32t()),
+        vec![empty_address, empty_expression.clone()],
+    );
+    let empty_root = UOp::sink(vec![
+        UOp::from_operation(Operation::Load, Some(f32t()), vec![empty_index]),
+        UOp::from_operation(Operation::EndRange, None, vec![empty_range]),
+    ]);
+    let empty_normalized = uop::normalize_kernel(&empty_root).unwrap();
+    let empty = empty_normalized
+        .topological()
+        .unwrap()
+        .into_iter()
+        .find(crate::projected_index::ProjectedIndexPlan::is_projected)
+        .unwrap();
+    assert_eq!(empty.sources()[1], empty_expression);
+}
+
+#[test]
 fn raw_scalar_identity_rewrite_is_type_checked_and_preserves_signed_zero() {
     let x = UOp::scalar_constant(DType::I32, 3, i32t());
     let positive_zero = UOp::scalar_constant(DType::I32, 0, i32t());

@@ -1992,16 +1992,23 @@ Historical Buffer indices decode as `IndexAddressing::Broadcast`. One
 `ProjectedIndexPlan` authenticates the exact source/output descriptors, byte
 extents, bounded expression depth, positive divisors, and all-domain source
 bounds; the interpreter and C11, PTX, OpenCL, Metal, and WGSL renderers consume
-that plan through one scalar emitter dialect. Projected addressing is valid only
-as a `Load` index; output Stores remain dense Broadcast indices, and portable
+that plan through one scalar emitter dialect. Before schedule identity or
+renderer input is published, one UPat rule reparses and revalidates the complete
+projected Index while canonicalizing only its closed integer algebra: neutral
+terms and constants, repeated positive division/remainder, exact quotient plus
+remainder reconstruction, and the output Range's own bound. The same pass runs
+inside reduction kernels, while zero-output addressless Range markers remain
+literal. Projected addressing is valid only as a
+`Load` index; output Stores remain dense Broadcast indices, and portable
 lane/vector planning stays fail-closed rather than discarding the address tree.
 This removes only the avoidable view copy: the computed producer remains an
 owned dependency and the consumer retains a fresh dense output. RGUA v21 is the
 first envelope that admits the typed projected-address declaration;
-older operation bytes and schedule keys remain pinned. Dynamic/symbolic shapes,
-effects and guarded fault transactions, unsupported index operations, excessive
-backend address width/depth, and specialized dense-operand kernels remain
-explicit boundaries rather than hidden host materializations.
+older decoded operation bytes remain literal and pinned. Newly compiled
+projected schedule/cache identities use the canonical tree. Dynamic/symbolic
+shapes, effects and guarded fault transactions, unsupported index operations,
+excessive backend address width/depth, and specialized dense-operand kernels
+remain explicit boundaries rather than hidden host materializations.
 
 ## Static-graph autograd lifecycle
 

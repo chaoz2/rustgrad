@@ -136,10 +136,12 @@ impl SymbolicProjectedIndexMap {
         environment: &BTreeMap<SymbolicVar, i64>,
     ) -> Result<crate::UOp, ReplayError> {
         let output = bind_shape(&self.output_shape, environment)?;
+        let output_elements = output.numel().map_err(|_| {
+            ReplayError::Symbolic("symbolic projected output extent overflows".into())
+        })?;
         self.specialize_expression(environment)?
-            .to_uop(output.numel().map_err(|_| {
-                ReplayError::Symbolic("symbolic projected output extent overflows".into())
-            })?)
+            .canonicalized_for_output(output_elements)
+            .to_uop(output_elements)
             .map_err(|error| ReplayError::Symbolic(error.to_string()))
     }
 
@@ -175,8 +177,10 @@ impl SymbolicProjectedIndexMap {
                 .max
                 == 0);
         }
-        Ok(concrete.expression.canonicalized()
-            == self.specialize_expression(environment)?.canonicalized())
+        Ok(concrete.canonical_expression()
+            == self
+                .specialize_expression(environment)?
+                .canonicalized_for_output(concrete.output_elements))
     }
 
     pub(crate) fn render<E: ProjectedIndexEmitter<SymbolicExpr>>(
@@ -783,4 +787,59 @@ fn evaluate(
     expression
         .evaluate(&projected)
         .map_err(|error| ReplayError::Symbolic(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_matching_uses_the_authenticated_output_extent_canonical_form() {
+        let expression = binary(
+            Binary::Mod,
+            ProjectedExpr::Linear,
+            constant(SymbolicExpr::constant(8)),
+        )
+        .unwrap();
+        let map = SymbolicProjectedIndexMap {
+            source_shape: SymbolicShape::new(vec![8usize.into()]),
+            output_shape: SymbolicShape::new(vec![8usize.into()]),
+            expression,
+        };
+        let ty = crate::UType::scalar(crate::DType::F32);
+        let address = crate::UOp::from_operation(
+            crate::Operation::DefineGlobal(crate::AddressValue {
+                space: crate::AddressSpace::Global,
+                name: "b7".into(),
+                element: ty,
+            }),
+            Some(ty),
+            vec![],
+        );
+        let index = crate::UOp::from_operation(
+            crate::Operation::Index(crate::IndexValue::Buffer {
+                buffer: 7,
+                elements: 8,
+                input_shape: Shape::from([8]),
+                output_shape: Shape::from([8]),
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(ty),
+            vec![address, ProjectedExpr::Linear.to_uop(8).unwrap()],
+        );
+
+        let environment = BTreeMap::new();
+        assert!(map.matches_template(&index, &environment).unwrap());
+        let specialized = map.specialize_uop(&environment).unwrap();
+        assert_eq!(
+            ProjectedIndexPlan::from_index(&crate::UOp::from_operation(
+                index.operation().clone(),
+                index.ty(),
+                vec![index.sources()[0].clone(), specialized],
+            ))
+            .unwrap()
+            .expression,
+            ProjectedExpr::Linear
+        );
+    }
 }

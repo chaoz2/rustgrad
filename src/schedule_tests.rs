@@ -1275,6 +1275,25 @@ fn scalar_alias_fusion_shares_one_affine_map_and_rejects_two_maps() {
 
 #[test]
 fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
+    fn assert_projected_indices_are_canonical(item: &crate::ScheduleItem) {
+        let projected = item
+            .kernel
+            .topological()
+            .unwrap()
+            .into_iter()
+            .filter(crate::projected_index::ProjectedIndexPlan::is_projected)
+            .collect::<Vec<_>>();
+        assert!(!projected.is_empty());
+        for index in projected {
+            let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).unwrap();
+            assert_eq!(
+                plan.expression,
+                plan.expression
+                    .canonicalized_for_output(plan.output_elements)
+            );
+        }
+    }
+
     fn graph_with_projected_view() -> (Graph, crate::NodeId, crate::NodeId, crate::NodeId) {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [1, 2, 2, 2], DType::F32);
@@ -1298,6 +1317,33 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .iter()
         .find(|item| item.node == output)
         .unwrap();
+    assert_projected_indices_are_canonical(output_item);
+    let output_range = UOp::from_operation(
+        crate::Operation::Range(0),
+        Some(crate::UType::scalar(DType::I64)),
+        vec![UOp::constant(8, crate::UType::scalar(DType::I64))],
+    );
+    let raw_projection = crate::rangeify::projected_view(
+        &elementwise,
+        reshaped,
+        elementwise.shape(output).unwrap(),
+        &output_range,
+    )
+    .unwrap();
+    let canonical_projection = output_item
+        .kernel
+        .topological()
+        .unwrap()
+        .into_iter()
+        .find(crate::projected_index::ProjectedIndexPlan::is_projected)
+        .unwrap();
+    assert!(
+        raw_projection.expression.topological().unwrap().len()
+            > canonical_projection.sources()[1]
+                .topological()
+                .unwrap()
+                .len()
+    );
     assert_eq!(output_item.dependencies, vec![producer_item.id]);
     assert_eq!(
         output_item
@@ -1316,6 +1362,7 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .iter()
         .find(|item| item.node == reshaped)
         .unwrap();
+    assert_projected_indices_are_canonical(requested_view);
     assert!(
         requested_view
             .kernel
@@ -1341,6 +1388,7 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .iter()
         .find(|item| item.node == direct_view)
         .unwrap();
+    assert_projected_indices_are_canonical(direct_view_item);
     assert!(
         direct_view_item
             .kernel
@@ -1524,6 +1572,7 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .iter()
         .find(|item| item.node == same_output)
         .unwrap();
+    assert_projected_indices_are_canonical(same_item);
     assert!(
         same_schedule
             .items
@@ -1613,6 +1662,7 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .iter()
         .find(|item| item.node == reduced)
         .unwrap();
+    assert_projected_indices_are_canonical(reduced_item);
     assert!(
         reduced_schedule
             .items
