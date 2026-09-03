@@ -1015,6 +1015,38 @@ composition, not a tokenizer, vocabulary workflow, pretrained-checkpoint
 translator/loader, span decoder, optimizer/trainer, downloaded checkpoint
 differential, dynamic-shape implementation, fused kernel, or live-device
 claim.
+`nn::EfficientNet` and `nn::MBConvBlock` are a separate source-shaped static
+image-model composition. Nonnegative configuration numbers select the checked
+B0--B8/L2 width/depth pairs, `-1` and `-2` select the source's compact block
+tables, and every other negative number retains B0 width/depth with the default
+block table, matching the checked-in fallback. Construction retains source width/depth rounding,
+repeat expansion, stride-specific asymmetric padding, depthwise groups,
+squeeze/excitation, shape-equal residuals, and stem/block/head/global-pool
+order. State traversal uses the source `_conv_stem`, `_bn0`, `_blocks.{i}`,
+`_conv_head`, `_bn1`, `_fc`, and `_fc_bias` paths, including BatchNorm's source
+declaration order. The classifier retains the source `[features,classes]`
+weight and delegates to typed `Graph::linear`, rather than publishing raw
+Matmul.
+
+`MBConvBlockConfig` separately exposes the source kernel, stride, expansion,
+input/output-filter, squeeze ratio, SE, and running-stat controls. Its public
+constructor uses the same whole-state preparation and source names as blocks
+owned by a model. Rust static controls require positive kernel/stride/channel
+geometry; a combination whose checked source padding would be negative fails
+before state publication rather than being narrowed into the unsigned Conv2d
+adapter.
+
+The constructor first validates and prepares the complete descriptor and every
+Glorot tensor through the shared `nn::init` seed cursor, then publishes host
+`Parameter` identities infallibly. Its explicit seed is the established Rust
+graph-independent module contract, not tinygrad's ambient tensor-RNG identity.
+Forward itself is random-free. Explicit and scoped ambient mode share one
+clone-rehearsed lowering and return BatchNorm updates as one source-ordered
+`PendingModeEffects` transaction; neither route mutates running state. Static
+CPU/captured-interpreter output, input VJP, empty batch, and malformed geometry
+are acceptance boundaries. The source pretrained downloader, PyTorch key
+translation, downloaded-checkpoint differential, dynamic geometry, fused or
+live-device execution, and whole training pipeline remain outside this module.
 `nn::LSTM` is a separate typed stateful composition rather than another
 sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
 `cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus

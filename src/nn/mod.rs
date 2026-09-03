@@ -11,6 +11,7 @@ mod bert_model;
 mod bert_pretraining;
 mod bert_qa;
 mod conv;
+mod efficientnet;
 mod embedding;
 mod init;
 mod linear;
@@ -36,6 +37,7 @@ pub use bert_pretraining::{
 };
 pub use bert_qa::BertForQuestionAnswering;
 pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
+pub use efficientnet::{EfficientNet, EfficientNetConfig, MBConvBlock, MBConvBlockConfig};
 pub use embedding::Embedding;
 pub use linear::Linear;
 pub use log_softmax::LogSoftmax;
