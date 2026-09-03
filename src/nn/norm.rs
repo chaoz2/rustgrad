@@ -365,6 +365,31 @@ impl Module for BatchNorm {
     }
 }
 
+/// Visits BatchNorm state in checked-in tinygrad declaration order.
+pub(super) fn visit_source_batch_norm(
+    norm: &BatchNorm,
+    prefix: &str,
+    visitor: &mut dyn FnMut(String, &Parameter, StateKind),
+) {
+    if let Some(weight) = &norm.weight {
+        visitor(join(prefix, "weight"), weight, StateKind::Parameter);
+    }
+    if let Some(bias) = &norm.bias {
+        visitor(join(prefix, "bias"), bias, StateKind::Parameter);
+    }
+    visitor(
+        join(prefix, "num_batches_tracked"),
+        &norm.num_batches_tracked,
+        StateKind::Buffer,
+    );
+    if let Some(mean) = &norm.running_mean {
+        visitor(join(prefix, "running_mean"), mean, StateKind::Buffer);
+    }
+    if let Some(variance) = &norm.running_var {
+        visitor(join(prefix, "running_var"), variance, StateKind::Buffer);
+    }
+}
+
 impl ModeModuleForward for BatchNorm {
     fn forward_mode<'a>(
         &'a self,

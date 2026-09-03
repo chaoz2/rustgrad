@@ -192,15 +192,16 @@ pub use movement_plan::{
     MovementPlanError,
 };
 pub use nn::{
-    ActivationFn, AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool1d, BatchNorm, BatchNorm2d,
-    BatchNorm3d, BatchNormOutput, BertEmbeddings, BertEncoder, BertEncoderLayer,
-    BertEncoderLayerConfig, BertForQuestionAnswering, BertModel, BertModelConfig, CastPolicy,
-    ConvTranspose1d, ConvTranspose2d, EfficientNet, EfficientNetConfig, Flatten, GroupNorm,
-    InstanceNorm, LiveStateDict, LoadReport, MBConvBlock, MBConvBlockConfig, MaxPool1d, Mode,
-    ModeForwardOutput, ModeModuleForward, ModeSequential, Module, ModuleForward, Parameter,
-    ParameterId, ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU,
-    RealizedBatchNormStats, StateDict as ModuleStateDict, StrictStateLoadLimits, TransformerBlock,
-    get_parameters, get_state_dict,
+    ActivationFn, AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool1d, BasicBlock, BasicBlockConfig,
+    BatchNorm, BatchNorm2d, BatchNorm3d, BatchNormOutput, BertEmbeddings, BertEncoder,
+    BertEncoderLayer, BertEncoderLayerConfig, BertForQuestionAnswering, BertModel, BertModelConfig,
+    Bottleneck, BottleneckConfig, CastPolicy, ConvTranspose1d, ConvTranspose2d, EfficientNet,
+    EfficientNetConfig, Flatten, GroupNorm, InstanceNorm, LiveStateDict, LoadReport, MBConvBlock,
+    MBConvBlockConfig, MaxPool1d, Mode, ModeForwardOutput, ModeModuleForward, ModeSequential,
+    Module, ModuleForward, Parameter, ParameterId, ParameterSnapshot, PendingBatchNormStats,
+    PendingModeEffects, ReLU, RealizedBatchNormStats, ResNet, ResNetBlock, ResNetConfig,
+    ResNetDepth, ResNetForwardOutput, ResNetOutput, StateDict as ModuleStateDict,
+    StrictStateLoadLimits, TransformerBlock, get_parameters, get_state_dict,
 };
 pub use onnx::{
     NativeOnnxInferenceResult, NativeOnnxInferenceTrace, OnnxModel, import_onnx,

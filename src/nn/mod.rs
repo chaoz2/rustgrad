@@ -22,6 +22,7 @@ mod parameter;
 mod pool;
 mod recurrent;
 mod regularization;
+mod resnet;
 mod sequential;
 mod shape;
 mod softmax;
@@ -53,6 +54,10 @@ pub use pool::{
 };
 pub use recurrent::{LSTM, LSTMCell, LSTMOutput, LSTMState};
 pub use regularization::{Dropout, ModeDropout};
+pub use resnet::{
+    BasicBlock, BasicBlockConfig, Bottleneck, BottleneckConfig, ResNet, ResNetBlock, ResNetConfig,
+    ResNetDepth, ResNetForwardOutput, ResNetOutput,
+};
 pub use sequential::{ModeSequential, Sequential};
 pub use shape::Flatten;
 pub use softmax::Softmax;

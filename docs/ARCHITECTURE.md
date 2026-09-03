@@ -1058,6 +1058,28 @@ CPU/captured-interpreter output, input VJP, empty batch, and malformed geometry
 are acceptance boundaries. The source pretrained downloader, PyTorch key
 translation, downloaded-checkpoint differential, dynamic geometry, fused or
 live-device execution, and whole training pipeline remain outside this module.
+`nn::ResNet` is the matching checked-in static ResNet image-model family. A
+typed depth selects the exact BasicBlock layouts for 18/34 or Bottleneck
+layouts for 50/101/152; grouped width also covers the source ResNeXt-50 32x4d
+configuration, and `stride_in_1x1` preserves the original versus v1.5 stride
+placement. Classifier models return logits after spatial mean, explicit F32
+cast, and source `Linear`; feature-only models return the four stage outputs in
+source order. State traversal retains `conv1`, `bn1`, `layer{1..4}.{i}`,
+`downsample.{0,1}`, and `fc` paths and the classifier's `[classes,features]`
+stored orientation.
+
+Construction validates and prepares every source-uniform host tensor with the
+shared explicit-seed initializer cursor before parameter publication. Forward
+is clone-rehearsed, accepts nonfloating image inputs through normal convolution
+promotion, and returns source-ordered BatchNorm effects without committing
+them. Static CPU logits and VJP construction cover both retained-stat and
+stateless BatchNorm. All five depth descriptors, both bottleneck stride
+placements, grouped width, feature-only ordering, empty batch, and malformed
+atomicity are acceptance boundaries. Full-model scheduling and
+captured-interpreter execution of the composed convolution reduction/view
+chain, pretrained download/PyTorch key translation, downloaded-model
+differential, dynamic shapes, fused/live-device execution, and an image
+preprocessing or training pipeline remain outside this module.
 `nn::LSTM` is a separate typed stateful composition rather than another
 sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
 `cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus
