@@ -151,13 +151,14 @@ pub struct CapturedStatefulInference {
 }
 
 /// Resource-free authenticated capture whose fixed F32 state is updated one
-/// complete row at a time through a host-validated monotonic I32 index.
+/// complete row at a time through an authenticated monotonic I32 position.
 #[derive(Clone, Debug)]
 pub struct CapturedAppendStateInference {
     inference: CapturedInference,
     public_output_count: usize,
     states: Vec<CapturedInferenceAppendState>,
     initial_state: BTreeMap<String, TensorData>,
+    sealed_position: Option<ReplayInput>,
     identity: u64,
 }
 
@@ -1022,8 +1023,82 @@ impl CapturedAppendStateInference {
             public_output_count: requested.len(),
             states,
             initial_state,
+            sealed_position: None,
             identity,
         })
+    }
+
+    /// Converts the already-authenticated shared append position into a private
+    /// runtime control. This consumes the capture so callers cannot retain an
+    /// unsealed transient schema beside the sealed policy.
+    pub(crate) fn seal_committed_position(
+        mut self,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        if self.sealed_position.is_some() {
+            return Err(CapturedInferenceError::Binding(
+                "append position is already sealed".into(),
+            ));
+        }
+        let Some(position) = self.states.first().map(|state| state.position.clone()) else {
+            return Err(CapturedInferenceError::Binding(
+                "append position cannot be sealed without state".into(),
+            ));
+        };
+        if self.states.iter().any(|state| state.position != position)
+            || self
+                .inference
+                .capture
+                .inputs
+                .iter()
+                .filter(|input| *input == &position)
+                .count()
+                != 1
+            || position.desc.shape.dims() != [1]
+            || position.desc.dtype != DType::I32
+            || position.desc.bytes != DType::I32.itemsize()
+            || position.desc.alignment != DType::I32.itemsize()
+            || !position.desc.read_only
+            || self
+                .inference
+                .resident_bindings
+                .contains_key(&position.name)
+            || self
+                .inference
+                .capture
+                .requested
+                .contains(&(position.node.index() as u64))
+            || self
+                .inference
+                .capture
+                .requested_passthroughs
+                .iter()
+                .any(|alias| alias.source == position.node)
+        {
+            return Err(CapturedInferenceError::Binding(
+                "sealed append position is not one shared dense I32 graph input".into(),
+            ));
+        }
+        let matches = self
+            .inference
+            .transient_inputs
+            .iter()
+            .filter(|input| *input == &position)
+            .count();
+        if matches != 1 {
+            return Err(CapturedInferenceError::Binding(
+                "sealed append position is not one exact transient".into(),
+            ));
+        }
+        self.inference
+            .transient_inputs
+            .retain(|input| input != &position);
+        let mut hasher = DefaultHasher::new();
+        "rustgrad-captured-append-state-inference-v3-sealed-position".hash(&mut hasher);
+        self.identity.hash(&mut hasher);
+        position.hash(&mut hasher);
+        self.identity = hasher.finish();
+        self.sealed_position = Some(position);
+        Ok(self)
     }
 
     pub const fn deployment_identity(&self) -> u64 {
@@ -1065,6 +1140,7 @@ impl CapturedAppendStateInference {
         usize,
         Vec<CapturedInferenceAppendState>,
         BTreeMap<String, TensorData>,
+        Option<ReplayInput>,
         u64,
     ) {
         (
@@ -1072,6 +1148,7 @@ impl CapturedAppendStateInference {
             self.public_output_count,
             self.states,
             self.initial_state,
+            self.sealed_position,
             self.identity,
         )
     }
@@ -1946,6 +2023,63 @@ mod tests {
             .unwrap();
         assert_eq!(index_owner.consumers, [append_owner.id]);
         assert!(append_owner.dependencies.contains(&index_owner.id));
+        assert!(capture.states[0].position.desc.view.is_some());
+        assert_eq!(
+            capture
+                .capture()
+                .inputs
+                .iter()
+                .filter(|input| *input == &capture.states[0].position)
+                .count(),
+            1
+        );
+        let sealed = capture.clone().seal_committed_position().unwrap();
+        assert_eq!(sealed.transient_inputs().len(), 1);
+        assert_eq!(sealed.transient_inputs()[0].node, update_source);
+        assert_eq!(sealed.sealed_position.as_ref().unwrap().node, position);
+        assert_eq!(sealed.capture().identity, capture.capture().identity);
+        assert_ne!(sealed.deployment_identity(), capture.deployment_identity());
+        assert!(matches!(
+            sealed.clone().seal_committed_position(),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        let mut forged = capture.clone();
+        forged.states[0].position.desc.dtype = DType::F32;
+        assert!(matches!(
+            forged.seal_committed_position(),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        let mut forged = capture.clone();
+        forged.states[0].position.desc.shape = crate::Shape::from([1, 1]);
+        assert!(matches!(
+            forged.seal_committed_position(),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        let mut forged = capture.clone();
+        forged.states[0].position.name = "update_source".into();
+        assert!(matches!(
+            forged.seal_committed_position(),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        let mut forged = capture.clone();
+        forged.inference.resident_bindings.insert(
+            forged.states[0].position.name.clone(),
+            TensorData::from_scalars([1], DType::I32, [crate::Scalar::I(0)]).unwrap(),
+        );
+        assert!(matches!(
+            forged.seal_committed_position(),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        let mut forged = capture.clone();
+        forged
+            .inference
+            .capture
+            .requested
+            .push(position.index() as u64);
+        assert!(matches!(
+            forged.seal_committed_position(),
+            Err(CapturedInferenceError::Binding(_))
+        ));
         let changed = CapturedAppendStateInference::from_module_graph(
             &module,
             &graph,

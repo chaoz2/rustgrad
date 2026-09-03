@@ -16,7 +16,7 @@ use std::{
 
 use crate::runtime::static_schedule::{
     CapturedStaticExecution, StaticAppendStateLink, StaticExecutionReport, StaticHostGather,
-    StaticLifetimePlan, StaticStateLink,
+    StaticHostOutputSelection, StaticLifetimePlan, StaticStateLink,
 };
 
 /// Resource-free planning controls shared by typed Metal inference facades.
@@ -48,6 +48,8 @@ pub struct MetalDeviceSessionSummary {
     pub resident_input_names: Vec<String>,
     /// Named inputs required on every invocation.
     pub transient_input_names: Vec<String>,
+    /// Capture-authenticated inputs synthesized by the session per invocation.
+    pub runtime_control_input_names: Vec<String>,
     /// Logical outputs, including ordered duplicate requests and aliases.
     pub requested_output_count: usize,
     /// Capture-owned constants, whether rendered inline or as buffers.
@@ -63,6 +65,8 @@ pub struct MetalDeviceSessionSummary {
     pub resident_input_bytes: usize,
     /// Declared host payload bytes for transient named inputs.
     pub transient_input_bytes: usize,
+    /// Declared payload bytes synthesized as session runtime controls.
+    pub runtime_control_input_bytes: usize,
     /// Physical allocation slots in the static memory plan.
     pub planned_slot_count: usize,
     /// Physical bytes planned for dense tensor slots and capture-owned packed
@@ -142,6 +146,10 @@ pub struct MetalDeviceRunReport {
     pub transient_h2d_calls: usize,
     /// Bytes passed to transient host API writes.
     pub transient_h2d_bytes: usize,
+    /// Host API writes synthesized from authenticated session runtime control.
+    pub runtime_control_h2d_calls: usize,
+    /// Bytes passed to runtime-control host API writes.
+    pub runtime_control_h2d_bytes: usize,
     /// Host API reads for requested materialized outputs only.
     pub retained_d2h_calls: usize,
     /// Bytes passed to retained-output host API reads.
@@ -251,6 +259,7 @@ struct MetalCapturePolicy {
     state_links: Vec<StaticStateLink>,
     append_state_links: Vec<StaticAppendStateLink>,
     host_gathers: Vec<StaticHostGather>,
+    runtime_controls: Vec<ReplayInput>,
 }
 
 fn static_host_gathers(links: &[crate::session::CapturedHostGather]) -> Vec<StaticHostGather> {
@@ -273,8 +282,14 @@ impl MetalAppendStateInferencePlan {
         inference: CapturedAppendStateInference,
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
-        let (inference, public_output_count, states, initial_state, deployment_identity) =
-            inference.into_parts();
+        let (
+            inference,
+            public_output_count,
+            states,
+            initial_state,
+            sealed_position,
+            deployment_identity,
+        ) = inference.into_parts();
         let (capture, execution_plan, resident_bindings, host_gathers, _) = inference.into_parts();
         let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
         let state_names = states
@@ -295,13 +310,17 @@ impl MetalAppendStateInferencePlan {
                 row_bytes: state.row_bytes,
             })
             .collect::<Vec<_>>();
-        let inner = MetalDeviceSessionPlan::from_capture_append_policy(
+        let inner = MetalDeviceSessionPlan::from_capture_policy(
             capture,
-            resident_names,
-            state_names,
-            public_output_count,
-            append_links,
-            static_host_gathers(&host_gathers),
+            MetalCapturePolicy {
+                resident_input_names: resident_names,
+                state_input_names: state_names,
+                public_output_count,
+                state_links: Vec::new(),
+                append_state_links: append_links,
+                host_gathers: static_host_gathers(&host_gathers),
+                runtime_controls: sealed_position.into_iter().collect(),
+            },
             renderer,
         )?;
         Ok(Self {
@@ -384,6 +403,7 @@ impl MetalStatefulInferencePlan {
                 state_links,
                 append_state_links: Vec::new(),
                 host_gathers: static_host_gathers(&host_gathers),
+                runtime_controls: Vec::new(),
             },
             renderer,
         )?;
@@ -454,6 +474,7 @@ impl MetalInferencePlan {
                 state_links: Vec::new(),
                 append_state_links: Vec::new(),
                 host_gathers: static_host_gathers(&host_gathers),
+                runtime_controls: Vec::new(),
             },
             renderer,
         )?;
@@ -542,6 +563,7 @@ impl MetalDeviceSessionPlan {
                 state_links: Vec::new(),
                 append_state_links: Vec::new(),
                 host_gathers: Vec::new(),
+                runtime_controls: Vec::new(),
             },
             renderer,
         )
@@ -559,6 +581,7 @@ impl MetalDeviceSessionPlan {
             state_links,
             append_state_links,
             host_gathers,
+            runtime_controls,
         } = policy;
         let planning_start = Instant::now();
         let projection =
@@ -576,13 +599,14 @@ impl MetalDeviceSessionPlan {
         let mut protected_outputs = host_outputs.clone();
         protected_outputs.extend(state_links.iter().map(|state| state.output));
         protected_outputs.extend(append_state_links.iter().map(|state| state.output));
-        let lifetime = if state_input_names.is_empty() {
+        let lifetime = if state_input_names.is_empty() && runtime_controls.is_empty() {
             StaticLifetimePlan::new(projection, &resident_input_names)
         } else {
-            StaticLifetimePlan::new_with_state(
+            StaticLifetimePlan::new_with_state_and_controls(
                 projection,
                 &resident_input_names,
                 &state_input_names,
+                &runtime_controls,
             )
         }
         .map_err(MetalError::InvalidBinding)?;
@@ -591,12 +615,16 @@ impl MetalDeviceSessionPlan {
             .iter()
             .map(|input| input.desc.id)
             .collect::<std::collections::BTreeSet<_>>();
-        if host_gathers
+        let runtime_control_ids = lifetime
+            .runtime_controls()
             .iter()
-            .any(|link| !transient_ids.contains(&link.input))
-        {
+            .map(|input| input.desc.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if host_gathers.iter().any(|link| {
+            !transient_ids.contains(&link.input) && !runtime_control_ids.contains(&link.input)
+        }) {
             return Err(MetalError::InvalidBinding(
-                "Metal host Gather input is not an exact transient".into(),
+                "Metal host Gather input is not an exact transient or runtime control".into(),
             ));
         }
         if !state_links.is_empty() && !append_state_links.is_empty() {
@@ -673,6 +701,15 @@ impl MetalDeviceSessionPlan {
                         .checked_add(input.desc.bytes)
                         .ok_or(MetalError::Overflow)
                 })?;
+        let runtime_control_input_bytes =
+            lifetime
+                .runtime_controls()
+                .iter()
+                .try_fold(0usize, |total, input| {
+                    total
+                        .checked_add(input.desc.bytes)
+                        .ok_or(MetalError::Overflow)
+                })?;
         let logical_state_bytes =
             lifetime
                 .state_inputs()
@@ -732,6 +769,11 @@ impl MetalDeviceSessionPlan {
             capture_identity: lifetime.capture().identity,
             resident_input_names: lifetime.resident_names().map(str::to_owned).collect(),
             transient_input_names: lifetime.transient_names().map(str::to_owned).collect(),
+            runtime_control_input_names: lifetime
+                .runtime_controls()
+                .iter()
+                .map(|input| input.name.clone())
+                .collect(),
             requested_output_count: public_output_count,
             constant_count: lifetime.capture().constants.len(),
             constant_bytes,
@@ -739,6 +781,7 @@ impl MetalDeviceSessionPlan {
             quantized_constant_bytes,
             resident_input_bytes,
             transient_input_bytes,
+            runtime_control_input_bytes,
             planned_slot_count,
             planned_device_bytes,
             zero_byte_sentinel_count,
@@ -763,29 +806,6 @@ impl MetalDeviceSessionPlan {
             renderer_capabilities,
             state_policy,
         })
-    }
-
-    fn from_capture_append_policy(
-        capture: CapturedSchedule,
-        resident_input_names: Vec<String>,
-        state_input_names: Vec<String>,
-        public_output_count: usize,
-        append_state_links: Vec<StaticAppendStateLink>,
-        host_gathers: Vec<StaticHostGather>,
-        renderer: MetalRenderer,
-    ) -> Result<Self, MetalError> {
-        Self::from_capture_policy(
-            capture,
-            MetalCapturePolicy {
-                resident_input_names,
-                state_input_names,
-                public_output_count,
-                state_links: Vec::new(),
-                append_state_links,
-                host_gathers,
-            },
-            renderer,
-        )
     }
 
     /// Returns the exact authenticated capture owned by this plan.
@@ -845,12 +865,18 @@ impl MetalDeviceSessionPlan {
                 .stage_initialized(resident_inputs, initial_state)
         }
         .map_err(MetalError::InvalidBinding)?;
-        let transient_ids = self
+        let mut transient_ids = self
             .lifetime
             .transient_inputs()
             .iter()
             .map(|input| input.desc.id)
             .collect::<std::collections::BTreeSet<_>>();
+        transient_ids.extend(
+            self.lifetime
+                .runtime_controls()
+                .iter()
+                .map(|input| input.desc.id),
+        );
         self.lifetime
             .validate_quantized_gathers(&resident_values, &transient_ids)
             .map_err(metal_quantized_gather_error)?;
@@ -1044,6 +1070,29 @@ impl MetalDeviceSession {
         &mut self,
         transient_inputs: &BTreeMap<String, TensorData>,
     ) -> Result<MetalDeviceRun, MetalError> {
+        self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::All)
+    }
+
+    pub(crate) fn run_without_host_outputs(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::None)
+    }
+
+    fn run_with_host_outputs(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        host_outputs: StaticHostOutputSelection,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        if host_outputs == StaticHostOutputSelection::None
+            && (!matches!(self.state_policy, MetalSessionStatePolicy::Append { .. })
+                || self.lifetime.runtime_controls().len() != 1)
+        {
+            return Err(MetalError::InvalidBinding(
+                "host-output suppression requires sealed append-state inference".into(),
+            ));
+        }
         let successful_invocation = self
             .successful_runs
             .checked_add(1)
@@ -1061,6 +1110,19 @@ impl MetalDeviceSession {
             .lifetime
             .stage_transient(transient_inputs)
             .map_err(MetalError::InvalidBinding)?;
+        let (runtime_control_h2d_calls, runtime_control_h2d_bytes) = match self.state_policy {
+            MetalSessionStatePolicy::Append { .. } => self
+                .lifetime
+                .stage_committed_position(self.committed_state_position, &mut values)
+                .map_err(MetalError::InvalidBinding)?,
+            _ => (0, 0),
+        };
+        let (runtime_control_h2d_calls, runtime_control_h2d_bytes) =
+            if self.summary.nonzero_item_count == 0 {
+                (0, 0)
+            } else {
+                (runtime_control_h2d_calls, runtime_control_h2d_bytes)
+            };
         self.lifetime
             .validate_quantized_gathers(&values, self.lifetime.resident_ids())
             .map_err(metal_quantized_gather_error)?;
@@ -1070,23 +1132,36 @@ impl MetalDeviceSession {
             MetalSessionStatePolicy::Epoch { .. } => self
                 .prepared
                 .execute_stateful(&mut values, self.state_epoch)?,
-            MetalSessionStatePolicy::Append { .. } => self
-                .prepared
-                .execute_append_state(&mut values, self.committed_state_position)?,
+            MetalSessionStatePolicy::Append { .. } => self.prepared.execute_append_state(
+                &mut values,
+                self.committed_state_position,
+                host_outputs,
+            )?,
         };
         let synchronous_transaction_wall_time = execute_start.elapsed();
-        let outputs = match self.state_policy {
-            MetalSessionStatePolicy::None => self.lifetime.project(&values, &self.resident_sources),
-            MetalSessionStatePolicy::Epoch { .. } | MetalSessionStatePolicy::Append { .. } => self
-                .lifetime
-                .project_prefix(self.public_output_count, &values, &self.resident_sources),
-        }
-        .map_err(MetalError::InvalidBinding)?;
+        let outputs = match host_outputs {
+            StaticHostOutputSelection::None => Vec::new(),
+            StaticHostOutputSelection::All => match self.state_policy {
+                MetalSessionStatePolicy::None => {
+                    self.lifetime.project(&values, &self.resident_sources)
+                }
+                MetalSessionStatePolicy::Epoch { .. } | MetalSessionStatePolicy::Append { .. } => {
+                    self.lifetime.project_prefix(
+                        self.public_output_count,
+                        &values,
+                        &self.resident_sources,
+                    )
+                }
+            }
+            .map_err(MetalError::InvalidBinding)?,
+        };
         let report = run_report(RunReportInput {
             successful_invocation,
             run_wall_time: run_start.elapsed(),
             synchronous_transaction_wall_time,
             transfer,
+            runtime_control_h2d_calls,
+            runtime_control_h2d_bytes,
             zero_item_count: self.summary.zero_item_count,
             output_count: outputs.len(),
             committed_state: match self.state_policy {
@@ -1134,6 +1209,8 @@ struct RunReportInput {
     run_wall_time: Duration,
     synchronous_transaction_wall_time: Duration,
     transfer: StaticExecutionReport,
+    runtime_control_h2d_calls: usize,
+    runtime_control_h2d_bytes: usize,
     zero_item_count: usize,
     output_count: usize,
     committed_state: CommittedState,
@@ -1146,6 +1223,8 @@ fn run_report(input: RunReportInput) -> MetalDeviceRunReport {
         run_wall_time,
         synchronous_transaction_wall_time,
         transfer,
+        runtime_control_h2d_calls,
+        runtime_control_h2d_bytes,
         zero_item_count,
         output_count,
         committed_state,
@@ -1156,8 +1235,16 @@ fn run_report(input: RunReportInput) -> MetalDeviceRunReport {
         first_successful_run: successful_invocation == 1,
         run_wall_time,
         synchronous_transaction_wall_time,
-        transient_h2d_calls: transfer.h2d_calls,
-        transient_h2d_bytes: transfer.h2d_bytes,
+        transient_h2d_calls: transfer
+            .h2d_calls
+            .checked_sub(runtime_control_h2d_calls)
+            .expect("runtime controls are a subset of invocation uploads"),
+        transient_h2d_bytes: transfer
+            .h2d_bytes
+            .checked_sub(runtime_control_h2d_bytes)
+            .expect("runtime controls are a subset of invocation upload bytes"),
+        runtime_control_h2d_calls,
+        runtime_control_h2d_bytes,
         retained_d2h_calls: transfer.d2h_calls,
         retained_d2h_bytes: transfer.d2h_bytes,
         kernel_launch_count: transfer.kernel_launches,

@@ -42,6 +42,7 @@ pub use decoder::{
 pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, LlamaSampling};
 pub use metal_step::{
     LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
+    LlamaMetalTokenCommit,
 };
 pub use model::{
     LlamaLinearWeight, LlamaModel, LlamaModelCache, LlamaModelConfig, LlamaModelError,

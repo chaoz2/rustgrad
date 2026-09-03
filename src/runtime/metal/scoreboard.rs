@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use std::{collections::BTreeSet, fmt, fs, io, path::Path, rc::Rc, time::Duration};
 
 /// Current deterministic JSON schema emitted by [`MetalSessionScoreboardReport`].
-pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 3;
+pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 4;
 const MAX_METADATA_BYTES: usize = 1_024;
 
 /// Caller-supplied labels attached to one measurement series.
@@ -65,6 +65,8 @@ pub enum MetalScoreboardInputKind {
     State,
     /// Caller input supplied independently to every invocation.
     Transient,
+    /// Session-synthesized input authenticated by the captured policy.
+    RuntimeControl,
 }
 
 /// Stateful policy authenticated by a scoreboard snapshot.
@@ -123,6 +125,10 @@ pub struct MetalScoreboardRun {
     pub transient_host_api_h2d_calls: usize,
     /// Per-invocation transient bytes passed to host API writes.
     pub transient_host_api_h2d_bytes: usize,
+    /// Per-invocation session-synthesized runtime-control host API writes.
+    pub runtime_control_host_api_h2d_calls: usize,
+    /// Per-invocation session-synthesized runtime-control bytes written.
+    pub runtime_control_host_api_h2d_bytes: usize,
     /// Per-invocation retained-output host API reads.
     pub retained_host_api_d2h_calls: usize,
     /// Per-invocation retained-output bytes passed to host API reads.
@@ -152,6 +158,8 @@ impl MetalScoreboardRun {
             synchronous_transaction_wall_time: report.synchronous_transaction_wall_time,
             transient_host_api_h2d_calls: report.transient_h2d_calls,
             transient_host_api_h2d_bytes: report.transient_h2d_bytes,
+            runtime_control_host_api_h2d_calls: report.runtime_control_h2d_calls,
+            runtime_control_host_api_h2d_bytes: report.runtime_control_h2d_bytes,
             retained_host_api_d2h_calls: report.retained_d2h_calls,
             retained_host_api_d2h_bytes: report.retained_d2h_bytes,
             kernel_launch_count: report.kernel_launch_count,
@@ -214,6 +222,8 @@ pub struct MetalSessionScoreboardReport {
     pub declared_resident_input_bytes: usize,
     /// Declared payload bytes for each invocation's transient inputs.
     pub declared_transient_input_bytes: usize,
+    /// Declared payload bytes for session-synthesized runtime controls.
+    pub declared_runtime_control_input_bytes: usize,
     /// Host wall time spent in resource-free planning and rendering.
     pub planning_wall_time: Duration,
     /// Host wall time spent compiling, allocating, and creating the queue.
@@ -268,13 +278,17 @@ pub struct MetalSessionScoreboardReport {
     pub transient_host_api_h2d_calls: usize,
     /// Bytes passed to recorded transient host API writes.
     pub transient_host_api_h2d_bytes: usize,
+    /// Host API writes issued for session-synthesized runtime controls.
+    pub runtime_control_host_api_h2d_calls: usize,
+    /// Bytes passed to session-synthesized runtime-control writes.
+    pub runtime_control_host_api_h2d_bytes: usize,
     /// Host API reads issued for recorded retained outputs.
     pub retained_host_api_d2h_calls: usize,
     /// Bytes passed to recorded retained-output host API reads.
     pub retained_host_api_d2h_bytes: usize,
-    /// Resident, initial-state, and transient host API write calls.
+    /// Resident, initial-state, caller-transient, and runtime-control writes.
     pub host_api_h2d_calls: usize,
-    /// Resident, initial-state, and transient bytes passed to host API writes.
+    /// Resident, initial-state, caller-transient, and runtime-control bytes.
     pub host_api_h2d_bytes: usize,
     /// Total recorded retained-output host API reads.
     pub host_api_d2h_calls: usize,
@@ -470,11 +484,19 @@ impl MetalSessionScoreboard {
             .iter()
             .map(|input| input.name.as_str())
             .collect::<BTreeSet<_>>();
+        let runtime_control_names = plan
+            .summary
+            .runtime_control_input_names
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         let inputs = plan
             .capture
             .inputs
             .iter()
-            .map(|input| scoreboard_input(input, &resident_names, &state_names))
+            .map(|input| {
+                scoreboard_input(input, &resident_names, &state_names, &runtime_control_names)
+            })
             .collect();
         Self {
             context,
@@ -608,9 +630,11 @@ impl MetalSessionScoreboard {
             .ok_or(MetalScoreboardError::Overflow)?;
         let host_api_h2d_calls = initialization_h2d_calls
             .checked_add(totals.transient_h2d_calls)
+            .and_then(|total| total.checked_add(totals.runtime_control_h2d_calls))
             .ok_or(MetalScoreboardError::Overflow)?;
         let host_api_h2d_bytes = initialization_h2d_bytes
             .checked_add(totals.transient_h2d_bytes)
+            .and_then(|total| total.checked_add(totals.runtime_control_h2d_bytes))
             .ok_or(MetalScoreboardError::Overflow)?;
         let committed_state_position = match self.state_policy {
             MetalScoreboardStatePolicy::Stateless => None,
@@ -644,6 +668,7 @@ impl MetalSessionScoreboard {
             captured_quantized_constant_bytes: self.plan_summary.quantized_constant_bytes,
             declared_resident_input_bytes: self.plan_summary.resident_input_bytes,
             declared_transient_input_bytes: self.plan_summary.transient_input_bytes,
+            declared_runtime_control_input_bytes: self.plan_summary.runtime_control_input_bytes,
             planning_wall_time: preparation.planning_wall_time,
             native_prepare_wall_time: preparation.native_prepare_wall_time,
             cache_miss_pipeline_build_wall_time: preparation.cache_miss_pipeline_build_wall_time,
@@ -673,6 +698,8 @@ impl MetalSessionScoreboard {
             initial_state_host_api_h2d_bytes: preparation.initial_state_h2d_bytes,
             transient_host_api_h2d_calls: totals.transient_h2d_calls,
             transient_host_api_h2d_bytes: totals.transient_h2d_bytes,
+            runtime_control_host_api_h2d_calls: totals.runtime_control_h2d_calls,
+            runtime_control_host_api_h2d_bytes: totals.runtime_control_h2d_bytes,
             retained_host_api_d2h_calls: totals.retained_d2h_calls,
             retained_host_api_d2h_bytes: totals.retained_d2h_bytes,
             host_api_h2d_calls,
@@ -697,6 +724,8 @@ impl MetalSessionScoreboard {
 struct RunTotals {
     transient_h2d_calls: usize,
     transient_h2d_bytes: usize,
+    runtime_control_h2d_calls: usize,
+    runtime_control_h2d_bytes: usize,
     retained_d2h_calls: usize,
     retained_d2h_bytes: usize,
     kernel_launch_count: usize,
@@ -726,6 +755,14 @@ impl RunTotals {
         }
         checked_add!(transient_h2d_calls, report.transient_host_api_h2d_calls);
         checked_add!(transient_h2d_bytes, report.transient_host_api_h2d_bytes);
+        checked_add!(
+            runtime_control_h2d_calls,
+            report.runtime_control_host_api_h2d_calls
+        );
+        checked_add!(
+            runtime_control_h2d_bytes,
+            report.runtime_control_host_api_h2d_bytes
+        );
         checked_add!(retained_d2h_calls, report.retained_host_api_d2h_calls);
         checked_add!(retained_d2h_bytes, report.retained_host_api_d2h_bytes);
         checked_add!(kernel_launch_count, report.kernel_launch_count);
@@ -754,6 +791,7 @@ fn scoreboard_input(
     input: &ReplayInput,
     resident_names: &BTreeSet<&str>,
     state_names: &BTreeSet<&str>,
+    runtime_control_names: &BTreeSet<&str>,
 ) -> MetalScoreboardInput {
     MetalScoreboardInput {
         name: input.name.clone(),
@@ -765,6 +803,8 @@ fn scoreboard_input(
             MetalScoreboardInputKind::Resident
         } else if state_names.contains(input.name.as_str()) {
             MetalScoreboardInputKind::State
+        } else if runtime_control_names.contains(input.name.as_str()) {
+            MetalScoreboardInputKind::RuntimeControl
         } else {
             MetalScoreboardInputKind::Transient
         },
@@ -848,14 +888,24 @@ mod tests {
                     family: "mock-family".into(),
                 },
             },
-            inputs: vec![MetalScoreboardInput {
-                name: "features".into(),
-                node_id: 4,
-                shape: Shape::from([1, 4]),
-                dtype: DType::F32,
-                bytes: 16,
-                kind: MetalScoreboardInputKind::Transient,
-            }],
+            inputs: vec![
+                MetalScoreboardInput {
+                    name: "features".into(),
+                    node_id: 4,
+                    shape: Shape::from([1, 4]),
+                    dtype: DType::F32,
+                    bytes: 16,
+                    kind: MetalScoreboardInputKind::Transient,
+                },
+                MetalScoreboardInput {
+                    name: "position".into(),
+                    node_id: 5,
+                    shape: Shape::from([1]),
+                    dtype: DType::I32,
+                    bytes: 4,
+                    kind: MetalScoreboardInputKind::RuntimeControl,
+                },
+            ],
             state_policy: MetalScoreboardStatePolicy::Stateless,
             state_pair_count: 0,
             logical_state_bytes: 0,
@@ -871,6 +921,7 @@ mod tests {
             captured_quantized_constant_bytes: 0,
             declared_resident_input_bytes: 0,
             declared_transient_input_bytes: 16,
+            declared_runtime_control_input_bytes: 4,
             planning_wall_time: Duration::new(0, 11),
             native_prepare_wall_time: Duration::new(0, 12),
             cache_miss_pipeline_build_wall_time: Duration::new(0, 7),
@@ -906,10 +957,12 @@ mod tests {
             initial_state_host_api_h2d_bytes: 0,
             transient_host_api_h2d_calls: 4,
             transient_host_api_h2d_bytes: 64,
+            runtime_control_host_api_h2d_calls: 4,
+            runtime_control_host_api_h2d_bytes: 16,
             retained_host_api_d2h_calls: 4,
             retained_host_api_d2h_bytes: 32,
-            host_api_h2d_calls: 5,
-            host_api_h2d_bytes: 80,
+            host_api_h2d_calls: 9,
+            host_api_h2d_bytes: 96,
             host_api_d2h_calls: 4,
             host_api_d2h_bytes: 32,
             kernel_launch_count: 4,
@@ -928,6 +981,8 @@ mod tests {
                         synchronous_transaction_wall_time: Duration::new(0, transaction_nanos),
                         transient_host_api_h2d_calls: 1,
                         transient_host_api_h2d_bytes: 16,
+                        runtime_control_host_api_h2d_calls: 1,
+                        runtime_control_host_api_h2d_bytes: 4,
                         retained_host_api_d2h_calls: 1,
                         retained_host_api_d2h_bytes: 8,
                         kernel_launch_count: 1,
@@ -960,14 +1015,20 @@ mod tests {
         let first = report.to_json_bytes().unwrap();
         assert_eq!(first, report.to_json_bytes().unwrap());
         let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(value["format_version"], 3);
+        assert_eq!(value["format_version"], 4);
         assert_eq!(value["workload"], "linear");
         assert_eq!(value["implementation_revision"], "abc123");
         assert_eq!(value["evidence"], "semantic mock");
         assert_eq!(value["planning_wall_time"]["secs"], 0);
         assert_eq!(value["planning_wall_time"]["nanos"], 11);
         assert_eq!(value["inputs"][0]["dtype"], "float");
+        assert_eq!(value["inputs"][1]["kind"], "runtime_control");
         assert_eq!(value["deployment_identity"], 1);
+        assert_eq!(value["runtime_control_host_api_h2d_calls"], 4);
+        assert_eq!(
+            value["successful_runs"][0]["runtime_control_host_api_h2d_bytes"],
+            4
+        );
         assert_eq!(value["successful_runs"].as_array().unwrap().len(), 4);
         let path = std::env::temp_dir().join(format!(
             "rustgrad-metal-scoreboard-{}-{}.json",

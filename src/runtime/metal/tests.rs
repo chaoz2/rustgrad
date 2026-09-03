@@ -986,6 +986,16 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
             ("updates".into(), TensorData::new([1, 3], updates).unwrap()),
         ])
     };
+    mock.clear_calls();
+    assert!(
+        session
+            .run_without_host_outputs(&invocation(0, vec![1.0, 2.0, 3.0]))
+            .is_err()
+    );
+    assert_eq!(session.committed_state_position(), Some(0));
+    assert_eq!(session.successful_run_count(), 0);
+    assert!(mock.calls().is_empty());
+
     mock.state.lock().unwrap().failures.read = Some("public read");
     assert!(session.run(&invocation(0, vec![1.0, 2.0, 3.0])).is_err());
     assert_eq!(session.committed_state_position(), Some(0));
@@ -1035,7 +1045,7 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(second.report().committed_state_position, Some(2));
     scoreboard.record(&second).unwrap();
     let report = scoreboard.report().unwrap();
-    assert_eq!(report.format_version, 3);
+    assert_eq!(report.format_version, 4);
     assert_eq!(report.successful_run_count, 2);
     assert_eq!(report.committed_state_position, Some(2));
     assert_eq!(report.state_pair_count, 1);
@@ -1370,6 +1380,14 @@ fn packed_llama_token_session_matches_dense_oracle_and_retries_atomically() {
     let (packed, _, dense, _) = packed_metal_fixture_models();
     let plan =
         LlamaMetalStepPlan::new(&packed, MetalRenderer::new(8, capabilities()).unwrap()).unwrap();
+    let control_name = &plan.summary().runtime_control_input_names[0];
+    let control = plan
+        .capture()
+        .inputs
+        .iter()
+        .find(|input| &input.name == control_name)
+        .expect("runtime control remains an exact captured input");
+    assert!(control.desc.view.is_some());
     let stable_summary = plan.summary().clone();
     let mock = Arc::new(MockDispatch::default());
     let mut session = plan.prepare(test_device(mock.clone())).unwrap();
@@ -1394,6 +1412,15 @@ fn packed_llama_token_session_matches_dense_oracle_and_retries_atomically() {
     };
 
     mock.clear_calls();
+    assert!(
+        session
+            .commit_token(packed.config().schema().vocab_size() as u32)
+            .is_err()
+    );
+    assert_eq!(session.position(), 0);
+    assert!(mock.calls().is_empty());
+
+    mock.clear_calls();
     mock.state.lock().unwrap().failures.launch = Some("packed Llama launch");
     assert!(session.run_token(3).is_err());
     assert_eq!(session.position(), 0);
@@ -1401,13 +1428,16 @@ fn packed_llama_token_session_matches_dense_oracle_and_retries_atomically() {
     mock.clear_failures();
 
     mock.clear_calls();
-    let first = session.run_token(3).unwrap();
-    assert_logits(first.logits(), &expected_last(&[3]));
+    let first = session.commit_token(3).unwrap();
     assert_eq!(first.position(), 0);
     assert_eq!(session.position(), 1);
-    assert_eq!(first.report().transient_h2d_calls, 2);
-    assert_eq!(first.report().transient_h2d_bytes, 8);
-    assert_eq!(first.report().retained_d2h_calls, 1);
+    assert_eq!(first.report().transient_h2d_calls, 1);
+    assert_eq!(first.report().transient_h2d_bytes, 4);
+    assert_eq!(first.report().runtime_control_h2d_calls, 1);
+    assert_eq!(first.report().runtime_control_h2d_bytes, 4);
+    assert_eq!(first.report().retained_d2h_calls, 0);
+    assert_eq!(first.report().retained_d2h_bytes, 0);
+    assert_eq!(first.report().output_count, 0);
     assert!(!mock.calls().iter().any(|call| {
         call.starts_with("buffer_create:")
             || call.starts_with("library_compile:")
@@ -1415,19 +1445,26 @@ fn packed_llama_token_session_matches_dense_oracle_and_retries_atomically() {
             || call.starts_with("queue_create:")
     }));
 
+    let second = session.commit_token(4).unwrap();
+    assert_eq!(second.position(), 1);
+    assert_eq!(second.report().retained_d2h_calls, 0);
+    assert_eq!(session.position(), 2);
+
     mock.state.lock().unwrap().failures.read = Some("packed Llama logits read");
-    assert!(session.run_token(4).is_err());
-    assert_eq!(session.position(), 1);
-    assert_eq!(session.metal_session().successful_run_count(), 1);
+    assert!(session.run_token(5).is_err());
+    assert_eq!(session.position(), 2);
+    assert_eq!(session.metal_session().successful_run_count(), 2);
     mock.clear_failures();
 
     mock.clear_calls();
     let retry = session.run_token(5).unwrap();
-    assert_logits(retry.logits(), &expected_last(&[3, 5]));
-    assert_eq!(retry.position(), 1);
-    assert_eq!(session.position(), 2);
-    assert_eq!(retry.report().transient_h2d_calls, 2);
-    assert_eq!(retry.report().transient_h2d_bytes, 8);
+    assert_logits(retry.logits(), &expected_last(&[3, 4, 5]));
+    assert_eq!(retry.position(), 2);
+    assert_eq!(session.position(), 3);
+    assert_eq!(retry.report().transient_h2d_calls, 1);
+    assert_eq!(retry.report().transient_h2d_bytes, 4);
+    assert_eq!(retry.report().runtime_control_h2d_calls, 1);
+    assert_eq!(retry.report().runtime_control_h2d_bytes, 4);
     assert_eq!(retry.report().retained_d2h_calls, 1);
     assert_eq!(session.metal_session().device_owner_id(), stable_owner);
     assert_eq!(session.metal_session().summary(), &stable_summary);

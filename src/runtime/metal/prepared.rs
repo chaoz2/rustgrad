@@ -9,8 +9,9 @@ use std::{cell::Cell, collections::BTreeMap, rc::Rc, time::Duration};
 use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
     StaticBufferAllocation, StaticDeviceAdapter, StaticExecutionReport, StaticHostGather,
-    StaticPlanAdapter, StaticQuantizedBufferPlan, StaticRendered, StaticRenderedBuffer,
-    StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticStateLink, bind_rendered_buffers,
+    StaticHostOutputSelection, StaticPlanAdapter, StaticQuantizedBufferPlan, StaticRendered,
+    StaticRenderedBuffer, StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticStateLink,
+    bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -496,8 +497,10 @@ impl InitializedMetalPrefix {
         &self,
         values: &mut BTreeMap<u64, TensorData>,
         committed_position: usize,
+        host_outputs: StaticHostOutputSelection,
     ) -> Result<StaticExecutionReport, MetalError> {
-        self.inner.execute_append_state(values, committed_position)
+        self.inner
+            .execute_append_state(values, committed_position, host_outputs)
     }
 }
 
