@@ -122,14 +122,17 @@ claim GPU time, physical bus traffic, allocator RSS, energy, or throughput.
 Dense-or-packed F32 GGUF Llama models also expose a fixed batch-one Metal
 token-step plan. It freezes exact named weights and a precomputed RoPE table,
 keeps one fixed-capacity K/V bank per tensor on device, and appends only the
-current complete K/V rows. Each call stages only an I32 token and scalar
-position; one shared row-shaped append index is expanded and materialized on
+current complete K/V rows. Packed Q4_0/Q8_0/Q4_K/Q6_K weights upload once and
+decode directly in the selected row-gather or matmul kernel. Each call stages
+only an I32 token and scalar position; one shared row-shaped append index is
+expanded and materialized on
 device from that same committed position and feeds exactly the declared append
 owners. F32 logits are the only device-to-host transfer: capture authenticates
 both host-validated scalar indices through their exact reshape/expand-to-Gather
 lineage, so lookup needs no status read or provisional
-candidate. Chunk prefill, sampling, live-device numerical evidence, and
-stateful scoreboard reporting
+candidate. The lower-level append session can emit ordered stateful scoreboard
+evidence, while a typed model-level scoreboard adapter, chunk prefill,
+tokenizer/generator/sampling integration, and live-device numerical evidence
 remain explicit follow-ups.
 
 ## How the system fits together

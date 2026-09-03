@@ -2594,17 +2594,21 @@ reach no driver work; a failed execution publishes neither outputs nor a
 successful-run metric and the settled prefix remains retryable. Zero-work
 captures allocate, compile, upload, launch, wait, and read nothing.
 
-`MetalSessionScoreboard` v2 is a stateless-only opt-in observation layer over
-that existing evidence. It snapshots a `MetalInferencePlan`, binds once to the
-exact prepared deployment/session identity, and accepts only its consecutive
-successful `MetalDeviceRun` prefix. The immutable report preserves every run's
-ordinal, first-run bit, host-wall times, transfers, launches, zero-item skips,
-and output count in invocation order. It derives checked aggregate transfer and
-launch totals from those same records, separates the first sample, and reports
-integer-duration nearest-rank percentiles over the remaining samples. Versioned
-deterministic JSON includes caller-labelled workload, implementation revision,
-evidence provenance, selected handle-free device, captured resident/transient
-descriptors, logical schedule/peak-live facts, and physical Metal slot facts.
+`MetalSessionScoreboard` v3 is an opt-in observation layer over that existing
+evidence. It snapshots either a stateless `MetalInferencePlan` or an
+append-only `MetalAppendStateInferencePlan`, binds once to the exact prepared
+deployment/session identity, and accepts only its consecutive successful
+`MetalDeviceRun` prefix. The immutable report preserves every run's ordinal,
+first-run bit, host-wall times, transfers, launches, zero-item skips, output
+count, and authenticated append position/row commit in invocation order. It
+derives checked aggregate transfer, launch, and state-commit totals from those
+same records, separates the first sample, and reports integer-duration
+nearest-rank percentiles over the remaining samples. Versioned deterministic
+JSON includes caller-labelled workload, implementation revision, evidence
+provenance, selected handle-free device, captured resident/state/transient
+descriptors, distinct dense-tensor and packed-GGUF captured constant counts and
+raw bytes, one-time initial-state writes, logical schedule/peak-live facts, and
+physical Metal slot/state-bank facts.
 `planning_wall_time` is planning and rendering; `native_prepare_wall_time`
 includes compilation, allocation, and queue setup; and
 `cache_miss_pipeline_build_wall_time` times only successful native
@@ -2613,9 +2617,10 @@ library/pipeline construction on cache misses within preparation.
 measured allocator peak memory, nor process RSS. Host-wall observations are not
 GPU timestamps, and host-API copy counts/bytes are not physical-bus
 measurements. Failed, skipped, reordered, foreign-session, or pre-bind records
-cannot mutate the scoreboard. Stateful and append-state scoreboard
-binding/schema is an explicit follow-up rather than an implicit extension of
-the v2 report.
+cannot mutate the scoreboard. The scoreboard observes an already-authenticated
+append session; it does not build a token generator, choose samples, or advance
+state independently. Fixed epoch-swapped state and model-level generation
+scoreboard facades remain explicit follow-ups.
 
 The dense-or-packed F32 Llama token-step layer uses the same boundary without
 adding a model-specific runtime. A crate-private capture projection
@@ -2651,9 +2656,9 @@ unique packed owner once even when tied bindings reference it more than once.
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, mutable training state, dynamically
 shaped/capacity-growing state, general output chaining across calls, chunk
-prefill, tokenizer/generator/sampling integration, stateful scoreboard v2,
-multi-device execution, and live Metal numerical/performance evidence remain
-explicit follow-ons.
+prefill, tokenizer/generator/sampling integration, model-level generation
+scoreboard wiring, multi-device execution, and live Metal
+numerical/performance evidence remain explicit follow-ons.
 The semantic mock covers fixed-shape state ping-pong and a bounded
 residual-style multi-layer graph. Protected acceptance exercises that typed
 facade on the complete default Eval/F32 ResNet-18 `[1,3,224,224]` graph:

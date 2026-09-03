@@ -159,6 +159,9 @@ pub struct MetalDeviceRunReport {
     /// Sparse recurrent elements committed by this invocation. Double-bank
     /// state reports its full logical element count; stateless runs report 0.
     pub committed_state_work_items: usize,
+    /// Next append row after this successful invocation. This is `None` for
+    /// stateless and epoch-swapped sessions.
+    pub committed_state_position: Option<usize>,
 }
 
 /// Detached ordered outputs plus the report committed for that successful run.
@@ -1079,14 +1082,14 @@ impl MetalDeviceSession {
                 .project_prefix(self.public_output_count, &values, &self.resident_sources),
         }
         .map_err(MetalError::InvalidBinding)?;
-        let report = run_report(
+        let report = run_report(RunReportInput {
             successful_invocation,
-            run_start.elapsed(),
+            run_wall_time: run_start.elapsed(),
             synchronous_transaction_wall_time,
             transfer,
-            self.summary.zero_item_count,
-            outputs.len(),
-            match self.state_policy {
+            zero_item_count: self.summary.zero_item_count,
+            output_count: outputs.len(),
+            committed_state: match self.state_policy {
                 MetalSessionStatePolicy::None => CommittedState::default(),
                 MetalSessionStatePolicy::Epoch {
                     pair_count,
@@ -1107,7 +1110,8 @@ impl MetalDeviceSession {
                     work_items,
                 },
             },
-        );
+            committed_state_position: next_committed_position,
+        });
         self.successful_runs = successful_invocation;
         match self.state_policy {
             MetalSessionStatePolicy::Epoch { .. } => self.state_epoch = !self.state_epoch,
@@ -1125,7 +1129,7 @@ impl MetalDeviceSession {
     }
 }
 
-fn run_report(
+struct RunReportInput {
     successful_invocation: u64,
     run_wall_time: Duration,
     synchronous_transaction_wall_time: Duration,
@@ -1133,7 +1137,20 @@ fn run_report(
     zero_item_count: usize,
     output_count: usize,
     committed_state: CommittedState,
-) -> MetalDeviceRunReport {
+    committed_state_position: Option<usize>,
+}
+
+fn run_report(input: RunReportInput) -> MetalDeviceRunReport {
+    let RunReportInput {
+        successful_invocation,
+        run_wall_time,
+        synchronous_transaction_wall_time,
+        transfer,
+        zero_item_count,
+        output_count,
+        committed_state,
+        committed_state_position,
+    } = input;
     MetalDeviceRunReport {
         successful_invocation,
         first_successful_run: successful_invocation == 1,
@@ -1149,6 +1166,7 @@ fn run_report(
         committed_state_pair_count: committed_state.pair_count,
         committed_state_bytes: committed_state.bytes,
         committed_state_work_items: committed_state.work_items,
+        committed_state_position,
     }
 }
 

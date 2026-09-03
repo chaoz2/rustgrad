@@ -504,6 +504,7 @@ fn portable_threefry_metal_renders_and_executes_broadcast_bits() {
     );
 }
 use super::*;
+use crate::engine::capture::QuantizedCaptureBinding;
 use crate::kernel::execute_lowered_elementwise;
 use crate::models::transformer::{LlamaMetalStepPlan, packed_metal_fixture_models};
 use crate::nn::{Linear, Module, Parameter, StateKind};
@@ -917,6 +918,10 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(plan.summary().state_device_bytes, 24);
     assert_eq!(plan.summary().append_state_row_bytes, 12);
     assert_eq!(plan.summary().append_state_work_items, 3);
+    let mut scoreboard = MetalSessionScoreboard::new_append_state(
+        MetalScoreboardContext::new("append-cache", "test-revision", "semantic mock").unwrap(),
+        &plan,
+    );
     let append_item = plan
         .rendered_items()
         .find(|rendered| rendered.append_state().is_some())
@@ -947,8 +952,29 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     let expected_kernel_launches = plan.summary().nonzero_item_count;
     let mock = Arc::new(MockDispatch::default());
     let mut session = plan.prepare(test_device(mock.clone())).unwrap();
+    let calls_after_prepare = mock.calls();
+    scoreboard.bind(&session).unwrap();
+    assert_eq!(mock.calls(), calls_after_prepare);
     assert_eq!(session.committed_state_position(), Some(0));
     assert_eq!(session.preparation_report().initial_state_h2d_bytes, 24);
+    let empty_report = scoreboard.report().unwrap();
+    assert_eq!(
+        empty_report.state_policy,
+        MetalScoreboardStatePolicy::Append
+    );
+    assert_eq!(empty_report.committed_state_position, Some(0));
+    assert_eq!(empty_report.successful_run_count, 0);
+    assert_eq!(empty_report.initial_state_host_api_h2d_calls, 1);
+    assert_eq!(empty_report.initial_state_host_api_h2d_bytes, 24);
+    assert_eq!(
+        empty_report
+            .inputs
+            .iter()
+            .filter(|input| input.kind == MetalScoreboardInputKind::State)
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>(),
+        ["cache"]
+    );
 
     let invocation = |position_value: i32, updates: Vec<f32>| {
         BTreeMap::from([
@@ -964,6 +990,7 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert!(session.run(&invocation(0, vec![1.0, 2.0, 3.0])).is_err());
     assert_eq!(session.committed_state_position(), Some(0));
     assert_eq!(session.successful_run_count(), 0);
+    assert_eq!(scoreboard.report().unwrap(), empty_report);
     mock.clear_failures();
 
     mock.clear_launch_bindings();
@@ -982,7 +1009,9 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(first.report().retained_d2h_calls, 1);
     assert_eq!(first.report().retained_d2h_bytes, 24);
     assert_eq!(first.report().kernel_launch_count, expected_kernel_launches);
+    assert_eq!(first.report().committed_state_position, Some(1));
     assert_eq!(session.committed_state_position(), Some(1));
+    scoreboard.record(&first).unwrap();
     let bindings = mock.launch_bindings();
     let append_ordinal = bindings
         .iter()
@@ -995,6 +1024,7 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert!(session.run(&invocation(0, vec![7.0, 8.0, 9.0])).is_err());
     assert_eq!(mock.calls().len(), before);
     assert_eq!(session.committed_state_position(), Some(1));
+    assert_eq!(scoreboard.report().unwrap().successful_run_count, 1);
 
     let second = session.run(&invocation(1, vec![7.0, 8.0, 9.0])).unwrap();
     assert_eq!(
@@ -1002,11 +1032,157 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
         TensorData::new([2, 3], vec![16.0, 25.0, 36.0, 49.0, 64.0, 81.0]).unwrap()
     );
     assert_eq!(session.committed_state_position(), Some(2));
+    assert_eq!(second.report().committed_state_position, Some(2));
+    scoreboard.record(&second).unwrap();
+    let report = scoreboard.report().unwrap();
+    assert_eq!(report.format_version, 3);
+    assert_eq!(report.successful_run_count, 2);
+    assert_eq!(report.committed_state_position, Some(2));
+    assert_eq!(report.state_pair_count, 1);
+    assert_eq!(report.logical_state_bytes, 24);
+    assert_eq!(report.state_bank_count, 1);
+    assert_eq!(report.state_device_bytes, 24);
+    assert_eq!(report.append_state_row_bytes, 12);
+    assert_eq!(report.append_state_work_items, 3);
+    assert_eq!(report.committed_state_pair_count, 2);
+    assert_eq!(report.committed_state_bytes, 24);
+    assert_eq!(report.committed_state_work_items, 6);
+    assert_eq!(report.successful_runs[0].committed_state_position, Some(1));
+    assert_eq!(report.successful_runs[1].committed_state_position, Some(2));
+    assert_eq!(
+        report.first_run_host_wall_time,
+        Some(first.report().run_wall_time)
+    );
+    assert_eq!(
+        report.steady_run_host_wall_times,
+        [second.report().run_wall_time]
+    );
+    assert_eq!(
+        report.host_api_h2d_calls,
+        report.resident_host_api_h2d_calls
+            + report.initial_state_host_api_h2d_calls
+            + report.transient_host_api_h2d_calls
+    );
+    assert_eq!(
+        report.host_api_h2d_bytes,
+        report.resident_host_api_h2d_bytes
+            + report.initial_state_host_api_h2d_bytes
+            + report.transient_host_api_h2d_bytes
+    );
+    assert_eq!(
+        report.kernel_launch_count,
+        report.planned_kernel_count * report.successful_runs.len()
+    );
+    assert_eq!(report.fallback_count, 0);
+    let json =
+        serde_json::from_slice::<serde_json::Value>(&report.to_json_bytes().unwrap()).unwrap();
+    assert_eq!(json["state_policy"], "append");
+    assert_eq!(json["committed_state_position"], 2);
+    assert_eq!(json["successful_runs"][0]["committed_state_position"], 1);
     let before = mock.calls().len();
     assert!(session.run(&invocation(2, vec![10.0, 11.0, 12.0])).is_err());
     assert_eq!(mock.calls().len(), before);
     assert_eq!(session.successful_run_count(), 2);
+    assert_eq!(scoreboard.report().unwrap(), report);
     assert!(!mock.calls().iter().any(|call| call.starts_with("copy:")));
+}
+
+#[test]
+fn metal_append_scoreboard_reports_packed_constants_exactly() {
+    let packed = packed_ones(GgmlType::Q4_0, 2);
+    let packed_bytes = packed.bytes().len();
+    let mut graph = Graph::new();
+    let activation = graph.input_dtype("activation", [1, 32], DType::F32);
+    let weight = graph.input_dtype("weight", [2, 32], DType::F32);
+    let transposed = graph.permute(weight, [1, 0]).unwrap();
+    let updates = graph.matmul(activation, transposed).unwrap();
+    let state = graph.input_dtype("cache", [2, 2], DType::F32);
+    let (position, index) = append_position(&mut graph, "position", [1, 2]);
+    let next = graph.scatter(state, index, updates, 0).unwrap();
+    let requested = graph.square(next).unwrap();
+    let capture = CapturedAppendStateInference::from_graph_residents(
+        &graph,
+        &[requested],
+        &[InferenceAppendStateLink::new(
+            state, next, position, index, updates, 0,
+        )],
+        BTreeMap::from([("cache".into(), TensorData::zeros([2, 2]).unwrap())]),
+        BTreeMap::new(),
+        &[QuantizedCaptureBinding::Matmul {
+            output: updates,
+            activation,
+            weight,
+            value: packed,
+        }],
+        &[],
+    )
+    .unwrap();
+    let plan =
+        MetalAppendStateInferencePlan::new(capture, MetalRenderer::new(8, capabilities()).unwrap())
+            .unwrap();
+    let summary = plan.summary().clone();
+    assert_eq!(summary.constant_count, 0);
+    assert_eq!(summary.constant_bytes, 0);
+    assert_eq!(summary.quantized_constant_count, 1);
+    assert_eq!(summary.quantized_constant_bytes, packed_bytes);
+    let mut scoreboard = MetalSessionScoreboard::new_append_state(
+        MetalScoreboardContext::new("packed-append", "test-revision", "semantic mock").unwrap(),
+        &plan,
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock)).unwrap();
+    scoreboard.bind(&session).unwrap();
+    let run = session
+        .run(&BTreeMap::from([
+            (
+                "activation".into(),
+                TensorData::new([1, 32], vec![1.0; 32]).unwrap(),
+            ),
+            (
+                "position".into(),
+                TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap(),
+            ),
+        ]))
+        .unwrap();
+    scoreboard.record(&run).unwrap();
+    let report = scoreboard.report().unwrap();
+    assert_eq!(report.captured_constant_count, summary.constant_count);
+    assert_eq!(report.captured_constant_bytes, summary.constant_bytes);
+    assert_eq!(
+        report.captured_quantized_constant_count,
+        summary.quantized_constant_count
+    );
+    assert_eq!(
+        report.captured_quantized_constant_bytes,
+        summary.quantized_constant_bytes
+    );
+    assert_eq!(
+        report.resident_host_api_h2d_bytes,
+        report.captured_quantized_constant_bytes
+    );
+    assert_eq!(report.initial_state_host_api_h2d_bytes, 16);
+    assert_eq!(
+        report
+            .captured_constant_bytes
+            .checked_add(report.captured_quantized_constant_bytes)
+            .unwrap(),
+        packed_bytes
+    );
+    assert!(
+        report.planned_physical_static_tensor_slot_bytes
+            >= report.captured_quantized_constant_bytes
+    );
+    let encoded = report.to_json_bytes().unwrap();
+    assert_eq!(encoded, report.to_json_bytes().unwrap());
+    let json = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
+    assert_eq!(json["state_policy"], "append");
+    assert_eq!(json["captured_constant_count"], 0);
+    assert_eq!(json["captured_constant_bytes"], 0);
+    assert_eq!(json["captured_quantized_constant_count"], 1);
+    assert_eq!(
+        json["captured_quantized_constant_bytes"],
+        u64::try_from(packed_bytes).unwrap()
+    );
 }
 
 #[test]
@@ -1152,10 +1328,15 @@ fn metal_append_state_empty_rows_are_addressless_but_advance_logically() {
     assert_eq!(plan.summary().state_bank_count, 1);
     assert_eq!(plan.summary().state_device_bytes, 0);
     assert_eq!(plan.summary().append_state_work_items, 0);
+    let mut scoreboard = MetalSessionScoreboard::new_append_state(
+        MetalScoreboardContext::new("empty-append", "test-revision", "semantic mock").unwrap(),
+        &plan,
+    );
     let mock = Arc::new(MockDispatch::default());
     let device = test_device(mock.clone());
     mock.clear_calls();
     let mut session = plan.prepare(device).unwrap();
+    scoreboard.bind(&session).unwrap();
     assert!(mock.calls().is_empty());
     let values = BTreeMap::from([
         (
@@ -1172,6 +1353,15 @@ fn metal_append_state_empty_rows_are_addressless_but_advance_logically() {
     assert_eq!(run.report().transient_h2d_calls, 0);
     assert_eq!(run.report().transient_h2d_bytes, 0);
     assert_eq!(run.report().kernel_launch_count, 0);
+    scoreboard.record(&run).unwrap();
+    let report = scoreboard.report().unwrap();
+    assert_eq!(report.committed_state_position, Some(1));
+    assert_eq!(report.initial_state_host_api_h2d_calls, 0);
+    assert_eq!(report.host_api_h2d_calls, 0);
+    assert_eq!(report.host_api_d2h_calls, 0);
+    assert_eq!(report.kernel_launch_count, 0);
+    assert_eq!(report.committed_state_bytes, 0);
+    assert_eq!(report.committed_state_work_items, 0);
     assert!(mock.calls().is_empty());
 }
 
