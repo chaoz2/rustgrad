@@ -35,6 +35,9 @@ impl std::error::Error for RangeifyError {}
 /// Computed producers deliberately remain an explicit materialization boundary.
 pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
     fn go(g: &Graph, n: NodeId) -> Result<(NodeId, AffineView), RangeifyError> {
+        let n = g
+            .contiguous_backward_owner(n)
+            .map_err(|_| RangeifyError::Invalid)?;
         match g.op(n).map_err(|_| RangeifyError::Invalid)? {
             Op::Input { .. } | Op::Constant(_) => {
                 let s = g.shape(n).map_err(|_| RangeifyError::Invalid)?.clone();
@@ -123,6 +126,9 @@ fn computed_view_seeded(
         n: NodeId,
         seed: Option<(NodeId, &AffineView)>,
     ) -> Result<(NodeId, AffineView), RangeifyError> {
+        let n = g
+            .contiguous_backward_owner(n)
+            .map_err(|_| RangeifyError::Invalid)?;
         if let Some((source, view)) = seed
             && n == source
         {
@@ -521,6 +527,9 @@ pub(crate) fn projected_view(
         coordinates: Vec<UOp>,
         range: &UOp,
     ) -> Result<(NodeId, UOp, Option<UOp>), RangeifyError> {
+        let node = graph
+            .contiguous_backward_owner(node)
+            .map_err(|_| RangeifyError::Invalid)?;
         match graph.op(node).map_err(|_| RangeifyError::Invalid)? {
             Op::Shrink { input, bounds } => {
                 let coordinates = coordinates

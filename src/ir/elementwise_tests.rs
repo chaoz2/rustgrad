@@ -12983,6 +12983,8 @@ fn tinygrad_contiguous_backward_has_distinct_reverse_rule_and_atomic_admission()
     );
     assert_eq!(graph.shape(boundary).unwrap(), &Shape::new([2, 1]));
     assert!(graph.requires_grad(boundary).unwrap());
+    let repeated = graph.contiguous_backward(boundary).unwrap();
+    assert_eq!(graph.contiguous_backward_owner(repeated).unwrap(), squared);
 
     let seed_input = graph.input_dtype_requires_grad("seed", [1, 2], DType::F32, false);
     let seed = graph.permute(seed_input, [1, 0]).unwrap();
@@ -12994,6 +12996,11 @@ fn tinygrad_contiguous_backward_has_distinct_reverse_rule_and_atomic_admission()
         .position(|node| matches!(node.op, Op::Contiguous { input: source } if source == seed))
         .map(|position| NodeId::from_index(before + position))
         .expect("contiguous-backward cotangent copy");
+    let second_seed = graph.input_dtype_requires_grad("second_seed", [2, 1], DType::F32, false);
+    let second_order = graph
+        .grad_with(gradient, input, Some(second_seed), true)
+        .unwrap();
+    assert_eq!(graph.shape(second_order).unwrap(), &Shape::from([2, 1]));
     let scheduled = crate::schedule(&graph, cotangent_copy).unwrap();
     assert_eq!(scheduled.items.len(), 1);
     assert!(matches!(

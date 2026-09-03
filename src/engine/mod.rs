@@ -135,7 +135,10 @@ impl RequestedOutputPlan {
         let mut ordered = Vec::with_capacity(requested.len());
         let mut retained_sources = HashMap::new();
         let mut aliases = BTreeMap::new();
-        for &node in requested {
+        for &requested_node in requested {
+            let node = graph
+                .contiguous_backward_owner(requested_node)
+                .map_err(|error| RealizationError::Schedule(error.to_string()))?;
             let shape = graph
                 .shape(node)
                 .map_err(|error| RealizationError::Schedule(error.to_string()))?
@@ -313,20 +316,25 @@ fn canonical_sort_item_owns(
                 && actual.read_only == read_only
                 && actual.view.is_none()
         };
-    let owner_matches = matches!(
-        graph.op(item.node),
+    let owner_matches = match graph.op(item.node) {
         Ok(Op::Sort {
             input,
             axis,
             descending,
             pair,
             output: crate::SortOutput::Values,
-        }) if *input == plan.source().node
-            && *axis == plan.axis()
-            && *descending == plan.descending()
-            && *pair == plan.pair()
-            && item.node == plan.values().node
-    );
+        }) => {
+            graph
+                .contiguous_backward_owner(*input)
+                .map_err(|error| RealizationError::Schedule(error.to_string()))?
+                == plan.source().node
+                && *axis == plan.axis()
+                && *descending == plan.descending()
+                && *pair == plan.pair()
+                && item.node == plan.values().node
+        }
+        _ => false,
+    };
     let payload_matches = payload.input == plan.source().node
         && payload.input_shape == plan.source().shape
         && payload.axis == plan.axis()
@@ -725,9 +733,17 @@ pub fn realize_with_options(
     let policy = options.backend;
     validate_realization_inputs(graph, schedule, inputs)?;
     let mut requested_plan = RequestedOutputPlan::new(graph, schedule, requested, inputs)?;
+    let requested_owners = requested
+        .iter()
+        .map(|node| {
+            graph
+                .contiguous_backward_owner(*node)
+                .map_err(|error| RealizationError::Schedule(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let memory_plan = MemoryPlan::from_schedule(
         schedule,
-        requested,
+        &requested_owners,
         options.memory_reuse == MemoryReuse::Enabled,
     )
     .map_err(RealizationError::Memory)?;
@@ -1338,6 +1354,9 @@ mod tests {
         let one = graph.constant(TensorData::scalar(1.0));
         let left = graph.add(shared, one).unwrap();
         let right = graph.mul(shared, one).unwrap();
+        let right_boundary = graph.contiguous_backward(right).unwrap();
+        let repeated_boundary = graph.contiguous_backward(right_boundary).unwrap();
+        let source_boundary = graph.contiguous_backward(source).unwrap();
         let empty = graph.input_dtype("empty", Shape::from([0]), DType::U32);
         let raw_source =
             TensorData::from_storage([2], Storage::BF16(vec![0x8000, 0x7fc1])).unwrap();
@@ -1353,7 +1372,14 @@ mod tests {
         assert_eq!(direct.outputs[0].storage(), raw_source.storage());
         assert_eq!(direct.outputs[1].storage(), raw_empty.storage());
         assert_eq!(direct.outputs[0].storage(), direct.outputs[3].storage());
-        let requested = [right, source, left, right, empty, one];
+        let requested = [
+            repeated_boundary,
+            source_boundary,
+            left,
+            right_boundary,
+            empty,
+            one,
+        ];
 
         let realized = CpuBackend
             .execute_many(&graph, &requested, &inputs)
@@ -1679,6 +1705,7 @@ mod tests {
         shadow_output.id = y.index() as u64;
         item.outputs = crate::ScheduledOutputs::single(shadow_output);
         item.cache_key = crate::schedule::item_cache_key(item).unwrap();
+        shadow.requested_materializations = vec![y.index() as u64];
         shadow.validate().unwrap();
         assert!(matches!(
             realize(
@@ -1728,6 +1755,7 @@ mod tests {
         tampered.items[0].kernel = other.items[0].kernel.clone();
         tampered.items[0].outputs = other.items[0].outputs.clone();
         tampered.items[0].cache_key = crate::schedule::item_cache_key(&tampered.items[0]).unwrap();
+        tampered.requested_materializations = other.requested_materializations.clone();
         tampered.validate().unwrap();
         assert_eq!(tampered.items[0].node, values);
         assert_ne!(tampered.items[0].node, other_values);

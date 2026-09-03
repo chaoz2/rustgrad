@@ -289,15 +289,21 @@ pub fn lower_graph_threefry(graph: &Graph, output: NodeId) -> std::result::Resul
     else {
         return Err(UOpError::InvalidArgument);
     };
+    let counter = graph
+        .contiguous_backward_owner(*counter)
+        .map_err(|_| UOpError::InvalidArgument)?;
+    let key = graph
+        .contiguous_backward_owner(*key)
+        .map_err(|_| UOpError::InvalidArgument)?;
     let value = crate::ThreefryValue {
-        counter: *counter,
-        key: *key,
+        counter,
+        key,
         counter_shape: graph
-            .shape(*counter)
+            .shape(counter)
             .map_err(|_| UOpError::UseBeforeDefinition)?
             .clone(),
         key_shape: graph
-            .shape(*key)
+            .shape(key)
             .map_err(|_| UOpError::UseBeforeDefinition)?
             .clone(),
         output,
@@ -1250,12 +1256,15 @@ pub fn lower_graph_prefix_scan(
     else {
         return Err(UOpError::InvalidArgument);
     };
+    let input = graph
+        .contiguous_backward_owner(*input)
+        .map_err(|_| UOpError::InvalidArgument)?;
     Ok(UOp::from_operation(
         Operation::PrefixScan(PrefixScanValue {
-            input: *input,
+            input,
             destination: output,
             input_shape: graph
-                .shape(*input)
+                .shape(input)
                 .map_err(|_| UOpError::UseBeforeDefinition)?
                 .clone(),
             output_shape: graph
@@ -1266,7 +1275,7 @@ pub fn lower_graph_prefix_scan(
             kind: *kind,
             output: *scan_output,
             input_dtype: graph
-                .dtype(*input)
+                .dtype(input)
                 .map_err(|_| UOpError::UseBeforeDefinition)?,
             dtype: graph
                 .dtype(output)
@@ -1326,8 +1335,11 @@ pub fn lower_graph_sort_pair(
     {
         return Err(UOpError::InvalidArgument);
     }
+    let input = graph
+        .contiguous_backward_owner(*input)
+        .map_err(|_| UOpError::InvalidArgument)?;
     let input_shape = graph
-        .shape(*input)
+        .shape(input)
         .map_err(|_| UOpError::UseBeforeDefinition)?
         .clone();
     if graph
@@ -1350,7 +1362,7 @@ pub fn lower_graph_sort_pair(
         .map_err(|_| UOpError::UseBeforeDefinition)?;
     Ok(UOp::from_operation(
         Operation::Sort(SortValue {
-            input: *input,
+            input,
             input_shape,
             axis: *axis,
             descending: *descending,
@@ -1373,8 +1385,11 @@ pub fn lower_graph_tensor_guard(
     else {
         return Err(UOpError::InvalidArgument);
     };
+    let input = graph
+        .contiguous_backward_owner(*input)
+        .map_err(|_| UOpError::InvalidArgument)?;
     let input_shape = graph
-        .shape(*input)
+        .shape(input)
         .map_err(|_| UOpError::UseBeforeDefinition)?
         .clone();
     let dtype = graph
@@ -1382,7 +1397,7 @@ pub fn lower_graph_tensor_guard(
         .map_err(|_| UOpError::UseBeforeDefinition)?;
     Ok(UOp::from_operation(
         Operation::TensorGuard(TensorGuardValue {
-            input: *input,
+            input,
             input_shape,
             axis: *axis,
             dtype,

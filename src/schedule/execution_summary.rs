@@ -64,7 +64,15 @@ impl ExecutionPlanSummary {
     ) -> Result<Self, ExecutionPlanSummaryError> {
         let schedule =
             schedule_many(graph, requested).map_err(ExecutionPlanSummaryError::Schedule)?;
-        Self::from_schedule(&schedule, requested, reuse_enabled)
+        let owners = requested
+            .iter()
+            .map(|node| {
+                graph
+                    .contiguous_backward_owner(*node)
+                    .map_err(|_| ExecutionPlanSummaryError::RequestedOutput(*node))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_schedule(&schedule, &owners, reuse_enabled)
     }
 
     /// Summarizes an already constructed schedule without constructing a

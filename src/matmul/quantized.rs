@@ -438,6 +438,12 @@ mod tests {
             assert!(
                 crate::Schedule {
                     items: decoded.items.clone(),
+                    requested_materializations:
+                        crate::schedule::physical_requested_materializations(
+                            &decoded.items,
+                            &decoded.requested_passthroughs,
+                            decoded.requested.iter().copied(),
+                        ),
                     requested_passthroughs: decoded.requested_passthroughs.clone(),
                     value_bindings: vec![],
                     state_bindings: vec![],

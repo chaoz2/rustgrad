@@ -695,12 +695,203 @@ fn contiguous_redirection_preserves_requested_shared_specialized_and_external_pr
     let backward = backward_graph.contiguous_backward(input).unwrap();
     let copied = backward_graph.contiguous(backward).unwrap();
     let backward_schedule = schedule(&backward_graph, copied).unwrap();
-    assert_eq!(backward_schedule.items.len(), 2);
+    assert_eq!(backward_schedule.items.len(), 1);
     assert!(
         backward_schedule
             .items
             .iter()
-            .any(|item| item.node == backward)
+            .all(|item| item.node != backward)
+    );
+    assert!(matches!(
+        backward_schedule.items[0].kernel.operation(),
+        crate::Operation::Movement(crate::MovementValue::Plan(plan))
+            if matches!(
+                &plan.kind,
+                crate::MovementKernelKind::Contiguous { input: operand }
+                    if operand.node == input
+            )
+    ));
+}
+
+#[test]
+fn contiguous_backward_never_owns_schedule_storage_or_direct_payloads() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 2], DType::F32);
+    let constant = graph.constant(TensorData::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap());
+    let computed = graph.add(input, constant).unwrap();
+    let first = graph.contiguous_backward(computed).unwrap();
+    let second = graph.contiguous_backward(first).unwrap();
+    let consumer = graph.neg(second).unwrap();
+    let product = graph.matmul(second, constant).unwrap();
+
+    let scheduled = schedule_many(&graph, &[second, consumer, product, second]).unwrap();
+    scheduled.validate().unwrap();
+    assert!(scheduled.items.iter().all(|item| {
+        item.node != first
+            && item.node != second
+            && item.outputs.iter().all(|output| {
+                output.id != first.index() as u64 && output.id != second.index() as u64
+            })
+            && item
+                .ordered_inputs()
+                .iter()
+                .all(|binding| binding.input_node != first && binding.input_node != second)
+    }));
+    let matmul = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == product)
+        .expect("matmul schedule item");
+    let crate::Operation::Matmul(_) = matmul.kernel.operation() else {
+        panic!("direct matmul payload")
+    };
+    assert!(
+        matmul
+            .ordered_inputs()
+            .iter()
+            .any(|binding| binding.input_node == computed)
+    );
+
+    let terminal = schedule(&graph, second).unwrap();
+    assert_eq!(terminal.items.len(), 1);
+    assert_eq!(terminal.items[0].node, computed);
+    assert!(terminal.items[0].consumers.is_empty());
+    assert!(terminal.internal_temporaries(&[second]).is_empty());
+    let terminal_memory = crate::MemoryPlan::from_schedule(&terminal, &[second], true).unwrap();
+    assert!(terminal_memory.requests.is_empty());
+    assert!(terminal_memory.temporaries.is_empty());
+
+    let later_shared = graph.square(consumer).unwrap();
+    let later_left = graph.neg(later_shared).unwrap();
+    let later_right = graph.add(later_shared, constant).unwrap();
+    let retained = schedule_many(&graph, &[second, consumer, later_left, later_right]).unwrap();
+    let retained_ids = retained
+        .requested_materializations
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(retained_ids.contains(&(computed.index() as u64)));
+    assert!(retained_ids.contains(&(consumer.index() as u64)));
+    assert!(!retained_ids.contains(&(later_shared.index() as u64)));
+    let retained_temporaries =
+        retained.internal_temporaries(&[second, consumer, later_left, later_right]);
+    assert_eq!(
+        retained_temporaries
+            .iter()
+            .map(|output| output.id)
+            .collect::<Vec<_>>(),
+        vec![later_shared.index() as u64]
+    );
+    assert_eq!(
+        crate::MemoryPlan::from_schedule(
+            &retained,
+            &[second, consumer, later_left, later_right],
+            true,
+        )
+        .unwrap()
+        .temporaries
+        .iter()
+        .map(|temporary| temporary.buffer_id)
+        .collect::<Vec<_>>(),
+        vec![later_shared.index() as u64]
+    );
+    let mut missing_owner = retained.clone();
+    missing_owner
+        .requested_materializations
+        .retain(|buffer| *buffer != computed.index() as u64);
+    assert!(matches!(
+        crate::CapturedSchedule::capture(
+            &graph,
+            &missing_owner,
+            &[second, consumer, later_left, later_right],
+        ),
+        Err(crate::ReplayError::Corrupt(reason))
+            if reason == "requested materialization inventory is inconsistent"
+    ));
+
+    let (values, indices) = graph.sort(input, 1, false).unwrap();
+    let requested_values = graph.contiguous_backward(values).unwrap();
+    let values_consumer = graph.neg(values).unwrap();
+    let sort_later_shared = graph.square(values_consumer).unwrap();
+    let sort_later_left = graph.neg(sort_later_shared).unwrap();
+    let sort_later_right = graph.add(sort_later_shared, constant).unwrap();
+    let coupled = schedule_many(
+        &graph,
+        &[requested_values, indices, sort_later_left, sort_later_right],
+    )
+    .unwrap();
+    let sort = coupled
+        .items
+        .iter()
+        .find(|item| matches!(item.kernel.operation(), crate::Operation::Sort(_)))
+        .unwrap();
+    assert_eq!(sort.outputs.len(), 2);
+    assert_eq!(sort.outputs.primary().id, values.index() as u64);
+    assert_eq!(
+        sort.outputs.iter().nth(1).unwrap().id,
+        indices.index() as u64
+    );
+    assert!(!sort.consumers.is_empty());
+    assert!(
+        coupled
+            .requested_materializations
+            .contains(&(values.index() as u64))
+    );
+    assert!(
+        coupled
+            .requested_materializations
+            .contains(&(indices.index() as u64))
+    );
+    assert!(
+        crate::MemoryPlan::from_schedule(
+            &coupled,
+            &[requested_values, indices, sort_later_left, sort_later_right,],
+            true,
+        )
+        .unwrap()
+        .temporaries
+        .iter()
+        .all(|temporary| {
+            temporary.buffer_id != values.index() as u64
+                && temporary.buffer_id != indices.index() as u64
+        })
+    );
+    assert!(
+        coupled
+            .internal_temporaries(&[requested_values, indices, sort_later_left, sort_later_right,])
+            .iter()
+            .any(|temporary| temporary.id == sort_later_shared.index() as u64)
+    );
+
+    let requested_source = graph.contiguous_backward(input).unwrap();
+    let requested_constant = graph.contiguous_backward(constant).unwrap();
+    let sources = schedule_many(&graph, &[requested_source, requested_constant]).unwrap();
+    assert!(sources.items.is_empty());
+    assert!(sources.requested_passthroughs.is_empty());
+
+    let external = schedule_with_external_materializations(&graph, &[consumer], &[second]).unwrap();
+    assert_eq!(external.items.len(), 1);
+    assert_eq!(external.items[0].external_materializations, vec![computed]);
+    assert_eq!(external.items[0].ordered_inputs()[0].input_node, computed);
+
+    let viewed = graph.permute(second, [1, 0]).unwrap();
+    let copied = graph.contiguous(viewed).unwrap();
+    let movement = schedule(&graph, copied).unwrap();
+    assert!(
+        movement
+            .items
+            .iter()
+            .all(|item| item.node != first && item.node != second)
+    );
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+        movement.items.last().unwrap().kernel.operation()
+    else {
+        panic!("contiguous view movement")
+    };
+    assert!(
+        plan.input_operands()
+            .iter()
+            .all(|operand| operand.node != first && operand.node != second)
     );
 }
 
@@ -3100,6 +3291,7 @@ fn scheduled_outputs_are_nonempty_ordered_and_define_cache_identity() {
 
     let live = crate::Schedule {
         items: vec![single],
+        requested_materializations: vec![],
         requested_passthroughs: vec![],
         value_bindings: vec![],
         state_bindings: vec![],

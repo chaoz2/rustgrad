@@ -829,6 +829,53 @@ mod tests {
         invocation
     }
 
+    #[test]
+    fn symbolic_program_canonicalizes_contiguous_backward_requested_ownership() {
+        let rows = SymbolicExpr::variable("rows", 0, 3).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let computed = graph.square(input).unwrap();
+        let first = graph.contiguous_backward(computed).unwrap();
+        let requested = graph.contiguous_backward(first).unwrap();
+        let schedule = crate::schedule_many(&graph, &[requested, requested]).unwrap();
+        assert!(
+            schedule
+                .items
+                .iter()
+                .all(|item| item.node != first && item.node != requested)
+        );
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[requested, requested],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![rows.into(), 2usize.into()]),
+            )])),
+            &BTreeMap::from([("rows".into(), 2)]),
+        )
+        .unwrap();
+        assert_eq!(capture.requested, vec![computed.index() as u64; 2]);
+        let program = CpuSymbolicProgram::new(capture).unwrap();
+        for count in [0usize, 1, 3] {
+            let input = TensorData::new(
+                [count, 2],
+                (0..count * 2).map(|index| index as f32 - 1.5).collect(),
+            )
+            .unwrap();
+            let outputs = program
+                .run(invocation(
+                    [("rows", count as i64)],
+                    BTreeMap::from([("input".into(), input)]),
+                ))
+                .unwrap()
+                .into_outputs();
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(outputs[0].shape(), &Shape::from([count, 2]));
+            assert_eq!(outputs[0].storage(), outputs[1].storage());
+        }
+    }
+
     fn projected_family(
         tokens: usize,
     ) -> (

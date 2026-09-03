@@ -61,12 +61,18 @@ impl MatmulKernelPlan {
         else {
             return Err(MatmulPlanError::NotMatmul);
         };
+        let lhs = graph
+            .contiguous_backward_owner(*lhs)
+            .map_err(|_| MatmulPlanError::InvalidGeometry)?;
+        let rhs = graph
+            .contiguous_backward_owner(*rhs)
+            .map_err(|_| MatmulPlanError::InvalidGeometry)?;
         let lhs_shape = graph
-            .shape(*lhs)
+            .shape(lhs)
             .map_err(|_| MatmulPlanError::InvalidGeometry)?
             .clone();
         let rhs_shape = graph
-            .shape(*rhs)
+            .shape(rhs)
             .map_err(|_| MatmulPlanError::InvalidGeometry)?
             .clone();
         let geometry = geometry(&lhs_shape, &rhs_shape)?;
@@ -74,12 +80,12 @@ impl MatmulKernelPlan {
             .output_shape
             .numel()
             .map_err(|_| MatmulPlanError::Overflow)?;
-        let lhs_dtype = graph.dtype(*lhs).map_err(|_| MatmulPlanError::DType)?;
-        let rhs_dtype = graph.dtype(*rhs).map_err(|_| MatmulPlanError::DType)?;
+        let lhs_dtype = graph.dtype(lhs).map_err(|_| MatmulPlanError::DType)?;
+        let rhs_dtype = graph.dtype(rhs).map_err(|_| MatmulPlanError::DType)?;
         let dtype = lhs_dtype.promote(rhs_dtype);
         let mut p = Self {
-            lhs: *lhs,
-            rhs: *rhs,
+            lhs,
+            rhs,
             output,
             lhs_shape,
             rhs_shape,

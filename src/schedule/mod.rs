@@ -10,8 +10,8 @@ use std::{
 /// Graph operands whose scheduled payload ABI names the exact dense NodeId.
 /// These operations cannot reconstruct an intervening computed alias through
 /// the ordinary scalar IndexView path.
-fn op_direct_payload_operands(op: &Op) -> Vec<NodeId> {
-    match op {
+fn op_direct_payload_operands(graph: &Graph, op: &Op) -> Result<Vec<NodeId>, ScheduleError> {
+    let operands = match op {
         Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
         Op::PrefixScan { input, .. } | Op::Sort { input, .. } | Op::TensorGuard { input, .. } => {
             vec![*input]
@@ -27,7 +27,15 @@ fn op_direct_payload_operands(op: &Op) -> Vec<NodeId> {
             .flatten()
             .collect(),
         _ => Vec::new(),
-    }
+    };
+    operands
+        .into_iter()
+        .map(|node| {
+            graph
+                .contiguous_backward_owner(node)
+                .map_err(ScheduleError::Graph)
+        })
+        .collect()
 }
 pub mod artifact;
 pub(crate) mod dynamic;
@@ -274,6 +282,11 @@ pub struct ScheduleItem {
 #[derive(Clone, Debug)]
 pub struct Schedule {
     pub items: Vec<ScheduleItem>,
+    /// Sorted unique physical output IDs retained by the caller's requested
+    /// graph values. This inventory survives graph-visible forward aliases so
+    /// graph-independent allocation planning never treats an escaping owner
+    /// as reusable scratch.
+    pub requested_materializations: Vec<u64>,
     /// Zero-kernel requested aliases of one immutable or scheduled owner.
     pub requested_passthroughs: Vec<RequestedPassthrough>,
     /// Explicit edges from a materialized pure output to an effect STORE
@@ -371,6 +384,29 @@ pub(crate) fn validate_item_output_bindings(item: &ScheduleItem) -> Result<(), S
     Ok(())
 }
 
+pub(crate) fn physical_requested_materializations(
+    items: &[ScheduleItem],
+    passthroughs: &[RequestedPassthrough],
+    requested: impl IntoIterator<Item = u64>,
+) -> Vec<u64> {
+    let produced = items
+        .iter()
+        .flat_map(|item| item.outputs.iter().map(|output| output.id))
+        .collect::<BTreeSet<_>>();
+    requested
+        .into_iter()
+        .filter(|buffer| produced.contains(buffer))
+        .chain(
+            passthroughs
+                .iter()
+                .map(|passthrough| passthrough.desc.id)
+                .filter(|buffer| produced.contains(buffer)),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 impl Schedule {
     /// Validates deterministic DAG and universal effect-item invariants before
     /// a backend is allowed to inspect a kernel.
@@ -427,6 +463,32 @@ impl Schedule {
                     ));
                 }
             }
+        }
+        if self
+            .requested_materializations
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+            || self
+                .requested_materializations
+                .iter()
+                .any(|buffer| !output_producers.contains_key(buffer))
+        {
+            return Err(ScheduleError::Binding(
+                "requested materialization inventory is not canonical".into(),
+            ));
+        }
+        let requested_materializations = self
+            .requested_materializations
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if self.requested_passthroughs.iter().any(|passthrough| {
+            output_producers.contains_key(&passthrough.desc.id)
+                && !requested_materializations.contains(&passthrough.desc.id)
+        }) {
+            return Err(ScheduleError::Binding(
+                "requested passthrough owner is not retained".into(),
+            ));
         }
         self.validate_dag_edges(&ids)?;
         for item in &self.items {
@@ -546,13 +608,20 @@ impl Schedule {
         Ok(())
     }
     /// Returns only compiler-owned outputs that can become candidates for a
-    /// future allocator. Requested outputs and external identities are kept
-    /// out of this list, so a planner cannot accidentally reuse them.
+    /// future allocator. The schedule's canonical requested-materialization
+    /// inventory, legacy caller IDs, external identities, and every output of
+    /// a consumerless terminal item are kept out of this list, so a planner
+    /// cannot accidentally reuse a value that escapes the schedule. Terminal
+    /// protection remains a conservative defense for manually constructed
+    /// schedules; the inventory protects requested owners that also have
+    /// consumers without requiring this graph-independent boundary to recover
+    /// graph-visible aliases.
     pub fn internal_temporaries(&self, requested: &[NodeId]) -> Vec<BufferDesc> {
         let mut requested = requested
             .iter()
             .map(|node| node.index() as u64)
             .collect::<BTreeSet<_>>();
+        requested.extend(self.requested_materializations.iter().copied());
         requested.extend(
             self.requested_passthroughs
                 .iter()
@@ -560,6 +629,7 @@ impl Schedule {
         );
         self.items
             .iter()
+            .filter(|item| !item.consumers.is_empty())
             .flat_map(|item| item.outputs.iter())
             .filter(|output| !requested.contains(&output.id))
             .cloned()
@@ -848,6 +918,7 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
     }
     let schedule = Schedule {
         items,
+        requested_materializations: vec![],
         requested_passthroughs: vec![],
         value_bindings: vec![],
         state_bindings: vec![],
@@ -2329,12 +2400,15 @@ pub fn schedule_with_external_materializations(
 ) -> Result<Schedule, ScheduleError> {
     let mut external = BTreeSet::new();
     for node in materialized {
+        let node = graph
+            .contiguous_backward_owner(*node)
+            .map_err(ScheduleError::Graph)?;
         if !external.insert(node.index()) {
             return Err(ScheduleError::Binding(
                 "duplicate external materialization".into(),
             ));
         }
-        match graph.op(*node).map_err(ScheduleError::Graph)? {
+        match graph.op(node).map_err(ScheduleError::Graph)? {
             Op::Input { .. } | Op::Constant(_) => {
                 return Err(ScheduleError::Binding(
                     "external materialization must be computed".into(),
@@ -2343,10 +2417,12 @@ pub fn schedule_with_external_materializations(
             _ => {}
         }
     }
-    if outputs
-        .iter()
-        .any(|output| external.contains(&output.index()))
-    {
+    if outputs.iter().try_fold(false, |found, output| {
+        graph
+            .contiguous_backward_owner(*output)
+            .map(|owner| found || external.contains(&owner.index()))
+            .map_err(ScheduleError::Graph)
+    })? {
         return Err(ScheduleError::Binding(
             "requested output cannot be external".into(),
         ));
@@ -2361,6 +2437,9 @@ pub fn schedule_with_external_materializations(
         external: &BTreeSet<usize>,
         seen: &mut BTreeSet<usize>,
     ) -> Result<bool, ScheduleError> {
+        let node = graph
+            .contiguous_backward_owner(node)
+            .map_err(ScheduleError::Graph)?;
         if !seen.insert(node.index()) {
             return Ok(false);
         }
@@ -2466,11 +2545,29 @@ fn schedule_many_with_external(
     if outputs.is_empty() {
         return Ok(Schedule {
             items: vec![],
+            requested_materializations: vec![],
             requested_passthroughs: vec![],
             value_bindings: vec![],
             state_bindings: vec![],
         });
     }
+    let outputs = outputs
+        .iter()
+        .map(|node| {
+            graph
+                .contiguous_backward_owner(*node)
+                .map_err(ScheduleError::Graph)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let external = external
+        .iter()
+        .map(|index| {
+            graph
+                .contiguous_backward_owner(NodeId::from_index(*index))
+                .map(NodeId::index)
+                .map_err(ScheduleError::Graph)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
     let mut needed = BTreeSet::new();
     let mut consumers = vec![0usize; graph.node_count()];
     fn mark(
@@ -2487,6 +2584,9 @@ fn schedule_many_with_external(
             return Ok(());
         }
         let mut child = |child: NodeId| -> Result<(), ScheduleError> {
+            let child = g
+                .contiguous_backward_owner(child)
+                .map_err(ScheduleError::Graph)?;
             consumers[child.index()] += 1;
             mark(g, child, needed, consumers, external)
         };
@@ -2569,9 +2669,9 @@ fn schedule_many_with_external(
         };
         Ok(())
     }
-    for output in outputs {
+    for output in &outputs {
         graph.op(*output).map_err(ScheduleError::Graph)?;
-        mark(graph, *output, &mut needed, &mut consumers, external)?;
+        mark(graph, *output, &mut needed, &mut consumers, &external)?;
     }
     // Sort selectors are one coupled producer. Preserve the user-requested
     // node as an observable output while making its sibling available to the
@@ -2605,7 +2705,7 @@ fn schedule_many_with_external(
     let requested: BTreeSet<usize> = outputs.iter().map(|id| id.index()).collect();
     let mut requested_passthroughs = Vec::new();
     let mut requested_passthrough_ids = BTreeSet::new();
-    for &requested_node in outputs {
+    for &requested_node in &outputs {
         if requested_passthrough_ids.contains(&requested_node.index())
             || matches!(
                 graph.op(requested_node).map_err(ScheduleError::Graph)?,
@@ -2648,12 +2748,15 @@ fn schedule_many_with_external(
     // requested alias could otherwise publish its producer directly.
     let direct_payload_operands = needed
         .iter()
-        .flat_map(|index| {
-            graph
+        .map(|index| {
+            let op = graph
                 .op(NodeId::from_index(*index))
-                .map(op_direct_payload_operands)
-                .unwrap_or_default()
+                .map_err(ScheduleError::Graph)?;
+            op_direct_payload_operands(graph, op)
         })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .map(NodeId::index)
         .filter(|index| {
             !matches!(
@@ -2847,7 +2950,7 @@ fn schedule_many_with_external(
                 .iter()
                 .chain(&requested)
                 .chain(&requested_passthrough_sources)
-                .chain(external)
+                .chain(&external)
                 .filter(|nested| **nested != *root && **nested != *reduction)
                 .all(|nested| {
                     crate::kernel::reduction_epilogue_node_uses(
@@ -2902,7 +3005,7 @@ fn schedule_many_with_external(
             }
         }
         let Some(fusion) =
-            rehearse_reduction_epilogue(graph, root, reduction, &roots, external, &candidates)
+            rehearse_reduction_epilogue(graph, root, reduction, &roots, &external, &candidates)
         else {
             continue;
         };
@@ -2937,7 +3040,7 @@ fn schedule_many_with_external(
             root,
             rehearsal.reduction,
             &roots,
-            external,
+            &external,
             &candidates,
         ) else {
             continue;
@@ -2993,7 +3096,7 @@ fn schedule_many_with_external(
                     node,
                     &ScalarAliasOwnership {
                         roots: &roots,
-                        external,
+                        external: &external,
                         requested: &requested,
                         consumers: &consumers,
                         protected: &scalar_alias_reserved,
@@ -3019,7 +3122,7 @@ fn schedule_many_with_external(
                     graph,
                     NodeId::from_index(root),
                     &roots,
-                    external,
+                    &external,
                 )?;
                 if !loads.is_empty() {
                     next_reserved.insert(root);
@@ -3063,7 +3166,7 @@ fn schedule_many_with_external(
             // root ownership. Specialized roots lower as a load of `producer` and
             // are rejected below; ordinary scalar DAGs lower to one checked Store.
             let Some(redirection) = checked_contiguous_redirection(
-                graph, node, &roots, external, &requested, &consumers,
+                graph, node, &roots, &external, &requested, &consumers,
             )?
             else {
                 continue;
@@ -3287,7 +3390,7 @@ fn schedule_many_with_external(
                     graph,
                     roots: &roots,
                     owner: index,
-                    external,
+                    external: &external,
                     allow_projected: policy.allow_projected,
                 }
                 .visit(node, &mut leaf_ids, &mut boundary)?,
@@ -3300,7 +3403,7 @@ fn schedule_many_with_external(
             .copied()
             .collect::<BTreeSet<_>>();
         let materialized = materialized
-            .union(external)
+            .union(&external)
             .copied()
             .collect::<BTreeSet<_>>();
         let mut inputs = leaf_ids
@@ -3475,8 +3578,14 @@ fn schedule_many_with_external(
                 .push(item.id);
         }
     }
+    let requested_materializations = physical_requested_materializations(
+        &items,
+        &requested_passthroughs,
+        outputs.iter().map(|node| node.index() as u64),
+    );
     let schedule = Schedule {
         items,
+        requested_materializations,
         requested_passthroughs,
         value_bindings: vec![],
         state_bindings: vec![],
@@ -3617,6 +3726,7 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
     item.cache_key = item_cache_key(&item)?;
     Ok(Schedule {
         items: vec![item],
+        requested_materializations: vec![output.index() as u64],
         requested_passthroughs: vec![],
         value_bindings: vec![],
         state_bindings: vec![],

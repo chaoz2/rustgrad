@@ -2977,6 +2977,7 @@ impl Graph {
         values: NodeId,
         indices: NodeId,
     ) -> Option<(Shape, DType, usize, bool, u64)> {
+        let source = self.contiguous_backward_owner(source).ok()?;
         let values_node = self.node(values).ok()?;
         let (axis, descending, pair) = match &values_node.op {
             Op::Sort {
@@ -2985,7 +2986,9 @@ impl Graph {
                 descending,
                 pair,
                 output: SortOutput::Values,
-            } if *input == source => (*axis, *descending, *pair),
+            } if self.contiguous_backward_owner(*input).ok()? == source => {
+                (*axis, *descending, *pair)
+            }
             _ => return None,
         };
         let source_node = self.node(source).ok()?;
@@ -3007,7 +3010,7 @@ impl Graph {
                 descending: candidate_descending,
                 pair: candidate_pair,
                 output: SortOutput::Indices,
-            } if *input == source
+            } if self.contiguous_backward_owner(*input).ok() == Some(source)
                 && *candidate_axis == axis
                 && *candidate_descending == descending
                 && *candidate_pair == pair
@@ -3025,7 +3028,7 @@ impl Graph {
                     descending: candidate_descending,
                     pair: candidate_pair,
                     output,
-                } if *input == source
+                } if self.contiguous_backward_owner(*input).ok() == Some(source)
                     && *candidate_axis == axis
                     && *candidate_descending == descending
                     && *candidate_pair == pair
@@ -5616,6 +5619,29 @@ impl Graph {
 
     pub fn dtype(&self, id: NodeId) -> Result<DType> {
         Ok(self.node(id)?.dtype)
+    }
+
+    /// Returns the sole physical forward owner beneath zero or more
+    /// `ContiguousBackward` autograd boundaries.
+    ///
+    /// The boundary stays graph-visible so reverse mode can insert its
+    /// `Contiguous` cotangent copy, but tinygrad removes it before range and
+    /// allocation planning.  Keep that ownership normalization in one
+    /// checked seam: only this exact identity operation may disappear, and
+    /// every wrapper must preserve the source descriptor and graph order.
+    pub(crate) fn contiguous_backward_owner(&self, id: NodeId) -> Result<NodeId> {
+        let mut current = id;
+        loop {
+            let node = self.node(current)?;
+            let Op::ContiguousBackward { input } = &node.op else {
+                return Ok(current);
+            };
+            let source = self.node(*input)?;
+            debug_assert!(input.index() < current.index());
+            debug_assert_eq!(source.shape, node.shape);
+            debug_assert_eq!(source.dtype, node.dtype);
+            current = *input;
+        }
     }
 
     /// Read-only tinygrad `Tensor.nbytes()`: concrete element count times

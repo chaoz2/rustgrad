@@ -786,6 +786,9 @@ impl From<MovementPlanError> for MovementExecutionError {
 
 impl MovementOperand {
     fn from_graph(graph: &Graph, node: NodeId) -> Result<Self, MovementPlanError> {
+        let node = graph
+            .contiguous_backward_owner(node)
+            .map_err(|_| MovementPlanError::InvalidGeometry)?;
         Ok(Self {
             node,
             shape: graph
@@ -1042,19 +1045,23 @@ impl MovementKernelPlan {
             .op(output)
             .map_err(|_| MovementPlanError::InvalidGeometry)?
         {
-            Op::Contiguous { input }
+            Op::Contiguous { input } => {
+                let input = graph
+                    .contiguous_backward_owner(*input)
+                    .map_err(|_| MovementPlanError::InvalidGeometry)?;
                 if matches!(
-                    graph.op(*input),
+                    graph.op(input),
                     Ok(Op::Shrink { .. }
                         | Op::Reshape { .. }
                         | Op::Permute { .. }
                         | Op::Expand { .. }
                         | Op::Stride { .. })
-                ) =>
-            {
-                *input
+                ) {
+                    input
+                } else {
+                    return Err(MovementPlanError::NotMovement);
+                }
             }
-            Op::Contiguous { .. } => return Err(MovementPlanError::NotMovement),
             _ => return Err(MovementPlanError::NotMovement),
         };
         let rangeified = match crate::rangeify::static_view(graph, input) {
