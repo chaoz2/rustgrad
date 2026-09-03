@@ -386,4 +386,6 @@ mod native_tests;
 #[cfg(test)]
 mod packed_tests;
 #[cfg(test)]
+pub(crate) use packed_tests::models as packed_metal_fixture_models;
+#[cfg(test)]
 mod workflow_tests;

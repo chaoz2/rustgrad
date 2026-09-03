@@ -7,7 +7,7 @@ use super::blocks::{
     decode_q6_k_block, decode_q8_0_block,
 };
 use crate::{GgmlLayout, GgmlType, Shape, TensorData};
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 /// Descriptor for a read-only packed GGML buffer. It deliberately has no
 /// `DType`: block quantization is a physical encoding, not a scalar dtype.
@@ -73,7 +73,7 @@ impl QuantizedBufferDesc {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct QuantizedTensorData {
     desc: QuantizedBufferDesc,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,7 +176,10 @@ impl QuantizedTensorData {
             identity: 0,
         };
         desc.identity = identity(&desc, &bytes);
-        let value = Self { desc, bytes };
+        let value = Self {
+            desc,
+            bytes: bytes.into(),
+        };
         value.validate()?;
         Ok(value)
     }
@@ -209,7 +212,7 @@ impl QuantizedTensorData {
     fn from_aligned_bytes_unchecked_identity(
         ggml_type: GgmlType,
         logical_shape: Shape,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
         alignment: usize,
     ) -> Result<Self, QuantizedError> {
         if alignment == 0

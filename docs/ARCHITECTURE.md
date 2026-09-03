@@ -48,7 +48,7 @@ src/
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
   tokenizer/             GGUF SimpleTokenizer metadata binding and byte-level coding
   models/
-    transformer/         validated dense-Llama GGUF model and graph execution
+    transformer/         validated dense/packed-Llama GGUF model and graph execution
       decoder.rs         typed graph planning and CPU semantic-oracle execution
       cache.rs           transactional single-sequence KV cache ownership
       layer.rs           authoritative dense block Graph composition
@@ -2616,14 +2616,21 @@ cannot mutate the scoreboard. Stateful and append-state scoreboard
 binding/schema is an explicit follow-up rather than an implicit extension of
 the v2 report.
 
-The dense F32 Llama token-step layer uses the same boundary without adding a
-model-specific runtime. A crate-private exact resident projection captures each
-GGUF weight by graph node, name, descriptor, and bytes; tied logits reuse the
-single token-embedding owner. One precomputed F32 RoPE table is resident. Two
-host-range-validated native Gather items consume I32 `[1,1]` token and `[1]`
-position inputs for embedding and RoPE lookup. Capture authenticates each
-scalar source through only its value-preserving reshape/expand lineage, so
-these two exact owners render without a status read or provisional candidate.
+The dense-or-packed F32 Llama token-step layer uses the same boundary without
+adding a model-specific runtime. A crate-private capture projection
+authenticates every GGUF weight by graph node, name, logical descriptor, and
+payload. Dense weights remain immutable resident inputs. Exact Q4_0, Q8_0,
+Q4_K, and Q6_K embedding and projection placeholders are replaced only when
+their graph and scheduled owners prove the literal row-Gather or
+transpose-plus-Matmul composition; the resulting item carries the existing
+typed packed ABI. Mixed models retain both ownership classes, and tied logits
+reuse one packed token-embedding allocation through two authenticated kernel
+bindings. One precomputed F32 RoPE table is resident. Dense embedding and RoPE
+lookups use host-range-validated native Gather items over I32 `[1,1]` token and
+`[1]` position inputs. A packed embedding instead uses the existing direct
+quantized row-Gather, while RoPE remains the sole host-Gather. Both routes
+validate their scalar indices before driver work and need no provisional
+candidate or status read.
 Each layer materializes one dense
 `[1, kv_heads, 1, head_dim]` key row and value row, then authenticated raw
 Scatter-replace owners append them in place to one fixed
@@ -2634,6 +2641,11 @@ position before driver work. Only `[1, vocab]` logits cross device-to-host.
 Position, row-byte/work metrics, state, and output publish only after every layer's K/V
 append and logits succeed, so a partial failure retries and overwrites the same
 uncommitted row without a full-state copy.
+
+Packed bytes are immutable `Arc<[u8]>` payloads: model, capture, and prepared
+session ownership clone handles rather than full weights. Capture identity
+still hashes exact content and descriptors, and preparation uploads each
+unique packed owner once even when tied bindings reference it more than once.
 
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, mutable training state, dynamically
@@ -2723,8 +2735,12 @@ portable CPU/native reference's f64 accumulator: comparisons are finite F32
 tolerance contracts, never bitwise-parity claims. The bounded direct-renderer
 acceptance uses absolute error `max(1e-5, K * 1e-5)`; widening that contract
 requires a renderer-identity revision and new numerical evidence. There is no
-hidden full-weight dequantization, CPU fallback, Llama deployment substitution,
-prefill, decode, generator, or live-device-performance claim in this slice.
+hidden full-weight dequantization or CPU fallback. The fixed batch-one Llama
+token-step deployment substitutes these exact packed plans for embedding,
+every q/k/v/o and gated-FFN projection, and explicit or tied output projection.
+Sequential callers may reuse that one T=1 session for prefill and decode;
+chunk prefill, final-only prefill logits, generator wiring, and
+live-device-performance evidence remain outside this slice.
 
 Devices are returned in deterministic registry-ID/name order with capability
 metadata in renderer and pipeline cache identities. Resources are deliberately

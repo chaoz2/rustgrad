@@ -185,18 +185,19 @@ impl CapturedInference {
             .into_iter()
             .collect::<BTreeMap<_, _>>();
 
-        Self::from_graph_residents_impl(graph, requested, module_bindings, false)
+        Self::from_graph_residents_impl(graph, requested, module_bindings, false, &[])
     }
 
-    /// Captures an exact graph-owned resident inventory. Unlike module
-    /// traversal, this internal model-composition seam requires every
-    /// declared name/node/value triple to remain an input of the capture.
+    /// Captures an exact graph-owned dense and packed resident inventory.
+    /// Unlike module traversal, this internal model-composition seam requires
+    /// every declared owner to remain an input of the capture.
     pub(crate) fn from_graph_residents(
         graph: &Graph,
         requested: &[NodeId],
         residents: BTreeMap<String, (NodeId, TensorData)>,
+        quantized: &[crate::engine::capture::QuantizedCaptureBinding],
     ) -> std::result::Result<Self, CapturedInferenceError> {
-        Self::from_graph_residents_impl(graph, requested, residents, true)
+        Self::from_graph_residents_impl(graph, requested, residents, true, quantized)
     }
 
     fn from_graph_residents_impl(
@@ -204,10 +205,17 @@ impl CapturedInference {
         requested: &[NodeId],
         mut residents: BTreeMap<String, (NodeId, TensorData)>,
         require_complete_inventory: bool,
+        quantized: &[crate::engine::capture::QuantizedCaptureBinding],
     ) -> std::result::Result<Self, CapturedInferenceError> {
         let schedule = schedule_many(graph, requested).map_err(CapturedInferenceError::Schedule)?;
-        let capture = CapturedSchedule::capture(graph, &schedule, requested)
-            .map_err(CapturedInferenceError::Capture)?;
+        let capture = if quantized.is_empty() {
+            CapturedSchedule::capture(graph, &schedule, requested)
+        } else {
+            CapturedSchedule::capture_with_quantized_bindings(
+                graph, &schedule, requested, quantized,
+            )
+        }
+        .map_err(CapturedInferenceError::Capture)?;
         let execution_plan = ExecutionPlanSummary::from_capture(&capture, true)
             .map_err(CapturedInferenceError::Summary)?;
 
@@ -608,6 +616,7 @@ impl CapturedAppendStateInference {
         state_links: &[InferenceAppendStateLink],
         initial_state: BTreeMap<String, TensorData>,
         residents: BTreeMap<String, (NodeId, TensorData)>,
+        quantized: &[crate::engine::capture::QuantizedCaptureBinding],
         host_gathers: &[&str],
     ) -> std::result::Result<Self, CapturedInferenceError> {
         Self::from_graph_with_capture(
@@ -616,7 +625,9 @@ impl CapturedAppendStateInference {
             state_links,
             initial_state,
             host_gathers,
-            |combined| CapturedInference::from_graph_residents(graph, combined, residents),
+            |combined| {
+                CapturedInference::from_graph_residents(graph, combined, residents, quantized)
+            },
         )
     }
 
@@ -1910,6 +1921,7 @@ mod tests {
             &graph,
             &[output],
             BTreeMap::from([("resident".into(), (resident, value.clone()))]),
+            &[],
         )
         .unwrap();
         assert_eq!(captured.resident_bindings()["resident"], value);
@@ -1920,6 +1932,7 @@ mod tests {
                 &graph,
                 &[output],
                 BTreeMap::from([("resident".into(), (collision, value.clone()))]),
+                &[],
             ),
             Err(CapturedInferenceError::Binding(reason))
                 if reason.contains("node identity mismatch")
@@ -1932,6 +1945,7 @@ mod tests {
                     ("resident".into(), (resident, value.clone())),
                     ("unused".into(), (collision, value)),
                 ]),
+                &[],
             ),
             Err(CapturedInferenceError::Binding(reason))
                 if reason.contains("absent from captured ownership")

@@ -35,6 +35,12 @@ fn q4_1_decodes_affine_low_high_lanes_and_checked_packed_extent() {
     assert_eq!(packed.descriptor().block_elements, 32);
     assert_eq!(packed.descriptor().block_bytes, 20);
     assert_eq!(packed.descriptor().bytes, 40);
+    let shared = packed.clone();
+    assert!(std::ptr::eq(
+        packed.bytes().as_ptr(),
+        shared.bytes().as_ptr()
+    ));
+    shared.validate().unwrap();
     let materialized = packed.dequantize_f32().unwrap();
     assert_eq!(materialized.values().len(), 64);
     assert_eq!(&materialized.values()[..32], expected.as_slice());
