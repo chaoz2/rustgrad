@@ -1,6 +1,6 @@
 //! Thread-confined safe Metal resources, caches, launch preflight, and events.
 use super::{
-    MetalBuffer, MetalDeviceInfo, MetalError, RenderedMetal,
+    MetalBuffer, MetalDeviceInfo, MetalError, MetalRenderer, RenderedMetal,
     buffer::{BufferSnapshot, PhysicalBuffer},
     dispatch::{
         CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawCommand, RawDevice, RawLibrary,
@@ -104,6 +104,15 @@ impl MetalRuntime {
             Err(error) => Err(error),
         }
     }
+
+    /// Selects one device by its deterministic registry-ID/name ordering.
+    /// Discovery creates no queue, pipeline, buffer, or command resource.
+    pub fn device(&self, index: usize) -> Result<MetalDevice, MetalError> {
+        self.devices()?
+            .into_iter()
+            .nth(index)
+            .ok_or(MetalError::InvalidArgument("device index is out of range"))
+    }
 }
 
 pub(super) struct DeviceInner {
@@ -152,6 +161,12 @@ impl MetalDevice {
     /// Returns the stable Rust owner identity.
     pub fn owner_id(&self) -> u64 {
         self.inner.owner
+    }
+
+    /// Creates a resource-free renderer for this device's exact capabilities.
+    /// The launch threadgroup width remains explicit caller policy.
+    pub fn renderer(&self, local_size: usize) -> Result<MetalRenderer, MetalError> {
+        MetalRenderer::new(local_size, self.info().capabilities.clone())
     }
 
     /// Creates a retained command queue owned by this device.

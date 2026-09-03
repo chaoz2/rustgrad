@@ -2524,8 +2524,10 @@ does not alter program or renderer cache identity. `MetalInferencePlan` consumes
 that resource-free snapshot, exposes the capture, logical plan, rendered items,
 and Metal resource summary, and delegates preparation and execution unchanged
 to `MetalDeviceSessionPlan`/`MetalDeviceSession`. Module mutation after capture
-cannot change the frozen deployment; device discovery and selection remain
-explicit.
+cannot change the frozen deployment. `MetalRuntime::device(index)` selects from
+the same deterministic registry-ID/name ordering as full discovery, while
+`MetalDevice::renderer(local_size)` carries that device's exact capabilities
+into a resource-free renderer without choosing the caller's launch width.
 
 The plan exposes exact typed input schemas, every rendered schedule item,
 nonzero compiled-kernel cache keys, planned slot bytes including private
@@ -2553,7 +2555,9 @@ loaded runtime with no process-visible GPU yields `MetalDiscovery::NoDevices`.
 It creates no queue or executable resource. This matters on managed macOS
 processes where hardware inventory can report Metal support without granting a
 usable device to the current process; live smokes are evidence only when this
-discovery step returns a device.
+discovery step returns a device. `MetalRuntime::device(index)` is the concise
+selection seam over that same ordered inventory; an absent inventory remains
+`NoDevices`, while an out-of-range nonempty selection is an invalid argument.
 
 `runtime/metal/mod.rs` is the facade for the first Apple Metal execution
 boundary. `ffi.rs` dynamically loads the Objective-C runtime, CoreGraphics, and

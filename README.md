@@ -80,42 +80,37 @@ layers:
 - [`examples/llama_prompt.rs`](examples/llama_prompt.rs)
 - [`examples/llama_chat.rs`](examples/llama_chat.rs)
 
-## Reuse a concrete capture on Metal
+## Reuse a static module on Metal
 
-The strict Metal device-session path keeps selected immutable inputs and
-intermediate slots resident across calls. Planning is resource-free and
-inspectable; unsupported captures return an error instead of using CPU
-fallback. Its plan summary exposes resident/transient schemas, kernels, planned
-device bytes, and a fixed fallback count of zero; successful preparation and
-run reports separate host wall-clock durations from host API copy counts. The
-current boundary is concrete pure captures, not general model inference yet.
+The strict Metal inference path freezes a module's capture-admitted parameters,
+keeps them and intermediate slots resident across calls, and stages only
+transient inputs. Device selection stays explicit, planning is resource-free
+and inspectable, and unsupported captures return an error instead of using CPU
+fallback. Reports distinguish host wall-clock observations from host API copy
+counts; they do not claim GPU timing or physical bus traffic.
 
 ```rust,no_run
-# use rustgrad::{CapturedSchedule, TensorData};
-# use rustgrad::runtime::metal::{MetalDeviceSessionPlan, MetalDiscovery, MetalRenderer, MetalRuntime};
-# use std::collections::BTreeMap;
-# fn captured_inference() -> CapturedSchedule { unimplemented!() }
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let runtime = MetalRuntime::load()?;
-let MetalDiscovery::Devices(mut devices) = runtime.discover()? else {
-    return Err("Metal is available, but this process sees no device".into());
-};
-let device = devices.remove(0);
-let renderer = MetalRenderer::new(64, device.info().capabilities.clone())?;
-let plan = MetalDeviceSessionPlan::from_capture(
-    captured_inference(),
-    ["weight".into()],
-    renderer,
-)?;
-let weight = TensorData::new([4], vec![1.0, 2.0, 3.0, 4.0])?;
-let mut session = plan.prepare(device, BTreeMap::from([("weight".into(), weight)]))?;
-let input = || TensorData::new([4], vec![1.0, 1.0, 1.0, 1.0]);
-let first = session.run(&BTreeMap::from([("input".into(), input()?)]))?;
-let second = session.run(&BTreeMap::from([("input".into(), input()?)]))?;
+use rustgrad::nn::Linear;
+use rustgrad::runtime::metal::{MetalInferencePlan, MetalRuntime};
+use rustgrad::{CapturedInference, DType, Graph, TensorData};
+use std::collections::BTreeMap;
+
+let device = MetalRuntime::load()?.device(0)?;
+let model = Linear::new_static(4, 2, true, 7)?;
+let mut graph = Graph::new();
+let features = graph.input_dtype("features", [1, 4], DType::F32);
+let scores = model.forward(&mut graph, features)?;
+let captured = CapturedInference::from_module_graph(&model, &graph, &[scores])?;
+let plan = MetalInferencePlan::new(captured, device.renderer(64)?)?;
+
+println!("plan: {:?}", plan.summary());
+let mut session = plan.prepare(device)?;
+let input = || TensorData::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]);
+let first = session.run(&BTreeMap::from([("features".into(), input()?)]))?;
+let second = session.run(&BTreeMap::from([("features".into(), input()?)]))?;
 assert_eq!(session.summary().fallback_count, 0);
 println!("{:?} {:?}", first.report(), second.report());
-# Ok(())
-# }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## How the system fits together
