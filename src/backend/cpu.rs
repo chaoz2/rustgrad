@@ -6155,11 +6155,12 @@ mod tests {
             data([5], &[1., 3., 4., 6., -1.])
         );
         assert!(
-            graph
-                .trace(selected)
-                .unwrap()
-                .to_string()
-                .contains("masked_select")
+            (0..graph.node_count())
+                .all(|index| !matches!(graph.op(NodeId(index)).unwrap(), Op::MaskedSelect { .. }))
+        );
+        assert!(
+            (0..graph.node_count())
+                .any(|index| matches!(graph.op(NodeId(index)).unwrap(), Op::PrefixScan { .. }))
         );
 
         let mut empty_graph = Graph::new();

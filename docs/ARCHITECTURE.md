@@ -370,12 +370,18 @@ CPU `nonzero` and `masked_select_dynamic`: the count-stage enum owns its typed
 bindings and has no side projection, sentinel capacity, or placeholder.
 Static and dynamic masked selection share one descriptor preflight for exact
 input/mask bytes, Bool right-broadcast geometry, inherited storage dtype, and
-any fixed output extent before either graph arena publishes a node. CPU
-materialization copies selected storage lanes directly, preserving all concrete
-integer/float widths, narrow NaN payloads, and signed zero. The fixed reverse
-rule composes row-major Arange, fixed compaction, Select, additive Scatter, and
-Reshape to route only retained cotangents; positions and the Bool mask remain
-non-value edges.
+any fixed output extent before either graph arena publishes a node. The fixed
+`Graph::masked_select` path clone-rehearses tinygrad's literal composition:
+broadcasted flat Bool ranks, lazy I32 scatter-add counts and their cumulative
+positions, a source-safe row-major Gather, and an independently weak fill
+Select narrowed once to the input dtype. It emits no new raw `MaskedSelect`
+node, inherits ordinary schedule/capture/native lowering, and preserves all
+concrete storage lanes. Its ordinary reverse graph follows only the selected
+input values; every mask, prefix rank, count, and gather index remains a
+non-value edge. The historical raw operation and its direct VJP remain only as
+an internal compatibility seam. Dynamic CPU materialization separately copies
+selected storage lanes directly, preserving all concrete integer/float widths,
+narrow NaN payloads, and signed zero.
 `RuntimeSchedule` is one validated topological instruction DAG. Count,
 allocation-resource, materialization, unary, binary, and reduction variants
 own their operands and results; `RuntimeValueDesc` distinguishes dynamic
@@ -599,12 +605,9 @@ algorithms, and live-device numeric validation remain fail-closed or unclaimed. 
 v18 schedule/capture identities are unchanged; only renderer source/cache keys
 distinguish the new accelerator programs. Legacy PrefixScan RGUA v11--v17
 payloads also fail closed because they cannot prove source dtype or destination
-identity. The fixed-size
-`MaskedSelect` reverse edge alone
-reuses its boolean prefix ranks as nondifferentiable control/index values to
-gather explicit upstream cotangents into retained row-major source lanes;
-padding, truncation, and false lanes are zeroed. This does not add a dynamic
-cardinality gradient path.
+identity. Fixed masked selection now consumes those prefix ranks only through
+the ordinary compositional graph described above; it adds neither a dedicated
+UOp nor a dynamic-cardinality gradient path.
 
 Each scheduled kernel retains immutable `ScheduleInputBinding` entries ordered
 by first lowered `Load` use (with repeated reads canonicalized), never by graph

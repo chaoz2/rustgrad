@@ -355,8 +355,9 @@ mod tests {
     impl ModuleForward for UnsupportedLater {
         fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
             let supported = graph.relu(input)?;
-            let mask = graph.gt_scalar(supported, Scalar::F(0.0))?;
-            graph.masked_select(supported, mask, 2, Scalar::F(0.0))
+            // Preserve a genuinely unsupported later schedule boundary now
+            // that fixed masked selection is an ordinary native composition.
+            graph.argmax(supported, Some(1), false)
         }
     }
 
