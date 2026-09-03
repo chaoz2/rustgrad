@@ -869,7 +869,7 @@ impl LinearKernel {
                     output_shape.clone(),
                     0usize,
                     true,
-                    *addressing == crate::IndexAddressing::Projected,
+                    *addressing != crate::IndexAddressing::Broadcast,
                 ),
                 Operation::Index(IndexValue::View {
                     buffer,

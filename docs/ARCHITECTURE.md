@@ -173,6 +173,19 @@ Gather/Scatter, dynamic geometry, and unspecialized symbolic execution remain
 separate fail-closed boundaries; renderer-private keys are the only identity
 change.
 
+When a source-literal Pad has canonical positive zero fill, an ordinary scalar
+or reduction owner may instead absorb the Pad together with its downstream
+static views. `rangeify/` emits one typed predicated Buffer index: its
+independently in-bounds projected address is paired with an exact Bool validity
+expression, and a false `Load` returns the destination dtype's canonical zero
+without touching memory. A zero-element source uses the narrower authenticated
+addressless form: address zero plus an exact constant-false predicate, so a
+populated padded output never invents a dereferenceable source element.
+Requested Pad outputs, nonzero fills, shared ownership, and every unproved
+composition retain the materializing movement plan. The captured interpreter
+and strict native C path execute this contract; PTX, OpenCL, Metal, WGSL,
+symbolic programs, and vector lanes reject it before resource work.
+
 `reduction_native.rs` is the single checked reduction recurrence boundary for
 CPU, capture, and native renderers. It derives exact source/accumulator/output
 dtypes from one scalar Init→Accumulate→Finalize chain, commits every step at
@@ -451,8 +464,9 @@ signed-stride chains lower as canonical `AffineView`/`ViewBufferIndex` through
 scheduling, interpretation, native CPU execution, and PTX rendering. Computed
 static non-affine movement chains consumed by ordinary elementwise or typed
 reduction kernels may instead lower through the checked projected-index address
-dialect; specialized, dynamic, symbolic, effectful, and unsupported chains stay
-explicit materialization boundaries. OpenCL, Metal, and WebGPU consume validated
+dialect. Canonical-zero Pad can additionally lower through its typed
+address-plus-validity form on CPU; specialized, dynamic, symbolic, effectful,
+and unsupported chains stay explicit materialization boundaries. OpenCL, Metal, and WebGPU consume validated
 signed affine maps with target-native signed address arithmetic. `CpuJitBackend` is an
 internal cached native-execution boundary with validated `ScheduleItem`
 preparation and invocation; replay never reconstructs a Graph.
@@ -2039,8 +2053,12 @@ This removes only the avoidable view copy: the computed producer remains an
 owned dependency and the consumer retains a fresh dense output. RGUA v21 is the
 first envelope that admits the typed projected-address declaration;
 older decoded operation bytes remain literal and pinned. Newly compiled
-projected schedule/cache identities use the canonical tree. Dynamic/symbolic
-shapes, effects and guarded fault transactions, unsupported index operations,
+projected schedule/cache identities use the canonical tree. RGUA v23 adds the
+three-source `IndexAddressing::Predicated` form `(buffer, address, valid)`;
+v22 remains exclusively the tag envelope, and historical v18/v21/v22 bytes are
+unchanged. False lanes produce canonical typed zero and cannot read either a
+safe placeholder address or the authenticated addressless empty-source form.
+Dynamic/symbolic shapes, effects and guarded fault transactions, unsupported index operations,
 excessive backend address width/depth, and specialized dense-operand kernels
 remain explicit boundaries rather than hidden host materializations.
 

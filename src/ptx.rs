@@ -808,6 +808,14 @@ fn render(
     let nodes = root
         .topological()
         .map_err(|e| PtxError::Unsupported(e.to_string()))?;
+    if nodes
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+    {
+        return Err(PtxError::Unsupported(
+            "predicated projected loads are outside PTX lowering".into(),
+        ));
+    }
     let store = root
         .sources()
         .iter()

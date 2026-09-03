@@ -366,6 +366,19 @@ pub(crate) fn build_schema(
             "symbolic capture has no multi-output schedule specialization".into(),
         ));
     }
+    for item in &schedule.items {
+        if item
+            .kernel
+            .topological()
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+        {
+            return Err(ReplayError::Unsupported(
+                "symbolic predicated indexing is unsupported".into(),
+            ));
+        }
+    }
     if spec.input_shapes.is_empty() && spec.constant_shapes.is_empty() {
         return Err(ReplayError::Symbolic(
             "symbolic capture requires at least one symbolic input or constant shape".into(),

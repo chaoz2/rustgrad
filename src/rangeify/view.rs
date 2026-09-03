@@ -17,6 +17,7 @@ pub(crate) struct RangeifiedView {
 pub(crate) struct RangeifiedProjection {
     pub source: NodeId,
     pub expression: UOp,
+    pub predicate: Option<UOp>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RangeifyError {
@@ -258,6 +259,55 @@ fn ibinary(operation: Binary, lhs: UOp, rhs: UOp) -> UOp {
     )
 }
 
+fn compare(operation: crate::CompareOp, lhs: UOp, rhs: UOp) -> UOp {
+    UOp::from_operation(
+        Operation::GraphCompare(operation),
+        Some(UType::scalar(DType::Bool)),
+        vec![lhs, rhs],
+    )
+}
+
+fn logical_and(lhs: UOp, rhs: UOp) -> UOp {
+    let constant = |value: &UOp| match value.operation() {
+        Operation::Const(crate::uop::LiteralValue::Scalar {
+            dtype: DType::Bool,
+            bits,
+        }) if value.sources().is_empty() && *bits <= 1 => Some(*bits != 0),
+        _ => None,
+    };
+    match (constant(&lhs), constant(&rhs)) {
+        (Some(false), _) | (_, Some(false)) => return bool_constant(false),
+        (Some(true), _) => return rhs,
+        (_, Some(true)) => return lhs,
+        _ => {}
+    }
+    UOp::from_operation(
+        Operation::GraphLogical(crate::LogicalOp::And),
+        Some(UType::scalar(DType::Bool)),
+        vec![lhs, rhs],
+    )
+}
+
+fn bool_constant(value: bool) -> UOp {
+    UOp::scalar_constant(DType::Bool, u64::from(value), UType::scalar(DType::Bool))
+}
+
+pub(crate) fn is_constant_zero_pad(graph: &Graph, node: NodeId) -> bool {
+    matches!(
+        graph.op(node),
+        Ok(Op::Pad {
+            fill: crate::Scalar::Bool(false) | crate::Scalar::I(0) | crate::Scalar::U(0),
+            ..
+        })
+    ) || matches!(
+        graph.op(node),
+        Ok(Op::Pad {
+            fill: crate::Scalar::F(value),
+            ..
+        }) if value.to_bits() == 0
+    )
+}
+
 fn checked_i64(value: usize) -> Result<i64, RangeifyError> {
     i64::try_from(value).map_err(|_| RangeifyError::Invalid)
 }
@@ -378,7 +428,7 @@ pub(crate) fn projected_view(
         node: NodeId,
         coordinates: Vec<UOp>,
         range: &UOp,
-    ) -> Result<(NodeId, UOp), RangeifyError> {
+    ) -> Result<(NodeId, UOp, Option<UOp>), RangeifyError> {
         match graph.op(node).map_err(|_| RangeifyError::Invalid)? {
             Op::Shrink { input, bounds } => {
                 let coordinates = coordinates
@@ -397,6 +447,61 @@ pub(crate) fn projected_view(
                     })
                     .collect::<Result<Vec<_>, RangeifyError>>()?;
                 go(graph, *input, coordinates, range)
+            }
+            Op::Pad { input, padding, .. } if is_constant_zero_pad(graph, node) => {
+                let input_shape = graph.shape(*input).map_err(|_| RangeifyError::Invalid)?;
+                if input_shape.rank() != coordinates.len() || padding.len() != coordinates.len() {
+                    return Err(RangeifyError::Unsupported(node));
+                }
+                if input_shape.dims().contains(&0) {
+                    // A source with no elements has no legal address, but a
+                    // canonical-zero Pad can still have a populated output.
+                    // Authenticate that case explicitly as an addressless
+                    // all-false load while still resolving the real storage
+                    // owner through any movement aliases below the Pad.
+                    let input_coordinates = vec![zero_from(range); input_shape.rank()];
+                    let (source, _, _) = go(graph, *input, input_coordinates, range)?;
+                    return Ok((source, zero_from(range), Some(bool_constant(false))));
+                }
+                let mut valid = None;
+                let coordinates = coordinates
+                    .into_iter()
+                    .zip(input_shape.dims())
+                    .zip(padding)
+                    .map(|((coordinate, dim), (before, _))| {
+                        let before = checked_i64(*before)?;
+                        let dim = checked_i64(*dim)?;
+                        let end = before.checked_add(dim).ok_or(RangeifyError::Invalid)?;
+                        let lower =
+                            compare(crate::CompareOp::Ge, coordinate.clone(), iconstant(before));
+                        let upper =
+                            compare(crate::CompareOp::Lt, coordinate.clone(), iconstant(end));
+                        let axis_valid = logical_and(lower, upper);
+                        valid = Some(match valid.take() {
+                            Some(previous) => logical_and(previous, axis_valid),
+                            None => axis_valid,
+                        });
+
+                        // The physical address is validated independently of
+                        // the lane predicate. Wrap every padded coordinate
+                        // into the nonempty source axis so even a false lane
+                        // carries an in-bounds, total integer expression.
+                        let shift = before
+                            .checked_add(dim - 1)
+                            .and_then(|value| value.checked_div(dim))
+                            .and_then(|value| value.checked_mul(dim))
+                            .ok_or(RangeifyError::Invalid)?;
+                        let shifted = ibinary(Binary::Add, coordinate, iconstant(shift - before));
+                        Ok(ibinary(Binary::Mod, shifted, iconstant(dim)))
+                    })
+                    .collect::<Result<Vec<_>, RangeifyError>>()?;
+                let (source, expression, child_valid) = go(graph, *input, coordinates, range)?;
+                let predicate = match (valid, child_valid) {
+                    (Some(lhs), Some(rhs)) => Some(logical_and(lhs, rhs)),
+                    (Some(value), None) | (None, Some(value)) => Some(value),
+                    (None, None) => None,
+                };
+                Ok((source, expression, predicate))
             }
             Op::Reshape { input, .. } => {
                 let output_shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
@@ -472,19 +577,45 @@ pub(crate) fn projected_view(
             }
             Op::Input { .. } | Op::Constant(_) => {
                 let shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
-                Ok((node, linearize_coordinates(shape, &coordinates, range)?))
+                Ok((
+                    node,
+                    linearize_coordinates(shape, &coordinates, range)?,
+                    None,
+                ))
             }
             _ => {
                 let shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
-                Ok((node, linearize_coordinates(shape, &coordinates, range)?))
+                Ok((
+                    node,
+                    linearize_coordinates(shape, &coordinates, range)?,
+                    None,
+                ))
             }
         }
     }
 
     let logical_shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
     let coordinates = logical_coordinates(logical_shape, output_shape, range)?;
-    let (source, expression) = go(graph, node, coordinates, range)?;
-    Ok(RangeifiedProjection { source, expression })
+    let (source, expression, predicate) = go(graph, node, coordinates, range)?;
+    Ok(RangeifiedProjection {
+        source,
+        expression,
+        predicate,
+    })
+}
+
+fn projection_for_output(
+    graph: &Graph,
+    node: NodeId,
+    output_shape: &Shape,
+) -> Result<RangeifiedProjection, RangeifyError> {
+    let extent = output_shape.numel().map_err(|_| RangeifyError::Invalid)?;
+    let range = UOp::from_operation(
+        Operation::Range(0),
+        Some(UType::scalar(DType::I64)),
+        vec![iconstant(checked_i64(extent)?)],
+    );
+    projected_view(graph, node, output_shape, &range)
 }
 
 pub(crate) fn projected_source(
@@ -492,13 +623,20 @@ pub(crate) fn projected_source(
     node: NodeId,
     output_shape: &Shape,
 ) -> Result<NodeId, RangeifyError> {
-    let extent = output_shape.numel().map_err(|_| RangeifyError::Invalid)?;
-    let range = UOp::from_operation(
-        Operation::Range(0),
-        Some(UType::scalar(DType::I64)),
-        vec![iconstant(checked_i64(extent)?)],
-    );
-    projected_view(graph, node, output_shape, &range).map(|projection| projection.source)
+    projection_for_output(graph, node, output_shape).map(|projection| projection.source)
+}
+
+pub(crate) fn predicated_source(
+    graph: &Graph,
+    node: NodeId,
+    output_shape: &Shape,
+) -> Result<NodeId, RangeifyError> {
+    let projection = projection_for_output(graph, node, output_shape)?;
+    projection
+        .predicate
+        .is_some()
+        .then_some(projection.source)
+        .ok_or(RangeifyError::Unsupported(node))
 }
 
 #[cfg(test)]
@@ -820,5 +958,111 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5, 4, 1, 0, 7, 6, 3, 2]
         );
+    }
+
+    #[test]
+    fn zero_pad_projects_total_addresses_with_exact_valid_lanes() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let padded = graph
+            .pad(input, [(1, 0), (0, 1)], crate::Scalar::F(0.0))
+            .unwrap();
+        let reversed = graph
+            .stride(
+                padded,
+                [
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(9)],
+        );
+        let projection = projected_view(&graph, reversed, &Shape::from([3, 3]), &range).unwrap();
+        assert_eq!(projection.source, input);
+        let ty = UType::scalar(DType::F32);
+        let index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: input.index() as u64,
+                elements: 4,
+                input_shape: Shape::from([2, 2]),
+                output_shape: Shape::from([3, 3]),
+                addressing: crate::IndexAddressing::Predicated,
+            }),
+            Some(ty),
+            vec![
+                UOp::from_operation(
+                    Operation::DefineGlobal(crate::uop::AddressValue {
+                        space: crate::uop::AddressSpace::Global,
+                        name: format!("b{}", input.index()),
+                        element: ty,
+                    }),
+                    Some(ty),
+                    vec![],
+                ),
+                projection.expression,
+                projection.predicate.unwrap(),
+            ],
+        );
+        let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).unwrap();
+        assert_eq!(
+            (0..9)
+                .map(|lane| plan.valid(lane).unwrap())
+                .collect::<Vec<_>>(),
+            vec![true, true, false, true, true, false, false, false, false]
+        );
+        assert!((0..9).all(|lane| plan.offset(lane).unwrap() < 4));
+
+        let empty = graph.input_dtype("empty", [0, 2], DType::F32);
+        let empty_pad = graph
+            .pad(empty, [(1, 0), (0, 0)], crate::Scalar::I(0))
+            .unwrap();
+        let empty_view = graph.permute(empty_pad, [1, 0]).unwrap();
+        let empty_range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(2)],
+        );
+        let empty_projection =
+            projected_view(&graph, empty_view, &Shape::from([2, 1]), &empty_range).unwrap();
+        assert_eq!(empty_projection.source, empty);
+        let empty_index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: empty.index() as u64,
+                elements: 0,
+                input_shape: Shape::from([0, 2]),
+                output_shape: Shape::from([2, 1]),
+                addressing: crate::IndexAddressing::Predicated,
+            }),
+            Some(ty),
+            vec![
+                UOp::from_operation(
+                    Operation::DefineGlobal(crate::uop::AddressValue {
+                        space: crate::uop::AddressSpace::Global,
+                        name: format!("b{}", empty.index()),
+                        element: ty,
+                    }),
+                    Some(ty),
+                    vec![],
+                ),
+                empty_projection.expression,
+                empty_projection.predicate.unwrap(),
+            ],
+        );
+        let empty_plan =
+            crate::projected_index::ProjectedIndexPlan::from_index(&empty_index).unwrap();
+        assert!((0..2).all(|lane| !empty_plan.valid(lane).unwrap()));
+        assert!((0..2).all(|lane| empty_plan.offset(lane).is_err()));
     }
 }

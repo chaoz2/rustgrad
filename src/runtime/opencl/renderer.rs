@@ -240,6 +240,14 @@ impl OpenClRenderer {
         let nodes = root
             .topological()
             .map_err(|error| OpenClError::Unsupported(error.to_string()))?;
+        if nodes
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+        {
+            return Err(OpenClError::Unsupported(
+                "predicated projected loads are outside OpenCL lowering".into(),
+            ));
+        }
         let uses_f16 = nodes
             .iter()
             .any(|node| node.ty().is_some_and(|ty| ty.scalar == DType::F16));

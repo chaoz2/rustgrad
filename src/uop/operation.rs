@@ -24,6 +24,10 @@ pub struct AddressValue {
 pub enum IndexAddressing {
     Broadcast,
     Projected,
+    /// An explicit projected address paired with a Bool validity expression.
+    /// Loads return the dtype's canonical zero when validity is false and must
+    /// not access the underlying buffer on that lane.
+    Predicated,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
