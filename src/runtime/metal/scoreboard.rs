@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use std::{collections::BTreeSet, fmt, fs, io, path::Path, rc::Rc, time::Duration};
 
 /// Current deterministic JSON schema emitted by [`MetalSessionScoreboardReport`].
-pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 1;
+pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 2;
 const MAX_METADATA_BYTES: usize = 1_024;
 
 /// Caller-supplied labels attached to one measurement series.
@@ -95,6 +95,51 @@ pub struct MetalHostWallTimeSummary {
     pub max: Duration,
 }
 
+/// Exact host-observed counters committed by one successful invocation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MetalScoreboardRun {
+    /// One-based successful invocation ordinal.
+    pub successful_invocation: u64,
+    /// Whether this was the session's first successfully published invocation.
+    pub first_successful_run: bool,
+    /// Host wall time covering validation, execution, and output projection.
+    pub run_wall_time: Duration,
+    /// Host wall time covering copies plus launch/wait calls.
+    pub synchronous_transaction_wall_time: Duration,
+    /// Per-invocation transient host API writes.
+    pub transient_host_api_h2d_calls: usize,
+    /// Per-invocation transient bytes passed to host API writes.
+    pub transient_host_api_h2d_bytes: usize,
+    /// Per-invocation retained-output host API reads.
+    pub retained_host_api_d2h_calls: usize,
+    /// Per-invocation retained-output bytes passed to host API reads.
+    pub retained_host_api_d2h_bytes: usize,
+    /// Nonzero schedule items launched by this invocation.
+    pub kernel_launch_count: usize,
+    /// Addressless schedule items skipped by this invocation.
+    pub zero_item_count: usize,
+    /// Logical outputs published after ordered projection.
+    pub output_count: usize,
+}
+
+impl MetalScoreboardRun {
+    fn from_report(report: &super::MetalDeviceRunReport) -> Self {
+        Self {
+            successful_invocation: report.successful_invocation,
+            first_successful_run: report.first_successful_run,
+            run_wall_time: report.run_wall_time,
+            synchronous_transaction_wall_time: report.synchronous_transaction_wall_time,
+            transient_host_api_h2d_calls: report.transient_h2d_calls,
+            transient_host_api_h2d_bytes: report.transient_h2d_bytes,
+            retained_host_api_d2h_calls: report.retained_d2h_calls,
+            retained_host_api_d2h_bytes: report.retained_d2h_bytes,
+            kernel_launch_count: report.kernel_launch_count,
+            zero_item_count: report.zero_item_count,
+            output_count: report.output_count,
+        }
+    }
+}
+
 /// Immutable snapshot of one recorder's exact successful-run prefix.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MetalSessionScoreboardReport {
@@ -130,6 +175,8 @@ pub struct MetalSessionScoreboardReport {
     pub planning_wall_time: Duration,
     /// Host wall time spent compiling, allocating, and creating the queue.
     pub native_prepare_wall_time: Duration,
+    /// Host wall time spent building cache-miss native libraries and pipelines.
+    pub cache_miss_pipeline_build_wall_time: Duration,
     /// Host wall time spent issuing immutable resident host API writes.
     pub resident_upload_host_wall_time: Duration,
     /// Host wall time for the first recorded successful run, if any.
@@ -144,10 +191,16 @@ pub struct MetalSessionScoreboardReport {
     pub steady_synchronous_transaction_host_wall_times: Vec<Duration>,
     /// Integer nearest-rank summary of steady transaction samples.
     pub steady_synchronous_transaction_host_wall_time_summary: Option<MetalHostWallTimeSummary>,
-    /// Physical tensor-slot count in the static memory plan.
-    pub planned_static_tensor_slot_count: usize,
-    /// Planned tensor-slot bytes, including private zero-byte sentinels.
-    pub planned_static_tensor_slot_bytes: usize,
+    /// Backend-neutral schedule item count before zero-domain admission.
+    pub logical_schedule_item_count: usize,
+    /// Peak simultaneously live logical temporary allocation count.
+    pub peak_logical_temporary_allocation_count: usize,
+    /// Peak simultaneously live logical temporary payload bytes.
+    pub peak_logical_temporary_bytes: usize,
+    /// Physical tensor-slot count in the Metal static memory plan.
+    pub planned_physical_static_tensor_slot_count: usize,
+    /// Planned physical Metal slot bytes, including private zero-byte sentinels.
+    pub planned_physical_static_tensor_slot_bytes: usize,
     /// Planned private sentinel handles for logical zero-byte values.
     pub planned_zero_byte_sentinel_count: usize,
     /// Nonzero schedule items expected to launch per run.
@@ -184,6 +237,8 @@ pub struct MetalSessionScoreboardReport {
     pub kernel_launch_count: usize,
     /// Addressless item skips across the recorded successful-run prefix.
     pub zero_item_count: usize,
+    /// Invocation-order exact counters for every recorded successful run.
+    pub successful_runs: Vec<MetalScoreboardRun>,
     /// Length of the recorded consecutive successful-run prefix.
     pub successful_run_count: u64,
     /// Strict execution fallback count, which is always zero for this path.
@@ -270,10 +325,13 @@ pub struct MetalSessionScoreboard {
     deployment_identity: u64,
     capture_identity: u64,
     execution_plan_identity: u64,
+    logical_schedule_item_count: usize,
+    peak_logical_temporary_allocation_count: usize,
+    peak_logical_temporary_bytes: usize,
     plan_summary: MetalDeviceSessionSummary,
     inputs: Vec<MetalScoreboardInput>,
     binding: Option<BoundScoreboard>,
-    runs: Vec<RecordedRun>,
+    runs: Vec<MetalScoreboardRun>,
     totals: RunTotals,
 }
 
@@ -281,10 +339,6 @@ struct BoundScoreboard {
     session_token: Rc<()>,
     device: MetalDeviceInfo,
     preparation: super::MetalDevicePreparationReport,
-}
-
-struct RecordedRun {
-    report: super::MetalDeviceRunReport,
 }
 
 impl MetalSessionScoreboard {
@@ -306,6 +360,9 @@ impl MetalSessionScoreboard {
             deployment_identity: plan.deployment_identity(),
             capture_identity: plan.capture().identity,
             execution_plan_identity: plan.execution_plan().identity,
+            logical_schedule_item_count: plan.execution_plan().schedule_item_count,
+            peak_logical_temporary_allocation_count: plan.execution_plan().peak_logical_allocations,
+            peak_logical_temporary_bytes: plan.execution_plan().peak_logical_bytes,
             plan_summary: plan.summary().clone(),
             inputs,
             binding: None,
@@ -353,11 +410,10 @@ impl MetalSessionScoreboard {
         if actual != expected || run.report().first_successful_run != (actual == 1) {
             return Err(MetalScoreboardError::OutOfOrder { expected, actual });
         }
+        let recorded = MetalScoreboardRun::from_report(run.report());
         let mut totals = self.totals.clone();
-        totals.add(run.report())?;
-        self.runs.push(RecordedRun {
-            report: run.report().clone(),
-        });
+        totals.add(&recorded)?;
+        self.runs.push(recorded);
         self.totals = totals;
         Ok(())
     }
@@ -369,30 +425,31 @@ impl MetalSessionScoreboard {
             .as_ref()
             .ok_or(MetalScoreboardError::NotBound)?;
         let preparation = &binding.preparation;
-        let first_run_host_wall_time = self.runs.first().map(|run| run.report.run_wall_time);
+        let totals = RunTotals::checked(&self.runs)?;
+        let first_run_host_wall_time = self.runs.first().map(|run| run.run_wall_time);
         let steady_run_host_wall_times = self
             .runs
             .iter()
             .skip(1)
-            .map(|run| run.report.run_wall_time)
+            .map(|run| run.run_wall_time)
             .collect::<Vec<_>>();
         let first_synchronous_transaction_host_wall_time = self
             .runs
             .first()
-            .map(|run| run.report.synchronous_transaction_wall_time);
+            .map(|run| run.synchronous_transaction_wall_time);
         let steady_synchronous_transaction_host_wall_times = self
             .runs
             .iter()
             .skip(1)
-            .map(|run| run.report.synchronous_transaction_wall_time)
+            .map(|run| run.synchronous_transaction_wall_time)
             .collect::<Vec<_>>();
         let host_api_h2d_calls = preparation
             .resident_h2d_calls
-            .checked_add(self.totals.transient_h2d_calls)
+            .checked_add(totals.transient_h2d_calls)
             .ok_or(MetalScoreboardError::Overflow)?;
         let host_api_h2d_bytes = preparation
             .resident_h2d_bytes
-            .checked_add(self.totals.transient_h2d_bytes)
+            .checked_add(totals.transient_h2d_bytes)
             .ok_or(MetalScoreboardError::Overflow)?;
         Ok(MetalSessionScoreboardReport {
             format_version: METAL_SESSION_SCOREBOARD_FORMAT_VERSION,
@@ -410,6 +467,7 @@ impl MetalSessionScoreboard {
             declared_transient_input_bytes: self.plan_summary.transient_input_bytes,
             planning_wall_time: preparation.planning_wall_time,
             native_prepare_wall_time: preparation.native_prepare_wall_time,
+            cache_miss_pipeline_build_wall_time: preparation.cache_miss_pipeline_build_wall_time,
             resident_upload_host_wall_time: preparation.initialization_upload_wall_time,
             first_run_host_wall_time,
             steady_run_host_wall_time_summary: wall_time_summary(&steady_run_host_wall_times),
@@ -419,8 +477,11 @@ impl MetalSessionScoreboard {
                 &steady_synchronous_transaction_host_wall_times,
             ),
             steady_synchronous_transaction_host_wall_times,
-            planned_static_tensor_slot_count: self.plan_summary.planned_slot_count,
-            planned_static_tensor_slot_bytes: self.plan_summary.planned_device_bytes,
+            logical_schedule_item_count: self.logical_schedule_item_count,
+            peak_logical_temporary_allocation_count: self.peak_logical_temporary_allocation_count,
+            peak_logical_temporary_bytes: self.peak_logical_temporary_bytes,
+            planned_physical_static_tensor_slot_count: self.plan_summary.planned_slot_count,
+            planned_physical_static_tensor_slot_bytes: self.plan_summary.planned_device_bytes,
             planned_zero_byte_sentinel_count: self.plan_summary.zero_byte_sentinel_count,
             planned_kernel_count: self.plan_summary.nonzero_item_count,
             planned_zero_item_count: self.plan_summary.zero_item_count,
@@ -429,16 +490,17 @@ impl MetalSessionScoreboard {
             pipeline_cache_miss_count: preparation.pipeline_cache_miss_count,
             resident_host_api_h2d_calls: preparation.resident_h2d_calls,
             resident_host_api_h2d_bytes: preparation.resident_h2d_bytes,
-            transient_host_api_h2d_calls: self.totals.transient_h2d_calls,
-            transient_host_api_h2d_bytes: self.totals.transient_h2d_bytes,
-            retained_host_api_d2h_calls: self.totals.retained_d2h_calls,
-            retained_host_api_d2h_bytes: self.totals.retained_d2h_bytes,
+            transient_host_api_h2d_calls: totals.transient_h2d_calls,
+            transient_host_api_h2d_bytes: totals.transient_h2d_bytes,
+            retained_host_api_d2h_calls: totals.retained_d2h_calls,
+            retained_host_api_d2h_bytes: totals.retained_d2h_bytes,
             host_api_h2d_calls,
             host_api_h2d_bytes,
-            host_api_d2h_calls: self.totals.retained_d2h_calls,
-            host_api_d2h_bytes: self.totals.retained_d2h_bytes,
-            kernel_launch_count: self.totals.kernel_launch_count,
-            zero_item_count: self.totals.zero_item_count,
+            host_api_d2h_calls: totals.retained_d2h_calls,
+            host_api_d2h_bytes: totals.retained_d2h_bytes,
+            kernel_launch_count: totals.kernel_launch_count,
+            zero_item_count: totals.zero_item_count,
+            successful_runs: self.runs.clone(),
             successful_run_count: u64::try_from(self.runs.len())
                 .map_err(|_| MetalScoreboardError::Overflow)?,
             fallback_count: self.plan_summary.fallback_count,
@@ -457,7 +519,15 @@ struct RunTotals {
 }
 
 impl RunTotals {
-    fn add(&mut self, report: &super::MetalDeviceRunReport) -> Result<(), MetalScoreboardError> {
+    fn checked(runs: &[MetalScoreboardRun]) -> Result<Self, MetalScoreboardError> {
+        let mut totals = Self::default();
+        for run in runs {
+            totals.add(run)?;
+        }
+        Ok(totals)
+    }
+
+    fn add(&mut self, report: &MetalScoreboardRun) -> Result<(), MetalScoreboardError> {
         macro_rules! checked_add {
             ($field:ident, $value:expr) => {
                 self.$field = self
@@ -466,10 +536,10 @@ impl RunTotals {
                     .ok_or(MetalScoreboardError::Overflow)?;
             };
         }
-        checked_add!(transient_h2d_calls, report.transient_h2d_calls);
-        checked_add!(transient_h2d_bytes, report.transient_h2d_bytes);
-        checked_add!(retained_d2h_calls, report.retained_d2h_calls);
-        checked_add!(retained_d2h_bytes, report.retained_d2h_bytes);
+        checked_add!(transient_h2d_calls, report.transient_host_api_h2d_calls);
+        checked_add!(transient_h2d_bytes, report.transient_host_api_h2d_bytes);
+        checked_add!(retained_d2h_calls, report.retained_host_api_d2h_calls);
+        checked_add!(retained_d2h_bytes, report.retained_host_api_d2h_bytes);
         checked_add!(kernel_launch_count, report.kernel_launch_count);
         checked_add!(zero_item_count, report.zero_item_count);
         Ok(())
@@ -591,17 +661,27 @@ mod tests {
             declared_transient_input_bytes: 16,
             planning_wall_time: Duration::new(0, 11),
             native_prepare_wall_time: Duration::new(0, 12),
+            cache_miss_pipeline_build_wall_time: Duration::new(0, 7),
             resident_upload_host_wall_time: Duration::new(0, 13),
             first_run_host_wall_time: Some(Duration::new(0, 20)),
             steady_run_host_wall_times: steady.clone(),
             steady_run_host_wall_time_summary: wall_time_summary(&steady),
             first_synchronous_transaction_host_wall_time: Some(Duration::new(0, 10)),
-            steady_synchronous_transaction_host_wall_times: vec![Duration::new(0, 4)],
+            steady_synchronous_transaction_host_wall_times: vec![
+                Duration::new(0, 4),
+                Duration::new(0, 3),
+                Duration::new(0, 2),
+            ],
             steady_synchronous_transaction_host_wall_time_summary: wall_time_summary(&[
                 Duration::new(0, 4),
+                Duration::new(0, 3),
+                Duration::new(0, 2),
             ]),
-            planned_static_tensor_slot_count: 2,
-            planned_static_tensor_slot_bytes: 32,
+            logical_schedule_item_count: 1,
+            peak_logical_temporary_allocation_count: 2,
+            peak_logical_temporary_bytes: 32,
+            planned_physical_static_tensor_slot_count: 2,
+            planned_physical_static_tensor_slot_bytes: 32,
             planned_zero_byte_sentinel_count: 0,
             planned_kernel_count: 1,
             planned_zero_item_count: 0,
@@ -620,6 +700,24 @@ mod tests {
             host_api_d2h_bytes: 32,
             kernel_launch_count: 4,
             zero_item_count: 0,
+            successful_runs: [(1, 20, 10), (2, 9, 4), (3, 1, 3), (4, 5, 2)]
+                .into_iter()
+                .map(
+                    |(successful_invocation, run_nanos, transaction_nanos)| MetalScoreboardRun {
+                        successful_invocation,
+                        first_successful_run: successful_invocation == 1,
+                        run_wall_time: Duration::new(0, run_nanos),
+                        synchronous_transaction_wall_time: Duration::new(0, transaction_nanos),
+                        transient_host_api_h2d_calls: 1,
+                        transient_host_api_h2d_bytes: 16,
+                        retained_host_api_d2h_calls: 1,
+                        retained_host_api_d2h_bytes: 8,
+                        kernel_launch_count: 1,
+                        zero_item_count: 0,
+                        output_count: 1,
+                    },
+                )
+                .collect(),
             successful_run_count: 4,
             fallback_count: 0,
         }
@@ -640,7 +738,7 @@ mod tests {
         let first = report.to_json_bytes().unwrap();
         assert_eq!(first, report.to_json_bytes().unwrap());
         let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(value["format_version"], 1);
+        assert_eq!(value["format_version"], 2);
         assert_eq!(value["workload"], "linear");
         assert_eq!(value["implementation_revision"], "abc123");
         assert_eq!(value["evidence"], "semantic mock");
@@ -648,6 +746,7 @@ mod tests {
         assert_eq!(value["planning_wall_time"]["nanos"], 11);
         assert_eq!(value["inputs"][0]["dtype"], "float");
         assert_eq!(value["deployment_identity"], 1);
+        assert_eq!(value["successful_runs"].as_array().unwrap().len(), 4);
         let path = std::env::temp_dir().join(format!(
             "rustgrad-metal-scoreboard-{}-{}.json",
             std::process::id(),

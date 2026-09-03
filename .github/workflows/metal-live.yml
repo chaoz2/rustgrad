@@ -24,8 +24,9 @@ jobs:
     env:
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       RUSTGRAD_METAL_EXPECTED_SHA: ${{ inputs.expected_sha }}
-      RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ runner.temp }}/metal-live-linear-scoreboard.json
-      RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH: ${{ runner.temp }}/metal-live-resnet18-scoreboard.json
+      RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-linear-scoreboard.json
+      RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-resnet18-scoreboard.json
+      RUSTGRAD_METAL_RESNET_RUNS: "10"
     steps:
       - name: Validate requested revision
         shell: bash
@@ -56,11 +57,15 @@ jobs:
         uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
         with:
           toolchain: 1.89.0
-      - name: Run exact live Metal acceptance
+      - name: Run exact live Metal Linear acceptance
         shell: bash
         run: >-
-          cargo test --release --test metal_live --
+          cargo test --release --test metal_live
+          live_metal_linear_persistent_session_emits_scoreboard --
           --ignored --nocapture --test-threads=1
+      - name: Benchmark exact live Metal ResNet-18
+        shell: bash
+        run: cargo run --release --example metal_resnet_benchmark
       - name: Print live evidence
         shell: bash
         run: |

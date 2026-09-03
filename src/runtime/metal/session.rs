@@ -97,6 +97,9 @@ pub struct MetalDevicePreparationReport {
     pub planning_wall_time: Duration,
     /// Host wall-clock duration of compilation, allocation, and queue setup.
     pub native_prepare_wall_time: Duration,
+    /// Host wall-clock duration spent building cache-miss native libraries and
+    /// compute pipelines. Cache hits contribute zero to this field.
+    pub cache_miss_pipeline_build_wall_time: Duration,
     /// Host wall-clock duration of immutable resident plus initial-state host
     /// API writes.
     pub initialization_upload_wall_time: Duration,
@@ -859,6 +862,7 @@ impl MetalDeviceSessionPlan {
         let native_prepare_start = Instant::now();
         let prepared = PreparedMetalPrefix::from_plan(device.clone(), self.prefix)?;
         let native_prepare_wall_time = native_prepare_start.elapsed();
+        let cache_miss_pipeline_build_wall_time = prepared.cache_miss_pipeline_build_wall_time();
         let initialization_upload_start = Instant::now();
         let (prepared, resident_transfer) =
             prepared.initialize_resident(&resident_values, &self.device_resident_ids)?;
@@ -872,6 +876,7 @@ impl MetalDeviceSessionPlan {
         let preparation = MetalDevicePreparationReport {
             planning_wall_time: self.planning_wall_time,
             native_prepare_wall_time,
+            cache_miss_pipeline_build_wall_time,
             initialization_upload_wall_time,
             pipeline_cache_request_count,
             pipeline_cache_hit_count,
