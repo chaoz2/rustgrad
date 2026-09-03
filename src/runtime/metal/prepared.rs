@@ -4,7 +4,7 @@ use super::{
     MetalRenderer,
 };
 use crate::{ScheduleItem, TensorData};
-use std::{collections::BTreeMap, rc::Rc};
+use std::{cell::Cell, collections::BTreeMap, rc::Rc, time::Duration};
 
 use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
@@ -17,6 +17,7 @@ struct MetalStaticAdapter {
     device: Option<MetalDevice>,
     renderer: MetalRenderer,
     cache: Option<MetalCache>,
+    cache_miss_pipeline_build_wall_time: Rc<Cell<Duration>>,
     append_state: BTreeMap<u64, StaticAppendStateLink>,
     host_gathers: BTreeMap<u64, StaticHostGather>,
 }
@@ -27,6 +28,7 @@ impl MetalStaticAdapter {
             device: None,
             renderer,
             cache: None,
+            cache_miss_pipeline_build_wall_time: Rc::new(Cell::new(Duration::ZERO)),
             append_state: BTreeMap::new(),
             host_gathers: BTreeMap::new(),
         }
@@ -38,6 +40,7 @@ impl MetalStaticAdapter {
             device: Some(device),
             renderer,
             cache: Some(cache),
+            cache_miss_pipeline_build_wall_time: Rc::new(Cell::new(Duration::ZERO)),
             append_state: BTreeMap::new(),
             host_gathers: BTreeMap::new(),
         }
@@ -158,10 +161,18 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
         false
     }
     fn compile(&self, rendered: &Self::Rendered) -> Result<Self::Kernel, Self::Error> {
-        self.cache
+        let loaded = self
+            .cache
             .as_ref()
             .ok_or_else(|| MetalError::InvalidBinding("Metal plan has no cache".into()))?
-            .load(rendered)
+            .load_observed(rendered)?;
+        self.cache_miss_pipeline_build_wall_time.set(
+            self.cache_miss_pipeline_build_wall_time
+                .get()
+                .checked_add(loaded.cache_miss_pipeline_build_wall_time)
+                .ok_or(MetalError::Overflow)?,
+        );
+        Ok(loaded.pipeline)
     }
     fn compiled_cache_key(&self, kernel: &Self::Kernel) -> String {
         kernel.rendered().cache_key.clone()
@@ -319,6 +330,7 @@ impl MetalPrefixPlan {
 /// A fully validated pure prefix whose logical intermediates remain device-resident.
 pub struct PreparedMetalPrefix {
     inner: PreparedStaticSchedule<MetalStaticAdapter>,
+    cache_miss_pipeline_build_wall_time: Duration,
 }
 
 pub(super) struct InitializedMetalPrefix {
@@ -357,14 +369,18 @@ impl PreparedMetalPrefix {
     pub fn from_plan(device: MetalDevice, plan: MetalPrefixPlan) -> Result<Self, MetalError> {
         let append_state = plan.plan.append_state_links().to_vec();
         let host_gathers = plan.plan.host_gathers().to_vec();
+        let adapter = MetalStaticAdapter::runtime(device, plan.renderer)
+            .with_append_state(&append_state)?
+            .with_host_gathers(&host_gathers)?;
+        let build_wall_time = adapter.cache_miss_pipeline_build_wall_time.clone();
         Ok(Self {
-            inner: PreparedStaticSchedule::from_plan(
-                MetalStaticAdapter::runtime(device, plan.renderer)
-                    .with_append_state(&append_state)?
-                    .with_host_gathers(&host_gathers)?,
-                plan.plan,
-            )?,
+            inner: PreparedStaticSchedule::from_plan(adapter, plan.plan)?,
+            cache_miss_pipeline_build_wall_time: build_wall_time.get(),
         })
+    }
+
+    pub(super) const fn cache_miss_pipeline_build_wall_time(&self) -> Duration {
+        self.cache_miss_pipeline_build_wall_time
     }
 
     pub fn cache_len(&self) -> usize {

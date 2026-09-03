@@ -20,6 +20,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -912,6 +913,11 @@ pub struct MetalCache {
     entries: Rc<RefCell<BTreeMap<String, Rc<MetalPipeline>>>>,
 }
 
+pub(crate) struct MetalCacheLoad {
+    pub(crate) pipeline: Rc<MetalPipeline>,
+    pub(crate) cache_miss_pipeline_build_wall_time: Duration,
+}
+
 impl MetalCache {
     /// Returns the number of compiled pipeline identities.
     pub fn len(&self) -> usize {
@@ -935,6 +941,13 @@ impl MetalCache {
     /// Returns an existing pipeline or compiles and inserts it atomically for
     /// this single-threaded cache owner.
     pub fn load(&self, rendered: &RenderedMetal) -> Result<Rc<MetalPipeline>, MetalError> {
+        Ok(self.load_observed(rendered)?.pipeline)
+    }
+
+    pub(crate) fn load_observed(
+        &self,
+        rendered: &RenderedMetal,
+    ) -> Result<MetalCacheLoad, MetalError> {
         if rendered.capabilities != self.device.info().capabilities {
             return Err(MetalError::InvalidBinding(
                 "renderer/device capability identity mismatch".into(),
@@ -946,11 +959,19 @@ impl MetalCache {
             self.device.info().registry_id,
         ));
         if let Some(pipeline) = self.entries.borrow().get(&key) {
-            return Ok(pipeline.clone());
+            return Ok(MetalCacheLoad {
+                pipeline: pipeline.clone(),
+                cache_miss_pipeline_build_wall_time: Duration::ZERO,
+            });
         }
+        let build_start = Instant::now();
         let pipeline = Rc::new(self.device.compile(rendered)?.create_pipeline()?);
+        let cache_miss_pipeline_build_wall_time = build_start.elapsed();
         self.entries.borrow_mut().insert(key, pipeline.clone());
-        Ok(pipeline)
+        Ok(MetalCacheLoad {
+            pipeline,
+            cache_miss_pipeline_build_wall_time,
+        })
     }
 }
 

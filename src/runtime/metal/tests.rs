@@ -1207,6 +1207,9 @@ fn metal_scoreboard_records_only_one_session_success_prefix() {
     let inference = CapturedInference::from_module_graph(&model, &graph, &[output]).unwrap();
     let renderer = MetalRenderer::new(8, capabilities()).unwrap();
     let plan = MetalInferencePlan::new(inference.clone(), renderer.clone()).unwrap();
+    let logical_schedule_item_count = plan.execution_plan().schedule_item_count;
+    let peak_logical_temporary_allocation_count = plan.execution_plan().peak_logical_allocations;
+    let peak_logical_temporary_bytes = plan.execution_plan().peak_logical_bytes;
     let mut scoreboard = MetalSessionScoreboard::new(
         MetalScoreboardContext::new("linear-1x2", "test-revision", "semantic mock").unwrap(),
         &plan,
@@ -1228,6 +1231,7 @@ fn metal_scoreboard_records_only_one_session_success_prefix() {
     );
     let empty = scoreboard.report().unwrap();
     assert_eq!(empty.successful_run_count, 0);
+    assert!(empty.successful_runs.is_empty());
     assert_eq!(empty.fallback_count, 0);
     assert_eq!(empty.inputs.len(), 3);
     assert_eq!(
@@ -1241,6 +1245,12 @@ fn metal_scoreboard_records_only_one_session_success_prefix() {
 
     let other_plan = MetalInferencePlan::new(inference, renderer).unwrap();
     let mut other_session = other_plan.prepare(device).unwrap();
+    assert_eq!(
+        other_session
+            .preparation_report()
+            .cache_miss_pipeline_build_wall_time,
+        std::time::Duration::ZERO
+    );
     let values = BTreeMap::from([(
         "features".into(),
         TensorData::new([1, 2], vec![2.0, -1.0]).unwrap(),
@@ -1278,6 +1288,30 @@ fn metal_scoreboard_records_only_one_session_success_prefix() {
     scoreboard.record(&third).unwrap();
     let report = scoreboard.report().unwrap();
     assert_eq!(report.successful_run_count, 3);
+    assert_eq!(report.successful_runs.len(), 3);
+    for (recorded, observed) in report.successful_runs.iter().zip([&first, &second, &third]) {
+        assert_eq!(
+            recorded.successful_invocation,
+            observed.report().successful_invocation
+        );
+        assert_eq!(recorded.run_wall_time, observed.report().run_wall_time);
+        assert_eq!(
+            recorded.transient_host_api_h2d_calls,
+            observed.report().transient_h2d_calls
+        );
+        assert_eq!(
+            recorded.transient_host_api_h2d_bytes,
+            observed.report().transient_h2d_bytes
+        );
+        assert_eq!(
+            recorded.retained_host_api_d2h_calls,
+            observed.report().retained_d2h_calls
+        );
+        assert_eq!(
+            recorded.retained_host_api_d2h_bytes,
+            observed.report().retained_d2h_bytes
+        );
+    }
     assert_eq!(
         report.first_run_host_wall_time,
         Some(first.report().run_wall_time)
@@ -1307,6 +1341,44 @@ fn metal_scoreboard_records_only_one_session_success_prefix() {
         report.retained_host_api_d2h_calls
     );
     assert_eq!(report.kernel_launch_count, 3 * report.planned_kernel_count);
+    assert_eq!(
+        report.transient_host_api_h2d_calls,
+        report
+            .successful_runs
+            .iter()
+            .map(|run| run.transient_host_api_h2d_calls)
+            .sum::<usize>()
+    );
+    assert_eq!(
+        report.retained_host_api_d2h_bytes,
+        report
+            .successful_runs
+            .iter()
+            .map(|run| run.retained_host_api_d2h_bytes)
+            .sum::<usize>()
+    );
+    assert_eq!(
+        report.logical_schedule_item_count,
+        logical_schedule_item_count
+    );
+    assert_eq!(
+        report.peak_logical_temporary_allocation_count,
+        peak_logical_temporary_allocation_count
+    );
+    assert_eq!(
+        report.planned_physical_static_tensor_slot_bytes,
+        session.summary().planned_device_bytes
+    );
+    assert_eq!(
+        report.peak_logical_temporary_bytes,
+        peak_logical_temporary_bytes
+    );
+    assert!(
+        session
+            .preparation_report()
+            .cache_miss_pipeline_build_wall_time
+            <= session.preparation_report().native_prepare_wall_time
+    );
     assert_eq!(report.fallback_count, 0);
 }
 
@@ -1336,8 +1408,8 @@ fn metal_scoreboard_keeps_zero_resource_passthrough_facts_exact() {
         .unwrap();
     scoreboard.record(&run).unwrap();
     let report = scoreboard.report().unwrap();
-    assert_eq!(report.planned_static_tensor_slot_count, 0);
-    assert_eq!(report.planned_static_tensor_slot_bytes, 0);
+    assert_eq!(report.planned_physical_static_tensor_slot_count, 0);
+    assert_eq!(report.planned_physical_static_tensor_slot_bytes, 0);
     assert_eq!(report.planned_kernel_count, 0);
     assert_eq!(report.planned_zero_item_count, 1);
     assert_eq!(report.kernel_launch_count, 0);
@@ -1346,6 +1418,8 @@ fn metal_scoreboard_keeps_zero_resource_passthrough_facts_exact() {
     assert_eq!(report.transient_host_api_h2d_calls, 0);
     assert_eq!(report.retained_host_api_d2h_calls, 0);
     assert_eq!(report.fallback_count, 0);
+    assert_eq!(report.successful_runs.len(), 1);
+    assert_eq!(report.successful_runs[0].zero_item_count, 1);
     assert!(mock.calls().is_empty());
 }
 

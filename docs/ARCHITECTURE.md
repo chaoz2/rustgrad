@@ -2591,23 +2591,28 @@ reach no driver work; a failed execution publishes neither outputs nor a
 successful-run metric and the settled prefix remains retryable. Zero-work
 captures allocate, compile, upload, launch, wait, and read nothing.
 
-`MetalSessionScoreboard` v1 is a stateless-only opt-in observation layer over
+`MetalSessionScoreboard` v2 is a stateless-only opt-in observation layer over
 that existing evidence. It snapshots a `MetalInferencePlan`, binds once to the
 exact prepared deployment/session identity, and accepts only its consecutive
-successful `MetalDeviceRun` prefix. The immutable report preserves the first host-wall
-run separately, retains steady host-wall samples in invocation order, derives
-integer-duration nearest-rank percentiles, and aggregates the exact plan,
-pipeline-cache, launch, zero-item, and host-API copy counters already owned by
-the session. Versioned deterministic JSON includes caller-labelled workload,
-implementation revision, evidence provenance, selected handle-free device,
-and captured resident/transient descriptors. `planning_wall_time` is planning
-and rendering; `native_prepare_wall_time` includes compilation, allocation,
-and queue setup; `planned_static_tensor_slot_bytes` is neither measured peak
-memory nor process RSS. Host-wall observations are not GPU timestamps, and
-host-API copy counts/bytes are not physical-bus measurements. Failed, skipped,
-reordered, foreign-session, or pre-bind records cannot mutate the scoreboard.
-Stateful and append-state scoreboard binding/schema is an explicit follow-up rather than an
-implicit extension of the v1 report.
+successful `MetalDeviceRun` prefix. The immutable report preserves every run's
+ordinal, first-run bit, host-wall times, transfers, launches, zero-item skips,
+and output count in invocation order. It derives checked aggregate transfer and
+launch totals from those same records, separates the first sample, and reports
+integer-duration nearest-rank percentiles over the remaining samples. Versioned
+deterministic JSON includes caller-labelled workload, implementation revision,
+evidence provenance, selected handle-free device, captured resident/transient
+descriptors, logical schedule/peak-live facts, and physical Metal slot facts.
+`planning_wall_time` is planning and rendering; `native_prepare_wall_time`
+includes compilation, allocation, and queue setup; and
+`cache_miss_pipeline_build_wall_time` times only successful native
+library/pipeline construction on cache misses within preparation.
+`planned_physical_static_tensor_slot_bytes` is neither logical peak payload,
+measured allocator peak memory, nor process RSS. Host-wall observations are not
+GPU timestamps, and host-API copy counts/bytes are not physical-bus
+measurements. Failed, skipped, reordered, foreign-session, or pre-bind records
+cannot mutate the scoreboard. Stateful and append-state scoreboard
+binding/schema is an explicit follow-up rather than an implicit extension of
+the v2 report.
 
 The dense F32 Llama token-step layer uses the same boundary without adding a
 model-specific runtime. A crate-private exact resident projection captures each
@@ -2655,8 +2660,9 @@ discovery step returns a device. `MetalRuntime::device(index)` is the concise
 selection seam over that same ordered inventory; an absent inventory remains
 `NoDevices`, while an out-of-range nonempty selection is an invalid argument.
 
-`tests/metal_live.rs` contains the exact ignored public-API hardware acceptance
-for this boundary. The manual-only `metal-live.yml` workflow requires a caller-
+`tests/metal_live.rs` and `examples/metal_resnet_benchmark.rs` contain the exact
+public-API hardware acceptance and benchmark entry points for this boundary.
+The manual-only `metal-live.yml` workflow requires a caller-
 supplied lowercase full commit SHA, verifies that the checkout matches it, and
 targets `[self-hosted, macOS, ARM64, rustgrad-metal]` behind the protected
 `live-metal` environment. Before checkout it requires the dispatch
@@ -2665,19 +2671,18 @@ after checkout. The repository workflow only names the environment;
 provisioning must configure its reviewers and deployment-ref restrictions. It
 treats `NoDevices` as failure, and prepares each deployment once. The fixed
 Linear smoke checks two distinct invocations byte-for-byte against its CPU
-oracle. The full default Eval/F32 ResNet-18 `[1,3,224,224]` acceptance constructs
-the typed `ResNetMetalPlan`, executes the complete initialized graph against one
-deterministic image, compares finite logits to a separately composed full CPU
-oracle under a documented F32 native-compilation tolerance, then repeats the
-same Metal invocation to authenticate persistent ownership and steady-session
-behavior. The manual lane uses the release test profile so that the complete
-CPU oracle remains practical without weakening the device workload.
-Both tests prove resident schemas, compiled cache identities, and device
-ownership remain stable with no run-time resident upload or fallback, and
-upload separate deterministic scoreboard JSON evidence. The workflow has no
-push or pull-request trigger. No matching runner or environment is currently
-provisioned, so this lane is dormant and its presence is not live-device
-evidence.
+oracle. The typed ResNet benchmark constructs the complete default Eval/F32
+`[1,3,224,224]` graph, computes one deterministic full CPU oracle, prepares one
+Metal session, and checks ten repeated session outputs by default under the
+documented F32 native-compilation tolerance. The workflow runs that complete
+benchmark exactly once rather than duplicating it through the ignored live
+test, and uploads its deterministic v2 scoreboard beside the Linear report.
+These paths prove stable resident schemas, compiled cache identities, device
+ownership, zero run-time resident upload, and zero fallback. The release profile
+keeps the one complete CPU oracle practical without weakening the device
+workload. The workflow has no push or pull-request trigger. No matching runner
+or environment is currently provisioned, so this lane is dormant and its
+presence is not live-device or performance evidence.
 
 `runtime/metal/mod.rs` is the facade for the first Apple Metal execution
 boundary. `ffi.rs` dynamically loads the Objective-C runtime, CoreGraphics, and

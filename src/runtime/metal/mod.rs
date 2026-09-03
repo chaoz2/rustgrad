@@ -29,8 +29,8 @@ pub use resource::{
 };
 pub use scoreboard::{
     METAL_SESSION_SCOREBOARD_FORMAT_VERSION, MetalHostWallTimeSummary, MetalScoreboardContext,
-    MetalScoreboardError, MetalScoreboardInput, MetalScoreboardInputKind, MetalSessionScoreboard,
-    MetalSessionScoreboardReport,
+    MetalScoreboardError, MetalScoreboardInput, MetalScoreboardInputKind, MetalScoreboardRun,
+    MetalSessionScoreboard, MetalSessionScoreboardReport,
 };
 pub use session::{
     MetalAppendStateInferencePlan, MetalDevicePreparationReport, MetalDeviceRun,

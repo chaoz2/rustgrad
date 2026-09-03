@@ -60,23 +60,26 @@ expose truthful host-API/planned metrics, and have no CPU fallback. Protected
 acceptance now takes the complete default Eval/F32 ResNet-18 `[1,3,224,224]`
 graph through boundary-free scheduling and capture, renders every scheduled
 item to MSL, then performs persistent resident preparation and repeated
-ABI-validating virtual-resource runs. The opt-in Metal scoreboard records one
-exact session's successful prefix with first/ordered steady host-wall samples
-and deterministic plan/cache/copy/launch JSON; it is measurement plumbing, not
-live workload evidence or GPU timing.
+ABI-validating virtual-resource runs. The opt-in Metal scoreboard v2 records
+one exact session's successful prefix with ordered per-run host-wall/copy/launch
+records, checked aggregates, successful cache-miss pipeline-build time, logical
+schedule/peak-live facts, and distinct physical Metal slot facts. It remains
+measurement plumbing, not live workload evidence, allocator peak memory, bus
+traffic, or GPU timing.
 
 `ResNetMetalPlan::eval_f32` is the concise public entry point for this vertical:
 it freezes the model, binds capability admission and preparation to one explicit
 device, exposes its capture/plan/schemas/MSL, and returns a persistent typed
 session whose only transient is the exact F32 NCHW image.
 
-Exact ignored Linear and full default Eval/F32 ResNet-18 acceptances plus a
-manual-only exact-SHA workflow are checked in for
+An exact ignored Linear acceptance and a deterministic typed ResNet-18
+benchmark plus a manual-only exact-SHA workflow are checked in for
 `[self-hosted, macOS, ARM64, rustgrad-metal]` behind the `live-metal`
-environment. The ResNet acceptance executes the complete initialized body with
-one deterministic image, compares its finite logits to the complete CPU oracle
-under a documented F32 native-compilation tolerance, and records a repeated
-persistent-session run. The release-profile lane is dormant until the matching
+environment. The benchmark executes the complete initialized body with one
+deterministic image, computes one complete CPU oracle, compares finite logits
+under a documented F32 native-compilation tolerance, and records ten persistent
+session runs by default without duplicating the full execution elsewhere in the
+workflow. The release-profile lane is dormant until the matching
 runner and protected environment, including reviewers and deployment-ref
 restrictions, are provisioned; the repository workflow only references those
 external controls. Ordinary macOS CI remains mock-only and no live-device
@@ -87,10 +90,10 @@ result is claimed by the workflow definition itself.
 Provision the protected Apple-GPU lane and run the checked-in exact-SHA
 acceptance, closing only demonstrated live renderer/runtime gaps. Required
 evidence is full CPU-oracle output agreement, zero fallback, stable resident
-weights and intermediates, inspectable kernels/memory/transfers, and
-compile/first-run/steady-state reporting with host-wall versus device evidence
-labeled exactly. Benchmark comparisons target the equivalent tinygrad and
-Candle workload.
+weights and intermediates, inspectable kernels/memory/transfers, and the
+checked-in v2 compile/prepare/first-run/ordered-steady reporting with host-wall
+versus device evidence labeled exactly. Benchmark comparisons target the
+equivalent tinygrad and Candle workload.
 
 ### 3. P0 — device-resident GGUF Llama prefill/KV/decode
 
