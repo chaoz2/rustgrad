@@ -3127,10 +3127,25 @@ pub(crate) fn emit_with_substitution(
                 .sources()
                 .first()
                 .ok_or_else(|| JitError::Unsupported("load no index".into()))?;
+            let projected_plan = if crate::projected_index::ProjectedIndexPlan::is_projected(ix) {
+                Some(
+                    crate::projected_index::ProjectedIndexPlan::from_index(ix)
+                        .map_err(|_| JitError::Unsupported("invalid projected index".into()))?,
+                )
+            } else {
+                None
+            };
+            if symbolic_offsets.is_some()
+                && projected_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.is_guarded())
+            {
+                return Err(JitError::Unsupported(
+                    "symbolic predicated indexing is unsupported".into(),
+                ));
+            }
             let (buffer, concrete_off) = match ix.operation() {
-                Operation::Index(IndexValue::Buffer { buffer, .. })
-                    if crate::projected_index::ProjectedIndexPlan::is_projected(ix) =>
-                {
+                Operation::Index(IndexValue::Buffer { buffer, .. }) if projected_plan.is_some() => {
                     (*buffer, projected_index_offset(ix, "((int64_t)rg_i)")?)
                 }
                 Operation::Index(IndexValue::Buffer {
@@ -3156,26 +3171,49 @@ pub(crate) fn emit_with_substitution(
                 None => concrete_off,
             };
             let raw = format!("((uint8_t*)buffers[{}])[{}]", ids[&buffer], off);
-            if ty.is_float8() {
-                Ok(raw)
+            let loaded = if ty.is_float8() {
+                raw
             } else if matches!(ty, DType::F16 | DType::BF16) {
                 let load = if ty == DType::F16 {
                     "rg_f16_to_f32"
                 } else {
                     "rg_bf16_to_f32"
                 };
-                Ok(format!(
-                    "{load}(((uint16_t*)buffers[{}])[{}])",
-                    ids[&buffer], off
-                ))
+                format!("{load}(((uint16_t*)buffers[{}])[{}])", ids[&buffer], off)
             } else {
-                Ok(format!(
-                    "(({}*)buffers[{}])[{}]",
-                    ctype(ty),
-                    ids[&buffer],
-                    off
-                ))
-            }
+                format!("(({}*)buffers[{}])[{}]", ctype(ty), ids[&buffer], off)
+            };
+            let Some(plan) = projected_plan.as_ref() else {
+                return Ok(loaded);
+            };
+            let Some(predicate) = crate::projected_index::render_infix_projected_predicate(
+                plan,
+                "((int64_t)rg_i)",
+                |value| {
+                    Ok(if value == i64::MIN {
+                        "INT64_MIN".into()
+                    } else {
+                        format!("((int64_t){value}LL)")
+                    })
+                },
+            )
+            .map_err(|_| JitError::Unsupported("projected predicate operation".into()))?
+            else {
+                return Ok(loaded);
+            };
+            let zero = if ty.is_float8() {
+                format!(
+                    "((uint8_t)0x{:02x}u)",
+                    ty.float8_format().expect("float8").encode(0.0)
+                )
+            } else if matches!(ty, DType::F16 | DType::BF16 | DType::F32) {
+                "0.0f".into()
+            } else if ty == DType::F64 {
+                "0.0".into()
+            } else {
+                format!("(({})0)", ctype(ty))
+            };
+            Ok(format!("(({predicate}) ? ({loaded}) : ({zero}))"))
         }
         Operation::Cast => {
             let source_dtype = n

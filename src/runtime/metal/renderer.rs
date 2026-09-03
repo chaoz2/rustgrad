@@ -238,6 +238,14 @@ impl MetalRenderer {
         let nodes = root
             .topological()
             .map_err(|error| MetalError::Unsupported(error.to_string()))?;
+        if nodes
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+        {
+            return Err(MetalError::Unsupported(
+                "predicated projected loads are outside Metal lowering".into(),
+            ));
+        }
         if nodes.iter().any(|node| {
             matches!(
                 node.operation(),

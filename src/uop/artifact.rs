@@ -22,9 +22,11 @@ const MAGIC: &[u8; 4] = b"RGUA";
 /// v19 adds the dependency-bearing live packed-U64 Threefry plan; v20 adds
 /// the checked static-position movement payload; v21 authenticates a Buffer
 /// index whose second source is a checked projected integer address tree. v22
-/// adds canonical rewrite tags to standalone UOp DAGs.
+/// adds canonical rewrite tags to standalone UOp DAGs. v23 adds predicated
+/// projected loads while retaining v22 as the tag-presence boundary.
 /// v15 is retained as the first internal mixed-schedule envelope.
-const VERSION: u8 = 22;
+const TAG_VERSION: u8 = 22;
+const VERSION: u8 = 23;
 const PREVIOUS_EFFECT_VERSION: u8 = 15;
 const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
@@ -111,6 +113,12 @@ enum WireArg {
         output_shape: Shape,
     },
     ProjectedBufferIndex {
+        buffer: u64,
+        elements: usize,
+        input_shape: Shape,
+        output_shape: Shape,
+    },
+    PredicatedBufferIndex {
         buffer: u64,
         elements: usize,
         input_shape: Shape,
@@ -316,6 +324,12 @@ fn operation_to_wire(operation: &Operation) -> (WireOpcode, WireArg) {
                     output_shape: output_shape.clone(),
                 },
                 crate::IndexAddressing::Projected => WireArg::ProjectedBufferIndex {
+                    buffer: *buffer,
+                    elements: *elements,
+                    input_shape: input_shape.clone(),
+                    output_shape: output_shape.clone(),
+                },
+                crate::IndexAddressing::Predicated => WireArg::PredicatedBufferIndex {
                     buffer: *buffer,
                     elements: *elements,
                     input_shape: input_shape.clone(),
@@ -578,6 +592,21 @@ fn operation_from_wire(opcode: WireOpcode, arg: WireArg) -> Result<Operation, Ar
         }),
         (
             WireOpcode::Index,
+            WireArg::PredicatedBufferIndex {
+                buffer,
+                elements,
+                input_shape,
+                output_shape,
+            },
+        ) => Operation::Index(IndexValue::Buffer {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+            addressing: crate::IndexAddressing::Predicated,
+        }),
+        (
+            WireOpcode::Index,
             WireArg::ViewBufferIndex {
                 buffer,
                 elements,
@@ -618,13 +647,18 @@ impl std::error::Error for ArtifactError {}
 /// Encodes one immutable UOp DAG. Node IDs are dense topological indices and
 /// repeated source IDs preserve shared subgraphs. Historical operation sets
 /// retain their released envelopes; projected indices require v21 and tagged
-/// DAGs require v22.
+/// DAGs require v22; predicated projected indices require v23.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let nodes = root
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
-    let version = if nodes.iter().any(|node| node.tag().is_some()) {
+    let version = if nodes
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+    {
         VERSION
+    } else if nodes.iter().any(|node| node.tag().is_some()) {
+        TAG_VERSION
     } else if nodes
         .iter()
         .any(crate::projected_index::ProjectedIndexPlan::is_projected)
@@ -672,6 +706,11 @@ pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactEr
         )
     });
     let version = if nodes
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+    {
+        VERSION
+    } else if nodes
         .iter()
         .any(crate::projected_index::ProjectedIndexPlan::is_projected)
     {
@@ -728,15 +767,18 @@ fn encode_inner(root: &UOp, effects: bool, version: u8) -> Result<Vec<u8>, Artif
         if version < 21 && matches!(&arg, WireArg::ProjectedBufferIndex { .. }) {
             return Err(ArtifactError::Format("projected index version"));
         }
+        if version < VERSION && matches!(&arg, WireArg::PredicatedBufferIndex { .. }) {
+            return Err(ArtifactError::Format("predicated index version"));
+        }
         validate_fields(&kind, node.ty(), &arg, node.sources(), effects)?;
         w.u32(id as u32)?;
         write_kind(&mut w, &kind, effects)?;
         write_type(&mut w, node.ty())?;
         write_arg(&mut w, &arg, effects)?;
-        if version < VERSION && node.tag().is_some() {
+        if version < TAG_VERSION && node.tag().is_some() {
             return Err(ArtifactError::Format("tag version"));
         }
-        if version >= VERSION {
+        if version >= TAG_VERSION {
             write_tag(&mut w, node.tag())?;
         }
         if node.sources().len() > MAX_SOURCES {
@@ -798,6 +840,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             | 19
             | 20
             | 21
+            | TAG_VERSION
             | VERSION
     ) {
         return Err(ArtifactError::Format("version"));
@@ -818,7 +861,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         let kind = read_kind(&mut r, version)?;
         let ty = read_type(&mut r)?;
         let arg = read_arg(&mut r, version)?;
-        let tag = if version >= VERSION {
+        let tag = if version >= TAG_VERSION {
             read_tag(&mut r)?
         } else {
             None
@@ -926,6 +969,26 @@ fn validate_fields(
             );
             crate::projected_index::ProjectedIndexPlan::from_index(&projected)
                 .map_err(|_| ArtifactError::Format("projected index"))?;
+        }
+        WireArg::PredicatedBufferIndex {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+        } => {
+            let projected = UOp::from_operation(
+                Operation::Index(IndexValue::Buffer {
+                    buffer: *buffer,
+                    elements: *elements,
+                    input_shape: input_shape.clone(),
+                    output_shape: output_shape.clone(),
+                    addressing: crate::IndexAddressing::Predicated,
+                }),
+                ty,
+                sources.to_vec(),
+            );
+            crate::projected_index::ProjectedIndexPlan::from_index(&projected)
+                .map_err(|_| ArtifactError::Format("predicated index"))?;
         }
         WireArg::ViewBufferIndex {
             elements,
@@ -1526,6 +1589,18 @@ fn write_arg(w: &mut Writer, arg: &WireArg, effects: bool) -> Result<(), Artifac
             write_shape(w, input_shape)?;
             write_shape(w, output_shape)
         }
+        WireArg::PredicatedBufferIndex {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+        } => {
+            w.u8(25)?;
+            w.u64(*buffer)?;
+            w.usize(*elements)?;
+            write_shape(w, input_shape)?;
+            write_shape(w, output_shape)
+        }
         WireArg::ViewBufferIndex {
             buffer,
             elements,
@@ -1724,6 +1799,12 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<WireArg, ArtifactError> {
             output_shape: read_shape(r)?,
         },
         24 => WireArg::ProjectedBufferIndex {
+            buffer: r.u64()?,
+            elements: r.usize()?,
+            input_shape: read_shape(r)?,
+            output_shape: read_shape(r)?,
+        },
+        25 if version >= VERSION => WireArg::PredicatedBufferIndex {
             buffer: r.u64()?,
             elements: r.usize()?,
             input_shape: read_shape(r)?,
@@ -3310,7 +3391,7 @@ mod tests {
         )
         .retag(Some(tuple));
         let bytes = encode(&tagged).unwrap();
-        assert_eq!(bytes[4], VERSION);
+        assert_eq!(bytes[4], TAG_VERSION);
         assert_eq!(decode(&bytes).unwrap(), tagged);
         assert_eq!(
             encode_schedule_identity(&tagged),
@@ -3350,7 +3431,7 @@ mod tests {
         let (kind, arg) = operation_to_wire(root.operation());
         let mut malformed = Writer::new();
         malformed.bytes(MAGIC).unwrap();
-        malformed.u8(VERSION).unwrap();
+        malformed.u8(TAG_VERSION).unwrap();
         malformed.u32(1).unwrap();
         malformed.u32(0).unwrap();
         malformed.u32(0).unwrap();
@@ -3875,6 +3956,80 @@ mod tests {
         assert_eq!(bytes[4], 21);
         assert_eq!(decode(&bytes).unwrap(), root);
         assert_eq!(encode_schedule_identity(&root).unwrap()[4], 21);
+
+        let mut predicated_graph = crate::Graph::new();
+        let input = predicated_graph.input_dtype("input", [2], DType::F32);
+        let padded = predicated_graph
+            .pad(input, [(1, 1)], crate::Scalar::F(0.0))
+            .unwrap();
+        let output = predicated_graph.square(padded).unwrap();
+        let predicated_schedule = crate::schedule(&predicated_graph, output).unwrap();
+        predicated_schedule.validate().unwrap();
+        assert!(
+            predicated_schedule
+                .items
+                .iter()
+                .all(|item| item.node != padded)
+        );
+        let predicated = predicated_schedule
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap()
+            .kernel
+            .clone();
+        assert!(
+            predicated
+                .topological()
+                .unwrap()
+                .iter()
+                .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+        );
+        let predicated_bytes = encode(&predicated).unwrap();
+        assert_eq!(predicated_bytes[4], VERSION);
+        assert_eq!(decode(&predicated_bytes).unwrap(), predicated);
+        assert_eq!(encode_schedule_identity(&predicated).unwrap()[4], VERSION);
+        let predicated_store_index = predicated
+            .topological()
+            .unwrap()
+            .into_iter()
+            .find(crate::projected_index::ProjectedIndexPlan::is_predicated)
+            .unwrap();
+        let predicated_store = UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![
+                predicated_store_index,
+                UOp::scalar_constant(
+                    DType::F32,
+                    0.0_f32.to_bits() as u64,
+                    UType::scalar(DType::F32),
+                ),
+            ],
+        );
+        let mut invalid_sources = vec![predicated_store];
+        invalid_sources.extend(
+            predicated
+                .sources()
+                .iter()
+                .filter(|source| matches!(source.operation(), Operation::EndRange))
+                .cloned(),
+        );
+        let predicated_store_root = UOp::sink(invalid_sources);
+        assert_eq!(
+            predicated_store_root.validate(),
+            Err(crate::UOpError::InvalidIndex)
+        );
+        assert!(encode(&predicated_store_root).is_err());
+        let mut forged_v22 = predicated_bytes.clone();
+        forged_v22[4] = TAG_VERSION;
+        let body_len = forged_v22.len() - 4;
+        let sum = checksum(&forged_v22[..body_len]);
+        forged_v22[body_len..].copy_from_slice(&sum.to_le_bytes());
+        assert!(matches!(
+            decode(&forged_v22),
+            Err(ArtifactError::Format("argument tag"))
+        ));
 
         let mut same_shape_graph = crate::Graph::new();
         let input = same_shape_graph.input_dtype("input", [2, 3, 4], DType::F32);

@@ -19,7 +19,56 @@ pub(crate) struct ProjectedIndexPlan {
     pub(crate) elements: usize,
     pub(crate) output_elements: usize,
     pub(crate) expression: ProjectedExpr<i64>,
+    predicate: Option<ProjectedPredicate>,
     fits_i32: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum ProjectedPredicate {
+    Constant(bool),
+    Compare {
+        operation: crate::CompareOp,
+        lhs: ProjectedExpr<i64>,
+        rhs: ProjectedExpr<i64>,
+    },
+    Logical {
+        operation: crate::LogicalOp,
+        lhs: Box<Self>,
+        rhs: Option<Box<Self>>,
+    },
+}
+
+impl ProjectedPredicate {
+    fn emit<E: ProjectedPredicateEmitter>(
+        &self,
+        emitter: &mut E,
+    ) -> Result<E::Predicate, E::Error> {
+        match self {
+            Self::Constant(value) => emitter.boolean(*value),
+            Self::Compare {
+                operation,
+                lhs,
+                rhs,
+            } => {
+                let lhs = lhs.emit(emitter)?;
+                let rhs = rhs.emit(emitter)?;
+                emitter.compare(*operation, lhs, rhs)
+            }
+            Self::Logical {
+                operation,
+                lhs,
+                rhs,
+            } => {
+                let lhs = lhs.emit(emitter)?;
+                let rhs = rhs.as_ref().map(|rhs| rhs.emit(emitter)).transpose()?;
+                emitter.logical(*operation, lhs, rhs)
+            }
+        }
+    }
+
+    fn is_always_false(&self) -> bool {
+        matches!(self, Self::Constant(false))
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -365,12 +414,112 @@ pub(crate) trait ProjectedIndexEmitter<C = i64> {
     ) -> Result<Self::Value, Self::Error>;
 }
 
+pub(crate) trait ProjectedPredicateEmitter<C = i64>: ProjectedIndexEmitter<C> {
+    type Predicate;
+
+    fn boolean(&mut self, value: bool) -> Result<Self::Predicate, Self::Error>;
+    fn compare(
+        &mut self,
+        operation: crate::CompareOp,
+        lhs: Self::Value,
+        rhs: Self::Value,
+    ) -> Result<Self::Predicate, Self::Error>;
+    fn logical(
+        &mut self,
+        operation: crate::LogicalOp,
+        lhs: Self::Predicate,
+        rhs: Option<Self::Predicate>,
+    ) -> Result<Self::Predicate, Self::Error>;
+}
+
+struct ProjectedEvaluator {
+    linear: i128,
+}
+
+impl ProjectedIndexEmitter for ProjectedEvaluator {
+    type Value = i128;
+    type Error = UOpError;
+
+    fn linear(&mut self) -> Result<Self::Value, Self::Error> {
+        Ok(self.linear)
+    }
+
+    fn constant(&mut self, value: &i64) -> Result<Self::Value, Self::Error> {
+        Ok(i128::from(*value))
+    }
+
+    fn binary(
+        &mut self,
+        operation: Binary,
+        lhs: Self::Value,
+        rhs: Self::Value,
+    ) -> Result<Self::Value, Self::Error> {
+        match operation {
+            Binary::Add => lhs.checked_add(rhs),
+            Binary::Sub => lhs.checked_sub(rhs),
+            Binary::Mul => lhs.checked_mul(rhs),
+            Binary::FloorDiv if rhs > 0 => Some(lhs.div_euclid(rhs)),
+            Binary::Mod if rhs > 0 => Some(lhs.rem_euclid(rhs)),
+            _ => None,
+        }
+        .ok_or(UOpError::InvalidIndex)
+    }
+}
+
+impl ProjectedPredicateEmitter for ProjectedEvaluator {
+    type Predicate = bool;
+
+    fn boolean(&mut self, value: bool) -> Result<Self::Predicate, Self::Error> {
+        Ok(value)
+    }
+
+    fn compare(
+        &mut self,
+        operation: crate::CompareOp,
+        lhs: Self::Value,
+        rhs: Self::Value,
+    ) -> Result<Self::Predicate, Self::Error> {
+        Ok(match operation {
+            crate::CompareOp::Eq => lhs == rhs,
+            crate::CompareOp::Ne => lhs != rhs,
+            crate::CompareOp::Lt => lhs < rhs,
+            crate::CompareOp::Le => lhs <= rhs,
+            crate::CompareOp::Gt => lhs > rhs,
+            crate::CompareOp::Ge => lhs >= rhs,
+        })
+    }
+
+    fn logical(
+        &mut self,
+        operation: crate::LogicalOp,
+        lhs: Self::Predicate,
+        rhs: Option<Self::Predicate>,
+    ) -> Result<Self::Predicate, Self::Error> {
+        match (operation, rhs) {
+            (crate::LogicalOp::Not, None) => Ok(!lhs),
+            (crate::LogicalOp::And, Some(rhs)) => Ok(lhs && rhs),
+            (crate::LogicalOp::Or, Some(rhs)) => Ok(lhs || rhs),
+            _ => Err(UOpError::InvalidIndex),
+        }
+    }
+}
+
 impl ProjectedIndexPlan {
     pub(crate) fn is_projected(index: &UOp) -> bool {
         matches!(
             index.operation(),
             Operation::Index(IndexValue::Buffer {
-                addressing: IndexAddressing::Projected,
+                addressing: IndexAddressing::Projected | IndexAddressing::Predicated,
+                ..
+            })
+        )
+    }
+
+    pub(crate) fn is_predicated(index: &UOp) -> bool {
+        matches!(
+            index.operation(),
+            Operation::Index(IndexValue::Buffer {
+                addressing: IndexAddressing::Predicated,
                 ..
             })
         )
@@ -382,13 +531,17 @@ impl ProjectedIndexPlan {
             elements,
             input_shape,
             output_shape,
-            addressing: IndexAddressing::Projected,
+            addressing,
         }) = index.operation()
         else {
             return Err(UOpError::InvalidIndex);
         };
-        let [address, expression] = index.sources() else {
-            return Err(UOpError::InvalidIndex);
+        let (address, expression, predicate) = match (addressing, index.sources()) {
+            (IndexAddressing::Projected, [address, expression]) => (address, expression, None),
+            (IndexAddressing::Predicated, [address, expression, predicate]) => {
+                (address, expression, Some(predicate))
+            }
+            _ => return Err(UOpError::InvalidIndex),
         };
         let Some(index_type) = index.ty() else {
             return Err(UOpError::InvalidIndex);
@@ -416,12 +569,18 @@ impl ProjectedIndexPlan {
             .ok_or(UOpError::InvalidIndex)?;
         let mut parsed_nodes = 0;
         let expression = parse_expression(expression, output_elements, 0, &mut parsed_nodes)?;
+        let predicate = predicate
+            .map(|predicate| parse_predicate(predicate, output_elements, 0, &mut parsed_nodes))
+            .transpose()?;
         let mut state = ValidationState {
             output_elements,
             nodes: 0,
             fits_i32: true,
         };
         let bounds = validate_expression(&expression, 0, &mut state)?;
+        if let Some(predicate) = &predicate {
+            validate_predicate(predicate, 0, &mut state)?;
+        }
         if state.nodes > MAX_PROJECTED_INDEX_NODES {
             return Err(UOpError::InvalidIndex);
         }
@@ -430,7 +589,13 @@ impl ProjectedIndexPlan {
             (0, Some(_)) | (_, None) => return Err(UOpError::InvalidIndex),
             (_, Some((minimum, maximum))) => {
                 let elements = i128::try_from(*elements).map_err(|_| UOpError::InvalidIndex)?;
-                if minimum < 0 || maximum >= elements {
+                let addressless = elements == 0
+                    && minimum == 0
+                    && maximum == 0
+                    && predicate
+                        .as_ref()
+                        .is_some_and(ProjectedPredicate::is_always_false);
+                if !addressless && (minimum < 0 || maximum >= elements) {
                     return Err(UOpError::InvalidIndex);
                 }
             }
@@ -440,6 +605,7 @@ impl ProjectedIndexPlan {
             elements: *elements,
             output_elements,
             expression,
+            predicate,
             fits_i32: state.fits_i32,
         })
     }
@@ -464,41 +630,29 @@ impl ProjectedIndexPlan {
         self.expression.emit(emitter)
     }
 
+    pub(crate) fn is_guarded(&self) -> bool {
+        self.predicate.is_some()
+    }
+
+    pub(crate) fn valid(&self, linear: usize) -> Result<bool, UOpError> {
+        if linear >= self.output_elements {
+            return Err(UOpError::InvalidIndex);
+        }
+        let mut evaluator = ProjectedEvaluator {
+            linear: i128::try_from(linear).map_err(|_| UOpError::InvalidIndex)?,
+        };
+        self.predicate
+            .as_ref()
+            .map(|predicate| predicate.emit(&mut evaluator))
+            .transpose()
+            .map(|predicate| predicate.unwrap_or(true))
+    }
+
     pub(crate) fn offset(&self, linear: usize) -> Result<usize, UOpError> {
         if linear >= self.output_elements {
             return Err(UOpError::InvalidIndex);
         }
-        struct Evaluator {
-            linear: i128,
-        }
-        impl ProjectedIndexEmitter for Evaluator {
-            type Value = i128;
-            type Error = UOpError;
-
-            fn linear(&mut self) -> Result<Self::Value, Self::Error> {
-                Ok(self.linear)
-            }
-            fn constant(&mut self, value: &i64) -> Result<Self::Value, Self::Error> {
-                Ok(i128::from(*value))
-            }
-            fn binary(
-                &mut self,
-                operation: Binary,
-                lhs: Self::Value,
-                rhs: Self::Value,
-            ) -> Result<Self::Value, Self::Error> {
-                match operation {
-                    Binary::Add => lhs.checked_add(rhs),
-                    Binary::Sub => lhs.checked_sub(rhs),
-                    Binary::Mul => lhs.checked_mul(rhs),
-                    Binary::FloorDiv if rhs > 0 => Some(lhs.div_euclid(rhs)),
-                    Binary::Mod if rhs > 0 => Some(lhs.rem_euclid(rhs)),
-                    _ => None,
-                }
-                .ok_or(UOpError::InvalidIndex)
-            }
-        }
-        let mut evaluator = Evaluator {
+        let mut evaluator = ProjectedEvaluator {
             linear: i128::try_from(linear).map_err(|_| UOpError::InvalidIndex)?,
         };
         let offset = self.emit(&mut evaluator)?;
@@ -509,43 +663,105 @@ impl ProjectedIndexPlan {
     }
 }
 
+struct InfixProjectedEmitter<'a, F> {
+    linear: String,
+    literal: &'a mut F,
+}
+
+impl<F: FnMut(i64) -> Result<String, UOpError>> ProjectedIndexEmitter
+    for InfixProjectedEmitter<'_, F>
+{
+    type Value = String;
+    type Error = UOpError;
+
+    fn linear(&mut self) -> Result<Self::Value, Self::Error> {
+        Ok(self.linear.clone())
+    }
+
+    fn constant(&mut self, value: &i64) -> Result<Self::Value, Self::Error> {
+        (self.literal)(*value)
+    }
+
+    fn binary(
+        &mut self,
+        operation: Binary,
+        lhs: Self::Value,
+        rhs: Self::Value,
+    ) -> Result<Self::Value, Self::Error> {
+        let operator = match operation {
+            Binary::Add => "+",
+            Binary::Sub => "-",
+            Binary::Mul => "*",
+            Binary::FloorDiv => "/",
+            Binary::Mod => "%",
+            _ => return Err(UOpError::InvalidIndex),
+        };
+        Ok(format!("(({lhs}) {operator} ({rhs}))"))
+    }
+}
+
+impl<F: FnMut(i64) -> Result<String, UOpError>> ProjectedPredicateEmitter
+    for InfixProjectedEmitter<'_, F>
+{
+    type Predicate = String;
+
+    fn boolean(&mut self, value: bool) -> Result<Self::Predicate, Self::Error> {
+        Ok(if value { "1" } else { "0" }.into())
+    }
+
+    fn compare(
+        &mut self,
+        operation: crate::CompareOp,
+        lhs: Self::Value,
+        rhs: Self::Value,
+    ) -> Result<Self::Predicate, Self::Error> {
+        let operator = match operation {
+            crate::CompareOp::Eq => "==",
+            crate::CompareOp::Ne => "!=",
+            crate::CompareOp::Lt => "<",
+            crate::CompareOp::Le => "<=",
+            crate::CompareOp::Gt => ">",
+            crate::CompareOp::Ge => ">=",
+        };
+        Ok(format!("(({lhs}) {operator} ({rhs}))"))
+    }
+
+    fn logical(
+        &mut self,
+        operation: crate::LogicalOp,
+        lhs: Self::Predicate,
+        rhs: Option<Self::Predicate>,
+    ) -> Result<Self::Predicate, Self::Error> {
+        match (operation, rhs) {
+            (crate::LogicalOp::Not, None) => Ok(format!("(!({lhs}))")),
+            (crate::LogicalOp::And, Some(rhs)) => Ok(format!("(({lhs}) && ({rhs}))")),
+            (crate::LogicalOp::Or, Some(rhs)) => Ok(format!("(({lhs}) || ({rhs}))")),
+            _ => Err(UOpError::InvalidIndex),
+        }
+    }
+}
+
+pub(crate) fn render_infix_projected_predicate(
+    plan: &ProjectedIndexPlan,
+    linear: impl Into<String>,
+    mut literal: impl FnMut(i64) -> Result<String, UOpError>,
+) -> Result<Option<String>, UOpError> {
+    let mut emitter = InfixProjectedEmitter {
+        linear: linear.into(),
+        literal: &mut literal,
+    };
+    plan.predicate
+        .as_ref()
+        .map(|predicate| predicate.emit(&mut emitter))
+        .transpose()
+}
+
 pub(crate) fn render_infix_projected_index(
     plan: &ProjectedIndexPlan,
     linear: impl Into<String>,
     mut literal: impl FnMut(i64) -> Result<String, UOpError>,
 ) -> Result<String, UOpError> {
-    struct Infix<'a, F> {
-        linear: String,
-        literal: &'a mut F,
-    }
-    impl<F: FnMut(i64) -> Result<String, UOpError>> ProjectedIndexEmitter for Infix<'_, F> {
-        type Value = String;
-        type Error = UOpError;
-
-        fn linear(&mut self) -> Result<Self::Value, Self::Error> {
-            Ok(self.linear.clone())
-        }
-        fn constant(&mut self, value: &i64) -> Result<Self::Value, Self::Error> {
-            (self.literal)(*value)
-        }
-        fn binary(
-            &mut self,
-            operation: Binary,
-            lhs: Self::Value,
-            rhs: Self::Value,
-        ) -> Result<Self::Value, Self::Error> {
-            let operator = match operation {
-                Binary::Add => "+",
-                Binary::Sub => "-",
-                Binary::Mul => "*",
-                Binary::FloorDiv => "/",
-                Binary::Mod => "%",
-                _ => return Err(UOpError::InvalidIndex),
-            };
-            Ok(format!("(({lhs}) {operator} ({rhs}))"))
-        }
-    }
-    plan.emit(&mut Infix {
+    plan.emit(&mut InfixProjectedEmitter {
         linear: linear.into(),
         literal: &mut literal,
     })
@@ -589,10 +805,86 @@ fn parse_expression(
     }
 }
 
+fn parse_predicate(
+    predicate: &UOp,
+    output_elements: usize,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<ProjectedPredicate, UOpError> {
+    *nodes = nodes.checked_add(1).ok_or(UOpError::InvalidIndex)?;
+    if depth > MAX_PROJECTED_INDEX_DEPTH
+        || *nodes > MAX_PROJECTED_INDEX_NODES
+        || predicate.ty() != Some(crate::UType::scalar(crate::DType::Bool))
+    {
+        return Err(UOpError::InvalidIndex);
+    }
+    match predicate.operation() {
+        Operation::Const(LiteralValue::Scalar {
+            dtype: crate::DType::Bool,
+            bits,
+        }) if predicate.sources().is_empty() && *bits <= 1 => {
+            Ok(ProjectedPredicate::Constant(*bits != 0))
+        }
+        Operation::GraphCompare(operation) if predicate.sources().len() == 2 => {
+            Ok(ProjectedPredicate::Compare {
+                operation: *operation,
+                lhs: parse_expression(&predicate.sources()[0], output_elements, depth + 1, nodes)?,
+                rhs: parse_expression(&predicate.sources()[1], output_elements, depth + 1, nodes)?,
+            })
+        }
+        Operation::GraphLogical(operation) => {
+            let (lhs, rhs) = match (operation, predicate.sources()) {
+                (crate::LogicalOp::Not, [lhs]) => (lhs, None),
+                (crate::LogicalOp::And | crate::LogicalOp::Or, [lhs, rhs]) => (lhs, Some(rhs)),
+                _ => return Err(UOpError::InvalidIndex),
+            };
+            Ok(ProjectedPredicate::Logical {
+                operation: *operation,
+                lhs: Box::new(parse_predicate(lhs, output_elements, depth + 1, nodes)?),
+                rhs: rhs
+                    .map(|rhs| {
+                        parse_predicate(rhs, output_elements, depth + 1, nodes).map(Box::new)
+                    })
+                    .transpose()?,
+            })
+        }
+        _ => Err(UOpError::InvalidIndex),
+    }
+}
+
 struct ValidationState {
     output_elements: usize,
     nodes: usize,
     fits_i32: bool,
+}
+
+fn validate_predicate(
+    predicate: &ProjectedPredicate,
+    depth: usize,
+    state: &mut ValidationState,
+) -> Result<(), UOpError> {
+    if depth > MAX_PROJECTED_INDEX_DEPTH {
+        return Err(UOpError::InvalidIndex);
+    }
+    state.nodes = state.nodes.checked_add(1).ok_or(UOpError::InvalidIndex)?;
+    if state.nodes > MAX_PROJECTED_INDEX_NODES {
+        return Err(UOpError::InvalidIndex);
+    }
+    match predicate {
+        ProjectedPredicate::Constant(_) => Ok(()),
+        ProjectedPredicate::Compare { lhs, rhs, .. } => {
+            validate_expression(lhs, depth + 1, state)?;
+            validate_expression(rhs, depth + 1, state)?;
+            Ok(())
+        }
+        ProjectedPredicate::Logical { lhs, rhs, .. } => {
+            validate_predicate(lhs, depth + 1, state)?;
+            if let Some(rhs) = rhs {
+                validate_predicate(rhs, depth + 1, state)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_expression(
@@ -725,6 +1017,38 @@ mod tests {
         )
     }
 
+    fn predicated_index(
+        input: impl Into<Shape>,
+        output: impl Into<Shape>,
+        expression: UOp,
+        predicate: UOp,
+    ) -> UOp {
+        let input = input.into();
+        let output = output.into();
+        let elements = input.numel().unwrap();
+        let ty = UType::scalar(DType::F32);
+        let address = UOp::from_operation(
+            Operation::DefineGlobal(AddressValue {
+                space: AddressSpace::Global,
+                name: "b7".into(),
+                element: ty,
+            }),
+            Some(ty),
+            vec![],
+        );
+        UOp::from_operation(
+            Operation::Index(IndexValue::Buffer {
+                buffer: 7,
+                elements,
+                input_shape: input,
+                output_shape: output,
+                addressing: IndexAddressing::Predicated,
+            }),
+            Some(ty),
+            vec![address, expression, predicate],
+        )
+    }
+
     fn range(extent: i64) -> UOp {
         UOp::from_operation(
             Operation::Range(0),
@@ -816,6 +1140,69 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn predicated_addresses_are_total_and_false_lanes_never_widen_bounds() {
+        let linear = range(5);
+        let address = binary(Binary::Mod, linear.clone(), integer(2));
+        let predicate = UOp::from_operation(
+            Operation::GraphCompare(crate::CompareOp::Ge),
+            Some(UType::scalar(DType::Bool)),
+            vec![linear, integer(2)],
+        );
+        let index = predicated_index([2], [5], address, predicate);
+        let plan = ProjectedIndexPlan::from_index(&index).unwrap();
+        assert!(plan.is_guarded());
+        assert_eq!(
+            (0..5)
+                .map(|lane| (plan.offset(lane).unwrap(), plan.valid(lane).unwrap()))
+                .collect::<Vec<_>>(),
+            vec![(0, false), (1, false), (0, true), (1, true), (0, true)]
+        );
+
+        let malformed_predicate = predicated_index(
+            [2],
+            [5],
+            binary(Binary::Mod, range(5), integer(2)),
+            integer(1),
+        );
+        assert!(ProjectedIndexPlan::from_index(&malformed_predicate).is_err());
+        let unsafe_address = predicated_index(
+            [2],
+            [5],
+            range(5),
+            UOp::scalar_constant(DType::Bool, 0, UType::scalar(DType::Bool)),
+        );
+        assert!(ProjectedIndexPlan::from_index(&unsafe_address).is_err());
+
+        let empty = predicated_index(
+            [1],
+            [0],
+            binary(Binary::Mul, range(0), integer(0)),
+            UOp::scalar_constant(DType::Bool, 0, UType::scalar(DType::Bool)),
+        );
+        let empty = ProjectedIndexPlan::from_index(&empty).unwrap();
+        assert_eq!(empty.output_elements, 0);
+        assert!(empty.valid(0).is_err());
+
+        let addressless = predicated_index(
+            [0],
+            [3],
+            integer(0),
+            UOp::scalar_constant(DType::Bool, 0, UType::scalar(DType::Bool)),
+        );
+        let addressless = ProjectedIndexPlan::from_index(&addressless).unwrap();
+        assert_eq!(addressless.elements, 0);
+        assert!((0..3).all(|lane| !addressless.valid(lane).unwrap()));
+        assert!((0..3).all(|lane| addressless.offset(lane).is_err()));
+        let claimed_valid = predicated_index(
+            [0],
+            [3],
+            integer(0),
+            UOp::scalar_constant(DType::Bool, 1, UType::scalar(DType::Bool)),
+        );
+        assert!(ProjectedIndexPlan::from_index(&claimed_valid).is_err());
     }
 
     #[test]

@@ -1319,6 +1319,17 @@ fn buffer(graph: &Graph, id: NodeId, read_only: bool) -> Result<BufferDesc, Sche
 /// raw Contiguous copy, so transport-only dtypes and backend-specific scalar
 /// gaps never lose an already-supported materialization route.
 fn portable_ordinary_kernel(kernel: &UOp) -> bool {
+    if kernel.topological().is_ok_and(|nodes| {
+        nodes
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+    }) {
+        // Predicated loads are an authenticated CPU/interpreter capability.
+        // Device renderers reject them explicitly before resource planning;
+        // requiring every portable renderer here would retain the Pad
+        // materialization and erase the typed contract from the schedule.
+        return true;
+    }
     let ptx = crate::PtxRenderer::new(80).and_then(|renderer| renderer.render(kernel));
     let opencl = crate::runtime::opencl::OpenClRenderer::default().render(kernel);
     let metal = crate::runtime::metal::MetalRenderer::new(
@@ -1439,7 +1450,7 @@ struct ScalarAliasCandidates {
 struct ScalarAliasCollector<'a> {
     graph: &'a Graph,
     output: NodeId,
-    output_shape: &'a Shape,
+    iteration_shape: &'a Shape,
     roots: &'a BTreeSet<usize>,
     external: &'a BTreeSet<usize>,
     requested: &'a BTreeSet<usize>,
@@ -1478,6 +1489,41 @@ impl ScalarAliasCollector<'_> {
         Ok(())
     }
 
+    fn record_projected_alias_roots(
+        &mut self,
+        terminal: NodeId,
+        source: NodeId,
+    ) -> Result<(), ScheduleError> {
+        let mut cursor = terminal;
+        while cursor != source {
+            if self.roots.contains(&cursor.index()) {
+                self.candidates
+                    .projected_view_roots
+                    .entry(source.index())
+                    .or_default()
+                    .insert(cursor.index());
+            }
+            cursor = match self.graph.op(cursor).map_err(ScheduleError::Graph)? {
+                Op::Shrink { input, .. }
+                | Op::Reshape { input, .. }
+                | Op::Permute { input, .. }
+                | Op::Expand { input, .. }
+                | Op::Stride { input, .. } => *input,
+                Op::Pad { input, .. }
+                    if crate::rangeify::is_constant_zero_pad(self.graph, cursor) =>
+                {
+                    *input
+                }
+                _ => {
+                    return Err(ScheduleError::Binding(
+                        "invalid computed projected path".into(),
+                    ));
+                }
+            };
+        }
+        Ok(())
+    }
+
     fn visit(&mut self, node: NodeId) -> Result<(), ScheduleError> {
         let op = self.graph.op(node).map_err(ScheduleError::Graph)?;
         let is_view = matches!(
@@ -1487,13 +1533,33 @@ impl ScalarAliasCollector<'_> {
                 | Op::Permute { .. }
                 | Op::Expand { .. }
                 | Op::Stride { .. }
-        );
+        ) || crate::rangeify::is_constant_zero_pad(self.graph, node);
+        // A canonical-zero Pad is semantically a guarded source read, even
+        // when an affine suffix (for example Reshape) can otherwise collapse
+        // only as far as the Pad root. Prefer the exact predicated projection
+        // before computed-view ownership so the Pad itself is not mistaken
+        // for an affine producer that would remain materialized.
+        if is_view
+            && !self.requested.contains(&node.index())
+            && !self.external.contains(&node.index())
+            && let Ok(source) =
+                crate::rangeify::predicated_source(self.graph, node, self.iteration_shape)
+            && (self.roots.contains(&source.index())
+                || self.external.contains(&source.index())
+                || matches!(
+                    self.graph.op(source),
+                    Ok(Op::Input { .. } | Op::Constant(_))
+                ))
+        {
+            self.record_projected_alias_roots(node, source)?;
+            return Ok(());
+        }
         if is_view
             && !self.requested.contains(&node.index())
             && !self.external.contains(&node.index())
             && let Ok(planned) = crate::rangeify::computed_view(self.graph, node)
             && self.roots.contains(&planned.source.index())
-            && let Ok(view) = planned.view.expand(self.output_shape.clone())
+            && let Ok(view) = planned.view.expand(self.iteration_shape.clone())
         {
             self.candidates
                 .affine_maps
@@ -1513,7 +1579,7 @@ impl ScalarAliasCollector<'_> {
             && !self.requested.contains(&node.index())
             && !self.external.contains(&node.index())
             && let Ok(source) =
-                crate::rangeify::projected_source(self.graph, node, self.output_shape)
+                crate::rangeify::projected_source(self.graph, node, self.iteration_shape)
             && (self.roots.contains(&source.index())
                 || self.external.contains(&source.index())
                 || matches!(
@@ -1521,11 +1587,7 @@ impl ScalarAliasCollector<'_> {
                     Ok(Op::Input { .. } | Op::Constant(_))
                 ))
         {
-            self.candidates
-                .projected_view_roots
-                .entry(source.index())
-                .or_default()
-                .insert(node.index());
+            self.record_projected_alias_roots(node, source)?;
             return Ok(());
         }
         if node != self.output && self.roots.contains(&node.index()) {
@@ -1551,11 +1613,18 @@ impl ScalarAliasCandidates {
         external: &BTreeSet<usize>,
         requested: &BTreeSet<usize>,
     ) -> Result<Self, ScheduleError> {
-        let output_shape = graph.shape(output).map_err(ScheduleError::Graph)?;
+        // Scalar elementwise lowering iterates the output shape. Reduction
+        // lowering first lowers its producer over the complete reduction
+        // input domain, so alias ownership must authenticate projections
+        // against that same iteration shape before rehearsal.
+        let iteration_shape = match graph.op(output).map_err(ScheduleError::Graph)? {
+            Op::Reduce { input, .. } => graph.shape(*input).map_err(ScheduleError::Graph)?,
+            _ => graph.shape(output).map_err(ScheduleError::Graph)?,
+        };
         let mut collector = ScalarAliasCollector {
             graph,
             output,
-            output_shape,
+            iteration_shape,
             roots,
             external,
             requested,
@@ -1774,6 +1843,21 @@ fn scalar_alias_materialized(
         .collect()
 }
 
+fn scalar_alias_group_is_protected(
+    group: &BTreeSet<usize>,
+    protected: &BTreeSet<usize>,
+    hard_loads: &BTreeSet<usize>,
+    movement_operand_owners: &BTreeMap<usize, BTreeSet<usize>>,
+) -> bool {
+    group.iter().any(|candidate| {
+        protected.contains(candidate)
+            && (hard_loads.contains(candidate)
+                || !movement_operand_owners
+                    .get(candidate)
+                    .is_some_and(|owners| owners.is_subset(group)))
+    })
+}
+
 fn rehearse_scalar_alias_fusion(
     graph: &Graph,
     output: NodeId,
@@ -1782,12 +1866,18 @@ fn rehearse_scalar_alias_fusion(
     removed: &BTreeSet<usize>,
 ) -> Result<Option<(UOp, BTreeSet<usize>)>, ScheduleError> {
     let materialized = scalar_alias_materialized(output, roots, external, removed);
-    let kernel = match crate::kernel::lower_graph_elementwise_with_owned_aliases(
-        graph,
-        output,
-        &materialized,
-        removed,
-    ) {
+    let lowered = match graph.op(output).map_err(ScheduleError::Graph)? {
+        Op::Reduce { .. } => {
+            crate::kernel::lower_graph_reduction_with_materialized(graph, output, &materialized)
+        }
+        _ => crate::kernel::lower_graph_elementwise_with_owned_aliases(
+            graph,
+            output,
+            &materialized,
+            removed,
+        ),
+    };
+    let kernel = match lowered {
         Ok(kernel) => kernel,
         Err(_) => return Ok(None),
     };
@@ -1805,22 +1895,35 @@ fn scalar_alias_output(op: &Op) -> bool {
             | Op::Compare { .. }
             | Op::Logical { .. }
             | Op::Select { .. }
+            | Op::Reduce { .. }
     )
+}
+
+struct ScalarAliasOwnership<'a> {
+    roots: &'a BTreeSet<usize>,
+    external: &'a BTreeSet<usize>,
+    requested: &'a BTreeSet<usize>,
+    consumers: &'a [usize],
+    protected: &'a BTreeSet<usize>,
+    hard_loads: &'a BTreeSet<usize>,
+    movement_operand_owners: &'a BTreeMap<usize, BTreeSet<usize>>,
 }
 
 fn checked_scalar_alias_fusion(
     graph: &Graph,
     output: NodeId,
-    roots: &BTreeSet<usize>,
-    external: &BTreeSet<usize>,
-    requested: &BTreeSet<usize>,
-    consumers: &[usize],
-    protected: &BTreeSet<usize>,
+    ownership: &ScalarAliasOwnership<'_>,
 ) -> Result<Option<ScalarAliasFusion>, ScheduleError> {
     if !scalar_alias_output(graph.op(output).map_err(ScheduleError::Graph)?) {
         return Ok(None);
     }
-    let candidates = ScalarAliasCandidates::collect(graph, output, roots, external, requested)?;
+    let candidates = ScalarAliasCandidates::collect(
+        graph,
+        output,
+        ownership.roots,
+        ownership.external,
+        ownership.requested,
+    )?;
     let mut accepted = BTreeSet::new();
     for source in candidates.affine_maps.keys().copied() {
         let Some(group) = exclusive_affine_alias_group(
@@ -1828,17 +1931,19 @@ fn checked_scalar_alias_fusion(
             output,
             source,
             &candidates,
-            external,
-            requested,
-            consumers,
+            ownership.external,
+            ownership.requested,
+            ownership.consumers,
         )?
         else {
             continue;
         };
-        if !group.is_disjoint(protected) {
+        if !group.is_disjoint(ownership.protected) {
             continue;
         }
-        if rehearse_scalar_alias_fusion(graph, output, roots, external, &group)?.is_some() {
+        if rehearse_scalar_alias_fusion(graph, output, ownership.roots, ownership.external, &group)?
+            .is_some()
+        {
             accepted.extend(group);
         }
     }
@@ -1848,25 +1953,37 @@ fn checked_scalar_alias_fusion(
             output,
             source,
             &candidates,
-            external,
-            requested,
-            consumers,
+            ownership.external,
+            ownership.requested,
+            ownership.consumers,
         )?
         else {
             continue;
         };
-        if !group.is_disjoint(protected) {
+        if scalar_alias_group_is_protected(
+            &group,
+            ownership.protected,
+            ownership.hard_loads,
+            ownership.movement_operand_owners,
+        ) {
             continue;
         }
-        if rehearse_scalar_alias_fusion(graph, output, roots, external, &group)?.is_some() {
+        if rehearse_scalar_alias_fusion(graph, output, ownership.roots, ownership.external, &group)?
+            .is_some()
+        {
             accepted.extend(group);
         }
     }
     if accepted.is_empty() {
         return Ok(None);
     }
-    let Some((kernel, load_nodes)) =
-        rehearse_scalar_alias_fusion(graph, output, roots, external, &accepted)?
+    let Some((kernel, load_nodes)) = rehearse_scalar_alias_fusion(
+        graph,
+        output,
+        ownership.roots,
+        ownership.external,
+        &accepted,
+    )?
     else {
         return Ok(None);
     };
@@ -1887,9 +2004,13 @@ fn ordinary_scalar_fallback_loads(
         return Ok(BTreeSet::new());
     }
     let materialized = scalar_alias_materialized(output, roots, external, &BTreeSet::new());
-    let kernel =
-        crate::kernel::lower_graph_elementwise_with_materialized(graph, output, &materialized)
-            .map_err(ScheduleError::UOp)?;
+    let kernel = match graph.op(output).map_err(ScheduleError::Graph)? {
+        Op::Reduce { .. } => {
+            crate::kernel::lower_graph_reduction_with_materialized(graph, output, &materialized)
+        }
+        _ => crate::kernel::lower_graph_elementwise_with_materialized(graph, output, &materialized),
+    }
+    .map_err(ScheduleError::UOp)?;
     let kernel = crate::uop::normalize_kernel(&kernel).map_err(ScheduleError::UOp)?;
     let topology = kernel.topological().map_err(ScheduleError::UOp)?;
     let mut loads = BTreeSet::new();
@@ -2516,7 +2637,7 @@ fn schedule_many_with_external(
     // Materializing movement kernels name their exact pointer ABI. In
     // particular, a contiguous boundary over an affine view consumes the
     // rangeified storage source rather than first materializing the view.
-    let mut movement_operands = BTreeSet::new();
+    let mut movement_operand_owners = BTreeMap::<usize, BTreeSet<usize>>::new();
     for index in &needed {
         let id = NodeId::from_index(*index);
         let plan = match crate::MovementKernelPlan::from_scheduled_graph(graph, id) {
@@ -2524,20 +2645,18 @@ fn schedule_many_with_external(
             Err(crate::MovementPlanError::NotMovement) => continue,
             Err(error) => return Err(ScheduleError::Binding(error.to_string())),
         };
-        movement_operands.extend(
-            plan.input_operands()
-                .into_iter()
-                .map(|input| input.node.index()),
-        );
+        for input in plan.input_operands() {
+            if !matches!(graph.op(input.node), Ok(Op::Input { .. } | Op::Constant(_))) {
+                movement_operand_owners
+                    .entry(input.node.index())
+                    .or_default()
+                    .insert(*index);
+            }
+        }
     }
-    let movement_operands = movement_operands
-        .into_iter()
-        .filter(|index| {
-            !matches!(
-                graph.op(NodeId::from_index(*index)),
-                Ok(Op::Input { .. } | Op::Constant(_))
-            )
-        })
+    let movement_operands = movement_operand_owners
+        .keys()
+        .copied()
         .collect::<BTreeSet<_>>();
     // A computed affine view normally materializes as its own dense movement
     // item, while a terminal requested alias keeps only its physical source.
@@ -2843,11 +2962,15 @@ fn schedule_many_with_external(
                 if let Some(fusion) = checked_scalar_alias_fusion(
                     graph,
                     node,
-                    &roots,
-                    external,
-                    &requested,
-                    &consumers,
-                    &scalar_alias_reserved,
+                    &ScalarAliasOwnership {
+                        roots: &roots,
+                        external,
+                        requested: &requested,
+                        consumers: &consumers,
+                        protected: &scalar_alias_reserved,
+                        hard_loads: &scalar_alias_loads,
+                        movement_operand_owners: &movement_operand_owners,
+                    },
                 )? {
                     next_reserved.insert(root);
                     next_reserved.extend(fusion.load_nodes.iter().copied());

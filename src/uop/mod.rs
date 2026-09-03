@@ -1052,8 +1052,12 @@ fn validate_operation_arity(n: &UOp) -> Result<(), UOpError> {
         | Operation::GraphBinary(_)
         | Operation::GraphCompare(_)
         | Operation::ReduceAccumulate
-        | Operation::Index(_)
         | Operation::Store => (actual == 2, "two sources"),
+        Operation::Index(IndexValue::Buffer {
+            addressing: IndexAddressing::Predicated,
+            ..
+        }) => (actual == 3, "three sources"),
+        Operation::Index(_) => (actual == 2, "two sources"),
         Operation::GraphLogical(crate::LogicalOp::Not) => (actual == 1, "one source"),
         Operation::GraphLogical(crate::LogicalOp::And | crate::LogicalOp::Or) => {
             (actual == 2, "two sources")

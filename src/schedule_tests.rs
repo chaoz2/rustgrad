@@ -1886,6 +1886,293 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
 }
 
 #[test]
+fn zero_pad_is_one_predicated_load_for_elementwise_and_reduction_owners() {
+    fn predicated(item: &crate::ScheduleItem) -> Vec<UOp> {
+        item.kernel
+            .topological()
+            .unwrap()
+            .into_iter()
+            .filter(crate::projected_index::ProjectedIndexPlan::is_predicated)
+            .collect()
+    }
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let padded = graph.pad(input, [(1, 2)], crate::Scalar::F(0.0)).unwrap();
+    let viewed = graph.reshape(padded, [1, 5]).unwrap();
+    let squared = graph.square(viewed).unwrap();
+    let scheduled = schedule(&graph, squared).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.items.len(), 1);
+    assert_eq!(scheduled.items[0].node, squared);
+    assert_eq!(predicated(&scheduled.items[0]).len(), 1);
+    assert_eq!(
+        scheduled.items[0]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![input]
+    );
+    assert!(scheduled.items.iter().all(|item| item.node != padded));
+    assert!(scheduled.items.iter().all(|item| item.node != viewed));
+    crate::MemoryPlan::from_schedule(&scheduled, &[squared], true).unwrap();
+
+    let bindings = HashMap::from([(
+        "input".into(),
+        TensorData::new([2], vec![1.0, -2.0]).unwrap(),
+    )]);
+    let actual = CpuBackend.execute(&graph, squared, &bindings).unwrap();
+    assert_eq!(
+        actual.storage(),
+        &crate::Storage::F32(vec![0.0, 1.0, 4.0, 0.0, 0.0])
+    );
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[squared]).unwrap();
+    let bytes = capture.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    assert_eq!(
+        decoded
+            .replay(&BTreeMap::from_iter(bindings.clone()))
+            .unwrap()[0],
+        actual
+    );
+    let native = decoded
+        .replay_with_options(
+            &BTreeMap::from_iter(bindings.clone()),
+            &crate::CapturedReplayExecutor::default(),
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(native.outputs[0], actual);
+    assert!(
+        crate::CpuJit::render(&scheduled.items[0].kernel)
+            .unwrap()
+            .source
+            .contains(" ? ")
+    );
+    let linear = crate::LinearKernel::from_uop(&scheduled.items[0].kernel).unwrap();
+    assert!(!linear.enabled);
+    assert!(linear.reason.contains("projected index"));
+    assert!(
+        crate::PtxRenderer::new(80)
+            .unwrap()
+            .render(&scheduled.items[0].kernel)
+            .is_err()
+    );
+    assert!(
+        crate::runtime::opencl::OpenClRenderer::default()
+            .render(&scheduled.items[0].kernel)
+            .is_err()
+    );
+    assert!(
+        crate::runtime::metal::MetalRenderer::new(
+            1,
+            crate::runtime::metal::MetalCapabilities {
+                max_buffer_length: usize::MAX,
+                unified_memory: false,
+                family: "predicated-index-test".into(),
+            },
+        )
+        .unwrap()
+        .render(&scheduled.items[0].kernel)
+        .is_err()
+    );
+    assert!(
+        crate::runtime::webgpu::WgslRenderer::new(
+            1,
+            crate::runtime::webgpu::WebGpuCapabilities {
+                max_buffer_size: usize::MAX,
+                max_storage_buffers_per_shader_stage: u32::MAX,
+                max_compute_workgroup_size_x: 1,
+                max_compute_workgroups_per_dimension: u32::MAX,
+                timestamp_query: false,
+                shader_f16: false,
+            },
+        )
+        .unwrap()
+        .render(&scheduled.items[0].kernel)
+        .is_err()
+    );
+
+    let reduced = graph.sum(squared, 1).unwrap();
+    let reduced_schedule = schedule(&graph, reduced).unwrap();
+    reduced_schedule.validate().unwrap();
+    let reduced_item = reduced_schedule
+        .items
+        .iter()
+        .find(|item| item.node == reduced)
+        .unwrap();
+    assert_eq!(predicated(reduced_item).len(), 1);
+    assert!(
+        reduced_schedule
+            .items
+            .iter()
+            .all(|item| item.node != padded)
+    );
+    let reduced_actual = CpuBackend.execute(&graph, reduced, &bindings).unwrap();
+    assert_eq!(reduced_actual.storage(), &crate::Storage::F32(vec![5.0]));
+
+    let mut raw = Graph::new();
+    let raw_input = raw.input_dtype("raw", [2], DType::F32);
+    let raw_padded = raw.pad(raw_input, [(1, 1)], crate::Scalar::F(0.0)).unwrap();
+    let raw_output = raw.detach(raw_padded).unwrap();
+    let raw_schedule = schedule(&raw, raw_output).unwrap();
+    let raw_capture = crate::CapturedSchedule::capture(&raw, &raw_schedule, &[raw_output]).unwrap();
+    let raw_bits = [0x8000_0000, 0x7fc0_1234];
+    let raw_values = BTreeMap::from([(
+        "raw".into(),
+        TensorData::from_storage(
+            [2],
+            crate::Storage::F32(raw_bits.into_iter().map(f32::from_bits).collect()),
+        )
+        .unwrap(),
+    )]);
+    let raw_actual = raw_capture.replay(&raw_values).unwrap();
+    let crate::Storage::F32(raw_actual) = raw_actual[0].storage() else {
+        panic!("predicated raw-lane output")
+    };
+    assert_eq!(
+        raw_actual
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        vec![0, raw_bits[0], raw_bits[1], 0]
+    );
+
+    let mut diagonal = Graph::new();
+    let matrix = diagonal.input_dtype("matrix", [2, 3], DType::F32);
+    let selected = diagonal.diagonal_default(matrix).unwrap();
+    let selected = diagonal.detach(selected).unwrap();
+    let diagonal_schedule = schedule(&diagonal, selected).unwrap();
+    diagonal_schedule.validate().unwrap();
+    assert!(
+        diagonal_schedule
+            .items
+            .iter()
+            .all(|item| !matches!(diagonal.op(item.node), Ok(crate::Op::Pad { .. })))
+    );
+    assert_eq!(
+        diagonal_schedule.items.iter().flat_map(predicated).count(),
+        1
+    );
+    let diagonal_actual = CpuBackend
+        .execute(
+            &diagonal,
+            selected,
+            &HashMap::from([(
+                "matrix".into(),
+                TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(
+        diagonal_actual.storage(),
+        &crate::Storage::F32(vec![1.0, 5.0])
+    );
+
+    let requested = schedule_many(&graph, &[padded, squared]).unwrap();
+    assert!(requested.items.iter().any(|item| item.node == padded));
+    let mut nonzero = Graph::new();
+    let source = nonzero.input_dtype("source", [2], DType::F32);
+    let padded = nonzero
+        .pad(source, [(1, 1)], crate::Scalar::F(3.0))
+        .unwrap();
+    let output = nonzero.square(padded).unwrap();
+    assert!(
+        schedule(&nonzero, output)
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.node == padded)
+    );
+
+    let mut empty = Graph::new();
+    let empty_input = empty.input_dtype("empty", [0, 2], DType::F32);
+    let empty_pad = empty
+        .pad(empty_input, [(1, 1), (1, 0)], crate::Scalar::F(0.0))
+        .unwrap();
+    let empty_view = empty.permute(empty_pad, [1, 0]).unwrap();
+    let empty_values = empty.square(empty_view).unwrap();
+    let empty_reduced = empty.sum(empty_values, 1).unwrap();
+    let empty_scalar_schedule = schedule(&empty, empty_values).unwrap();
+    let empty_scalar_item = empty_scalar_schedule
+        .items
+        .iter()
+        .find(|item| item.node == empty_values)
+        .unwrap();
+    let empty_scalar_source = crate::CpuJit::render(&empty_scalar_item.kernel)
+        .unwrap()
+        .source;
+    assert!(empty_scalar_source.contains("((0) ? ("));
+    assert!(!empty_scalar_source.contains("false"));
+    let empty_schedule = schedule(&empty, empty_reduced).unwrap();
+    empty_schedule.validate().unwrap();
+    assert!(
+        empty_schedule
+            .items
+            .iter()
+            .all(|item| item.node != empty_pad)
+    );
+    assert!(
+        empty_schedule
+            .items
+            .iter()
+            .all(|item| item.node != empty_view)
+    );
+    let empty_item = empty_schedule
+        .items
+        .iter()
+        .find(|item| item.node == empty_reduced)
+        .unwrap();
+    let empty_indices = predicated(empty_item);
+    assert_eq!(empty_indices.len(), 1);
+    let empty_plan =
+        crate::projected_index::ProjectedIndexPlan::from_index(&empty_indices[0]).unwrap();
+    assert_eq!(empty_plan.elements, 0);
+    assert!((0..6).all(|lane| !empty_plan.valid(lane).unwrap()));
+    let empty_reduction_source = crate::CpuJit::render(&empty_item.kernel).unwrap().source;
+    assert!(empty_reduction_source.contains("((0) ? ("));
+    assert!(!empty_reduction_source.contains("false"));
+    assert_eq!(
+        empty_item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![empty_input]
+    );
+    crate::MemoryPlan::from_schedule(&empty_schedule, &[empty_reduced], true).unwrap();
+    let empty_bindings = BTreeMap::from([(
+        "empty".into(),
+        TensorData::new([0, 2], Vec::<f32>::new()).unwrap(),
+    )]);
+    let empty_capture =
+        crate::CapturedSchedule::capture(&empty, &empty_schedule, &[empty_reduced]).unwrap();
+    let empty_bytes = empty_capture.to_bytes().unwrap();
+    let empty_capture = crate::CapturedSchedule::from_bytes(&empty_bytes).unwrap();
+    assert_eq!(empty_capture.to_bytes().unwrap(), empty_bytes);
+    let empty_output = empty_capture.replay(&empty_bindings).unwrap();
+    assert_eq!(empty_output[0].shape(), &Shape::from([3]));
+    assert_eq!(
+        empty_output[0].storage(),
+        &crate::Storage::F32(vec![0.0, 0.0, 0.0])
+    );
+    let empty_native = empty_capture
+        .replay_with_options(
+            &empty_bindings,
+            &crate::CapturedReplayExecutor::default(),
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(empty_native.outputs, empty_output);
+}
+
+#[test]
 fn scalar_alias_fusion_owns_shared_intermediate_equivalent_view_paths() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [2, 3], DType::F32);

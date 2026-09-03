@@ -759,6 +759,14 @@ impl WgslRenderer {
         let nodes = root
             .topological()
             .map_err(|error| WebGpuError::Unsupported(error.to_string()))?;
+        if nodes
+            .iter()
+            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+        {
+            return Err(WebGpuError::Unsupported(
+                "predicated projected loads are outside WGSL lowering".into(),
+            ));
+        }
         if nodes.iter().any(|node| {
             matches!(
                 node.operation(),

@@ -142,7 +142,8 @@ impl VectorProgram {
                     output: crate::IndexRef {
                         value: crate::IndexValue::View { .. }
                             | crate::IndexValue::Buffer {
-                                addressing: crate::IndexAddressing::Projected,
+                                addressing: crate::IndexAddressing::Projected
+                                    | crate::IndexAddressing::Predicated,
                                 ..
                             },
                         ..
