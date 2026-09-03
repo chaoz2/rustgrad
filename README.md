@@ -81,57 +81,43 @@ layers:
 - [`examples/llama_chat.rs`](examples/llama_chat.rs)
 - [`examples/metal_scoreboard.rs`](examples/metal_scoreboard.rs)
 
-## Reuse a static module on Metal
+## Run ResNet on a persistent Metal session
 
-The strict Metal inference path freezes a module's capture-admitted parameters,
-keeps them and intermediate slots resident across calls, and stages only
-transient inputs. Device selection stays explicit, planning is resource-free
-and inspectable, and unsupported captures return an error instead of using CPU
-fallback. Reports distinguish host wall-clock observations from host API copy
-counts; they do not claim GPU timing or physical bus traffic.
+The typed ResNet facade builds and captures the complete Eval/F32 graph, freezes
+its parameters, and binds the plan to one explicitly selected Metal device.
+Preparation uploads residents once; repeated runs stage only the image and
+download logits. The graph, capture, memory plan, input schemas, rendered MSL,
+and reports remain inspectable, and unsupported work returns an error instead
+of using CPU fallback.
 
 ```rust,no_run
-use rustgrad::nn::Linear;
-use rustgrad::runtime::metal::{
-    MetalInferencePlan, MetalRuntime, MetalScoreboardContext, MetalSessionScoreboard,
-};
-use rustgrad::{CapturedInference, DType, Graph, TensorData};
-use std::collections::BTreeMap;
+use rustgrad::nn::{ResNet, ResNetConfig, ResNetMetalPlan};
+use rustgrad::runtime::metal::{MetalPlanOptions, MetalRuntime};
+use rustgrad::TensorData;
 
 let device = MetalRuntime::load()?.device(0)?;
-let model = Linear::new_static(4, 2, true, 7)?;
-let mut graph = Graph::new();
-let features = graph.input_dtype("features", [1, 4], DType::F32);
-let scores = model.forward(&mut graph, features)?;
-let captured = CapturedInference::from_module_graph(&model, &graph, &[scores])?;
-let plan = MetalInferencePlan::new(captured, device.renderer(64)?)?;
+let model = ResNet::new_static(ResNetConfig::default(), 7)?;
+let plan = ResNetMetalPlan::eval_f32(
+    &model,
+    &device,
+    [1, 3, 224, 224],
+    MetalPlanOptions::default(),
+)?;
+assert_eq!(plan.summary().fallback_count, 0);
+println!("kernels: {}", plan.rendered_items().count());
 
-println!("plan: {:?}", plan.summary());
-let mut scoreboard = MetalSessionScoreboard::new(
-    MetalScoreboardContext::new(
-        "linear-1x4",
-        env!("CARGO_PKG_VERSION"),
-        "live Metal device; host wall clock and host API counters",
-    )?,
-    &plan,
-);
-let mut session = plan.prepare(device)?;
-scoreboard.bind(&session)?;
-let input = || TensorData::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]);
-let first = session.run(&BTreeMap::from([("features".into(), input()?)]))?;
-scoreboard.record(&first)?;
-let second = session.run(&BTreeMap::from([("features".into(), input()?)]))?;
-scoreboard.record(&second)?;
-assert_eq!(session.summary().fallback_count, 0);
-scoreboard.report()?.write_json("metal-scoreboard.json")?;
+let mut session = plan.prepare()?;
+let image = TensorData::zeros([1, 3, 224, 224])?;
+let first = session.run(image.clone())?;
+let second = session.run(image)?;
+assert_eq!(first.logits().shape().dims(), &[1, 1000]);
+println!("steady run: {:?}", second.report());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The opt-in scoreboard records the first successful run separately from ordered
-steady-run samples. Its JSON contains host wall-clock observations, host API
-copy counts, planned static tensor-slot bytes, launches, cache facts, and the
-strict path's zero fallback count. It does not report GPU time, compile-only
-time, physical bus traffic, process memory, energy, or throughput.
+The lower-level session and opt-in scoreboard remain available for detailed
+deployment evidence. Their host wall-clock and host API copy counts do not
+claim GPU time, physical bus traffic, allocator RSS, energy, or throughput.
 
 ## How the system fits together
 

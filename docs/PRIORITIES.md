@@ -48,9 +48,9 @@ workloads demonstrates that they are the next concrete blocker.
 
 ### 1. P0 — strict persistent Metal device session
 
-**Status:** persistent runtime and full default ResNet-18 structural conformance
-delivered; exact ignored live numerical acceptance checked in, hardware evidence
-pending.
+**Status:** persistent runtime, a typed ResNet deployment facade, and full
+default ResNet-18 structural conformance delivered; exact ignored live
+numerical acceptance checked in, hardware evidence pending.
 
 `MetalDeviceSessionPlan` authenticates one concrete pure capture and an
 explicit resident/transient input partition before resources. Preparation
@@ -64,6 +64,11 @@ ABI-validating virtual-resource runs. The opt-in Metal scoreboard records one
 exact session's successful prefix with first/ordered steady host-wall samples
 and deterministic plan/cache/copy/launch JSON; it is measurement plumbing, not
 live workload evidence or GPU timing.
+
+`ResNetMetalPlan::eval_f32` is the concise public entry point for this vertical:
+it freezes the model, binds capability admission and preparation to one explicit
+device, exposes its capture/plan/schemas/MSL, and returns a persistent typed
+session whose only transient is the exact F32 NCHW image.
 
 Exact ignored Linear and full default Eval/F32 ResNet-18 acceptances plus a
 manual-only exact-SHA workflow are checked in for

@@ -207,8 +207,9 @@ use crate::{
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
     CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
     InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
-    LaneInstruction, Mode, MovementKernelKind, MovementValue, NodeId, Operation, ReduceKind,
-    ResNet, ResNetConfig, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UType, schedule,
+    LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation, ReduceKind, ResNet,
+    ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
+    TypedValue, UType, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -1341,14 +1342,20 @@ fn metal_device_session_zero_contraction_uses_pointer_sentinels_without_empty_wr
 fn default_resnet18_is_one_boundary_free_resident_metal_session() {
     let model = ResNet::new_static(ResNetConfig::default(), 19).unwrap();
     zero_trainable_module_parameters(&model);
-    let mut graph = Graph::new();
-    let image = graph.input_dtype("image", [1, 3, 224, 224], DType::F32);
-    let forward = model.forward_mode(&mut graph, image, Mode::Eval).unwrap();
-    assert!(forward.pending.is_empty());
-    let logits = forward.output.logits().unwrap();
+    let mock = Arc::new(MockDispatch::virtual_zero_execution());
+    let device = test_device(mock.clone());
+    let plan =
+        ResNetMetalPlan::eval_f32(&model, &device, [1, 3, 224, 224], MetalPlanOptions::new(64))
+            .unwrap();
+    let graph = plan.graph();
+    let image = plan.image_input().node;
+    let logits = plan.logits_node();
     assert_eq!(graph.shape(logits).unwrap(), &Shape::new([1, 1000]));
+    assert_eq!(plan.logits_output().shape, Shape::new([1, 1000]));
+    assert_eq!(plan.selected_device_owner_id(), device.owner_id());
+    assert_eq!(plan.selected_device_info(), device.info());
 
-    let scheduled = crate::schedule(&graph, logits).unwrap();
+    let scheduled = plan.capture();
     assert!(!scheduled.items.is_empty());
     assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
 
@@ -1399,23 +1406,9 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
         input.id == maxpool_windows.primary_output().id && input.shape == maxpool_window_shape
     }));
 
-    let capture = CapturedSchedule::capture(&graph, &scheduled, &[logits]).unwrap();
-    let capture_identity = capture.identity;
-    let capture = CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
-    assert_eq!(capture.identity, capture_identity);
-    let residents = model
-        .input_bindings(&graph)
-        .unwrap()
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    let resident_names = residents.keys().cloned().collect::<Vec<_>>();
-    assert!(!resident_names.is_empty());
-    let plan = MetalDeviceSessionPlan::from_capture(
-        capture,
-        resident_names,
-        MetalRenderer::new(64, virtual_conformance_capabilities()).unwrap(),
-    )
-    .unwrap();
+    let capture_identity = plan.capture().identity;
+    let roundtrip = CapturedSchedule::from_bytes(&plan.capture().to_bytes().unwrap()).unwrap();
+    assert_eq!(roundtrip.identity, capture_identity);
     assert_eq!(plan.summary().capture_identity, capture_identity);
     assert_eq!(plan.summary().fallback_count, 0);
     assert_eq!(plan.summary().zero_item_count, 0);
@@ -1424,7 +1417,7 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
         plan.summary().rendered_cache_keys.len(),
         plan.summary().nonzero_item_count
     );
-    assert_eq!(plan.resident_inputs().len(), residents.len());
+    assert!(!plan.resident_inputs().is_empty());
     assert_eq!(
         plan.transient_inputs()
             .iter()
@@ -1432,44 +1425,97 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
             .collect::<Vec<_>>(),
         ["image"]
     );
+    let stable_summary = plan.summary().clone();
+    let stable_resident_schema = plan.resident_inputs().to_vec();
+    let cache = device.cache();
+    assert!(cache.is_empty());
+
+    // The plan owns the captured resident snapshots, not live module handles.
+    let mut first_parameter = None;
+    model.visit("", &mut |_, parameter, kind| {
+        if first_parameter.is_none() && matches!(kind, StateKind::Parameter) {
+            first_parameter = Some(parameter.clone());
+        }
+    });
+    let changed = first_parameter.expect("ResNet has trainable parameters");
+    let snapshot = changed.snapshot().unwrap();
+    let changed_elements = snapshot.shape.numel().unwrap();
+    changed
+        .replace(TensorData::new(snapshot.shape, vec![1.0; changed_elements]).unwrap())
+        .unwrap();
+    drop(model);
 
     // Full host evaluation is intentionally excluded here: the semantic mock
     // validates every registered kernel/slot ABI but virtualizes large device
     // allocations. With zero trainable parameters, exact source logits are
     // zero for any finite image, so zero-filled retained output is observable
     // source truth without billions of host convolution operations.
-    let mock = Arc::new(MockDispatch::virtual_zero_execution());
-    let device = test_device(mock.clone());
-    let mut session = plan.prepare(device, residents).unwrap();
+    let mut session = plan.prepare().unwrap();
     assert!(mock.registered_semantic_program_count() > 0);
-    assert!(mock.registered_semantic_program_count() <= session.summary().nonzero_item_count);
-    assert_eq!(
-        session.compiled_kernels().count(),
-        session.summary().nonzero_item_count
+    assert!(
+        mock.registered_semantic_program_count()
+            <= session.metal_session().summary().nonzero_item_count
     );
-    let prepared_owner = session.device_owner_id();
-    let planned_slots = session.summary().planned_slot_count;
+    assert_eq!(
+        session.metal_session().compiled_kernels().count(),
+        session.metal_session().summary().nonzero_item_count
+    );
+    let prepared_owner = session.metal_session().device_owner_id();
+    let planned_slots = session.metal_session().summary().planned_slot_count;
+    let stable_cache_len = cache.len();
+    assert_eq!(session.metal_session().summary(), &stable_summary);
+    assert_eq!(
+        session.metal_session().resident_inputs(),
+        stable_resident_schema.as_slice()
+    );
+
+    mock.clear_calls();
+    assert!(matches!(
+        session.run(TensorData::zeros([1, 3, 223, 224]).unwrap()),
+        Err(ResNetMetalError::InvalidImage { .. })
+    ));
+    assert!(matches!(
+        session.run(TensorData::zeros_with_dtype([1, 3, 224, 224], DType::I32).unwrap()),
+        Err(ResNetMetalError::InvalidImage { .. })
+    ));
+    assert!(mock.calls().is_empty());
+    assert_eq!(session.metal_session().successful_run_count(), 0);
+
+    mock.state.lock().unwrap().failures.launch = Some("ResNet facade retry");
+    assert!(
+        session
+            .run(TensorData::zeros([1, 3, 224, 224]).unwrap())
+            .is_err()
+    );
+    assert_eq!(session.metal_session().successful_run_count(), 0);
+    mock.clear_failures();
 
     let mut observed_bindings = None;
     for invocation in 0..2 {
         mock.clear_calls();
         mock.clear_launch_bindings();
         let run = session
-            .run(&BTreeMap::from([(
-                "image".into(),
-                TensorData::zeros([1, 3, 224, 224]).unwrap(),
-            )]))
+            .run(TensorData::zeros([1, 3, 224, 224]).unwrap())
             .unwrap();
-        assert_eq!(run.outputs(), &[TensorData::zeros([1, 1000]).unwrap()]);
+        assert_eq!(run.logits(), &TensorData::zeros([1, 1000]).unwrap());
         assert_eq!(run.report().successful_invocation, invocation as u64 + 1);
         assert_eq!(
             run.report().kernel_launch_count,
-            session.summary().nonzero_item_count
+            session.metal_session().summary().nonzero_item_count
         );
         assert_eq!(run.report().transient_h2d_calls, 1);
         assert_eq!(run.report().retained_d2h_calls, 1);
-        assert_eq!(session.device_owner_id(), prepared_owner);
-        assert_eq!(session.summary().planned_slot_count, planned_slots);
+        assert_eq!(session.metal_session().device_owner_id(), prepared_owner);
+        assert_eq!(cache.len(), stable_cache_len);
+        assert_eq!(session.metal_session().summary(), &stable_summary);
+        assert_eq!(
+            session.metal_session().resident_inputs(),
+            stable_resident_schema.as_slice()
+        );
+        assert_eq!(
+            session.metal_session().summary().planned_slot_count,
+            planned_slots
+        );
         assert!(!mock.calls().iter().any(|call| {
             call.starts_with("buffer_create:")
                 || call.starts_with("library_compile:")
@@ -1477,7 +1523,10 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
                 || call.starts_with("queue_create:")
         }));
         let bindings = mock.launch_bindings();
-        assert_eq!(bindings.len(), session.summary().nonzero_item_count);
+        assert_eq!(
+            bindings.len(),
+            session.metal_session().summary().nonzero_item_count
+        );
         if let Some(previous) = &observed_bindings {
             assert_eq!(&bindings, previous);
         }
@@ -2983,14 +3032,6 @@ fn decode_mock_scalar(dtype: DType, bytes: &[u8]) -> Result<Scalar, MetalError> 
 fn capabilities() -> MetalCapabilities {
     MetalCapabilities {
         max_buffer_length: 1 << 20,
-        unified_memory: true,
-        family: "MockApple9".into(),
-    }
-}
-
-fn virtual_conformance_capabilities() -> MetalCapabilities {
-    MetalCapabilities {
-        max_buffer_length: 1usize << 40,
         unified_memory: true,
         family: "MockApple9".into(),
     }
