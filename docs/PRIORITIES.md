@@ -49,7 +49,8 @@ workloads demonstrates that they are the next concrete blocker.
 ### 1. P0 — strict persistent Metal device session
 
 **Status:** persistent runtime and full default ResNet-18 structural conformance
-delivered; live numerical validation next.
+delivered; exact ignored live numerical acceptance checked in, hardware evidence
+pending.
 
 `MetalDeviceSessionPlan` authenticates one concrete pure capture and an
 explicit resident/transient input partition before resources. Preparation
@@ -64,22 +65,27 @@ exact session's successful prefix with first/ordered steady host-wall samples
 and deterministic plan/cache/copy/launch JSON; it is measurement plumbing, not
 live workload evidence or GPU timing.
 
-An exact ignored Linear acceptance and a manual-only exact-SHA workflow are
-checked in for `[self-hosted, macOS, ARM64, rustgrad-metal]` behind the
-`live-metal` environment. That lane is dormant until the matching runner and
-protected environment, including reviewers and deployment-ref restrictions,
-are provisioned; the repository workflow only references those external
-controls. Ordinary macOS CI remains mock-only and no live-device result is
-claimed by the workflow definition itself.
+Exact ignored Linear and full default Eval/F32 ResNet-18 acceptances plus a
+manual-only exact-SHA workflow are checked in for
+`[self-hosted, macOS, ARM64, rustgrad-metal]` behind the `live-metal`
+environment. The ResNet acceptance executes the complete initialized body with
+one deterministic image, compares its finite logits to the complete CPU oracle
+under a documented F32 native-compilation tolerance, and records a repeated
+persistent-session run. The release-profile lane is dormant until the matching
+runner and protected environment, including reviewers and deployment-ref
+restrictions, are provisioned; the repository workflow only references those
+external controls. Ordinary macOS CI remains mock-only and no live-device
+result is claimed by the workflow definition itself.
 
 ### 2. P0 — ResNet-18 Metal conformance
 
-Run that already authenticated public graph on the Apple M5, closing only
-demonstrated live renderer/runtime gaps. Remaining acceptance is CPU-oracle
-output agreement, zero fallback, stable resident weights and intermediates,
-inspectable kernels/memory/transfers, and compile/first-run/steady-state
-reporting with host-wall versus device evidence labeled exactly. Benchmark
-comparisons target the equivalent tinygrad and Candle workload.
+Provision the protected Apple-GPU lane and run the checked-in exact-SHA
+acceptance, closing only demonstrated live renderer/runtime gaps. Required
+evidence is full CPU-oracle output agreement, zero fallback, stable resident
+weights and intermediates, inspectable kernels/memory/transfers, and
+compile/first-run/steady-state reporting with host-wall versus device evidence
+labeled exactly. Benchmark comparisons target the equivalent tinygrad and
+Candle workload.
 
 ### 3. P0 — device-resident GGUF Llama prefill/KV/decode
 

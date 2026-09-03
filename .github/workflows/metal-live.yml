@@ -24,7 +24,8 @@ jobs:
     env:
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       RUSTGRAD_METAL_EXPECTED_SHA: ${{ inputs.expected_sha }}
-      RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ runner.temp }}/metal-live-scoreboard.json
+      RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ runner.temp }}/metal-live-linear-scoreboard.json
+      RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH: ${{ runner.temp }}/metal-live-resnet18-scoreboard.json
     steps:
       - name: Validate requested revision
         shell: bash
@@ -58,16 +59,19 @@ jobs:
       - name: Run exact live Metal acceptance
         shell: bash
         run: >-
-          cargo test --test metal_live
-          live_metal_linear_persistent_session_emits_scoreboard --
-          --ignored --exact --nocapture --test-threads=1
+          cargo test --release --test metal_live --
+          --ignored --nocapture --test-threads=1
       - name: Print live evidence
         shell: bash
-        run: cat "$RUSTGRAD_METAL_SCOREBOARD_PATH"
+        run: |
+          cat "$RUSTGRAD_METAL_SCOREBOARD_PATH"
+          cat "$RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH"
       - name: Upload live Metal scoreboard
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: metal-live-${{ inputs.expected_sha }}
-          path: ${{ env.RUSTGRAD_METAL_SCOREBOARD_PATH }}
+          path: |
+            ${{ env.RUSTGRAD_METAL_SCOREBOARD_PATH }}
+            ${{ env.RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH }}
           if-no-files-found: error
           retention-days: 30
