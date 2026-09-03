@@ -129,6 +129,16 @@ This mirrors tinygrad's responsibility flow without copying its Python mixin
 mechanics. Rust extension `impl` blocks split the public API by operation family;
 the compiler and runtime remain explicit typed layers.
 
+The public `Graph::Op` enum and each variant's ordered direct value-edge fields
+are declared by one local schema macro. Its `node`, `optional`, and `variadic`
+markers generate only `value_inputs`; they do not form a second operation kind,
+carry string metadata, or classify backend support. Reverse-edge projection
+keeps its explicit semantic exceptions for predicates, indices, detached values,
+and derivative-role operands, while dtype/shape validation and lowering remain
+at their existing typed boundaries. The generated enum therefore preserves the
+same variants, fields, derived `Debug`, and construction syntax, and changes no
+UOp, schedule, artifact, or cache identity.
+
 Static core-parity additions stay within existing operation families:
 `ir::rearrange` lowers checked `split`/`chunk` only to `Shrink`; `ir::reduce`
 composes variance/std from existing mean, square, cast, and sum nodes;
