@@ -2529,6 +2529,20 @@ the same deterministic registry-ID/name ordering as full discovery, while
 `MetalDevice::renderer(local_size)` carries that device's exact capabilities
 into a resource-free renderer without choosing the caller's launch width.
 
+`ResNetMetalPlan::eval_f32` is the deliberately model-specific public facade
+over those same layers. It composes the complete existing Eval/F32 ResNet graph,
+snapshots its capture-admitted parameter leaves, requires exactly one dense F32
+NCHW `image` transient and one F32 classifier output, and derives rendering from
+an explicitly selected `MetalDevice` plus `MetalPlanOptions`. The
+preparation-free plan retains a clone of that exact thread-confined device
+owner, so `prepare`
+cannot be redirected to another device after capability admission. It exposes
+the graph, capture, logical memory plan, resident/transient schemas, rendered
+MSL, and deterministic session summary. `ResNetMetalSession::run` accepts only
+the authenticated image descriptor before driver work and returns detached
+typed logits with the underlying committed run report; it adds no CPU path or
+fallback policy.
+
 `CapturedStatefulInference` adds an authenticated fixed-shape recurrent
 sidecar without changing captured schedule bytes. Each `InferenceStateLink`
 pairs one exact graph `Input` descriptor with one distinct directly produced,
@@ -2600,14 +2614,15 @@ effects, RNG state, quantized bindings, mutable training state, dynamically
 shaped/capacity-growing state, Llama/KV graph integration, general output
 chaining across calls, and multi-device execution remain explicit follow-ons.
 The semantic mock covers fixed-shape state ping-pong and a bounded
-residual-style multi-layer graph. Protected acceptance also lowers the complete
-default Eval/F32 ResNet-18 `[1,3,224,224]` graph through boundary-free
-scheduling and capture, renders all scheduled items to MSL, then performs
-resident preparation and two ABI-validating virtual-resource runs. That
-full-model test proves shapes, ownership, stable slot handles, and zero
-fallback; it deliberately avoids billions of host-side mock convolution
-operations and therefore makes no numerical Metal, live-device, or performance
-claim.
+residual-style multi-layer graph. Protected acceptance exercises that typed
+facade on the complete default Eval/F32 ResNet-18 `[1,3,224,224]` graph:
+boundary-free scheduling and capture, all scheduled items rendered to MSL,
+resident preparation, malformed-call preflight, injected launch failure and
+retry, and two ABI-validating virtual-resource runs after the source model is
+mutated and dropped. That test proves frozen parameter ownership, shapes,
+stable slot handles, and zero fallback; it deliberately avoids billions of
+host-side mock convolution operations and therefore makes no numerical Metal,
+live-device, or performance claim.
 
 `MetalRuntime::discover` is the narrow diagnostic seam for deployment setup:
 framework/symbol errors remain structured `MetalError`s, while a successfully
@@ -2629,12 +2644,13 @@ after checkout. The repository workflow only names the environment;
 provisioning must configure its reviewers and deployment-ref restrictions. It
 treats `NoDevices` as failure, and prepares each deployment once. The fixed
 Linear smoke checks two distinct invocations byte-for-byte against its CPU
-oracle. The full default Eval/F32 ResNet-18 `[1,3,224,224]` acceptance executes
-the complete initialized graph against one deterministic image, compares finite
-logits to a full CPU oracle under a documented F32 native-compilation tolerance,
-then repeats the same Metal invocation to authenticate persistent ownership and
-steady-session behavior. The manual lane uses the release test profile so that
-the complete CPU oracle remains practical without weakening the device workload.
+oracle. The full default Eval/F32 ResNet-18 `[1,3,224,224]` acceptance constructs
+the typed `ResNetMetalPlan`, executes the complete initialized graph against one
+deterministic image, compares finite logits to a separately composed full CPU
+oracle under a documented F32 native-compilation tolerance, then repeats the
+same Metal invocation to authenticate persistent ownership and steady-session
+behavior. The manual lane uses the release test profile so that the complete
+CPU oracle remains practical without weakening the device workload.
 Both tests prove resident schemas, compiled cache identities, and device
 ownership remain stable with no run-time resident upload or fallback, and
 upload separate deterministic scoreboard JSON evidence. The workflow has no

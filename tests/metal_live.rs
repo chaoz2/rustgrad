@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use rustgrad::nn::{Linear, Mode, ResNet, ResNetConfig};
+use rustgrad::nn::{Linear, Mode, ResNet, ResNetConfig, ResNetMetalPlan};
 use rustgrad::runtime::metal::*;
 use rustgrad::{Backend, CapturedInference, CpuBackend, DType, Graph, Module, Storage, TensorData};
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
@@ -281,6 +281,20 @@ fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
         env::var_os("RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH")
             .expect("the live lane must provide RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH"),
     );
+    let runtime = MetalRuntime::load().expect("the live lane requires the native Metal runtime");
+    let mut devices = match runtime
+        .discover()
+        .expect("native Metal discovery must complete")
+    {
+        MetalDiscovery::Devices(devices) => devices,
+        MetalDiscovery::NoDevices => panic!("the live Metal lane requires a process-visible GPU"),
+    };
+    assert!(
+        !devices.is_empty(),
+        "typed discovery returned an empty device set"
+    );
+    let device = devices.remove(0);
+    let device_info = device.info().clone();
 
     let model = ResNet::new_static(ResNetConfig::default(), 19)
         .expect("default ResNet-18 construction is valid");
@@ -312,30 +326,11 @@ fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
         expected_logits.iter().all(|value| value.is_finite()),
         "the deterministic initialized full-model oracle must produce finite logits"
     );
-    let inference = CapturedInference::from_module_graph(&model, &graph, &[logits])
-        .expect("full default ResNet-18 capture is valid");
-
-    let runtime = MetalRuntime::load().expect("the live lane requires the native Metal runtime");
-    let mut devices = match runtime
-        .discover()
-        .expect("native Metal discovery must complete")
-    {
-        MetalDiscovery::Devices(devices) => devices,
-        MetalDiscovery::NoDevices => panic!("the live Metal lane requires a process-visible GPU"),
-    };
-    assert!(
-        !devices.is_empty(),
-        "typed discovery returned an empty device set"
-    );
-    let device = devices.remove(0);
-    let device_info = device.info().clone();
-    let plan = MetalInferencePlan::new(
-        inference,
-        device
-            .renderer(64)
-            .expect("selected device must produce its exact renderer identity"),
-    )
-    .expect("full default ResNet-18 capture must be entirely Metal-admitted");
+    let plan =
+        ResNetMetalPlan::eval_f32(&model, &device, [1, 3, 224, 224], MetalPlanOptions::new(64))
+            .expect("full default ResNet-18 capture must be entirely Metal-admitted");
+    assert_eq!(plan.selected_device_info(), &device_info);
+    assert_eq!(plan.selected_device_owner_id(), device.owner_id());
     assert!(!plan.execution_plan().items.is_empty());
     assert_eq!(
         plan.rendered_items().count(),
@@ -366,7 +361,7 @@ fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
             LIVE_EVIDENCE,
         )
         .expect("fixed live evidence labels are valid"),
-        &plan,
+        plan.metal_plan(),
     );
 
     let cache = device.cache();
@@ -375,13 +370,16 @@ fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
         "freshly discovered device cache is not empty"
     );
     let mut session = plan
-        .prepare(device.clone())
+        .prepare()
         .expect("live ResNet-18 preparation must compile, allocate, and upload residents");
-    assert_eq!(session.device_info(), &device_info);
-    assert_eq!(session.summary(), &stable_summary);
-    assert_eq!(session.resident_inputs(), stable_resident_schema.as_slice());
-    let stable_device_owner_id = session.device_owner_id();
-    let preparation = session.preparation_report().clone();
+    assert_eq!(session.metal_session().device_info(), &device_info);
+    assert_eq!(session.metal_session().summary(), &stable_summary);
+    assert_eq!(
+        session.metal_session().resident_inputs(),
+        stable_resident_schema.as_slice()
+    );
+    let stable_device_owner_id = session.metal_session().device_owner_id();
+    let preparation = session.metal_session().preparation_report().clone();
     assert!(preparation.resident_h2d_calls > 0);
     assert!(preparation.resident_h2d_bytes > 0);
     assert_eq!(
@@ -396,6 +394,7 @@ fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
     let stable_cache_len = cache.len();
     assert_eq!(
         session
+            .metal_session()
             .compiled_kernels()
             .map(|kernel| kernel.cache_key.as_str())
             .collect::<Vec<_>>(),
@@ -405,15 +404,14 @@ fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
             .collect::<Vec<_>>()
     );
     scoreboard
-        .bind(&session)
+        .bind(session.metal_session())
         .expect("scoreboard must bind the exact prepared deployment");
 
     for index in 0..2 {
         let run = session
-            .run(&BTreeMap::from([("image".into(), live_image.clone())]))
+            .run(live_image.clone())
             .expect("live persistent ResNet-18 invocation must succeed");
-        assert_eq!(run.outputs().len(), 1);
-        assert_resnet_logits_close(&run.outputs()[0], &expected);
+        assert_resnet_logits_close(run.logits(), &expected);
         assert_eq!(run.report().successful_invocation, index as u64 + 1);
         assert_eq!(run.report().first_successful_run, index == 0);
         assert_eq!(run.report().transient_h2d_calls, 1);
@@ -431,15 +429,22 @@ fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
             stable_summary.nonzero_item_count
         );
         scoreboard
-            .record(&run)
+            .record(run.metal_run())
             .expect("successful live runs must form one ordered prefix");
         assert_eq!(cache.len(), stable_cache_len);
-        assert_eq!(session.summary(), &stable_summary);
-        assert_eq!(session.resident_inputs(), stable_resident_schema.as_slice());
-        assert_eq!(session.device_owner_id(), stable_device_owner_id);
-        assert_eq!(session.preparation_report(), &preparation);
+        assert_eq!(session.metal_session().summary(), &stable_summary);
+        assert_eq!(
+            session.metal_session().resident_inputs(),
+            stable_resident_schema.as_slice()
+        );
+        assert_eq!(
+            session.metal_session().device_owner_id(),
+            stable_device_owner_id
+        );
+        assert_eq!(session.metal_session().preparation_report(), &preparation);
         assert_eq!(
             session
+                .metal_session()
                 .compiled_kernels()
                 .map(|kernel| kernel.cache_key.as_str())
                 .collect::<Vec<_>>(),
@@ -450,7 +455,7 @@ fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
         );
     }
 
-    assert_eq!(session.successful_run_count(), 2);
+    assert_eq!(session.metal_session().successful_run_count(), 2);
     let report = scoreboard
         .report()
         .expect("two live runs must produce a scoreboard report");

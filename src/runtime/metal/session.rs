@@ -19,6 +19,26 @@ use crate::runtime::static_schedule::{
     StaticStateLink,
 };
 
+/// Resource-free planning controls shared by typed Metal inference facades.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetalPlanOptions {
+    /// Preferred launch threadgroup width. Exact pipeline limits are checked
+    /// during preparation on the selected device.
+    pub local_size: usize,
+}
+
+impl MetalPlanOptions {
+    pub const fn new(local_size: usize) -> Self {
+        Self { local_size }
+    }
+}
+
+impl Default for MetalPlanOptions {
+    fn default() -> Self {
+        Self { local_size: 64 }
+    }
+}
+
 /// Deterministic inspection metadata for one concrete Metal session plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalDeviceSessionSummary {

@@ -200,8 +200,9 @@ pub use nn::{
     MBConvBlockConfig, MaxPool1d, Mode, ModeForwardOutput, ModeModuleForward, ModeSequential,
     Module, ModuleForward, Parameter, ParameterId, ParameterSnapshot, PendingBatchNormStats,
     PendingModeEffects, ReLU, RealizedBatchNormStats, ResNet, ResNetBlock, ResNetConfig,
-    ResNetDepth, ResNetForwardOutput, ResNetOutput, StateDict as ModuleStateDict,
-    StrictStateLoadLimits, TransformerBlock, get_parameters, get_state_dict,
+    ResNetDepth, ResNetForwardOutput, ResNetMetalError, ResNetMetalPlan, ResNetMetalRun,
+    ResNetMetalSession, ResNetOutput, StateDict as ModuleStateDict, StrictStateLoadLimits,
+    TransformerBlock, get_parameters, get_state_dict,
 };
 pub use onnx::{
     NativeOnnxInferenceResult, NativeOnnxInferenceTrace, OnnxModel, import_onnx,
