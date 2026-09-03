@@ -24,8 +24,8 @@ jobs:
     env:
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       RUSTGRAD_METAL_EXPECTED_SHA: ${{ inputs.expected_sha }}
-      RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ runner.temp }}/metal-live-linear-scoreboard.json
-      RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH: ${{ runner.temp }}/metal-live-resnet18-scoreboard.json
+      RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-linear-scoreboard.json
+      RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-resnet18-scoreboard.json
     steps:
       - name: Validate requested revision
         shell: bash
