@@ -60,12 +60,14 @@ expose truthful host-API/planned metrics, and have no CPU fallback. Protected
 acceptance now takes the complete default Eval/F32 ResNet-18 `[1,3,224,224]`
 graph through boundary-free scheduling and capture, renders every scheduled
 item to MSL, then performs persistent resident preparation and repeated
-ABI-validating virtual-resource runs. The opt-in Metal scoreboard v2 records
-one exact session's successful prefix with ordered per-run host-wall/copy/launch
-records, checked aggregates, successful cache-miss pipeline-build time, logical
-schedule/peak-live facts, and distinct physical Metal slot facts. It remains
-measurement plumbing, not live workload evidence, allocator peak memory, bus
-traffic, or GPU timing.
+ABI-validating virtual-resource runs. The opt-in Metal scoreboard v3 records
+one exact stateless or append-only session's successful prefix with ordered
+per-run host-wall/copy/launch and append-position/row-commit records, checked
+aggregates, successful cache-miss pipeline-build time, logical schedule/peak-live
+facts, and distinct physical Metal slot/state-bank facts. Failed attempts cannot
+enter that prefix or advance recorder-owned counters. It remains measurement
+plumbing, not generation wiring, live workload evidence, allocator peak memory,
+bus traffic, or GPU timing.
 
 `ResNetMetalPlan::eval_f32` is the concise public entry point for this vertical:
 it freezes the model, binds capability admission and preparation to one explicit
@@ -91,7 +93,7 @@ Provision the protected Apple-GPU lane and run the checked-in exact-SHA
 acceptance, closing only demonstrated live renderer/runtime gaps. Required
 evidence is full CPU-oracle output agreement, zero fallback, stable resident
 weights and intermediates, inspectable kernels/memory/transfers, and the
-checked-in v2 compile/prepare/first-run/ordered-steady reporting with host-wall
+checked-in v3 compile/prepare/first-run/ordered-steady reporting with host-wall
 versus device evidence labeled exactly. Benchmark comparisons target the
 equivalent tinygrad and Candle workload.
 

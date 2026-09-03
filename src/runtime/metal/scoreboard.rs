@@ -1,15 +1,15 @@
 //! Opt-in host-observed measurements for one persistent Metal inference session.
 
 use super::{
-    MetalDeviceInfo, MetalDeviceRun, MetalDeviceSession, MetalDeviceSessionSummary,
-    MetalInferencePlan,
+    MetalAppendStateInferencePlan, MetalDeviceInfo, MetalDeviceRun, MetalDeviceSession,
+    MetalDeviceSessionSummary, MetalInferencePlan,
 };
-use crate::{DType, ReplayInput, Shape};
+use crate::{CapturedSchedule, DType, ExecutionPlanSummary, ReplayInput, Shape};
 use serde::{Serialize, Serializer};
 use std::{collections::BTreeSet, fmt, fs, io, path::Path, rc::Rc, time::Duration};
 
 /// Current deterministic JSON schema emitted by [`MetalSessionScoreboardReport`].
-pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 2;
+pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 3;
 const MAX_METADATA_BYTES: usize = 1_024;
 
 /// Caller-supplied labels attached to one measurement series.
@@ -60,8 +60,21 @@ impl MetalScoreboardContext {
 pub enum MetalScoreboardInputKind {
     /// Immutable module input uploaded during session preparation.
     Resident,
+    /// Recurrent input initialized once and updated only by the session's
+    /// authenticated state policy.
+    State,
     /// Caller input supplied independently to every invocation.
     Transient,
+}
+
+/// Stateful policy authenticated by a scoreboard snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetalScoreboardStatePolicy {
+    /// No recurrent state is owned by the session.
+    Stateless,
+    /// One fixed-capacity state bank receives one complete row per success.
+    Append,
 }
 
 /// Exact captured descriptor retained as report evidence.
@@ -120,6 +133,14 @@ pub struct MetalScoreboardRun {
     pub zero_item_count: usize,
     /// Logical outputs published after ordered projection.
     pub output_count: usize,
+    /// Recurrent pairs committed atomically with this successful output.
+    pub committed_state_pair_count: usize,
+    /// Logical recurrent bytes committed by this successful output.
+    pub committed_state_bytes: usize,
+    /// Sparse recurrent elements committed by this successful output.
+    pub committed_state_work_items: usize,
+    /// Next append row after this success, or `None` for a stateless session.
+    pub committed_state_position: Option<usize>,
 }
 
 impl MetalScoreboardRun {
@@ -136,6 +157,10 @@ impl MetalScoreboardRun {
             kernel_launch_count: report.kernel_launch_count,
             zero_item_count: report.zero_item_count,
             output_count: report.output_count,
+            committed_state_pair_count: report.committed_state_pair_count,
+            committed_state_bytes: report.committed_state_bytes,
+            committed_state_work_items: report.committed_state_work_items,
+            committed_state_position: report.committed_state_position,
         }
     }
 }
@@ -157,16 +182,34 @@ pub struct MetalSessionScoreboardReport {
     /// Handle-free selected-device evidence.
     #[serde(serialize_with = "serialize_device")]
     pub device: MetalDeviceInfo,
-    /// Capture-order resident and transient input descriptors.
+    /// Capture-order resident, state, and transient input descriptors.
     pub inputs: Vec<MetalScoreboardInput>,
+    /// Stateless or authenticated append-only execution policy.
+    pub state_policy: MetalScoreboardStatePolicy,
+    /// Number of authenticated recurrent input/output pairs.
+    pub state_pair_count: usize,
+    /// Bytes in one logical recurrent-state bank.
+    pub logical_state_bytes: usize,
+    /// Number of logical recurrent bank sets owned by the session.
+    pub state_bank_count: usize,
+    /// Logical bytes represented by the selected recurrent-bank policy.
+    pub state_device_bytes: usize,
+    /// Logical recurrent bytes committed by each successful append.
+    pub append_state_row_bytes: usize,
+    /// Sparse recurrent elements committed by each successful append.
+    pub append_state_work_items: usize,
     /// Ordered cache identities of the plan's nonzero rendered kernels.
     pub rendered_cache_keys: Vec<String>,
     /// Logical requested outputs, including ordered duplicates and aliases.
     pub requested_output_count: usize,
-    /// Capture-owned constants.
+    /// Capture-owned dense tensor constants.
     pub captured_constant_count: usize,
-    /// Exact raw payload bytes of capture-owned constants.
+    /// Exact raw tensor payload bytes of capture-owned dense constants.
     pub captured_constant_bytes: usize,
+    /// Capture-owned packed GGUF constants.
+    pub captured_quantized_constant_count: usize,
+    /// Exact raw packed GGUF payload bytes of capture-owned constants.
+    pub captured_quantized_constant_bytes: usize,
     /// Declared payload bytes for immutable resident inputs.
     pub declared_resident_input_bytes: usize,
     /// Declared payload bytes for each invocation's transient inputs.
@@ -177,7 +220,7 @@ pub struct MetalSessionScoreboardReport {
     pub native_prepare_wall_time: Duration,
     /// Host wall time spent building cache-miss native libraries and pipelines.
     pub cache_miss_pipeline_build_wall_time: Duration,
-    /// Host wall time spent issuing immutable resident host API writes.
+    /// Host wall time spent issuing immutable resident and initial-state writes.
     pub resident_upload_host_wall_time: Duration,
     /// Host wall time for the first recorded successful run, if any.
     pub first_run_host_wall_time: Option<Duration>,
@@ -217,6 +260,10 @@ pub struct MetalSessionScoreboardReport {
     pub resident_host_api_h2d_calls: usize,
     /// Bytes passed to immutable resident host API writes.
     pub resident_host_api_h2d_bytes: usize,
+    /// One-time host API writes for initial recurrent state.
+    pub initial_state_host_api_h2d_calls: usize,
+    /// One-time initial recurrent-state bytes passed to host API writes.
+    pub initial_state_host_api_h2d_bytes: usize,
     /// Host API writes issued for all recorded transient inputs.
     pub transient_host_api_h2d_calls: usize,
     /// Bytes passed to recorded transient host API writes.
@@ -225,9 +272,9 @@ pub struct MetalSessionScoreboardReport {
     pub retained_host_api_d2h_calls: usize,
     /// Bytes passed to recorded retained-output host API reads.
     pub retained_host_api_d2h_bytes: usize,
-    /// Resident plus transient host API write calls.
+    /// Resident, initial-state, and transient host API write calls.
     pub host_api_h2d_calls: usize,
-    /// Resident plus transient bytes passed to host API writes.
+    /// Resident, initial-state, and transient bytes passed to host API writes.
     pub host_api_h2d_bytes: usize,
     /// Total recorded retained-output host API reads.
     pub host_api_d2h_calls: usize,
@@ -237,6 +284,14 @@ pub struct MetalSessionScoreboardReport {
     pub kernel_launch_count: usize,
     /// Addressless item skips across the recorded successful-run prefix.
     pub zero_item_count: usize,
+    /// Recurrent pair commits across the recorded successful-run prefix.
+    pub committed_state_pair_count: usize,
+    /// Logical recurrent bytes committed across the successful-run prefix.
+    pub committed_state_bytes: usize,
+    /// Sparse recurrent elements committed across the successful-run prefix.
+    pub committed_state_work_items: usize,
+    /// Next append row after the recorded prefix, or `None` when stateless.
+    pub committed_state_position: Option<usize>,
     /// Invocation-order exact counters for every recorded successful run.
     pub successful_runs: Vec<MetalScoreboardRun>,
     /// Length of the recorded consecutive successful-run prefix.
@@ -279,6 +334,13 @@ pub enum MetalScoreboardError {
     WrongSession,
     /// A successful run was skipped, repeated, or reordered.
     OutOfOrder { expected: u64, actual: u64 },
+    /// A successful run did not commit the authenticated append position.
+    StateOutOfOrder {
+        expected: Option<usize>,
+        actual: Option<usize>,
+    },
+    /// A successful run's committed recurrent work disagrees with its plan.
+    StateCommitMismatch,
     /// Exact counter arithmetic exceeded the host integer representation.
     Overflow,
     /// Deterministic JSON encoding failed.
@@ -305,6 +367,14 @@ impl fmt::Display for MetalScoreboardError {
                 formatter,
                 "Metal run {actual} is out of order; expected successful invocation {expected}"
             ),
+            Self::StateOutOfOrder { expected, actual } => write!(
+                formatter,
+                "Metal run committed state position {actual:?}; expected {expected:?}"
+            ),
+            Self::StateCommitMismatch => write!(
+                formatter,
+                "Metal run committed state work that disagrees with the scoreboard plan"
+            ),
             Self::Overflow => write!(formatter, "Metal scoreboard counter overflow"),
             Self::Json(error) => {
                 write!(formatter, "Metal scoreboard JSON encoding failed: {error}")
@@ -329,6 +399,7 @@ pub struct MetalSessionScoreboard {
     peak_logical_temporary_allocation_count: usize,
     peak_logical_temporary_bytes: usize,
     plan_summary: MetalDeviceSessionSummary,
+    state_policy: MetalScoreboardStatePolicy,
     inputs: Vec<MetalScoreboardInput>,
     binding: Option<BoundScoreboard>,
     runs: Vec<MetalScoreboardRun>,
@@ -341,29 +412,80 @@ struct BoundScoreboard {
     preparation: super::MetalDevicePreparationReport,
 }
 
+struct ScoreboardPlanView<'a> {
+    deployment_identity: u64,
+    capture: &'a CapturedSchedule,
+    execution_plan: &'a ExecutionPlanSummary,
+    summary: &'a MetalDeviceSessionSummary,
+    resident_inputs: &'a [ReplayInput],
+    state_inputs: &'a [ReplayInput],
+    state_policy: MetalScoreboardStatePolicy,
+}
+
 impl MetalSessionScoreboard {
     /// Snapshots resource-free plan evidence without creating a Metal resource.
     pub fn new(context: MetalScoreboardContext, plan: &MetalInferencePlan) -> Self {
+        Self::from_plan(
+            context,
+            ScoreboardPlanView {
+                deployment_identity: plan.deployment_identity(),
+                capture: plan.capture(),
+                execution_plan: plan.execution_plan(),
+                summary: plan.summary(),
+                resident_inputs: plan.resident_inputs(),
+                state_inputs: &[],
+                state_policy: MetalScoreboardStatePolicy::Stateless,
+            },
+        )
+    }
+
+    /// Snapshots one authenticated append-state deployment without creating a
+    /// Metal resource. Generation/model orchestration remains caller-owned.
+    pub fn new_append_state(
+        context: MetalScoreboardContext,
+        plan: &MetalAppendStateInferencePlan,
+    ) -> Self {
+        Self::from_plan(
+            context,
+            ScoreboardPlanView {
+                deployment_identity: plan.deployment_identity(),
+                capture: plan.capture(),
+                execution_plan: plan.execution_plan(),
+                summary: plan.summary(),
+                resident_inputs: plan.resident_inputs(),
+                state_inputs: plan.state_inputs(),
+                state_policy: MetalScoreboardStatePolicy::Append,
+            },
+        )
+    }
+
+    fn from_plan(context: MetalScoreboardContext, plan: ScoreboardPlanView<'_>) -> Self {
         let resident_names = plan
-            .resident_inputs()
+            .resident_inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let state_names = plan
+            .state_inputs
             .iter()
             .map(|input| input.name.as_str())
             .collect::<BTreeSet<_>>();
         let inputs = plan
-            .capture()
+            .capture
             .inputs
             .iter()
-            .map(|input| scoreboard_input(input, &resident_names))
+            .map(|input| scoreboard_input(input, &resident_names, &state_names))
             .collect();
         Self {
             context,
-            deployment_identity: plan.deployment_identity(),
-            capture_identity: plan.capture().identity,
-            execution_plan_identity: plan.execution_plan().identity,
-            logical_schedule_item_count: plan.execution_plan().schedule_item_count,
-            peak_logical_temporary_allocation_count: plan.execution_plan().peak_logical_allocations,
-            peak_logical_temporary_bytes: plan.execution_plan().peak_logical_bytes,
-            plan_summary: plan.summary().clone(),
+            deployment_identity: plan.deployment_identity,
+            capture_identity: plan.capture.identity,
+            execution_plan_identity: plan.execution_plan.identity,
+            logical_schedule_item_count: plan.execution_plan.schedule_item_count,
+            peak_logical_temporary_allocation_count: plan.execution_plan.peak_logical_allocations,
+            peak_logical_temporary_bytes: plan.execution_plan.peak_logical_bytes,
+            plan_summary: plan.summary.clone(),
+            state_policy: plan.state_policy,
             inputs,
             binding: None,
             runs: Vec::new(),
@@ -377,10 +499,15 @@ impl MetalSessionScoreboard {
         if self.binding.is_some() {
             return Err(MetalScoreboardError::AlreadyBound);
         }
+        let expected_position = match self.state_policy {
+            MetalScoreboardStatePolicy::Stateless => None,
+            MetalScoreboardStatePolicy::Append => Some(0),
+        };
         if session.inference_deployment_identity() != Some(self.deployment_identity)
             || session.capture().identity != self.capture_identity
             || session.summary() != &self.plan_summary
             || session.successful_run_count() != 0
+            || session.committed_state_position() != expected_position
         {
             return Err(MetalScoreboardError::PlanMismatch);
         }
@@ -411,6 +538,34 @@ impl MetalSessionScoreboard {
             return Err(MetalScoreboardError::OutOfOrder { expected, actual });
         }
         let recorded = MetalScoreboardRun::from_report(run.report());
+        let expected_position = match self.state_policy {
+            MetalScoreboardStatePolicy::Stateless => None,
+            MetalScoreboardStatePolicy::Append => {
+                Some(usize::try_from(expected).map_err(|_| MetalScoreboardError::Overflow)?)
+            }
+        };
+        if recorded.committed_state_position != expected_position {
+            return Err(MetalScoreboardError::StateOutOfOrder {
+                expected: expected_position,
+                actual: recorded.committed_state_position,
+            });
+        }
+        let state_commit_matches = match self.state_policy {
+            MetalScoreboardStatePolicy::Stateless => {
+                recorded.committed_state_pair_count == 0
+                    && recorded.committed_state_bytes == 0
+                    && recorded.committed_state_work_items == 0
+            }
+            MetalScoreboardStatePolicy::Append => {
+                recorded.committed_state_pair_count == self.plan_summary.state_pair_count
+                    && recorded.committed_state_bytes == self.plan_summary.append_state_row_bytes
+                    && recorded.committed_state_work_items
+                        == self.plan_summary.append_state_work_items
+            }
+        };
+        if !state_commit_matches {
+            return Err(MetalScoreboardError::StateCommitMismatch);
+        }
         let mut totals = self.totals.clone();
         totals.add(&recorded)?;
         self.runs.push(recorded);
@@ -443,14 +598,29 @@ impl MetalSessionScoreboard {
             .skip(1)
             .map(|run| run.synchronous_transaction_wall_time)
             .collect::<Vec<_>>();
-        let host_api_h2d_calls = preparation
+        let initialization_h2d_calls = preparation
             .resident_h2d_calls
+            .checked_add(preparation.initial_state_h2d_calls)
+            .ok_or(MetalScoreboardError::Overflow)?;
+        let initialization_h2d_bytes = preparation
+            .resident_h2d_bytes
+            .checked_add(preparation.initial_state_h2d_bytes)
+            .ok_or(MetalScoreboardError::Overflow)?;
+        let host_api_h2d_calls = initialization_h2d_calls
             .checked_add(totals.transient_h2d_calls)
             .ok_or(MetalScoreboardError::Overflow)?;
-        let host_api_h2d_bytes = preparation
-            .resident_h2d_bytes
+        let host_api_h2d_bytes = initialization_h2d_bytes
             .checked_add(totals.transient_h2d_bytes)
             .ok_or(MetalScoreboardError::Overflow)?;
+        let committed_state_position = match self.state_policy {
+            MetalScoreboardStatePolicy::Stateless => None,
+            MetalScoreboardStatePolicy::Append => Some(
+                self.runs
+                    .last()
+                    .and_then(|run| run.committed_state_position)
+                    .unwrap_or(0),
+            ),
+        };
         Ok(MetalSessionScoreboardReport {
             format_version: METAL_SESSION_SCOREBOARD_FORMAT_VERSION,
             context: self.context.clone(),
@@ -459,10 +629,19 @@ impl MetalSessionScoreboard {
             execution_plan_identity: self.execution_plan_identity,
             device: binding.device.clone(),
             inputs: self.inputs.clone(),
+            state_policy: self.state_policy,
+            state_pair_count: self.plan_summary.state_pair_count,
+            logical_state_bytes: self.plan_summary.logical_state_bytes,
+            state_bank_count: self.plan_summary.state_bank_count,
+            state_device_bytes: self.plan_summary.state_device_bytes,
+            append_state_row_bytes: self.plan_summary.append_state_row_bytes,
+            append_state_work_items: self.plan_summary.append_state_work_items,
             rendered_cache_keys: self.plan_summary.rendered_cache_keys.clone(),
             requested_output_count: self.plan_summary.requested_output_count,
             captured_constant_count: self.plan_summary.constant_count,
             captured_constant_bytes: self.plan_summary.constant_bytes,
+            captured_quantized_constant_count: self.plan_summary.quantized_constant_count,
+            captured_quantized_constant_bytes: self.plan_summary.quantized_constant_bytes,
             declared_resident_input_bytes: self.plan_summary.resident_input_bytes,
             declared_transient_input_bytes: self.plan_summary.transient_input_bytes,
             planning_wall_time: preparation.planning_wall_time,
@@ -490,6 +669,8 @@ impl MetalSessionScoreboard {
             pipeline_cache_miss_count: preparation.pipeline_cache_miss_count,
             resident_host_api_h2d_calls: preparation.resident_h2d_calls,
             resident_host_api_h2d_bytes: preparation.resident_h2d_bytes,
+            initial_state_host_api_h2d_calls: preparation.initial_state_h2d_calls,
+            initial_state_host_api_h2d_bytes: preparation.initial_state_h2d_bytes,
             transient_host_api_h2d_calls: totals.transient_h2d_calls,
             transient_host_api_h2d_bytes: totals.transient_h2d_bytes,
             retained_host_api_d2h_calls: totals.retained_d2h_calls,
@@ -500,6 +681,10 @@ impl MetalSessionScoreboard {
             host_api_d2h_bytes: totals.retained_d2h_bytes,
             kernel_launch_count: totals.kernel_launch_count,
             zero_item_count: totals.zero_item_count,
+            committed_state_pair_count: totals.committed_state_pair_count,
+            committed_state_bytes: totals.committed_state_bytes,
+            committed_state_work_items: totals.committed_state_work_items,
+            committed_state_position,
             successful_runs: self.runs.clone(),
             successful_run_count: u64::try_from(self.runs.len())
                 .map_err(|_| MetalScoreboardError::Overflow)?,
@@ -516,6 +701,9 @@ struct RunTotals {
     retained_d2h_bytes: usize,
     kernel_launch_count: usize,
     zero_item_count: usize,
+    committed_state_pair_count: usize,
+    committed_state_bytes: usize,
+    committed_state_work_items: usize,
 }
 
 impl RunTotals {
@@ -542,6 +730,15 @@ impl RunTotals {
         checked_add!(retained_d2h_bytes, report.retained_host_api_d2h_bytes);
         checked_add!(kernel_launch_count, report.kernel_launch_count);
         checked_add!(zero_item_count, report.zero_item_count);
+        checked_add!(
+            committed_state_pair_count,
+            report.committed_state_pair_count
+        );
+        checked_add!(committed_state_bytes, report.committed_state_bytes);
+        checked_add!(
+            committed_state_work_items,
+            report.committed_state_work_items
+        );
         Ok(())
     }
 }
@@ -553,7 +750,11 @@ fn validate_label(field: &'static str, value: &str) -> Result<(), MetalScoreboar
     Ok(())
 }
 
-fn scoreboard_input(input: &ReplayInput, resident_names: &BTreeSet<&str>) -> MetalScoreboardInput {
+fn scoreboard_input(
+    input: &ReplayInput,
+    resident_names: &BTreeSet<&str>,
+    state_names: &BTreeSet<&str>,
+) -> MetalScoreboardInput {
     MetalScoreboardInput {
         name: input.name.clone(),
         node_id: input.node.index() as u64,
@@ -562,6 +763,8 @@ fn scoreboard_input(input: &ReplayInput, resident_names: &BTreeSet<&str>) -> Met
         bytes: input.desc.bytes,
         kind: if resident_names.contains(input.name.as_str()) {
             MetalScoreboardInputKind::Resident
+        } else if state_names.contains(input.name.as_str()) {
+            MetalScoreboardInputKind::State
         } else {
             MetalScoreboardInputKind::Transient
         },
@@ -653,10 +856,19 @@ mod tests {
                 bytes: 16,
                 kind: MetalScoreboardInputKind::Transient,
             }],
+            state_policy: MetalScoreboardStatePolicy::Stateless,
+            state_pair_count: 0,
+            logical_state_bytes: 0,
+            state_bank_count: 0,
+            state_device_bytes: 0,
+            append_state_row_bytes: 0,
+            append_state_work_items: 0,
             rendered_cache_keys: vec!["kernel-a".into()],
             requested_output_count: 1,
             captured_constant_count: 0,
             captured_constant_bytes: 0,
+            captured_quantized_constant_count: 0,
+            captured_quantized_constant_bytes: 0,
             declared_resident_input_bytes: 0,
             declared_transient_input_bytes: 16,
             planning_wall_time: Duration::new(0, 11),
@@ -690,6 +902,8 @@ mod tests {
             pipeline_cache_miss_count: 1,
             resident_host_api_h2d_calls: 1,
             resident_host_api_h2d_bytes: 16,
+            initial_state_host_api_h2d_calls: 0,
+            initial_state_host_api_h2d_bytes: 0,
             transient_host_api_h2d_calls: 4,
             transient_host_api_h2d_bytes: 64,
             retained_host_api_d2h_calls: 4,
@@ -700,6 +914,10 @@ mod tests {
             host_api_d2h_bytes: 32,
             kernel_launch_count: 4,
             zero_item_count: 0,
+            committed_state_pair_count: 0,
+            committed_state_bytes: 0,
+            committed_state_work_items: 0,
+            committed_state_position: None,
             successful_runs: [(1, 20, 10), (2, 9, 4), (3, 1, 3), (4, 5, 2)]
                 .into_iter()
                 .map(
@@ -715,6 +933,10 @@ mod tests {
                         kernel_launch_count: 1,
                         zero_item_count: 0,
                         output_count: 1,
+                        committed_state_pair_count: 0,
+                        committed_state_bytes: 0,
+                        committed_state_work_items: 0,
+                        committed_state_position: None,
                     },
                 )
                 .collect(),
@@ -738,7 +960,7 @@ mod tests {
         let first = report.to_json_bytes().unwrap();
         assert_eq!(first, report.to_json_bytes().unwrap());
         let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(value["format_version"], 2);
+        assert_eq!(value["format_version"], 3);
         assert_eq!(value["workload"], "linear");
         assert_eq!(value["implementation_revision"], "abc123");
         assert_eq!(value["evidence"], "semantic mock");
