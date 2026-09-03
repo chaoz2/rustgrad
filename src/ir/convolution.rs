@@ -1518,4 +1518,38 @@ mod tests {
         let captured = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
         assert!(!captured.requested.is_empty());
     }
+
+    #[test]
+    fn rank_eight_window_projection_compacts_before_reduction_lowering() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 1, 8, 8]);
+        let weight = graph.input("weight", [32, 1, 3, 3]);
+        let output = graph
+            .conv2d(
+                input,
+                weight,
+                None,
+                crate::Conv2dOptions {
+                    groups: 1,
+                    stride: [2, 2],
+                    dilation: [1, 1],
+                    padding: [0, 1, 0, 1],
+                },
+            )
+            .unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        schedule.validate().unwrap();
+        let projected = schedule
+            .items
+            .iter()
+            .flat_map(|item| item.kernel.topological().unwrap())
+            .filter(crate::projected_index::ProjectedIndexPlan::is_projected)
+            .collect::<Vec<_>>();
+        assert!(!projected.is_empty());
+        assert!(projected.iter().all(|index| {
+            crate::projected_index::ProjectedIndexPlan::from_index(index).is_ok()
+        }));
+        let captured = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        assert_eq!(captured.requested, vec![output.index() as u64]);
+    }
 }
