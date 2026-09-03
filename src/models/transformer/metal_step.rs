@@ -20,21 +20,19 @@ use std::{collections::BTreeMap, error, fmt};
 
 const TOKEN_INPUT: &str = "llama.token";
 const POSITION_INPUT: &str = "llama.position";
-const APPEND_INDEX_INPUT: &str = "llama.append_index";
 const ROPE_TABLE: &str = "llama.rope.table";
 
 /// Resource-free deployment of one dense F32, batch-one Llama token body.
 ///
 /// The graph owns fixed-capacity K/V state and is captured exactly once. Token,
-/// scalar position, and its authenticated row-shaped append index are the only
-/// per-run host inputs; all GGUF weights and the precomputed RoPE table are
-/// immutable named residents.
+/// scalar position are the only per-run host inputs; the row-shaped append
+/// index is derived and materialized on device from that position. All GGUF
+/// weights and the precomputed RoPE table are immutable named residents.
 pub struct LlamaMetalStepPlan {
     inner: MetalAppendStateInferencePlan,
     max_context: usize,
     vocab_size: usize,
     layer_count: usize,
-    append_index_shape: Shape,
     output_binding: LlamaOutputBinding,
 }
 
@@ -44,7 +42,6 @@ pub struct LlamaMetalStepSession {
     inner: MetalDeviceSession,
     max_context: usize,
     vocab_size: usize,
-    append_index_shape: Shape,
 }
 
 /// One successfully committed token invocation.
@@ -153,7 +150,6 @@ impl LlamaMetalStepPlan {
             max_context: config.max_context(),
             vocab_size: schema.vocab_size(),
             layer_count: config.layer_count(),
-            append_index_shape: built.append_index_shape,
             output_binding: model.output_binding(),
         })
     }
@@ -188,7 +184,7 @@ impl LlamaMetalStepPlan {
         self.inner.state_inputs()
     }
 
-    /// Returns the token, scalar-position, and row-index transient schemas.
+    /// Returns the token and scalar-position transient schemas.
     pub fn transient_inputs(&self) -> &[ReplayInput] {
         self.inner.transient_inputs()
     }
@@ -228,7 +224,6 @@ impl LlamaMetalStepPlan {
             inner: self.inner.prepare(device)?,
             max_context: self.max_context,
             vocab_size: self.vocab_size,
-            append_index_shape: self.append_index_shape,
         })
     }
 }
@@ -267,10 +262,8 @@ impl LlamaMetalStepSession {
                 maximum: self.max_context,
             });
         }
-        let (position_value, append_index_value) =
-            step_position_inputs(position, &self.append_index_shape)?;
+        let position_value = step_position_input(position)?;
         let inputs = BTreeMap::from([
-            (APPEND_INDEX_INPUT.to_owned(), append_index_value),
             (
                 TOKEN_INPUT.to_owned(),
                 TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))])?,
@@ -293,21 +286,14 @@ impl LlamaMetalStepSession {
     }
 }
 
-fn step_position_inputs(
-    position: usize,
-    append_index_shape: &Shape,
-) -> Result<(TensorData, TensorData), LlamaMetalStepError> {
+fn step_position_input(position: usize) -> Result<TensorData, LlamaMetalStepError> {
     let position = i32::try_from(position)
         .map_err(|_| LlamaMetalStepError::Dimension("position exceeds I32"))?;
-    let scalar = Scalar::I(i64::from(position));
-    let position = TensorData::from_scalars([1], DType::I32, [scalar])?;
-    let elements = append_index_shape.numel()?;
-    let append_index = TensorData::from_scalars(
-        append_index_shape.clone(),
+    Ok(TensorData::from_scalars(
+        [1],
         DType::I32,
-        std::iter::repeat_n(scalar, elements),
-    )?;
-    Ok((position, append_index))
+        [Scalar::I(i64::from(position))],
+    )?)
 }
 
 struct BuiltStepGraph {
@@ -316,7 +302,6 @@ struct BuiltStepGraph {
     quantized: Vec<QuantizedCaptureBinding>,
     initial_state: BTreeMap<String, TensorData>,
     state_links: Vec<InferenceAppendStateLink>,
-    append_index_shape: Shape,
     packed_embedding: bool,
     logits: NodeId,
 }
@@ -328,12 +313,8 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
     let token = graph.input_dtype_requires_grad(TOKEN_INPUT, [1, 1], DType::I32, false);
     let position = graph.input_dtype_requires_grad(POSITION_INPUT, [1], DType::I32, false);
     let append_index_shape = Shape::new([1, schema.kv_heads(), 1, schema.head_dim()]);
-    let append_index = graph.input_dtype_requires_grad(
-        APPEND_INDEX_INPUT,
-        append_index_shape.clone(),
-        DType::I32,
-        false,
-    );
+    let append_index = graph.reshape(position, vec![1; append_index_shape.rank()])?;
+    let append_index = graph.expand(append_index, append_index_shape)?;
     let mut residents = BTreeMap::new();
     let mut nodes = BTreeMap::new();
     let mut packed = BTreeMap::new();
@@ -433,10 +414,18 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
         .append(x, layer, past_key, past_value)?;
         x = built.output;
         state_links.extend([
-            InferenceAppendStateLink::new(past_key, built.key, append_index, built.key_update, 2),
+            InferenceAppendStateLink::new(
+                past_key,
+                built.key,
+                position,
+                append_index,
+                built.key_update,
+                2,
+            ),
             InferenceAppendStateLink::new(
                 past_value,
                 built.value,
+                position,
                 append_index,
                 built.value_update,
                 2,
@@ -470,7 +459,6 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
         quantized,
         initial_state,
         state_links,
-        append_index_shape,
         packed_embedding,
         logits,
     })
@@ -963,6 +951,17 @@ mod tests {
                         .expect("Llama has K/V state")
                         .index()
         }));
+        let index = built.state_links[0].index();
+        let Op::Expand {
+            input: reshaped, ..
+        } = built.graph.op(index).unwrap()
+        else {
+            panic!("append index must be the shared scalar expansion")
+        };
+        assert!(matches!(
+            built.graph.op(*reshaped).unwrap(),
+            Op::Reshape { input, .. } if *input == built.state_links[0].position()
+        ));
         let mut states = built.initial_state.clone();
         let mut oracle = super::super::LlamaModelCache::new(model.config().clone());
         for (position, token) in [3u32, 4, 5].into_iter().enumerate() {
@@ -980,18 +979,6 @@ mod tests {
             bindings.insert(
                 POSITION_INPUT.into(),
                 TensorData::from_scalars([1], DType::I32, [Scalar::I(position as i64)]).unwrap(),
-            );
-            bindings.insert(
-                APPEND_INDEX_INPUT.into(),
-                TensorData::from_scalars(
-                    built.append_index_shape.clone(),
-                    DType::I32,
-                    std::iter::repeat_n(
-                        Scalar::I(position as i64),
-                        built.append_index_shape.numel().unwrap(),
-                    ),
-                )
-                .unwrap(),
             );
             let actual = CpuBackend
                 .execute(&built.graph, built.logits, &bindings)
@@ -1017,22 +1004,11 @@ mod tests {
     }
 
     #[test]
-    fn scalar_position_and_append_index_share_one_checked_value() {
-        let shape = Shape::new([1, 2, 1, 3]);
-        let (position, append_index) = step_position_inputs(7, &shape).unwrap();
+    fn scalar_position_is_the_only_host_append_coordinate() {
+        let position = step_position_input(7).unwrap();
         assert_eq!(position.dtype(), DType::I32);
         assert_eq!(position.shape().dims(), [1]);
-        assert_eq!(append_index.dtype(), DType::I32);
-        assert_eq!(append_index.shape(), &shape);
-        let expected = 7i32.to_le_bytes();
-        assert_eq!(position.to_le_bytes().unwrap(), expected);
-        assert!(
-            append_index
-                .to_le_bytes()
-                .unwrap()
-                .chunks_exact(4)
-                .all(|lane| lane == expected)
-        );
+        assert_eq!(position.to_le_bytes().unwrap(), 7i32.to_le_bytes());
     }
 
     #[test]
@@ -1072,16 +1048,6 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                (
-                    APPEND_INDEX_INPUT,
-                    DType::I32,
-                    vec![
-                        1,
-                        tied.config().schema().kv_heads(),
-                        1,
-                        tied.config().schema().head_dim(),
-                    ],
-                ),
                 (POSITION_INPUT, DType::I32, vec![1]),
                 (TOKEN_INPUT, DType::I32, vec![1, 1]),
             ]

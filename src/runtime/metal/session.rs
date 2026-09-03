@@ -283,7 +283,8 @@ impl MetalAppendStateInferencePlan {
             .map(|state| StaticAppendStateLink {
                 input: state.input.desc.id,
                 output: state.output.id,
-                index: state.index.desc.id,
+                position: state.position.desc.id,
+                index: state.index.id,
                 updates: state.updates.id,
                 axis: state.link.axis(),
                 axis_extent: state.axis_extent,

@@ -119,15 +119,17 @@ The lower-level session and opt-in scoreboard remain available for detailed
 deployment evidence. Their host wall-clock and host API copy counts do not
 claim GPU time, physical bus traffic, allocator RSS, energy, or throughput.
 
-Dense F32 GGUF Llama models also expose a fixed batch-one Metal token-step
-plan. It freezes exact named weights and a precomputed RoPE table, keeps one
-fixed-capacity K/V bank per tensor on device, and appends only the current
-complete K/V rows. Each call stages an I32 token plus scalar and row-shaped
-position values derived from one committed position. F32 logits are the only
-device-to-host transfer: capture authenticates both host-validated scalar
-indices through their exact reshape/expand-to-Gather lineage, so lookup needs
-no status read or provisional candidate. Packed weights, chunk prefill,
-sampling, live-device numerical evidence, and stateful scoreboard reporting
+Dense-or-packed F32 GGUF Llama models also expose a fixed batch-one Metal
+token-step plan. It freezes exact named weights and a precomputed RoPE table,
+keeps one fixed-capacity K/V bank per tensor on device, and appends only the
+current complete K/V rows. Each call stages only an I32 token and scalar
+position; one shared row-shaped append index is expanded and materialized on
+device from that same committed position and feeds exactly the declared append
+owners. F32 logits are the only device-to-host transfer: capture authenticates
+both host-validated scalar indices through their exact reshape/expand-to-Gather
+lineage, so lookup needs no status read or provisional
+candidate. Chunk prefill, sampling, live-device numerical evidence, and
+stateful scoreboard reporting
 remain explicit follow-ups.
 
 ## How the system fits together

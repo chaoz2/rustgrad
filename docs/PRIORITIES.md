@@ -100,9 +100,10 @@ equivalent tinygrad and Candle workload.
 The dense F32 fixed-batch-one token body now binds exact immutable GGUF weights
 to the released append-state foundation: one exclusively owned physical KV
 bank per tensor, one host-validated monotonic I32 position, sparse complete-row
-updates, and same-capture downstream reads. Its scalar model position and every
-lane of the dedicated row-shaped append index derive from that one committed
-position. Capture-authenticated scalar embedding and RoPE lookup now removes
+updates, and same-capture downstream reads. Its scalar model position derives
+from the committed position, while one shared row-shaped append index is
+expanded and materialized from that scalar on device. Capture-authenticated
+scalar embedding and RoPE lookup now removes
 the checked-Gather status/candidate path. At the lower runtime boundary,
 capture-owned Q4_0/Q8_0/Q4_K/Q6_K row-gather and matmul plans have a direct
 persistent Metal packed-buffer ABI, one-time immutable upload,
