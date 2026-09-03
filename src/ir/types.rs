@@ -213,79 +213,160 @@ impl fmt::Display for NodeId {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum Op {
+macro_rules! graph_op_input_iter {
+    (node, $field:ident) => {
+        std::iter::once(*$field)
+    };
+    (optional, $field:ident) => {
+        $field.iter().copied()
+    };
+    (variadic, $field:ident) => {
+        $field.iter().copied()
+    };
+}
+
+/// Declares the public graph operation and its ordered direct value edges in
+/// one place. Edge markers describe only structural field cardinality; reverse
+/// semantics, validation, and backend support remain independent explicit
+/// policy.
+macro_rules! define_graph_ops {
+    (@parse [$($variants:tt)*] [$($input_arms:tt)*]) => {
+        #[derive(Clone, Debug)]
+        pub enum Op {
+            $($variants)*
+        }
+
+        impl Op {
+            /// Direct value dependencies. This is the authoritative pure-DAG
+            /// edge inventory; effect safety analysis uses it without
+            /// inspecting labels.
+            pub(crate) fn value_inputs(&self) -> Vec<NodeId> {
+                match self {
+                    $($input_arms)*
+                }
+            }
+        }
+    };
+    (@parse
+        [$($variants:tt)*]
+        [$($input_arms:tt)*]
+        $(#[$meta:meta])*
+        $variant:ident ($payload:ty) => inputs [] ,
+        $($rest:tt)*
+    ) => {
+        define_graph_ops!(@parse
+            [
+                $($variants)*
+                $(#[$meta])*
+                $variant($payload),
+            ]
+            [
+                $($input_arms)*
+                Self::$variant(..) => vec![],
+            ]
+            $($rest)*
+        );
+    };
+    (@parse
+        [$($variants:tt)*]
+        [$($input_arms:tt)*]
+        $(#[$meta:meta])*
+        $variant:ident { $($fields:tt)* }
+        => inputs [$($cardinality:ident $input:ident),* $(,)?] ,
+        $($rest:tt)*
+    ) => {
+        define_graph_ops!(@parse
+            [
+                $($variants)*
+                $(#[$meta])*
+                $variant { $($fields)* },
+            ]
+            [
+                $($input_arms)*
+                Self::$variant { $($input,)* .. } => std::iter::empty()
+                    $(.chain(graph_op_input_iter!($cardinality, $input)))*
+                    .collect(),
+            ]
+            $($rest)*
+        );
+    };
+    ($($schema:tt)*) => {
+        define_graph_ops!(@parse [] [] $($schema)*);
+    };
+}
+
+define_graph_ops! {
     Input {
         name: String,
-    },
-    Constant(TensorData),
+    } => inputs [],
+    Constant(TensorData) => inputs [],
     Random {
         kind: RandomKind,
         stream: RandomStream,
-    },
+    } => inputs [],
     RandomPermutation {
         stream: RandomStream,
-    },
+    } => inputs [],
     Cast {
         input: NodeId,
         dtype: DType,
-    },
+    } => inputs [node input],
     /// Raw storage reinterpretation. Differing item sizes rescale the final
     /// axis while preserving the tensor's total byte extent.
     Bitcast {
         input: NodeId,
         dtype: DType,
-    },
+    } => inputs [node input],
     /// An explicit owned-storage materialization boundary. The value, shape,
     /// and dtype are unchanged, but schedulers must not fuse the copy away.
     Contiguous {
         input: NodeId,
-    },
+    } => inputs [node input],
     /// Forward identity whose reverse rule materializes its incoming
     /// cotangent through [`Op::Contiguous`].
     ContiguousBackward {
         input: NodeId,
-    },
+    } => inputs [node input],
     /// Value-preserving boundary which deliberately stops reverse-mode edges.
     Detach {
         input: NodeId,
-    },
+    } => inputs [node input],
     /// CPU-static validation boundary that preserves `input` on success.
     TensorGuard {
         input: NodeId,
         axis: usize,
-    },
+    } => inputs [node input],
     Unary {
         op: UnaryOp,
         input: NodeId,
-    },
+    } => inputs [node input],
     Binary {
         op: BinaryOp,
         lhs: NodeId,
         rhs: NodeId,
-    },
+    } => inputs [node lhs, node rhs],
     /// tinygrad's live two-input Threefry2x32 permutation. Both operands and
     /// the result are packed U64 words; the low and high halves are the two
     /// U32 lanes of the source operation.
     Threefry {
         counter: NodeId,
         key: NodeId,
-    },
+    } => inputs [node counter, node key],
     Compare {
         op: CompareOp,
         lhs: NodeId,
         rhs: NodeId,
-    },
+    } => inputs [node lhs, node rhs],
     Logical {
         op: LogicalOp,
         lhs: NodeId,
         rhs: Option<NodeId>,
-    },
+    } => inputs [optional rhs, node lhs],
     Select {
         condition: NodeId,
         on_true: NodeId,
         on_false: NodeId,
-    },
+    } => inputs [node condition, node on_true, node on_false],
     Reduce {
         input: NodeId,
         kind: ReduceKind,
@@ -294,14 +375,14 @@ pub enum Op {
         /// Storage dtype committed after each recurrence step. The node dtype
         /// remains the independently committed final output storage.
         accumulator: DType,
-    },
+    } => inputs [node input],
     /// Inclusive, static cumulative operation along one normalized axis.
     PrefixScan {
         input: NodeId,
         axis: usize,
         kind: PrefixScanKind,
         output: PrefixScanOutput,
-    },
+    } => inputs [node input],
     /// One selector from a stable static sort pair. Both selectors carry the
     /// same `pair` identity and are scheduled as one values+indices producer.
     Sort {
@@ -310,20 +391,20 @@ pub enum Op {
         descending: bool,
         pair: u64,
         output: SortOutput,
-    },
+    } => inputs [node input],
     ArgReduce {
         input: NodeId,
         max: bool,
         axis: Option<usize>,
         keepdim: bool,
-    },
+    } => inputs [node input],
     ReduceGrad {
         input: NodeId,
         upstream: NodeId,
         kind: ReduceKind,
         axes: Vec<usize>,
         keepdim: bool,
-    },
+    } => inputs [node input, node upstream],
     /// Second-order VJP of the zero-aware/tie-aware reduction reverse node.
     /// `wrt` is 0 for the source input and 1 for the original upstream.
     ReduceGradVjp {
@@ -334,41 +415,41 @@ pub enum Op {
         axes: Vec<usize>,
         keepdim: bool,
         wrt: u8,
-    },
+    } => inputs [node cotangent, node input, node upstream],
     SumTo {
         input: NodeId,
         shape: Shape,
-    },
+    } => inputs [node input],
     Reshape {
         input: NodeId,
         shape: Shape,
-    },
+    } => inputs [node input],
     Permute {
         input: NodeId,
         axes: Vec<usize>,
-    },
+    } => inputs [node input],
     Expand {
         input: NodeId,
         shape: Shape,
-    },
+    } => inputs [node input],
     Shrink {
         input: NodeId,
         bounds: Vec<(usize, usize)>,
-    },
+    } => inputs [node input],
     /// Constant padding. The fill scalar is cast to the input dtype at execution.
     Pad {
         input: NodeId,
         padding: Vec<(usize, usize)>,
         fill: Scalar,
-    },
+    } => inputs [node input],
     Stride {
         input: NodeId,
         slices: Vec<Slice>,
-    },
+    } => inputs [node input],
     Concat {
         inputs: Vec<NodeId>,
         axis: usize,
-    },
+    } => inputs [variadic inputs],
     /// Internal reverse-mode primitive: place each input coordinate at
     /// `starts + coordinate * steps`, leaving all other output positions zero.
     ScatterPositions {
@@ -376,36 +457,36 @@ pub enum Op {
         shape: Shape,
         starts: Vec<isize>,
         steps: Vec<isize>,
-    },
+    } => inputs [node input],
     /// VJP of `ScatterPositions`: read the cotangent at the same static map.
     ScatterPositionsVjp {
         cotangent: NodeId,
         input_shape: Shape,
         starts: Vec<isize>,
         steps: Vec<isize>,
-    },
+    } => inputs [node cotangent],
     Gather {
         input: NodeId,
         index: NodeId,
         axis: usize,
-    },
+    } => inputs [node input, node index],
     /// Immutable static mixed indexing, normalized by `ir::indexing`.
     StaticIndex {
         input: NodeId,
         plan: indexing::StaticIndexPlan,
-    },
+    } => inputs [node input],
     /// Reverse-mode scatter for [`Op::StaticIndex`].
     StaticIndexGrad {
         cotangent: NodeId,
         input_shape: Shape,
         plan: indexing::StaticIndexPlan,
-    },
+    } => inputs [node cotangent],
     /// Immutable snapshot replacement at a normalized static index map.
     StaticIndexUpdate {
         base: NodeId,
         value: NodeId,
         plan: indexing::StaticIndexPlan,
-    },
+    } => inputs [node base, node value],
     /// First-order F32 VJP of [`Op::StaticIndexUpdate`].
     StaticIndexUpdateGrad {
         cotangent: NodeId,
@@ -413,14 +494,14 @@ pub enum Op {
         value_shape: Shape,
         plan: indexing::StaticIndexPlan,
         wrt: StaticIndexUpdateWrt,
-    },
+    } => inputs [node cotangent],
     Scatter {
         base: NodeId,
         index: NodeId,
         updates: NodeId,
         axis: usize,
         add: bool,
-    },
+    } => inputs [node base, node index, node updates],
     /// Fixed-length mask selection. `size` makes the output shape static;
     /// excess matches are truncated and missing matches receive `fill`.
     MaskedSelect {
@@ -428,11 +509,11 @@ pub enum Op {
         mask: NodeId,
         size: usize,
         fill: Scalar,
-    },
+    } => inputs [node input, node mask],
     Matmul {
         lhs: NodeId,
         rhs: NodeId,
-    },
+    } => inputs [node lhs, node rhs],
     /// Static, normalized Einstein summation.  The plan is retained in the IR
     /// so execution and later lowering inspect identical indexing semantics.
     Einsum {
@@ -444,14 +525,14 @@ pub enum Op {
         /// Explicit `Tensor.einsum(dtype=...)` accumulation/output dtype.
         /// `None` retains RustGrad's established default einsum behavior.
         accumulation_dtype: Option<DType>,
-    },
+    } => inputs [variadic inputs],
     /// Internal reverse-mode scatter-add for a static normalized einsum plan.
     EinsumGrad {
         upstream: NodeId,
         inputs: Vec<NodeId>,
         plan: EinsumPlan,
         target: usize,
-    },
+    } => inputs [node upstream, variadic inputs],
     /// VJP of `EinsumGrad`, retaining its normalized plan and scatter map.
     EinsumGradVjp {
         cotangent: NodeId,
@@ -460,7 +541,7 @@ pub enum Op {
         plan: EinsumPlan,
         target: usize,
         wrt: usize,
-    },
+    } => inputs [node cotangent, node upstream, variadic inputs],
     /// Internal reverse-mode primitive for generalized matmul.  Keeping the
     /// coordinate mapping in the CPU oracle avoids rank-dependent transpose
     /// graphs and makes broadcast accumulation explicit.
@@ -469,7 +550,7 @@ pub enum Op {
         lhs: NodeId,
         rhs: NodeId,
         lhs_gradient: bool,
-    },
+    } => inputs [node upstream, node lhs, node rhs],
     /// VJP of `MatmulGrad` over its generalized dense coordinate map.
     /// `wrt` is 0=upstream, 1=lhs, 2=rhs.
     MatmulGradVjp {
@@ -479,13 +560,13 @@ pub enum Op {
         rhs: NodeId,
         lhs_gradient: bool,
         wrt: u8,
-    },
+    } => inputs [node cotangent, node upstream, node lhs, node rhs],
     Conv2d {
         input: NodeId,
         weight: NodeId,
         bias: Option<NodeId>,
         options: Conv2dOptions,
-    },
+    } => inputs [node input, node weight, optional bias],
     Conv2dGrad {
         upstream: NodeId,
         input: NodeId,
@@ -493,7 +574,7 @@ pub enum Op {
         bias: Option<NodeId>,
         options: Conv2dOptions,
         target: u8,
-    },
+    } => inputs [node upstream, node input, node weight, optional bias],
     Conv2dGradVjp {
         cotangent: NodeId,
         upstream: NodeId,
@@ -503,13 +584,13 @@ pub enum Op {
         options: Conv2dOptions,
         target: u8,
         wrt: u8,
-    },
+    } => inputs [node cotangent, node upstream, node input, node weight, optional bias],
     ConvTranspose2d {
         input: NodeId,
         weight: NodeId,
         bias: Option<NodeId>,
         options: ConvTranspose2dOptions,
-    },
+    } => inputs [node input, node weight, optional bias],
     ConvTranspose2dGrad {
         upstream: NodeId,
         input: NodeId,
@@ -517,7 +598,7 @@ pub enum Op {
         bias: Option<NodeId>,
         options: ConvTranspose2dOptions,
         target: u8,
-    },
+    } => inputs [node upstream, node input, node weight, optional bias],
     ConvTranspose2dGradVjp {
         cotangent: NodeId,
         upstream: NodeId,
@@ -527,7 +608,7 @@ pub enum Op {
         options: ConvTranspose2dOptions,
         target: u8,
         wrt: u8,
-    },
+    } => inputs [node cotangent, node upstream, node input, node weight, optional bias],
 }
 
 /// Stateless seeded distributions used by replayable random graph nodes.
@@ -941,147 +1022,6 @@ impl BinaryOp {
 }
 
 impl Op {
-    /// Direct value dependencies. This is the authoritative pure-DAG edge
-    /// inventory; effect safety analysis uses it without inspecting labels.
-    pub(crate) fn value_inputs(&self) -> Vec<NodeId> {
-        match self {
-            Self::Input { .. }
-            | Self::Constant(_)
-            | Self::Random { .. }
-            | Self::RandomPermutation { .. } => vec![],
-            Self::Cast { input, .. }
-            | Self::Bitcast { input, .. }
-            | Self::Contiguous { input }
-            | Self::ContiguousBackward { input }
-            | Self::Detach { input }
-            | Self::TensorGuard { input, .. }
-            | Self::Unary { input, .. }
-            | Self::Reduce { input, .. }
-            | Self::PrefixScan { input, .. }
-            | Self::Sort { input, .. }
-            | Self::ArgReduce { input, .. }
-            | Self::SumTo { input, .. }
-            | Self::Reshape { input, .. }
-            | Self::Permute { input, .. }
-            | Self::Expand { input, .. }
-            | Self::Shrink { input, .. }
-            | Self::Pad { input, .. }
-            | Self::Stride { input, .. }
-            | Self::ScatterPositions { input, .. }
-            | Self::StaticIndex { input, .. } => vec![*input],
-            Self::Binary { lhs, rhs, .. }
-            | Self::Compare { lhs, rhs, .. }
-            | Self::Threefry {
-                counter: lhs,
-                key: rhs,
-            }
-            | Self::Matmul { lhs, rhs } => vec![*lhs, *rhs],
-            Self::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
-            Self::Select {
-                condition,
-                on_true,
-                on_false,
-            } => vec![*condition, *on_true, *on_false],
-            Self::ReduceGrad {
-                input, upstream, ..
-            } => vec![*input, *upstream],
-            Self::ReduceGradVjp {
-                cotangent,
-                input,
-                upstream,
-                ..
-            } => vec![*cotangent, *input, *upstream],
-            Self::Concat { inputs, .. } | Self::Einsum { inputs, .. } => inputs.clone(),
-            Self::ScatterPositionsVjp { cotangent, .. }
-            | Self::StaticIndexGrad { cotangent, .. }
-            | Self::StaticIndexUpdateGrad { cotangent, .. } => vec![*cotangent],
-            Self::Gather { input, index, .. } => vec![*input, *index],
-            Self::StaticIndexUpdate { base, value, .. } => vec![*base, *value],
-            Self::Scatter {
-                base,
-                index,
-                updates,
-                ..
-            } => vec![*base, *index, *updates],
-            Self::MaskedSelect { input, mask, .. } => vec![*input, *mask],
-            Self::EinsumGrad {
-                upstream, inputs, ..
-            } => std::iter::once(*upstream)
-                .chain(inputs.iter().copied())
-                .collect(),
-            Self::EinsumGradVjp {
-                cotangent,
-                upstream,
-                inputs,
-                ..
-            } => std::iter::once(*cotangent)
-                .chain([*upstream])
-                .chain(inputs.iter().copied())
-                .collect(),
-            Self::MatmulGrad {
-                upstream, lhs, rhs, ..
-            } => vec![*upstream, *lhs, *rhs],
-            Self::MatmulGradVjp {
-                cotangent,
-                upstream,
-                lhs,
-                rhs,
-                ..
-            } => vec![*cotangent, *upstream, *lhs, *rhs],
-            Self::Conv2d {
-                input,
-                weight,
-                bias,
-                ..
-            }
-            | Self::ConvTranspose2d {
-                input,
-                weight,
-                bias,
-                ..
-            } => std::iter::once(*input)
-                .chain([*weight])
-                .chain(bias.iter().copied())
-                .collect(),
-            Self::Conv2dGrad {
-                upstream,
-                input,
-                weight,
-                bias,
-                ..
-            }
-            | Self::ConvTranspose2dGrad {
-                upstream,
-                input,
-                weight,
-                bias,
-                ..
-            } => std::iter::once(*upstream)
-                .chain([*input, *weight])
-                .chain(bias.iter().copied())
-                .collect(),
-            Self::Conv2dGradVjp {
-                cotangent,
-                upstream,
-                input,
-                weight,
-                bias,
-                ..
-            }
-            | Self::ConvTranspose2dGradVjp {
-                cotangent,
-                upstream,
-                input,
-                weight,
-                bias,
-                ..
-            } => std::iter::once(*cotangent)
-                .chain([*upstream, *input, *weight])
-                .chain(bias.iter().copied())
-                .collect(),
-        }
-    }
-
     /// Direct dependencies whose values may be read by this operation's
     /// reverse rule. Predicate/index/control edges and `Detach` are excluded.
     pub(crate) fn backward_inputs(&self) -> Vec<NodeId> {
@@ -1375,5 +1315,76 @@ impl Op {
                 format!("conv_transpose2d_grad_vjp(target={target}, wrt={wrt})")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_op_schema_preserves_direct_edge_order_cardinality_and_aliases() {
+        let a = NodeId::from_index(1);
+        let b = NodeId::from_index(2);
+        let c = NodeId::from_index(3);
+
+        assert!(
+            Op::Input {
+                name: "input".into()
+            }
+            .value_inputs()
+            .is_empty()
+        );
+        assert_eq!(
+            Op::Logical {
+                op: LogicalOp::And,
+                lhs: a,
+                rhs: Some(b),
+            }
+            .value_inputs(),
+            vec![b, a]
+        );
+        assert_eq!(
+            Op::Logical {
+                op: LogicalOp::Not,
+                lhs: a,
+                rhs: None,
+            }
+            .value_inputs(),
+            vec![a]
+        );
+        assert_eq!(
+            Op::Concat {
+                inputs: vec![a, b, a],
+                axis: 0,
+            }
+            .value_inputs(),
+            vec![a, b, a]
+        );
+        assert_eq!(
+            Op::Conv2d {
+                input: a,
+                weight: b,
+                bias: Some(c),
+                options: Conv2dOptions::default(),
+            }
+            .value_inputs(),
+            vec![a, b, c]
+        );
+    }
+
+    #[test]
+    fn graph_op_reverse_projection_remains_semantic() {
+        let condition = NodeId::from_index(1);
+        let on_true = NodeId::from_index(2);
+        let on_false = NodeId::from_index(3);
+        let selected = Op::Select {
+            condition,
+            on_true,
+            on_false,
+        };
+        assert_eq!(selected.value_inputs(), vec![condition, on_true, on_false]);
+        assert_eq!(selected.backward_inputs(), vec![on_true, on_false]);
+        assert!(Op::Detach { input: on_true }.backward_inputs().is_empty());
     }
 }

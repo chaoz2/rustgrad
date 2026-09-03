@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:b4946a4bfe704951",
+  "source_fingerprint": "fnv1a64:0a30e46d6226dcf9",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -288,7 +288,7 @@
       "subject": "Typed backend-neutral graph",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Initial ops and trace verified"
+        "Acceptance requirement": "The single public `Graph::Op` enum retains its existing variants, fields, construction syntax, and derived debug behavior. One local declarative schema now co-locates each variant with its ordered direct `node`/`optional`/`variadic` value edges and generates the authoritative `value_inputs` inventory used by traversal, scheduling, and lifecycle analysis. Reverse-edge exceptions, descriptor/type validation, lowering, and backend capability policy remain explicit semantic matches; there is no `OpKind`, visitor layer, string metadata bag, artifact/cache change, or wire version bump. Full tinygrad op coverage remains incomplete."
       }
     },
     {
