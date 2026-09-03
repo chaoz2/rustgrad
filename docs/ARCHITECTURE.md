@@ -952,11 +952,30 @@ rehearses the full base-plus-head graph and reserves the base model's ambient
 dropout streams in the same transaction. Empty batch/time remain zero-work;
 CPU, captured-interpreter, state-order, output-order, and complete-composition
 VJP acceptance are fixture-backed.
-This is the source base BERT and question-answering model composition, not a
-tokenizer, vocabulary workflow, pretrained-checkpoint translator/loader,
-pooler, masked-language or next-sentence head, span loss/decoder, trainer,
-downloaded checkpoint differential, dynamic-shape implementation, fused
-kernel, or live-device claim.
+`nn::BertForPretraining` reuses the same base model and adds the checked source
+prediction transform, tied embedding-weight language-model projection, first-
+token tanh pooler, and next-sentence projection under `cls.*`. Masked positions
+are gathered by the source's equality one-hot Matmul, including repeated and
+out-of-range positions, rather than a new indexing operation. The forward
+result retains `(prediction_logits, seq_relationship_logits)` order. Loss and
+accuracy remain explicit graph compositions: the model's live
+`masked_lm_ids != masked_lm_weights` mask, F32 LogSoftmax, one-hot labels,
+`1e-5` denominator residual, logits BCE, zero-label accuracy mask, and four
+ordered metric outputs are all visible IR. The word embedding and
+`cls.predictions.embedding_weight` are cloned handles of one versioned
+`Parameter`; traversal exposes both source names, while the established state
+dictionary and optimizer inventories emit the shared identity once at its
+first `bert.embeddings.word_embeddings.weight` name. Full-model explicit and
+ambient forwards retain the base model's clone rehearsal and atomic dropout
+reservation. The heads consume no random stream. Empty batches and empty
+masked-position axes are ordinary zero-work shapes; a zero sequence axis is
+rejected atomically because the source pooler indexes position zero.
+
+This is the source base BERT, question-answering, and pretraining model
+composition, not a tokenizer, vocabulary workflow, pretrained-checkpoint
+translator/loader, span decoder, optimizer/trainer, downloaded checkpoint
+differential, dynamic-shape implementation, fused kernel, or live-device
+claim.
 `nn::LSTM` is a separate typed stateful composition rather than another
 sequential trait adapter. It owns graph-independent `LSTMCell`s traversed as
 `cells.{layer}.*`, accepts one static F32 `[time,batch,input]` sequence plus
