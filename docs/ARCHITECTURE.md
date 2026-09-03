@@ -1536,6 +1536,15 @@ operands, and uses bounds only for proofs. Its trace records accepted rewrites,
 and the bounded fixed-point driver makes rewrite inspection reproducible. More
 specialized UOp patterns remain future universal-IR work.
 
+Authenticated CPU symbolic code generation lowers every currently admitted
+`SymbolicExpr` through the existing scalar `Operation` algebra before emitting
+C11. Schema-ID-ordered `DefineVar` leaves are private compiler values;
+comparisons and logical expressions stay Bool internally and cast back to the
+source expression's I64 zero/one contract. The renderer accepts only that
+authenticated restricted DAG, so an arbitrary legacy `DefineVar` cannot acquire
+a symbolic-schema slot by name. These ephemeral UOps are neither scheduled nor
+serialized and do not admit runtime-valued `Range` execution.
+
 `SymbolicShape` is a planning value beside concrete `Shape`. Binding validates
 the complete variable environment and converts every non-negative dimension to
 `usize`; `Graph::input_symbolic` is the ordinary Graph specialization point. No

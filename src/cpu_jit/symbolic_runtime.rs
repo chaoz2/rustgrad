@@ -12,6 +12,7 @@ use super::{
     scalar_store_expr, scan_commit_expr, scan_store_expr,
 };
 use crate::engine::symbolic::{SymbolicItemDomain, SymbolicSchema};
+use crate::engine::symbolic_uop::{AuthenticatedSymbolicUOp, lower_symbolic_expression};
 use crate::engine::symbolic_view::SymbolicViewMap;
 use crate::projected_index::ProjectedIndexEmitter;
 use crate::uop::Binary;
@@ -821,64 +822,73 @@ fn maximum_elements(shape: &SymbolicShape) -> Result<usize, JitError> {
 }
 
 fn expression_c(expression: &SymbolicExpr, schema: &SymbolicSchema) -> Result<String, JitError> {
-    let child = |expression: &SymbolicExpr| expression_c(expression, schema);
-    Ok(match expression {
-        SymbolicExpr::Const(i64::MIN) => "INT64_MIN".into(),
-        SymbolicExpr::Const(value) => format!("INT64_C({value})"),
-        SymbolicExpr::Var(variable) => {
-            let slot = schema
-                .parameters
-                .iter()
-                .position(|parameter| parameter.variable() == variable)
-                .ok_or_else(|| JitError::Symbolic("symbolic variable is absent".into()))?;
-            format!("symbols[{slot}]")
+    let lowered = lower_symbolic_expression(expression, schema.parameters())
+        .map_err(|error| JitError::Symbolic(error.to_string()))?;
+    render_symbolic_expression(&lowered)
+}
+
+/// Renders only the authenticated scalar subset produced by
+/// `lower_symbolic_expression`. Keeping this consumer typed prevents an
+/// arbitrary legacy `DefineVar` UOp from acquiring schema-slot semantics.
+fn render_symbolic_expression(program: &AuthenticatedSymbolicUOp) -> Result<String, JitError> {
+    fn render(
+        node: &UOp,
+        program: &AuthenticatedSymbolicUOp,
+        memo: &mut BTreeMap<UOp, String>,
+    ) -> Result<String, JitError> {
+        if let Some(value) = memo.get(node) {
+            return Ok(value.clone());
         }
-        SymbolicExpr::Add(terms) if terms.is_empty() => "INT64_C(0)".into(),
-        SymbolicExpr::Add(terms) => format!(
-            "({})",
-            terms
-                .iter()
-                .map(child)
-                .collect::<Result<Vec<_>, _>>()?
-                .join("+")
-        ),
-        SymbolicExpr::Mul(factors) if factors.is_empty() => "INT64_C(1)".into(),
-        SymbolicExpr::Mul(factors) => format!(
-            "({})",
-            factors
-                .iter()
-                .map(child)
-                .collect::<Result<Vec<_>, _>>()?
-                .join("*")
-        ),
-        SymbolicExpr::Neg(value) => format!("(-({}))", child(value)?),
-        SymbolicExpr::FloorDiv(left, right) => {
-            format!("rg_floor_div({}, {})", child(left)?, child(right)?)
-        }
-        SymbolicExpr::Mod(left, right) => {
-            format!("rg_floor_mod({}, {})", child(left)?, child(right)?)
-        }
-        SymbolicExpr::Min(left, right) => {
-            let (left, right) = (child(left)?, child(right)?);
-            format!("(({left})<({right})?({left}):({right}))")
-        }
-        SymbolicExpr::Max(left, right) => {
-            let (left, right) = (child(left)?, child(right)?);
-            format!("(({left})>({right})?({left}):({right}))")
-        }
-        SymbolicExpr::Eq(left, right) => format!("({}=={})", child(left)?, child(right)?),
-        SymbolicExpr::Lt(left, right) => format!("({}<{})", child(left)?, child(right)?),
-        SymbolicExpr::Le(left, right) => format!("({}<={})", child(left)?, child(right)?),
-        SymbolicExpr::And(left, right) => format!("({}&&{})", child(left)?, child(right)?),
-        SymbolicExpr::Or(left, right) => format!("({}||{})", child(left)?, child(right)?),
-        SymbolicExpr::Not(value) => format!("(!{})", child(value)?),
-        SymbolicExpr::Where(condition, on_true, on_false) => format!(
-            "({}?{}:{})",
-            child(condition)?,
-            child(on_true)?,
-            child(on_false)?
-        ),
-    })
+        let mut source = |index: usize| render(&node.sources()[index], program, memo);
+        let value = match node.operation() {
+            Operation::Const(crate::uop::LiteralValue::Int(i64::MIN)) => "INT64_MIN".into(),
+            Operation::Const(crate::uop::LiteralValue::Int(value)) => {
+                format!("INT64_C({value})")
+            }
+            Operation::DefineVar(value) => {
+                let slot = program.variable_slot(value).ok_or_else(|| {
+                    JitError::Symbolic("symbolic variable is not authenticated".into())
+                })?;
+                format!("symbols[{slot}]")
+            }
+            Operation::Unary(crate::uop::Unary::Neg) => format!("(-({}))", source(0)?),
+            Operation::Unary(crate::uop::Unary::Not) => format!("(!({}))", source(0)?),
+            Operation::Binary(operation) => {
+                let (left, right) = (source(0)?, source(1)?);
+                match operation {
+                    Binary::Add => format!("(({left})+({right}))"),
+                    Binary::Mul => format!("(({left})*({right}))"),
+                    Binary::FloorDiv => format!("rg_floor_div(({left}),({right}))"),
+                    Binary::Mod => format!("rg_floor_mod(({left}),({right}))"),
+                    Binary::Min => format!("(({left})<({right})?({left}):({right}))"),
+                    Binary::Max => format!("(({left})>({right})?({left}):({right}))"),
+                    Binary::Eq => format!("(({left})==({right}))"),
+                    Binary::Lt => format!("(({left})<({right}))"),
+                    Binary::Le => format!("(({left})<=({right}))"),
+                    Binary::And => format!("(({left})&&({right}))"),
+                    Binary::Or => format!("(({left})||({right}))"),
+                    Binary::Sub => {
+                        return Err(JitError::Symbolic(
+                            "unauthenticated symbolic binary operation".into(),
+                        ));
+                    }
+                }
+            }
+            Operation::Cast => format!("((int64_t)({}))", source(0)?),
+            Operation::Ternary(crate::uop::Ternary::Where) => {
+                format!("(({})?({}):({}))", source(0)?, source(1)?, source(2)?)
+            }
+            _ => {
+                return Err(JitError::Symbolic(
+                    "operation is outside authenticated symbolic scalar lowering".into(),
+                ));
+            }
+        };
+        memo.insert(node.clone(), value.clone());
+        Ok(value)
+    }
+
+    render(program.root(), program, &mut BTreeMap::new())
 }
 
 fn prologue(capture_identity: u64, item: u64) -> Vec<String> {
@@ -886,7 +896,7 @@ fn prologue(capture_identity: u64, item: u64) -> Vec<String> {
         format!("/* runtime-symbolic capture={capture_identity:016x} item={item:016x} */"),
         true,
         true,
-        vec!["static int64_t rg_floor_div(int64_t a,int64_t b){int64_t q=a/b,r=a%b;return(r&&((r<0)!=(b<0)))?q-1:q;} static int64_t rg_floor_mod(int64_t a,int64_t b){return a-rg_floor_div(a,b)*b;}".into()],
+        vec!["static int64_t rg_floor_div(int64_t a,int64_t b){int64_t q=a/b,r=a%b;return(r&&((r<0)!=(b<0)))?q-1:q;} static int64_t rg_floor_mod(int64_t a,int64_t b){int64_t r=a%b;return(r&&((r<0)!=(b<0)))?r+b:r;}".into()],
         "int rustgrad_kernel(void **buffers,const int64_t *symbols,uint64_t *failure){failure[0]=UINT64_MAX;failure[1]=0;".into(),
     )
 }
@@ -911,4 +921,83 @@ fn finish(
         abi,
         cache_key,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SymbolicVar;
+    use crate::engine::SymbolicParameter;
+
+    #[test]
+    fn symbolic_c_uses_authenticated_uop_slots_and_checked_helpers() {
+        let lhs = SymbolicVar::from_artifact(20_001, "lhs".into(), -8, 8).unwrap();
+        let rhs = SymbolicVar::from_artifact(20_002, "rhs".into(), 1, 8).unwrap();
+        let condition = SymbolicExpr::And(
+            Box::new(SymbolicExpr::Var(lhs.clone())),
+            Box::new(SymbolicExpr::Lt(
+                Box::new(SymbolicExpr::Var(lhs.clone())),
+                Box::new(SymbolicExpr::Var(rhs.clone())),
+            )),
+        );
+        let expression = SymbolicExpr::Where(
+            Box::new(condition.clone()),
+            Box::new(SymbolicExpr::FloorDiv(
+                Box::new(SymbolicExpr::Var(lhs)),
+                Box::new(SymbolicExpr::Var(rhs.clone())),
+            )),
+            Box::new(SymbolicExpr::Mod(
+                Box::new(SymbolicExpr::Const(-7)),
+                Box::new(SymbolicExpr::Var(rhs)),
+            )),
+        );
+        let parameters = [
+            SymbolicParameter {
+                variable: SymbolicVar::from_artifact(20_001, "lhs".into(), -8, 8).unwrap(),
+                dtype: DType::I64,
+            },
+            SymbolicParameter {
+                variable: SymbolicVar::from_artifact(20_002, "rhs".into(), 1, 8).unwrap(),
+                dtype: DType::I64,
+            },
+        ];
+        let lowered = lower_symbolic_expression(&expression, &parameters).unwrap();
+        let rendered = render_symbolic_expression(&lowered).unwrap();
+        assert!(rendered.contains("symbols[0]"));
+        assert!(rendered.contains("symbols[1]"));
+        assert!(rendered.contains("rg_floor_div"));
+        assert!(rendered.contains("rg_floor_mod"));
+        assert_eq!(
+            lowered.root().sources()[0].ty(),
+            Some(crate::uop::UType::scalar(DType::Bool))
+        );
+        assert!(!rendered.contains("((int64_t)"));
+        assert!(!rendered.contains("lhs"));
+        assert!(!rendered.contains("rhs"));
+
+        let predicate_value = lower_symbolic_expression(&condition, &parameters).unwrap();
+        assert!(matches!(
+            predicate_value.root().operation(),
+            Operation::Cast
+        ));
+        assert!(
+            render_symbolic_expression(&predicate_value)
+                .unwrap()
+                .contains("((int64_t)")
+        );
+    }
+
+    #[test]
+    fn symbolic_c_preserves_i64_min_without_an_invalid_literal() {
+        let parameter = SymbolicParameter {
+            variable: SymbolicVar::from_artifact(20_010, "unused".into(), 0, 1).unwrap(),
+            dtype: DType::I64,
+        };
+        let lowered = lower_symbolic_expression(
+            &SymbolicExpr::Const(i64::MIN),
+            std::slice::from_ref(&parameter),
+        )
+        .unwrap();
+        assert_eq!(render_symbolic_expression(&lowered).unwrap(), "INT64_MIN");
+    }
 }
