@@ -12508,6 +12508,146 @@ fn live_threefry_captures_computed_dependencies_and_deduplicates_shared_producer
 }
 
 #[test]
+fn live_random_bits_captures_and_replays_source_composition_exactly() {
+    let mut graph = Graph::new();
+    let key = graph.input_dtype("key", [2], DType::U32);
+    let counter = graph.input_dtype("counter", [2], DType::U32);
+    let empty = graph.random_bits(key, counter, 0).unwrap();
+    let negative = graph.random_bits(key, counter, -11).unwrap();
+    let output = graph.random_bits(key, counter, 7).unwrap();
+    let key_words = [0x0123_4567, 0x89ab_cdef];
+    let counter_words = [u32::MAX - 2, 9];
+    let inputs = HashMap::from([
+        (
+            "key".into(),
+            TensorData::from_storage([2], Storage::U32(key_words.to_vec())).unwrap(),
+        ),
+        (
+            "counter".into(),
+            TensorData::from_storage([2], Storage::U32(counter_words.to_vec())).unwrap(),
+        ),
+    ]);
+    let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+    assert_eq!(
+        expected.storage(),
+        &Storage::U32(crate::random::words(key_words, counter_words, 7))
+    );
+
+    let requested = [output, empty, negative, output];
+    let scheduled = crate::schedule_many(&graph, &requested).unwrap();
+    assert!(!scheduled.items.is_empty());
+    for requested in [empty, negative] {
+        let passthrough = scheduled
+            .requested_passthroughs
+            .iter()
+            .find(|passthrough| passthrough.requested == requested)
+            .expect("nonpositive random_bits is a source-owned empty view");
+        assert_eq!(passthrough.source, counter);
+        // The physical descriptor remains the exact U32 [2] counter. Only
+        // its authenticated affine view has the requested empty geometry.
+        assert_eq!(passthrough.desc.id, counter.index() as u64);
+        assert_eq!(passthrough.desc.shape, Shape::new([2]));
+        assert!(passthrough.desc.read_only);
+        let view = passthrough.desc.view.as_ref().expect("empty counter view");
+        assert_eq!(view.source_shape, Shape::new([2]));
+        assert_eq!(view.logical_shape, Shape::new([0]));
+        let normalized = view.normalized_read().unwrap();
+        assert_eq!(normalized.offset, 0);
+        assert!(
+            normalized
+                .axes
+                .iter()
+                .all(|axis| axis.stride == 0 && !axis.reversed)
+        );
+    }
+    assert!(
+        scheduled
+            .items
+            .iter()
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::Threefry(_)))
+    );
+    for item in &scheduled.items {
+        crate::CpuJit::render(&item.kernel).unwrap();
+        crate::ptx::PtxRenderer::new(80)
+            .unwrap()
+            .render(&item.kernel)
+            .unwrap();
+    }
+    let metal = crate::runtime::metal::MetalRenderer::new(
+        8,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: 1 << 20,
+            unified_memory: true,
+            family: "RandomBitsBoundary".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        scheduled
+            .items
+            .iter()
+            .any(|item| metal.render(&item.kernel).is_err())
+    );
+    let wgsl = crate::runtime::webgpu::WgslRenderer::new(
+        8,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: 1 << 20,
+            max_storage_buffers_per_shader_stage: 8,
+            max_compute_workgroup_size_x: 256,
+            max_compute_workgroups_per_dimension: 65_535,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        scheduled
+            .items
+            .iter()
+            .any(|item| wgsl.render(&item.kernel).is_err())
+    );
+
+    let captured = crate::CapturedSchedule::capture(&graph, &scheduled, &requested).unwrap();
+    let encoded = captured.to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&encoded).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), encoded);
+    let replay_inputs = inputs.into_iter().collect::<BTreeMap<_, _>>();
+    let executor = crate::CapturedReplayExecutor::default();
+    let interpreted = executor
+        .replay(
+            &decoded,
+            &replay_inputs,
+            crate::CapturedReplayOptions::default(),
+        )
+        .unwrap();
+    let native = executor
+        .replay(
+            &decoded,
+            &replay_inputs,
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    for result in [&interpreted, &native] {
+        assert_eq!(result.outputs.len(), 4);
+        assert_eq!(result.outputs[0].storage(), expected.storage());
+        assert_eq!(result.outputs[1].shape(), &Shape::new([0]));
+        assert_eq!(result.outputs[1].storage(), &Storage::U32(Vec::new()));
+        assert_eq!(result.outputs[2].shape(), &Shape::new([0]));
+        assert_eq!(result.outputs[2].storage(), &Storage::U32(Vec::new()));
+        assert_eq!(result.outputs[3].storage(), expected.storage());
+    }
+    assert!(
+        native
+            .trace
+            .items
+            .iter()
+            .all(|item| item.backend == crate::ItemBackend::NativeJit)
+    );
+}
+
+#[test]
 fn live_threefry_rejects_invalid_descriptors_without_publication() {
     let mut unknown = Graph::new();
     let counter = unknown.input_dtype("counter", [2], DType::U64);

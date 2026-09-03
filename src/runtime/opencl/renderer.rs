@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v9";
+pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v10";
 pub const OPENCL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-opencl-raw-copy-v1";
 pub const OPENCL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-opencl-portable-bitcast-v1";
 pub const OPENCL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
@@ -300,15 +300,16 @@ impl OpenClRenderer {
             preserves_raw_predicated_narrow,
         )?;
 
+        let common_views = crate::schedule::common_buffer_views(&nodes);
         let mut inventory = BTreeMap::<u64, OpenClBufferAbi>::new();
         for node in &nodes {
-            let (buffer, source_shape, elements, view) = match node.operation() {
+            let (buffer, source_shape, elements) = match node.operation() {
                 Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements,
                     input_shape,
                     ..
-                }) => (*buffer, input_shape.clone(), *elements, None),
+                }) => (*buffer, input_shape.clone(), *elements),
                 Operation::Index(IndexValue::View { buffer, view, .. }) => {
                     let access = OpenClViewAccess::new(
                         view,
@@ -320,7 +321,7 @@ impl OpenClRenderer {
                         .source_shape
                         .numel()
                         .map_err(|_| OpenClError::Overflow)?;
-                    (*buffer, access.source_shape, elements, Some(view.clone()))
+                    (*buffer, access.source_shape, elements)
                 }
                 _ => continue,
             };
@@ -335,7 +336,7 @@ impl OpenClRenderer {
                 source_shape,
                 elements,
                 mutable: buffer == *output_id,
-                view,
+                view: common_views.get(&buffer).cloned().flatten(),
             };
             if let Some(old) = inventory.insert(buffer, abi.clone())
                 && old != abi
@@ -1678,6 +1679,8 @@ impl ScalarLaneDialect for OpenClScalarDialect {
             (DType::U32, DType::I32) => format!("as_int({value})"),
             (DType::I64, DType::U64) => format!("as_ulong({value})"),
             (DType::U64, DType::I64) => format!("as_long({value})"),
+            (DType::U32, DType::U64) => format!("((ulong)({value}))"),
+            (DType::U64, DType::U32) => format!("((uint)({value}))"),
             (DType::I32 | DType::U32 | DType::I64 | DType::U64, DType::F32) => {
                 format!("((float)({value}))")
             }

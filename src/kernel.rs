@@ -816,7 +816,21 @@ fn lower_graph_elementwise_with_substitutions(
                             .or_else(|_| crate::rangeify::computed_view(graph, id))
                         {
                             Ok(planned) => {
-                                if context.materialized.contains(&planned.source.index()) {
+                                if context.iteration.is_none()
+                                    && matches!(
+                                        graph.op(planned.source),
+                                        Ok(Op::Constant(data)) if data.shape().rank() == 0
+                                    )
+                                {
+                                    // A validated affine read of one scalar
+                                    // constant is the same raw typed literal
+                                    // at every reachable coordinate. Keep it
+                                    // in the UOp instead of manufacturing a
+                                    // caller-owned pointer ABI for the graph
+                                    // constant. The surrounding scheduled
+                                    // output still materializes normally.
+                                    lower(graph, planned.source, out, range, memo, context)?
+                                } else if context.materialized.contains(&planned.source.index()) {
                                     load(
                                         graph,
                                         planned.source,
@@ -2494,6 +2508,32 @@ mod tests {
         assert!(!nodes.iter().any(|node| matches!(
             node.operation(),
             Operation::Index(IndexValue::Buffer { buffer, .. }) if *buffer == truth.index() as u64
+        )));
+
+        // Validated scalar-backed views retain that same literal ownership.
+        // In particular, an expanded fill that must be materialized for a
+        // direct-payload consumer does not leak its rank-zero Constant as an
+        // external pointer input.
+        let mut expanded = Graph::new();
+        let scalar = expanded.constant(TensorData::scalar_with_dtype(
+            Scalar::U(u64::from(u32::MAX)),
+            DType::U32,
+        ));
+        let output = expanded.expand(scalar, [4]).unwrap();
+        let nodes = lower_graph_elementwise(&expanded, output)
+            .unwrap()
+            .topological()
+            .unwrap();
+        assert!(nodes.iter().any(|node| matches!(
+            node.operation(),
+            Operation::Const(LiteralValue::Scalar {
+                dtype: DType::U32,
+                bits: 0xffff_ffff
+            })
+        )));
+        assert!(!nodes.iter().any(|node| matches!(
+            node.operation(),
+            Operation::Index(IndexValue::Buffer { buffer, .. }) if *buffer == scalar.index() as u64
         )));
 
         // Exact scalar payloads are carried through the UOp rather than host

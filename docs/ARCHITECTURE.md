@@ -674,6 +674,11 @@ private because uploads precede all launches and downloads follow them; zero-byt
 native sentinels also stay private. OpenCL, Metal, and WebGPU prepared prefixes
 own each physical slot once behind a logical-ID map, while CUDA graph capture
 retains one stable lease per physical slot and fences or quarantines it once.
+An OpenCL item with authenticated guarded-integer metadata launches through the
+existing provisional-output/status transaction and commits that candidate only
+after a clean status read; the shared prefix publishes detached host outputs
+only after every item and download succeeds. Metal, WebGPU, and CUDA prepared
+prefixes retain their existing guarded-operation rejection.
 This projection changes no logical binding order, BufferDesc, ScheduleItem,
 artifact, or cache identity; capacity-class reuse, suballocation, aliases,
 effects, dynamic schedules, and cross-backend slots remain outside it. Sharded CUDA mock execution
@@ -1926,6 +1931,26 @@ domains submit no work, and unsupported or malformed bindings reject before
 resource work. Semantic mocks are exact; live-device validation, ambient stream
 mutation, and device-random reservation remain unclaimed.
 
+Source-facing `Graph::random_bits(key, counter, num)` is a descriptor-first
+composition over that live Threefry operation rather than a new operation or
+an ambient reservation. A positive request requires exact U32 `[2]` key and
+counter inputs, packs their lanes into U64 words, derives the per-chunk key,
+builds the pair counter with a private U32 scalar-Full/cumulative-Add/offset
+range, emits source-order low lanes followed by high lanes, and returns exact
+U32 `[num]` storage. Every signed `num <= 0` follows Python's empty range and
+returns the same addressless counter view as zero without inspecting `key`. A
+cloned graph rehearses the complete lowering before publication. The initial
+contract admits one tinygrad source chunk (`0 < num <= u32::MAX`); larger
+positive requests reject atomically instead of constructing an unbounded
+graph. Nonpositive requests retain the source's addressless `counter[0:0]`
+view and emit no Threefry work. CPU, captured interpreter, strict C11, PTX,
+and 64-bit-capable OpenCL, including exact U32/U64 widening and truncation,
+consume the ordinary composed schedule without another ABI or artifact tag.
+Metal and WGSL remain fail-closed for the ordinary U64 packing/shift nodes;
+their isolated portable Threefry support does not imply this composition.
+The integer-only result is nondifferentiable and never reads or advances the
+process-global random registry.
+
 Durable schedule keys encode each kernel with its minimum admitted semantic
 RGUA envelope rather than the current standalone writer version. Existing
 operations, including reductions, retain their released v18 key bytes when the
@@ -2761,14 +2786,20 @@ uses a global linear CUDA thread index with an extent guard; zero domains skip
 the launch on the host and scalar domains still launch exactly one thread.
 
 The accepted type subset is bool, i32/u32/i64/u64, f32 and f64, with typed
-loads/stores, casts, comparison/select and ordinary add/sub/mul/min/max (plus
-floating division). Unary `neg` and `abs` are accepted only for i32/i64/f32/f64
+loads/stores, casts, comparison/select, 32/64-bit integer bitwise operations,
+and ordinary add/sub/mul/min/max (plus floating division). Unary `neg` and `abs`
+are accepted only for i32/i64/f32/f64
 and lower to PTX scalar instructions; bool/unsigned and all other unary pairs
-are structured renderer errors. Guarded integer division, modulo and shifts are
-rejected until a device-status ABI exists. f16/bf16 are likewise intentionally
-rejected until their capability-specific conversion and requantization path is
-proven. Transcendental unary functions remain rejected by the ordinary
-renderer. The sole exception is `LinkedF32ExpRequest`: after an exact F32 Exp
+are structured renderer errors. Guarded integer division, modulo, and dynamic
+shifts are rejected until a device-status ABI exists. The exact U64 shift by the
+literal 32 used to pack and unpack source `random_bits` words is separately
+authenticated and cannot fault. f16/bf16 are likewise intentionally rejected
+until their capability-specific conversion and requantization path is proven.
+Dedicated `%rgv` 64-bit scalar registers keep value temporaries disjoint from
+the numbered `%rd` pointer/address namespace in ordinary and reduction PTX,
+including kernels with ten or more buffer parameters.
+Transcendental unary functions remain rejected by the ordinary renderer. The
+sole exception is `LinkedF32ExpRequest`: after an exact F32 Exp
 UOp proof with distinct canonical `DefineGlobal` buffers, one shared axis-zero
 `Range`/`EndRange`, and a range bound equal to the dense element count, plus one
 matching NVVM `__nv_expf: f32 -> f32` producer attestation, it emits a versioned

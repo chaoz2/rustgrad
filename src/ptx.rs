@@ -4,8 +4,9 @@
 //! have a complete PTX contract. The CPU UOp interpreter remains the semantic
 //! oracle; static reductions consume the shared typed recurrence for the
 //! proven scalar storage subset. Float8 remains rejected outside validated
-//! operation-scoped or raw-copy storage ABIs; guarded integer division/shifts
-//! and device-status reporting remain fail-closed.
+//! operation-scoped or raw-copy storage ABIs. Guarded integer division and
+//! dynamic shifts remain fail-closed; the exact in-range U64 word shift used
+//! by source `random_bits` needs no device-status path.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
@@ -30,7 +31,7 @@ mod prefix_scan;
 #[path = "ptx_sort.rs"]
 mod sort;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v32";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v34";
 /// Separate identity for raw storage-width computed affine materialization.
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 /// Separate identity for dense raw storage-width materialization.
@@ -1003,7 +1004,28 @@ fn render(
         // explicit even for ordinary kernels so cache keys fully describe the
         // versioned Sign narrow-storage ABI.
         "  .reg .b32 %r<96>;".into(),
-        "  .reg .b64 %rd<32>;".into(),
+        format!(
+            "  .reg .b64 %rd<{}>;",
+            if nodes.iter().any(|node| {
+                node.ty()
+                    .is_some_and(|ty| matches!(ty.scalar, DType::I64 | DType::U64))
+            }) {
+                256
+            } else {
+                32
+            }
+        ),
+        format!(
+            "  .reg .b64 %rgv<{}>;",
+            if nodes.iter().any(|node| {
+                node.ty()
+                    .is_some_and(|ty| matches!(ty.scalar, DType::I64 | DType::U64))
+            }) {
+                256
+            } else {
+                1
+            }
+        ),
         "  .reg .f32 %f<32>;".into(),
         // `%fd31` is the scoped Reciprocal widening scratch. Keep the
         // declaration in renderer identity so no older artifact is reused.
@@ -5358,7 +5380,14 @@ fn emit(
         {
             format!("%r{id}")
         }
-        DType::I64 | DType::U64 if storage_mode.is_some() => format!("%rd{id}"),
+        DType::I64 | DType::U64 => {
+            if id >= 256 {
+                return Err(PtxError::Unsupported(
+                    "64-bit value exceeds PTX register budget".into(),
+                ));
+            }
+            format!("%rgv{id}")
+        }
         DType::F16 | DType::BF16 | DType::F32 => format!("%f{id}"),
         DType::F64 => format!("%fd{id}"),
         DType::Bool => format!("%r{id}"),
@@ -6005,7 +6034,41 @@ fn emit(
             lines.push(format!("  {mnemonic}.{} {dst}, {a};", ptx_type(ty)));
         }
         Operation::GraphBinary(op) => {
-            let (a, b) = (child(0)?, child(1)?);
+            let a = child(0)?;
+            if matches!(op, crate::BinaryOp::Shl | crate::BinaryOp::Shr)
+                && ty == DType::U64
+                && matches!(
+                    n.sources().get(1).map(|source| source.operation()),
+                    Some(Operation::Const(LiteralValue::Scalar {
+                        dtype: DType::U64,
+                        bits: 32,
+                    }))
+                )
+            {
+                let mnemonic = if *op == crate::BinaryOp::Shl {
+                    "shl.b64"
+                } else {
+                    "shr.u64"
+                };
+                lines.push(format!("  {mnemonic} {dst}, {a}, 32;"));
+                return Ok(dst);
+            }
+            let b = child(1)?;
+            if matches!(
+                op,
+                crate::BinaryOp::BitAnd | crate::BinaryOp::BitOr | crate::BinaryOp::BitXor
+            ) && matches!(ty, DType::I32 | DType::U32 | DType::I64 | DType::U64)
+            {
+                let mnemonic = match op {
+                    crate::BinaryOp::BitAnd => "and",
+                    crate::BinaryOp::BitOr => "or",
+                    crate::BinaryOp::BitXor => "xor",
+                    _ => unreachable!(),
+                };
+                let width = ty.itemsize() * 8;
+                lines.push(format!("  {mnemonic}.b{width} {dst}, {a}, {b};"));
+                return Ok(dst);
+            }
             if storage_mode == Some(ScopedStorageMode::LeakyRelu) {
                 if *op != crate::BinaryOp::Mul {
                     return Err(PtxError::Unsupported(
@@ -6863,6 +6926,9 @@ fn render_reduction(
     reduction: ReductionSpec<'_>,
     storage_mode: Option<ScopedStorageMode>,
 ) -> Result<RenderedPtx, PtxError> {
+    let nodes = store
+        .topological()
+        .map_err(|_| PtxError::Unsupported("reduction DAG".into()))?;
     let out = buffers
         .iter()
         .find(|buffer| buffer.id == out_id)
@@ -6920,13 +6986,32 @@ fn render_reduction(
         "{".into(),
         "  .reg .pred %p<8>;".into(),
         "  .reg .b32 %r<96>;".into(),
-        "  .reg .b64 %rd<96>;".into(),
+        format!(
+            "  .reg .b64 %rd<{}>;",
+            if nodes.iter().any(|node| {
+                node.ty()
+                    .is_some_and(|ty| matches!(ty.scalar, DType::I64 | DType::U64))
+            }) {
+                256
+            } else {
+                96
+            }
+        ),
+        format!(
+            "  .reg .b64 %rgv<{}>;",
+            if nodes.iter().any(|node| {
+                node.ty()
+                    .is_some_and(|ty| matches!(ty.scalar, DType::I64 | DType::U64))
+            }) {
+                256
+            } else {
+                1
+            }
+        ),
         "  .reg .f32 %f<96>;".into(),
         "  .reg .f64 %fd<96>;".into(),
     ]);
-    if store
-        .topological()
-        .map_err(|_| PtxError::Unsupported("reduction DAG".into()))?
+    if nodes
         .iter()
         .any(crate::projected_index::ProjectedIndexPlan::is_projected)
     {
@@ -8340,6 +8425,86 @@ mod tests {
             .unwrap()
             .retain_primary_context()
             .unwrap()
+    }
+
+    #[test]
+    fn exact_u64_word_shifts_render_while_guarded_counts_stay_closed() {
+        assert_eq!(PTX_RENDERER_VERSION, "rustgrad-ptx-elementwise-v34");
+        let renderer = PtxRenderer::new(80).unwrap();
+        let mut graph = Graph::new();
+        let words = graph.input_dtype("words", [2], DType::U64);
+        let counts = graph.input_dtype("counts", [2], DType::U64);
+        let left = graph.lshift_scalar(words, Scalar::I(32)).unwrap();
+        let right = graph.rshift_scalar(words, Scalar::I(32)).unwrap();
+        let packed = graph.bitwise_or(left, right).unwrap();
+        let dynamic = graph.lshift(words, counts).unwrap();
+
+        let left = crate::schedule(&graph, left).unwrap().items.pop().unwrap();
+        let right = crate::schedule(&graph, right).unwrap().items.pop().unwrap();
+        let left_source = renderer.render(&left.kernel).unwrap().source;
+        let right_source = renderer.render(&right.kernel).unwrap().source;
+        let left_shift = left_source
+            .lines()
+            .find(|line| line.contains("shl.b64"))
+            .unwrap();
+        let right_shift = right_source
+            .lines()
+            .find(|line| line.contains("shr.u64"))
+            .unwrap();
+        assert!(left_shift.ends_with(", 32;"), "{left_shift}");
+        assert!(right_shift.ends_with(", 32;"), "{right_shift}");
+        assert_eq!(left_shift.matches(',').count(), 2);
+        assert_eq!(right_shift.matches(',').count(), 2);
+        assert!(
+            renderer
+                .render(&crate::schedule(&graph, packed).unwrap().items[0].kernel)
+                .unwrap()
+                .source
+                .contains("or.b64")
+        );
+        assert!(matches!(
+            renderer.render(&crate::schedule(&graph, dynamic).unwrap().items[0].kernel),
+            Err(PtxError::Unsupported(reason)) if reason.contains("status ABI")
+        ));
+    }
+
+    #[test]
+    fn many_buffer_u64_values_use_a_disjoint_ptx_register_namespace() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        let mut graph = Graph::new();
+        let inputs = (0..10)
+            .map(|index| graph.input_dtype(format!("input_{index}"), [2], DType::U64))
+            .collect::<Vec<_>>();
+        let mut output = inputs[0];
+        for input in &inputs[1..] {
+            output = graph.add(output, *input).unwrap();
+        }
+
+        let item = crate::schedule(&graph, output)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert_eq!(rendered.buffers.len(), 11);
+        assert!(rendered.source.contains(".reg .b64 %rgv<256>;"));
+        assert!(rendered.source.contains("ld.param.u64 %rd100, [p9];"));
+        assert!(rendered.source.contains("add.u64 %rgv"));
+        assert!(!rendered.source.contains("add.u64 %rd100,"));
+
+        let reduced = graph.sum(output, 0).unwrap();
+        let item = crate::schedule(&graph, reduced)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert_eq!(rendered.buffers.len(), 11);
+        assert!(rendered.source.contains("REDUCE:"));
+        assert!(rendered.source.contains(".reg .b64 %rgv<256>;"));
+        assert!(rendered.source.contains("ld.param.u64 %rd100, [p9];"));
+        assert!(rendered.source.contains("add.u64 %rgv"));
+        assert!(!rendered.source.contains("add.u64 %rd100,"));
     }
 
     #[test]
@@ -13102,13 +13267,13 @@ mod tests {
             (DType::U32, "ld.global.u32", "setp.ne.u32", "st.global.u32"),
             (
                 DType::I64,
-                "ld.global.s64 %rd",
+                "ld.global.s64 %rgv",
                 "setp.lt.s64",
                 "st.global.s64",
             ),
             (
                 DType::U64,
-                "ld.global.u64 %rd",
+                "ld.global.u64 %rgv",
                 "setp.ne.u64",
                 "st.global.u64",
             ),

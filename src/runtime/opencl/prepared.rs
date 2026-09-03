@@ -37,11 +37,6 @@ impl StaticPlanAdapter for OpenClStaticAdapter {
     fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
         let rendered = self.renderer.render(&item.kernel)?;
         rendered.validate_schedule_bindings(item.ordered_inputs())?;
-        if rendered.transaction.is_some() {
-            return Err(OpenClError::Unsupported(
-                "guarded OpenCL prefixes require a staged candidate ABI".into(),
-            ));
-        }
         let buffers = bind_rendered_buffers(
             item,
             rendered.buffers.iter().scan(0usize, |ordinal, abi| {
@@ -115,6 +110,9 @@ impl StaticDeviceAdapter for OpenClStaticAdapter {
         kernel: &Self::Kernel,
         buffers: &[&Self::Buffer],
     ) -> Result<(), Self::Error> {
+        if kernel.rendered().transaction.is_some() {
+            return kernel.launch_transactional(queue, buffers)?.wait();
+        }
         if let Some(event) = kernel.launch(queue, buffers)? {
             event.wait()?;
         }

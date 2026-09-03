@@ -168,6 +168,32 @@ pub struct ScheduleInputBinding {
     pub desc: BufferDesc,
     pub abi_index: usize,
 }
+
+/// Canonical consumer-local view metadata for one physical buffer ABI slot.
+/// A single repeated view retains its historical descriptor identity. Dense
+/// access or more than one distinct view makes the pointer slot view-free;
+/// each `IndexValue::View` still owns and validates its exact address map.
+pub(crate) fn common_buffer_views(nodes: &[UOp]) -> BTreeMap<u64, Option<crate::AffineView>> {
+    let mut views = BTreeMap::<u64, Option<crate::AffineView>>::new();
+    for node in nodes {
+        let (buffer, view) = match node.operation() {
+            crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. }) => (*buffer, None),
+            crate::Operation::Index(crate::IndexValue::View { buffer, view, .. }) => {
+                (*buffer, Some(view.clone()))
+            }
+            _ => continue,
+        };
+        views
+            .entry(buffer)
+            .and_modify(|common| {
+                if *common != view {
+                    *common = None;
+                }
+            })
+            .or_insert(view);
+    }
+    views
+}
 /// A packed GGML input occupies one immutable pointer ABI slot but is not a
 /// dense `BufferDesc` and therefore cannot acquire a fake scalar `DType`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -3363,12 +3389,10 @@ fn schedule_many_with_external(
         } else {
             kernel
         };
-        for value in kernel.topological().map_err(ScheduleError::UOp)? {
-            if let crate::Operation::Index(crate::IndexValue::View { buffer, view, .. }) =
-                value.operation()
-                && let Some(desc) = inputs.iter_mut().find(|desc| desc.id == *buffer)
-            {
-                desc.view = Some(view.clone());
+        let kernel_nodes = kernel.topological().map_err(ScheduleError::UOp)?;
+        for (buffer, view) in common_buffer_views(&kernel_nodes) {
+            if let Some(desc) = inputs.iter_mut().find(|desc| desc.id == buffer) {
+                desc.view = view;
             }
         }
         let id = *node_to_item.get(&index).ok_or(ScheduleError::Overflow)?;
@@ -3568,12 +3592,10 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
     } else {
         kernel
     };
-    for node in kernel.topological().map_err(ScheduleError::UOp)? {
-        if let crate::Operation::Index(crate::IndexValue::View { buffer, view, .. }) =
-            node.operation()
-            && let Some(desc) = inputs.iter_mut().find(|desc| desc.id == *buffer)
-        {
-            desc.view = Some(view.clone());
+    let kernel_nodes = kernel.topological().map_err(ScheduleError::UOp)?;
+    for (buffer, view) in common_buffer_views(&kernel_nodes) {
+        if let Some(desc) = inputs.iter_mut().find(|desc| desc.id == buffer) {
+            desc.view = view;
         }
     }
     let input_bindings = input_bindings(&kernel, &inputs, &out)?;
