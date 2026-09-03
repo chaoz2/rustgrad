@@ -12,6 +12,7 @@ mod prepared;
 mod random;
 mod renderer;
 mod resource;
+mod session;
 mod transaction;
 
 pub use buffer::MetalBuffer;
@@ -23,6 +24,10 @@ pub use renderer::{
 pub use resource::{
     MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice, MetalDiscovery,
     MetalLibrary, MetalPipeline, MetalRuntime, MetalTransaction,
+};
+pub use session::{
+    MetalDevicePreparationReport, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
+    MetalDeviceSessionPlan, MetalDeviceSessionSummary,
 };
 pub use transaction::{
     GuardedIntegerOp, METAL_TRANSACTION_ABI_VERSION, MetalGuard, MetalTransactionAbi,

@@ -11,7 +11,7 @@ use crate::{
     memory_plan::{ExactSlotPolicy, ExactSlotRequest, assign_exact_slots},
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 mod sealed {
     pub trait Sealed {}
@@ -25,26 +25,62 @@ mod sealed {
 /// restores requested values in capture order after a successful transaction.
 #[derive(Clone)]
 pub(crate) struct CapturedStaticExecution {
-    inputs: Vec<ReplayInput>,
-    constants: BTreeMap<u64, TensorData>,
+    backing: CapturedStaticBacking,
     passthroughs: BTreeMap<u64, RequestedPassthrough>,
-    requested: Vec<u64>,
     retained: Vec<u64>,
+}
+
+#[derive(Clone)]
+enum CapturedStaticBacking {
+    Projected {
+        inputs: Vec<ReplayInput>,
+        constants: BTreeMap<u64, TensorData>,
+        requested: Vec<u64>,
+    },
+    Owned(Arc<CapturedSchedule>),
+}
+
+#[derive(Debug)]
+pub(crate) enum CapturedStaticAdmissionError {
+    Invalid(String),
+    Unsupported(String),
 }
 
 impl CapturedStaticExecution {
     pub(crate) fn new(capture: &CapturedSchedule) -> Result<Self, String> {
-        crate::schedule::artifact::validate_capture(capture)
-            .map_err(|error| format!("captured static identity: {error}"))?;
+        Self::admit(capture, None).map_err(|error| match error {
+            CapturedStaticAdmissionError::Invalid(reason)
+            | CapturedStaticAdmissionError::Unsupported(reason) => reason,
+        })
+    }
+
+    pub(crate) fn from_owned(
+        capture: CapturedSchedule,
+    ) -> Result<Self, CapturedStaticAdmissionError> {
+        let capture = Arc::new(capture);
+        Self::admit(&capture, Some(capture.clone()))
+    }
+
+    fn admit(
+        capture: &CapturedSchedule,
+        owned: Option<Arc<CapturedSchedule>>,
+    ) -> Result<Self, CapturedStaticAdmissionError> {
+        crate::schedule::artifact::validate_capture(capture).map_err(|error| {
+            CapturedStaticAdmissionError::Invalid(format!("captured static identity: {error}"))
+        })?;
         if capture.is_symbolic() {
-            return Err("captured static execution requires a concrete artifact".into());
+            return Err(CapturedStaticAdmissionError::Unsupported(
+                "captured static execution requires a concrete artifact".into(),
+            ));
         }
         if capture
             .items
             .iter()
             .any(|item| item.is_effect() || item.boundary.is_some())
         {
-            return Err("captured static execution requires a pure boundary-free prefix".into());
+            return Err(CapturedStaticAdmissionError::Unsupported(
+                "captured static execution requires a pure boundary-free prefix".into(),
+            ));
         }
         if !capture.quantized_constants.is_empty()
             || capture
@@ -52,7 +88,9 @@ impl CapturedStaticExecution {
                 .iter()
                 .any(|item| !item.quantized_input_bindings.is_empty())
         {
-            return Err("captured static execution does not admit quantized bindings".into());
+            return Err(CapturedStaticAdmissionError::Unsupported(
+                "captured static execution does not admit quantized bindings".into(),
+            ));
         }
         let produced = capture
             .items
@@ -79,32 +117,71 @@ impl CapturedStaticExecution {
             .filter(|id| retained_seen.insert(*id))
             .collect::<Vec<_>>();
         if !capture.items.is_empty() && retained.is_empty() {
-            return Err("captured static prefix has no produced requested output".into());
+            return Err(CapturedStaticAdmissionError::Invalid(
+                "captured static prefix has no produced requested output".into(),
+            ));
         }
         Ok(Self {
-            inputs: capture.inputs.clone(),
-            constants: capture.constants.clone(),
             passthroughs: capture
                 .requested_passthroughs
                 .iter()
                 .cloned()
                 .map(|alias| (alias.requested.index() as u64, alias))
                 .collect(),
-            requested: capture.requested.clone(),
+            backing: match owned {
+                Some(capture) => CapturedStaticBacking::Owned(capture),
+                None => CapturedStaticBacking::Projected {
+                    inputs: capture.inputs.clone(),
+                    constants: capture.constants.clone(),
+                    requested: capture.requested.clone(),
+                },
+            },
             retained,
         })
+    }
+
+    fn owned_capture(&self) -> Option<&CapturedSchedule> {
+        match &self.backing {
+            CapturedStaticBacking::Owned(capture) => Some(capture),
+            CapturedStaticBacking::Projected { .. } => None,
+        }
     }
 
     pub(crate) fn retained(&self) -> &[u64] {
         &self.retained
     }
 
-    pub(crate) fn stage(
-        &self,
+    pub(crate) fn inputs(&self) -> &[ReplayInput] {
+        match &self.backing {
+            CapturedStaticBacking::Projected { inputs, .. } => inputs,
+            CapturedStaticBacking::Owned(capture) => &capture.inputs,
+        }
+    }
+
+    fn constants(&self) -> &BTreeMap<u64, TensorData> {
+        match &self.backing {
+            CapturedStaticBacking::Projected { constants, .. } => constants,
+            CapturedStaticBacking::Owned(capture) => &capture.constants,
+        }
+    }
+
+    fn requested(&self) -> &[u64] {
+        match &self.backing {
+            CapturedStaticBacking::Projected { requested, .. } => requested,
+            CapturedStaticBacking::Owned(capture) => &capture.requested,
+        }
+    }
+
+    pub(crate) fn constant_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.constants().keys().copied()
+    }
+
+    fn validate_provided_names(
+        inputs: &[ReplayInput],
         provided: &BTreeMap<String, TensorData>,
-    ) -> Result<BTreeMap<u64, TensorData>, String> {
-        let expected = self
-            .inputs
+        context: &str,
+    ) -> Result<(), String> {
+        let expected = inputs
             .iter()
             .map(|input| input.name.as_str())
             .collect::<BTreeSet<_>>();
@@ -112,35 +189,93 @@ impl CapturedStaticExecution {
             .keys()
             .find(|name| !expected.contains(name.as_str()))
         {
-            return Err(format!("unexpected captured static input {extra}"));
+            return Err(format!("unexpected {context} input {extra}"));
         }
-        let mut values = self.constants.clone();
-        for input in &self.inputs {
-            let value = provided
-                .get(&input.name)
-                .ok_or_else(|| format!("missing captured static input {}", input.name))?;
+        if let Some(missing) = inputs
+            .iter()
+            .find(|input| !provided.contains_key(&input.name))
+        {
+            return Err(format!("missing {context} input {}", missing.name));
+        }
+        Ok(())
+    }
+
+    fn insert_inputs(
+        inputs: &[ReplayInput],
+        provided: &BTreeMap<String, TensorData>,
+        values: &mut BTreeMap<u64, TensorData>,
+        context: &str,
+    ) -> Result<(), String> {
+        Self::validate_provided_names(inputs, provided, context)?;
+        for input in inputs {
+            let value = &provided[&input.name];
             if value.shape() != &input.desc.shape || value.dtype() != input.desc.dtype {
                 return Err(format!(
-                    "captured static input {} descriptor mismatch",
+                    "{context} input {} descriptor mismatch",
                     input.name
                 ));
             }
             let bytes = value
                 .to_le_bytes()
-                .map_err(|_| format!("captured static input {} bytes", input.name))?;
+                .map_err(|_| format!("{context} input {} bytes", input.name))?;
             if bytes.len() != input.desc.bytes {
                 return Err(format!(
-                    "captured static input {} byte length mismatch",
+                    "{context} input {} byte length mismatch",
                     input.name
                 ));
             }
             if values.insert(input.desc.id, value.clone()).is_some() {
                 return Err(format!(
-                    "captured static input {} aliases owned storage",
+                    "{context} input {} aliases owned storage",
                     input.name
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn insert_owned_inputs(
+        inputs: &[ReplayInput],
+        mut provided: BTreeMap<String, TensorData>,
+        values: &mut BTreeMap<u64, TensorData>,
+        context: &str,
+    ) -> Result<(), String> {
+        Self::validate_provided_names(inputs, &provided, context)?;
+        for input in inputs {
+            let value = provided
+                .remove(&input.name)
+                .expect("validated resident input name");
+            if value.shape() != &input.desc.shape || value.dtype() != input.desc.dtype {
+                return Err(format!(
+                    "{context} input {} descriptor mismatch",
+                    input.name
+                ));
+            }
+            let bytes = value
+                .to_le_bytes()
+                .map_err(|_| format!("{context} input {} bytes", input.name))?;
+            if bytes.len() != input.desc.bytes {
+                return Err(format!(
+                    "{context} input {} byte length mismatch",
+                    input.name
+                ));
+            }
+            if values.insert(input.desc.id, value).is_some() {
+                return Err(format!(
+                    "{context} input {} aliases owned storage",
+                    input.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage(
+        &self,
+        provided: &BTreeMap<String, TensorData>,
+    ) -> Result<BTreeMap<u64, TensorData>, String> {
+        let mut values = self.constants().clone();
+        Self::insert_inputs(self.inputs(), provided, &mut values, "captured static")?;
         Ok(values)
     }
 
@@ -148,19 +283,32 @@ impl CapturedStaticExecution {
         &self,
         values: &BTreeMap<u64, TensorData>,
     ) -> Result<Vec<TensorData>, String> {
-        self.requested
+        self.project_with_fallback(values, &BTreeMap::new())
+    }
+
+    fn project_with_fallback(
+        &self,
+        values: &BTreeMap<u64, TensorData>,
+        fallback: &BTreeMap<u64, TensorData>,
+    ) -> Result<Vec<TensorData>, String> {
+        let value = |id: u64| {
+            values
+                .get(&id)
+                .or_else(|| fallback.get(&id))
+                .or_else(|| self.constants().get(&id))
+        };
+        self.requested()
             .iter()
             .map(|id| {
                 if let Some(alias) = self.passthroughs.get(id) {
-                    let source = values.get(&(alias.source.index() as u64)).ok_or_else(|| {
+                    let source = value(alias.source.index() as u64).ok_or_else(|| {
                         "captured static passthrough source is absent".to_string()
                     })?;
                     return alias
                         .project(source)
                         .map_err(|error| format!("captured static passthrough: {error}"));
                 }
-                values
-                    .get(id)
+                value(*id)
                     .cloned()
                     .ok_or_else(|| format!("captured static requested value {id} is absent"))
             })
@@ -179,6 +327,149 @@ impl CapturedStaticExecution {
         let mut values = self.stage(provided).map_err(&invalid_binding)?;
         execute(&mut values)?;
         self.project(&values).map_err(invalid_binding)
+    }
+}
+
+/// Runtime-only partition of one authenticated capture's named inputs.
+///
+/// Constants and explicitly selected inputs are immutable resident values;
+/// every other named input must be supplied to each invocation. This does not
+/// alter captured bytes or schedule identities.
+pub(crate) struct StaticLifetimePlan {
+    capture: CapturedStaticExecution,
+    resident_inputs: Vec<ReplayInput>,
+    transient_inputs: Vec<ReplayInput>,
+    resident_ids: BTreeSet<u64>,
+}
+
+impl StaticLifetimePlan {
+    pub(crate) fn new(
+        capture: CapturedStaticExecution,
+        resident_names: &[String],
+    ) -> Result<Self, String> {
+        if capture.owned_capture().is_none() {
+            return Err("static lifetime plan requires owned capture backing".into());
+        }
+        let mut names = BTreeSet::new();
+        for name in resident_names {
+            if name.is_empty() || !names.insert(name.as_str()) {
+                return Err("resident input names must be nonempty and unique".into());
+            }
+        }
+        let known = capture
+            .inputs()
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(name) = names.iter().find(|name| !known.contains(**name)) {
+            return Err(format!("resident input {name} is absent from the capture"));
+        }
+        let (resident_inputs, transient_inputs): (Vec<_>, Vec<_>) = capture
+            .inputs()
+            .iter()
+            .cloned()
+            .partition(|input| names.contains(input.name.as_str()));
+        let resident_ids = capture
+            .constant_ids()
+            .chain(resident_inputs.iter().map(|input| input.desc.id))
+            .collect();
+        Ok(Self {
+            capture,
+            resident_inputs,
+            transient_inputs,
+            resident_ids,
+        })
+    }
+
+    pub(crate) fn resident_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.resident_inputs.iter().map(|input| input.name.as_str())
+    }
+
+    pub(crate) fn resident_inputs(&self) -> &[ReplayInput] {
+        &self.resident_inputs
+    }
+
+    pub(crate) fn transient_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.transient_inputs
+            .iter()
+            .map(|input| input.name.as_str())
+    }
+
+    pub(crate) fn transient_inputs(&self) -> &[ReplayInput] {
+        &self.transient_inputs
+    }
+
+    pub(crate) fn resident_ids(&self) -> &BTreeSet<u64> {
+        &self.resident_ids
+    }
+
+    pub(crate) fn retained(&self) -> &[u64] {
+        self.capture.retained()
+    }
+
+    pub(crate) fn capture(&self) -> &CapturedSchedule {
+        self.capture
+            .owned_capture()
+            .expect("static lifetime plans own their capture")
+    }
+
+    pub(crate) fn stage_resident(
+        &self,
+        provided: BTreeMap<String, TensorData>,
+    ) -> Result<BTreeMap<u64, TensorData>, String> {
+        let mut values = self.capture.constants().clone();
+        CapturedStaticExecution::insert_owned_inputs(
+            &self.resident_inputs,
+            provided,
+            &mut values,
+            "resident Metal session",
+        )?;
+        Ok(values)
+    }
+
+    pub(crate) fn stage_transient(
+        &self,
+        provided: &BTreeMap<String, TensorData>,
+    ) -> Result<BTreeMap<u64, TensorData>, String> {
+        let mut values = BTreeMap::new();
+        CapturedStaticExecution::insert_inputs(
+            &self.transient_inputs,
+            provided,
+            &mut values,
+            "transient Metal session",
+        )?;
+        Ok(values)
+    }
+
+    pub(crate) fn project(
+        &self,
+        values: &BTreeMap<u64, TensorData>,
+        resident_sources: &BTreeMap<u64, TensorData>,
+    ) -> Result<Vec<TensorData>, String> {
+        self.capture.project_with_fallback(values, resident_sources)
+    }
+
+    pub(crate) fn retain_projection_sources(
+        &self,
+        values: BTreeMap<u64, TensorData>,
+    ) -> BTreeMap<u64, TensorData> {
+        let mut required = self
+            .capture
+            .requested()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        required.extend(
+            self.capture
+                .passthroughs
+                .values()
+                .map(|alias| alias.source.index() as u64),
+        );
+        required.retain(|id| !self.capture.constants().contains_key(id));
+        values
+            .into_iter()
+            .filter(|(id, _)| required.contains(id))
+            .collect()
     }
 }
 
@@ -554,6 +845,16 @@ pub(crate) struct StaticBufferAllocation {
     pub(crate) bytes: usize,
     pub(crate) dtype: DType,
     pub(crate) requires_native_handle: bool,
+}
+
+impl StaticBufferAllocation {
+    pub(crate) fn physical_bytes(self) -> usize {
+        if self.bytes == 0 && self.requires_native_handle {
+            DType::F32.itemsize()
+        } else {
+            self.bytes
+        }
+    }
 }
 
 /// Binds the renderer's exact pointer subset/order to schedule-owned physical
@@ -1175,6 +1476,17 @@ struct PreparedStaticItem<K> {
     buffer_ids: Vec<u64>,
 }
 
+/// Exact successful host/device activity for one prepared static transaction.
+/// Counts describe host API copies and launches, not PCIe traffic or GPU time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StaticExecutionReport {
+    pub(crate) h2d_calls: usize,
+    pub(crate) h2d_bytes: usize,
+    pub(crate) d2h_calls: usize,
+    pub(crate) d2h_bytes: usize,
+    pub(crate) kernel_launches: usize,
+}
+
 /// Prepared thread-confined resources for a fully validated static plan.
 pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     adapter: A,
@@ -1186,6 +1498,13 @@ pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     external_inputs: Vec<u64>,
     retained_outputs: Vec<u64>,
     compiled_cache_keys: Vec<String>,
+}
+
+/// Prepared static resources after one authenticated immutable input set has
+/// been uploaded successfully. The owned set is the only set skipped later.
+pub(crate) struct InitializedStaticSchedule<A: StaticDeviceAdapter> {
+    prepared: PreparedStaticSchedule<A>,
+    resident_ids: BTreeSet<u64>,
 }
 
 impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
@@ -1268,16 +1587,26 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         self.compiled_cache_keys.clone()
     }
 
+    pub(crate) fn kernels(&self) -> impl Iterator<Item = &A::Kernel> {
+        self.items.iter().filter_map(|item| item.kernel.as_ref())
+    }
+
     fn buffer(&self, id: u64) -> Option<&A::Buffer> {
         self.logical_slots
             .get(&id)
             .and_then(|slot| self.slots.get(*slot))
     }
 
-    pub(crate) fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), A::Error> {
-        // Complete all host validation and allocation before the first driver call.
+    fn validated_uploads(
+        &self,
+        values: &BTreeMap<u64, TensorData>,
+        upload: impl Fn(u64) -> bool,
+    ) -> Result<Vec<(u64, Vec<u8>)>, A::Error> {
         let mut uploads = Vec::with_capacity(self.external_inputs.len());
         for id in &self.external_inputs {
+            if !upload(*id) {
+                continue;
+            }
             let plan = &self.buffer_plans[id];
             let value = values
                 .get(id)
@@ -1295,15 +1624,92 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     "prefix input {id} byte length mismatch"
                 )));
             }
-            if self.buffer(*id).is_some() {
+            // Native zero-byte sentinels carry pointer identity only. Their
+            // logical descriptor is validated above, but adapter writes are
+            // intentionally reserved for observable payload bytes.
+            if !bytes.is_empty() && self.buffer(*id).is_some() {
                 uploads.push((*id, bytes));
             }
         }
+        Ok(uploads)
+    }
+
+    /// Validates and uploads the selected immutable external inputs once. A
+    /// failed upload leaves construction unpublished.
+    pub(crate) fn initialize_resident(
+        self,
+        values: &BTreeMap<u64, TensorData>,
+        resident_ids: &BTreeSet<u64>,
+    ) -> Result<(InitializedStaticSchedule<A>, StaticExecutionReport), A::Error> {
+        if let Some(id) = resident_ids
+            .iter()
+            .find(|id| !self.external_inputs.contains(id))
+        {
+            return Err(A::invalid_binding(format!(
+                "resident logical buffer {id} is not an external prefix input"
+            )));
+        }
+        let uploads = self.validated_uploads(values, |id| resident_ids.contains(&id))?;
+        let report = StaticExecutionReport {
+            h2d_calls: uploads.len(),
+            h2d_bytes: uploads.iter().try_fold(0usize, |total, (_, bytes)| {
+                total.checked_add(bytes.len()).ok_or_else(A::overflow)
+            })?,
+            ..StaticExecutionReport::default()
+        };
+        if let Some(queue) = &self.queue {
+            for (id, bytes) in &uploads {
+                self.adapter.write(
+                    queue,
+                    self.buffer(*id).ok_or_else(|| {
+                        A::invalid_binding(format!("logical resident buffer {id} is absent"))
+                    })?,
+                    bytes,
+                )?;
+            }
+        }
+        Ok((
+            InitializedStaticSchedule {
+                prepared: self,
+                resident_ids: resident_ids.clone(),
+            },
+            report,
+        ))
+    }
+
+    pub(crate) fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), A::Error> {
+        self.execute_skipping_residents(values, &BTreeSet::new())?;
+        Ok(())
+    }
+
+    /// Executes one transaction while preserving an already initialized set
+    /// of immutable external buffers.
+    fn execute_skipping_residents(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        resident_ids: &BTreeSet<u64>,
+    ) -> Result<StaticExecutionReport, A::Error> {
+        // Complete all host validation before the first driver call.
+        let uploads = self.validated_uploads(values, |id| !resident_ids.contains(&id))?;
         let mut downloads = self
             .retained_outputs
             .iter()
             .map(|id| (*id, vec![0; self.buffer_plans[id].bytes]))
             .collect::<Vec<_>>();
+        let report = StaticExecutionReport {
+            h2d_calls: uploads.len(),
+            h2d_bytes: uploads.iter().try_fold(0usize, |total, (_, bytes)| {
+                total.checked_add(bytes.len()).ok_or_else(A::overflow)
+            })?,
+            d2h_calls: downloads
+                .iter()
+                .filter(|(_, bytes)| !bytes.is_empty())
+                .count(),
+            d2h_bytes: downloads.iter().try_fold(0usize, |total, (_, bytes)| {
+                total.checked_add(bytes.len()).ok_or_else(A::overflow)
+            })?,
+            kernel_launches: self.items.iter().filter(|item| item.extent != 0).count(),
+        };
 
         if let Some(queue) = &self.queue {
             for (id, bytes) in &uploads {
@@ -1359,7 +1765,21 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         for (id, value) in decoded {
             values.insert(id, value);
         }
-        Ok(())
+        Ok(report)
+    }
+}
+
+impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
+    pub(crate) fn kernels(&self) -> impl Iterator<Item = &A::Kernel> {
+        self.prepared.kernels()
+    }
+
+    pub(crate) fn execute(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+    ) -> Result<StaticExecutionReport, A::Error> {
+        self.prepared
+            .execute_skipping_residents(values, &self.resident_ids)
     }
 }
 
@@ -2345,6 +2765,74 @@ mod tests {
             projected[0].to_le_bytes().unwrap(),
             projected[1].to_le_bytes().unwrap()
         );
+    }
+
+    #[test]
+    fn static_lifetime_plan_partitions_resident_transient_and_constant_inputs() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let weight = graph.input_dtype("weight", [2], DType::F32);
+        let constant = graph.constant(TensorData::new([2], vec![1.0, 1.0]).unwrap());
+        let sum = graph.add(input, weight).unwrap();
+        let output = graph.mul(sum, constant).unwrap();
+        let schedule = schedule_many(&graph, &[output, output]).unwrap();
+        let capture =
+            crate::CapturedSchedule::capture(&graph, &schedule, &[output, output]).unwrap();
+        let projection = CapturedStaticExecution::from_owned(capture).unwrap();
+        let lifetime = StaticLifetimePlan::new(projection, &["weight".into()]).unwrap();
+        assert_eq!(lifetime.resident_names().collect::<Vec<_>>(), ["weight"]);
+        assert_eq!(lifetime.transient_names().collect::<Vec<_>>(), ["input"]);
+        assert!(lifetime.resident_ids().contains(&(weight.index() as u64)));
+        assert!(lifetime.resident_ids().contains(&(constant.index() as u64)));
+
+        assert!(
+            lifetime
+                .stage_resident(BTreeMap::new())
+                .unwrap_err()
+                .contains("missing")
+        );
+        assert!(
+            StaticLifetimePlan::new(lifetime.capture.clone(), &["input".into(), "input".into()])
+                .err()
+                .unwrap()
+                .contains("unique")
+        );
+        assert!(
+            StaticLifetimePlan::new(lifetime.capture.clone(), &["unknown".into()])
+                .err()
+                .unwrap()
+                .contains("absent")
+        );
+
+        let resident = lifetime
+            .stage_resident(BTreeMap::from([(
+                "weight".into(),
+                TensorData::new([2], vec![2.0, 3.0]).unwrap(),
+            )]))
+            .unwrap();
+        assert!(resident.contains_key(&(weight.index() as u64)));
+        assert!(resident.contains_key(&(constant.index() as u64)));
+        let values = lifetime
+            .stage_transient(&BTreeMap::from([(
+                "input".into(),
+                TensorData::new([2], vec![5.0, 7.0]).unwrap(),
+            )]))
+            .unwrap();
+        let projected = lifetime
+            .project(
+                &BTreeMap::from([(
+                    output.index() as u64,
+                    TensorData::new([2], vec![7.0, 10.0]).unwrap(),
+                )]),
+                &resident,
+            )
+            .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(
+            projected[0].to_le_bytes().unwrap(),
+            projected[1].to_le_bytes().unwrap()
+        );
+        assert_eq!(values.len(), 1);
     }
 
     #[test]

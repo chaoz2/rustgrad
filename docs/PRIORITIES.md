@@ -8,7 +8,7 @@ the constraints for changes that make these workflows possible.
 
 ## Priority definitions
 
-- **P0 — usable workflow:** a person can complete a common CPU-first task from
+- **P0 — usable workflow:** a person can complete a useful bounded task from
   documented public APIs, with a bounded acceptance test and useful failure
   diagnostics. A missing P0 blocks adoption even if its lower-level pieces are
   tested.
@@ -42,8 +42,52 @@ slice over a broad subsystem checklist.
 
 ## Active queue
 
-The queue is deliberately small and ordered. “Evidence” names what exists
-today, not a promise that the user workflow is already complete.
+The hardware-first queue is deliberately small and ordered. Compiler parity,
+dynamic-shape breadth, and additional backends are frozen unless one of these
+workloads demonstrates that they are the next concrete blocker.
+
+### 1. P0 — strict persistent Metal device session
+
+**Status:** first bounded vertical delivered; live-hardware validation next.
+
+`MetalDeviceSessionPlan` authenticates one concrete pure capture and an
+explicit resident/transient input partition before resources. Preparation
+uploads immutable weights once and owns persistent slots, pipelines, and queue;
+repeated synchronous runs stage only transients, download requested outputs,
+expose truthful host-API/planned metrics, and have no CPU fallback. The current
+semantic-mock vertical is a bounded residual-style graph, not a full model or
+performance claim.
+
+### 2. P0 — ResNet-18 Metal conformance
+
+Run the public ResNet-18 inference graph through that strict session on the
+Apple M5, closing only demonstrated renderer/scheduler gaps. Acceptance is
+CPU-oracle output agreement, zero fallback, stable resident weights and
+intermediates, inspectable kernels/memory/transfers, and compile/first-run/
+steady-state reporting with host-wall versus device evidence labeled exactly.
+Benchmark comparisons target the equivalent tinygrad and Candle workload.
+
+### 3. P0 — device-resident GGUF Llama prefill/KV/decode
+
+Extend the same authenticated ownership model to immutable GGUF weights and
+explicit state-input/state-output KV ping-pong, with atomic mapping swaps only
+after successful completion. Acceptance covers bounded prefill and repeated
+decode, output agreement, no hidden host fallback, resident-memory and transfer
+accounting, and the same compile/first-run/steady-state scoreboard.
+Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
+serving path.
+
+### 4. Release hygiene
+
+Keep protected Linux/macOS/ASan CI, compatibility fingerprints, live-device
+evidence labels, examples, and unsupported-boundary diagnostics synchronized
+with each hardware slice.
+
+## Delivered foundation
+
+The CPU adoption, training, GGUF, local interchange, dataset, module, and
+compiler/runtime foundations below are delivered evidence. They stay here as
+dependency context rather than competing active priorities.
 
 ### 1. P0 — ergonomic CPU tensor session and getting started
 
@@ -74,19 +118,6 @@ broadcasting, model arithmetic/activation/softmax/argmax, static movement and
 gather, reshape, reduction, realization, trace inspection, repeatable variable
 rebinding, first-order gradients, and deterministic invalid-input or device
 errors. No accelerator fallback is claimed.
-
-**Strict Metal realization.** The separate opt-in
-`CpuSession::realize_metal` route reuses this static schedule on a
-caller-owned Metal device for the verified elementwise/view subset. It
-preflights every item before resource work, returns detached output plus
-handle-free cache/capability trace evidence, and has no fallback. Empty domains
-are exact typed no-resource skips. This is not yet a device session,
-model/ONNX/Linear route, or accelerator-training claim.
-
-The release-host framework probe currently reaches typed discovery but can
-return `MetalDiscovery::NoDevices` despite system hardware inventory. Its
-semantic mock evidence remains valid, but this is not portable live-device
-evidence until a process-visible device is available.
 
 ### 2. P0 — minimal train, resume, and evaluate workflow
 

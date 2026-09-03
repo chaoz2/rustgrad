@@ -2503,21 +2503,37 @@ resources, and broad live ICD validation remain explicit boundaries.
 
 ## Metal runtime boundary
 
-`CpuSession::realize_metal` is the intentionally narrow public deployment
-adapter for this runtime. The caller owns the loaded `MetalDevice` and therefore
-its thread-confined cache; the session keeps Graph nodes and binding maps
-private. It resolves only canonical static input bindings and graph constants,
-builds the ordinary schedule, and runs `MetalPrefixPlan::plan` across every
-item before resource preparation. `MetalSessionTrace` retains ordered logical
-item/cache identities and capabilities but no handles, pointers, or current
-tensor bytes. Legal zero-domain pure items are retained as typed plan sentinels:
-they materialize exact empty `TensorData` values without queue, pipeline,
-buffer, or command work. This adapter is strict—unsupported renderer/ABI/view/
-dtype/capability items return before resource work and never select CPU
-fallback. It currently covers static elementwise/view and proven typed-reduction
-session graphs, not model/Linear/ONNX inference, unsupported unary activation,
-effects, dynamic
-shapes, persistent device state, graph capture, or profiling.
+`CpuSession::realize_metal` remains the intentionally narrow one-shot public
+deployment adapter. `MetalDeviceSessionPlan` is the persistent concrete-capture
+path: it authenticates the complete pure capture, renderer ABI, static memory
+plan, and an exhaustive resident/transient named-input partition before Metal
+resource work. `prepare` uploads buffer-backed constants and selected immutable
+resident inputs once, then type-states the prepared prefix with that exact
+resident set. Each `run` stages only transient tensors, preserves physical
+intermediates across schedule items, waits once per nonzero item, downloads only
+deduplicated materialized requested owners, and reconstructs ordered duplicate
+or affine passthrough outputs through the shared captured projection. There is
+no CPU fallback branch.
+
+The plan exposes exact typed input schemas, every rendered schedule item,
+nonzero compiled-kernel cache keys, planned slot bytes including private
+zero-byte sentinels, and nonzero/zero item counts. The prepared session exposes
+only its compiled nonzero kernels, selected handle-free `MetalDeviceInfo`, and stable
+Rust owner identity. Preparation and successful-run reports distinguish
+deterministic counts from host wall-clock durations and host API copy bytes;
+they make no claim about allocator RSS, PCIe traffic, cache residency, or GPU
+timestamps. Runs are synchronous host transactions and currently submit and
+wait per schedule item rather than batching one command buffer. Invalid calls
+reach no driver work; a failed execution publishes neither outputs nor a
+successful-run metric and the settled prefix remains retryable. Zero-work
+captures allocate, compile, upload, launch, wait, and read nothing.
+
+This boundary is concrete, pure, static inference only. Symbolic programs,
+effects, RNG state, quantized bindings, mutable training or KV state,
+state-input/state-output ping-pong, output chaining across calls, multi-device
+execution, and full ResNet/Linear/ONNX workload support remain explicit
+follow-ons. The semantic mock covers a bounded residual-style multi-layer graph;
+live device performance evidence is not claimed.
 
 `MetalRuntime::discover` is the narrow diagnostic seam for deployment setup:
 framework/symbol errors remain structured `MetalError`s, while a successfully

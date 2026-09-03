@@ -863,6 +863,15 @@ impl MetalCache {
         self.entries.borrow().is_empty()
     }
 
+    pub(crate) fn contains_rendered(&self, rendered: &RenderedMetal) -> bool {
+        let key = stable_key(&(
+            rendered.cache_key.as_str(),
+            &self.device.info().capabilities,
+            self.device.info().registry_id,
+        ));
+        self.entries.borrow().contains_key(&key)
+    }
+
     /// Returns an existing pipeline or compiles and inserts it atomically for
     /// this single-threaded cache owner.
     pub fn load(&self, rendered: &RenderedMetal) -> Result<Rc<MetalPipeline>, MetalError> {
