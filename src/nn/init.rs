@@ -21,3 +21,52 @@ pub(super) fn uniform(shape: Shape, low: f32, high: f32, seed: u64) -> Result<Te
         }),
     )
 }
+
+/// Monotone seed allocation for graph-independent module initialization.
+///
+/// Composite modules use one cursor instead of inventing per-layer offsets.
+/// A cursor is local to a constructor rehearsal, so a failed preparation
+/// consumes no ambient random state and publishes no parameters.
+pub(super) struct InitCursor {
+    next: u64,
+}
+
+pub(super) fn glorot_uniform_bound(shape: &Shape) -> Result<f32> {
+    if shape.rank() == 0 {
+        return Err(crate::Error::InvalidRandom {
+            reason: "glorot_uniform requires rank at least one",
+        });
+    }
+    let tail = shape.dims()[1..].iter().try_fold(1usize, |fan, &dim| {
+        fan.checked_mul(dim)
+            .ok_or_else(|| crate::Error::ShapeOverflow(shape.clone()))
+    })?;
+    let fan = shape.dims()[0]
+        .checked_add(tail)
+        .ok_or_else(|| crate::Error::ShapeOverflow(shape.clone()))?;
+    if fan == 0 {
+        return Err(crate::Error::InvalidRandom {
+            reason: "glorot_uniform has zero fan",
+        });
+    }
+    shape.numel()?;
+    Ok((6.0 / fan as f64).sqrt() as f32)
+}
+
+impl InitCursor {
+    pub(super) const fn new(seed: u64) -> Self {
+        Self { next: seed }
+    }
+
+    fn take(&mut self) -> u64 {
+        let seed = self.next;
+        self.next = self.next.wrapping_add(1);
+        seed
+    }
+
+    /// Host-owned F32 form of checked-in tinygrad's Glorot bound.
+    pub(super) fn glorot_uniform(&mut self, shape: Shape) -> Result<TensorData> {
+        let bound = glorot_uniform_bound(&shape)?;
+        uniform(shape, -bound, bound, self.take())
+    }
+}
