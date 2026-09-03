@@ -1025,16 +1025,11 @@ pub(crate) fn single_reduction_epilogue(
         .shape(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?;
     let mut reductions = std::collections::BTreeSet::new();
-    fn visit(
-        graph: &Graph,
-        node: NodeId,
-        output: NodeId,
-        output_shape: &Shape,
-        reductions: &mut std::collections::BTreeSet<NodeId>,
-        seen: &mut std::collections::BTreeSet<NodeId>,
-    ) -> std::result::Result<bool, UOpError> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pending = vec![output];
+    while let Some(node) = pending.pop() {
         if !seen.insert(node) {
-            return Ok(true);
+            continue;
         }
         let op = graph.op(node).map_err(|_| UOpError::UseBeforeDefinition)?;
         let dtype = graph
@@ -1046,10 +1041,10 @@ pub(crate) fn single_reduction_epilogue(
                 .map_err(|_| UOpError::UseBeforeDefinition)?
                 != output_shape
             {
-                return Ok(false);
+                return Ok(None);
             }
             reductions.insert(node);
-            return Ok(true);
+            continue;
         }
         if node != output && !matches!(op, Op::Input { .. } | Op::Constant(_)) {
             let shape = graph
@@ -1057,28 +1052,15 @@ pub(crate) fn single_reduction_epilogue(
                 .map_err(|_| UOpError::UseBeforeDefinition)?;
             if !matches!(shape.broadcast_with(output_shape), Ok(broadcast) if &broadcast == output_shape)
             {
-                return Ok(false);
+                return Ok(None);
             }
         }
         let Some(children) = scalar_reduction_epilogue_children(op, dtype) else {
-            return Ok(false);
+            return Ok(None);
         };
-        for child in children {
-            if !visit(graph, child, output, output_shape, reductions, seen)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        pending.extend(children.into_iter().rev());
     }
-    if !visit(
-        graph,
-        output,
-        output,
-        output_shape,
-        &mut reductions,
-        &mut std::collections::BTreeSet::new(),
-    )? || reductions.len() != 1
-    {
+    if reductions.len() != 1 {
         return Ok(None);
     }
     let reduction = *reductions.first().ok_or(UOpError::InvalidArgument)?;
@@ -1147,49 +1129,44 @@ pub(crate) fn reduction_epilogue_node_uses(
     output: NodeId,
     target: NodeId,
 ) -> std::result::Result<usize, UOpError> {
-    fn visit(
-        graph: &Graph,
-        node: NodeId,
-        target: NodeId,
-        seen: &mut std::collections::BTreeSet<NodeId>,
-    ) -> std::result::Result<usize, UOpError> {
-        if node == target || !seen.insert(node) {
-            return Ok(0);
-        }
-        let op = graph.op(node).map_err(|_| UOpError::UseBeforeDefinition)?;
-        // The sole reduction is the terminal of an eligible epilogue DAG.
-        // Probing whether another schedule root is nested beneath this
-        // candidate must report no use instead of trying to traverse through
-        // the materialization boundary.
-        if matches!(op, Op::Reduce { .. }) {
-            return Ok(0);
-        }
-        let dtype = graph
-            .dtype(node)
-            .map_err(|_| UOpError::UseBeforeDefinition)?;
-        let children =
-            scalar_reduction_epilogue_children(op, dtype).ok_or(UOpError::InvalidArgument)?;
-        let mut uses = 0usize;
-        for child in children {
-            if child == target {
-                uses = uses.checked_add(1).ok_or(UOpError::InvalidArgument)?;
-            } else {
-                uses = uses
-                    .checked_add(visit(graph, child, target, seen)?)
-                    .ok_or(UOpError::InvalidArgument)?;
-            }
-        }
-        Ok(uses)
-    }
     if target == output || single_reduction_epilogue(graph, output)?.is_none() {
         return Err(UOpError::InvalidArgument);
     }
-    visit(
-        graph,
-        output,
-        target,
-        &mut std::collections::BTreeSet::new(),
-    )
+    enum Frame {
+        Node(NodeId),
+        Edge(NodeId),
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut uses = 0usize;
+    let mut pending = vec![Frame::Node(output)];
+    while let Some(frame) = pending.pop() {
+        match frame {
+            Frame::Edge(child) if child == target => {
+                uses = uses.checked_add(1).ok_or(UOpError::InvalidArgument)?;
+            }
+            Frame::Edge(child) => pending.push(Frame::Node(child)),
+            Frame::Node(node) => {
+                if node == target || !seen.insert(node) {
+                    continue;
+                }
+                let op = graph.op(node).map_err(|_| UOpError::UseBeforeDefinition)?;
+                // The sole reduction is the terminal of an eligible epilogue
+                // DAG. Probing whether another schedule root is nested beneath
+                // this candidate reports no use instead of traversing through
+                // the materialization boundary.
+                if matches!(op, Op::Reduce { .. }) {
+                    continue;
+                }
+                let dtype = graph
+                    .dtype(node)
+                    .map_err(|_| UOpError::UseBeforeDefinition)?;
+                let children = scalar_reduction_epilogue_children(op, dtype)
+                    .ok_or(UOpError::InvalidArgument)?;
+                pending.extend(children.into_iter().rev().map(Frame::Edge));
+            }
+        }
+    }
+    Ok(uses)
 }
 
 pub(crate) fn lower_graph_reduction_epilogue_with_materialized(

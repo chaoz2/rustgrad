@@ -1623,81 +1623,82 @@ impl ScalarAliasCollector<'_> {
     }
 
     fn visit(&mut self, node: NodeId) -> Result<(), ScheduleError> {
-        let op = self.graph.op(node).map_err(ScheduleError::Graph)?;
-        let is_view = matches!(
-            op,
-            Op::Shrink { .. }
-                | Op::Reshape { .. }
-                | Op::Permute { .. }
-                | Op::Expand { .. }
-                | Op::Stride { .. }
-        ) || crate::rangeify::is_constant_zero_pad(self.graph, node);
-        // A canonical-zero Pad is semantically a guarded source read, even
-        // when an affine suffix (for example Reshape) can otherwise collapse
-        // only as far as the Pad root. Prefer the exact predicated projection
-        // before computed-view ownership so the Pad itself is not mistaken
-        // for an affine producer that would remain materialized.
-        if is_view
-            && !self.requested.contains(&node.index())
-            && !self.external.contains(&node.index())
-            && let Ok(source) =
-                crate::rangeify::predicated_source(self.graph, node, self.iteration_shape)
-            && (self.roots.contains(&source.index())
-                || self.external.contains(&source.index())
-                || matches!(
-                    self.graph.op(source),
-                    Ok(Op::Input { .. } | Op::Constant(_))
-                ))
-        {
-            self.record_projected_alias_roots(node, source)?;
-            return Ok(());
-        }
-        if is_view
-            && !self.requested.contains(&node.index())
-            && !self.external.contains(&node.index())
-            && let Ok(planned) = crate::rangeify::computed_view(self.graph, node)
-            && self.roots.contains(&planned.source.index())
-            && let Ok(view) = planned.view.expand(self.iteration_shape.clone())
-        {
-            self.candidates
-                .affine_maps
-                .entry(planned.source.index())
-                .or_default()
-                .insert(view);
-            // `computed_view` canonicalizes the whole movement chain to its
-            // ultimate producer. Retain every scheduled root on that path so
-            // an accepted scalar owner removes the complete physical chain,
-            // including a shared intermediate view hidden below two equivalent
-            // terminal maps.
-            self.record_affine_view_roots(node, planned.source)?;
-            return Ok(());
-        }
-        if is_view
-            && self.roots.contains(&node.index())
-            && !self.requested.contains(&node.index())
-            && !self.external.contains(&node.index())
-            && let Ok(source) =
-                crate::rangeify::projected_source(self.graph, node, self.iteration_shape)
-            && (self.roots.contains(&source.index())
-                || self.external.contains(&source.index())
-                || matches!(
-                    self.graph.op(source),
-                    Ok(Op::Input { .. } | Op::Constant(_))
-                ))
-        {
-            self.record_projected_alias_roots(node, source)?;
-            return Ok(());
-        }
-        if node != self.output && self.roots.contains(&node.index()) {
-            self.candidates.direct_roots.insert(node.index());
-            return Ok(());
-        }
-        let children = op.value_inputs();
-        if !self.seen.insert(node) {
-            return Ok(());
-        }
-        for child in children {
-            self.visit(child)?;
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            let op = self.graph.op(node).map_err(ScheduleError::Graph)?;
+            let is_view = matches!(
+                op,
+                Op::Shrink { .. }
+                    | Op::Reshape { .. }
+                    | Op::Permute { .. }
+                    | Op::Expand { .. }
+                    | Op::Stride { .. }
+            ) || crate::rangeify::is_constant_zero_pad(self.graph, node);
+            // A canonical-zero Pad is semantically a guarded source read, even
+            // when an affine suffix (for example Reshape) can otherwise collapse
+            // only as far as the Pad root. Prefer the exact predicated projection
+            // before computed-view ownership so the Pad itself is not mistaken
+            // for an affine producer that would remain materialized.
+            if is_view
+                && !self.requested.contains(&node.index())
+                && !self.external.contains(&node.index())
+                && let Ok(source) =
+                    crate::rangeify::predicated_source(self.graph, node, self.iteration_shape)
+                && (self.roots.contains(&source.index())
+                    || self.external.contains(&source.index())
+                    || matches!(
+                        self.graph.op(source),
+                        Ok(Op::Input { .. } | Op::Constant(_))
+                    ))
+            {
+                self.record_projected_alias_roots(node, source)?;
+                continue;
+            }
+            if is_view
+                && !self.requested.contains(&node.index())
+                && !self.external.contains(&node.index())
+                && let Ok(planned) = crate::rangeify::computed_view(self.graph, node)
+                && self.roots.contains(&planned.source.index())
+                && let Ok(view) = planned.view.expand(self.iteration_shape.clone())
+            {
+                self.candidates
+                    .affine_maps
+                    .entry(planned.source.index())
+                    .or_default()
+                    .insert(view);
+                // `computed_view` canonicalizes the whole movement chain to its
+                // ultimate producer. Retain every scheduled root on that path so
+                // an accepted scalar owner removes the complete physical chain,
+                // including a shared intermediate view hidden below two equivalent
+                // terminal maps.
+                self.record_affine_view_roots(node, planned.source)?;
+                continue;
+            }
+            if is_view
+                && self.roots.contains(&node.index())
+                && !self.requested.contains(&node.index())
+                && !self.external.contains(&node.index())
+                && let Ok(source) =
+                    crate::rangeify::projected_source(self.graph, node, self.iteration_shape)
+                && (self.roots.contains(&source.index())
+                    || self.external.contains(&source.index())
+                    || matches!(
+                        self.graph.op(source),
+                        Ok(Op::Input { .. } | Op::Constant(_))
+                    ))
+            {
+                self.record_projected_alias_roots(node, source)?;
+                continue;
+            }
+            if node != self.output && self.roots.contains(&node.index()) {
+                self.candidates.direct_roots.insert(node.index());
+                continue;
+            }
+            let children = op.value_inputs();
+            if !self.seen.insert(node) {
+                continue;
+            }
+            stack.extend(children.into_iter().rev());
         }
         Ok(())
     }
@@ -1824,28 +1825,30 @@ fn checked_scalar_sink(
 }
 
 fn graph_node_uses(graph: &Graph, output: NodeId, target: NodeId) -> Result<usize, ScheduleError> {
-    fn visit(
-        graph: &Graph,
-        node: NodeId,
-        target: NodeId,
-        seen: &mut BTreeSet<NodeId>,
-    ) -> Result<usize, ScheduleError> {
-        if node == target || !seen.insert(node) {
-            return Ok(0);
-        }
-        let mut uses = 0usize;
-        for child in graph.op(node).map_err(ScheduleError::Graph)?.value_inputs() {
-            if child == target {
-                uses = uses.checked_add(1).ok_or(ScheduleError::Overflow)?;
-            } else {
-                uses = uses
-                    .checked_add(visit(graph, child, target, seen)?)
-                    .ok_or(ScheduleError::Overflow)?;
-            }
-        }
-        Ok(uses)
+    enum Frame {
+        Node(NodeId),
+        Edge(NodeId),
     }
-    visit(graph, output, target, &mut BTreeSet::new())
+
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![Frame::Node(output)];
+    let mut uses = 0usize;
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Node(node) => {
+                if node == target || !seen.insert(node) {
+                    continue;
+                }
+                let children = graph.op(node).map_err(ScheduleError::Graph)?.value_inputs();
+                stack.extend(children.into_iter().rev().map(Frame::Edge));
+            }
+            Frame::Edge(child) if child == target => {
+                uses = uses.checked_add(1).ok_or(ScheduleError::Overflow)?;
+            }
+            Frame::Edge(child) => stack.push(Frame::Node(child)),
+        }
+    }
+    Ok(uses)
 }
 
 fn scalar_aliases_are_exclusive(
@@ -2370,6 +2373,189 @@ fn supported(op: &Op) -> bool {
             | Op::Conv2d { .. }
     )
 }
+
+struct LeafTraversal<'a> {
+    graph: &'a Graph,
+    roots: &'a BTreeSet<usize>,
+    owner: usize,
+    external: &'a BTreeSet<usize>,
+    allow_projected: bool,
+}
+
+impl LeafTraversal<'_> {
+    fn visit_one(
+        &self,
+        id: NodeId,
+        out: &mut BTreeSet<usize>,
+        boundary: &mut Option<ScheduleBoundary>,
+        pending: &mut Vec<NodeId>,
+    ) -> Result<(), ScheduleError> {
+        if id.index() != self.owner && self.roots.contains(&id.index()) {
+            out.insert(id.index());
+            return Ok(());
+        }
+        if self.external.contains(&id.index()) {
+            out.insert(id.index());
+            return Ok(());
+        }
+        let op = self.graph.op(id).map_err(ScheduleError::Graph)?;
+        if !supported(op) {
+            *boundary = Some(ScheduleBoundary::Unsupported(
+                "operation requires materialization",
+            ));
+            if id.index() != self.owner {
+                out.insert(id.index());
+            }
+            return Ok(());
+        }
+        match op {
+            Op::Input { .. } | Op::Constant(_) => {
+                out.insert(id.index());
+            }
+            Op::Random { .. } | Op::ShapeIota { .. } => {}
+            Op::Cast { input, .. }
+            | Op::Bitcast { input, .. }
+            | Op::Contiguous { input }
+            | Op::ContiguousBackward { input }
+            | Op::Detach { input }
+            | Op::Unary { input, .. }
+            | Op::Reduce { input, .. }
+            | Op::PrefixScan { input, .. }
+            | Op::TensorGuard { input, .. }
+            | Op::Sort { input, .. }
+            | Op::Pad { input, .. }
+            | Op::ScatterPositions { input, .. } => pending.push(*input),
+            Op::ScatterPositionsVjp { cotangent, .. } => pending.push(*cotangent),
+            Op::Shrink { input, .. }
+            | Op::Reshape { input, .. }
+            | Op::Permute { input, .. }
+            | Op::Expand { input, .. }
+            | Op::Stride { input, .. } => {
+                match crate::rangeify::static_view(self.graph, id) {
+                    Ok(view) => {
+                        out.insert(view.source.index());
+                    }
+                    Err(_) => match crate::rangeify::computed_view(self.graph, id) {
+                        Ok(view) => {
+                            out.insert(view.source.index());
+                        }
+                        Err(_) if self.allow_projected => {
+                            match self.graph.shape(id).map_err(ScheduleError::Graph).and_then(
+                                |shape| {
+                                    crate::rangeify::projected_source(self.graph, id, shape)
+                                        .map_err(|_| {
+                                            ScheduleError::Binding(
+                                                "view is outside static owned index projection"
+                                                    .into(),
+                                            )
+                                        })
+                                },
+                            ) {
+                                Ok(source) => {
+                                    out.insert(source.index());
+                                }
+                                Err(_) => {
+                                    *boundary = Some(ScheduleBoundary::Unsupported(
+                                        "view is outside static owned index projection",
+                                    ));
+                                    out.insert(input.index());
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            *boundary = Some(ScheduleBoundary::Unsupported(
+                                "projected indexing is outside symbolic capture",
+                            ));
+                            // Preserve a complete producer inventory even though
+                            // symbolic capture rejects the projected address. The
+                            // unsupported boundary must not manufacture a binding
+                            // to an unscheduled intermediate movement node.
+                            let source = self
+                                .graph
+                                .shape(id)
+                                .ok()
+                                .and_then(|shape| {
+                                    crate::rangeify::projected_source(self.graph, id, shape).ok()
+                                })
+                                .unwrap_or(*input);
+                            out.insert(source.index());
+                        }
+                    },
+                }
+            }
+            Op::Binary { lhs, rhs, .. }
+            | Op::Compare { lhs, rhs, .. }
+            | Op::Threefry {
+                counter: lhs,
+                key: rhs,
+            }
+            | Op::Matmul { lhs, rhs } => {
+                pending.push(*rhs);
+                pending.push(*lhs);
+            }
+            Op::Conv2d {
+                input,
+                weight,
+                bias,
+                ..
+            } => {
+                if let Some(bias) = bias {
+                    pending.push(*bias);
+                }
+                pending.push(*weight);
+                pending.push(*input);
+            }
+            Op::Concat { inputs, .. } => {
+                pending.extend(inputs.iter().rev().copied());
+            }
+            Op::Gather { input, index, .. } => {
+                pending.push(*index);
+                pending.push(*input);
+            }
+            Op::Scatter {
+                base,
+                index,
+                updates,
+                ..
+            } => {
+                pending.push(*updates);
+                pending.push(*index);
+                pending.push(*base);
+            }
+            Op::Logical { lhs, rhs, .. } => {
+                if let Some(rhs) = rhs {
+                    pending.push(*rhs);
+                }
+                pending.push(*lhs);
+            }
+            Op::Select {
+                condition,
+                on_true,
+                on_false,
+            } => {
+                pending.push(*on_false);
+                pending.push(*on_true);
+                pending.push(*condition);
+            }
+            _ => unreachable!(),
+        };
+        Ok(())
+    }
+
+    fn visit(
+        &self,
+        id: NodeId,
+        out: &mut BTreeSet<usize>,
+        boundary: &mut Option<ScheduleBoundary>,
+    ) -> Result<(), ScheduleError> {
+        let mut pending = vec![id];
+        while let Some(node) = pending.pop() {
+            self.visit_one(node, out, boundary, &mut pending)?;
+        }
+        Ok(())
+    }
+}
+
 /// Creates one conservative fused item for a pure elementwise output. Anything
 /// else is a visible schedule boundary, never an implicit mislowering.
 pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError> {
@@ -2437,67 +2623,66 @@ pub fn schedule_with_external_materializations(
         external: &BTreeSet<usize>,
         seen: &mut BTreeSet<usize>,
     ) -> Result<bool, ScheduleError> {
-        let node = graph
-            .contiguous_backward_owner(node)
-            .map_err(ScheduleError::Graph)?;
-        if !seen.insert(node.index()) {
-            return Ok(false);
-        }
-        if external.contains(&node.index()) {
-            return Ok(true);
-        }
-        let children: Vec<NodeId> = match graph.op(node).map_err(ScheduleError::Graph)? {
-            Op::Cast { input, .. }
-            | Op::Bitcast { input, .. }
-            | Op::Contiguous { input }
-            | Op::ContiguousBackward { input }
-            | Op::Detach { input }
-            | Op::Unary { input, .. }
-            | Op::Shrink { input, .. }
-            | Op::Reshape { input, .. }
-            | Op::Permute { input, .. }
-            | Op::Expand { input, .. }
-            | Op::Stride { input, .. }
-            | Op::Reduce { input, .. }
-            | Op::PrefixScan { input, .. }
-            | Op::TensorGuard { input, .. }
-            | Op::Sort { input, .. }
-            | Op::Pad { input, .. }
-            | Op::ScatterPositions { input, .. } => vec![*input],
-            Op::ScatterPositionsVjp { cotangent, .. } => vec![*cotangent],
-            Op::Binary { lhs, rhs, .. }
-            | Op::Compare { lhs, rhs, .. }
-            | Op::Threefry {
-                counter: lhs,
-                key: rhs,
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            let node = graph
+                .contiguous_backward_owner(node)
+                .map_err(ScheduleError::Graph)?;
+            if !seen.insert(node.index()) {
+                continue;
             }
-            | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
-            Op::Conv2d {
-                input,
-                weight,
-                bias,
-                ..
-            } => bias.iter().copied().chain([*input, *weight]).collect(),
-            Op::Concat { inputs, .. } => inputs.clone(),
-            Op::Gather { input, index, .. } => vec![*input, *index],
-            Op::Scatter {
-                base,
-                index,
-                updates,
-                ..
-            } => vec![*base, *index, *updates],
-            Op::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
-            Op::Select {
-                condition,
-                on_true,
-                on_false,
-            } => vec![*condition, *on_true, *on_false],
-            _ => vec![],
-        };
-        for child in children {
-            if reaches_external(graph, child, external, seen)? {
+            if external.contains(&node.index()) {
                 return Ok(true);
             }
+            let children: Vec<NodeId> = match graph.op(node).map_err(ScheduleError::Graph)? {
+                Op::Cast { input, .. }
+                | Op::Bitcast { input, .. }
+                | Op::Contiguous { input }
+                | Op::ContiguousBackward { input }
+                | Op::Detach { input }
+                | Op::Unary { input, .. }
+                | Op::Shrink { input, .. }
+                | Op::Reshape { input, .. }
+                | Op::Permute { input, .. }
+                | Op::Expand { input, .. }
+                | Op::Stride { input, .. }
+                | Op::Reduce { input, .. }
+                | Op::PrefixScan { input, .. }
+                | Op::TensorGuard { input, .. }
+                | Op::Sort { input, .. }
+                | Op::Pad { input, .. }
+                | Op::ScatterPositions { input, .. } => vec![*input],
+                Op::ScatterPositionsVjp { cotangent, .. } => vec![*cotangent],
+                Op::Binary { lhs, rhs, .. }
+                | Op::Compare { lhs, rhs, .. }
+                | Op::Threefry {
+                    counter: lhs,
+                    key: rhs,
+                }
+                | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
+                Op::Conv2d {
+                    input,
+                    weight,
+                    bias,
+                    ..
+                } => bias.iter().copied().chain([*input, *weight]).collect(),
+                Op::Concat { inputs, .. } => inputs.clone(),
+                Op::Gather { input, index, .. } => vec![*input, *index],
+                Op::Scatter {
+                    base,
+                    index,
+                    updates,
+                    ..
+                } => vec![*base, *index, *updates],
+                Op::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
+                Op::Select {
+                    condition,
+                    on_true,
+                    on_false,
+                } => vec![*condition, *on_true, *on_false],
+                _ => vec![],
+            };
+            pending.extend(children.into_iter().rev());
         }
         Ok(false)
     }
@@ -2536,6 +2721,45 @@ impl SchedulePolicy {
     };
 }
 
+fn mark_needed(
+    graph: &Graph,
+    output: NodeId,
+    needed: &mut BTreeSet<usize>,
+    consumers: &mut [usize],
+    external: &BTreeSet<usize>,
+) -> Result<(), ScheduleError> {
+    enum Frame {
+        Node(NodeId),
+        Edge(NodeId),
+    }
+
+    let mut stack = vec![Frame::Node(output)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Node(node) => {
+                if !needed.insert(node.index()) || external.contains(&node.index()) {
+                    continue;
+                }
+                let op = graph.op(node).map_err(ScheduleError::Graph)?;
+                let children = if supported(op) {
+                    op.value_inputs()
+                } else {
+                    Vec::new()
+                };
+                stack.extend(children.into_iter().rev().map(Frame::Edge));
+            }
+            Frame::Edge(child) => {
+                let child = graph
+                    .contiguous_backward_owner(child)
+                    .map_err(ScheduleError::Graph)?;
+                consumers[child.index()] += 1;
+                stack.push(Frame::Node(child));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn schedule_many_with_external(
     graph: &Graph,
     outputs: &[NodeId],
@@ -2570,108 +2794,9 @@ fn schedule_many_with_external(
         .collect::<Result<BTreeSet<_>, _>>()?;
     let mut needed = BTreeSet::new();
     let mut consumers = vec![0usize; graph.node_count()];
-    fn mark(
-        g: &Graph,
-        id: NodeId,
-        needed: &mut BTreeSet<usize>,
-        consumers: &mut [usize],
-        external: &BTreeSet<usize>,
-    ) -> Result<(), ScheduleError> {
-        if !needed.insert(id.index()) {
-            return Ok(());
-        }
-        if external.contains(&id.index()) {
-            return Ok(());
-        }
-        let mut child = |child: NodeId| -> Result<(), ScheduleError> {
-            let child = g
-                .contiguous_backward_owner(child)
-                .map_err(ScheduleError::Graph)?;
-            consumers[child.index()] += 1;
-            mark(g, child, needed, consumers, external)
-        };
-        match g.op(id).map_err(ScheduleError::Graph)? {
-            Op::Cast { input, .. }
-            | Op::Bitcast { input, .. }
-            | Op::Contiguous { input }
-            | Op::ContiguousBackward { input }
-            | Op::Detach { input }
-            | Op::Unary { input, .. }
-            | Op::Shrink { input, .. }
-            | Op::Reshape { input, .. }
-            | Op::Permute { input, .. }
-            | Op::Expand { input, .. }
-            | Op::Stride { input, .. }
-            | Op::Reduce { input, .. }
-            | Op::PrefixScan { input, .. }
-            | Op::TensorGuard { input, .. }
-            | Op::Sort { input, .. }
-            | Op::Pad { input, .. }
-            | Op::ScatterPositions { input, .. } => child(*input)?,
-            Op::ScatterPositionsVjp { cotangent, .. } => child(*cotangent)?,
-            Op::Binary { lhs, rhs, .. }
-            | Op::Compare { lhs, rhs, .. }
-            | Op::Threefry {
-                counter: lhs,
-                key: rhs,
-            }
-            | Op::Matmul { lhs, rhs } => {
-                child(*lhs)?;
-                child(*rhs)?;
-            }
-            Op::Conv2d {
-                input,
-                weight,
-                bias,
-                ..
-            } => {
-                child(*input)?;
-                child(*weight)?;
-                if let Some(bias) = bias {
-                    child(*bias)?;
-                }
-            }
-            Op::Concat { inputs, .. } => {
-                for input in inputs {
-                    child(*input)?;
-                }
-            }
-            Op::Gather { input, index, .. } => {
-                child(*input)?;
-                child(*index)?;
-            }
-            Op::Scatter {
-                base,
-                index,
-                updates,
-                ..
-            } => {
-                child(*base)?;
-                child(*index)?;
-                child(*updates)?;
-            }
-            Op::Logical { lhs, rhs, .. } => {
-                child(*lhs)?;
-                if let Some(rhs) = rhs {
-                    child(*rhs)?;
-                }
-            }
-            Op::Select {
-                condition,
-                on_true,
-                on_false,
-            } => {
-                child(*condition)?;
-                child(*on_true)?;
-                child(*on_false)?;
-            }
-            _ => {}
-        };
-        Ok(())
-    }
     for output in &outputs {
         graph.op(*output).map_err(ScheduleError::Graph)?;
-        mark(graph, *output, &mut needed, &mut consumers, &external)?;
+        mark_needed(graph, *output, &mut needed, &mut consumers, &external)?;
     }
     // Sort selectors are one coupled producer. Preserve the user-requested
     // node as an observable output while making its sibling available to the
@@ -3191,174 +3316,6 @@ fn schedule_many_with_external(
             node_to_item.insert(sibling.index(), item as u64);
         }
     }
-    struct LeafTraversal<'a> {
-        graph: &'a Graph,
-        roots: &'a BTreeSet<usize>,
-        owner: usize,
-        external: &'a BTreeSet<usize>,
-        allow_projected: bool,
-    }
-    impl LeafTraversal<'_> {
-        fn visit(
-            &self,
-            id: NodeId,
-            out: &mut BTreeSet<usize>,
-            boundary: &mut Option<ScheduleBoundary>,
-        ) -> Result<(), ScheduleError> {
-            if id.index() != self.owner && self.roots.contains(&id.index()) {
-                out.insert(id.index());
-                return Ok(());
-            }
-            if self.external.contains(&id.index()) {
-                out.insert(id.index());
-                return Ok(());
-            }
-            let op = self.graph.op(id).map_err(ScheduleError::Graph)?;
-            if !supported(op) {
-                *boundary = Some(ScheduleBoundary::Unsupported(
-                    "operation requires materialization",
-                ));
-                if id.index() != self.owner {
-                    out.insert(id.index());
-                }
-                return Ok(());
-            }
-            match op {
-                Op::Input { .. } | Op::Constant(_) => {
-                    out.insert(id.index());
-                }
-                Op::Random { .. } | Op::ShapeIota { .. } => {}
-                Op::Cast { input, .. }
-                | Op::Bitcast { input, .. }
-                | Op::Contiguous { input }
-                | Op::ContiguousBackward { input }
-                | Op::Detach { input }
-                | Op::Unary { input, .. }
-                | Op::Reduce { input, .. }
-                | Op::PrefixScan { input, .. }
-                | Op::TensorGuard { input, .. }
-                | Op::Sort { input, .. }
-                | Op::Pad { input, .. }
-                | Op::ScatterPositions { input, .. } => self.visit(*input, out, boundary)?,
-                Op::ScatterPositionsVjp { cotangent, .. } => {
-                    self.visit(*cotangent, out, boundary)?
-                }
-                Op::Shrink { input, .. }
-                | Op::Reshape { input, .. }
-                | Op::Permute { input, .. }
-                | Op::Expand { input, .. }
-                | Op::Stride { input, .. } => match crate::rangeify::static_view(self.graph, id) {
-                    Ok(view) => {
-                        out.insert(view.source.index());
-                    }
-                    Err(_) => match crate::rangeify::computed_view(self.graph, id) {
-                        Ok(view) => {
-                            out.insert(view.source.index());
-                        }
-                        Err(_) if self.allow_projected => {
-                            match self.graph.shape(id).map_err(ScheduleError::Graph).and_then(
-                                |shape| {
-                                    crate::rangeify::projected_source(self.graph, id, shape)
-                                        .map_err(|_| {
-                                            ScheduleError::Binding(
-                                                "view is outside static owned index projection"
-                                                    .into(),
-                                            )
-                                        })
-                                },
-                            ) {
-                                Ok(source) => {
-                                    out.insert(source.index());
-                                }
-                                Err(_) => {
-                                    *boundary = Some(ScheduleBoundary::Unsupported(
-                                        "view is outside static owned index projection",
-                                    ));
-                                    out.insert(input.index());
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            *boundary = Some(ScheduleBoundary::Unsupported(
-                                "projected indexing is outside symbolic capture",
-                            ));
-                            // Preserve a complete producer inventory even though
-                            // symbolic capture rejects the projected address. The
-                            // unsupported boundary must not manufacture a binding
-                            // to an unscheduled intermediate movement node.
-                            let source = self
-                                .graph
-                                .shape(id)
-                                .ok()
-                                .and_then(|shape| {
-                                    crate::rangeify::projected_source(self.graph, id, shape).ok()
-                                })
-                                .unwrap_or(*input);
-                            out.insert(source.index());
-                        }
-                    },
-                },
-                Op::Binary { lhs, rhs, .. }
-                | Op::Compare { lhs, rhs, .. }
-                | Op::Threefry {
-                    counter: lhs,
-                    key: rhs,
-                }
-                | Op::Matmul { lhs, rhs } => {
-                    self.visit(*lhs, out, boundary)?;
-                    self.visit(*rhs, out, boundary)?;
-                }
-                Op::Conv2d {
-                    input,
-                    weight,
-                    bias,
-                    ..
-                } => {
-                    self.visit(*input, out, boundary)?;
-                    self.visit(*weight, out, boundary)?;
-                    if let Some(bias) = bias {
-                        self.visit(*bias, out, boundary)?;
-                    }
-                }
-                Op::Concat { inputs, .. } => {
-                    for input in inputs {
-                        self.visit(*input, out, boundary)?;
-                    }
-                }
-                Op::Gather { input, index, .. } => {
-                    self.visit(*input, out, boundary)?;
-                    self.visit(*index, out, boundary)?;
-                }
-                Op::Scatter {
-                    base,
-                    index,
-                    updates,
-                    ..
-                } => {
-                    self.visit(*base, out, boundary)?;
-                    self.visit(*index, out, boundary)?;
-                    self.visit(*updates, out, boundary)?;
-                }
-                Op::Logical { lhs, rhs, .. } => {
-                    self.visit(*lhs, out, boundary)?;
-                    if let Some(rhs) = rhs {
-                        self.visit(*rhs, out, boundary)?;
-                    }
-                }
-                Op::Select {
-                    condition,
-                    on_true,
-                    on_false,
-                } => {
-                    self.visit(*condition, out, boundary)?;
-                    self.visit(*on_true, out, boundary)?;
-                    self.visit(*on_false, out, boundary)?;
-                }
-                _ => unreachable!(),
-            };
-            Ok(())
-        }
-    }
     let mut items = Vec::with_capacity(roots.len());
     for &index in &roots {
         let node = NodeId::from_index(index);
@@ -3731,4 +3688,147 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
         value_bindings: vec![],
         state_bindings: vec![],
     })
+}
+
+#[cfg(test)]
+mod ownership_traversal_tests {
+    use super::*;
+
+    #[test]
+    fn deep_ownership_walks_preserve_edges_and_do_not_use_the_call_stack() {
+        std::thread::Builder::new()
+            .name("deep-schedule-ownership".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let mut graph = Graph::new();
+                let input = graph.input("input", [1, 1]);
+                let mut chain = vec![input];
+                for _ in 0..8_192 {
+                    chain.push(graph.neg(*chain.last().unwrap()).unwrap());
+                }
+                let deep = *chain.last().unwrap();
+
+                let duplicated = graph.add(deep, deep).unwrap();
+                let mut needed = BTreeSet::new();
+                let mut consumers = vec![0usize; graph.node_count()];
+                mark_needed(
+                    &graph,
+                    duplicated,
+                    &mut needed,
+                    &mut consumers,
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+                assert_eq!(consumers[deep.index()], 2);
+                assert_eq!(graph_node_uses(&graph, duplicated, deep).unwrap(), 2);
+                assert_eq!(graph_node_uses(&graph, deep, input).unwrap(), 1);
+
+                let external = chain[chain.len() / 2];
+                needed.clear();
+                consumers.fill(0);
+                mark_needed(
+                    &graph,
+                    deep,
+                    &mut needed,
+                    &mut consumers,
+                    &BTreeSet::from([external.index()]),
+                )
+                .unwrap();
+                assert!(needed.contains(&external.index()));
+                assert!(!needed.contains(&chain[chain.len() / 2 - 1].index()));
+                assert_eq!(consumers[external.index()], 1);
+
+                let candidates = ScalarAliasCandidates::collect(
+                    &graph,
+                    deep,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+                assert!(candidates.affine_maps.is_empty());
+                assert!(candidates.direct_roots.is_empty());
+                assert!(candidates.affine_view_roots.is_empty());
+                assert!(candidates.projected_view_roots.is_empty());
+
+                let alias_input = graph.input("alias_input", [1]);
+                let alias_source = graph.neg(alias_input).unwrap();
+                let alias = graph.reshape(alias_source, [1, 1]).unwrap();
+                let rhs = graph.input("rhs", [1, 1]);
+                let alias_owner = graph.add(alias, rhs).unwrap();
+                let alias_candidates = ScalarAliasCandidates::collect(
+                    &graph,
+                    alias_owner,
+                    &BTreeSet::from([alias_source.index()]),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+                assert!(
+                    alias_candidates
+                        .affine_maps
+                        .contains_key(&alias_source.index())
+                );
+                assert_eq!(
+                    graph_node_uses(&graph, alias_owner, alias_source).unwrap(),
+                    1
+                );
+
+                let mut leaf_ids = BTreeSet::new();
+                let mut boundary = None;
+                LeafTraversal {
+                    graph: &graph,
+                    roots: &BTreeSet::new(),
+                    owner: deep.index(),
+                    external: &BTreeSet::new(),
+                    allow_projected: true,
+                }
+                .visit(deep, &mut leaf_ids, &mut boundary)
+                .unwrap();
+                assert_eq!(leaf_ids, BTreeSet::from([input.index()]));
+                assert!(boundary.is_none());
+
+                let reduction_input = graph.input("reduction_input", [1, 2]);
+                let reduction = graph
+                    .reduce(reduction_input, crate::ReduceKind::Sum, Some(vec![1]), true)
+                    .unwrap();
+                let mut epilogue = reduction;
+                for _ in 0..4_096 {
+                    epilogue = graph.neg(epilogue).unwrap();
+                }
+                assert_eq!(
+                    crate::kernel::single_reduction_epilogue(&graph, epilogue).unwrap(),
+                    Some(reduction)
+                );
+                assert_eq!(
+                    crate::kernel::reduction_epilogue_node_uses(&graph, epilogue, reduction)
+                        .unwrap(),
+                    1
+                );
+
+                // Every duplicated value is an explicit schedule root, so
+                // scalar lowering stays one operation deep while the public
+                // external-materialization reachability check must still
+                // traverse the complete ancestry without the call stack.
+                let midpoint = graph.neg(input).unwrap();
+                let mut output = midpoint;
+                for _ in 0..4_096 {
+                    output = graph.add(output, output).unwrap();
+                }
+                let scheduled =
+                    schedule_with_external_materializations(&graph, &[output], &[midpoint])
+                        .unwrap();
+                let first = scheduled
+                    .items
+                    .first()
+                    .expect("duplicated chain schedule item");
+                assert_eq!(first.external_materializations, vec![midpoint]);
+                assert_eq!(scheduled.items.last().unwrap().node, output);
+                assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
+                scheduled.validate().unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }
