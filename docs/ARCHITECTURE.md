@@ -2059,11 +2059,13 @@ CUDA prefixes consume that same projection and publish detached values only
 after their existing transaction succeeds. Logical request order and repeated
 IDs are preserved while each physical produced buffer is retained once;
 external-materialization bindings are reused without parsing capture metadata
-in a renderer. Symbolic schemas, effects or boundaries, quantized bindings,
-and any operation outside a renderer's existing static subset still reject
-before device work. Capture payload, UOp, schedule, and renderer/cache
-identities are unchanged; RGSA/RGSO bump only their ownership-admission
-envelopes as described below.
+in a renderer. Symbolic schemas, effects or boundaries, and any operation
+outside a renderer's existing static subset still reject before device work.
+Borrowed/raw prepared-prefix APIs continue to reject quantized bindings because
+they cannot own their initialization. The owned Metal session path admits only
+capture-authenticated packed constants through its separate typed initialization
+transition. Capture payload, UOp, schedule, and artifact identities are
+unchanged; RGSA/RGSO retain their existing ownership-admission envelopes.
 
 `AuthenticatedSymbolicBody` is the shared immutable schema/capture owner used by
 CPU and static-device symbolic programs. It authenticates the body once, then
@@ -2634,7 +2636,7 @@ append and logits succeed, so a partial failure retries and overwrites the same
 uncommitted row without a full-state copy.
 
 This boundary is concrete, pure, static inference only. Symbolic programs,
-effects, RNG state, quantized bindings, mutable training state, dynamically
+effects, RNG state, mutable training state, dynamically
 shaped/capacity-growing state, general output chaining across calls, chunk
 prefill, tokenizer/generator/sampling integration, stateful scoreboard v2,
 multi-device execution, and live Metal numerical/performance evidence remain
@@ -2696,6 +2698,33 @@ physical generations, `renderer.rs` owns ordinary pure MSL and pointer-ABI lower
 metadata/reconstruction. `resource.rs` owns device, queue, library, pipeline,
 command, transaction, cache, and completion lifetimes. No raw handle is
 reachable from a safe public API.
+
+Capture-owned Q4_0, Q8_0, Q4_K, and Q6_K constants use a separate packed-buffer
+ABI rather than pretending block encodings are scalar dtypes. The resource-free
+session plan authenticates each exact descriptor, packed identity, schedule
+binding ordinal, and MSL pointer order before device work. Successful
+preparation allocates and uploads each required packed owner once; repeated
+runs retain those immutable buffers and transfer only transient dense inputs
+and requested dense outputs. Zero-output items neither allocate nor upload an
+otherwise-unused packed constant, while a nonzero K=0 item uses the existing
+private four-byte address sentinel and performs no packed read. Raw/borrowed
+prepared prefixes remain fail-closed because they have no capture-owned packed
+initialization transition.
+
+The `rustgrad-metal-quantized-matmul-f32-v1` and
+`rustgrad-metal-quantized-row-gather-v1` operation-specific renderer identities
+lower authenticated `QuantizedMatmulPlan` and `QuantizedRowGatherPlan` directly
+from packed bytes.
+Row-gather accepts exact dense/view-free I32 indices and validates every lane on
+the host before any per-run Metal write or launch. Matmul keeps GGUF
+`[out_features,in_features]` orientation and accumulates each dot product in
+MSL `float` with contraction disabled. This intentionally differs from the
+portable CPU/native reference's f64 accumulator: comparisons are finite F32
+tolerance contracts, never bitwise-parity claims. The bounded direct-renderer
+acceptance uses absolute error `max(1e-5, K * 1e-5)`; widening that contract
+requires a renderer-identity revision and new numerical evidence. There is no
+hidden full-weight dequantization, CPU fallback, Llama deployment substitution,
+prefill, decode, generator, or live-device-performance claim in this slice.
 
 Devices are returned in deterministic registry-ID/name order with capability
 metadata in renderer and pipeline cache identities. Resources are deliberately

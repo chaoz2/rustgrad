@@ -5,8 +5,9 @@
 //! Metal, WebGPU, and fixed-schema CUDA graph paths.
 
 use crate::{
-    BufferDesc, CapturedSchedule, DType, Operation, ReplayError, ReplayInput, RequestedPassthrough,
-    ScheduleInputBinding, ScheduleItem, Shape, SymbolicInvocation, TensorData,
+    BufferDesc, CapturedSchedule, DType, Operation, QuantizedBufferDesc, QuantizedTensorData,
+    ReplayError, ReplayInput, RequestedPassthrough, ScheduleInputBinding, ScheduleItem, Shape,
+    SymbolicInvocation, TensorData,
     engine::{AuthenticatedSymbolicBody, AuthenticatedSymbolicInvocation},
     memory_plan::{ExactSlotPolicy, ExactSlotRequest, assign_exact_slots},
 };
@@ -35,6 +36,7 @@ enum CapturedStaticBacking {
     Projected {
         inputs: Vec<ReplayInput>,
         constants: BTreeMap<u64, TensorData>,
+        quantized_constants: BTreeMap<u64, QuantizedTensorData>,
         requested: Vec<u64>,
     },
     Owned(Arc<CapturedSchedule>),
@@ -82,11 +84,12 @@ impl CapturedStaticExecution {
                 "captured static execution requires a pure boundary-free prefix".into(),
             ));
         }
-        if !capture.quantized_constants.is_empty()
-            || capture
-                .items
-                .iter()
-                .any(|item| !item.quantized_input_bindings.is_empty())
+        if owned.is_none()
+            && (!capture.quantized_constants.is_empty()
+                || capture
+                    .items
+                    .iter()
+                    .any(|item| !item.quantized_input_bindings.is_empty()))
         {
             return Err(CapturedStaticAdmissionError::Unsupported(
                 "captured static execution does not admit quantized bindings".into(),
@@ -133,6 +136,7 @@ impl CapturedStaticExecution {
                 None => CapturedStaticBacking::Projected {
                     inputs: capture.inputs.clone(),
                     constants: capture.constants.clone(),
+                    quantized_constants: capture.quantized_constants.clone(),
                     requested: capture.requested.clone(),
                 },
             },
@@ -185,6 +189,16 @@ impl CapturedStaticExecution {
         }
     }
 
+    fn quantized_constants(&self) -> &BTreeMap<u64, QuantizedTensorData> {
+        match &self.backing {
+            CapturedStaticBacking::Projected {
+                quantized_constants,
+                ..
+            } => quantized_constants,
+            CapturedStaticBacking::Owned(capture) => &capture.quantized_constants,
+        }
+    }
+
     fn requested(&self) -> &[u64] {
         match &self.backing {
             CapturedStaticBacking::Projected { requested, .. } => requested,
@@ -194,6 +208,10 @@ impl CapturedStaticExecution {
 
     pub(crate) fn constant_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.constants().keys().copied()
+    }
+
+    pub(crate) fn quantized_constant_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.quantized_constants().keys().copied()
     }
 
     fn validate_provided_names(
@@ -384,6 +402,16 @@ pub(crate) struct StaticLifetimePlan {
     resident_ids: BTreeSet<u64>,
 }
 
+#[derive(Debug)]
+pub(crate) enum StaticQuantizedGatherError {
+    Invalid(String),
+    IndexOutOfBounds {
+        position: usize,
+        value: i32,
+        rows: usize,
+    },
+}
+
 impl StaticLifetimePlan {
     pub(crate) fn new(
         capture: CapturedStaticExecution,
@@ -433,6 +461,7 @@ impl StaticLifetimePlan {
             .partition(|input| state.contains(input.name.as_str()));
         let resident_ids = capture
             .constant_ids()
+            .chain(capture.quantized_constant_ids())
             .chain(resident_inputs.iter().map(|input| input.desc.id))
             .chain(state_inputs.iter().map(|input| input.desc.id))
             .collect();
@@ -475,6 +504,54 @@ impl StaticLifetimePlan {
         self.capture
             .owned_capture()
             .expect("static lifetime plans own their capture")
+    }
+
+    pub(crate) fn quantized_constants(&self) -> &BTreeMap<u64, QuantizedTensorData> {
+        self.capture.quantized_constants()
+    }
+
+    pub(crate) fn validate_quantized_gathers(
+        &self,
+        values: &BTreeMap<u64, TensorData>,
+        allowed_missing: &BTreeSet<u64>,
+    ) -> Result<(), StaticQuantizedGatherError> {
+        for item in &self.capture().items {
+            let Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+                item.kernel.operation()
+            else {
+                continue;
+            };
+            let id = plan.indices.index() as u64;
+            let Some(indices) = values.get(&id) else {
+                if allowed_missing.contains(&id) {
+                    continue;
+                }
+                return Err(StaticQuantizedGatherError::Invalid(format!(
+                    "quantized row-gather indices {id} are absent"
+                )));
+            };
+            plan.preflight_indices(indices)
+                .map_err(|error| match error {
+                    crate::QuantizedRowGatherError::NegativeIndex { position, index } => {
+                        StaticQuantizedGatherError::IndexOutOfBounds {
+                            position,
+                            value: i32::try_from(index).unwrap_or(i32::MIN),
+                            rows: plan.weight_desc.logical_shape.dims()[0],
+                        }
+                    }
+                    crate::QuantizedRowGatherError::IndexOutOfBounds {
+                        position,
+                        index,
+                        rows,
+                    } => StaticQuantizedGatherError::IndexOutOfBounds {
+                        position,
+                        value: i32::try_from(index).unwrap_or(i32::MAX),
+                        rows,
+                    },
+                    error => StaticQuantizedGatherError::Invalid(error.to_string()),
+                })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn stage_resident(
@@ -929,6 +1006,12 @@ pub(crate) struct StaticRenderedBuffer {
     pub(crate) output_ordinal: Option<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StaticRenderedQuantizedBuffer {
+    pub(crate) id: u64,
+    pub(crate) desc: QuantizedBufferDesc,
+}
+
 /// Logical allocation metadata plus the native-handle requirement derived
 /// from the complete rendered prefix. A zero-byte buffer keeps its logical
 /// descriptor while receiving a private physical sentinel only when a
@@ -1041,6 +1124,8 @@ pub(crate) struct StaticRendered<R> {
     pub(crate) cache_key: String,
     pub(crate) extent: usize,
     pub(crate) buffers: Vec<StaticBufferUse>,
+    pub(crate) quantized_buffers: Vec<StaticRenderedQuantizedBuffer>,
+    pub(crate) pointer_ids: Vec<u64>,
 }
 
 /// Canonical physical storage contract for one logical schedule buffer.
@@ -1052,6 +1137,12 @@ pub(crate) struct StaticBufferPlan {
     pub(crate) bytes: usize,
     pub(crate) alignment: usize,
     pub(crate) producer: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StaticQuantizedBufferPlan {
+    pub(crate) desc: QuantizedBufferDesc,
+    pub(crate) requires_native_handle: bool,
 }
 
 /// Exact within one `StaticPlanAdapter` build; the adapter type is the backend
@@ -1101,6 +1192,7 @@ pub(crate) struct StaticItemPlan<R> {
 pub(crate) struct StaticSchedulePlan<R> {
     items: Vec<StaticItemPlan<R>>,
     buffers: BTreeMap<u64, StaticBufferPlan>,
+    quantized_buffers: BTreeMap<u64, StaticQuantizedBufferPlan>,
     external_inputs: Vec<u64>,
     host_outputs: Vec<u64>,
     protected_outputs: Vec<u64>,
@@ -1404,6 +1496,14 @@ pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
     fn compile(&self, rendered: &Self::Rendered) -> Result<Self::Kernel, Self::Error>;
     fn compiled_cache_key(&self, kernel: &Self::Kernel) -> String;
     fn allocate(&self, request: StaticBufferAllocation) -> Result<Self::Buffer, Self::Error>;
+    fn allocate_quantized(
+        &self,
+        _plan: &StaticQuantizedBufferPlan,
+    ) -> Result<Self::Buffer, Self::Error> {
+        Err(Self::unsupported(
+            "packed static buffers are unsupported by this device adapter".into(),
+        ))
+    }
     fn create_queue(&self) -> Result<Self::Queue, Self::Error>;
     fn write(
         &self,
@@ -1457,6 +1557,10 @@ impl<R> StaticSchedulePlan<R> {
 
     pub(crate) fn allocations(&self) -> &StaticAllocationPlan {
         &self.allocations
+    }
+
+    pub(crate) fn quantized_buffers(&self) -> &BTreeMap<u64, StaticQuantizedBufferPlan> {
+        &self.quantized_buffers
     }
 
     pub(crate) fn append_state_links(&self) -> &[StaticAppendStateLink] {
@@ -1543,6 +1647,7 @@ impl<R> StaticSchedulePlan<R> {
     {
         let mut planned = Vec::with_capacity(items.len());
         let mut buffers = BTreeMap::<u64, StaticBufferPlan>::new();
+        let mut quantized_buffers = BTreeMap::<u64, StaticQuantizedBufferPlan>::new();
         let mut buffer_order = Vec::new();
         let mut producers = BTreeMap::<u64, usize>::new();
         let append_by_output = outputs
@@ -1567,10 +1672,7 @@ impl<R> StaticSchedulePlan<R> {
         validate_prefix::<A>(items)?;
 
         for (item_index, item) in items.iter().enumerate() {
-            if item.boundary.is_some()
-                || item.is_effect()
-                || !item.quantized_input_bindings.is_empty()
-            {
+            if item.boundary.is_some() || item.is_effect() {
                 return Err(A::unsupported(
                     "pure prefix item is outside static single-device execution".into(),
                 ));
@@ -1589,12 +1691,13 @@ impl<R> StaticSchedulePlan<R> {
             }
 
             let rendered = adapter.render(item)?;
-            let input_ids = rendered
+            let mut input_ids = rendered
                 .buffers
                 .iter()
                 .filter(|buffer| buffer.role == StaticBufferRole::Input)
                 .map(|buffer| buffer.id)
                 .collect::<Vec<_>>();
+            input_ids.extend(rendered.quantized_buffers.iter().map(|buffer| buffer.id));
             let mut output_ids = vec![None; item.outputs.len()];
             for buffer in &rendered.buffers {
                 if let StaticBufferRole::Output(ordinal) = buffer.role
@@ -1654,7 +1757,7 @@ impl<R> StaticSchedulePlan<R> {
 
             let mut item_ids = BTreeSet::new();
             for use_ in &rendered.buffers {
-                if !item_ids.insert(use_.id) {
+                if !item_ids.insert(use_.id) || quantized_buffers.contains_key(&use_.id) {
                     return Err(A::invalid_binding(format!(
                         "duplicate logical buffer {} in one ABI",
                         use_.id
@@ -1700,15 +1803,55 @@ impl<R> StaticSchedulePlan<R> {
                     }
                 }
             }
+            for use_ in &rendered.quantized_buffers {
+                if !item_ids.insert(use_.id) || buffers.contains_key(&use_.id) {
+                    return Err(A::invalid_binding(format!(
+                        "duplicate logical buffer {} in one packed ABI",
+                        use_.id
+                    )));
+                }
+                use_.desc
+                    .validate_metadata()
+                    .map_err(|error| A::invalid_binding(error.to_string()))?;
+                let requires_native_handle = rendered.extent != 0;
+                match quantized_buffers.get_mut(&use_.id) {
+                    Some(existing) if existing.desc == use_.desc => {
+                        existing.requires_native_handle |= requires_native_handle;
+                    }
+                    Some(_) => {
+                        return Err(A::invalid_binding(format!(
+                            "conflicting packed descriptor for logical buffer {}",
+                            use_.id
+                        )));
+                    }
+                    None => {
+                        quantized_buffers.insert(
+                            use_.id,
+                            StaticQuantizedBufferPlan {
+                                desc: use_.desc.clone(),
+                                requires_native_handle,
+                            },
+                        );
+                    }
+                }
+            }
+            if rendered.pointer_ids.len() != item_ids.len()
+                || rendered
+                    .pointer_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    != item_ids
+            {
+                return Err(A::invalid_binding(
+                    "rendered pointer order does not cover its dense and packed ABI".into(),
+                ));
+            }
             planned.push(StaticItemPlan {
                 rendered: rendered.artifact,
                 cache_key: rendered.cache_key,
                 extent: rendered.extent,
-                buffer_ids: rendered
-                    .buffers
-                    .into_iter()
-                    .map(|buffer| buffer.id)
-                    .collect(),
+                buffer_ids: rendered.pointer_ids,
                 input_ids,
                 dependencies: item
                     .dependencies
@@ -1993,6 +2136,7 @@ impl<R> StaticSchedulePlan<R> {
         Ok(Self {
             items: planned,
             buffers,
+            quantized_buffers,
             external_inputs,
             host_outputs,
             protected_outputs,
@@ -2121,8 +2265,13 @@ fn build_static_allocation_plan<A: StaticPlanAdapter>(
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| A::invalid_binding("static allocation slot is vacant".into()))?;
     for item in items.iter().filter(|item| item.extent != 0) {
-        let item_slots = item
+        let dense_ids = item
             .buffer_ids
+            .iter()
+            .filter(|id| buffers.contains_key(id))
+            .copied()
+            .collect::<Vec<_>>();
+        let item_slots = dense_ids
             .iter()
             .map(|id| logical_slots.get(id).copied())
             .collect::<Option<Vec<_>>>()
@@ -2132,8 +2281,8 @@ fn build_static_allocation_plan<A: StaticPlanAdapter>(
         for lhs in 0..item_slots.len() {
             for rhs in lhs + 1..item_slots.len() {
                 if item_slots[lhs] == item_slots[rhs]
-                    && aliases.get(&item.buffer_ids[lhs]) != Some(&item.buffer_ids[rhs])
-                    && aliases.get(&item.buffer_ids[rhs]) != Some(&item.buffer_ids[lhs])
+                    && aliases.get(&dense_ids[lhs]) != Some(&dense_ids[rhs])
+                    && aliases.get(&dense_ids[rhs]) != Some(&dense_ids[lhs])
                 {
                     return Err(A::invalid_binding(
                         "distinct logical buffers in one static item alias a physical slot".into(),
@@ -2195,6 +2344,8 @@ pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     slots: Vec<A::Buffer>,
     logical_slots: BTreeMap<u64, usize>,
     buffer_plans: BTreeMap<u64, StaticBufferPlan>,
+    quantized_buffers: BTreeMap<u64, A::Buffer>,
+    quantized_plans: BTreeMap<u64, StaticQuantizedBufferPlan>,
     external_inputs: Vec<u64>,
     host_outputs: Vec<u64>,
     state_links: Vec<StaticStateLink>,
@@ -2233,6 +2384,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         let StaticSchedulePlan {
             items,
             buffers: buffer_plans,
+            quantized_buffers: quantized_plans,
             external_inputs,
             host_outputs,
             protected_outputs,
@@ -2271,6 +2423,12 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         for allocation in &allocations.slots {
             slots.push(adapter.allocate(*allocation)?);
         }
+        let mut quantized_buffers = BTreeMap::new();
+        for (id, packed) in &quantized_plans {
+            if packed.requires_native_handle {
+                quantized_buffers.insert(*id, adapter.allocate_quantized(packed)?);
+            }
+        }
         let queue = prepared_items
             .iter()
             .any(|item| item.extent != 0)
@@ -2287,6 +2445,8 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             slots,
             logical_slots: allocations.logical_slots,
             buffer_plans,
+            quantized_buffers,
+            quantized_plans,
             external_inputs,
             host_outputs,
             state_links,
@@ -2309,9 +2469,11 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
     }
 
     fn buffer(&self, id: u64) -> Option<&A::Buffer> {
-        self.logical_slots
-            .get(&id)
-            .and_then(|slot| self.slots.get(*slot))
+        self.quantized_buffers.get(&id).or_else(|| {
+            self.logical_slots
+                .get(&id)
+                .and_then(|slot| self.slots.get(*slot))
+        })
     }
 
     fn buffer_for_epoch(&self, id: u64, alternate: bool) -> Option<&A::Buffer> {
@@ -2411,25 +2573,53 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
 
     /// Validates and uploads the selected immutable external inputs once. A
     /// failed upload leaves construction unpublished.
-    pub(crate) fn initialize_resident(
+    pub(crate) fn initialize_resident_with_quantized(
         self,
         values: &BTreeMap<u64, TensorData>,
         resident_ids: &BTreeSet<u64>,
+        quantized: &BTreeMap<u64, QuantizedTensorData>,
     ) -> Result<(InitializedStaticSchedule<A>, StaticExecutionReport), A::Error> {
         if let Some(id) = resident_ids
             .iter()
-            .find(|id| !self.external_inputs.contains(id))
+            .find(|id| !self.external_inputs.contains(id) && !self.quantized_plans.contains_key(id))
         {
             return Err(A::invalid_binding(format!(
                 "resident logical buffer {id} is not an external prefix input"
             )));
         }
+        if quantized.len() != self.quantized_plans.len()
+            || quantized.iter().any(|(id, value)| {
+                self.quantized_plans
+                    .get(id)
+                    .is_none_or(|plan| value.descriptor() != &plan.desc)
+            })
+        {
+            return Err(A::invalid_binding(
+                "capture-owned packed constants do not match the static plan".into(),
+            ));
+        }
         let uploads = self.validated_uploads(values, |id| resident_ids.contains(&id))?;
+        let packed_uploads = quantized
+            .iter()
+            .filter(|(id, value)| {
+                self.quantized_plans
+                    .get(*id)
+                    .is_some_and(|plan| plan.requires_native_handle)
+                    && !value.bytes().is_empty()
+            })
+            .collect::<Vec<_>>();
         let report = StaticExecutionReport {
-            h2d_calls: uploads.len(),
-            h2d_bytes: uploads.iter().try_fold(0usize, |total, (_, bytes)| {
-                total.checked_add(bytes.len()).ok_or_else(A::overflow)
-            })?,
+            h2d_calls: uploads
+                .len()
+                .checked_add(packed_uploads.len())
+                .ok_or_else(A::overflow)?,
+            h2d_bytes: uploads
+                .iter()
+                .map(|(_, bytes)| bytes.len())
+                .chain(packed_uploads.iter().map(|(_, value)| value.bytes().len()))
+                .try_fold(0usize, |total, bytes| {
+                    total.checked_add(bytes).ok_or_else(A::overflow)
+                })?,
             ..StaticExecutionReport::default()
         };
         if let Some(queue) = &self.queue {
@@ -2440,6 +2630,15 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                         A::invalid_binding(format!("logical resident buffer {id} is absent"))
                     })?,
                     bytes,
+                )?;
+            }
+            for (id, value) in packed_uploads {
+                self.adapter.write(
+                    queue,
+                    self.buffer(*id).ok_or_else(|| {
+                        A::invalid_binding(format!("packed resident buffer {id} is absent"))
+                    })?,
+                    value.bytes(),
                 )?;
             }
         }
@@ -2753,7 +2952,9 @@ mod tests {
                 extent: StaticLaunchDomain::checked(item, logical)
                     .map_err(str::to_owned)?
                     .work_items,
+                pointer_ids: buffers.iter().map(|buffer| buffer.id).collect(),
                 buffers,
+                quantized_buffers: Vec::new(),
             })
         }
         fn invalid_binding(reason: String) -> Self::Error {

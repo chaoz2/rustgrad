@@ -67,6 +67,8 @@ pub(super) fn render(
     Ok(RenderedMetal {
         source: source.clone(),
         source_map: BTreeMap::from([(plan.output.index(), source_line)]),
+        pointer_order: vec![super::renderer::MetalPointerAbi::Dense(0)],
+        quantized_buffers: Vec::new(),
         buffers: vec![buffer],
         extent,
         entry,

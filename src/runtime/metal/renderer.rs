@@ -3,8 +3,8 @@ use super::{
     MetalCapabilities, MetalError, guard::emit_transactional, transaction::MetalTransactionAbi,
 };
 use crate::{
-    AffineView, DType, IndexValue, LiteralValue, MovementValue, Operation, ScheduleInputBinding,
-    Shape, UOp,
+    AffineView, DType, GgmlType, IndexValue, LiteralValue, MovementValue, Operation,
+    QuantizedBufferDesc, QuantizedScheduleInputBinding, ScheduleInputBinding, Shape, UOp,
     runtime::scalar_lane::{
         ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
     },
@@ -30,6 +30,9 @@ pub const METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-prefix-scan-v1";
 pub const METAL_PORTABLE_SORT_RENDERER_VERSION: &str = "rustgrad-metal-portable-sort-v1";
 pub const METAL_PORTABLE_THREEFRY_RENDERER_VERSION: &str = "rustgrad-metal-portable-threefry-v1";
+pub const METAL_QUANTIZED_MATMUL_RENDERER_VERSION: &str = "rustgrad-metal-quantized-matmul-f32-v1";
+pub const METAL_QUANTIZED_ROW_GATHER_RENDERER_VERSION: &str =
+    "rustgrad-metal-quantized-row-gather-v1";
 pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -48,6 +51,21 @@ pub struct MetalBufferAbi {
     pub mutable: bool,
     /// Optional source-backed affine logical mapping.
     pub view: Option<AffineView>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// One immutable capture-owned GGUF pointer in a Metal kernel ABI.
+pub struct MetalQuantizedBufferAbi {
+    /// Stable captured quantized-constant identity.
+    pub id: u64,
+    /// Exact packed format, geometry, byte extent, and content identity.
+    pub desc: QuantizedBufferDesc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum MetalPointerAbi {
+    Dense(usize),
+    Quantized(usize),
 }
 
 /// Handle-free authenticated ABI for one complete-row append into an
@@ -72,6 +90,10 @@ pub struct RenderedMetal {
     pub source_map: BTreeMap<usize, usize>,
     /// Ordered input pointers followed by the ordered output pointers.
     pub buffers: Vec<MetalBufferAbi>,
+    /// Read-only packed GGUF pointers, kept separate from scalar dtypes.
+    pub quantized_buffers: Vec<MetalQuantizedBufferAbi>,
+    /// Exact dense/packed pointer order used by the MSL entry point.
+    pub(super) pointer_order: Vec<MetalPointerAbi>,
     /// Exact launch work-item count supplied as the final scalar ABI value.
     /// This equals the logical output extent for ordinary kernels; PrefixScan
     /// and coupled Sort launch per independent lane, while Bitcast launches
@@ -115,6 +137,7 @@ impl RenderedMetal {
     ) -> Result<(), MetalError> {
         if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
             && let Operation::Matmul(value) = root.operation()
+            && !matches!(value, crate::MatmulValue::Quantized(_))
         {
             crate::matmul::PortableF32Matmul::new(value)
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
@@ -204,6 +227,31 @@ impl RenderedMetal {
         }
         Ok(())
     }
+
+    pub(super) fn validate_quantized_schedule_bindings(
+        &self,
+        bindings: &[QuantizedScheduleInputBinding],
+    ) -> Result<(), MetalError> {
+        if bindings.len() != self.quantized_buffers.len() {
+            return Err(MetalError::InvalidBinding(
+                "schedule/Metal packed input count mismatch".into(),
+            ));
+        }
+        for (position, (binding, expected)) in
+            bindings.iter().zip(&self.quantized_buffers).enumerate()
+        {
+            if binding.input_node.index() as u64 != expected.id
+                || binding.desc != expected.desc
+                || self.pointer_order.get(binding.abi_index)
+                    != Some(&MetalPointerAbi::Quantized(position))
+            {
+                return Err(MetalError::InvalidBinding(
+                    "schedule/Metal packed descriptor mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,7 +278,10 @@ impl MetalRenderer {
     /// Lowers a validated scheduled UOp into the exact static subset.
     pub fn render(&self, root: &UOp) -> Result<RenderedMetal, MetalError> {
         if let Operation::Matmul(value) = root.operation() {
-            return render_portable_f32_matmul(self, root, value);
+            return match value {
+                crate::MatmulValue::Quantized(plan) => render_quantized_matmul(self, root, plan),
+                _ => render_portable_f32_matmul(self, root, value),
+            };
         }
         if let Operation::PrefixScan(value) = root.operation() {
             return render_portable_prefix_scan(self, root, value);
@@ -275,9 +326,9 @@ impl MetalRenderer {
                     render_indexed_movement(self, root, plan)
                 }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
-                MovementValue::QuantizedRowGather(_) => Err(MetalError::Unsupported(
-                    "quantized movement is outside Metal contiguous-copy lowering".into(),
-                )),
+                MovementValue::QuantizedRowGather(plan) => {
+                    render_quantized_row_gather(self, root, plan)
+                }
             };
         }
         if let Operation::Random(plan) = root.operation() {
@@ -551,6 +602,8 @@ impl MetalRenderer {
         Ok(RenderedMetal {
             source,
             source_map,
+            pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+            quantized_buffers: Vec::new(),
             buffers,
             extent: *extent,
             entry,
@@ -708,6 +761,8 @@ impl MetalRenderer {
         Ok(RenderedMetal {
             source,
             source_map: BTreeMap::new(),
+            pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+            quantized_buffers: Vec::new(),
             buffers,
             extent: link.row_elements,
             entry: "rg_metal_append_state_f32_i32".into(),
@@ -816,6 +871,8 @@ fn render_portable_threefry(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent: portable.elements(),
         entry,
@@ -940,6 +997,8 @@ fn render_portable_sort(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent: portable.launch_extent(),
         entry,
@@ -1040,6 +1099,8 @@ fn render_portable_prefix_scan(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent: portable.launch_extent(),
         entry,
@@ -1371,6 +1432,8 @@ fn render_portable_f32_matmul(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent: portable.extent(),
         entry,
@@ -1383,6 +1446,334 @@ fn render_portable_f32_matmul(
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
         ))),
+    })
+}
+
+fn quantized_decode_lines(kind: GgmlType) -> Result<Vec<&'static str>, MetalError> {
+    Ok(match kind {
+        GgmlType::Q4_0 => vec![
+            "    const ulong rg_lane = rg_k & 31ul;",
+            "    device const uchar* rg_b = b1 + rg_block * 18ul;",
+            "    const float rg_d = rg_half(rg_b);",
+            "    const uchar rg_p = rg_b[2ul + (rg_lane & 15ul)];",
+            "    const int rg_qv = int(rg_lane < 16ul ? (rg_p & 15u) : (rg_p >> 4)) - 8;",
+            "    const float rg_v = rg_d * float(rg_qv);",
+        ],
+        GgmlType::Q8_0 => vec![
+            "    const ulong rg_lane = rg_k & 31ul;",
+            "    device const uchar* rg_b = b1 + rg_block * 34ul;",
+            "    const float rg_d = rg_half(rg_b);",
+            "    const float rg_v = rg_d * float(as_type<char>(rg_b[2ul + rg_lane]));",
+        ],
+        GgmlType::Q4K => vec![
+            "    const ulong rg_lane = rg_k & 255ul;",
+            "    const ulong rg_g = rg_lane / 32ul;",
+            "    const ulong rg_l = rg_lane & 31ul;",
+            "    device const uchar* rg_b = b1 + rg_block * 144ul;",
+            "    const float rg_d = rg_half(rg_b);",
+            "    const float rg_dm = rg_half(rg_b + 2ul);",
+            "    uint rg_s, rg_m;",
+            "    if (rg_g < 4ul) { rg_s = uint(rg_b[4ul + rg_g]) & 63u; rg_m = uint(rg_b[8ul + rg_g]) & 63u; } else { const ulong rg_x = rg_g - 4ul; rg_s = (uint(rg_b[12ul + rg_x]) & 15u) | ((uint(rg_b[4ul + rg_x]) >> 6) << 4); rg_m = (uint(rg_b[12ul + rg_x]) >> 4) | ((uint(rg_b[8ul + rg_x]) >> 6) << 4); }",
+            "    const uint rg_qv = (uint(rg_b[16ul + (rg_g / 2ul) * 32ul + rg_l]) >> uint((rg_g & 1ul) * 4ul)) & 15u;",
+            "    const float rg_v = rg_d * float(rg_s) * float(rg_qv) - rg_dm * float(rg_m);",
+        ],
+        GgmlType::Q6K => vec![
+            "    const ulong rg_lane = rg_k & 255ul;",
+            "    const ulong rg_h = rg_lane / 128ul;",
+            "    const ulong rg_x = rg_lane & 127ul;",
+            "    device const uchar* rg_b = b1 + rg_block * 210ul;",
+            "    const uint rg_low = (uint(rg_b[rg_h * 64ul + (rg_x & 63ul)]) >> uint((rg_x / 64ul) * 4ul)) & 15u;",
+            "    const uint rg_hi = ((uint(rg_b[128ul + rg_h * 32ul + (rg_x & 31ul)]) >> uint((rg_x / 32ul) * 2ul)) & 3u) << 4;",
+            "    const int rg_qv = int(rg_low | rg_hi) - 32;",
+            "    const int rg_scale = int(as_type<char>(rg_b[192ul + rg_lane / 16ul]));",
+            "    const float rg_v = rg_half(rg_b + 208ul) * float(rg_qv * rg_scale);",
+        ],
+        _ => {
+            return Err(MetalError::Unsupported(
+                "GGUF format is outside direct Metal packed execution".into(),
+            ));
+        }
+    })
+}
+
+fn quantized_half_helper() -> &'static str {
+    "inline float rg_half(device const uchar* p) { const ushort h = ushort(p[0]) | (ushort(p[1]) << 8); return float(as_type<half>(h)); }"
+}
+
+fn render_quantized_matmul(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    plan: &crate::QuantizedMatmulPlan,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    plan.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    if plan
+        .output_shape
+        .numel()
+        .map_err(|_| MetalError::Overflow)?
+        > u32::MAX as usize
+    {
+        return Err(MetalError::Unsupported(
+            "quantized matmul extent exceeds uint thread indexing".into(),
+        ));
+    }
+    let extent = plan
+        .output_shape
+        .numel()
+        .map_err(|_| MetalError::Overflow)?;
+    let activation_elements = plan
+        .activation_shape
+        .numel()
+        .map_err(|_| MetalError::Overflow)?;
+    let buffers = vec![
+        MetalBufferAbi {
+            id: plan.activation.index() as u64,
+            dtype: DType::F32,
+            source_shape: plan.activation_shape.clone(),
+            elements: activation_elements,
+            mutable: false,
+            view: None,
+        },
+        MetalBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: DType::F32,
+            source_shape: plan.output_shape.clone(),
+            elements: extent,
+            mutable: true,
+            view: None,
+        },
+    ];
+    let quantized_buffers = vec![MetalQuantizedBufferAbi {
+        id: plan.weight.index() as u64,
+        desc: plan.weight_desc.clone(),
+    }];
+    for bytes in [
+        activation_elements
+            .checked_mul(DType::F32.itemsize())
+            .ok_or(MetalError::Overflow)?,
+        plan.weight_desc.bytes,
+        extent
+            .checked_mul(DType::F32.itemsize())
+            .ok_or(MetalError::Overflow)?,
+    ] {
+        if bytes > renderer.capabilities.max_buffer_length {
+            return Err(MetalError::Unsupported(
+                "quantized matmul binding exceeds device buffer limit".into(),
+            ));
+        }
+    }
+    let entry = format!("rg_metal_quantized_matmul_{}", plan.cache_key);
+    let mut lines = vec![
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        "#pragma clang fp contract(off)".into(),
+        format!(
+            "// {METAL_QUANTIZED_MATMUL_RENDERER_VERSION} ABI {METAL_ABI_VERSION}; F32 accumulation"
+        ),
+        quantized_half_helper().into(),
+        format!("kernel void {entry}("),
+        "    device const float* b0 [[buffer(0)]],".into(),
+        "    device const uchar* b1 [[buffer(1)]],".into(),
+        "    device float* b2 [[buffer(2)]],".into(),
+        "    constant ulong& extent [[buffer(3)]],".into(),
+        "    uint gid32 [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = ulong(gid32);".into(),
+        "  if (gid >= extent) return;".into(),
+        format!("  const ulong rg_col = gid % {}ul;", plan.n.max(1)),
+        format!("  const ulong rg_row = gid / {}ul;", plan.n.max(1)),
+        "  float rg_acc = 0.0f;".into(),
+        format!("  for (ulong rg_k = 0ul; rg_k < {}ul; ++rg_k) {{", plan.k),
+        format!(
+            "    const ulong rg_block = rg_col * {}ul + rg_k / {}ul;",
+            if plan.k == 0 {
+                0
+            } else {
+                plan.k / plan.weight_desc.block_elements
+            },
+            plan.weight_desc.block_elements
+        ),
+    ];
+    lines.extend(
+        quantized_decode_lines(plan.weight_desc.ggml_type)?
+            .into_iter()
+            .map(str::to_owned),
+    );
+    lines.extend([
+        format!(
+            "    rg_acc = rg_acc + b0[rg_row * {}ul + rg_k] * rg_v;",
+            plan.k
+        ),
+        "  }".into(),
+        "  b2[gid] = rg_acc;".into(),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let pointer_order = vec![
+        MetalPointerAbi::Dense(0),
+        MetalPointerAbi::Quantized(0),
+        MetalPointerAbi::Dense(1),
+    ];
+    let cache_key = stable_key(&(
+        METAL_QUANTIZED_MATMUL_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        plan,
+        &source,
+        &buffers,
+        &quantized_buffers,
+        &pointer_order,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers: buffers.clone(),
+        quantized_buffers,
+        pointer_order,
+        extent,
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        indexed_movement: None,
+        append_state: None,
+        schedule_inputs: vec![buffers[0].clone()],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::QuantizedMatmul(
+            Arc::new(plan.clone()),
+        )),
+    })
+}
+
+fn render_quantized_row_gather(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    plan: &crate::QuantizedRowGatherPlan,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    plan.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    if plan.indices_dtype != DType::I32 {
+        return Err(MetalError::Unsupported(
+            "direct Metal quantized row gather requires I32 indices".into(),
+        ));
+    }
+    let index_elements = plan
+        .indices_shape
+        .numel()
+        .map_err(|_| MetalError::Overflow)?;
+    let extent = plan
+        .output_shape
+        .numel()
+        .map_err(|_| MetalError::Overflow)?;
+    if extent > u32::MAX as usize {
+        return Err(MetalError::Unsupported(
+            "quantized row-gather extent exceeds uint thread indexing".into(),
+        ));
+    }
+    let columns = plan.weight_desc.logical_shape.dims()[1];
+    let buffers = vec![
+        MetalBufferAbi {
+            id: plan.indices.index() as u64,
+            dtype: DType::I32,
+            source_shape: plan.indices_shape.clone(),
+            elements: index_elements,
+            mutable: false,
+            view: None,
+        },
+        MetalBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: DType::F32,
+            source_shape: plan.output_shape.clone(),
+            elements: extent,
+            mutable: true,
+            view: None,
+        },
+    ];
+    let quantized_buffers = vec![MetalQuantizedBufferAbi {
+        id: plan.weight.index() as u64,
+        desc: plan.weight_desc.clone(),
+    }];
+    for bytes in [
+        index_elements
+            .checked_mul(DType::I32.itemsize())
+            .ok_or(MetalError::Overflow)?,
+        plan.weight_desc.bytes,
+        extent
+            .checked_mul(DType::F32.itemsize())
+            .ok_or(MetalError::Overflow)?,
+    ] {
+        if bytes > renderer.capabilities.max_buffer_length {
+            return Err(MetalError::Unsupported(
+                "quantized row-gather binding exceeds device buffer limit".into(),
+            ));
+        }
+    }
+    let entry = format!("rg_metal_quantized_row_gather_{}", plan.cache_key);
+    let mut lines = vec![
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        format!("// {METAL_QUANTIZED_ROW_GATHER_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        quantized_half_helper().into(),
+        format!("kernel void {entry}("),
+        "    device const int* b0 [[buffer(0)]],".into(),
+        "    device const uchar* b1 [[buffer(1)]],".into(),
+        "    device float* b2 [[buffer(2)]],".into(),
+        "    constant ulong& extent [[buffer(3)]],".into(),
+        "    uint gid32 [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = ulong(gid32);".into(),
+        "  if (gid >= extent) return;".into(),
+        format!("  const ulong rg_index = gid / {}ul;", columns.max(1)),
+        format!("  const ulong rg_k = gid % {}ul;", columns.max(1)),
+        "  const ulong rg_row = ulong(b0[rg_index]);".into(),
+        format!(
+            "  const ulong rg_block = rg_row * {}ul + rg_k / {}ul;",
+            columns / plan.weight_desc.block_elements,
+            plan.weight_desc.block_elements
+        ),
+    ];
+    lines.extend(
+        quantized_decode_lines(plan.weight_desc.ggml_type)?
+            .into_iter()
+            .map(str::to_owned),
+    );
+    lines.extend(["  b2[gid] = rg_v;".into(), "}".into()]);
+    let source = lines.join("\n") + "\n";
+    let pointer_order = vec![
+        MetalPointerAbi::Dense(0),
+        MetalPointerAbi::Quantized(0),
+        MetalPointerAbi::Dense(1),
+    ];
+    let cache_key = stable_key(&(
+        METAL_QUANTIZED_ROW_GATHER_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        plan,
+        &source,
+        &buffers,
+        &quantized_buffers,
+        &pointer_order,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers: buffers.clone(),
+        quantized_buffers,
+        pointer_order,
+        extent,
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        indexed_movement: None,
+        append_state: None,
+        schedule_inputs: vec![buffers[0].clone()],
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::QuantizedRowGather(
+            Arc::new(plan.clone()),
+        )),
     })
 }
 
@@ -1453,6 +1844,8 @@ fn render_portable_bitcast(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent: portable.bytes(),
         entry,
@@ -1550,6 +1943,8 @@ fn render_portable_dense_materialization(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent: portable.elements(),
         entry,
@@ -1667,6 +2062,8 @@ fn render_indexed_movement(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent: portable.output_elements(),
         entry,
@@ -1774,6 +2171,8 @@ fn render_host_gather(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent: portable.output_elements(),
         entry,
@@ -2071,6 +2470,8 @@ fn render_raw_copy(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent,
         entry,
@@ -2204,6 +2605,8 @@ fn render_static_positions(
     Ok(RenderedMetal {
         source,
         source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
         buffers,
         extent,
         entry,
