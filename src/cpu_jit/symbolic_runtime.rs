@@ -7,9 +7,9 @@
 
 use super::{
     ABI_VERSION, BufferAbi, JitError, KernelAbi, KernelPointerAbi, RenderedC, SymbolicLoadOffsets,
-    ctype, emit_with_substitution, native_cache_key, reduction_accumulator_type,
-    reduction_arithmetic_expr, runtime_mean_divisor_expr, scalar_kernel_prologue,
-    scalar_store_expr, scan_commit_expr, scan_store_expr,
+    ctype, emit_with_substitution, linear_store_iteration, native_cache_key,
+    reduction_accumulator_type, reduction_arithmetic_expr, runtime_mean_divisor_expr,
+    scalar_kernel_prologue, scalar_store_expr, scan_commit_expr, scan_store_expr,
 };
 use crate::engine::symbolic::{SymbolicItemDomain, SymbolicSchema};
 use crate::engine::symbolic_uop::{AuthenticatedSymbolicUOp, lower_symbolic_expression};
@@ -145,6 +145,12 @@ fn render_uop(
                 domain: output,
             };
             let mut map = BTreeMap::new();
+            let iteration = linear_store_iteration(
+                store
+                    .sources()
+                    .first()
+                    .ok_or_else(|| JitError::Unsupported("symbolic Store lacks index".into()))?,
+            )?;
             let value = emit_with_substitution(
                 store
                     .sources()
@@ -153,7 +159,7 @@ fn render_uop(
                 &ids,
                 &mut map,
                 &mut lines,
-                None,
+                Some((iteration, "((int64_t)rg_i)")),
                 Some(&offsets),
             )?;
             let dtype = item.primary_output().dtype;

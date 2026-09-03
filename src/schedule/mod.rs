@@ -2253,6 +2253,7 @@ fn supported(op: &Op) -> bool {
             | Op::Compare { .. }
             | Op::Logical { .. }
             | Op::Select { .. }
+            | Op::ShapeIota { .. }
             | Op::Shrink { .. }
             | Op::Reshape { .. }
             | Op::Permute { .. }
@@ -2766,6 +2767,7 @@ fn schedule_many_with_external(
                     || matches!(
                         graph.op(id),
                         Ok(Op::Random { .. }
+                            | Op::ShapeIota { .. }
                             | Op::Threefry { .. }
                             | Op::Reduce { .. }
                             | Op::PrefixScan { .. }
@@ -3096,7 +3098,7 @@ fn schedule_many_with_external(
                 Op::Input { .. } | Op::Constant(_) => {
                     out.insert(id.index());
                 }
-                Op::Random { .. } => {}
+                Op::Random { .. } | Op::ShapeIota { .. } => {}
                 Op::Cast { input, .. }
                 | Op::Bitcast { input, .. }
                 | Op::Contiguous { input }

@@ -1711,6 +1711,36 @@ fn derive_shape(
                 guards,
             )?
         }
+        Op::ShapeIota { source, axis } => {
+            let source = derive_shape(
+                graph,
+                *source,
+                seeds,
+                movement_candidates,
+                template_environment,
+                memo,
+                guards,
+            )?;
+            let dimension = source.dims().get(*axis).ok_or_else(|| {
+                ReplayError::Symbolic("shape iota axis is outside its source rank".into())
+            })?;
+            let bounds = dimension
+                .expression()
+                .bounds()
+                .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+            let dtype = graph
+                .dtype(node)
+                .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
+            if bounds.min < 0
+                || (dtype == DType::I32 && bounds.max > i64::from(i32::MAX))
+                || !matches!(dtype, DType::I32 | DType::I64)
+            {
+                return Err(ReplayError::Unsupported(
+                    "symbolic shape iota exceeds its fixed integer storage".into(),
+                ));
+            }
+            SymbolicShape::new(vec![dimension.clone()])
+        }
         Op::Reduce {
             input,
             axes,

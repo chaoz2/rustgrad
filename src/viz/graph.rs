@@ -192,7 +192,11 @@ fn conv_transpose2d_geometry(node: VizNode, options: crate::ConvTranspose2dOptio
 
 fn inputs(op: &Op) -> Result<Vec<(String, NodeId)>, VizError> {
     Ok(match op {
-        Op::Input { .. } | Op::Constant(_) | Op::Random { .. } | Op::RandomPermutation { .. } => {
+        Op::Input { .. }
+        | Op::Constant(_)
+        | Op::Random { .. }
+        | Op::RandomPermutation { .. }
+        | Op::ShapeIota { .. } => {
             vec![]
         }
         Op::Cast { input, .. }
@@ -372,6 +376,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::Compare { .. } => "compare",
         Op::Logical { .. } => "logical",
         Op::Select { .. } => "select",
+        Op::ShapeIota { .. } => "shape_iota",
         Op::Reduce { .. } => "reduce",
         Op::PrefixScan { .. } => "prefix_scan",
         Op::Sort { .. } => "sort",
@@ -442,6 +447,9 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
         Op::Threefry { .. } => node.field("algorithm", "threefry2x32-20"),
         Op::Compare { op, .. } => node.field("operator", op.name()),
         Op::Logical { op, .. } => node.field("operator", op.name()),
+        Op::ShapeIota { source, axis } => node
+            .field("source", source.to_string())
+            .field("axis", axis.to_string()),
         Op::Reduce {
             kind,
             axes,

@@ -1138,7 +1138,8 @@ impl Graph {
                 Op::Reduce {
                     kind: crate::ReduceKind::Any | crate::ReduceKind::All,
                     ..
-                } => {}
+                }
+                | Op::ShapeIota { .. } => {}
                 Op::ArgReduce { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
                         "reduction gradient not yet represented",

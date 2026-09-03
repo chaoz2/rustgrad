@@ -367,6 +367,13 @@ define_graph_ops! {
         on_true: NodeId,
         on_false: NodeId,
     } => inputs [node condition, node on_true, node on_false],
+    /// One-dimensional `0..source.shape[axis]` integer values. `source` is
+    /// descriptor provenance only: the generated values never read its
+    /// storage and therefore it is intentionally not a value edge.
+    ShapeIota {
+        source: NodeId,
+        axis: usize,
+    } => inputs [],
     Reduce {
         input: NodeId,
         kind: ReduceKind,
@@ -1033,6 +1040,7 @@ impl Op {
             | Self::Random { .. }
             | Self::RandomPermutation { .. }
             | Self::Threefry { .. }
+            | Self::ShapeIota { .. }
             | Self::ArgReduce { .. }
             | Self::Compare { .. }
             | Self::Logical { .. }
@@ -1137,6 +1145,9 @@ impl Op {
                 on_true,
                 on_false,
             } => format!("where(%{condition}, %{on_true}, %{on_false})"),
+            Self::ShapeIota { source, axis } => {
+                format!("shape_iota(%{source}, axis={axis})")
+            }
             Self::Reduce {
                 input,
                 kind,

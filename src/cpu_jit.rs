@@ -827,6 +827,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     let out_id = *out_id;
     let extent = *extent;
     let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
+    let iteration = linear_store_iteration(out_index)?;
     // Float8 storage is a tagged byte encoding, never an ordered integer.
     // Homogeneous arithmetic/extrema decode both operands and exactly encode
     // every typed result boundary. Numeric comparisons have a decode-only
@@ -981,7 +982,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         });
     }
     let mut map = BTreeMap::new();
-    let value = emit(
+    let value = emit_with_substitution(
         store
             .sources()
             .get(1)
@@ -989,6 +990,8 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         &ids,
         &mut map,
         &mut lines,
+        Some((iteration, "((int64_t)rg_i)")),
+        None,
     )?;
     let store_value = scalar_store_expr(out.dtype, &value);
     lines.push(format!(
@@ -3061,6 +3064,38 @@ fn emit(
     lines: &mut Vec<String>,
 ) -> Result<String, JitError> {
     emit_with_substitution(n, ids, map, lines, None, None)
+}
+
+/// Returns the exact loop index owned by a dense output Store. Scalar values
+/// may reference this same Range node (for example ShapeIota), so renderers
+/// substitute the already-authenticated executable iteration rather than
+/// treating Range as an independently executable scalar operation.
+pub(crate) fn linear_store_iteration(index: &UOp) -> Result<&UOp, JitError> {
+    let Operation::Index(IndexValue::Buffer { elements, .. }) = index.operation() else {
+        return Err(JitError::Unsupported(
+            "Store iteration requires a dense Buffer index".into(),
+        ));
+    };
+    let range = index
+        .sources()
+        .get(1)
+        .ok_or_else(|| JitError::Unsupported("Store index lacks iteration Range".into()))?;
+    if !matches!(range.operation(), Operation::Range(0)) {
+        return Err(JitError::Unsupported(
+            "Store index has a noncanonical iteration Range".into(),
+        ));
+    }
+    let expected = i64::try_from(*elements)
+        .map_err(|_| JitError::Unsupported("Store iteration extent overflow".into()))?;
+    if !matches!(
+        range.sources().first().map(UOp::operation),
+        Some(Operation::Const(LiteralValue::Int(bound))) if *bound == expected
+    ) {
+        return Err(JitError::Unsupported(
+            "Store iteration Range bound is inconsistent".into(),
+        ));
+    }
+    Ok(range)
 }
 
 pub(crate) trait SymbolicLoadOffsets {

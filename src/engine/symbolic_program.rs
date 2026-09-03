@@ -1811,6 +1811,124 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_argmax_specializes_one_shape_iota_across_axis_extents() {
+        let tokens = SymbolicExpr::variable("tokens", 0, 4).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let output = graph.argmax_with_axis(input, Some(1), false).unwrap();
+        let iota = (0..graph.node_count())
+            .map(crate::NodeId::from_index)
+            .find(|node| matches!(graph.op(*node), Ok(crate::Op::ShapeIota { .. })))
+            .unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![2usize.into(), tokens.clone().into()]),
+            )])),
+            &BTreeMap::from([("tokens".into(), 3)]),
+        )
+        .unwrap();
+        assert_eq!(
+            capture.symbolic.as_ref().unwrap().buffer_shapes[&(iota.index() as u64)],
+            SymbolicShape::new(vec![tokens.into()])
+        );
+        let encoded = crate::schedule::artifact::encode(&capture).unwrap();
+        let decoded = crate::schedule::artifact::decode(&encoded).unwrap();
+        let mut tampered = decoded.clone();
+        tampered
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .buffer_shapes
+            .insert(iota.index() as u64, SymbolicShape::new(vec![1usize.into()]));
+        tampered.identity = 0;
+        tampered.identity = crate::schedule::artifact::identity(&tampered).unwrap();
+        assert!(CpuSymbolicProgram::new(tampered).is_err());
+        let program = CpuSymbolicProgram::new(decoded).unwrap();
+
+        for (extent, values, expected) in [
+            (0usize, vec![], vec![i32::MIN, i32::MIN]),
+            (1usize, vec![5.0, -2.0], vec![0, 0]),
+            (3, vec![1.0, 5.0, 5.0, 9.0, 2.0, 9.0], vec![1, 0]),
+            (4, vec![1.0, 5.0, 5.0, 0.0, 9.0, 2.0, 9.0, 10.0], vec![1, 3]),
+        ] {
+            let input = TensorData::new([2, extent], values).unwrap();
+            let result = program
+                .run(invocation(
+                    [("tokens", extent as i64)],
+                    BTreeMap::from([("input".into(), input)]),
+                ))
+                .unwrap();
+            assert_eq!(
+                (0..2)
+                    .map(|index| result.outputs()[0].scalar_at(index))
+                    .collect::<Vec<_>>(),
+                expected
+                    .into_iter()
+                    .map(|value| Scalar::I(i64::from(value)))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(program.compile_count(), 1);
+
+        let extent = SymbolicExpr::variable("extent", 0, 4).unwrap();
+        let mut iota_graph = Graph::new();
+        let source = iota_graph.input("source", [2, 1]);
+        let iota = iota_graph.shape_iota(source, 1).unwrap();
+        let schedule = crate::schedule(&iota_graph, iota).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &iota_graph,
+            &schedule,
+            &[iota],
+            &SymbolicCaptureSpec::new(BTreeMap::from([(
+                source,
+                SymbolicShape::new(vec![2usize.into(), extent.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 1)]),
+        )
+        .unwrap();
+        let program = CpuSymbolicProgram::new(capture).unwrap();
+        for extent in [0usize, 1, 4] {
+            let result = program
+                .run(invocation([("extent", extent as i64)], BTreeMap::new()))
+                .unwrap();
+            assert_eq!(
+                result.outputs()[0],
+                TensorData::from_scalars(
+                    [extent],
+                    DType::I32,
+                    (0..extent).map(|value| Scalar::I(value as i64)),
+                )
+                .unwrap()
+            );
+        }
+
+        let oversized = SymbolicExpr::variable("oversized", 1, i64::from(i32::MAX) + 1).unwrap();
+        let mut oversized_graph = Graph::new();
+        let source = oversized_graph.input("source", [1]);
+        let iota = oversized_graph.shape_iota(source, 0).unwrap();
+        let schedule = crate::schedule(&oversized_graph, iota).unwrap();
+        assert!(matches!(
+            CapturedSchedule::capture_symbolic(
+                &oversized_graph,
+                &schedule,
+                &[iota],
+                &SymbolicCaptureSpec::new(BTreeMap::from([(
+                    source,
+                    SymbolicShape::new(vec![oversized.into()]),
+                )])),
+                &BTreeMap::from([("oversized".into(), 1)]),
+            ),
+            Err(crate::ReplayError::Unsupported(message))
+                if message == "symbolic shape iota exceeds its fixed integer storage"
+        ));
+    }
+
+    #[test]
     fn symbolic_mean_commits_runtime_cardinality_at_the_work_dtype() {
         let cases = [
             (DType::F16, 2_049usize),
