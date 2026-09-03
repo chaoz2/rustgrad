@@ -29,8 +29,15 @@ impl SymbolicProjectedIndexMap {
     ) -> Result<Self, ReplayError> {
         let logical = shape(shapes, node)?;
         let coordinates = logical_coordinates(logical, &output_shape)?;
-        let (derived_source, expression) =
-            derive_chain(graph, node, source, coordinates, shapes, template)?;
+        let (derived_source, expression) = derive_chain(
+            graph,
+            node,
+            source,
+            coordinates,
+            &output_shape,
+            shapes,
+            template,
+        )?;
         if derived_source != source {
             return Err(ReplayError::Unsupported(
                 "symbolic projected source is inconsistent".into(),
@@ -196,11 +203,15 @@ fn derive_chain(
     node: NodeId,
     source: NodeId,
     coordinates: Vec<ProjectedExpr<SymbolicExpr>>,
+    iteration_shape: &SymbolicShape,
     shapes: &BTreeMap<NodeId, SymbolicShape>,
     template: &BTreeMap<SymbolicVar, i64>,
 ) -> Result<(NodeId, ProjectedExpr<SymbolicExpr>), ReplayError> {
     if node == source {
-        return Ok((source, linearize(shape(shapes, node)?, &coordinates)?));
+        return Ok((
+            source,
+            linearize(shape(shapes, node)?, &coordinates, iteration_shape)?,
+        ));
     }
     match graph
         .op(node)
@@ -227,12 +238,28 @@ fn derive_chain(
                     }
                 })
                 .collect::<Result<Vec<_>, ReplayError>>()?;
-            derive_chain(graph, *input, source, coordinates, shapes, template)
+            derive_chain(
+                graph,
+                *input,
+                source,
+                coordinates,
+                iteration_shape,
+                shapes,
+                template,
+            )
         }
         Op::Reshape { input, .. } => {
-            let linear = linearize(shape(shapes, node)?, &coordinates)?;
+            let linear = linearize(shape(shapes, node)?, &coordinates, iteration_shape)?;
             let coordinates = decompose(shape(shapes, *input)?, linear)?;
-            derive_chain(graph, *input, source, coordinates, shapes, template)
+            derive_chain(
+                graph,
+                *input,
+                source,
+                coordinates,
+                iteration_shape,
+                shapes,
+                template,
+            )
         }
         Op::Permute { input, axes } => {
             let mut input_coordinates = vec![zero(); axes.len()];
@@ -242,7 +269,15 @@ fn derive_chain(
                         ReplayError::Symbolic("projected permutation rank mismatch".into())
                     })?;
             }
-            derive_chain(graph, *input, source, input_coordinates, shapes, template)
+            derive_chain(
+                graph,
+                *input,
+                source,
+                input_coordinates,
+                iteration_shape,
+                shapes,
+                template,
+            )
         }
         Op::Expand { input, .. } => {
             let input_shape = shape(shapes, *input)?;
@@ -264,7 +299,15 @@ fn derive_chain(
                     }
                 })
                 .collect::<Result<Vec<_>, ReplayError>>()?;
-            derive_chain(graph, *input, source, coordinates, shapes, template)
+            derive_chain(
+                graph,
+                *input,
+                source,
+                coordinates,
+                iteration_shape,
+                shapes,
+                template,
+            )
         }
         Op::Stride { input, slices } => {
             if slices.len() != coordinates.len() {
@@ -308,7 +351,15 @@ fn derive_chain(
                     }
                 })
                 .collect::<Result<Vec<_>, ReplayError>>()?;
-            derive_chain(graph, *input, source, coordinates, shapes, template)
+            derive_chain(
+                graph,
+                *input,
+                source,
+                coordinates,
+                iteration_shape,
+                shapes,
+                template,
+            )
         }
         _ => Err(ReplayError::Unsupported(
             "symbolic projected movement chain is not source-backed".into(),
@@ -342,15 +393,16 @@ fn logical_coordinates(
                     "symbolic projected broadcast relation is not structural".into(),
                 ));
             }
-            binary(
-                Binary::Mod,
+            let divided = if is_projected_one(&strides[output_axis])? {
+                ProjectedExpr::Linear
+            } else {
                 binary(
                     Binary::FloorDiv,
                     ProjectedExpr::Linear,
                     strides[output_axis].clone(),
-                )?,
-                positive_dimension(output_dimension),
-            )
+                )?
+            };
+            binary(Binary::Mod, divided, positive_dimension(output_dimension))
         })
         .collect()
 }
@@ -358,11 +410,15 @@ fn logical_coordinates(
 fn linearize(
     shape: &SymbolicShape,
     coordinates: &[ProjectedExpr<SymbolicExpr>],
+    iteration_shape: &SymbolicShape,
 ) -> Result<ProjectedExpr<SymbolicExpr>, ReplayError> {
     if shape.rank() != coordinates.len() {
         return Err(ReplayError::Symbolic(
             "projected coordinate rank mismatch".into(),
         ));
+    }
+    if let Some(recomposed) = recomposed_linear(shape, coordinates, iteration_shape)? {
+        return Ok(recomposed);
     }
     let strides = contiguous_strides(shape)?;
     coordinates
@@ -372,6 +428,67 @@ fn linearize(
         .try_fold(zero(), |sum, (coordinate, stride)| {
             binary(Binary::Add, sum, binary(Binary::Mul, coordinate, stride)?)
         })
+}
+
+fn recomposed_linear(
+    shape: &SymbolicShape,
+    coordinates: &[ProjectedExpr<SymbolicExpr>],
+    iteration_shape: &SymbolicShape,
+) -> Result<Option<ProjectedExpr<SymbolicExpr>>, ReplayError> {
+    let strides = contiguous_strides(shape)?;
+    let mut decomposed = None;
+    for ((coordinate, dimension), stride) in coordinates.iter().zip(shape.dims()).zip(strides) {
+        if is_one(dimension)? {
+            if coordinate != &zero() {
+                return Ok(None);
+            }
+            continue;
+        }
+        let ProjectedExpr::Binary {
+            operation: Binary::Mod,
+            lhs: divided,
+            rhs: modulus,
+        } = coordinate
+        else {
+            return Ok(None);
+        };
+        if modulus.as_ref() != &positive_dimension(dimension) {
+            return Ok(None);
+        }
+        let candidate = if is_projected_one(&stride)? {
+            divided.as_ref()
+        } else {
+            let ProjectedExpr::Binary {
+                operation: Binary::FloorDiv,
+                lhs: candidate,
+                rhs: divisor,
+            } = divided.as_ref()
+            else {
+                return Ok(None);
+            };
+            if divisor.as_ref() != &stride {
+                return Ok(None);
+            }
+            candidate.as_ref()
+        };
+        if decomposed.as_ref().is_some_and(|prior| prior != candidate) {
+            return Ok(None);
+        }
+        decomposed = Some(candidate.clone());
+    }
+    let Some(decomposed) = decomposed else {
+        return Ok(None);
+    };
+    // The same structural recovery is safe only when the complete symbolic
+    // consumer domain proves that shared numerator is already a valid address
+    // in this shape. In particular, an outer broadcast does not collapse to
+    // Linear because its iteration extent can exceed this logical extent.
+    let proof = SymbolicProjectedIndexMap {
+        source_shape: shape.clone(),
+        output_shape: iteration_shape.clone(),
+        expression: decomposed.clone(),
+    };
+    Ok(proof.validate_bounds().is_ok().then_some(decomposed))
 }
 
 fn decompose(
@@ -387,11 +504,12 @@ fn decompose(
             if is_one(dimension)? {
                 Ok(zero())
             } else {
-                binary(
-                    Binary::Mod,
-                    binary(Binary::FloorDiv, linear.clone(), stride)?,
-                    positive_dimension(dimension),
-                )
+                let divided = if is_projected_one(&stride)? {
+                    linear.clone()
+                } else {
+                    binary(Binary::FloorDiv, linear.clone(), stride)?
+                };
+                binary(Binary::Mod, divided, positive_dimension(dimension))
             }
         })
         .collect()
@@ -453,6 +571,17 @@ fn binary(
 fn is_one(dimension: &SymbolicDim) -> Result<bool, ReplayError> {
     Ok(dimension
         .expression()
+        .bounds()
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+        .constant()
+        == Some(1))
+}
+
+fn is_projected_one(expression: &ProjectedExpr<SymbolicExpr>) -> Result<bool, ReplayError> {
+    let ProjectedExpr::Constant(expression) = expression else {
+        return Ok(false);
+    };
+    Ok(expression
         .bounds()
         .map_err(|error| ReplayError::Symbolic(error.to_string()))?
         .constant()
@@ -792,6 +921,36 @@ fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbolic_recomposition_requires_the_complete_iteration_domain_to_fit() {
+        let extent = SymbolicExpr::variable("extent", 0, 5).unwrap();
+        let shape = SymbolicShape::new(vec![1usize.into(), extent.clone().into(), 4usize.into()]);
+        let coordinates = decompose(&shape, ProjectedExpr::Linear).unwrap();
+        assert!(matches!(
+            coordinates.last(),
+            Some(ProjectedExpr::Binary {
+                operation: Binary::Mod,
+                lhs,
+                ..
+            }) if lhs.as_ref() == &ProjectedExpr::Linear
+        ));
+        assert_eq!(
+            linearize(&shape, &coordinates, &shape).unwrap(),
+            ProjectedExpr::Linear
+        );
+
+        let broadcast = SymbolicShape::new(vec![
+            3usize.into(),
+            1usize.into(),
+            extent.into(),
+            4usize.into(),
+        ]);
+        assert_ne!(
+            linearize(&shape, &coordinates, &broadcast).unwrap(),
+            ProjectedExpr::Linear
+        );
+    }
 
     #[test]
     fn template_matching_uses_the_authenticated_output_extent_canonical_form() {

@@ -236,6 +236,30 @@ impl ProjectedExpr<i64> {
                     _ => {}
                 }
 
+                // In the authenticated linear domain `0 <= i < extent`, the
+                // remainder around a quotient is redundant when the complete
+                // quotient range already fits below the modulus. This is the
+                // unit-axis form emitted by a symbolic permutation; concrete
+                // lowering omits that axis before rebuilding the same address.
+                if matches!(operation, Binary::Mod)
+                    && let Self::Binary {
+                        operation: Binary::FloorDiv,
+                        lhs: numerator,
+                        rhs: divisor,
+                    } = &lhs
+                    && matches!(numerator.as_ref(), Self::Linear)
+                    && let (Self::Constant(divisor), Self::Constant(modulus)) =
+                        (divisor.as_ref(), &rhs)
+                    && *divisor > 0
+                    && *modulus > 0
+                    && let Some(limit) = divisor.checked_mul(*modulus)
+                    && output_elements
+                        .and_then(|extent| i64::try_from(extent).ok())
+                        .is_some_and(|extent| extent <= limit)
+                {
+                    return lhs;
+                }
+
                 // tinygrad's active symbolic rules keep repeated division and
                 // remainder chains compact. Positive constant divisors are an
                 // authenticated property of this closed address dialect.
@@ -661,6 +685,40 @@ impl ProjectedIndexPlan {
             .then_some(offset)
             .ok_or(UOpError::InvalidIndex)
     }
+}
+
+/// Canonicalizes one graph-derived projected address before another movement
+/// step composes it. Repeated reshape decomposition preserves UOp DAG sharing,
+/// but its expanded expression tree can otherwise grow past the hostile-wire
+/// limit before the final Index is available to the ordinary canonicalizer.
+/// This helper retains that limit for every intermediate expression and proves
+/// its complete concrete output domain against the declared source extent.
+pub(crate) fn canonicalize_graph_projected_address(
+    expression: &UOp,
+    output_elements: usize,
+    source_elements: usize,
+) -> Result<UOp, UOpError> {
+    let mut parsed_nodes = 0;
+    let expression = parse_expression(expression, output_elements, 0, &mut parsed_nodes)?;
+    let expression = expression.canonicalized_for_output(output_elements);
+    let mut state = ValidationState {
+        output_elements,
+        nodes: 0,
+        fits_i32: true,
+    };
+    let bounds = validate_expression(&expression, 0, &mut state)?;
+    match (output_elements, bounds) {
+        (0, None) => {}
+        (0, Some(_)) | (_, None) => return Err(UOpError::InvalidIndex),
+        (_, Some((minimum, maximum))) => {
+            let source_elements =
+                i128::try_from(source_elements).map_err(|_| UOpError::InvalidIndex)?;
+            if minimum < 0 || maximum >= source_elements {
+                return Err(UOpError::InvalidIndex);
+            }
+        }
+    }
+    expression.to_uop(output_elements)
 }
 
 struct InfixProjectedEmitter<'a, F> {
@@ -1136,10 +1194,11 @@ mod tests {
             ProjectedIndexPlan::from_index(&index(
                 Shape::from([1]),
                 Shape::from([1]),
-                shared_diamond,
+                shared_diamond.clone(),
             ))
             .is_err()
         );
+        assert!(canonicalize_graph_projected_address(&shared_diamond, 1, 1).is_err());
     }
 
     #[test]
@@ -1321,6 +1380,27 @@ mod tests {
             )
             .unwrap()
             .canonicalized_for_output(8),
+            ProjectedExpr::Linear
+        );
+
+        let two = ProjectedExpr::Constant(2);
+        let quotient =
+            ProjectedExpr::binary(Binary::FloorDiv, ProjectedExpr::Linear, two.clone()).unwrap();
+        let bounded_quotient =
+            ProjectedExpr::binary(Binary::Mod, quotient.clone(), two.clone()).unwrap();
+        assert_eq!(bounded_quotient.canonicalized_for_output(4), quotient);
+        assert_eq!(
+            bounded_quotient.canonicalized_for_output(12),
+            bounded_quotient
+        );
+        let reconstructed = ProjectedExpr::binary(
+            Binary::Add,
+            ProjectedExpr::binary(Binary::Mul, bounded_quotient, two.clone()).unwrap(),
+            ProjectedExpr::binary(Binary::Mod, ProjectedExpr::Linear, two).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reconstructed.canonicalized_for_output(4),
             ProjectedExpr::Linear
         );
 

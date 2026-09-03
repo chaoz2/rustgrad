@@ -316,6 +316,19 @@ fn zero_from(range: &UOp) -> UOp {
     ibinary(Binary::Mul, range.clone(), iconstant(0))
 }
 
+fn range_extent(range: &UOp) -> Result<usize, RangeifyError> {
+    let Operation::Range(0) = range.operation() else {
+        return Err(RangeifyError::Invalid);
+    };
+    let [bound] = range.sources() else {
+        return Err(RangeifyError::Invalid);
+    };
+    let Operation::Const(crate::uop::LiteralValue::Int(bound)) = bound.operation() else {
+        return Err(RangeifyError::Invalid);
+    };
+    usize::try_from(*bound).map_err(|_| RangeifyError::Invalid)
+}
+
 fn logical_coordinates(
     logical: &Shape,
     output: &Shape,
@@ -359,6 +372,82 @@ fn logical_coordinates(
         .collect()
 }
 
+fn recomposed_linear(
+    shape: &Shape,
+    coordinates: &[UOp],
+    range: &UOp,
+) -> Result<Option<UOp>, RangeifyError> {
+    let strides = shape.contiguous_strides();
+    // Reshape decomposes one already-authenticated linear address into every
+    // source coordinate. A later dense/computed boundary commonly linearizes
+    // those same coordinates again. Recover that exact shared numerator before
+    // constructing a much larger quotient/remainder tree, but only when the
+    // complete consumer range proves the numerator is already in this shape.
+    // This deliberately does not collapse a broadcast: its root Range exceeds
+    // the logical source extent and therefore fails the checked proof below.
+    let mut decomposed = None;
+    for ((coordinate, dim), stride) in coordinates.iter().zip(shape.dims()).zip(&strides) {
+        if *dim == 0 || *stride == 0 || *dim == 1 {
+            let is_zero = matches!(
+                (coordinate.operation(), coordinate.sources()),
+                (Operation::Binary(Binary::Mul), [_, rhs])
+                    if matches!(rhs.operation(), Operation::Const(crate::uop::LiteralValue::Int(0)))
+            );
+            if !is_zero {
+                return Ok(None);
+            }
+            continue;
+        }
+        let (Operation::Binary(Binary::Mod), [divided, modulus]) =
+            (coordinate.operation(), coordinate.sources())
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            modulus.operation(),
+            Operation::Const(crate::uop::LiteralValue::Int(value))
+                if usize::try_from(*value).ok() == Some(*dim)
+        ) {
+            return Ok(None);
+        }
+        let candidate = if *stride == 1 {
+            divided
+        } else {
+            let (Operation::Binary(Binary::FloorDiv), [candidate, divisor]) =
+                (divided.operation(), divided.sources())
+            else {
+                return Ok(None);
+            };
+            if !matches!(
+                divisor.operation(),
+                Operation::Const(crate::uop::LiteralValue::Int(value))
+                    if usize::try_from(*value).ok() == Some(*stride)
+            ) {
+                return Ok(None);
+            }
+            candidate
+        };
+        if decomposed
+            .as_ref()
+            .is_some_and(|prior: &UOp| prior.node_identity() != candidate.node_identity())
+        {
+            return Ok(None);
+        }
+        decomposed = Some(candidate.clone());
+    }
+    let Some(decomposed) = decomposed else {
+        return Ok(None);
+    };
+    Ok(
+        crate::projected_index::canonicalize_graph_projected_address(
+            &decomposed,
+            range_extent(range)?,
+            shape.numel().map_err(|_| RangeifyError::Invalid)?,
+        )
+        .ok(),
+    )
+}
+
 fn linearize_coordinates(
     shape: &Shape,
     coordinates: &[UOp],
@@ -366,6 +455,9 @@ fn linearize_coordinates(
 ) -> Result<UOp, RangeifyError> {
     if coordinates.len() != shape.rank() {
         return Err(RangeifyError::Invalid);
+    }
+    if let Some(recomposed) = recomposed_linear(shape, coordinates, range)? {
+        return Ok(recomposed);
     }
     let strides = shape.contiguous_strides();
     let mut expression = zero_from(range);
@@ -507,6 +599,17 @@ pub(crate) fn projected_view(
                 let output_shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
                 let input_shape = graph.shape(*input).map_err(|_| RangeifyError::Invalid)?;
                 let linear = linearize_coordinates(output_shape, &coordinates, range)?;
+                // A long reshape/decompose chain is a compact shared UOp DAG,
+                // but expanding that DAG directly into the closed projected
+                // expression tree can multiply identical quotient/remainder
+                // subtrees. Authenticate and canonicalize this complete linear
+                // map while it is still bounded by the current reshape input.
+                let linear = crate::projected_index::canonicalize_graph_projected_address(
+                    &linear,
+                    range_extent(range)?,
+                    input_shape.numel().map_err(|_| RangeifyError::Invalid)?,
+                )
+                .map_err(|_| RangeifyError::Invalid)?;
                 let coordinates = decompose_linear(input_shape, linear, range)?;
                 go(graph, *input, coordinates, range)
             }
@@ -643,6 +746,36 @@ pub(crate) fn predicated_source(
 mod tests {
     use super::*;
     use crate::{Shape, Slice};
+
+    #[test]
+    fn reshape_linear_recomposition_requires_the_complete_domain_to_fit() {
+        let shape = Shape::from([2, 4]);
+        let bounded_range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(8)],
+        );
+        let bounded = decompose_linear(&shape, bounded_range.clone(), &bounded_range).unwrap();
+        assert!(
+            recomposed_linear(&shape, &bounded, &bounded_range)
+                .unwrap()
+                .is_some()
+        );
+
+        let broadcast_range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(24)],
+        );
+        let broadcast =
+            decompose_linear(&shape, broadcast_range.clone(), &broadcast_range).unwrap();
+        assert!(
+            recomposed_linear(&shape, &broadcast, &broadcast_range)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn nested_shrink_has_stable_offsets() {
         let mut g = Graph::new();
@@ -896,7 +1029,7 @@ mod tests {
                 addressing: crate::IndexAddressing::Projected,
             }),
             Some(ty),
-            vec![address, projected.expression],
+            vec![address.clone(), projected.expression],
         );
         let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).unwrap();
         assert_eq!(
@@ -904,6 +1037,34 @@ mod tests {
                 .map(|linear| plan.offset(linear).unwrap())
                 .collect::<Vec<_>>(),
             vec![0, 1, 4, 5, 2, 3, 6, 7]
+        );
+
+        let broadcast_shape = Shape::from([3, 1, 2, 4]);
+        let broadcast_range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(24)],
+        );
+        let broadcast =
+            projected_view(&graph, reshaped, &broadcast_shape, &broadcast_range).unwrap();
+        let broadcast_index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: producer.index() as u64,
+                elements: 8,
+                input_shape: graph.shape(producer).unwrap().clone(),
+                output_shape: broadcast_shape,
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(ty),
+            vec![address, broadcast.expression],
+        );
+        let broadcast_plan =
+            crate::projected_index::ProjectedIndexPlan::from_index(&broadcast_index).unwrap();
+        assert_eq!(
+            (0..24)
+                .map(|linear| broadcast_plan.offset(linear).unwrap())
+                .collect::<Vec<_>>(),
+            [0, 1, 4, 5, 2, 3, 6, 7].repeat(3)
         );
 
         let reversed = graph
