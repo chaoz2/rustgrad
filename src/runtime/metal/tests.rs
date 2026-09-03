@@ -2,8 +2,49 @@ use super::renderer::{
     METAL_PORTABLE_BITCAST_RENDERER_VERSION, METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
     METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
     METAL_PORTABLE_SORT_RENDERER_VERSION, METAL_PORTABLE_THREEFRY_RENDERER_VERSION,
-    METAL_RAW_COPY_RENDERER_VERSION, METAL_STATIC_POSITION_RENDERER_VERSION,
+    METAL_RAW_COPY_RENDERER_VERSION, METAL_RENDERER_VERSION,
+    METAL_STATIC_POSITION_RENDERER_VERSION,
 };
+
+#[test]
+fn predicated_projected_metal_preserves_raw_lanes_and_guards_addressless_reads() {
+    for (shape, values, expected) in [
+        (
+            Shape::from([2]),
+            Storage::F32(vec![-0.0, f32::from_bits(0x7fc0_1234)]),
+            vec![0, 0x8000_0000u32, 0x7fc0_1234, 0],
+        ),
+        (Shape::from([0]), Storage::F32(vec![]), vec![0; 2]),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", shape.clone(), DType::F32);
+        let output = graph.pad(input, [(1, 1)], Scalar::F(0.0)).unwrap();
+        let output = graph.detach(output).unwrap();
+        let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+        let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert!(rendered.source.contains(METAL_RENDERER_VERSION));
+        assert!(rendered.source.contains(" ? "));
+        let (actual, _) = execute_mock(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_storage(shape, values).unwrap(),
+            )]),
+        );
+        let Storage::F32(actual) = actual.storage() else {
+            panic!("predicated Metal F32 output")
+        };
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
 
 #[test]
 fn portable_dense_metal_uses_checked_multi_input_raw_storage_abi() {
@@ -1681,7 +1722,14 @@ fn execute_mock(
         .buffers
         .iter()
         .map(|abi| {
-            let buffer = device.allocate_typed(abi.elements, abi.dtype).unwrap();
+            let buffer = device
+                .allocate_static(crate::runtime::static_schedule::StaticBufferAllocation {
+                    elements: abi.elements,
+                    bytes: abi.elements * abi.dtype.itemsize(),
+                    dtype: abi.dtype,
+                    requires_native_handle: rendered.extent != 0,
+                })
+                .unwrap();
             if let Some(value) = values.get(&abi.id) {
                 queue
                     .write(&buffer, 0, &value.to_le_bytes().unwrap())

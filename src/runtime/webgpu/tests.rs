@@ -2,8 +2,99 @@ use super::renderer::{
     WGSL_PORTABLE_BITCAST_RENDERER_VERSION, WGSL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
     WGSL_PORTABLE_F32_MATMUL_RENDERER_VERSION, WGSL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
     WGSL_PORTABLE_SORT_RENDERER_VERSION, WGSL_PORTABLE_THREEFRY_RENDERER_VERSION,
-    WGSL_RAW_COPY_RENDERER_VERSION, WGSL_STATIC_POSITION_RENDERER_VERSION,
+    WGSL_RAW_COPY_RENDERER_VERSION, WGSL_RENDERER_VERSION, WGSL_STATIC_POSITION_RENDERER_VERSION,
 };
+
+#[test]
+fn predicated_projected_wgsl_uses_control_flow_and_guards_addressless_reads() {
+    for (shape, values, expected) in [
+        (
+            Shape::from([2]),
+            Storage::F32(vec![-0.0, f32::from_bits(0x7fc0_1234)]),
+            vec![0, 0x8000_0000u32, 0x7fc0_1234, 0],
+        ),
+        (Shape::from([0]), Storage::F32(vec![]), vec![0; 2]),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", shape.clone(), DType::F32);
+        let output = graph.pad(input, [(1, 1)], Scalar::F(0.0)).unwrap();
+        let output = graph.detach(output).unwrap();
+        let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+        let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert!(rendered.source.contains(WGSL_RENDERER_VERSION));
+        assert!(rendered.source.contains("var rg_predicated_"));
+        assert!(rendered.source.contains("if ("));
+        let (actual, _) = execute_mock(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_storage(shape, values).unwrap(),
+            )]),
+        );
+        let Storage::F32(actual) = actual.storage() else {
+            panic!("predicated WGSL F32 output")
+        };
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    for (dtype, storage, expected) in [
+        (
+            DType::F16,
+            Storage::F16(vec![0x7e00, 0x8000]),
+            Storage::F16(vec![0, 0x7e00, 0x8000, 0]),
+        ),
+        (
+            DType::BF16,
+            Storage::BF16(vec![0x7fc1, 0x8000]),
+            Storage::BF16(vec![0, 0x7fc1, 0x8000, 0]),
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let padded = graph.pad(input, [(1, 1)], Scalar::F(0.0)).unwrap();
+        let output = graph.detach(padded).unwrap();
+        let (actual, _) = execute_mock(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_storage([2], storage).unwrap(),
+            )]),
+        );
+        assert_eq!(
+            actual.storage(),
+            &expected,
+            "{dtype:?} raw predicated passthrough"
+        );
+    }
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1], DType::F32);
+    let rhs = graph.input_dtype("rhs", [1], DType::F32);
+    let lhs = graph.pad(lhs, [(1, 1)], Scalar::F(0.0)).unwrap();
+    let rhs = graph.pad(rhs, [(1, 1)], Scalar::F(0.0)).unwrap();
+    let output = graph.add(lhs, rhs).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let source = WgslRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap()
+        .source;
+    let temporaries = source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("var rg_predicated_"))
+        .filter_map(|suffix| suffix.split(':').next())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(temporaries.len(), 2, "each predicated Load owns one name");
+}
 
 #[test]
 fn portable_dense_wgsl_uses_checked_regions_and_atomic_byte_writes() {
@@ -1617,7 +1708,14 @@ fn allocate_rendered(
         .buffers
         .iter()
         .map(|abi| {
-            let buffer = device.allocate_typed(abi.elements, abi.dtype).unwrap();
+            let buffer = device
+                .allocate_static(crate::runtime::static_schedule::StaticBufferAllocation {
+                    elements: abi.elements,
+                    bytes: abi.elements * abi.dtype.itemsize(),
+                    dtype: abi.dtype,
+                    requires_native_handle: rendered.extent != 0,
+                })
+                .unwrap();
             if let Some(value) = values.get(&abi.id) {
                 queue
                     .write(&buffer, 0, &value.to_le_bytes().unwrap())
@@ -1997,6 +2095,12 @@ fn execute_webgpu_semantics(program: &UOp, bindings: &KernelBindings) -> crate::
         return Err(crate::Error::InvalidIndex);
     };
     let dtype = index.ty().ok_or(crate::Error::InvalidIndex)?.scalar;
+    if crate::projected_index::ProjectedIndexPlan::from_direct_predicated_load(&store.sources()[1])
+        .map_err(|_| crate::Error::InvalidIndex)?
+        .is_some()
+    {
+        return execute_lowered_elementwise(program, bindings);
+    }
     if dtype == DType::BF16
         && store.sources()[1].operation() == &Operation::Cast
         && store.sources()[1]

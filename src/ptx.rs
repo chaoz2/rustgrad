@@ -30,7 +30,7 @@ mod prefix_scan;
 #[path = "ptx_sort.rs"]
 mod sort;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v31";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v32";
 /// Separate identity for raw storage-width computed affine materialization.
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 /// Separate identity for dense raw storage-width materialization.
@@ -808,12 +808,18 @@ fn render(
     let nodes = root
         .topological()
         .map_err(|e| PtxError::Unsupported(e.to_string()))?;
-    if nodes
-        .iter()
-        .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
-    {
+    if nodes.iter().any(|node| {
+        matches!(node.operation(), Operation::Load)
+            && node
+                .ty()
+                .is_some_and(|ty| matches!(ty.scalar, DType::F16 | DType::BF16))
+            && node
+                .sources()
+                .first()
+                .is_some_and(crate::projected_index::ProjectedIndexPlan::is_predicated)
+    }) {
         return Err(PtxError::Unsupported(
-            "predicated projected loads are outside PTX lowering".into(),
+            "predicated narrow loads require a raw PTX storage path".into(),
         ));
     }
     let store = root
@@ -1010,6 +1016,7 @@ fn render(
         // A distinct register namespace prevents projected addresses from
         // colliding with pointer parameters or typed scalar value IDs.
         lines.push("  .reg .s64 %rgi<128>;".into());
+        lines.push("  .reg .pred %rgp<128>;".into());
     }
     for n in 0..buffers.len() {
         lines.push(format!("  ld.param.u64 %rd{}0, [p{n}];", n + 1));
@@ -5392,6 +5399,8 @@ fn emit(
                         linear: &'a str,
                         next: usize,
                         free: Vec<usize>,
+                        predicate_next: usize,
+                        predicate_free: Vec<usize>,
                     }
                     impl crate::projected_index::ProjectedIndexEmitter for PtxProjectedIndex<'_> {
                         type Value = usize;
@@ -5440,6 +5449,70 @@ fn emit(
                             Ok(lhs)
                         }
                     }
+                    impl crate::projected_index::ProjectedPredicateEmitter for PtxProjectedIndex<'_> {
+                        type Predicate = usize;
+
+                        fn boolean(&mut self, value: bool) -> Result<Self::Predicate, Self::Error> {
+                            let predicate = self.allocate_predicate()?;
+                            let comparison = if value { "eq" } else { "ne" };
+                            self.lines
+                                .push(format!("  setp.{comparison}.u32 %rgp{predicate}, 0, 0;"));
+                            Ok(predicate)
+                        }
+
+                        fn compare(
+                            &mut self,
+                            operation: crate::CompareOp,
+                            lhs: Self::Value,
+                            rhs: Self::Value,
+                        ) -> Result<Self::Predicate, Self::Error> {
+                            let comparison = match operation {
+                                crate::CompareOp::Eq => "eq",
+                                crate::CompareOp::Ne => "ne",
+                                crate::CompareOp::Lt => "lt",
+                                crate::CompareOp::Le => "le",
+                                crate::CompareOp::Gt => "gt",
+                                crate::CompareOp::Ge => "ge",
+                            };
+                            let predicate = self.allocate_predicate()?;
+                            self.lines.push(format!(
+                                "  setp.{comparison}.s64 %rgp{predicate}, %rgi{lhs}, %rgi{rhs};"
+                            ));
+                            self.free.extend([lhs, rhs]);
+                            Ok(predicate)
+                        }
+
+                        fn logical(
+                            &mut self,
+                            operation: crate::LogicalOp,
+                            lhs: Self::Predicate,
+                            rhs: Option<Self::Predicate>,
+                        ) -> Result<Self::Predicate, Self::Error> {
+                            match (operation, rhs) {
+                                (crate::LogicalOp::Not, None) => {
+                                    self.lines.push(format!("  not.pred %rgp{lhs}, %rgp{lhs};"));
+                                }
+                                (crate::LogicalOp::And, Some(rhs)) => {
+                                    self.lines.push(format!(
+                                        "  and.pred %rgp{lhs}, %rgp{lhs}, %rgp{rhs};"
+                                    ));
+                                    self.predicate_free.push(rhs);
+                                }
+                                (crate::LogicalOp::Or, Some(rhs)) => {
+                                    self.lines.push(format!(
+                                        "  or.pred %rgp{lhs}, %rgp{lhs}, %rgp{rhs};"
+                                    ));
+                                    self.predicate_free.push(rhs);
+                                }
+                                _ => {
+                                    return Err(PtxError::Unsupported(
+                                        "projected predicate operation".into(),
+                                    ));
+                                }
+                            }
+                            Ok(lhs)
+                        }
+                    }
                     impl PtxProjectedIndex<'_> {
                         fn allocate(&mut self) -> Result<usize, PtxError> {
                             // The generic renderer reserves a distinct rgi
@@ -5461,15 +5534,36 @@ fn emit(
                             self.next += 1;
                             Ok(register)
                         }
+
+                        fn allocate_predicate(&mut self) -> Result<usize, PtxError> {
+                            if let Some(predicate) = self.predicate_free.pop() {
+                                return Ok(predicate);
+                            }
+                            if self.predicate_next >= 128 {
+                                return Err(PtxError::Unsupported(
+                                    "projected predicate exceeds PTX register budget".into(),
+                                ));
+                            }
+                            let predicate = self.predicate_next;
+                            self.predicate_next += 1;
+                            Ok(predicate)
+                        }
                     }
                     let mut emitter = PtxProjectedIndex {
                         lines,
                         linear,
                         next: 0,
                         free: Vec::new(),
+                        predicate_next: 0,
+                        predicate_free: Vec::new(),
                     };
-                    let offset = format!("%rgi{}", plan.emit(&mut emitter)?);
-                    (buffer, input_shape, output_shape, None, Some(offset))
+                    let offset = plan.emit(&mut emitter)?;
+                    emitter
+                        .lines
+                        .push(format!("  mov.s64 %rd28, %rgi{offset};"));
+                    emitter.free.push(offset);
+                    let predicate = plan.emit_predicate(&mut emitter)?;
+                    (buffer, input_shape, output_shape, None, Some(predicate))
                 }
                 Operation::Index(IndexValue::Buffer {
                     buffer,
@@ -5487,9 +5581,8 @@ fn emit(
                 _ => return Err(PtxError::Unsupported("Load index".into())),
             };
             let b = ids[buffer] + 1;
-            if let Some(offset) = projected {
-                lines.push(format!("  mov.s64 %rd28, {offset};"));
-            } else {
+            let projected_predicate = projected.flatten();
+            if projected.is_none() {
                 let off = broadcast_offset(input_shape.dims(), output_shape.dims(), linear)?;
                 lines.extend(off);
                 if let Some(view) = view {
@@ -5500,9 +5593,25 @@ fn emit(
             // map has been proven in-range by its immutable descriptor.
             lines.push(format!("  mul.lo.u64 %rd28, %rd28, {};", ty.itemsize()));
             lines.push(format!("  add.u64 %rd29, %rd{b}0, %rd28;"));
+            if projected_predicate.is_some() {
+                match ty {
+                    DType::F16 | DType::BF16 | DType::Bool | DType::I32 | DType::U32 => {
+                        lines.push(format!("  mov.b32 %r{id}, 0;"));
+                    }
+                    DType::F32 => lines.push(format!("  mov.b32 {dst}, 0x00000000;")),
+                    DType::F64 => {
+                        lines.push(format!("  mov.b64 {dst}, 0x0000000000000000;"));
+                    }
+                    DType::I64 | DType::U64 => lines.push(format!("  mov.b64 {dst}, 0;")),
+                    _ => unreachable!("validated PTX storage"),
+                }
+            }
+            let guard = projected_predicate
+                .map(|predicate| format!("@%rgp{predicate} "))
+                .unwrap_or_default();
             match ty {
                 DType::F16 => {
-                    lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
+                    lines.push(format!("  {guard}ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
                         && !matches!(
                             storage_mode,
@@ -5523,7 +5632,7 @@ fn emit(
                     }
                 }
                 DType::BF16 => {
-                    lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
+                    lines.push(format!("  {guard}ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
                         && !matches!(
                             storage_mode,
@@ -5544,7 +5653,10 @@ fn emit(
                         lines.push(format!("  mov.b32 {dst}, %r90;"));
                     }
                 }
-                _ => lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty))),
+                _ => lines.push(format!(
+                    "  {guard}ld.global.{} {dst}, [%rd29];",
+                    ptx_type(ty)
+                )),
             }
         }
         Operation::Cast

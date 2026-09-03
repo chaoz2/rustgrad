@@ -1324,10 +1324,11 @@ fn portable_ordinary_kernel(kernel: &UOp) -> bool {
             .iter()
             .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
     }) {
-        // Predicated loads are an authenticated CPU/interpreter capability.
-        // Device renderers reject them explicitly before resource planning;
-        // requiring every portable renderer here would retain the Pad
-        // materialization and erase the typed contract from the schedule.
+        // Predicated loads carry one backend-neutral authenticated plan. Keep
+        // that plan visible in the schedule even when a particular renderer's
+        // dtype or address-width capability will reject it before resources;
+        // otherwise scheduling would silently replace the semantic contract
+        // with a Pad materialization based on the host's backend inventory.
         return true;
     }
     let ptx = crate::PtxRenderer::new(80).and_then(|renderer| renderer.render(kernel));

@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v8";
+pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v9";
 pub const OPENCL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-opencl-raw-copy-v1";
 pub const OPENCL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-opencl-portable-bitcast-v1";
 pub const OPENCL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
@@ -240,14 +240,6 @@ impl OpenClRenderer {
         let nodes = root
             .topological()
             .map_err(|error| OpenClError::Unsupported(error.to_string()))?;
-        if nodes
-            .iter()
-            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
-        {
-            return Err(OpenClError::Unsupported(
-                "predicated projected loads are outside OpenCL lowering".into(),
-            ));
-        }
         let uses_f16 = nodes
             .iter()
             .any(|node| node.ty().is_some_and(|ty| ty.scalar == DType::F16));
@@ -294,7 +286,19 @@ impl OpenClRenderer {
             .ty()
             .ok_or_else(|| OpenClError::Unsupported("untyped output index".into()))?
             .scalar;
-        supported_storage(output_dtype, self.capabilities)?;
+        let store_value = store
+            .sources()
+            .get(1)
+            .ok_or_else(|| OpenClError::Unsupported("store has no value".into()))?;
+        let preserves_raw_predicated_narrow = narrow::is_narrow(output_dtype)
+            && crate::projected_index::ProjectedIndexPlan::from_direct_predicated_load(store_value)
+                .map_err(|_| OpenClError::Unsupported("invalid predicated narrow load".into()))?
+                .is_some();
+        supported_kernel_storage(
+            output_dtype,
+            self.capabilities,
+            preserves_raw_predicated_narrow,
+        )?;
 
         let mut inventory = BTreeMap::<u64, OpenClBufferAbi>::new();
         for node in &nodes {
@@ -324,7 +328,7 @@ impl OpenClRenderer {
                 .ty()
                 .ok_or_else(|| OpenClError::Unsupported("untyped buffer index".into()))?
                 .scalar;
-            supported_storage(dtype, self.capabilities)?;
+            supported_kernel_storage(dtype, self.capabilities, preserves_raw_predicated_narrow)?;
             let abi = OpenClBufferAbi {
                 id: buffer,
                 dtype,
@@ -342,10 +346,6 @@ impl OpenClRenderer {
             }
         }
 
-        let store_value = store
-            .sources()
-            .get(1)
-            .ok_or_else(|| OpenClError::Unsupported("store has no value".into()))?;
         let reduction = crate::reduction_native::NativeReductionKernel::from_store(store)
             .map_err(|reason| OpenClError::Unsupported(reason.into()))?;
         let mut schedule_inputs = Vec::new();
@@ -457,7 +457,10 @@ impl OpenClRenderer {
         }
 
         let entry = format!("rg_opencl_e{}_b{}", extent, buffers.len());
-        let mut required_capabilities = required_capabilities(&buffers, uses_f16 || uses_bf16);
+        let mut required_capabilities = required_capabilities(
+            &buffers,
+            (uses_f16 || uses_bf16) && !preserves_raw_predicated_narrow,
+        );
         required_capabilities.int64 |= nodes
             .iter()
             .any(crate::projected_index::ProjectedIndexPlan::is_projected);
@@ -520,7 +523,16 @@ impl OpenClRenderer {
                 transaction.as_ref(),
             )?;
         } else {
-            let value = if let Some(transaction) = &transaction {
+            let raw_predicated_narrow = if transaction.is_none() && narrow::is_narrow(output_dtype)
+            {
+                emit_raw_predicated_narrow_load(store_value, &ids, "gid")?
+            } else {
+                None
+            };
+            let preserves_raw_narrow = raw_predicated_narrow.is_some();
+            let value = if let Some(value) = raw_predicated_narrow {
+                value
+            } else if let Some(transaction) = &transaction {
                 emit_transactional(
                     store_value,
                     transaction,
@@ -541,7 +553,11 @@ impl OpenClRenderer {
             };
             let store = format!(
                 "b{output_position}[gid] = {};",
-                encode_store(output_dtype, value)
+                if preserves_raw_narrow {
+                    value
+                } else {
+                    encode_store(output_dtype, value)
+                }
             );
             lines.push(if transaction.is_some() {
                 format!("  if (rg_ok) {store}")
@@ -1600,6 +1616,18 @@ fn supported_storage(dtype: DType, capabilities: OpenClCapabilities) -> Result<(
     }
 }
 
+fn supported_kernel_storage(
+    dtype: DType,
+    capabilities: OpenClCapabilities,
+    preserves_raw_predicated_narrow: bool,
+) -> Result<(), OpenClError> {
+    if preserves_raw_predicated_narrow && narrow::is_narrow(dtype) {
+        Ok(())
+    } else {
+        supported_storage(dtype, capabilities)
+    }
+}
+
 pub(super) fn cl_type(dtype: DType) -> &'static str {
     match dtype {
         DType::Bool => "uchar",
@@ -1745,6 +1773,41 @@ impl ScalarLaneDialect for OpenClScalarDialect {
 
 fn encode_store(dtype: DType, value: impl AsRef<str>) -> String {
     narrow::encode(dtype, value.as_ref()).unwrap_or_else(|| value.as_ref().into())
+}
+
+fn emit_raw_predicated_narrow_load(
+    value: &UOp,
+    ids: &BTreeMap<u64, usize>,
+    linear: &str,
+) -> Result<Option<String>, OpenClError> {
+    let Some(plan) = crate::projected_index::ProjectedIndexPlan::from_direct_predicated_load(value)
+        .map_err(|_| OpenClError::Unsupported("invalid predicated narrow load".into()))?
+    else {
+        return Ok(None);
+    };
+    let position = ids
+        .get(&plan.buffer)
+        .ok_or_else(|| OpenClError::InvalidBinding("load buffer absent from ABI".into()))?;
+    let access = crate::projected_index::render_infix_projected_access(
+        &plan,
+        format!("((long)({linear}))"),
+        |literal| {
+            Ok(if literal == i64::MIN {
+                "((-9223372036854775807l) - 1l)".into()
+            } else {
+                format!("((long){literal}l)")
+            })
+        },
+        |boolean| if boolean { "1" } else { "0" }.into(),
+    )
+    .map_err(|_| OpenClError::Unsupported("invalid predicated narrow load".into()))?;
+    let predicate = access
+        .predicate
+        .ok_or_else(|| OpenClError::Unsupported("predicated narrow load has no guard".into()))?;
+    Ok(Some(format!(
+        "(({predicate}) ? (b{position}[{}]) : ((ushort)0u))",
+        access.offset
+    )))
 }
 
 fn required_capabilities(buffers: &[OpenClBufferAbi], uses_narrow: bool) -> OpenClCapabilities {
@@ -1925,7 +1988,7 @@ fn emit_expr_with_substitution(
                 {
                     let plan = crate::projected_index::ProjectedIndexPlan::from_index(index)
                         .map_err(|_| OpenClError::Unsupported("invalid projected index".into()))?;
-                    let offset = crate::projected_index::render_infix_projected_index(
+                    let access = crate::projected_index::render_infix_projected_access(
                         &plan,
                         format!("((long)({linear}))"),
                         |value| {
@@ -1935,19 +1998,36 @@ fn emit_expr_with_substitution(
                                 format!("((long){value}l)")
                             })
                         },
+                        |value| if value { "1" } else { "0" }.into(),
                     )
                     .map_err(|_| OpenClError::Unsupported("invalid projected index".into()))?;
                     let position = ids.get(buffer).ok_or_else(|| {
                         OpenClError::InvalidBinding("load buffer absent from ABI".into())
                     })?;
-                    let raw = format!("b{position}[{offset}]");
-                    return if dtype == DType::Bool {
-                        Ok(format!("(({raw}) != 0)"))
+                    let raw = format!("b{position}[{}]", access.offset);
+                    let value = if dtype == DType::Bool {
+                        format!("(({raw}) != 0)")
                     } else if narrow::is_narrow(dtype) {
-                        Ok(narrow::decode(dtype, raw).expect("validated narrow load"))
+                        narrow::decode(dtype, raw).expect("validated narrow load")
                     } else {
-                        Ok(raw)
+                        raw
                     };
+                    return Ok(access
+                        .predicate
+                        .map(|predicate| {
+                            let zero = match dtype {
+                                DType::Bool => "false",
+                                DType::F16 | DType::BF16 | DType::F32 => "0.0f",
+                                DType::F64 => "0.0",
+                                DType::I32 => "((int)0)",
+                                DType::U32 => "((uint)0u)",
+                                DType::I64 => "((long)0l)",
+                                DType::U64 => "((ulong)0ul)",
+                                _ => unreachable!("validated OpenCL storage"),
+                            };
+                            format!("(({predicate}) ? ({value}) : ({zero}))")
+                        })
+                        .unwrap_or(value));
                 }
                 Operation::Index(IndexValue::Buffer {
                     buffer,

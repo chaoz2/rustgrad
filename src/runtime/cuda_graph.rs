@@ -156,6 +156,22 @@ struct CudaGraphBinding {
     keepalives: Vec<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
+fn cuda_physical_allocation_bytes(
+    allocation: crate::runtime::static_schedule::StaticBufferAllocation,
+    slot: usize,
+) -> Result<NonZeroUsize, PtxError> {
+    let bytes = if allocation.bytes == 0 && allocation.requires_native_handle {
+        4
+    } else {
+        allocation.bytes
+    };
+    NonZeroUsize::new(bytes).ok_or_else(|| {
+        PtxError::Unsupported(format!(
+            "nonzero CUDA graph item requires zero-byte physical slot {slot}"
+        ))
+    })
+}
+
 impl CudaGraphPrefixPlan {
     pub fn plan(items: &[ScheduleItem], renderer: PtxRenderer) -> Result<Self, PtxError> {
         Self::plan_with_retained(items, None, renderer)
@@ -262,11 +278,7 @@ impl PreparedCudaGraphPrefix {
         let allocator = primary.allocator();
         let mut leases = Vec::with_capacity(plan.allocations().slots().len());
         for (slot, allocation) in plan.allocations().slots().iter().enumerate() {
-            let bytes = NonZeroUsize::new(allocation.bytes).ok_or_else(|| {
-                PtxError::Unsupported(format!(
-                    "nonzero CUDA graph item requires zero-byte physical slot {slot}"
-                ))
-            })?;
+            let bytes = cuda_physical_allocation_bytes(*allocation, slot)?;
             leases.push(Arc::new(allocator.allocate(bytes)?));
         }
         let logical_slots = plan.allocations().logical_slots().clone();
@@ -417,11 +429,7 @@ impl PreparedCudaGraphPrefix {
         let allocator = primary.allocator();
         let mut leases = Vec::with_capacity(plan.allocations().slots().len());
         for (slot, allocation) in plan.allocations().slots().iter().enumerate() {
-            let bytes = NonZeroUsize::new(allocation.bytes).ok_or_else(|| {
-                PtxError::Unsupported(format!(
-                    "nonzero CUDA graph item requires zero-byte physical slot {slot}"
-                ))
-            })?;
+            let bytes = cuda_physical_allocation_bytes(*allocation, slot)?;
             leases.push(Arc::new(allocator.allocate(bytes)?));
         }
         let logical_slots = plan.allocations().logical_slots().clone();
@@ -1528,6 +1536,41 @@ mod tests {
                     | "graph_launch"
             )
         }));
+    }
+
+    #[test]
+    fn predicated_projected_cuda_graph_guards_addressless_source_loads() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [0], crate::DType::F32);
+        let padded = graph.pad(input, [(2, 1)], crate::Scalar::F(0.0)).unwrap();
+        let output = graph.detach(padded).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&schedule.items[0].kernel)
+            .unwrap();
+        assert!(rendered.source.contains("@%rgp"));
+        assert!(rendered.source.contains("ld.global"));
+
+        let (mock, primary) = make_primary();
+        let mut prepared = prepare_outputs(primary, &schedule, &[output.index() as u64]);
+        let mut values = BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage([0], Storage::F32(vec![])).unwrap(),
+        )]);
+        prepared.execute(&mut values).unwrap();
+        assert_eq!(
+            values[&(output.index() as u64)].storage(),
+            &Storage::F32(vec![0.0; 3])
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| **call == "graph_launch")
+                .count(),
+            1
+        );
     }
 
     fn projected_reduction_capture() -> CapturedSchedule {

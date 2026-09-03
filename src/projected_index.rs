@@ -634,6 +634,23 @@ impl ProjectedIndexPlan {
         })
     }
 
+    /// Recognizes the only projected path whose storage payload can bypass
+    /// scalar decoding: a predicated Load stored as the value itself. The
+    /// returned plan is still fully authenticated by `from_index`; renderers
+    /// may preserve raw narrow lanes while spelling their own guarded load.
+    pub(crate) fn from_direct_predicated_load(value: &UOp) -> Result<Option<Self>, UOpError> {
+        let Operation::Load = value.operation() else {
+            return Ok(None);
+        };
+        let [index] = value.sources() else {
+            return Err(UOpError::InvalidIndex);
+        };
+        if !Self::is_predicated(index) {
+            return Ok(None);
+        }
+        Self::from_index(index).map(Some)
+    }
+
     pub(crate) fn fits_i32(&self) -> bool {
         self.fits_i32
     }
@@ -652,6 +669,16 @@ impl ProjectedIndexPlan {
         emitter: &mut E,
     ) -> Result<E::Value, E::Error> {
         self.expression.emit(emitter)
+    }
+
+    pub(crate) fn emit_predicate<E: ProjectedPredicateEmitter>(
+        &self,
+        emitter: &mut E,
+    ) -> Result<Option<E::Predicate>, E::Error> {
+        self.predicate
+            .as_ref()
+            .map(|predicate| predicate.emit(emitter))
+            .transpose()
     }
 
     pub(crate) fn is_guarded(&self) -> bool {
@@ -721,13 +748,16 @@ pub(crate) fn canonicalize_graph_projected_address(
     expression.to_uop(output_elements)
 }
 
-struct InfixProjectedEmitter<'a, F> {
+struct InfixProjectedEmitter<'a, F, B> {
     linear: String,
     literal: &'a mut F,
+    boolean: &'a mut B,
 }
 
-impl<F: FnMut(i64) -> Result<String, UOpError>> ProjectedIndexEmitter
-    for InfixProjectedEmitter<'_, F>
+impl<F, B> ProjectedIndexEmitter for InfixProjectedEmitter<'_, F, B>
+where
+    F: FnMut(i64) -> Result<String, UOpError>,
+    B: FnMut(bool) -> String,
 {
     type Value = String;
     type Error = UOpError;
@@ -758,13 +788,15 @@ impl<F: FnMut(i64) -> Result<String, UOpError>> ProjectedIndexEmitter
     }
 }
 
-impl<F: FnMut(i64) -> Result<String, UOpError>> ProjectedPredicateEmitter
-    for InfixProjectedEmitter<'_, F>
+impl<F, B> ProjectedPredicateEmitter for InfixProjectedEmitter<'_, F, B>
+where
+    F: FnMut(i64) -> Result<String, UOpError>,
+    B: FnMut(bool) -> String,
 {
     type Predicate = String;
 
     fn boolean(&mut self, value: bool) -> Result<Self::Predicate, Self::Error> {
-        Ok(if value { "1" } else { "0" }.into())
+        Ok((self.boolean)(value))
     }
 
     fn compare(
@@ -804,14 +836,38 @@ pub(crate) fn render_infix_projected_predicate(
     linear: impl Into<String>,
     mut literal: impl FnMut(i64) -> Result<String, UOpError>,
 ) -> Result<Option<String>, UOpError> {
+    let mut boolean = |value| String::from(if value { "1" } else { "0" });
     let mut emitter = InfixProjectedEmitter {
         linear: linear.into(),
         literal: &mut literal,
+        boolean: &mut boolean,
     };
-    plan.predicate
-        .as_ref()
-        .map(|predicate| predicate.emit(&mut emitter))
-        .transpose()
+    plan.emit_predicate(&mut emitter)
+}
+
+pub(crate) struct InfixProjectedAccess {
+    pub(crate) offset: String,
+    pub(crate) predicate: Option<String>,
+}
+
+/// Renders the address and optional validity predicate through one checked
+/// projection. Backends remain responsible for spelling a genuinely guarded
+/// load: an eager value selection is not sufficient for addressless sources.
+pub(crate) fn render_infix_projected_access(
+    plan: &ProjectedIndexPlan,
+    linear: impl Into<String>,
+    mut literal: impl FnMut(i64) -> Result<String, UOpError>,
+    mut boolean: impl FnMut(bool) -> String,
+) -> Result<InfixProjectedAccess, UOpError> {
+    let mut emitter = InfixProjectedEmitter {
+        linear: linear.into(),
+        literal: &mut literal,
+        boolean: &mut boolean,
+    };
+    Ok(InfixProjectedAccess {
+        offset: plan.emit(&mut emitter)?,
+        predicate: plan.emit_predicate(&mut emitter)?,
+    })
 }
 
 pub(crate) fn render_infix_projected_index(
@@ -819,9 +875,11 @@ pub(crate) fn render_infix_projected_index(
     linear: impl Into<String>,
     mut literal: impl FnMut(i64) -> Result<String, UOpError>,
 ) -> Result<String, UOpError> {
+    let mut boolean = |value| String::from(if value { "1" } else { "0" });
     plan.emit(&mut InfixProjectedEmitter {
         linear: linear.into(),
         literal: &mut literal,
+        boolean: &mut boolean,
     })
 }
 

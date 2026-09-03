@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v6";
+pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v7";
 pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-metal-portable-bitcast-v1";
 pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
@@ -238,14 +238,6 @@ impl MetalRenderer {
         let nodes = root
             .topological()
             .map_err(|error| MetalError::Unsupported(error.to_string()))?;
-        if nodes
-            .iter()
-            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
-        {
-            return Err(MetalError::Unsupported(
-                "predicated projected loads are outside Metal lowering".into(),
-            ));
-        }
         if nodes.iter().any(|node| {
             matches!(
                 node.operation(),
@@ -1937,7 +1929,7 @@ fn emit_expr_with_substitution(
                 {
                     let plan = crate::projected_index::ProjectedIndexPlan::from_index(index)
                         .map_err(|_| MetalError::Unsupported("invalid projected index".into()))?;
-                    let offset = crate::projected_index::render_infix_projected_index(
+                    let access = crate::projected_index::render_infix_projected_access(
                         &plan,
                         format!("((long)({linear}))"),
                         |value| {
@@ -1947,17 +1939,31 @@ fn emit_expr_with_substitution(
                                 format!("((long){value}l)")
                             })
                         },
+                        |value| if value { "1" } else { "0" }.into(),
                     )
                     .map_err(|_| MetalError::Unsupported("invalid projected index".into()))?;
                     let position = ids.get(buffer).ok_or_else(|| {
                         MetalError::InvalidBinding("load buffer absent from ABI".into())
                     })?;
-                    let raw = format!("b{position}[{offset}]");
-                    return if dtype == DType::Bool {
-                        Ok(format!("(({raw}) != 0)"))
+                    let raw = format!("b{position}[{}]", access.offset);
+                    let value = if dtype == DType::Bool {
+                        format!("(({raw}) != 0)")
                     } else {
-                        Ok(raw)
+                        raw
                     };
+                    return Ok(access
+                        .predicate
+                        .map(|predicate| {
+                            let zero = match dtype {
+                                DType::Bool => "false",
+                                DType::F32 => "0.0f",
+                                DType::I32 => "((int)0)",
+                                DType::U32 => "((uint)0u)",
+                                _ => unreachable!("validated Metal storage"),
+                            };
+                            format!("(({predicate}) ? ({value}) : ({zero}))")
+                        })
+                        .unwrap_or(value));
                 }
                 Operation::Index(IndexValue::Buffer {
                     buffer,

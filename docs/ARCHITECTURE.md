@@ -192,9 +192,20 @@ without touching memory. A zero-element source uses the narrower authenticated
 addressless form: address zero plus an exact constant-false predicate, so a
 populated padded output never invents a dereferenceable source element.
 Requested Pad outputs, nonzero fills, shared ownership, and every unproved
-composition retain the materializing movement plan. The captured interpreter
-and strict native C path execute this contract; PTX, OpenCL, Metal, WGSL,
-symbolic programs, and vector lanes reject it before resource work.
+composition retain the materializing movement plan. The captured interpreter,
+strict native C, PTX, OpenCL C, Metal, and WGSL paths execute this contract.
+The portable renderers consume the same checked address and predicate trees:
+PTX predicates the physical load, OpenCL C and Metal use short-circuiting
+conditional expressions, and WGSL uses an explicit `if` because `select`
+evaluates both values. Each false lane is initialized to canonical typed zero,
+including the zero-source addressless form. Exact direct F16/BF16 passthroughs
+on OpenCL and WGSL keep the guarded lane in its raw u16 storage form, avoiding
+NaN-payload changes from decode/re-encode; numeric narrow consumers retain
+their established typed commitment. PTX rejects predicated narrow loads until
+it has an equivalent raw-storage path, while Metal's portable subset already
+rejects narrow storage. Symbolic programs, vector lanes, guarded fault
+transactions, unsupported dtypes, and unproved live-device configurations
+remain rejected before resource work.
 
 `reduction_native.rs` is the single checked reduction recurrence boundary for
 CPU, capture, and native renderers. It derives exact source/accumulator/output
@@ -2110,9 +2121,14 @@ three-source `IndexAddressing::Predicated` form `(buffer, address, valid)`;
 v22 remains exclusively the tag envelope, and historical v18/v21/v22 bytes are
 unchanged. False lanes produce canonical typed zero and cannot read either a
 safe placeholder address or the authenticated addressless empty-source form.
-Dynamic/symbolic shapes, effects and guarded fault transactions, unsupported index operations,
-excessive backend address width/depth, and specialized dense-operand kernels
-remain explicit boundaries rather than hidden host materializations.
+Static prepared CUDA, OpenCL, Metal, and WebGPU prefixes preserve the ordinary
+projected input dependency and output ownership, including a private physical
+sentinel for an addressless zero-byte input used by a nonzero launch. Renderer
+cache versions distinguish the new source while RGUA and schedule/artifact
+identity stay unchanged. Dynamic/symbolic shapes, effects and guarded fault
+transactions, unsupported index operations, excessive backend address
+width/depth, and specialized dense-operand kernels remain explicit boundaries
+rather than hidden host materializations.
 
 ## Static-graph autograd lifecycle
 
