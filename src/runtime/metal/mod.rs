@@ -27,7 +27,7 @@ pub use resource::{
 };
 pub use session::{
     MetalDevicePreparationReport, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
-    MetalDeviceSessionPlan, MetalDeviceSessionSummary,
+    MetalDeviceSessionPlan, MetalDeviceSessionSummary, MetalInferencePlan,
 };
 pub use transaction::{
     GuardedIntegerOp, METAL_TRANSACTION_ABI_VERSION, MetalGuard, MetalTransactionAbi,

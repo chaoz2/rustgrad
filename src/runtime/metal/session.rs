@@ -4,7 +4,7 @@ use super::{
     MetalDevice, MetalDeviceInfo, MetalError, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix,
     RenderedMetal, prepared::InitializedMetalPrefix,
 };
-use crate::{CapturedSchedule, ReplayInput, TensorData};
+use crate::{CapturedInference, CapturedSchedule, ExecutionPlanSummary, ReplayInput, TensorData};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -125,6 +125,77 @@ impl MetalDeviceRun {
     /// Returns measurements committed with this successful invocation.
     pub fn report(&self) -> &MetalDeviceRunReport {
         &self.report
+    }
+}
+
+/// Resource-free deployment of one owned inference capture to the strict
+/// persistent Metal session path.
+///
+/// Immutable resident values are frozen by the backend-neutral capture. This
+/// wrapper adds no execution policy: rendering, allocation, preparation, and
+/// repeated execution remain owned by [`MetalDeviceSessionPlan`] and
+/// [`MetalDeviceSession`].
+pub struct MetalInferencePlan {
+    inner: MetalDeviceSessionPlan,
+    execution_plan: ExecutionPlanSummary,
+    resident_bindings: BTreeMap<String, TensorData>,
+    deployment_identity: u64,
+}
+
+impl MetalInferencePlan {
+    /// Renders an owned inference capture without creating a Metal resource.
+    pub fn new(inference: CapturedInference, renderer: MetalRenderer) -> Result<Self, MetalError> {
+        let (capture, execution_plan, resident_bindings, deployment_identity) =
+            inference.into_parts();
+        let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
+        let inner = MetalDeviceSessionPlan::from_capture(capture, resident_names, renderer)?;
+        Ok(Self {
+            inner,
+            execution_plan,
+            resident_bindings,
+            deployment_identity,
+        })
+    }
+
+    /// Returns the identity of the capture plus exact immutable resident
+    /// names, descriptors, and payload bytes.
+    pub const fn deployment_identity(&self) -> u64 {
+        self.deployment_identity
+    }
+
+    /// Returns the exact authenticated capture owned by the device plan.
+    pub fn capture(&self) -> &CapturedSchedule {
+        self.inner.capture()
+    }
+
+    /// Returns backend-neutral logical schedule and memory facts.
+    pub const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.execution_plan
+    }
+
+    /// Returns typed immutable resident schemas.
+    pub fn resident_inputs(&self) -> &[ReplayInput] {
+        self.inner.resident_inputs()
+    }
+
+    /// Returns typed per-invocation transient schemas.
+    pub fn transient_inputs(&self) -> &[ReplayInput] {
+        self.inner.transient_inputs()
+    }
+
+    /// Returns deterministic Metal resource and execution planning metadata.
+    pub fn summary(&self) -> &MetalDeviceSessionSummary {
+        self.inner.summary()
+    }
+
+    /// Returns every rendered item, including addressless zero-work items.
+    pub fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
+        self.inner.rendered_items()
+    }
+
+    /// Creates persistent resources and uploads the frozen residents once.
+    pub fn prepare(self, device: MetalDevice) -> Result<MetalDeviceSession, MetalError> {
+        self.inner.prepare(device, self.resident_bindings)
     }
 }
 

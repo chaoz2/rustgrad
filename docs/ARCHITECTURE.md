@@ -2515,6 +2515,18 @@ deduplicated materialized requested owners, and reconstructs ordered duplicate
 or affine passthrough outputs through the shared captured projection. There is
 no CPU fallback branch.
 
+`CapturedInference` is the backend-neutral model admission layer above that
+runtime. From one already-composed graph plus `Module` traversal it owns the
+authenticated capture, its logical `ExecutionPlanSummary`, only immutable
+module bindings that survive capture, and the remaining transient schemas. Its
+deployment identity includes exact resident names, descriptors, and bytes but
+does not alter program or renderer cache identity. `MetalInferencePlan` consumes
+that resource-free snapshot, exposes the capture, logical plan, rendered items,
+and Metal resource summary, and delegates preparation and execution unchanged
+to `MetalDeviceSessionPlan`/`MetalDeviceSession`. Module mutation after capture
+cannot change the frozen deployment; device discovery and selection remain
+explicit.
+
 The plan exposes exact typed input schemas, every rendered schedule item,
 nonzero compiled-kernel cache keys, planned slot bytes including private
 zero-byte sentinels, and nonzero/zero item counts. The prepared session exposes

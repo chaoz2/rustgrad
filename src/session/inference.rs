@@ -1,13 +1,187 @@
-//! Fresh-graph static CPU module inference.
-use crate::nn::{ModuleForward, Parameter};
+//! Backend-neutral static module capture and fresh-graph CPU inference.
+use crate::nn::{Module, ModuleForward, Parameter, module_input_node_bindings};
 use crate::{
     Backend, CapturedReplayExecutor, CapturedReplayTrace, CapturedSchedule, CompileTrace,
-    CpuBackend, DType, Error, ExecutionPlanSummary, Graph, Result, Schedule, TensorData, schedule,
+    CpuBackend, DType, Error, ExecutionPlanSummary, ExecutionPlanSummaryError, Graph, NodeId,
+    ReplayError, ReplayInput, Result, Schedule, ScheduleError, TensorData, schedule, schedule_many,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
+    error, fmt,
+    hash::{Hash, Hasher},
     time::{Duration, Instant},
 };
+
+/// Backend-neutral, resource-free ownership of one static module inference
+/// capture and the immutable module values admitted by that capture.
+#[derive(Clone, Debug)]
+pub struct CapturedInference {
+    capture: CapturedSchedule,
+    execution_plan: ExecutionPlanSummary,
+    resident_bindings: BTreeMap<String, TensorData>,
+    transient_inputs: Vec<ReplayInput>,
+    identity: u64,
+}
+
+/// Failure while constructing an owned inference capture.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapturedInferenceError {
+    State(Error),
+    Schedule(ScheduleError),
+    Capture(ReplayError),
+    Summary(ExecutionPlanSummaryError),
+    Binding(String),
+}
+
+impl fmt::Display for CapturedInferenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "captured inference error: {self:?}")
+    }
+}
+
+impl error::Error for CapturedInferenceError {}
+
+impl CapturedInference {
+    /// Authenticates one static request and snapshots only graph-bound values
+    /// belonging to `module` that remain inputs of the resulting capture.
+    /// All validation completes before the owned capture is returned.
+    pub fn from_module_graph(
+        module: &(impl Module + ?Sized),
+        graph: &Graph,
+        requested: &[NodeId],
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        let schedule = schedule_many(graph, requested).map_err(CapturedInferenceError::Schedule)?;
+        let capture = CapturedSchedule::capture(graph, &schedule, requested)
+            .map_err(CapturedInferenceError::Capture)?;
+        let execution_plan = ExecutionPlanSummary::from_capture(&capture, true)
+            .map_err(CapturedInferenceError::Summary)?;
+        let mut module_bindings = module_input_node_bindings(module, graph)
+            .map_err(CapturedInferenceError::State)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let capture_names = capture
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<BTreeSet<_>>();
+        module_bindings.retain(|name, _| capture_names.contains(name.as_str()));
+
+        let mut resident_bindings = BTreeMap::new();
+        let mut transient_inputs = Vec::new();
+        for input in &capture.inputs {
+            let Some((node, _)) = module_bindings.get(&input.name) else {
+                transient_inputs.push(input.clone());
+                continue;
+            };
+            let node = *node;
+            if node != input.node || input.desc.id != node.index() as u64 {
+                transient_inputs.push(input.clone());
+                continue;
+            }
+            let (_, value) = module_bindings
+                .remove(&input.name)
+                .expect("checked module input binding exists");
+            validate_captured_inference_binding(input, node, &value)?;
+            resident_bindings.insert(input.name.clone(), value);
+        }
+        let identity = captured_inference_identity(&capture, &resident_bindings)?;
+        Ok(Self {
+            capture,
+            execution_plan,
+            resident_bindings,
+            transient_inputs,
+            identity,
+        })
+    }
+
+    /// Returns the deterministic capture plus resident-payload identity.
+    pub const fn deployment_identity(&self) -> u64 {
+        self.identity
+    }
+
+    /// Returns the exact authenticated schedule capture.
+    pub const fn capture(&self) -> &CapturedSchedule {
+        &self.capture
+    }
+
+    /// Returns the non-executing logical schedule and memory summary.
+    pub const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.execution_plan
+    }
+
+    /// Returns exact immutable values snapshotted from graph-bound module
+    /// state. Mutating the module later cannot alter these values.
+    pub const fn resident_bindings(&self) -> &BTreeMap<String, TensorData> {
+        &self.resident_bindings
+    }
+
+    /// Returns named input schemas that remain caller-supplied per run.
+    pub fn transient_inputs(&self) -> &[ReplayInput] {
+        &self.transient_inputs
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CapturedSchedule,
+        ExecutionPlanSummary,
+        BTreeMap<String, TensorData>,
+        u64,
+    ) {
+        (
+            self.capture,
+            self.execution_plan,
+            self.resident_bindings,
+            self.identity,
+        )
+    }
+}
+
+fn validate_captured_inference_binding(
+    input: &ReplayInput,
+    node: NodeId,
+    value: &TensorData,
+) -> std::result::Result<(), CapturedInferenceError> {
+    if input.node != node
+        || input.desc.id != node.index() as u64
+        || value.shape() != &input.desc.shape
+        || value.dtype() != input.desc.dtype
+    {
+        return Err(CapturedInferenceError::Binding(format!(
+            "resident input {} descriptor mismatch",
+            input.name
+        )));
+    }
+    let bytes = value.to_le_bytes().map_err(CapturedInferenceError::State)?;
+    if bytes.len() != input.desc.bytes {
+        return Err(CapturedInferenceError::Binding(format!(
+            "resident input {} byte length mismatch",
+            input.name
+        )));
+    }
+    Ok(())
+}
+
+fn captured_inference_identity(
+    capture: &CapturedSchedule,
+    residents: &BTreeMap<String, TensorData>,
+) -> std::result::Result<u64, CapturedInferenceError> {
+    let mut hasher = DefaultHasher::new();
+    "rustgrad-captured-inference-v1".hash(&mut hasher);
+    capture.identity.hash(&mut hasher);
+    for input in &capture.inputs {
+        let Some(value) = residents.get(&input.name) else {
+            continue;
+        };
+        input.hash(&mut hasher);
+        value
+            .to_le_bytes()
+            .map_err(CapturedInferenceError::State)?
+            .hash(&mut hasher);
+    }
+    Ok(hasher.finish())
+}
+
 #[derive(Clone, Debug)]
 pub struct ModuleInferenceResult {
     output: TensorData,
@@ -361,6 +535,14 @@ mod tests {
         }
     }
 
+    struct SingleParameter(Parameter);
+
+    impl Module for SingleParameter {
+        fn visit(&self, _: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor("value".into(), &self.0, StateKind::Buffer);
+        }
+    }
+
     fn relu_mlp() -> (Sequential, Parameter) {
         let first = Linear::new_static(2, 2, true, 41).unwrap();
         first
@@ -421,6 +603,92 @@ mod tests {
         model.push(Flatten::new(1));
         model.push(linear);
         (model, output_weight)
+    }
+
+    #[test]
+    fn captured_inference_owns_only_admitted_module_state_and_payload_identity() {
+        let (model, output_weight) = relu_mlp();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("module_input", [2, 2], DType::F32);
+        let output = model.forward(&mut graph, input).unwrap();
+        let inference = CapturedInference::from_module_graph(&model, &graph, &[output]).unwrap();
+        assert_eq!(inference.capture().requested, [output.index() as u64]);
+        assert_eq!(inference.execution_plan().requested_outputs.len(), 1);
+        assert_eq!(inference.resident_bindings().len(), 4);
+        assert_eq!(
+            inference
+                .transient_inputs()
+                .iter()
+                .map(|input| input.name.as_str())
+                .collect::<Vec<_>>(),
+            ["module_input"]
+        );
+        let captured_residents = inference
+            .resident_bindings()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.to_le_bytes().unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let capture_identity = inference.capture().identity;
+        let deployment_identity = inference.deployment_identity();
+        let output_snapshot = output_weight.snapshot().unwrap();
+        let output_name = format!(
+            "{}_v{}",
+            output_snapshot.input_name, output_snapshot.version
+        );
+        let mut alternate_residents = inference.resident_bindings().clone();
+        alternate_residents.insert(output_name, TensorData::new([1, 2], vec![9., 10.]).unwrap());
+        assert_ne!(
+            captured_inference_identity(inference.capture(), &alternate_residents).unwrap(),
+            deployment_identity
+        );
+
+        output_weight
+            .replace(TensorData::new([1, 2], vec![9., 10.]).unwrap())
+            .unwrap();
+        assert_eq!(
+            inference
+                .resident_bindings()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.to_le_bytes().unwrap()))
+                .collect::<BTreeMap<_, _>>(),
+            captured_residents
+        );
+
+        let mut changed_graph = Graph::new();
+        let changed_input = changed_graph.input_dtype("module_input", [2, 2], DType::F32);
+        let changed_output = model.forward(&mut changed_graph, changed_input).unwrap();
+        let changed =
+            CapturedInference::from_module_graph(&model, &changed_graph, &[changed_output])
+                .unwrap();
+        assert_ne!(changed.capture().identity, capture_identity);
+        assert_ne!(changed.deployment_identity(), deployment_identity);
+        assert_eq!(changed.execution_plan(), inference.execution_plan());
+    }
+
+    #[test]
+    fn captured_inference_authenticates_parameter_nodes_across_name_collisions() {
+        let model = SingleParameter(Parameter::new(
+            TensorData::new([2], vec![9.0, 10.0]).unwrap(),
+            false,
+        ));
+        let snapshot = model.0.snapshot().unwrap();
+        let generated_name = format!("{}_v{}", snapshot.input_name, snapshot.version);
+        let mut graph = Graph::new();
+        let exposed = graph.input_dtype(generated_name, [2], DType::F32);
+        let unused_parameter = model.0.bind(&mut graph).unwrap();
+        assert_ne!(exposed, unused_parameter);
+
+        let inference =
+            CapturedInference::from_module_graph(&model, &graph, &[exposed, exposed]).unwrap();
+        assert!(inference.resident_bindings().is_empty());
+        assert_eq!(inference.transient_inputs().len(), 1);
+        assert_eq!(inference.transient_inputs()[0].node, exposed);
+        assert_eq!(
+            inference.transient_inputs()[0].desc.id,
+            exposed.index() as u64
+        );
+        assert_eq!(inference.execution_plan().schedule_item_count, 0);
+        assert_eq!(inference.execution_plan().requested_outputs.len(), 2);
     }
 
     #[test]

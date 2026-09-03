@@ -1,6 +1,6 @@
 //! Immutable static schedule and logical-memory inspection.
 use super::{BufferDesc, Schedule, ScheduleError, ScheduledOutputs, schedule_many};
-use crate::{Graph, MemoryPlan, MemoryPlanError, NodeId, Operation};
+use crate::{CapturedSchedule, Graph, MemoryPlan, MemoryPlanError, NodeId, Operation};
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
     fmt,
@@ -85,8 +85,6 @@ impl ExecutionPlanSummary {
         schedule
             .validate()
             .map_err(ExecutionPlanSummaryError::Schedule)?;
-        let memory = MemoryPlan::from_schedule(schedule, requested, reuse_enabled)
-            .map_err(ExecutionPlanSummaryError::Memory)?;
         let outputs = schedule
             .items
             .iter()
@@ -102,6 +100,77 @@ impl ExecutionPlanSummary {
                     .ok_or(ExecutionPlanSummaryError::RequestedOutput(*node))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        Self::summarize(schedule, requested, requested_outputs, reuse_enabled)
+    }
+
+    /// Summarizes one authenticated captured schedule, including direct
+    /// input/constant results and source-backed requested aliases. External
+    /// passthrough storage is described as an output but never planned as a
+    /// temporary allocation.
+    pub fn from_capture(
+        capture: &CapturedSchedule,
+        reuse_enabled: bool,
+    ) -> Result<Self, ExecutionPlanSummaryError> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|error| captured_summary_error(error.to_string()))?;
+        let requested_materializations = super::physical_requested_materializations(
+            &capture.items,
+            &capture.requested_passthroughs,
+            capture.requested.iter().copied(),
+        );
+        let schedule = Schedule {
+            items: capture.items.clone(),
+            requested_materializations,
+            requested_passthroughs: capture.requested_passthroughs.clone(),
+            value_bindings: Vec::new(),
+            state_bindings: Vec::new(),
+        };
+        let passthroughs = capture
+            .requested_passthroughs
+            .iter()
+            .map(|passthrough| (passthrough.requested.index() as u64, passthrough))
+            .collect::<BTreeMap<_, _>>();
+        let outputs = capture
+            .items
+            .iter()
+            .flat_map(|item| item.outputs.iter().map(|output| (output.id, output)))
+            .collect::<BTreeMap<_, _>>();
+        let inputs = capture
+            .inputs
+            .iter()
+            .map(|input| (input.node.index() as u64, input))
+            .collect::<BTreeMap<_, _>>();
+        let requested = capture
+            .requested
+            .iter()
+            .map(|id| {
+                let physical = passthroughs.get(id).map_or(*id, |entry| entry.desc.id);
+                usize::try_from(physical)
+                    .map(NodeId::from_index)
+                    .map_err(|_| captured_summary_error("requested ID overflow"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let requested_outputs = capture
+            .requested
+            .iter()
+            .map(|id| {
+                captured_requested_output(&outputs, &passthroughs, &inputs, &capture.constants, *id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::summarize(&schedule, &requested, requested_outputs, reuse_enabled)
+    }
+
+    fn summarize(
+        schedule: &Schedule,
+        requested: &[NodeId],
+        requested_outputs: Vec<BufferDesc>,
+        reuse_enabled: bool,
+    ) -> Result<Self, ExecutionPlanSummaryError> {
+        schedule
+            .validate()
+            .map_err(ExecutionPlanSummaryError::Schedule)?;
+        let memory = MemoryPlan::from_schedule(schedule, requested, reuse_enabled)
+            .map_err(ExecutionPlanSummaryError::Memory)?;
         let items = schedule
             .items
             .iter()
@@ -163,6 +232,50 @@ impl ExecutionPlanSummary {
     }
 }
 
+fn captured_requested_output(
+    outputs: &BTreeMap<u64, &BufferDesc>,
+    passthroughs: &BTreeMap<u64, &crate::RequestedPassthrough>,
+    inputs: &BTreeMap<u64, &crate::ReplayInput>,
+    constants: &BTreeMap<u64, crate::TensorData>,
+    requested: u64,
+) -> Result<BufferDesc, ExecutionPlanSummaryError> {
+    if let Some(output) = outputs.get(&requested) {
+        return Ok((**output).clone());
+    }
+    if let Some(passthrough) = passthroughs.get(&requested) {
+        return Ok(passthrough.desc.clone());
+    }
+    if let Some(input) = inputs.get(&requested) {
+        return Ok(input.desc.clone());
+    }
+    let Some(value) = constants.get(&requested) else {
+        return Err(captured_summary_error(format!(
+            "requested output {requested} is absent"
+        )));
+    };
+    let dtype = value.dtype();
+    let bytes = value
+        .to_le_bytes()
+        .map_err(|error| captured_summary_error(error.to_string()))?
+        .len();
+    Ok(BufferDesc {
+        id: requested,
+        shape: value.shape().clone(),
+        dtype,
+        bytes,
+        alignment: dtype.itemsize().max(1),
+        read_only: true,
+        view: None,
+    })
+}
+
+fn captured_summary_error(reason: impl Into<String>) -> ExecutionPlanSummaryError {
+    ExecutionPlanSummaryError::Schedule(ScheduleError::Binding(format!(
+        "captured execution summary: {}",
+        reason.into()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +319,51 @@ mod tests {
         let summary = ExecutionPlanSummary::from_graph(&graph, &[output], true).unwrap();
         assert_eq!(summary.requested_outputs[0].bytes, 0);
         assert_eq!(summary.zero_domain_item_count, 1);
+    }
+
+    #[test]
+    fn captured_summary_represents_external_duplicate_outputs_without_allocations() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [1, 2], DType::F32);
+        let constant = graph.constant(TensorData::new([2], vec![3.0, 4.0]).unwrap());
+        let transposed = graph.permute(input, [1, 0]).unwrap();
+        let requested = [input, constant, input, transposed, transposed];
+        let schedule = schedule_many(&graph, &requested).unwrap();
+        let capture = CapturedSchedule::capture(&graph, &schedule, &requested).unwrap();
+        assert_eq!(capture.requested_passthroughs.len(), 1);
+        let summary = ExecutionPlanSummary::from_capture(&capture, true).unwrap();
+
+        assert_eq!(summary.schedule_item_count, 0);
+        assert_eq!(summary.temporary_allocation_count, 0);
+        assert_eq!(summary.peak_logical_allocations, 0);
+        assert_eq!(summary.peak_logical_bytes, 0);
+        assert_eq!(
+            summary
+                .requested_outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            [
+                input.index() as u64,
+                constant.index() as u64,
+                input.index() as u64,
+                input.index() as u64,
+                input.index() as u64,
+            ]
+        );
+        assert_eq!(summary.requested_outputs[3].shape, Shape::from([1, 2]));
+        assert_eq!(
+            summary.requested_outputs[3]
+                .view
+                .as_ref()
+                .unwrap()
+                .logical_shape,
+            Shape::from([2, 1])
+        );
+        assert_eq!(summary.requested_outputs[3], summary.requested_outputs[4]);
+
+        let mut tampered = capture;
+        tampered.identity ^= 1;
+        assert!(ExecutionPlanSummary::from_capture(&tampered, true).is_err());
     }
 }

@@ -69,6 +69,7 @@ pub use state::{
 pub use transformer::TransformerBlock;
 
 pub(crate) use parameter::{ParameterRestore, next_version, restore_parameters};
+pub(crate) use state::module_input_node_bindings;
 
 #[cfg(test)]
 mod conv_tests;
