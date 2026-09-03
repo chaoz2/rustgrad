@@ -30,7 +30,8 @@ pub use session::{
     MetalDeviceSessionPlan, MetalDeviceSessionSummary, MetalInferencePlan,
 };
 pub use transaction::{
-    GuardedIntegerOp, METAL_TRANSACTION_ABI_VERSION, MetalGuard, MetalTransactionAbi,
+    GuardedIntegerOp, METAL_INDEXED_MOVEMENT_ABI_VERSION, METAL_TRANSACTION_ABI_VERSION,
+    MetalGuard, MetalIndexedMovementAbi, MetalTransactionAbi,
 };
 
 use std::fmt;
@@ -66,6 +67,12 @@ pub enum MetalError {
         index: usize,
         count: Option<i64>,
         bits: usize,
+    },
+    IndexOutOfBounds {
+        axis: usize,
+        index: usize,
+        value: i32,
+        dim: usize,
     },
     Closed(&'static str),
     Bounds,
@@ -104,6 +111,15 @@ impl fmt::Display for MetalError {
             } => write!(
                 f,
                 "Metal guarded integer {operation:?} failed at logical index {index} (count {count:?}, {bits} bits)"
+            ),
+            Self::IndexOutOfBounds {
+                axis,
+                index,
+                value,
+                dim,
+            } => write!(
+                f,
+                "Metal indexed movement axis {axis} has value {value} at logical index {index}, outside [0, {dim})"
             ),
             Self::Closed(resource) => write!(f, "Metal {resource} is closed"),
             Self::Bounds => write!(f, "Metal buffer range is out of bounds"),

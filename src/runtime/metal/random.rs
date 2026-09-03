@@ -80,6 +80,7 @@ pub(super) fn render(
         )),
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs: Vec::new(),
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::Random(Arc::new(
             plan.clone(),

@@ -132,6 +132,11 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
         kernel: &Self::Kernel,
         buffers: &[&Self::Buffer],
     ) -> Result<(), Self::Error> {
+        if kernel.rendered().indexed_movement.is_some() {
+            return kernel
+                .launch_transactional(queue, buffers, self.renderer.local_size)?
+                .wait();
+        }
         if let Some(command) = kernel.launch(queue, buffers, self.renderer.local_size)? {
             command.collect()?;
         }

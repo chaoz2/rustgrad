@@ -412,6 +412,7 @@ impl MetalLibrary {
                 extent: self.inner.rendered.extent,
                 program: self.inner.rendered.semantic_program.clone(),
                 transaction: self.inner.rendered.transaction.clone(),
+                indexed_movement: self.inner.rendered.indexed_movement.clone(),
             }),
         )?;
         Ok(MetalPipeline { inner })
@@ -469,7 +470,7 @@ impl MetalPipeline {
             return Err(MetalError::Closed("compute pipeline"));
         }
         let rendered = &self.inner.library.rendered;
-        if rendered.transaction.is_some() {
+        if rendered.transaction.is_some() || rendered.indexed_movement.is_some() {
             return Err(MetalError::InvalidArgument(
                 "guarded kernel requires transactional launch",
             ));
@@ -536,7 +537,7 @@ impl MetalPipeline {
         )))
     }
 
-    /// Submits a guarded integer kernel into a provisional physical output.
+    /// Submits a guarded kernel into a provisional physical output.
     /// Only consuming a clean transaction may make that generation visible.
     pub fn launch_transactional<'a>(
         &'a self,
@@ -545,9 +546,16 @@ impl MetalPipeline {
         local_size: usize,
     ) -> Result<MetalTransaction<'a>, MetalError> {
         let rendered = &self.inner.library.rendered;
-        let transaction = rendered
+        let output_abi_index = rendered
             .transaction
             .as_ref()
+            .map(|transaction| transaction.output_abi_index)
+            .or_else(|| {
+                rendered
+                    .indexed_movement
+                    .as_ref()
+                    .map(|transaction| transaction.output_abi_index)
+            })
             .ok_or(MetalError::InvalidArgument("kernel is not transactional"))?;
         queue.live()?;
         let device = &self.inner.library.device;
@@ -581,8 +589,8 @@ impl MetalPipeline {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let output = bindings[transaction.output_abi_index];
-        let base_generation = snapshots[transaction.output_abi_index].generation();
+        let output = bindings[output_abi_index];
+        let base_generation = snapshots[output_abi_index].generation();
         let candidate = output.candidate()?;
         if rendered.extent == 0 {
             return Ok(MetalTransaction {
@@ -606,7 +614,7 @@ impl MetalPipeline {
         let status_snapshot = status.snapshot(device, 0, 4, None)?;
         let mut raws = Vec::with_capacity(snapshots.len() + 1);
         for (index, snapshot) in snapshots.iter().enumerate() {
-            let raw = if index == transaction.output_abi_index {
+            let raw = if index == output_abi_index {
                 candidate.raw
             } else {
                 snapshot.raw()
@@ -696,6 +704,16 @@ impl MetalTransaction<'_> {
             )?;
             let status = u32::from_le_bytes(bytes);
             if status != CLEAN_STATUS {
+                if let Some(indexed) = &self.pipeline.rendered().indexed_movement {
+                    let index = indexed.decode(status)?;
+                    let value = self.read_index(indexed, index)?;
+                    return Err(MetalError::IndexOutOfBounds {
+                        axis: indexed.axis,
+                        index,
+                        value,
+                        dim: indexed.axis_extent,
+                    });
+                }
                 let transaction = self.pipeline.rendered().transaction.as_ref().unwrap();
                 let (index, guard) = transaction.decode(status)?;
                 let count = if guard.operation.is_shift() {
@@ -768,6 +786,33 @@ impl MetalTransaction<'_> {
             DType::U32 => value.as_u64().min(i64::MAX as u64) as i64,
             _ => return Err(MetalError::InvalidBinding("guard dtype mismatch".into())),
         })
+    }
+
+    fn read_index(
+        &self,
+        indexed: &super::MetalIndexedMovementAbi,
+        logical: usize,
+    ) -> Result<i32, MetalError> {
+        let _abi = self
+            .pipeline
+            .rendered()
+            .buffers
+            .get(indexed.index_abi_index)
+            .filter(|abi| abi.dtype == DType::I32 && abi.elements == indexed.index_elements)
+            .ok_or_else(|| MetalError::InvalidBinding("indexed detail ABI mismatch".into()))?;
+        let snapshot = self
+            .snapshots
+            .get(indexed.index_abi_index)
+            .ok_or_else(|| MetalError::InvalidBinding("indexed detail buffer absent".into()))?;
+        let mut bytes = [0u8; 4];
+        let offset = logical.checked_mul(4).ok_or(MetalError::Overflow)?;
+        self.pipeline.inner.library.device.dispatch.buffer_read(
+            snapshot.raw().ok_or(MetalError::Bounds)?,
+            offset,
+            &mut bytes,
+            self.pipeline.inner.library.device.owner,
+        )?;
+        Ok(i32::from_le_bytes(bytes))
     }
 }
 

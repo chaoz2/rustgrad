@@ -2623,6 +2623,20 @@ generation only when all checks succeed. Failed or competing stale transactions
 leave the old visible bytes and generation unchanged; query never reads status
 or commits.
 
+Concrete F32-value/I32-index Gather, replacement Scatter, and ScatterAdd reuse
+the authenticated `MovementKernelPlan` descriptors and row-major geometry in a
+separate renderer-private cache identity. Gather launches per output lane;
+Scatter launches per destination and folds every update in row-major order, so
+duplicate replacement and addition are deterministic without Metal floating
+atomics. Every index lane participates in a lowest-lane status reduction.
+Completion reads the offending I32 lane directly from its retained native input
+generation and swaps the provisional output only after a clean status; it never
+stages an intermediate `TensorData` or invokes a CPU fallback. Captured
+persistent Metal sessions use the same candidate transaction. Empty outputs
+compile, allocate, transfer, and submit nothing. This contract excludes I64
+indices, non-F32 values, symbolic geometry, and higher-level scatter
+compositions.
+
 Source identity includes renderer/ABI/transaction versions, local size,
 complete device capabilities, ordered buffer/view/guard metadata, and emitted
 source. The injectable semantic mock interprets typed UOps independently of
