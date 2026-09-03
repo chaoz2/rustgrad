@@ -414,8 +414,15 @@ fn metal_inference_plan_freezes_module_residents_and_preserves_inspection() {
     let deployment_identity = inference.deployment_identity();
     let capture_identity = inference.capture().identity;
     let logical_identity = inference.execution_plan().identity;
-    let plan =
-        MetalInferencePlan::new(inference, MetalRenderer::new(8, capabilities()).unwrap()).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let runtime = MetalRuntime::from_dispatch(mock.clone());
+    let device = runtime.device(0).unwrap();
+    let renderer = device.renderer(8).unwrap();
+    assert_eq!(renderer.local_size, 8);
+    assert_eq!(renderer.capabilities, device.info().capabilities);
+    mock.clear_calls();
+    let plan = MetalInferencePlan::new(inference, renderer).unwrap();
+    assert!(mock.calls().is_empty());
     assert_eq!(plan.deployment_identity(), deployment_identity);
     assert_eq!(plan.capture().identity, capture_identity);
     assert_eq!(plan.execution_plan().identity, logical_identity);
@@ -439,8 +446,6 @@ fn metal_inference_plan_freezes_module_residents_and_preserves_inspection() {
         .weight
         .replace(TensorData::zeros([2, 2]).unwrap())
         .unwrap();
-    let mock = Arc::new(MockDispatch::default());
-    let device = test_device(mock.clone());
     let mut session = plan.prepare(device).unwrap();
     assert_eq!(session.preparation_report().resident_h2d_calls, 2);
     for invocation in 1..=2 {
@@ -2133,6 +2138,40 @@ fn typed_discovery_reports_devices_without_queue_creation() {
             .iter()
             .any(|call| call.starts_with("queue_create:"))
     );
+}
+
+#[test]
+fn indexed_device_selection_and_renderer_policy_create_no_execution_resources() {
+    let mock = Arc::new(MockDispatch::default());
+    let runtime = MetalRuntime::from_dispatch(mock.clone());
+    let device = runtime.device(0).unwrap();
+    assert_eq!(device.info().registry_id, 1);
+    let renderer = device.renderer(8).unwrap();
+    assert_eq!(renderer.local_size, 8);
+    assert_eq!(renderer.capabilities, device.info().capabilities);
+    assert!(matches!(
+        device.renderer(0),
+        Err(MetalError::InvalidArgument("zero local size"))
+    ));
+    assert!(!mock.calls().iter().any(|call| {
+        call.starts_with("queue_create:")
+            || call.starts_with("buffer_create:")
+            || call.starts_with("library_compile:")
+            || call.starts_with("pipeline_create:")
+    }));
+
+    mock.clear_calls();
+    assert!(matches!(
+        runtime.device(2),
+        Err(MetalError::InvalidArgument("device index is out of range"))
+    ));
+    assert!(mock.calls().contains(&"devices".into()));
+    assert!(!mock.calls().iter().any(|call| {
+        call.starts_with("queue_create:")
+            || call.starts_with("buffer_create:")
+            || call.starts_with("library_compile:")
+            || call.starts_with("pipeline_create:")
+    }));
 }
 
 #[test]
