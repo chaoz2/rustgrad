@@ -1754,4 +1754,33 @@ fn empty_affine_reads_still_validate_products_and_address_representability() {
             .iter()
             .all(|axis| axis.stride == 0 && !axis.reversed)
     );
+
+    let boundary_empty = crate::AffineView::identity(Shape::from([2, 3]))
+        .shrink(&[(0, 2), (3, 3)])
+        .unwrap()
+        .reshape_read(Shape::from([0]))
+        .unwrap();
+    assert_eq!(boundary_empty.source_shape, Shape::from([2, 3]));
+    assert_eq!(boundary_empty.logical_shape, Shape::from([0]));
+    assert_eq!(boundary_empty.strides, vec![0]);
+    assert_eq!(boundary_empty.offset, 0);
+    assert!(boundary_empty.validate_read().is_ok());
+    let reranked_empty = crate::AffineView::identity(Shape::from([2, 3]))
+        .shrink(&[(0, 2), (3, 3)])
+        .unwrap()
+        .reshape_read(Shape::from([1, 0, 4]))
+        .unwrap();
+    assert_eq!(reranked_empty.source_shape, Shape::from([2, 3]));
+    assert_eq!(reranked_empty.strides, vec![0, 0, 0]);
+    assert_eq!(reranked_empty.offset, 0);
+    let malformed_empty = crate::AffineView {
+        strides: vec![],
+        ..boundary_empty
+    };
+    assert!(malformed_empty.reshape_read(Shape::from([0])).is_err());
+    assert!(
+        crate::AffineView::identity(Shape::from([1]))
+            .reshape_read(Shape::from([0]))
+            .is_err()
+    );
 }

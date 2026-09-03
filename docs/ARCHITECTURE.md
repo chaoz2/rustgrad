@@ -260,6 +260,21 @@ remain outside it.
 two selected axes last and delegates rectangular, batched, signed-axis, signed-
 offset, zero-domain, and Bool cases to that same normalized static-index map and
 composed Gather substrate; it is not a dynamic indexing or aliasing path.
+`Graph::diagonal` instead follows tinygrad's literal movement composition. A
+nonempty diagonal crops and flattens the selected square into one affine-copy
+operand, appends the row-separator zero Pad, and leaves the final
+reshape/shrink/squeeze result as a requested affine alias of that computed Pad
+buffer. Capture retains only the two materializing producers and reconstructs
+ordered duplicate diagonal requests from the authenticated view descriptor;
+interpreter and strict CPU-native replay preserve the selected lanes' exact raw
+storage. A zero diagonal omits both materializations and remains a source-owned,
+resource-free empty view. When a non-contiguous view is reshaped across an empty
+domain, `AffineView::reshape_read` first validates the incoming map, then emits
+the existing canonical addressless descriptor: the exact physical source shape,
+the requested logical shape, offset zero, and one zero stride per logical axis.
+The ordinary requested-passthrough artifact and replay paths therefore retain
+shape, dtype, source ownership, and duplicate order without a fabricated read,
+buffer, kernel, submission, cache entry, or new wire tag.
 `Graph::diag` is distinct rank-one construction: checked `n + 1` and `n²`
 arithmetic lowers only through existing unsqueeze, typed-zero pad, flatten,
 shrink, and reshape nodes, so it preserves storage and inherits their static
