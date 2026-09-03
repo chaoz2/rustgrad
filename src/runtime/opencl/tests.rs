@@ -8,6 +8,146 @@ use super::renderer::{
 };
 
 #[test]
+fn predicated_projected_opencl_guards_nonempty_and_addressless_reads() {
+    let renderer = OpenClRenderer::default();
+    for (shape, values, expected) in [
+        (
+            Shape::from([2]),
+            Storage::F32(vec![-0.0, f32::from_bits(0x7fc0_1234)]),
+            vec![0.0, -0.0, f32::from_bits(0x7fc0_1234), 0.0],
+        ),
+        (Shape::from([0]), Storage::F32(vec![]), vec![0.0; 2]),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", shape.clone(), DType::F32);
+        let output = graph.pad(input, [(1, 1)], Scalar::F(0.0)).unwrap();
+        let output = graph.detach(output).unwrap();
+        let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        assert!(rendered.source.contains(OPENCL_RENDERER_VERSION));
+        assert!(rendered.source.contains(" ? "));
+        let (actual, _) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &BTreeMap::from([(
+                input.index() as u64,
+                TensorData::from_storage(shape, values).unwrap(),
+            )]),
+        );
+        let actual = actual
+            .chunks_exact(4)
+            .map(|lane| f32::from_le_bytes(lane.try_into().unwrap()).to_bits())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            expected.into_iter().map(f32::to_bits).collect::<Vec<_>>()
+        );
+    }
+
+    for (dtype, storage, expected) in [
+        (
+            DType::F16,
+            Storage::F16(vec![0x7e00, 0x8000]),
+            vec![0, 0, 0, 0x7e, 0, 0x80, 0, 0],
+        ),
+        (
+            DType::BF16,
+            Storage::BF16(vec![0x7fc1, 0x8000]),
+            vec![0, 0, 0xc1, 0x7f, 0, 0x80, 0, 0],
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let padded = graph.pad(input, [(1, 1)], Scalar::F(0.0)).unwrap();
+        let output = graph.detach(padded).unwrap();
+        let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+        let rendered = renderer.render(&item.kernel).unwrap();
+        let (actual, _) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &BTreeMap::from([(
+                input.index() as u64,
+                TensorData::from_storage([2], storage).unwrap(),
+            )]),
+        );
+        assert_eq!(actual, expected, "{dtype:?} raw predicated passthrough");
+    }
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::Bool);
+    let output = graph.pad(input, [(1, 1)], Scalar::Bool(false)).unwrap();
+    let output = graph.logical_not(output).unwrap();
+    let mut item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    item.input_bindings[0].desc.bytes += 1;
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let owner = context.owner_id();
+    let before = mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(context, &[item], renderer),
+        Err(OpenClError::InvalidBinding(_))
+    ));
+    assert_eq!(
+        &mock.calls()[before.len()..],
+        &[format!("context_release:{owner}")],
+        "projected binding validation precedes program, queue, and buffer work"
+    );
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let producer = graph.contiguous(producer).unwrap();
+    let padded = graph.pad(producer, [(1, 1)], Scalar::F(0.0)).unwrap();
+    let output = graph.neg(padded).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    assert_eq!(scheduled.items.len(), 2);
+    assert_eq!(
+        scheduled.items[1]
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![producer]
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let plan = OpenClPrefixPlan::plan_for_outputs(
+        context.clone(),
+        &scheduled.items,
+        &[output.index() as u64],
+        renderer,
+    )
+    .unwrap();
+    let prefix = PreparedOpenClPrefix::from_plan(context, plan).unwrap();
+    let before = mock.calls();
+    let mut values = BTreeMap::from([(
+        input.index() as u64,
+        TensorData::from_storage([2], Storage::F32(vec![2.0, -3.0])).unwrap(),
+    )]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(output.index() as u64)].storage(),
+        &Storage::F32(vec![0.0, -4.0, -9.0, 0.0])
+    );
+    let calls = &mock.calls()[before.len()..];
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("launch:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1,
+        "the computed producer remains device-resident"
+    );
+}
+
+#[test]
 fn portable_dense_opencl_preserves_pad_fill_concat_order_and_raw_bytes() {
     let renderer = OpenClRenderer::default();
     let mut graph = Graph::new();
@@ -2075,7 +2215,14 @@ fn execute_mock_rendered(
         .iter()
         .map(|abi| {
             let bytes = abi.elements * abi.dtype.itemsize();
-            let buffer = context.allocate(bytes).unwrap();
+            let buffer = context
+                .allocate_static(crate::runtime::static_schedule::StaticBufferAllocation {
+                    elements: abi.elements,
+                    bytes,
+                    dtype: abi.dtype,
+                    requires_native_handle: rendered.extent != 0,
+                })
+                .unwrap();
             if let Some(value) = values.get(&abi.id) {
                 queue
                     .write(&buffer, 0, &value.to_le_bytes().unwrap())

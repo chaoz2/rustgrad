@@ -1956,45 +1956,52 @@ fn zero_pad_is_one_predicated_load_for_elementwise_and_reduction_owners() {
     let linear = crate::LinearKernel::from_uop(&scheduled.items[0].kernel).unwrap();
     assert!(!linear.enabled);
     assert!(linear.reason.contains("projected index"));
-    assert!(
-        crate::PtxRenderer::new(80)
-            .unwrap()
-            .render(&scheduled.items[0].kernel)
-            .is_err()
-    );
-    assert!(
-        crate::runtime::opencl::OpenClRenderer::default()
-            .render(&scheduled.items[0].kernel)
-            .is_err()
-    );
-    assert!(
-        crate::runtime::metal::MetalRenderer::new(
-            1,
-            crate::runtime::metal::MetalCapabilities {
-                max_buffer_length: usize::MAX,
-                unified_memory: false,
-                family: "predicated-index-test".into(),
-            },
-        )
+    let ptx = crate::PtxRenderer::new(80)
         .unwrap()
         .render(&scheduled.items[0].kernel)
-        .is_err()
-    );
-    assert!(
-        crate::runtime::webgpu::WgslRenderer::new(
-            1,
-            crate::runtime::webgpu::WebGpuCapabilities {
-                max_buffer_size: usize::MAX,
-                max_storage_buffers_per_shader_stage: u32::MAX,
-                max_compute_workgroup_size_x: 1,
-                max_compute_workgroups_per_dimension: u32::MAX,
-                timestamp_query: false,
-                shader_f16: false,
-            },
-        )
-        .unwrap()
+        .unwrap();
+    assert!(ptx.source.contains("@%rgp"));
+    assert!(ptx.source.contains("ld.global"));
+    let opencl = crate::runtime::opencl::OpenClRenderer::default()
         .render(&scheduled.items[0].kernel)
-        .is_err()
+        .unwrap();
+    assert!(opencl.source.contains(" ? "));
+    let metal = crate::runtime::metal::MetalRenderer::new(
+        1,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: usize::MAX,
+            unified_memory: false,
+            family: "predicated-index-test".into(),
+        },
+    )
+    .unwrap()
+    .render(&scheduled.items[0].kernel)
+    .unwrap();
+    assert!(metal.source.contains(" ? "));
+    let wgsl = crate::runtime::webgpu::WgslRenderer::new(
+        1,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: usize::MAX,
+            max_storage_buffers_per_shader_stage: u32::MAX,
+            max_compute_workgroup_size_x: 1,
+            max_compute_workgroups_per_dimension: u32::MAX,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap()
+    .render(&scheduled.items[0].kernel)
+    .unwrap();
+    assert!(wgsl.source.contains("var rg_predicated_"));
+    assert!(wgsl.source.contains("if ("));
+    let wgsl_lines = wgsl.source.lines().collect::<Vec<_>>();
+    let load = wgsl_lines
+        .iter()
+        .position(|line| line.contains("rg_predicated_") && line.contains(" = b"))
+        .unwrap();
+    assert!(
+        load != 0 && wgsl_lines[load - 1].trim_start().starts_with("if ("),
+        "the physical load is inside explicit control flow"
     );
 
     let reduced = graph.sum(squared, 1).unwrap();
@@ -2041,6 +2048,80 @@ fn zero_pad_is_one_predicated_load_for_elementwise_and_reduction_owners() {
             .collect::<Vec<_>>(),
         vec![0, raw_bits[0], raw_bits[1], 0]
     );
+
+    for (dtype, input_storage, expected_storage) in [
+        (
+            DType::F16,
+            crate::Storage::F16(vec![0x7e00, 0x8000]),
+            crate::Storage::F16(vec![0, 0x7e00, 0x8000, 0]),
+        ),
+        (
+            DType::BF16,
+            crate::Storage::BF16(vec![0x7fc1, 0x8000]),
+            crate::Storage::BF16(vec![0, 0x7fc1, 0x8000, 0]),
+        ),
+    ] {
+        let mut narrow = Graph::new();
+        let input = narrow.input_dtype("narrow", [2], dtype);
+        let padded = narrow.pad(input, [(1, 1)], crate::Scalar::F(0.0)).unwrap();
+        let output = narrow.detach(padded).unwrap();
+        let item = schedule(&narrow, output).unwrap().items.pop().unwrap();
+        let opencl = crate::runtime::opencl::OpenClRenderer::default()
+            .render(&item.kernel)
+            .unwrap();
+        assert!(opencl.source.contains("? (b0["), "{dtype:?}");
+        assert!(opencl.source.contains(": ((ushort)0u)"), "{dtype:?}");
+        let wgsl = crate::runtime::webgpu::WgslRenderer::new(
+            1,
+            crate::runtime::webgpu::WebGpuCapabilities {
+                max_buffer_size: usize::MAX,
+                max_storage_buffers_per_shader_stage: u32::MAX,
+                max_compute_workgroup_size_x: 1,
+                max_compute_workgroups_per_dimension: u32::MAX,
+                timestamp_query: false,
+                shader_f16: false,
+            },
+        )
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+        assert!(wgsl.source.contains("var rg_predicated_raw_"), "{dtype:?}");
+        assert!(
+            wgsl.source
+                .lines()
+                .any(|line| line.contains("atomicOr") && line.contains("rg_predicated_raw_")),
+            "{dtype:?}"
+        );
+        assert!(matches!(
+            crate::PtxRenderer::new(80)
+                .unwrap()
+                .render(&item.kernel),
+            Err(crate::PtxError::Unsupported(reason)) if reason.contains("raw PTX storage path")
+        ));
+        assert!(matches!(
+            crate::runtime::metal::MetalRenderer::new(
+                1,
+                crate::runtime::metal::MetalCapabilities {
+                    max_buffer_length: usize::MAX,
+                    unified_memory: false,
+                    family: "predicated-index-test".into(),
+                },
+            )
+            .unwrap()
+            .render(&item.kernel),
+            Err(crate::runtime::metal::MetalError::Unsupported(reason))
+                if reason == format!("dtype {dtype:?} is outside the exact Metal static subset")
+        ));
+        let input_value = TensorData::from_storage([2], input_storage).unwrap();
+        let actual = CpuBackend
+            .execute(
+                &narrow,
+                output,
+                &HashMap::from([("narrow".into(), input_value)]),
+            )
+            .unwrap();
+        assert_eq!(actual.storage(), &expected_storage, "{dtype:?}");
+    }
 
     let mut diagonal = Graph::new();
     let matrix = diagonal.input_dtype("matrix", [2, 3], DType::F32);
@@ -2133,6 +2214,43 @@ fn zero_pad_is_one_predicated_load_for_elementwise_and_reduction_owners() {
         crate::projected_index::ProjectedIndexPlan::from_index(&empty_indices[0]).unwrap();
     assert_eq!(empty_plan.elements, 0);
     assert!((0..6).all(|lane| !empty_plan.valid(lane).unwrap()));
+    let empty_ptx = crate::PtxRenderer::new(80)
+        .unwrap()
+        .render(&empty_item.kernel)
+        .unwrap();
+    assert!(empty_ptx.source.contains("@%rgp"));
+    let empty_opencl = crate::runtime::opencl::OpenClRenderer::default()
+        .render(&empty_item.kernel)
+        .unwrap();
+    assert!(empty_opencl.source.contains(" ? "));
+    let empty_metal = crate::runtime::metal::MetalRenderer::new(
+        1,
+        crate::runtime::metal::MetalCapabilities {
+            max_buffer_length: usize::MAX,
+            unified_memory: false,
+            family: "predicated-index-test".into(),
+        },
+    )
+    .unwrap()
+    .render(&empty_item.kernel)
+    .unwrap();
+    assert!(empty_metal.source.contains(" ? "));
+    let empty_wgsl = crate::runtime::webgpu::WgslRenderer::new(
+        1,
+        crate::runtime::webgpu::WebGpuCapabilities {
+            max_buffer_size: usize::MAX,
+            max_storage_buffers_per_shader_stage: u32::MAX,
+            max_compute_workgroup_size_x: 1,
+            max_compute_workgroups_per_dimension: u32::MAX,
+            timestamp_query: false,
+            shader_f16: false,
+        },
+    )
+    .unwrap()
+    .render(&empty_item.kernel)
+    .unwrap();
+    assert!(empty_wgsl.source.contains("var rg_predicated_"));
+    assert!(empty_wgsl.source.contains("if (false)"));
     let empty_reduction_source = crate::CpuJit::render(&empty_item.kernel).unwrap().source;
     assert!(empty_reduction_source.contains("((0) ? ("));
     assert!(!empty_reduction_source.contains("false"));

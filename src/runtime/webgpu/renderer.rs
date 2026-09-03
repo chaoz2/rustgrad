@@ -19,7 +19,7 @@ use std::{
 };
 
 /// Deterministic renderer/source identity.
-pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v7";
+pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v8";
 pub const WGSL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-wgsl-raw-copy-v1";
 pub const WGSL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-wgsl-portable-bitcast-v1";
 pub const WGSL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
@@ -759,14 +759,6 @@ impl WgslRenderer {
         let nodes = root
             .topological()
             .map_err(|error| WebGpuError::Unsupported(error.to_string()))?;
-        if nodes
-            .iter()
-            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
-        {
-            return Err(WebGpuError::Unsupported(
-                "predicated projected loads are outside WGSL lowering".into(),
-            ));
-        }
         if nodes.iter().any(|node| {
             matches!(
                 node.operation(),
@@ -1038,7 +1030,16 @@ impl WgslRenderer {
         lines.push("  let gid: u32 = rg_global.x;".into());
         lines.push("  if (gid >= rg_extent.value) { return; }".into());
         let mut source_map = BTreeMap::new();
-        let expression = if let Some(reduction) = &reduction {
+        let raw_predicated_narrow =
+            if reduction.is_none() && transaction.is_none() && narrow::is_narrow(output_dtype) {
+                emit_raw_predicated_narrow_load(value, &ids, &mut source_map, &mut lines, "gid")?
+            } else {
+                None
+            };
+        let preserves_raw_narrow = raw_predicated_narrow.is_some();
+        let expression = if let Some(expression) = raw_predicated_narrow {
+            expression
+        } else if let Some(reduction) = &reduction {
             if transaction.is_some() {
                 return Err(WebGpuError::Unsupported(
                     "guarded reduction producers are outside the exact WGSL subset".into(),
@@ -1071,8 +1072,11 @@ impl WgslRenderer {
                     "guarded narrow-float output is outside the exact WGSL subset".into(),
                 ));
             }
-            let encoded =
-                narrow::encode(output_dtype, &expression).expect("validated narrow output dtype");
+            let encoded = if preserves_raw_narrow {
+                expression
+            } else {
+                narrow::encode(output_dtype, &expression).expect("validated narrow output dtype")
+            };
             lines.push("  let rg_shift: u32 = (gid & 1u) * 16u;".into());
             lines.push(format!(
                 "  atomicAnd(&b{output_position}[gid >> 1u], ~(0xffffu << rg_shift));"
@@ -2929,6 +2933,61 @@ fn supported_storage(dtype: DType) -> Result<(), WebGpuError> {
     }
 }
 
+fn emit_raw_predicated_narrow_load(
+    value: &UOp,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+    linear: &str,
+) -> Result<Option<String>, WebGpuError> {
+    let Some(plan) = crate::projected_index::ProjectedIndexPlan::from_direct_predicated_load(value)
+        .map_err(|_| WebGpuError::Unsupported("invalid predicated narrow load".into()))?
+    else {
+        return Ok(None);
+    };
+    if !plan.fits_i32()
+        || plan.elements > i32::MAX as usize
+        || plan.output_elements > i32::MAX as usize
+    {
+        return Err(WebGpuError::Unsupported(
+            "projected index exceeds WGSL signed address range".into(),
+        ));
+    }
+    let position = ids
+        .get(&plan.buffer)
+        .ok_or_else(|| WebGpuError::InvalidBinding("load buffer absent from ABI".into()))?;
+    let access = crate::projected_index::render_infix_projected_access(
+        &plan,
+        format!("i32({linear})"),
+        |literal| {
+            i32::try_from(literal)
+                .map(|literal| {
+                    if literal == i32::MIN {
+                        "((-2147483647i) - 1i)".into()
+                    } else {
+                        format!("{literal}i")
+                    }
+                })
+                .map_err(|_| crate::UOpError::InvalidIndex)
+        },
+        |boolean| boolean.to_string(),
+    )
+    .map_err(|_| WebGpuError::Unsupported("invalid predicated narrow load".into()))?;
+    let predicate = access
+        .predicate
+        .ok_or_else(|| WebGpuError::Unsupported("predicated narrow load has no guard".into()))?;
+    let expression_id = source_map.len();
+    source_map.insert(expression_id, lines.len() + 1);
+    let temporary = format!("rg_predicated_raw_{expression_id}");
+    let offset = format!("u32({})", access.offset);
+    let raw = format!("((b{position}[({offset}) >> 1u] >> ((({offset}) & 1u) * 16u)) & 0xffffu)");
+    lines.push(format!("var {temporary}: u32 = 0u;"));
+    lines.push(format!("if ({predicate}) {{"));
+    lines.push(format!("  {temporary} = {raw};"));
+    lines.push("}".into());
+    Ok(Some(temporary))
+}
+
 fn wgsl_storage_decl(dtype: DType, mutable: bool) -> &'static str {
     match (dtype, mutable) {
         (DType::F32, _) => "f32",
@@ -3057,7 +3116,8 @@ fn emit_expr_with_substitution(
     {
         return Ok(value.into());
     }
-    source_map.insert(source_map.len(), lines.len() + 1);
+    let expression_id = source_map.len();
+    source_map.insert(expression_id, lines.len() + 1);
     let dtype = node
         .ty()
         .ok_or_else(|| WebGpuError::Unsupported(format!("untyped {:?}", node.operation())))?
@@ -3122,7 +3182,7 @@ fn emit_expr_with_substitution(
                             "projected index exceeds WGSL signed address range".into(),
                         ));
                     }
-                    let signed = crate::projected_index::render_infix_projected_index(
+                    let access = crate::projected_index::render_infix_projected_access(
                         &plan,
                         format!("i32({linear})"),
                         |value| {
@@ -3136,24 +3196,44 @@ fn emit_expr_with_substitution(
                                 })
                                 .map_err(|_| crate::UOpError::InvalidIndex)
                         },
+                        |value| value.to_string(),
                     )
                     .map_err(|_| WebGpuError::Unsupported("invalid projected index".into()))?;
-                    let offset = format!("u32({signed})");
+                    let offset = format!("u32({})", access.offset);
                     let position = ids.get(buffer).ok_or_else(|| {
                         WebGpuError::InvalidBinding("load buffer absent from ABI".into())
                     })?;
-                    return if dtype == DType::Bool {
-                        Ok(format!(
+                    let value = if dtype == DType::Bool {
+                        format!(
                             "(((b{position}[({offset}) >> 2u] >> ((({offset}) & 3u) * 8u)) & 0xffu) != 0u)"
-                        ))
+                        )
                     } else if narrow::is_narrow(dtype) {
                         let raw = format!(
                             "((b{position}[({offset}) >> 1u] >> ((({offset}) & 1u) * 16u)) & 0xffffu)"
                         );
-                        Ok(narrow::decode(dtype, raw).expect("validated narrow load"))
+                        narrow::decode(dtype, raw).expect("validated narrow load")
                     } else {
-                        Ok(format!("b{position}[{offset}]"))
+                        format!("b{position}[{offset}]")
                     };
+                    let Some(predicate) = access.predicate else {
+                        return Ok(value);
+                    };
+                    let zero = match dtype {
+                        DType::Bool => "false",
+                        DType::F16 | DType::BF16 | DType::F32 => "0.0f",
+                        DType::I32 => "0i",
+                        DType::U32 => "0u",
+                        _ => unreachable!("validated WGSL storage"),
+                    };
+                    let temporary = format!("rg_predicated_{expression_id}");
+                    lines.push(format!(
+                        "var {temporary}: {} = {zero};",
+                        wgsl_reduction_type(dtype)
+                    ));
+                    lines.push(format!("if ({predicate}) {{"));
+                    lines.push(format!("  {temporary} = {value};"));
+                    lines.push("}".into());
+                    return Ok(temporary);
                 }
                 Operation::Index(IndexValue::Buffer {
                     buffer,
