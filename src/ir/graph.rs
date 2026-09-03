@@ -53,6 +53,54 @@ fn masked_select_plan(
     })
 }
 
+fn lower_fixed_masked_select(
+    graph: &mut Graph,
+    input: NodeId,
+    mask: NodeId,
+    size: usize,
+    fill: Scalar,
+) -> Result<NodeId> {
+    let input_shape = graph.shape(input)?.clone();
+    let input_dtype = graph.dtype(input)?;
+    let input_elements = input_shape.numel()?;
+    let input = graph.flatten_default(input)?;
+    let mask = graph.expand(mask, input_shape)?;
+    let mask = graph.flatten_default(mask)?;
+    let mask_cumsum = graph.cumsum(mask, 0)?;
+
+    // This is checked-in tinygrad's literal fixed-size compaction.  Invalid
+    // cumulative positions become all-false one-hot lanes in the source
+    // scatter/gather compositions, so empty, padded, and truncated results
+    // never require an unchecked backend index.
+    let counts = graph.lazy_full_with_dtype([size], Scalar::I(0), DType::I32)?;
+    let counts = graph.scatter_tinygrad(
+        counts,
+        0,
+        mask_cumsum,
+        ScatterSource::Scalar(Scalar::I(1)),
+        ScatterMode::Add,
+    )?;
+    let positions = graph.cumsum(counts, 0)?;
+
+    let end = i64::try_from(size).map_err(|_| Error::ShapeOverflow(Shape::from([size])))?;
+    let output_positions = graph.lazy_arange_default_int(0, end, 1)?;
+    let selected_count = graph.sum_default(mask)?;
+    let valid = graph.lt(output_positions, selected_count)?;
+    let selected = if input_elements == 0 {
+        // The validity predicate is identically false, so an addressless
+        // typed placeholder supplies only the unselected branch's descriptor.
+        graph.lazy_full_with_dtype([size], Scalar::I(0), input_dtype)?
+    } else {
+        // Padded cumulative positions can equal the source length. Clamp only
+        // those false lanes before the raw movement Gather so selected
+        // Float8/IEEE lanes retain their exact storage bits.
+        let safe_positions = graph.where_false_scalar(valid, positions, Scalar::I(0))?;
+        graph.gather(input, safe_positions, 0)?
+    };
+    let filled = graph.where_false_scalar(valid, selected, fill)?;
+    graph.cast(filled, input_dtype)
+}
+
 fn nonzero_coordinate_dtype(shape: &Shape) -> Result<DType> {
     let mut dtype = DType::I32;
     for &extent in shape.dims() {
@@ -4562,6 +4610,11 @@ impl Graph {
 
     /// Fixed-shape form of tinygrad's `masked_select(size=N)`. The mask must
     /// be bool and broadcastable to input; matches use row-major order.
+    ///
+    /// The public route is the source's lazy cumsum/scatter/gather composition,
+    /// not the legacy raw [`Op::MaskedSelect`] node. The complete candidate is
+    /// constructed on a clone so a late view, reduction, scalar, or byte-bound
+    /// failure publishes no partial graph state.
     pub fn masked_select(
         &mut self,
         input: NodeId,
@@ -4571,16 +4624,18 @@ impl Graph {
     ) -> Result<NodeId> {
         let plan = masked_select_plan(self, input, mask, Some(size), "masked_select")?;
         let output_shape = plan.fixed_shape.expect("fixed masked-select plan");
-        Ok(self.push(
-            Op::MaskedSelect {
-                input,
-                mask,
-                size,
-                fill,
-            },
-            output_shape,
-            plan.dtype,
-        ))
+        let mut candidate = self.clone();
+        let output = lower_fixed_masked_select(&mut candidate, input, mask, size, fill)?;
+        if candidate.shape(output)? != &output_shape || candidate.dtype(output)? != plan.dtype {
+            return Err(Error::InvalidIndexedShape {
+                op: "masked_select",
+                input: output_shape,
+                index: candidate.shape(output)?.clone(),
+            });
+        }
+        candidate.nbytes(output)?;
+        *self = candidate;
+        Ok(output)
     }
 
     /// Checked-in tinygrad's public `Tensor.dot(rhs, dtype)` composition.

@@ -747,7 +747,7 @@ fn scatter_positions_graph_visualization_preserves_static_map_geometry() {
 }
 
 #[test]
-fn masked_select_graph_visualization_preserves_fixed_and_dynamic_contracts() {
+fn masked_select_graph_visualization_preserves_literal_fixed_composition() {
     let mut graph = Graph::new();
     let input = graph.input("x", [2, 3]);
     let mask = graph.input_dtype("mask", [1, 3], DType::Bool);
@@ -757,17 +757,18 @@ fn masked_select_graph_visualization_preserves_fixed_and_dynamic_contracts() {
     let first = graph_viz(&graph, &[selected]).unwrap();
     let second = graph_viz(&graph, &[selected]).unwrap();
     assert_eq!(first, second);
-    assert_eq!(
-        first.to_dot(),
-        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=bool\\nname=mask\\nnode=1\\nshape=[1,3]\"];\n  \"g2\" [label=\"masked_select\\nkind=graph_op\\ndtype=f32\\ndynamic_counterpart=runtime_rank1\\nfill=f:0x8000000000000000\\nnode=2\\nresult_policy=fixed_size_pad_truncate\\nshape=[4]\\nsize=4\"];\n  \"g0\" -> \"g2\" [label=\"data:0:input\"];\n  \"g1\" -> \"g2\" [label=\"data:1:mask\"];\n}\n"
-    );
+    let dot = first.to_dot();
+    assert!(!dot.contains("masked_select"));
+    assert!(dot.contains("prefix_scan"));
+    assert!(dot.contains("reduction=sum"));
+    assert!(dot.contains("shape=[4]"));
 
     let empty = graph
         .masked_select(input, mask, 0, crate::Scalar::I(7))
         .unwrap();
     let empty_dot = graph_viz(&graph, &[empty]).unwrap().to_dot();
-    assert!(empty_dot.contains("fill=i:7"));
-    assert!(empty_dot.contains("result_policy=fixed_size_pad_truncate"));
+    assert!(!empty_dot.contains("masked_select"));
+    assert!(empty_dot.contains("prefix_scan"));
     assert!(empty_dot.contains("shape=[0]"));
 }
 

@@ -1924,10 +1924,9 @@ impl Graph {
         Ok(matches[0])
     }
 
-    /// Routes one fixed-size compacted cotangent to the retained row-major
-    /// source lanes. Positions and padding validity remain index/control
-    /// values only, so the mask has no reverse edge while the scattered
-    /// cotangent remains compositional for higher-order transforms.
+    /// Legacy raw-`MaskedSelect` VJP retained for graphs constructed inside
+    /// the crate. The public fixed-size route is now an ordinary source
+    /// composition whose existing rules provide the same value-only edge.
     fn masked_select_vjp(
         &mut self,
         upstream: NodeId,
@@ -2869,7 +2868,12 @@ mod tests {
         let compacted = graph
             .masked_select(x, condition, 3, Scalar::F(0.0))
             .unwrap();
-        assert_eq!(graph.op(compacted).unwrap().backward_inputs(), vec![x]);
+        assert!(graph.backward_slice_contains(compacted, x).unwrap());
+        assert!(!graph.backward_slice_contains(compacted, condition).unwrap());
+        assert!(
+            (0..graph.node_count())
+                .all(|index| !matches!(graph.op(NodeId(index)).unwrap(), Op::MaskedSelect { .. }))
+        );
 
         let detached = graph.detach(x).unwrap();
         assert!(graph.op(detached).unwrap().backward_inputs().is_empty());

@@ -11963,6 +11963,91 @@ fn tinygrad_gather_preflights_invalid_descriptors_atomically() {
 }
 
 #[test]
+fn fixed_masked_select_is_literal_schedulable_compaction_and_replays_natively() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F32);
+    let mask = graph.input_dtype("mask", [1, 3], DType::Bool);
+    let before = graph.node_count();
+    let output = graph
+        .masked_select(input, mask, 6, Scalar::F(-1.0))
+        .unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([6]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(
+        graph.nodes[before..]
+            .iter()
+            .all(|node| !matches!(node.op, Op::MaskedSelect { .. }))
+    );
+    // Two scans are the mask/count prefix operations in tinygrad's literal
+    // algorithm; the other two are RustGrad's lazy-range representation for
+    // scatter's one-hot classes and the final output validity comparison.
+    assert_eq!(
+        graph.nodes[before..]
+            .iter()
+            .filter(|node| matches!(node.op, Op::PrefixScan { .. }))
+            .count(),
+        4
+    );
+    assert!(graph.nodes[before..].iter().any(|node| matches!(
+        node.op,
+        Op::Reduce {
+            kind: ReduceKind::Sum,
+            ..
+        }
+    )));
+    assert!(
+        graph.nodes[before..]
+            .iter()
+            .any(|node| matches!(node.op, Op::Gather { .. }))
+    );
+
+    let inputs = HashMap::from([
+        (
+            "input".into(),
+            TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        ),
+        ("mask".into(), bool_data([1, 3], [true, false, true])),
+    ]);
+    let expected = TensorData::new([6], vec![1.0, 3.0, 4.0, 6.0, -1.0, -1.0]).unwrap();
+    assert_eq!(
+        CpuBackend.execute(&graph, output, &inputs).unwrap(),
+        expected
+    );
+
+    let schedule = crate::schedule(&graph, output).unwrap();
+    assert!(!schedule.items.is_empty());
+    assert!(schedule.items.iter().all(|item| item.boundary.is_none()));
+    let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+    let replay_inputs = inputs.into_iter().collect::<BTreeMap<_, _>>();
+    let executor = crate::CapturedReplayExecutor::default();
+    let interpreted = executor
+        .replay(
+            &capture,
+            &replay_inputs,
+            crate::CapturedReplayOptions::default(),
+        )
+        .unwrap();
+    let native = executor
+        .replay(
+            &capture,
+            &replay_inputs,
+            crate::CapturedReplayOptions {
+                backend: crate::CapturedBackendPolicy::NativeJit { vectorized: false },
+            },
+        )
+        .unwrap();
+    assert_eq!(interpreted.outputs, vec![expected.clone()]);
+    assert_eq!(native.outputs, vec![expected]);
+    assert!(
+        native
+            .trace
+            .items
+            .iter()
+            .all(|item| item.backend == crate::ItemBackend::NativeJit)
+    );
+}
+
+#[test]
 fn tinygrad_matmul_wrappers_are_exact_typed_dot_shells() {
     let mut forward = Graph::new();
     let lhs = forward.input_dtype("lhs", [2, 3], DType::F16);
