@@ -447,7 +447,11 @@ pub(super) fn linear(graph: &mut Graph, input: NodeId, weight: NodeId) -> Result
     graph.matmul(input, weight)
 }
 
-fn add_bias(graph: &mut Graph, output: NodeId, bias: Option<NodeId>) -> Result<NodeId, Error> {
+pub(super) fn add_bias(
+    graph: &mut Graph,
+    output: NodeId,
+    bias: Option<NodeId>,
+) -> Result<NodeId, Error> {
     bias.map_or(Ok(output), |bias| graph.add(output, bias))
 }
 
@@ -474,7 +478,7 @@ fn batch_heads(
     graph.permute(input, vec![0, 2, 1, 3])
 }
 
-fn permute_rope_projection(
+pub(super) fn permute_rope_projection(
     graph: &mut Graph,
     projection: NodeId,
     heads: usize,

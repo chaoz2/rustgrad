@@ -2609,10 +2609,31 @@ reordered, foreign-session, or pre-bind records cannot mutate the scoreboard.
 Stateful and append-state scoreboard binding/schema is an explicit follow-up rather than an
 implicit extension of the v1 report.
 
+The dense F32 Llama token-step layer uses the same boundary without adding a
+model-specific runtime. A crate-private exact resident projection captures each
+GGUF weight by graph node, name, descriptor, and bytes; tied logits reuse the
+single token-embedding owner. One precomputed F32 RoPE table is resident. Two
+host-range-validated native Gather items consume I32 `[1,1]` token and `[1]`
+position inputs for embedding and RoPE lookup. Capture authenticates each
+scalar source through only its value-preserving reshape/expand lineage, so
+these two exact owners render without a status read or provisional candidate.
+Each layer materializes one dense
+`[1, kv_heads, 1, head_dim]` key row and value row, then authenticated raw
+Scatter-replace owners append them in place to one fixed
+`[1, kv_heads, max_context, head_dim]` physical bank per tensor. The dedicated
+row-shaped I32 append index and scalar model position are generated from the
+session's single committed position. Every index lane must match that next
+position before driver work. Only `[1, vocab]` logits cross device-to-host.
+Position, row-byte/work metrics, state, and output publish only after every layer's K/V
+append and logits succeed, so a partial failure retries and overwrites the same
+uncommitted row without a full-state copy.
+
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, quantized bindings, mutable training state, dynamically
-shaped/capacity-growing state, Llama/KV graph integration, general output
-chaining across calls, and multi-device execution remain explicit follow-ons.
+shaped/capacity-growing state, general output chaining across calls, chunk
+prefill, tokenizer/generator/sampling integration, stateful scoreboard v2,
+multi-device execution, and live Metal numerical/performance evidence remain
+explicit follow-ons.
 The semantic mock covers fixed-shape state ping-pong and a bounded
 residual-style multi-layer graph. Protected acceptance exercises that typed
 facade on the complete default Eval/F32 ResNet-18 `[1,3,224,224]` graph:
@@ -2735,6 +2756,21 @@ persistent Metal sessions use the same candidate transaction. Empty outputs
 compile, allocate, transfer, and submit nothing. This contract excludes I64
 indices, non-F32 values, symbolic geometry, and higher-level scatter
 compositions.
+
+A private inference-capture sidecar may authorize one narrower Gather path by
+transient input name. Authorization inspects only the already-owned captured
+schedule: it proves an exact dense scalar I32 input, one capture-owned
+`AffineCopy` whose normalized read maps every reachable index lane to physical
+offset zero, its exact dependency into one internal raw Gather owner, and the
+owner's `PortableIndexedMovement` axis and extent. Static planning repeats the
+same provenance proof over logical/physical slots. Static execution reports the
+ordinary typed `IndexOutOfBounds` error for a bad scalar before any driver call;
+only then does a separately versioned MSL kernel write its final output directly,
+without candidate/status resources or a status download. Requested Gather
+outputs, resident/state inputs,
+multi-element or transformed indices, ambiguous owners, and ordinary Gather
+rendering retain the checked transactional path. This runtime-only permission
+does not alter graph, schedule, capture, or artifact bytes.
 
 Source identity includes renderer/ABI/transaction versions, local size,
 complete device capabilities, ordered buffer/view/guard metadata, and emitted

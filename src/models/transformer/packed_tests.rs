@@ -1,12 +1,13 @@
 use super::{
     LlamaBatchGenerator, LlamaBatchNativeCache, LlamaBatchNativeGenerator, LlamaBatchSampling,
-    LlamaLinearWeight, LlamaModel, LlamaModelError, LlamaNativeCache, LlamaNativeGenerator,
-    LlamaNativeStageKind, LlamaSampling,
+    LlamaLinearWeight, LlamaMetalStepError, LlamaMetalStepPlan, LlamaModel, LlamaModelError,
+    LlamaNativeCache, LlamaNativeGenerator, LlamaNativeStageKind, LlamaSampling,
     serving::{
         LlamaRequestStatus, LlamaServingConfig, LlamaServingGenerationConfig, LlamaServingSampling,
         LlamaServingScheduler,
     },
 };
+use crate::runtime::metal::{MetalCapabilities, MetalRenderer};
 use crate::{
     GgmlLayout, GgmlType, QuantizedTensorData, Shape, TensorData, tokenizer::SimpleTokenizer,
 };
@@ -342,6 +343,24 @@ fn assert_close(actual: &TensorData, expected: &TensorData) {
             "index {index}: {actual} != {expected}, difference={difference}"
         );
     }
+}
+
+#[test]
+fn metal_step_rejects_packed_weights_before_graph_or_resource_planning() {
+    let (packed, _, _, _) = models();
+    let renderer = MetalRenderer::new(
+        8,
+        MetalCapabilities {
+            max_buffer_length: 1 << 30,
+            unified_memory: true,
+            family: "MockApple9".into(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        LlamaMetalStepPlan::new(&packed, renderer),
+        Err(LlamaMetalStepError::PackedTensor(_))
+    ));
 }
 
 #[test]
