@@ -4460,6 +4460,34 @@ impl Graph {
         self.lower_lazy_arange(lazy_arange_default_int_plan(start, end, step)?)
     }
 
+    /// Builds the typed `0..source.shape[axis]` value used by shape-dependent
+    /// indexing compositions. The source is immutable descriptor provenance,
+    /// not a storage operand; symbolic capture derives the output extent from
+    /// that exact axis instead of guessing from an equal template dimension.
+    pub(crate) fn shape_iota(&mut self, source: NodeId, axis: usize) -> Result<NodeId> {
+        let source_shape = self.shape(source)?.clone();
+        let Some(&extent) = source_shape.dims().get(axis) else {
+            return Err(Error::InvalidAxis {
+                node: source,
+                axis,
+                rank: source_shape.rank(),
+            });
+        };
+        let extent_i64 =
+            i64::try_from(extent).map_err(|_| Error::ShapeOverflow(source_shape.clone()))?;
+        let dtype = if extent_i64 <= i64::from(i32::MAX) {
+            DType::I32
+        } else {
+            DType::I64
+        };
+        let shape = Shape::new([extent]);
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        Ok(self.push(Op::ShapeIota { source, axis }, shape, dtype))
+    }
+
     // Literal `arange(n, dtype=default_float)` used by tinygrad linspace:
     // scalar F32 full, typed cumulative Add, then typed F32 offset. Keeping
     // this float throughout avoids an integer-range cast boundary for large

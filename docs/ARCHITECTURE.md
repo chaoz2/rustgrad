@@ -210,9 +210,12 @@ remain rejected before resource work.
 `reduction_native.rs` is the single checked reduction recurrence boundary for
 CPU, capture, and native renderers. It derives exact source/accumulator/output
 dtypes from one scalar Init→Accumulate→Finalize chain, commits every step at
-accumulator width, owns typed identities and Mean finalization, and rejects
-empty extrema. The finalize result may have a different storage dtype from
-the accumulator. Newly emitted raw Float8 Sum/Mean use F32 recurrence followed
+accumulator width, and owns typed identities and Mean finalization. Empty
+extrema finalize their committed dtype identity, including when symbolic
+specialization turns a nonempty template reduction into an empty domain; a
+backend without that exact lowering remains free to reject it before resource
+work. The finalize result may have a different storage dtype from the
+accumulator. Newly emitted raw Float8 Sum/Mean use F32 recurrence followed
 by one final narrow encoding when a real reduction axis remains; a singleton or
 no-effective-axis reduction is an exact raw-lane identity. Explicit
 same-storage reductions commit each step in that storage. The decoder also
@@ -1578,6 +1581,19 @@ authenticated restricted DAG, so an arbitrary legacy `DefineVar` cannot acquire
 a symbolic-schema slot by name. These ephemeral UOps are neither scheduled nor
 serialized and do not admit runtime-valued `Range` execution.
 
+Shape-dependent tensor indices use a narrower typed boundary. `Op::ShapeIota`
+owns the one-dimensional integer value `0..source.shape[axis]`; `source` is
+descriptor provenance rather than a storage edge. Static scheduling gives that
+value an ordinary owned elementwise item whose kernel is the existing
+`Range(0)`/Cast/Store algebra. Symbolic schema construction derives its sole
+dimension from the exact authenticated source axis and proves that the complete
+declared family fits its fixed I32 or I64 storage before capture publication.
+Specialization therefore only rebinds existing output/Range geometry: it adds
+no UOp, schedule, artifact, or cache-key taxonomy. Source argmin/argmax compose
+this value with ordinary compare/select/Max reductions, while the integer index
+result and `ShapeIota` provenance intentionally expose no reverse edge. General
+runtime range endpoints and runtime-selected reduction axes remain separate.
+
 `SymbolicShape` is a planning value beside concrete `Shape`. Binding validates
 the complete variable environment and converts every non-negative dimension to
 `usize`; `Graph::input_symbolic` is the ordinary Graph specialization point. No
@@ -2414,7 +2430,7 @@ unordered candidates retain the accumulator and I64/U64 never project through
 floating point. Effective singleton domains bypass recurrence. F16/BF16 use the
 software codecs and require the existing fp64 helper capability; Float8 remains
 outside OpenCL. Empty sum writes zero, empty mean writes a canonical quiet NaN,
-empty product writes its typed identity, and empty extrema remain a graph error.
+and empty product and extrema write their typed identities.
 Pointer arguments
 follow `ScheduleInputBinding` first-use order, the output follows inputs, and a
 checked `ulong` extent is the final scalar ABI. Compile-time empty reductions

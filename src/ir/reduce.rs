@@ -315,9 +315,6 @@ struct ArgmaxPlan {
     axis: isize,
     keepdim: bool,
     output_shape: Shape,
-    first_bounds: Vec<(usize, usize)>,
-    sentinel: TensorData,
-    empty: bool,
 }
 
 enum ArgminInverse {
@@ -826,72 +823,10 @@ fn argmax_plan(
         .checked_mul(dtype.itemsize())
         .ok_or_else(|| Error::ShapeOverflow(work_shape.clone()))?;
     let output_shape = reduction_shape(&work_shape, &[axis], keepdim);
-    let output_numel = output_shape.numel()?;
-    output_numel
+    output_shape
+        .numel()?
         .checked_mul(DType::I32.itemsize())
         .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
-    let axis_extent = work_shape.dims()[axis];
-    let axis_extent =
-        i64::try_from(axis_extent).map_err(|_| Error::ShapeOverflow(work_shape.clone()))?;
-    let empty = axis_extent == 0 && output_numel > 0;
-    let first_bounds = if axis_extent == 0 {
-        Vec::new()
-    } else {
-        work_shape
-            .dims()
-            .iter()
-            .enumerate()
-            .map(|(dimension, &extent)| {
-                if dimension == axis {
-                    (0, 1)
-                } else {
-                    (0, extent)
-                }
-            })
-            .collect()
-    };
-    if !empty {
-        let first_shape = Shape::new(
-            first_bounds
-                .iter()
-                .map(|(start, end)| end - start)
-                .collect::<Vec<_>>(),
-        );
-        let first_result_shape = if keepdim {
-            first_shape
-        } else {
-            Shape::new(
-                first_shape
-                    .dims()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(dimension, &extent)| (dimension != axis).then_some(extent))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        if first_result_shape != output_shape {
-            return Err(Error::InvalidData {
-                shape: output_shape.clone(),
-                expected: output_numel,
-                actual: first_result_shape.numel()?,
-            });
-        }
-        first_result_shape
-            .numel()?
-            .checked_mul(dtype.itemsize())
-            .ok_or_else(|| Error::ShapeOverflow(first_result_shape.clone()))?;
-        first_result_shape
-            .numel()?
-            .checked_mul(DType::Bool.itemsize())
-            .ok_or_else(|| Error::ShapeOverflow(first_result_shape.clone()))?;
-    }
-    let sentinel = TensorData::scalar_with_dtype(Scalar::I(axis_extent), DType::I32);
-    if output_shape.broadcast_with(sentinel.shape())? != output_shape {
-        return Err(Error::InvalidElementwiseDType {
-            op: "argmax sentinel promotion",
-            actual: DType::I32,
-        });
-    }
     let axis = isize::try_from(axis).map_err(|_| Error::ShapeOverflow(work_shape.clone()))?;
     Ok(ArgmaxPlan {
         flatten,
@@ -899,9 +834,6 @@ fn argmax_plan(
         axis,
         keepdim,
         output_shape,
-        first_bounds,
-        sentinel,
-        empty,
     })
 }
 
@@ -1033,6 +965,55 @@ fn mean_plan(
 }
 
 impl Graph {
+    fn lower_source_argmax(&mut self, input: NodeId, plan: &ArgmaxPlan) -> Result<NodeId> {
+        let source = if plan.flatten {
+            self.reshape(input, plan.work_shape.clone())?
+        } else {
+            input
+        };
+        let axis = usize::try_from(plan.axis)
+            .map_err(|_| Error::ShapeOverflow(plan.work_shape.clone()))?;
+        let maximum = self.max_with_axes(source, Some(vec![plan.axis]), true)?;
+        let matches = self.eq(source, maximum)?;
+        let positions = self.shape_iota(source, axis)?;
+        let position_dtype = self.dtype(positions)?;
+        let ones = self.eq(positions, positions)?;
+        let ones = self.cast(ones, position_dtype)?;
+        let extent = self.reduce_with_output_dtype(
+            ones,
+            ReduceKind::Sum,
+            Some(vec![0]),
+            false,
+            position_dtype,
+        )?;
+        let mut position_shape = vec![1; plan.work_shape.rank()];
+        position_shape[axis] = plan.work_shape.dims()[axis];
+        let positions = self.reshape(positions, Shape::new(position_shape))?;
+        // `extent - (0..extent)` is checked-in tinygrad's descending
+        // `arange(extent, 0, -1)` priority, with the extent itself remaining
+        // a graph value when the source axis is symbolic.
+        let descending = self.sub(extent, positions)?;
+        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), position_dtype));
+        let priorities = self.select(matches, descending, zero)?;
+        let priority = self.max_with_axes(priorities, Some(vec![plan.axis]), plan.keepdim)?;
+        // Max's empty identity is the storage minimum. Clamp it to the zero
+        // no-witness priority before subtracting, so no dead branch can
+        // contain signed overflow and a zero axis stays in the same topology.
+        let priority = self.maximum(priority, zero)?;
+        let first = self.sub(extent, priority)?;
+        let first = if self.dtype(first)? == DType::I32 {
+            first
+        } else {
+            self.cast(first, DType::I32)?
+        };
+        let empty = self.eq(extent, zero)?;
+        let empty_index = self.constant(TensorData::scalar_with_dtype(
+            Scalar::I(i32::MIN.into()),
+            DType::I32,
+        ));
+        self.select(empty, empty_index, first)
+    }
+
     /// Runs a Sum or Product through an explicit, source-validated
     /// accumulator/output dtype contract.
     ///
@@ -1396,8 +1377,9 @@ impl Graph {
     /// Source-faithful public tinygrad-style ArgMax.
     ///
     /// `None` flattens and ignores `keepdim`; an explicit axis uses the
-    /// first-tie ArgReduce path with tinygrad's leading-NaN and empty-axis
-    /// sentinels. The legacy [`Self::argmax`] remains the raw ArgReduce API.
+    /// first-tie equality/range/reduction composition with tinygrad's
+    /// identity-first unordered-NaN and empty-axis behavior. The legacy
+    /// [`Self::argmax`] remains the raw ArgReduce API.
     pub fn argmax_with_axis(
         &mut self,
         input: NodeId,
@@ -1409,34 +1391,17 @@ impl Graph {
             (input_node.shape.clone(), input_node.dtype)
         };
         let plan = argmax_plan(input, &shape, dtype, axis, keepdim)?;
-        let output = if plan.empty {
-            self.full_with_dtype(
-                plan.output_shape.clone(),
-                Scalar::I(i32::MIN.into()),
-                DType::I32,
-            )?
-        } else {
-            let source = if plan.flatten {
-                self.reshape(input, plan.work_shape.clone())?
-            } else {
-                input
-            };
-            let indices = self.argmax(source, Some(plan.axis), plan.keepdim)?;
-            let first = self.shrink(source, plan.first_bounds)?;
-            let first = if plan.keepdim {
-                first
-            } else {
-                self.squeeze(first, Some(plan.axis))?
-            };
-            let leading_nan = self.isnan(first)?;
-            let sentinel = self.constant(plan.sentinel);
-            self.select(leading_nan, sentinel, indices)?
-        };
+        let mut candidate = self.clone();
+        let output = candidate.lower_source_argmax(input, &plan)?;
         debug_assert_eq!(
-            self.shape(output).expect("argmax preflighted"),
+            candidate.shape(output).expect("argmax preflighted"),
             &plan.output_shape
         );
-        debug_assert_eq!(self.dtype(output).expect("argmax preflighted"), DType::I32);
+        debug_assert_eq!(
+            candidate.dtype(output).expect("argmax preflighted"),
+            DType::I32
+        );
+        *self = candidate;
         Ok(output)
     }
 
@@ -1463,42 +1428,25 @@ impl Graph {
             (input_node.shape.clone(), input_node.dtype)
         };
         let plan = argmin_plan(input, &shape, dtype, axis, keepdim)?;
-        let output = if plan.argmax.empty {
-            self.full_with_dtype(
-                plan.argmax.output_shape.clone(),
-                Scalar::I(i32::MIN.into()),
-                DType::I32,
-            )?
-        } else {
-            let inverse = match plan.inverse {
-                ArgminInverse::Negate => self.neg(input)?,
-                ArgminInverse::LogicalNot => self.logical_not(input)?,
-                ArgminInverse::BitwiseNot(value) => {
-                    let value = self.constant(value);
-                    self.bit_xor(input, value)?
-                }
-            };
-            let source = if plan.argmax.flatten {
-                self.reshape(inverse, plan.argmax.work_shape.clone())?
-            } else {
-                inverse
-            };
-            let indices = self.argmax(source, Some(plan.argmax.axis), plan.argmax.keepdim)?;
-            let first = self.shrink(source, plan.argmax.first_bounds)?;
-            let first = if plan.argmax.keepdim {
-                first
-            } else {
-                self.squeeze(first, Some(plan.argmax.axis))?
-            };
-            let leading_nan = self.isnan(first)?;
-            let sentinel = self.constant(plan.argmax.sentinel);
-            self.select(leading_nan, sentinel, indices)?
+        let mut candidate = self.clone();
+        let inverse = match plan.inverse {
+            ArgminInverse::Negate => candidate.neg(input)?,
+            ArgminInverse::LogicalNot => candidate.logical_not(input)?,
+            ArgminInverse::BitwiseNot(value) => {
+                let value = candidate.constant(value);
+                candidate.bit_xor(input, value)?
+            }
         };
+        let output = candidate.lower_source_argmax(inverse, &plan.argmax)?;
         debug_assert_eq!(
-            self.shape(output).expect("argmin preflighted"),
+            candidate.shape(output).expect("argmin preflighted"),
             &plan.argmax.output_shape
         );
-        debug_assert_eq!(self.dtype(output).expect("argmin preflighted"), DType::I32);
+        debug_assert_eq!(
+            candidate.dtype(output).expect("argmin preflighted"),
+            DType::I32
+        );
+        *self = candidate;
         Ok(output)
     }
 
@@ -2139,8 +2087,11 @@ fn valid_reduction_dtypes(kind: ReduceKind, input: DType, dtypes: ReductionDType
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, Shape};
-    use std::collections::HashMap;
+    use crate::{
+        Backend, CapturedBackendPolicy, CapturedReplayExecutor, CapturedReplayOptions,
+        CapturedSchedule, CpuBackend, CpuJit, Shape,
+    };
+    use std::collections::{BTreeMap, HashMap};
 
     fn data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
         TensorData::new(shape, values.to_vec()).unwrap()
@@ -2698,7 +2649,7 @@ mod tests {
     }
 
     #[test]
-    fn argmax_with_axis_matches_tinygrad_flatten_and_nan_sentinels() {
+    fn argmax_with_axis_matches_tinygrad_flatten_and_nan_behavior() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [3, 3], DType::F64);
         let output = graph.argmax_with_axis(input, Some(-1), false).unwrap();
@@ -2722,7 +2673,10 @@ mod tests {
             .unwrap(),
         )]);
         let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
-        assert_eq!(values.to_vec_f64(), vec![3., 0., 2.]);
+        // Checked-in tinygrad defines this through equality with its Max
+        // reduction. Max's identity-first unordered-NaN behavior ignores the
+        // leading NaN, so the numerical maximum remains at index two.
+        assert_eq!(values.to_vec_f64(), vec![2., 0., 2.]);
         assert!(matches!(
             graph.grad(output, input),
             Err(Error::NonDifferentiableTarget(node)) if node == output
@@ -2796,7 +2750,144 @@ mod tests {
     }
 
     #[test]
-    fn argmin_with_axis_uses_tinygrad_inverse_and_argmax_sentinels() {
+    fn source_argmax_uses_schedulable_shape_iota_and_keeps_raw_argreduce_legacy() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 4]);
+        let output = graph.argmax_with_axis(input, Some(-1), false).unwrap();
+        let iotas = (0..graph.node_count())
+            .map(NodeId)
+            .filter(|node| matches!(graph.op(*node), Ok(crate::Op::ShapeIota { .. })))
+            .collect::<Vec<_>>();
+        assert_eq!(iotas.len(), 1);
+        assert!(
+            (0..graph.node_count())
+                .map(NodeId)
+                .all(|node| !matches!(graph.op(node), Ok(crate::Op::ArgReduce { .. })))
+        );
+        let schedule = crate::schedule(&graph, output).unwrap();
+        assert!(schedule.items.iter().all(|item| item.boundary.is_none()));
+        assert!(
+            schedule
+                .items
+                .iter()
+                .any(|item| item.node == iotas[0] && item.input_bindings.is_empty())
+        );
+        let values = TensorData::new([2, 4], vec![1.0, 7.0, 7.0, 2.0, 4.0, 3.0, 9.0, 9.0]).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, output, &HashMap::from([("input".into(), values)]))
+                .unwrap(),
+            TensorData::from_scalars([2], DType::I32, [Scalar::I(1), Scalar::I(2)]).unwrap()
+        );
+
+        let raw = graph.argmax(input, Some(-1), false).unwrap();
+        assert!(matches!(graph.op(raw), Ok(crate::Op::ArgReduce { .. })));
+        let raw_schedule = crate::schedule(&graph, raw).unwrap();
+        let raw_item = raw_schedule
+            .items
+            .iter()
+            .find(|item| item.node == raw)
+            .expect("raw ArgReduce boundary");
+        assert_eq!(
+            raw_item.boundary,
+            Some(crate::ScheduleBoundary::Unsupported(
+                "operation requires materialization"
+            ))
+        );
+        assert!(raw_item.input_bindings.is_empty());
+        assert!(matches!(
+            raw_item.kernel.operation(),
+            crate::Operation::Sink
+        ));
+        assert!(raw_item.kernel.sources().is_empty());
+
+        let mut iota_graph = Graph::new();
+        let empty_source = iota_graph.input("empty", [3, 0]);
+        let empty_iota = iota_graph.shape_iota(empty_source, 1).unwrap();
+        assert_eq!(iota_graph.shape(empty_iota).unwrap(), &Shape::new([0]));
+        assert_eq!(iota_graph.dtype(empty_iota).unwrap(), DType::I32);
+        assert!(
+            iota_graph
+                .op(empty_iota)
+                .unwrap()
+                .backward_inputs()
+                .is_empty()
+        );
+        let empty_schedule = crate::schedule(&iota_graph, empty_iota).unwrap();
+        assert!(empty_schedule.items[0].input_bindings.is_empty());
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &iota_graph,
+                    empty_iota,
+                    &HashMap::from([("empty".into(), data([3, 0], &[]))]),
+                )
+                .unwrap(),
+            TensorData::from_scalars([0], DType::I32, []).unwrap()
+        );
+        let nodes = iota_graph.node_count();
+        assert!(matches!(
+            iota_graph.shape_iota(empty_source, 2),
+            Err(Error::InvalidAxis { .. })
+        ));
+        assert_eq!(iota_graph.node_count(), nodes);
+
+        let wide_source = iota_graph.input("wide", [i32::MAX as usize + 1]);
+        let wide_iota = iota_graph.shape_iota(wide_source, 0).unwrap();
+        assert_eq!(iota_graph.dtype(wide_iota).unwrap(), DType::I64);
+        let wide_schedule = crate::schedule(&iota_graph, wide_iota).unwrap();
+        let wide_item = wide_schedule
+            .items
+            .iter()
+            .find(|item| item.node == wide_iota)
+            .expect("wide ShapeIota item");
+        let wide_source = CpuJit::render(&wide_item.kernel).unwrap().source;
+        assert!(wide_source.contains("((int64_t)rg_i)"));
+        assert!(!wide_source.contains("unsupported Range"));
+
+        let mut captured_iota = Graph::new();
+        let source = captured_iota.input("source", [2, 4]);
+        let iota = captured_iota.shape_iota(source, 1).unwrap();
+        let schedule = crate::schedule(&captured_iota, iota).unwrap();
+        let capture = CapturedSchedule::capture(&captured_iota, &schedule, &[iota]).unwrap();
+        let result = CapturedReplayExecutor::default()
+            .replay(
+                &capture,
+                &BTreeMap::new(),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.outputs[0],
+            TensorData::from_scalars(
+                [4],
+                DType::I32,
+                [Scalar::I(0), Scalar::I(1), Scalar::I(2), Scalar::I(3)],
+            )
+            .unwrap()
+        );
+
+        let mut zero_output = Graph::new();
+        let input = zero_output.input("input", [0, 0]);
+        let output = zero_output.argmax_with_axis(input, Some(1), false).unwrap();
+        assert_eq!(zero_output.shape(output).unwrap(), &Shape::new([0]));
+        assert_eq!(zero_output.dtype(output).unwrap(), DType::I32);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &zero_output,
+                    output,
+                    &HashMap::from([("input".into(), data([0, 0], &[]))]),
+                )
+                .unwrap(),
+            TensorData::from_scalars([0], DType::I32, []).unwrap()
+        );
+    }
+
+    #[test]
+    fn argmin_with_axis_uses_tinygrad_inverse_and_argmax_behavior() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [3, 3], DType::F64);
         let output = graph.argmin_with_axis(input, Some(-1), false).unwrap();
@@ -2820,7 +2911,7 @@ mod tests {
             .unwrap(),
         )]);
         let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
-        assert_eq!(values.to_vec_f64(), vec![3., 0., 2.]);
+        assert_eq!(values.to_vec_f64(), vec![2., 0., 2.]);
         assert!(matches!(
             graph.grad(output, input),
             Err(Error::NonDifferentiableTarget(node)) if node == output
@@ -2939,7 +3030,7 @@ mod tests {
     }
 
     #[test]
-    fn argextrema_default_wrappers_preserve_flattened_i32_sentinel_structure() {
+    fn argextrema_default_wrappers_preserve_flattened_i32_structure() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [2, 3], DType::F64);
         let maximum = graph.argmax_default(input).unwrap();
@@ -2947,8 +3038,9 @@ mod tests {
         for output in [maximum, minimum] {
             assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
             assert_eq!(graph.dtype(output).unwrap(), DType::I32);
-            // The explicit source plan keeps first-tie ArgReduce and its
-            // leading-NaN sentinel as a Select over the flattened operand.
+            // The explicit source plan keeps the first-tie range/reduction
+            // composition and its explicit empty-axis sentinel as a Select
+            // over the flattened operand.
             assert!(matches!(
                 graph.op(output).unwrap(),
                 crate::Op::Select { .. }
@@ -2966,11 +3058,14 @@ mod tests {
             graph
                 .nodes
                 .iter()
-                .filter_map(|node| match &node.op {
-                    crate::Op::Constant(data) => Some((data.dtype(), data.scalar_at(0))),
-                    _ => None,
-                })
-                .any(|(dtype, value)| dtype == DType::I32 && value.as_i64() == 6)
+                .any(|node| matches!(&node.op, crate::Op::ShapeIota { .. })
+                    && node.shape == Shape::new([6]))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| !matches!(&node.op, crate::Op::ArgReduce { .. }))
         );
         // ArgMin is source-literal inverse → ArgMax, not raw ArgMin.
         assert!(graph.nodes.iter().any(|node| matches!(

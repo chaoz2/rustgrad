@@ -169,15 +169,9 @@ impl NativeReductionPlan {
         output_elements
             .checked_mul(output_dtype.itemsize())
             .ok_or("native reduction output byte count overflows")?;
-        let reduction_len = geometry
+        geometry
             .reduction_len()
             .map_err(|_| "native reduction domain overflows")?;
-        if output_elements != 0
-            && reduction_len == 0
-            && matches!(kind, ReduceKind::Max | ReduceKind::Min)
-        {
-            return Err("native extrema reduction has an empty domain");
-        }
         Ok(Self {
             geometry,
             kind,
@@ -655,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_geometry_dtype_and_empty_extrema_fail_closed() {
+    fn malformed_geometry_and_dtype_fail_closed_while_empty_extrema_use_identity() {
         assert!(
             NativeReductionPlan::new(
                 Shape::from([2, 3]),
@@ -704,17 +698,20 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            NativeReductionPlan::new(
-                Shape::from([0]),
-                Shape::new([]),
-                vec![0],
-                false,
-                ReduceKind::Max,
-                DType::I32,
-                ReductionDType::new(DType::I32, DType::I32),
-            )
-            .is_err()
+        let empty_max = NativeReductionPlan::new(
+            Shape::from([0]),
+            Shape::new([]),
+            vec![0],
+            false,
+            ReduceKind::Max,
+            DType::I32,
+            ReductionDType::new(DType::I32, DType::I32),
+        )
+        .unwrap();
+        assert_eq!(empty_max.reduction_len(), 0);
+        assert_eq!(
+            empty_max.finalize(empty_max.identity()),
+            Scalar::I(i32::MIN.into())
         );
         assert!(
             NativeReductionPlan::new(

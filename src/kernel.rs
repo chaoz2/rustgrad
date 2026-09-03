@@ -765,7 +765,7 @@ fn lower_graph_elementwise_with_substitutions(
             node: id,
             view: context
                 .iteration
-                .map(|iteration| iteration.project(graph, shape, out))
+                .map(|iteration| iteration.project(graph, shape.clone(), out))
                 .transpose()?,
         };
         if let Some(v) = memo.get(&key) {
@@ -790,6 +790,12 @@ fn lower_graph_elementwise_with_substitutions(
                 }
                 Op::Constant(_) => load(graph, id, out, range, None, context.iteration)?,
                 Op::Random { .. } => return Err(UOpError::InvalidArgument),
+                Op::ShapeIota { .. } => {
+                    if context.iteration.is_some() || &shape != out {
+                        return Err(UOpError::InvalidArgument);
+                    }
+                    UOp::cast(range.clone(), ty)
+                }
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
                 Op::Reduce { .. } | Op::PrefixScan { .. } => {

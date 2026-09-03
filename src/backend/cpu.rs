@@ -237,6 +237,11 @@ impl Backend for CpuBackend {
                     &node.shape,
                     node.dtype,
                 )?,
+                Op::ShapeIota { .. } => TensorData::from_scalars(
+                    node.shape.clone(),
+                    node.dtype,
+                    (0..node.shape.numel()?).map(|index| Scalar::I(index as i64)),
+                )?,
                 Op::Reduce {
                     input,
                     kind,
