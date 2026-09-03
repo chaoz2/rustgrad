@@ -235,10 +235,11 @@ pub use schedule::{
     schedule, schedule_effects, schedule_many, schedule_with_external_materializations,
 };
 pub use session::{
-    BinaryClassificationSummary, CapturedInference, CapturedInferenceError, ClassificationSummary,
-    CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CpuBinaryModuleTrainer,
-    CpuCompiledMomentumSgd, CpuGradientStore, CpuModeModuleTrainer, CpuModuleTrainer, CpuSession,
-    DynamicTensor, MaskedSelectOutput, MetalSessionResult, MetalSessionTrace,
+    BinaryClassificationSummary, CapturedInference, CapturedInferenceError,
+    CapturedStatefulInference, ClassificationSummary, CompiledMomentumSgdConfig,
+    CompiledMomentumSgdStepResult, CpuBinaryModuleTrainer, CpuCompiledMomentumSgd,
+    CpuGradientStore, CpuModeModuleTrainer, CpuModuleTrainer, CpuSession, DynamicTensor,
+    InferenceStateLink, MaskedSelectOutput, MetalSessionResult, MetalSessionTrace,
     ModuleBinaryCrossEntropy, ModuleCrossEntropy, ModuleInferenceResult, ModuleStepResult,
     NativeModuleExecutionReport, NativeModuleInferenceResult, NativeModuleInferenceTrace,
     ReportedNativeModuleInferenceResult, SessionDevice, Tensor, TrainingParameterInit,

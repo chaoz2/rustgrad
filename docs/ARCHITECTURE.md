@@ -2529,12 +2529,28 @@ the same deterministic registry-ID/name ordering as full discovery, while
 `MetalDevice::renderer(local_size)` carries that device's exact capabilities
 into a resource-free renderer without choosing the caller's launch width.
 
+`CapturedStatefulInference` adds an authenticated fixed-shape recurrent
+sidecar without changing captured schedule bytes. Each `InferenceStateLink`
+pairs one exact graph `Input` descriptor with one distinct directly produced,
+full-buffer output of the same shape, dtype, byte extent, and alignment. State
+inputs cannot be module residents or public requests; state outputs are
+protected physical owners but are excluded from host projection.
+`MetalStatefulInferencePlan` owns two logical epoch bank sets for every pair;
+nonempty state receives two private allocations, while empty state remains
+addressless and owns no native resource. It uploads the initial active bank
+once. A run reads the active bank and writes the candidate bank; only after
+every launch/wait, public download, decode, and ordered projection succeeds
+does the session flip its single epoch bit and publish state counters. Failure
+leaves the active bank and all visible metrics unchanged, so retry safely
+overwrites the uncommitted candidate bank.
+
 The plan exposes exact typed input schemas, every rendered schedule item,
 nonzero compiled-kernel cache keys, planned slot bytes including private
 zero-byte sentinels, and nonzero/zero item counts. The prepared session exposes
 only its compiled nonzero kernels, selected handle-free `MetalDeviceInfo`, and stable
 Rust owner identity. Preparation and successful-run reports distinguish
 deterministic counts from host wall-clock durations and host API copy bytes;
+initialization upload time includes immutable resident and initial-state writes;
 they make no claim about allocator RSS, PCIe traffic, cache residency, or GPU
 timestamps. Runs are synchronous host transactions and currently submit and
 wait per schedule item rather than batching one command buffer. Invalid calls
@@ -2542,10 +2558,10 @@ reach no driver work; a failed execution publishes neither outputs nor a
 successful-run metric and the settled prefix remains retryable. Zero-work
 captures allocate, compile, upload, launch, wait, and read nothing.
 
-`MetalSessionScoreboard` is an opt-in observation layer over that existing
-evidence. It snapshots a `MetalInferencePlan`, binds once to the exact prepared
-deployment/session identity, and accepts only its consecutive successful
-`MetalDeviceRun` prefix. The immutable report preserves the first host-wall
+`MetalSessionScoreboard` v1 is a stateless-only opt-in observation layer over
+that existing evidence. It snapshots a `MetalInferencePlan`, binds once to the
+exact prepared deployment/session identity, and accepts only its consecutive
+successful `MetalDeviceRun` prefix. The immutable report preserves the first host-wall
 run separately, retains steady host-wall samples in invocation order, derives
 integer-duration nearest-rank percentiles, and aggregates the exact plan,
 pipeline-cache, launch, zero-item, and host-API copy counters already owned by
@@ -2557,18 +2573,22 @@ and queue setup; `planned_static_tensor_slot_bytes` is neither measured peak
 memory nor process RSS. Host-wall observations are not GPU timestamps, and
 host-API copy counts/bytes are not physical-bus measurements. Failed, skipped,
 reordered, foreign-session, or pre-bind records cannot mutate the scoreboard.
+Stateful scoreboard binding/schema is an explicit follow-up rather than an
+implicit extension of the v1 report.
 
 This boundary is concrete, pure, static inference only. Symbolic programs,
-effects, RNG state, quantized bindings, mutable training or KV state,
-state-input/state-output ping-pong, output chaining across calls, and
-multi-device execution remain explicit follow-ons. In addition to the bounded
-numerical semantic mock, protected acceptance lowers the complete default
-Eval/F32 ResNet-18 `[1,3,224,224]` graph through boundary-free scheduling and
-capture, renders all scheduled items to MSL, then performs resident preparation
-and two ABI-validating virtual-resource runs. That full-model test proves
-shapes, ownership, stable slot handles, and zero fallback; it deliberately
-avoids billions of host-side mock convolution operations and therefore makes
-no numerical Metal, live-device, or performance claim.
+effects, RNG state, quantized bindings, mutable training state, dynamically
+shaped/capacity-growing state, Llama/KV graph integration, general output
+chaining across calls, and multi-device execution remain explicit follow-ons.
+The semantic mock covers fixed-shape state ping-pong and a bounded
+residual-style multi-layer graph. Protected acceptance also lowers the complete
+default Eval/F32 ResNet-18 `[1,3,224,224]` graph through boundary-free
+scheduling and capture, renders all scheduled items to MSL, then performs
+resident preparation and two ABI-validating virtual-resource runs. That
+full-model test proves shapes, ownership, stable slot handles, and zero
+fallback; it deliberately avoids billions of host-side mock convolution
+operations and therefore makes no numerical Metal, live-device, or performance
+claim.
 
 `MetalRuntime::discover` is the narrow diagnostic seam for deployment setup:
 framework/symbol errors remain structured `MetalError`s, while a successfully
