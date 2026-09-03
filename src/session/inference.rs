@@ -31,6 +31,59 @@ pub struct InferenceStateLink {
     output: NodeId,
 }
 
+/// One append-only recurrent state update. The output must be an exact raw
+/// Scatter-replace of `updates` into `input` through the live I32 `index`
+/// tensor along `axis`; Metal may then authenticate and execute it in place.
+/// The row-shaped index is a dedicated authenticated input. Model wrappers
+/// that also expose a scalar position must derive it from that scalar and
+/// preserve their equality before constructing this lower-level contract.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InferenceAppendStateLink {
+    input: NodeId,
+    output: NodeId,
+    index: NodeId,
+    updates: NodeId,
+    axis: usize,
+}
+
+impl InferenceAppendStateLink {
+    pub const fn new(
+        input: NodeId,
+        output: NodeId,
+        index: NodeId,
+        updates: NodeId,
+        axis: usize,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            index,
+            updates,
+            axis,
+        }
+    }
+
+    pub const fn input(self) -> NodeId {
+        self.input
+    }
+
+    pub const fn output(self) -> NodeId {
+        self.output
+    }
+
+    pub const fn index(self) -> NodeId {
+        self.index
+    }
+
+    pub const fn updates(self) -> NodeId {
+        self.updates
+    }
+
+    pub const fn axis(self) -> usize {
+        self.axis
+    }
+}
+
 impl InferenceStateLink {
     pub const fn new(input: NodeId, output: NodeId) -> Self {
         Self { input, output }
@@ -52,6 +105,18 @@ pub(crate) struct CapturedInferenceState {
     pub(crate) output: crate::BufferDesc,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedInferenceAppendState {
+    pub(crate) link: InferenceAppendStateLink,
+    pub(crate) input: ReplayInput,
+    pub(crate) index: ReplayInput,
+    pub(crate) updates: crate::BufferDesc,
+    pub(crate) output: crate::BufferDesc,
+    pub(crate) axis_extent: usize,
+    pub(crate) row_elements: usize,
+    pub(crate) row_bytes: usize,
+}
+
 /// Resource-free authenticated capture with fixed-shape recurrent state.
 /// State outputs are private protected owners and are never public results.
 #[derive(Clone, Debug)]
@@ -59,6 +124,17 @@ pub struct CapturedStatefulInference {
     inference: CapturedInference,
     public_output_count: usize,
     states: Vec<CapturedInferenceState>,
+    initial_state: BTreeMap<String, TensorData>,
+    identity: u64,
+}
+
+/// Resource-free authenticated capture whose fixed F32 state is updated one
+/// complete row at a time through a host-validated monotonic I32 index.
+#[derive(Clone, Debug)]
+pub struct CapturedAppendStateInference {
+    inference: CapturedInference,
+    public_output_count: usize,
+    states: Vec<CapturedInferenceAppendState>,
     initial_state: BTreeMap<String, TensorData>,
     identity: u64,
 }
@@ -229,41 +305,9 @@ impl CapturedStatefulInference {
                     "state input name aliases another owned binding".into(),
                 ));
             }
-            let input = inference
-                .capture
-                .inputs
-                .iter()
-                .find(|input| input.node == link.input && input.name == *name)
-                .cloned()
-                .ok_or_else(|| {
-                    CapturedInferenceError::Binding(
-                        "state input is absent from captured input ownership".into(),
-                    )
-                })?;
-            let output = inference
-                .capture
-                .items
-                .iter()
-                .flat_map(|item| item.outputs.iter())
-                .find(|output| output.id == link.output.index() as u64)
-                .cloned()
-                .ok_or_else(|| {
-                    CapturedInferenceError::Binding(
-                        "state output must be a directly produced capture owner".into(),
-                    )
-                })?;
-            if output.view.is_some()
-                || output.read_only
-                || input.desc.view.is_some()
-                || input.desc.shape != output.shape
-                || input.desc.dtype != output.dtype
-                || input.desc.bytes != output.bytes
-                || input.desc.alignment != output.alignment
-            {
-                return Err(CapturedInferenceError::Binding(
-                    "state input/output descriptors are not exact full-buffer peers".into(),
-                ));
-            }
+            let input = captured_owned_input(&inference.capture, link.input, name, "state")?;
+            let output = captured_owned_output(&inference.capture, link.output, "state")?;
+            validate_state_descriptors(&input, &output, "state")?;
             let initial = initial_state.get(name).ok_or_else(|| {
                 CapturedInferenceError::Binding(format!("missing initial state {name}"))
             })?;
@@ -360,6 +404,424 @@ impl CapturedStatefulInference {
             self.identity,
         )
     }
+}
+
+impl CapturedAppendStateInference {
+    pub fn from_module_graph(
+        module: &(impl Module + ?Sized),
+        graph: &Graph,
+        requested: &[NodeId],
+        state_links: &[InferenceAppendStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        if state_links.is_empty() {
+            return Err(CapturedInferenceError::Binding(
+                "append-state inference requires at least one state link".into(),
+            ));
+        }
+        let public = requested.iter().copied().collect::<BTreeSet<_>>();
+        let mut owned = BTreeSet::new();
+        let mut combined = requested.to_vec();
+        for link in state_links {
+            for id in [link.input, link.output, link.updates] {
+                graph.op(id).map_err(CapturedInferenceError::State)?;
+                if public.contains(&id) || !owned.insert(id) {
+                    return Err(CapturedInferenceError::Binding(
+                        "append state and public outputs must own distinct nodes".into(),
+                    ));
+                }
+            }
+            graph
+                .op(link.index)
+                .map_err(CapturedInferenceError::State)?;
+            if public.contains(&link.index) {
+                return Err(CapturedInferenceError::Binding(
+                    "append position cannot be a public output".into(),
+                ));
+            }
+            combined.push(link.output);
+        }
+        let mut inference = CapturedInference::from_module_graph(module, graph, &combined)?;
+        if inference
+            .capture
+            .requested_passthroughs
+            .iter()
+            .any(|alias| {
+                public.contains(&alias.requested)
+                    && state_links.iter().any(|state| {
+                        alias.source == state.input
+                            || alias.source == state.output
+                            || alias.source == state.updates
+                    })
+            })
+        {
+            return Err(CapturedInferenceError::Binding(
+                "append state storage cannot escape through a public alias".into(),
+            ));
+        }
+        let mut states = Vec::with_capacity(state_links.len());
+        let mut state_names = BTreeSet::new();
+        let mut shared_index = None;
+        let mut shared_extent = None;
+        for link in state_links {
+            let Op::Input { name: state_name } = graph
+                .op(link.input)
+                .map_err(CapturedInferenceError::State)?
+            else {
+                return Err(CapturedInferenceError::Binding(
+                    "append state input must be a graph Input".into(),
+                ));
+            };
+            let Op::Input { name: index_name } = graph
+                .op(link.index)
+                .map_err(CapturedInferenceError::State)?
+            else {
+                return Err(CapturedInferenceError::Binding(
+                    "append position index must be a graph Input".into(),
+                ));
+            };
+            let Op::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                add,
+            } = graph
+                .op(link.output)
+                .map_err(CapturedInferenceError::State)?
+            else {
+                return Err(CapturedInferenceError::Binding(
+                    "append state output must be raw Scatter-replace".into(),
+                ));
+            };
+            if *base != link.input
+                || *index != link.index
+                || *updates != link.updates
+                || *axis != link.axis
+                || *add
+            {
+                return Err(CapturedInferenceError::Binding(
+                    "append state output does not match its declared update".into(),
+                ));
+            }
+            if graph
+                .dtype(link.input)
+                .map_err(CapturedInferenceError::State)?
+                != DType::F32
+                || graph
+                    .dtype(link.index)
+                    .map_err(CapturedInferenceError::State)?
+                    != DType::I32
+                || graph
+                    .dtype(link.updates)
+                    .map_err(CapturedInferenceError::State)?
+                    != DType::F32
+            {
+                return Err(CapturedInferenceError::Binding(
+                    "append state requires F32 state/updates and I32 indices".into(),
+                ));
+            }
+            let state_shape = graph
+                .shape(link.input)
+                .map_err(CapturedInferenceError::State)?;
+            let index_shape = graph
+                .shape(link.index)
+                .map_err(CapturedInferenceError::State)?;
+            if index_shape
+                != graph
+                    .shape(link.updates)
+                    .map_err(CapturedInferenceError::State)?
+                || index_shape.rank() != state_shape.rank()
+                || link.axis >= state_shape.rank()
+                || index_shape.dims()[link.axis] != 1
+                || index_shape
+                    .dims()
+                    .iter()
+                    .zip(state_shape.dims())
+                    .enumerate()
+                    .any(|(axis, (index, state))| axis != link.axis && index != state)
+            {
+                return Err(CapturedInferenceError::Binding(
+                    "append update is not one complete state row".into(),
+                ));
+            }
+            let axis_extent = state_shape.dims()[link.axis];
+            if shared_index
+                .replace(link.index)
+                .is_some_and(|id| id != link.index)
+                || shared_extent
+                    .replace(axis_extent)
+                    .is_some_and(|extent| extent != axis_extent)
+            {
+                return Err(CapturedInferenceError::Binding(
+                    "append state links must share one position and capacity".into(),
+                ));
+            }
+            if !state_names.insert(state_name.as_str())
+                || inference.resident_bindings.contains_key(state_name)
+                || inference.resident_bindings.contains_key(index_name)
+            {
+                return Err(CapturedInferenceError::Binding(
+                    "append state inputs must not alias immutable residents".into(),
+                ));
+            }
+            let input =
+                captured_owned_input(&inference.capture, link.input, state_name, "append state")?;
+            let index =
+                captured_owned_input(&inference.capture, link.index, index_name, "append index")?;
+            let updates =
+                captured_owned_output(&inference.capture, link.updates, "append updates")?;
+            let output = captured_owned_output(&inference.capture, link.output, "append state")?;
+            validate_state_descriptors(&input, &output, "append state")?;
+            if updates.view.is_some()
+                || updates.read_only
+                || updates.shape != index.desc.shape
+                || updates.dtype != DType::F32
+                || updates.bytes != index.desc.bytes
+            {
+                return Err(CapturedInferenceError::Binding(
+                    "append update is not an owned dense F32 row".into(),
+                ));
+            }
+            let initial = initial_state.get(state_name).ok_or_else(|| {
+                CapturedInferenceError::Binding(format!("missing initial state {state_name}"))
+            })?;
+            validate_captured_inference_binding(&input, link.input, initial)?;
+            let row_elements = index_shape.numel().map_err(CapturedInferenceError::State)?;
+            if (axis_extent == 0 && row_elements != 0) || axis_extent > i32::MAX as usize + 1 {
+                return Err(CapturedInferenceError::Binding(
+                    "append state capacity is outside the live I32 position contract".into(),
+                ));
+            }
+            let row_bytes = row_elements
+                .checked_mul(DType::F32.itemsize())
+                .ok_or_else(|| {
+                    CapturedInferenceError::State(Error::ShapeOverflow(index_shape.clone()))
+                })?;
+            states.push(CapturedInferenceAppendState {
+                link: *link,
+                input,
+                index,
+                updates,
+                output,
+                axis_extent,
+                row_elements,
+                row_bytes,
+            });
+        }
+        let output_owners = inference
+            .capture
+            .items
+            .iter()
+            .flat_map(|item| item.outputs.iter().map(move |output| (output.id, item)))
+            .collect::<BTreeMap<_, _>>();
+        let append_owner_ids = states
+            .iter()
+            .map(|state| {
+                output_owners
+                    .get(&state.output.id)
+                    .map(|item| item.id)
+                    .ok_or_else(|| {
+                        CapturedInferenceError::Binding("append state owner is absent".into())
+                    })
+            })
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        for state in &states {
+            let owner = output_owners
+                .get(&state.output.id)
+                .copied()
+                .ok_or_else(|| {
+                    CapturedInferenceError::Binding("append state owner is absent".into())
+                })?;
+            let update_owner = output_owners
+                .get(&state.updates.id)
+                .copied()
+                .ok_or_else(|| {
+                    CapturedInferenceError::Binding("append update producer is absent".into())
+                })?;
+            if update_owner.id == owner.id || !owner.dependencies.contains(&update_owner.id) {
+                return Err(CapturedInferenceError::Binding(
+                    "append update producer is absent from owner dependencies".into(),
+                ));
+            }
+            for id in [state.input.desc.id, state.updates.id] {
+                let consumers = inference
+                    .capture
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.ordered_inputs()
+                            .iter()
+                            .any(|input| input.desc.id == id)
+                    })
+                    .collect::<Vec<_>>();
+                if consumers.len() != 1 || consumers[0].id != owner.id {
+                    return Err(CapturedInferenceError::Binding(
+                        "append state inputs must be owned exclusively by their update".into(),
+                    ));
+                }
+            }
+            let index_consumers = inference
+                .capture
+                .items
+                .iter()
+                .filter(|item| {
+                    item.ordered_inputs()
+                        .iter()
+                        .any(|input| input.desc.id == state.index.desc.id)
+                })
+                .map(|item| item.id)
+                .collect::<BTreeSet<_>>();
+            if index_consumers != append_owner_ids {
+                return Err(CapturedInferenceError::Binding(
+                    "append position must be shared only by append-state owners".into(),
+                ));
+            }
+        }
+        if let Some(extra) = initial_state
+            .keys()
+            .find(|name| !state_names.contains(name.as_str()))
+        {
+            return Err(CapturedInferenceError::Binding(format!(
+                "unexpected initial state {extra}"
+            )));
+        }
+        inference
+            .transient_inputs
+            .retain(|input| !state_links.iter().any(|state| state.input == input.node));
+
+        let mut hasher = DefaultHasher::new();
+        "rustgrad-captured-append-state-inference-v1".hash(&mut hasher);
+        inference.identity.hash(&mut hasher);
+        requested.len().hash(&mut hasher);
+        for state in &states {
+            state.link.hash(&mut hasher);
+            state.input.hash(&mut hasher);
+            state.index.hash(&mut hasher);
+            state.updates.hash(&mut hasher);
+            state.output.hash(&mut hasher);
+            state.axis_extent.hash(&mut hasher);
+            state.row_elements.hash(&mut hasher);
+            initial_state[&state.input.name]
+                .to_le_bytes()
+                .map_err(CapturedInferenceError::State)?
+                .hash(&mut hasher);
+        }
+        let identity = hasher.finish();
+        Ok(Self {
+            inference,
+            public_output_count: requested.len(),
+            states,
+            initial_state,
+            identity,
+        })
+    }
+
+    pub const fn deployment_identity(&self) -> u64 {
+        self.identity
+    }
+
+    pub const fn capture(&self) -> &CapturedSchedule {
+        &self.inference.capture
+    }
+
+    pub const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.inference.execution_plan
+    }
+
+    pub const fn public_output_count(&self) -> usize {
+        self.public_output_count
+    }
+
+    pub fn resident_bindings(&self) -> &BTreeMap<String, TensorData> {
+        &self.inference.resident_bindings
+    }
+
+    pub fn initial_state(&self) -> &BTreeMap<String, TensorData> {
+        &self.initial_state
+    }
+
+    pub fn transient_inputs(&self) -> &[ReplayInput] {
+        &self.inference.transient_inputs
+    }
+
+    pub fn state_links(&self) -> impl ExactSizeIterator<Item = InferenceAppendStateLink> + '_ {
+        self.states.iter().map(|state| state.link)
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CapturedInference,
+        usize,
+        Vec<CapturedInferenceAppendState>,
+        BTreeMap<String, TensorData>,
+        u64,
+    ) {
+        (
+            self.inference,
+            self.public_output_count,
+            self.states,
+            self.initial_state,
+            self.identity,
+        )
+    }
+}
+
+fn captured_owned_input(
+    capture: &CapturedSchedule,
+    node: NodeId,
+    name: &str,
+    label: &str,
+) -> std::result::Result<ReplayInput, CapturedInferenceError> {
+    capture
+        .inputs
+        .iter()
+        .find(|input| input.node == node && input.name == name)
+        .cloned()
+        .ok_or_else(|| {
+            CapturedInferenceError::Binding(format!(
+                "{label} input is absent from captured ownership"
+            ))
+        })
+}
+
+fn captured_owned_output(
+    capture: &CapturedSchedule,
+    node: NodeId,
+    label: &str,
+) -> std::result::Result<crate::BufferDesc, CapturedInferenceError> {
+    capture
+        .items
+        .iter()
+        .flat_map(|item| item.outputs.iter())
+        .find(|output| output.id == node.index() as u64)
+        .cloned()
+        .ok_or_else(|| {
+            CapturedInferenceError::Binding(format!(
+                "{label} output must be a directly produced capture owner"
+            ))
+        })
+}
+
+fn validate_state_descriptors(
+    input: &ReplayInput,
+    output: &crate::BufferDesc,
+    label: &str,
+) -> std::result::Result<(), CapturedInferenceError> {
+    if output.view.is_some()
+        || output.read_only
+        || input.desc.view.is_some()
+        || input.desc.shape != output.shape
+        || input.desc.dtype != output.dtype
+        || input.desc.bytes != output.bytes
+        || input.desc.alignment != output.alignment
+    {
+        return Err(CapturedInferenceError::Binding(format!(
+            "{label} input/output descriptors are not exact full-buffer peers"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_captured_inference_binding(
@@ -968,6 +1430,121 @@ mod tests {
             Err(CapturedInferenceError::Binding(_))
         ));
         assert_eq!(graph.node_count(), count);
+    }
+
+    #[test]
+    fn append_state_capture_rejects_partial_additive_and_aliased_ownership() {
+        let module = Sequential::default();
+        let mut graph = Graph::new();
+        let state = graph.input_dtype("cache", [2, 3], DType::F32);
+        let position = graph.input_dtype("position", [1, 3], DType::I32);
+        let update_source = graph.input_dtype("update_source", [1, 3], DType::F32);
+        let updates = graph.relu(update_source).unwrap();
+        let output = graph.scatter(state, position, updates, 0).unwrap();
+        let public = graph.square(output).unwrap();
+        let initial = BTreeMap::from([(
+            "cache".into(),
+            TensorData::new([2, 3], vec![0.0; 6]).unwrap(),
+        )]);
+        let capture = CapturedAppendStateInference::from_module_graph(
+            &module,
+            &graph,
+            &[public],
+            &[InferenceAppendStateLink::new(
+                state, output, position, updates, 0,
+            )],
+            initial.clone(),
+        )
+        .unwrap();
+        assert_eq!(capture.state_links().count(), 1);
+        assert_eq!(capture.transient_inputs().len(), 2);
+        assert!(
+            capture
+                .transient_inputs()
+                .iter()
+                .any(|input| input.node == update_source)
+        );
+        assert!(
+            capture
+                .transient_inputs()
+                .iter()
+                .all(|input| input.node != updates)
+        );
+        let changed = CapturedAppendStateInference::from_module_graph(
+            &module,
+            &graph,
+            &[public],
+            &[InferenceAppendStateLink::new(
+                state, output, position, updates, 0,
+            )],
+            BTreeMap::from([(
+                "cache".into(),
+                TensorData::new([2, 3], vec![1.0; 6]).unwrap(),
+            )]),
+        )
+        .unwrap();
+        assert_ne!(capture.deployment_identity(), changed.deployment_identity());
+
+        let partial_index = graph.input_dtype("partial_position", [1, 1], DType::I32);
+        let partial_source = graph.input_dtype("partial_source", [1, 1], DType::F32);
+        let partial_update = graph.relu(partial_source).unwrap();
+        let partial = graph
+            .scatter(state, partial_index, partial_update, 0)
+            .unwrap();
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[public],
+                &[InferenceAppendStateLink::new(
+                    state,
+                    partial,
+                    partial_index,
+                    partial_update,
+                    0,
+                )],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        let additive = graph.scatter_add(state, position, updates, 0).unwrap();
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[public],
+                &[InferenceAppendStateLink::new(
+                    state, additive, position, updates, 0,
+                )],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        let state_alias = graph.reshape(state, [6]).unwrap();
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[state_alias],
+                &[InferenceAppendStateLink::new(
+                    state, output, position, updates, 0,
+                )],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[output],
+                &[InferenceAppendStateLink::new(
+                    state, output, position, updates, 0,
+                )],
+                initial,
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
     }
 
     #[test]

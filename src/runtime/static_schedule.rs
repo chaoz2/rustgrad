@@ -1105,6 +1105,7 @@ pub(crate) struct StaticSchedulePlan<R> {
     host_outputs: Vec<u64>,
     protected_outputs: Vec<u64>,
     state_links: Vec<StaticStateLink>,
+    append_state_links: Vec<StaticAppendStateLink>,
     allocations: StaticAllocationPlan,
 }
 
@@ -1114,6 +1115,27 @@ pub(crate) struct StaticSchedulePlan<R> {
 pub(crate) struct StaticStateLink {
     pub(crate) input: u64,
     pub(crate) output: u64,
+}
+
+/// One authenticated full-buffer logical Scatter output that aliases its
+/// exclusively owned input allocation while writing exactly one complete row.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct StaticAppendStateLink {
+    pub(crate) input: u64,
+    pub(crate) output: u64,
+    pub(crate) index: u64,
+    pub(crate) updates: u64,
+    pub(crate) axis: usize,
+    pub(crate) axis_extent: usize,
+    pub(crate) row_elements: usize,
+    pub(crate) row_bytes: usize,
+}
+
+struct StaticOutputPolicy<'a> {
+    host_outputs: &'a [u64],
+    protected_outputs: &'a [u64],
+    state_links: &'a [StaticStateLink],
+    append_state_links: &'a [StaticAppendStateLink],
 }
 
 /// Pure renderer/planner seam shared by ordinary device execution and CUDA
@@ -1196,6 +1218,10 @@ impl<R> StaticSchedulePlan<R> {
         &self.allocations
     }
 
+    pub(crate) fn append_state_links(&self) -> &[StaticAppendStateLink] {
+        &self.append_state_links
+    }
+
     pub(crate) fn build<A>(
         adapter: &A,
         items: &[ScheduleItem],
@@ -1204,7 +1230,12 @@ impl<R> StaticSchedulePlan<R> {
     where
         A: StaticPlanAdapter<Rendered = R>,
     {
-        let outputs = retained.map(|outputs| (outputs, outputs, &[] as &[StaticStateLink]));
+        let outputs = retained.map(|outputs| StaticOutputPolicy {
+            host_outputs: outputs,
+            protected_outputs: outputs,
+            state_links: &[],
+            append_state_links: &[],
+        });
         Self::build_with_outputs(adapter, items, outputs)
     }
 
@@ -1221,14 +1252,41 @@ impl<R> StaticSchedulePlan<R> {
         Self::build_with_outputs(
             adapter,
             items,
-            Some((host_outputs, protected_outputs, state_links)),
+            Some(StaticOutputPolicy {
+                host_outputs,
+                protected_outputs,
+                state_links,
+                append_state_links: &[],
+            }),
+        )
+    }
+
+    pub(crate) fn build_with_append_policy<A>(
+        adapter: &A,
+        items: &[ScheduleItem],
+        host_outputs: &[u64],
+        protected_outputs: &[u64],
+        append_state_links: &[StaticAppendStateLink],
+    ) -> Result<Self, A::Error>
+    where
+        A: StaticPlanAdapter<Rendered = R>,
+    {
+        Self::build_with_outputs(
+            adapter,
+            items,
+            Some(StaticOutputPolicy {
+                host_outputs,
+                protected_outputs,
+                state_links: &[],
+                append_state_links,
+            }),
         )
     }
 
     fn build_with_outputs<A>(
         adapter: &A,
         items: &[ScheduleItem],
-        outputs: Option<(&[u64], &[u64], &[StaticStateLink])>,
+        outputs: Option<StaticOutputPolicy<'_>>,
     ) -> Result<Self, A::Error>
     where
         A: StaticPlanAdapter<Rendered = R>,
@@ -1237,6 +1295,24 @@ impl<R> StaticSchedulePlan<R> {
         let mut buffers = BTreeMap::<u64, StaticBufferPlan>::new();
         let mut buffer_order = Vec::new();
         let mut producers = BTreeMap::<u64, usize>::new();
+        let append_by_output = outputs
+            .as_ref()
+            .map(|policy| {
+                policy
+                    .append_state_links
+                    .iter()
+                    .map(|link| (link.output, *link))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        if outputs
+            .as_ref()
+            .is_some_and(|policy| append_by_output.len() != policy.append_state_links.len())
+        {
+            return Err(A::invalid_binding(
+                "static append-state outputs must be unique".into(),
+            ));
+        }
 
         validate_prefix::<A>(items)?;
 
@@ -1317,7 +1393,10 @@ impl<R> StaticSchedulePlan<R> {
                     )));
                 }
             }
-            if rendered.extent != launch.work_items {
+            let expected_work_items = append_by_output
+                .get(&item.outputs.primary().id)
+                .map_or(launch.work_items, |link| link.row_elements);
+            if rendered.extent != expected_work_items {
                 return Err(A::invalid_binding(
                     "rendered launch extent mismatches scheduled output".into(),
                 ));
@@ -1428,17 +1507,22 @@ impl<R> StaticSchedulePlan<R> {
             }
             Ok(ids.to_vec())
         };
-        let (host_outputs, protected_outputs, state_links) = match outputs {
-            Some((host, protected, state_links)) => {
-                let host = validate_outputs(host, "host")?;
-                let protected = validate_outputs(protected, "protected")?;
+        let (host_outputs, protected_outputs, state_links, append_state_links) = match outputs {
+            Some(policy) => {
+                let host = validate_outputs(policy.host_outputs, "host")?;
+                let protected = validate_outputs(policy.protected_outputs, "protected")?;
                 let protected_set = protected.iter().copied().collect::<BTreeSet<_>>();
                 if let Some(id) = host.iter().find(|id| !protected_set.contains(id)) {
                     return Err(A::invalid_binding(format!(
                         "host logical output {id} is not protected"
                     )));
                 }
-                (host, protected, state_links.to_vec())
+                (
+                    host,
+                    protected,
+                    policy.state_links.to_vec(),
+                    policy.append_state_links.to_vec(),
+                )
             }
             // Public prepared-prefix APIs historically materialize every item
             // output into the caller map. Exact internal consumers pass an
@@ -1448,7 +1532,7 @@ impl<R> StaticSchedulePlan<R> {
                     .iter()
                     .flat_map(|item| item.outputs.iter().map(|output| output.id))
                     .collect::<Vec<_>>();
-                (all.clone(), all, Vec::new())
+                (all.clone(), all, Vec::new(), Vec::new())
             }
         };
         if !items.is_empty() && protected_outputs.is_empty() {
@@ -1468,12 +1552,18 @@ impl<R> StaticSchedulePlan<R> {
             .collect::<Vec<_>>();
         let mut allocation_protected = protected_outputs.clone();
         allocation_protected.extend(state_links.iter().map(|link| link.input));
+        allocation_protected.extend(append_state_links.iter().map(|link| link.input));
+        let append_aliases = append_state_links
+            .iter()
+            .map(|link| (link.output, link.input))
+            .collect::<BTreeMap<_, _>>();
         let allocations = build_static_allocation_plan::<A>(
             &planned,
             &buffers,
             &buffer_order,
             &external_inputs,
             &allocation_protected,
+            &append_aliases,
         )?;
 
         let mut state_ids = BTreeSet::new();
@@ -1514,6 +1604,77 @@ impl<R> StaticSchedulePlan<R> {
             }
         }
 
+        for link in &append_state_links {
+            if link.input == link.output
+                || state_ids.contains(&link.input)
+                || state_ids.contains(&link.output)
+                || !state_ids.insert(link.input)
+                || !state_ids.insert(link.output)
+                || link.axis_extent == 0 && link.row_elements != 0
+                || link.row_bytes
+                    != link
+                        .row_elements
+                        .checked_mul(DType::F32.itemsize())
+                        .ok_or_else(A::overflow)?
+            {
+                return Err(A::invalid_binding(
+                    "static append-state declaration is inconsistent".into(),
+                ));
+            }
+            let input = buffers.get(&link.input).ok_or_else(|| {
+                A::invalid_binding(format!("static append input {} is absent", link.input))
+            })?;
+            let output = buffers.get(&link.output).ok_or_else(|| {
+                A::invalid_binding(format!("static append output {} is absent", link.output))
+            })?;
+            let index = buffers.get(&link.index).ok_or_else(|| {
+                A::invalid_binding(format!("static append index {} is absent", link.index))
+            })?;
+            let updates = buffers.get(&link.updates).ok_or_else(|| {
+                A::invalid_binding(format!("static append updates {} is absent", link.updates))
+            })?;
+            let producer = output
+                .producer
+                .ok_or_else(|| A::invalid_binding("static append output has no producer".into()))?;
+            let update_producer = updates.producer.ok_or_else(|| {
+                A::invalid_binding("static append update has no device producer".into())
+            })?;
+            let item = &planned[producer];
+            let source_item = &items[producer];
+            if input.producer.is_some()
+                || !external_inputs.contains(&link.input)
+                || !protected_outputs.contains(&link.output)
+                || host_outputs.contains(&link.output)
+                || index.producer.is_some()
+                || update_producer >= producer
+                || !source_item
+                    .dependencies
+                    .contains(&items[update_producer].id)
+                || input.dtype != DType::F32
+                || output.dtype != DType::F32
+                || index.dtype != DType::I32
+                || updates.dtype != DType::F32
+                || input.source_shape != output.source_shape
+                || input.elements != output.elements
+                || input.bytes != output.bytes
+                || input.alignment != output.alignment
+                || index.elements != link.row_elements
+                || updates.elements != link.row_elements
+                || item.extent != link.row_elements
+                || source_item.outputs.len() != 1
+                || source_item.outputs.primary().id != link.output
+                || !item.input_ids.contains(&link.input)
+                || !item.input_ids.contains(&link.index)
+                || !item.input_ids.contains(&link.updates)
+                || allocations.logical_slots.get(&link.input)
+                    != allocations.logical_slots.get(&link.output)
+            {
+                return Err(A::invalid_binding(
+                    "static append-state ownership or geometry is invalid".into(),
+                ));
+            }
+        }
+
         Ok(Self {
             items: planned,
             buffers,
@@ -1521,6 +1682,7 @@ impl<R> StaticSchedulePlan<R> {
             host_outputs,
             protected_outputs,
             state_links,
+            append_state_links,
             allocations,
         })
     }
@@ -1540,6 +1702,7 @@ fn build_static_allocation_plan<A: StaticPlanAdapter>(
     buffer_order: &[u64],
     external_inputs: &[u64],
     retained_outputs: &[u64],
+    aliases: &BTreeMap<u64, u64>,
 ) -> Result<StaticAllocationPlan, A::Error> {
     let required = items
         .iter()
@@ -1561,7 +1724,7 @@ fn build_static_allocation_plan<A: StaticPlanAdapter>(
                 .map(|(position, _)| position)
                 .max()
                 .unwrap_or(producer_position);
-            let policy = if !required.contains(id) {
+            let policy = if aliases.contains_key(id) || !required.contains(id) {
                 ExactSlotPolicy::Absent
             } else if buffer.bytes != 0
                 && buffer.producer.is_some()
@@ -1622,6 +1785,21 @@ fn build_static_allocation_plan<A: StaticPlanAdapter>(
         }
         logical_slots.insert(assignment.identity, slot);
     }
+    for (alias, source) in aliases {
+        let Some(slot) = logical_slots.get(source).copied() else {
+            if buffers[source].bytes == 0 {
+                continue;
+            }
+            return Err(A::invalid_binding(format!(
+                "static alias source {source} has no allocation"
+            )));
+        };
+        if logical_slots.insert(*alias, slot).is_some() {
+            return Err(A::invalid_binding(format!(
+                "static alias output {alias} already has an allocation"
+            )));
+        }
+    }
     let slots = slots
         .into_iter()
         .collect::<Option<Vec<_>>>()
@@ -1635,10 +1813,17 @@ fn build_static_allocation_plan<A: StaticPlanAdapter>(
             .ok_or_else(|| {
                 A::invalid_binding("nonzero static item has an unallocated logical buffer".into())
             })?;
-        if item_slots.iter().copied().collect::<BTreeSet<_>>().len() != item_slots.len() {
-            return Err(A::invalid_binding(
-                "distinct logical buffers in one static item alias a physical slot".into(),
-            ));
+        for lhs in 0..item_slots.len() {
+            for rhs in lhs + 1..item_slots.len() {
+                if item_slots[lhs] == item_slots[rhs]
+                    && aliases.get(&item.buffer_ids[lhs]) != Some(&item.buffer_ids[rhs])
+                    && aliases.get(&item.buffer_ids[rhs]) != Some(&item.buffer_ids[lhs])
+                {
+                    return Err(A::invalid_binding(
+                        "distinct logical buffers in one static item alias a physical slot".into(),
+                    ));
+                }
+            }
         }
     }
     slots.iter().try_fold(0usize, |total, allocation| {
@@ -1697,6 +1882,7 @@ pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     external_inputs: Vec<u64>,
     host_outputs: Vec<u64>,
     state_links: Vec<StaticStateLink>,
+    append_state_links: Vec<StaticAppendStateLink>,
     compiled_cache_keys: Vec<String>,
 }
 
@@ -1734,6 +1920,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             host_outputs,
             protected_outputs,
             state_links,
+            append_state_links,
             allocations,
         } = plan;
         if host_outputs
@@ -1785,6 +1972,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             external_inputs,
             host_outputs,
             state_links,
+            append_state_links,
             compiled_cache_keys,
         })
     }
@@ -1817,7 +2005,13 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 None
             }
         });
-        self.buffer(mapped.unwrap_or(id))
+        let id = mapped.unwrap_or(id);
+        let id = self
+            .append_state_links
+            .iter()
+            .find_map(|link| (id == link.output).then_some(link.input))
+            .unwrap_or(id);
+        self.buffer(id)
     }
 
     fn validated_uploads(
@@ -2003,6 +2197,51 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         }
         Ok(report)
     }
+
+    fn execute_append_state(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        resident_ids: &BTreeSet<u64>,
+        committed_position: usize,
+    ) -> Result<StaticExecutionReport, A::Error> {
+        if self.append_state_links.is_empty() || !self.state_links.is_empty() {
+            return Err(A::invalid_binding(
+                "static append-state execution policy is absent".into(),
+            ));
+        }
+        for link in &self.append_state_links {
+            if committed_position >= link.axis_extent {
+                return Err(A::invalid_binding(format!(
+                    "append position {committed_position} exceeds state extent {}",
+                    link.axis_extent
+                )));
+            }
+            let index = values.get(&link.index).ok_or_else(|| {
+                A::invalid_binding(format!("append index {} is absent", link.index))
+            })?;
+            if index.dtype() != DType::I32
+                || index.shape() != &self.buffer_plans[&link.index].source_shape
+            {
+                return Err(A::invalid_binding(
+                    "append index descriptor mismatch".into(),
+                ));
+            }
+            let expected = i32::try_from(committed_position).map_err(|_| A::overflow())?;
+            let bytes = index
+                .to_le_bytes()
+                .map_err(|_| A::invalid_binding("append index bytes".into()))?;
+            if bytes.len() != link.row_elements.checked_mul(4).ok_or_else(A::overflow)?
+                || bytes.chunks_exact(4).any(|chunk| {
+                    i32::from_le_bytes(chunk.try_into().expect("four-byte chunk")) != expected
+                })
+            {
+                return Err(A::invalid_binding(
+                    "append index is not the next monotonic position".into(),
+                ));
+            }
+        }
+        self.execute_skipping_residents_at_epoch(values, resident_ids, false)
+    }
 }
 
 impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
@@ -2028,6 +2267,15 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
             &self.resident_ids,
             alternate_state_bank,
         )
+    }
+
+    pub(crate) fn execute_append_state(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        committed_position: usize,
+    ) -> Result<StaticExecutionReport, A::Error> {
+        self.prepared
+            .execute_append_state(values, &self.resident_ids, committed_position)
     }
 }
 

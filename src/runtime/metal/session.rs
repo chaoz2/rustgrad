@@ -5,8 +5,8 @@ use super::{
     RenderedMetal, prepared::InitializedMetalPrefix,
 };
 use crate::{
-    CapturedInference, CapturedSchedule, CapturedStatefulInference, ExecutionPlanSummary,
-    ReplayInput, TensorData,
+    CapturedAppendStateInference, CapturedInference, CapturedSchedule, CapturedStatefulInference,
+    ExecutionPlanSummary, ReplayInput, TensorData,
 };
 use std::{
     collections::BTreeMap,
@@ -15,7 +15,8 @@ use std::{
 };
 
 use crate::runtime::static_schedule::{
-    CapturedStaticExecution, StaticExecutionReport, StaticLifetimePlan, StaticStateLink,
+    CapturedStaticExecution, StaticAppendStateLink, StaticExecutionReport, StaticLifetimePlan,
+    StaticStateLink,
 };
 
 /// Deterministic inspection metadata for one concrete Metal session plan.
@@ -56,12 +57,16 @@ pub struct MetalDeviceSessionSummary {
     pub state_pair_count: usize,
     /// Bytes in one logical recurrent-state bank.
     pub logical_state_bytes: usize,
-    /// Logical epoch bank sets (zero or exactly two). Empty state remains
-    /// addressless and owns no physical allocation.
+    /// Logical bank sets: zero when stateless, one for append-only state, or
+    /// two for epoch-swapped state. Empty state remains addressless.
     pub state_bank_count: usize,
-    /// Logical payload bytes represented by both epoch banks. Physical slot
-    /// bytes, including any sentinels, remain in `planned_device_bytes`.
+    /// Logical payload bytes represented by the selected state-bank policy.
+    /// Physical slot bytes remain in `planned_device_bytes`.
     pub state_device_bytes: usize,
+    /// Sparse F32 payload bytes written by one successful append invocation.
+    pub append_state_row_bytes: usize,
+    /// Sparse state elements written by one successful append invocation.
+    pub append_state_work_items: usize,
 }
 
 /// Successful Metal preparation measurements. Durations are current-thread
@@ -119,8 +124,11 @@ pub struct MetalDeviceRunReport {
     pub output_count: usize,
     /// Recurrent pairs atomically committed by this successful invocation.
     pub committed_state_pair_count: usize,
-    /// Logical recurrent bytes committed by the epoch flip.
+    /// Logical recurrent bytes committed by the epoch flip or row append.
     pub committed_state_bytes: usize,
+    /// Sparse recurrent elements committed by this invocation. Double-bank
+    /// state reports its full logical element count; stateless runs report 0.
+    pub committed_state_work_items: usize,
 }
 
 /// Detached ordered outputs plus the report committed for that successful run.
@@ -179,6 +187,115 @@ pub struct MetalStatefulInferencePlan {
     deployment_identity: u64,
 }
 
+/// Resource-free deployment of one authenticated append-only state capture.
+pub struct MetalAppendStateInferencePlan {
+    inner: MetalDeviceSessionPlan,
+    execution_plan: ExecutionPlanSummary,
+    resident_bindings: BTreeMap<String, TensorData>,
+    initial_state: BTreeMap<String, TensorData>,
+    deployment_identity: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetalSessionStatePolicy {
+    None,
+    Epoch {
+        pair_count: usize,
+        bytes: usize,
+        work_items: usize,
+    },
+    Append {
+        pair_count: usize,
+        row_bytes: usize,
+        work_items: usize,
+    },
+}
+
+impl MetalAppendStateInferencePlan {
+    pub fn new(
+        inference: CapturedAppendStateInference,
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
+        let (inference, public_output_count, states, initial_state, deployment_identity) =
+            inference.into_parts();
+        let (capture, execution_plan, resident_bindings, _) = inference.into_parts();
+        let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
+        let state_names = states
+            .iter()
+            .map(|state| state.input.name.clone())
+            .collect::<Vec<_>>();
+        let append_links = states
+            .iter()
+            .map(|state| StaticAppendStateLink {
+                input: state.input.desc.id,
+                output: state.output.id,
+                index: state.index.desc.id,
+                updates: state.updates.id,
+                axis: state.link.axis(),
+                axis_extent: state.axis_extent,
+                row_elements: state.row_elements,
+                row_bytes: state.row_bytes,
+            })
+            .collect::<Vec<_>>();
+        let inner = MetalDeviceSessionPlan::from_capture_append_policy(
+            capture,
+            resident_names,
+            state_names,
+            public_output_count,
+            append_links,
+            renderer,
+        )?;
+        Ok(Self {
+            inner,
+            execution_plan,
+            resident_bindings,
+            initial_state,
+            deployment_identity,
+        })
+    }
+
+    pub const fn deployment_identity(&self) -> u64 {
+        self.deployment_identity
+    }
+
+    pub fn capture(&self) -> &CapturedSchedule {
+        self.inner.capture()
+    }
+
+    pub const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.execution_plan
+    }
+
+    pub fn summary(&self) -> &MetalDeviceSessionSummary {
+        self.inner.summary()
+    }
+
+    pub fn state_inputs(&self) -> &[ReplayInput] {
+        self.inner.state_inputs()
+    }
+
+    pub fn resident_inputs(&self) -> &[ReplayInput] {
+        self.inner.resident_inputs()
+    }
+
+    pub fn transient_inputs(&self) -> &[ReplayInput] {
+        self.inner.transient_inputs()
+    }
+
+    pub fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
+        self.inner.rendered_items()
+    }
+
+    pub fn prepare(self, device: MetalDevice) -> Result<MetalDeviceSession, MetalError> {
+        self.inner.prepare_with_state_and_deployment(
+            device,
+            self.resident_bindings,
+            self.initial_state,
+            Some(self.deployment_identity),
+        )
+    }
+}
+
 impl MetalStatefulInferencePlan {
     pub fn new(
         inference: CapturedStatefulInference,
@@ -205,6 +322,7 @@ impl MetalStatefulInferencePlan {
             state_names,
             public_output_count,
             state_links,
+            Vec::new(),
             renderer,
         )?;
         Ok(Self {
@@ -330,6 +448,7 @@ pub struct MetalDeviceSessionPlan {
     summary: MetalDeviceSessionSummary,
     planning_wall_time: Duration,
     renderer_capabilities: super::MetalCapabilities,
+    state_policy: MetalSessionStatePolicy,
 }
 
 impl MetalDeviceSessionPlan {
@@ -347,6 +466,7 @@ impl MetalDeviceSessionPlan {
             Vec::new(),
             requested_count,
             Vec::new(),
+            Vec::new(),
             renderer,
         )
     }
@@ -357,6 +477,7 @@ impl MetalDeviceSessionPlan {
         state_input_names: Vec<String>,
         public_output_count: usize,
         state_links: Vec<StaticStateLink>,
+        append_state_links: Vec<StaticAppendStateLink>,
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
         let planning_start = Instant::now();
@@ -374,6 +495,7 @@ impl MetalDeviceSessionPlan {
             .map_err(MetalError::InvalidBinding)?;
         let mut protected_outputs = host_outputs.clone();
         protected_outputs.extend(state_links.iter().map(|state| state.output));
+        protected_outputs.extend(append_state_links.iter().map(|state| state.output));
         let lifetime = if state_input_names.is_empty() {
             StaticLifetimePlan::new(projection, &resident_input_names)
         } else {
@@ -384,13 +506,28 @@ impl MetalDeviceSessionPlan {
             )
         }
         .map_err(MetalError::InvalidBinding)?;
-        let prefix = MetalPrefixPlan::plan_with_output_policy(
-            &lifetime.capture().items,
-            &host_outputs,
-            &protected_outputs,
-            &state_links,
-            renderer.clone(),
-        )?;
+        if !state_links.is_empty() && !append_state_links.is_empty() {
+            return Err(MetalError::InvalidBinding(
+                "Metal session cannot mix epoch and append state".into(),
+            ));
+        }
+        let prefix = if append_state_links.is_empty() {
+            MetalPrefixPlan::plan_with_output_policy(
+                &lifetime.capture().items,
+                &host_outputs,
+                &protected_outputs,
+                &state_links,
+                renderer.clone(),
+            )?
+        } else {
+            MetalPrefixPlan::plan_with_append_policy(
+                &lifetime.capture().items,
+                &host_outputs,
+                &protected_outputs,
+                &append_state_links,
+                renderer.clone(),
+            )?
+        };
         let external_inputs = prefix
             .external_input_ids()
             .iter()
@@ -441,9 +578,52 @@ impl MetalDeviceSessionPlan {
                         .checked_add(input.desc.bytes)
                         .ok_or(MetalError::Overflow)
                 })?;
+        let logical_state_elements =
+            lifetime
+                .state_inputs()
+                .iter()
+                .try_fold(0usize, |total, input| {
+                    total
+                        .checked_add(input.desc.shape.numel().map_err(|_| MetalError::Overflow)?)
+                        .ok_or(MetalError::Overflow)
+                })?;
+        let append_state_row_bytes =
+            append_state_links.iter().try_fold(0usize, |total, link| {
+                total
+                    .checked_add(link.row_bytes)
+                    .ok_or(MetalError::Overflow)
+            })?;
+        let append_state_work_items =
+            append_state_links.iter().try_fold(0usize, |total, link| {
+                total
+                    .checked_add(link.row_elements)
+                    .ok_or(MetalError::Overflow)
+            })?;
+        let state_bank_count = if !append_state_links.is_empty() {
+            1
+        } else if !state_links.is_empty() {
+            2
+        } else {
+            0
+        };
         let state_device_bytes = logical_state_bytes
-            .checked_mul(2)
+            .checked_mul(state_bank_count)
             .ok_or(MetalError::Overflow)?;
+        let state_policy = if !append_state_links.is_empty() {
+            MetalSessionStatePolicy::Append {
+                pair_count: append_state_links.len(),
+                row_bytes: append_state_row_bytes,
+                work_items: append_state_work_items,
+            }
+        } else if !state_links.is_empty() {
+            MetalSessionStatePolicy::Epoch {
+                pair_count: state_links.len(),
+                bytes: logical_state_bytes,
+                work_items: logical_state_elements,
+            }
+        } else {
+            MetalSessionStatePolicy::None
+        };
         let summary = MetalDeviceSessionSummary {
             capture_identity: lifetime.capture().identity,
             resident_input_names: lifetime.resident_names().map(str::to_owned).collect(),
@@ -460,10 +640,12 @@ impl MetalDeviceSessionPlan {
             zero_item_count,
             rendered_cache_keys: prefix.cache_keys(),
             fallback_count: 0,
-            state_pair_count: state_links.len(),
+            state_pair_count: state_links.len() + append_state_links.len(),
             logical_state_bytes,
-            state_bank_count: if state_links.is_empty() { 0 } else { 2 },
+            state_bank_count,
             state_device_bytes,
+            append_state_row_bytes,
+            append_state_work_items,
         };
         let renderer_capabilities = renderer.capabilities.clone();
         Ok(Self {
@@ -473,7 +655,27 @@ impl MetalDeviceSessionPlan {
             summary,
             planning_wall_time: planning_start.elapsed(),
             renderer_capabilities,
+            state_policy,
         })
+    }
+
+    fn from_capture_append_policy(
+        capture: CapturedSchedule,
+        resident_input_names: Vec<String>,
+        state_input_names: Vec<String>,
+        public_output_count: usize,
+        append_state_links: Vec<StaticAppendStateLink>,
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
+        Self::from_capture_policy(
+            capture,
+            resident_input_names,
+            state_input_names,
+            public_output_count,
+            Vec::new(),
+            append_state_links,
+            renderer,
+        )
     }
 
     /// Returns the exact authenticated capture owned by this plan.
@@ -612,6 +814,8 @@ impl MetalDeviceSessionPlan {
             device_owner_id,
             successful_runs: 0,
             state_epoch: false,
+            committed_state_position: 0,
+            state_policy: self.state_policy,
             public_output_count,
             session_token: Rc::new(()),
             inference_deployment_identity,
@@ -630,6 +834,8 @@ pub struct MetalDeviceSession {
     device_owner_id: u64,
     successful_runs: u64,
     state_epoch: bool,
+    committed_state_position: usize,
+    state_policy: MetalSessionStatePolicy,
     public_output_count: usize,
     session_token: Rc<()>,
     inference_deployment_identity: Option<u64>,
@@ -699,6 +905,15 @@ impl MetalDeviceSession {
         self.state_epoch
     }
 
+    /// Returns the next append row for append-state sessions. Other session
+    /// policies return `None`.
+    pub const fn committed_state_position(&self) -> Option<usize> {
+        match self.state_policy {
+            MetalSessionStatePolicy::Append { .. } => Some(self.committed_state_position),
+            _ => None,
+        }
+    }
+
     /// Validates exact transient inputs, executes each nonzero schedule item
     /// with an individual Metal launch/wait, and returns only requested outputs.
     pub fn run(
@@ -709,24 +924,35 @@ impl MetalDeviceSession {
             .successful_runs
             .checked_add(1)
             .ok_or(MetalError::Overflow)?;
+        let next_committed_position = match self.state_policy {
+            MetalSessionStatePolicy::Append { .. } => Some(
+                self.committed_state_position
+                    .checked_add(1)
+                    .ok_or(MetalError::Overflow)?,
+            ),
+            _ => None,
+        };
         let run_start = Instant::now();
         let mut values = self
             .lifetime
             .stage_transient(transient_inputs)
             .map_err(MetalError::InvalidBinding)?;
         let execute_start = Instant::now();
-        let transfer = if self.summary.state_pair_count == 0 {
-            self.prepared.execute(&mut values)?
-        } else {
-            self.prepared
-                .execute_stateful(&mut values, self.state_epoch)?
+        let transfer = match self.state_policy {
+            MetalSessionStatePolicy::None => self.prepared.execute(&mut values)?,
+            MetalSessionStatePolicy::Epoch { .. } => self
+                .prepared
+                .execute_stateful(&mut values, self.state_epoch)?,
+            MetalSessionStatePolicy::Append { .. } => self
+                .prepared
+                .execute_append_state(&mut values, self.committed_state_position)?,
         };
         let synchronous_transaction_wall_time = execute_start.elapsed();
-        let outputs = if self.summary.state_pair_count == 0 {
-            self.lifetime.project(&values, &self.resident_sources)
-        } else {
-            self.lifetime
-                .project_prefix(self.public_output_count, &values, &self.resident_sources)
+        let outputs = match self.state_policy {
+            MetalSessionStatePolicy::None => self.lifetime.project(&values, &self.resident_sources),
+            MetalSessionStatePolicy::Epoch { .. } | MetalSessionStatePolicy::Append { .. } => self
+                .lifetime
+                .project_prefix(self.public_output_count, &values, &self.resident_sources),
         }
         .map_err(MetalError::InvalidBinding)?;
         let report = run_report(
@@ -736,14 +962,36 @@ impl MetalDeviceSession {
             transfer,
             self.summary.zero_item_count,
             outputs.len(),
-            CommittedState {
-                pair_count: self.summary.state_pair_count,
-                bytes: self.summary.logical_state_bytes,
+            match self.state_policy {
+                MetalSessionStatePolicy::None => CommittedState::default(),
+                MetalSessionStatePolicy::Epoch {
+                    pair_count,
+                    bytes,
+                    work_items,
+                } => CommittedState {
+                    pair_count,
+                    bytes,
+                    work_items,
+                },
+                MetalSessionStatePolicy::Append {
+                    pair_count,
+                    row_bytes,
+                    work_items,
+                } => CommittedState {
+                    pair_count,
+                    bytes: row_bytes,
+                    work_items,
+                },
             },
         );
         self.successful_runs = successful_invocation;
-        if self.summary.state_pair_count != 0 {
-            self.state_epoch = !self.state_epoch;
+        match self.state_policy {
+            MetalSessionStatePolicy::Epoch { .. } => self.state_epoch = !self.state_epoch,
+            MetalSessionStatePolicy::Append { .. } => {
+                self.committed_state_position =
+                    next_committed_position.expect("append position was preflighted");
+            }
+            MetalSessionStatePolicy::None => {}
         }
         Ok(MetalDeviceRun {
             outputs,
@@ -776,11 +1024,13 @@ fn run_report(
         output_count,
         committed_state_pair_count: committed_state.pair_count,
         committed_state_bytes: committed_state.bytes,
+        committed_state_work_items: committed_state.work_items,
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct CommittedState {
     pair_count: usize,
     bytes: usize,
+    work_items: usize,
 }

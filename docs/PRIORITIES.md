@@ -84,10 +84,14 @@ comparisons target the equivalent tinygrad and Candle workload.
 ### 3. P0 — device-resident GGUF Llama prefill/KV/decode
 
 Extend the same authenticated ownership model to immutable GGUF weights and
-explicit state-input/state-output KV ping-pong, with atomic mapping swaps only
-after successful completion. Acceptance covers bounded prefill and repeated
-decode, output agreement, no hidden host fallback, resident-memory and transfer
-accounting, and the same compile/first-run/steady-state scoreboard.
+the released fixed-capacity append-state foundation: one exclusively owned
+physical KV bank, one host-validated monotonic I32 position, sparse complete-row
+updates, and same-capture downstream reads. The model wrapper must expand its
+scalar position into the dedicated authenticated row-shaped index and enforce
+their equality. Remaining acceptance wires bounded
+prefill and repeated decode to that policy, proves output agreement and no
+hidden host fallback, and adds resident-memory/transfer accounting to the live
+scoreboard evidence.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 
