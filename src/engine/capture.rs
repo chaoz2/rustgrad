@@ -35,6 +35,24 @@ pub enum ReplayError {
     Symbolic(String),
     Batch { invocation: usize, reason: String },
 }
+
+/// One graph-authenticated dense placeholder that is replaced by an exact
+/// packed schedule ABI only while constructing an owned capture.
+#[derive(Clone, Debug)]
+pub(crate) enum QuantizedCaptureBinding {
+    RowGather {
+        output: NodeId,
+        indices: NodeId,
+        weight: NodeId,
+        value: crate::QuantizedTensorData,
+    },
+    Matmul {
+        output: NodeId,
+        activation: NodeId,
+        weight: NodeId,
+        value: crate::QuantizedTensorData,
+    },
+}
 impl fmt::Display for ReplayError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "replay error: {self:?}")
@@ -46,6 +64,26 @@ impl CapturedSchedule {
         graph: &Graph,
         schedule: &Schedule,
         requested: &[NodeId],
+    ) -> Result<Self, ReplayError> {
+        Self::capture_impl(graph, schedule, requested, BTreeMap::new())
+    }
+
+    pub(crate) fn capture_with_quantized_bindings(
+        graph: &Graph,
+        schedule: &Schedule,
+        requested: &[NodeId],
+        bindings: &[QuantizedCaptureBinding],
+    ) -> Result<Self, ReplayError> {
+        let mut schedule = schedule.clone();
+        let quantized_constants = authenticate_quantized_bindings(graph, &mut schedule, bindings)?;
+        Self::capture_impl(graph, &schedule, requested, quantized_constants)
+    }
+
+    fn capture_impl(
+        graph: &Graph,
+        schedule: &Schedule,
+        requested: &[NodeId],
+        quantized_constants: BTreeMap<u64, crate::QuantizedTensorData>,
     ) -> Result<Self, ReplayError> {
         // Generic captured schedules have no durable representation for a
         // persistent-state version or view. Validate the complete source
@@ -266,7 +304,7 @@ impl CapturedSchedule {
             items: schedule.items.clone(),
             inputs,
             constants,
-            quantized_constants: BTreeMap::new(),
+            quantized_constants,
             requested_passthroughs: schedule.requested_passthroughs.clone(),
             requested: requested.iter().map(|n| n.index() as u64).collect(),
             identity: 0,
@@ -606,6 +644,568 @@ impl CapturedSchedule {
             .replay(self, provided, crate::CapturedReplayOptions::default())?
             .outputs)
     }
+}
+
+fn authenticate_quantized_bindings(
+    graph: &Graph,
+    schedule: &mut Schedule,
+    bindings: &[QuantizedCaptureBinding],
+) -> Result<BTreeMap<u64, crate::QuantizedTensorData>, ReplayError> {
+    schedule
+        .validate()
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    let mut outputs = BTreeSet::new();
+    let mut rewritten_outputs = BTreeSet::new();
+    let mut constants = BTreeMap::<u64, crate::QuantizedTensorData>::new();
+    for binding in bindings {
+        let output = match binding {
+            QuantizedCaptureBinding::RowGather { output, .. }
+            | QuantizedCaptureBinding::Matmul { output, .. } => *output,
+        };
+        if !outputs.insert(output) {
+            return Err(ReplayError::Corrupt(
+                "quantized capture output is substituted more than once".into(),
+            ));
+        }
+        let item_position = schedule
+            .items
+            .iter()
+            .position(|item| {
+                item.outputs
+                    .iter()
+                    .any(|desc| desc.id == output.index() as u64)
+            })
+            .ok_or_else(|| ReplayError::Corrupt("quantized capture owner is absent".into()))?;
+        if schedule.items.iter().skip(item_position + 1).any(|item| {
+            item.outputs
+                .iter()
+                .any(|desc| desc.id == output.index() as u64)
+        }) {
+            return Err(ReplayError::Corrupt(
+                "quantized capture output has ambiguous ownership".into(),
+            ));
+        }
+        // Authenticate against the untouched dense schedule, then replace only
+        // the cloned terminal owner. The final dependency rebuild below drops
+        // materialized views only when no retained item still reaches them.
+        let mut item = schedule.items[item_position].clone();
+        let (weight_node, value) = match binding {
+            QuantizedCaptureBinding::RowGather {
+                indices,
+                weight,
+                value,
+                ..
+            } => authenticate_quantized_row_gather(
+                graph, schedule, &mut item, output, *indices, *weight, value,
+            )?,
+            QuantizedCaptureBinding::Matmul {
+                activation,
+                weight,
+                value,
+                ..
+            } => authenticate_quantized_matmul(
+                graph,
+                schedule,
+                &mut item,
+                output,
+                *activation,
+                *weight,
+                value,
+            )?,
+        };
+        schedule.items[item_position] = item;
+        rewritten_outputs.insert(output.index() as u64);
+        match constants.entry(weight_node.index() as u64) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == value => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(ReplayError::Corrupt(
+                    "one packed capture owner has conflicting payloads".into(),
+                ));
+            }
+        }
+    }
+    finalize_quantized_schedule(schedule, &rewritten_outputs)?;
+    let packed_ids = constants.keys().copied().collect::<BTreeSet<_>>();
+    if schedule.items.iter().any(|item| {
+        item.input_bindings
+            .iter()
+            .any(|binding| packed_ids.contains(&binding.desc.id))
+    }) {
+        return Err(ReplayError::Corrupt(
+            "packed placeholder escapes through a dense schedule binding".into(),
+        ));
+    }
+    schedule
+        .validate()
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    Ok(constants)
+}
+
+fn authenticate_quantized_matmul<'a>(
+    graph: &Graph,
+    schedule: &Schedule,
+    item: &mut ScheduleItem,
+    output: NodeId,
+    activation: NodeId,
+    weight: NodeId,
+    value: &'a crate::QuantizedTensorData,
+) -> Result<(NodeId, &'a crate::QuantizedTensorData), ReplayError> {
+    value
+        .validate()
+        .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+    let Op::Matmul { lhs, rhs } = graph
+        .op(output)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+    else {
+        return Err(ReplayError::Corrupt(
+            "quantized Matmul substitution does not target Matmul".into(),
+        ));
+    };
+    let Op::Permute {
+        input: transposed_weight,
+        axes,
+    } = graph
+        .op(*rhs)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+    else {
+        return Err(ReplayError::Corrupt(
+            "quantized Matmul weight is not an exact transpose".into(),
+        ));
+    };
+    authenticate_quantized_view_owner(graph, schedule, item, *rhs, weight)?;
+    let expected = crate::MatmulKernelPlan::from_graph(graph, output)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    let scheduled = match item.kernel.operation() {
+        crate::Operation::Matmul(crate::MatmulValue::Serial(plan)) => plan.as_ref(),
+        crate::Operation::Matmul(crate::MatmulValue::Tiled(plan)) => &plan.matmul,
+        crate::Operation::Matmul(crate::MatmulValue::TensorCore(plan)) => &plan.matmul,
+        _ => {
+            return Err(ReplayError::Corrupt(
+                "quantized Matmul graph/schedule provenance mismatch".into(),
+            ));
+        }
+    };
+    if *lhs != activation
+        || *transposed_weight != weight
+        || axes.as_slice() != [1, 0]
+        || graph
+            .shape(weight)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            != &value.descriptor().logical_shape
+        || graph
+            .dtype(weight)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            != crate::DType::F32
+        || !matches!(
+            graph
+                .op(weight)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?,
+            Op::Input { .. }
+        )
+        || item.node != output
+        || !item.outputs.is_single()
+        || item.boundary.is_some()
+        || scheduled != &expected
+        || !item
+            .input_bindings
+            .iter()
+            .any(|binding| binding.input_node == *rhs && binding.desc.id == rhs.index() as u64)
+    {
+        return Err(ReplayError::Corrupt(
+            "quantized Matmul graph/schedule provenance mismatch".into(),
+        ));
+    }
+    let plan = crate::QuantizedMatmulPlan::new(
+        activation,
+        weight,
+        output,
+        graph
+            .shape(activation)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            .clone(),
+        value.descriptor().clone(),
+    )
+    .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+    let activation_desc = item
+        .input_bindings
+        .iter()
+        .find(|binding| binding.desc.id == activation.index() as u64)
+        .map(|binding| binding.desc.clone())
+        .ok_or_else(|| ReplayError::Corrupt("quantized Matmul activation is absent".into()))?;
+    if activation_desc.shape != plan.activation_shape
+        || activation_desc.dtype != crate::DType::F32
+        || activation_desc.view.is_some()
+        || !activation_desc.read_only
+        || item.primary_output().id != output.index() as u64
+        || item.primary_output().shape != plan.output_shape
+        || item.primary_output().dtype != crate::DType::F32
+    {
+        return Err(ReplayError::Corrupt(
+            "quantized Matmul descriptor mismatch".into(),
+        ));
+    }
+    rewrite_quantized_item(
+        item,
+        crate::Operation::Matmul(crate::MatmulValue::Quantized(Box::new(plan))),
+        activation,
+        activation_desc,
+        weight,
+        value.descriptor().clone(),
+    )?;
+    Ok((weight, value))
+}
+
+fn authenticate_quantized_row_gather<'a>(
+    graph: &Graph,
+    schedule: &Schedule,
+    item: &mut ScheduleItem,
+    output: NodeId,
+    indices: NodeId,
+    weight: NodeId,
+    value: &'a crate::QuantizedTensorData,
+) -> Result<(NodeId, &'a crate::QuantizedTensorData), ReplayError> {
+    value
+        .validate()
+        .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+    let Op::Gather {
+        input: gathered,
+        index,
+        axis,
+    } = graph
+        .op(output)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+    else {
+        return Err(ReplayError::Corrupt(
+            "quantized row-gather substitution does not target Gather".into(),
+        ));
+    };
+    let Op::Reshape {
+        input: gathered_weight,
+        shape: gathered_shape,
+    } = graph
+        .op(*gathered)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+    else {
+        return Err(ReplayError::Corrupt(
+            "quantized row-gather source is not an exact reshape".into(),
+        ));
+    };
+    let Op::Expand {
+        input: index_view,
+        shape: expanded_shape,
+    } = graph
+        .op(*index)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+    else {
+        return Err(ReplayError::Corrupt(
+            "quantized row-gather index is not an exact expansion".into(),
+        ));
+    };
+    let Op::Reshape {
+        input: scalar_indices,
+        shape: index_shape,
+    } = graph
+        .op(*index_view)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+    else {
+        return Err(ReplayError::Corrupt(
+            "quantized row-gather index source is not an exact reshape".into(),
+        ));
+    };
+    let [rows, columns]: [usize; 2] = value
+        .descriptor()
+        .logical_shape
+        .dims()
+        .try_into()
+        .map_err(|_| ReplayError::Descriptor("packed row-gather weight rank".into()))?;
+    authenticate_quantized_view_owner(graph, schedule, item, *gathered, weight)?;
+    authenticate_quantized_view_owner(graph, schedule, item, *index, indices)?;
+    let expected = crate::MovementKernelPlan::from_scheduled_graph(graph, output)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    if *axis != 1
+        || *gathered_weight != weight
+        || *scalar_indices != indices
+        || gathered_shape.dims() != [1, rows, columns]
+        || index_shape.dims() != [1, 1, 1]
+        || expanded_shape.dims() != [1, 1, columns]
+        || graph
+            .shape(output)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            != expanded_shape
+        || graph
+            .shape(indices)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            .dims()
+            != [1, 1]
+        || graph
+            .dtype(indices)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            != crate::DType::I32
+        || graph
+            .shape(weight)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            != &value.descriptor().logical_shape
+        || !matches!(
+            graph
+                .op(weight)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?,
+            Op::Input { .. }
+        )
+        || item.node != output
+        || !item.outputs.is_single()
+        || item.boundary.is_some()
+        || !matches!(
+            item.kernel.operation(),
+            crate::Operation::Movement(crate::MovementValue::Plan(plan))
+                if plan.as_ref() == &expected
+        )
+        || !item.input_bindings.iter().any(|binding| {
+            binding.input_node == *gathered && binding.desc.id == gathered.index() as u64
+        })
+        || !item
+            .input_bindings
+            .iter()
+            .any(|binding| binding.input_node == *index && binding.desc.id == index.index() as u64)
+    {
+        return Err(ReplayError::Corrupt(
+            "quantized row-gather graph/schedule provenance mismatch".into(),
+        ));
+    }
+    let plan = crate::QuantizedRowGatherPlan::new(
+        indices,
+        weight,
+        output,
+        graph
+            .shape(indices)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+            .clone(),
+        crate::DType::I32,
+        value,
+    )
+    .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+    if item.primary_output().id != output.index() as u64
+        || item.primary_output().shape != plan.output_shape
+        || item.primary_output().dtype != crate::DType::F32
+    {
+        return Err(ReplayError::Corrupt(
+            "quantized row-gather output descriptor mismatch".into(),
+        ));
+    }
+    let indices_desc = graph_buffer_desc(graph, indices, true)?;
+    rewrite_quantized_item(
+        item,
+        crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(Box::new(plan))),
+        indices,
+        indices_desc,
+        weight,
+        value.descriptor().clone(),
+    )?;
+    Ok((weight, value))
+}
+
+fn authenticate_quantized_view_owner(
+    graph: &Graph,
+    schedule: &Schedule,
+    consumer: &ScheduleItem,
+    view_node: NodeId,
+    source: NodeId,
+) -> Result<(), ReplayError> {
+    let rangeified = crate::rangeify::static_view(graph, view_node)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    // Source-backed views deliberately do not use the computed-affine copy
+    // plan. Direct-payload consumers make them roots, and the scheduler
+    // materializes those roots through the ordinary scalar lowering path.
+    let expected_kernel = crate::kernel::lower_graph_elementwise(graph, view_node)
+        .and_then(|kernel| crate::uop::normalize_kernel(&kernel))
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    let owners = schedule
+        .items
+        .iter()
+        .filter(|item| {
+            item.outputs
+                .iter()
+                .any(|output| output.id == view_node.index() as u64)
+        })
+        .collect::<Vec<_>>();
+    let [owner] = owners.as_slice() else {
+        return Err(ReplayError::Corrupt(
+            "quantized view has ambiguous schedule ownership".into(),
+        ));
+    };
+    let expected_output = graph_buffer_desc(graph, view_node, false)?;
+    if rangeified.source != source
+        || owner.node != view_node
+        || !owner.outputs.is_single()
+        || owner.primary_output() != &expected_output
+        || owner.boundary.is_some()
+        || owner.kernel != expected_kernel
+        || !consumer.dependencies.contains(&owner.id)
+        || !consumer.input_bindings.iter().any(|binding| {
+            binding.input_node == view_node
+                && binding.desc.id == view_node.index() as u64
+                && binding.desc.shape == expected_output.shape
+                && binding.desc.dtype == expected_output.dtype
+                && binding.desc.bytes == expected_output.bytes
+                && binding.desc.alignment == expected_output.alignment
+                && binding.desc.read_only
+                && binding.desc.view.is_none()
+        })
+    {
+        return Err(ReplayError::Corrupt(
+            "quantized view graph/schedule provenance mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn finalize_quantized_schedule(
+    schedule: &mut Schedule,
+    rewritten_outputs: &BTreeSet<u64>,
+) -> Result<(), ReplayError> {
+    let producers = schedule
+        .items
+        .iter()
+        .flat_map(|item| item.outputs.iter().map(move |output| (output.id, item.id)))
+        .collect::<BTreeMap<_, _>>();
+    for item in &mut schedule.items {
+        if rewritten_outputs.contains(&item.primary_output().id) {
+            item.dependencies = item
+                .input_bindings
+                .iter()
+                .filter_map(|binding| producers.get(&binding.desc.id).copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+    }
+
+    let retained_roots = schedule
+        .requested_materializations
+        .iter()
+        .chain(
+            schedule
+                .requested_passthroughs
+                .iter()
+                .map(|passthrough| &passthrough.desc.id),
+        )
+        .filter_map(|output| producers.get(output).copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let by_id = schedule
+        .items
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    let mut retained = BTreeSet::new();
+    let mut pending = retained_roots;
+    while let Some(id) = pending.pop() {
+        if retained.insert(id) {
+            let item = by_id.get(&id).ok_or_else(|| {
+                ReplayError::Corrupt("quantized schedule dependency is absent".into())
+            })?;
+            pending.extend(item.dependencies.iter().copied());
+        }
+    }
+    let remap = schedule
+        .items
+        .iter()
+        .filter(|item| retained.contains(&item.id))
+        .enumerate()
+        .map(|(new, item)| (item.id, new as u64))
+        .collect::<BTreeMap<_, _>>();
+    schedule.items.retain(|item| retained.contains(&item.id));
+    for item in &mut schedule.items {
+        item.id = remap[&item.id];
+        item.dependencies = item
+            .dependencies
+            .iter()
+            .map(|dependency| remap[dependency])
+            .collect();
+        item.consumers.clear();
+    }
+    for position in 0..schedule.items.len() {
+        let consumer = schedule.items[position].id;
+        for dependency in schedule.items[position].dependencies.clone() {
+            schedule.items[dependency as usize].consumers.push(consumer);
+        }
+    }
+    for item in &mut schedule.items {
+        item.cache_key = crate::schedule::item_cache_key(item)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn rewrite_quantized_item(
+    item: &mut ScheduleItem,
+    operation: crate::Operation,
+    dense_input: NodeId,
+    dense_desc: crate::BufferDesc,
+    weight: NodeId,
+    weight_desc: crate::QuantizedBufferDesc,
+) -> Result<(), ReplayError> {
+    if !item.external_materializations.is_empty() {
+        return Err(ReplayError::Corrupt(
+            "quantized capture owner has external materializations".into(),
+        ));
+    }
+    let kernel = crate::UOp::from_operation(
+        operation,
+        Some(crate::UType::scalar(crate::DType::F32)),
+        Vec::new(),
+    );
+    kernel
+        .validate()
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    item.inputs = vec![dense_desc.clone()];
+    item.input_bindings = vec![crate::ScheduleInputBinding {
+        input_node: dense_input,
+        desc: dense_desc,
+        abi_index: 0,
+    }];
+    item.quantized_input_bindings = vec![crate::QuantizedScheduleInputBinding {
+        input_node: weight,
+        desc: weight_desc,
+        abi_index: 1,
+    }];
+    item.kernel = kernel;
+    item.cache_key = crate::schedule::item_cache_key(item)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    item.validate_input_bindings()
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    Ok(())
+}
+
+fn graph_buffer_desc(
+    graph: &Graph,
+    node: NodeId,
+    read_only: bool,
+) -> Result<crate::BufferDesc, ReplayError> {
+    let shape = graph
+        .shape(node)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?
+        .clone();
+    let dtype = graph
+        .dtype(node)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    let bytes = shape
+        .numel()
+        .map_err(|error| ReplayError::Descriptor(error.to_string()))?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| ReplayError::Descriptor("captured buffer byte overflow".into()))?;
+    Ok(crate::BufferDesc {
+        id: node.index() as u64,
+        shape,
+        dtype,
+        bytes,
+        alignment: dtype.itemsize().max(1),
+        read_only,
+        view: None,
+    })
 }
 
 #[cfg(test)]
@@ -1243,6 +1843,167 @@ mod tests {
             ("b".into(), TensorData::new([2, 1], vec![4., 5.]).unwrap()),
         ]);
         assert_eq!(decoded.replay(&provided).unwrap()[0].values(), &[23.]);
+    }
+
+    #[test]
+    fn integrated_quantized_capture_authenticates_exact_graph_owners() {
+        let mut graph = Graph::new();
+        let activation = graph.input("activation", Shape::from([1, 32]));
+        let weight = graph.input("weight", Shape::from([2, 32]));
+        let transposed = graph.permute(weight, [1, 0]).unwrap();
+        let output = graph.matmul(activation, transposed).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let value = crate::QuantizedTensorData::new(
+            crate::GgmlType::Q4_0,
+            Shape::from([2, 32]),
+            vec![0; 36],
+        )
+        .unwrap();
+        let binding = QuantizedCaptureBinding::Matmul {
+            output,
+            activation,
+            weight,
+            value,
+        };
+        assert!(schedule.items.iter().any(|item| {
+            item.outputs
+                .iter()
+                .any(|desc| desc.id == transposed.index() as u64)
+        }));
+        let capture = CapturedSchedule::capture_with_quantized_bindings(
+            &graph,
+            &schedule,
+            &[output],
+            std::slice::from_ref(&binding),
+        )
+        .unwrap();
+        assert_eq!(capture.items.len(), 1);
+        assert!(matches!(
+            capture.items[0].kernel.operation(),
+            crate::Operation::Matmul(crate::MatmulValue::Quantized(_))
+        ));
+        assert!(
+            capture.items[0]
+                .ordered_quantized_inputs()
+                .iter()
+                .any(|input| input.input_node == weight)
+        );
+        assert!(capture.items.iter().all(|item| {
+            item.outputs
+                .iter()
+                .all(|desc| desc.id != transposed.index() as u64)
+        }));
+        assert_eq!(capture.quantized_constants.len(), 1);
+        assert!(capture.inputs.iter().all(|input| input.node != weight));
+        let bytes = capture.to_bytes().unwrap();
+        assert_eq!(
+            CapturedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
+
+        assert!(matches!(
+            CapturedSchedule::capture_with_quantized_bindings(
+                &graph,
+                &schedule,
+                &[output],
+                &[binding.clone(), binding.clone()],
+            ),
+            Err(ReplayError::Corrupt(message))
+                if message == "quantized capture output is substituted more than once"
+        ));
+        let QuantizedCaptureBinding::Matmul { value, .. } = binding else {
+            unreachable!()
+        };
+        let forged = QuantizedCaptureBinding::Matmul {
+            output,
+            activation: weight,
+            weight,
+            value,
+        };
+        assert!(matches!(
+            CapturedSchedule::capture_with_quantized_bindings(
+                &graph,
+                &schedule,
+                &[output],
+                &[forged],
+            ),
+            Err(ReplayError::Corrupt(message))
+                if message == "quantized Matmul graph/schedule provenance mismatch"
+        ));
+
+        let shared = crate::schedule_many(&graph, &[output, transposed]).unwrap();
+        assert!(matches!(
+            CapturedSchedule::capture_with_quantized_bindings(
+                &graph,
+                &shared,
+                &[output, transposed],
+                &[QuantizedCaptureBinding::Matmul {
+                    output,
+                    activation,
+                    weight,
+                    value: capture.quantized_constants[&(weight.index() as u64)].clone(),
+                }],
+            ),
+            Err(ReplayError::Corrupt(message))
+                if message == "packed placeholder escapes through a dense schedule binding"
+        ));
+    }
+
+    #[test]
+    fn integrated_quantized_row_gather_prunes_only_authenticated_view_owners() {
+        let mut graph = Graph::new();
+        let weight = graph.input("weight", Shape::from([2, 32]));
+        let indices = graph.input_dtype("indices", [1, 1], crate::DType::I32);
+        let gathered_weight = graph.reshape(weight, [1, 2, 32]).unwrap();
+        let index_view = graph.reshape(indices, [1, 1, 1]).unwrap();
+        let index = graph.expand(index_view, [1, 1, 32]).unwrap();
+        let output = graph.gather(gathered_weight, index, 1).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        assert!(
+            schedule
+                .items
+                .iter()
+                .any(|item| item.node == gathered_weight)
+        );
+        assert!(schedule.items.iter().any(|item| item.node == index));
+        let value = crate::QuantizedTensorData::new(
+            crate::GgmlType::Q4_0,
+            Shape::from([2, 32]),
+            vec![0; 36],
+        )
+        .unwrap();
+        let binding = QuantizedCaptureBinding::RowGather {
+            output,
+            indices,
+            weight,
+            value,
+        };
+        let capture = CapturedSchedule::capture_with_quantized_bindings(
+            &graph,
+            &schedule,
+            &[output],
+            &[binding],
+        )
+        .unwrap();
+        assert_eq!(capture.items.len(), 1);
+        assert!(matches!(
+            capture.items[0].kernel.operation(),
+            crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(_))
+        ));
+        assert_eq!(capture.items[0].ordered_inputs()[0].input_node, indices);
+        assert_eq!(
+            capture.items[0].ordered_quantized_inputs()[0].input_node,
+            weight
+        );
+        assert!(
+            capture
+                .items
+                .iter()
+                .all(|item| item.node != gathered_weight && item.node != index)
+        );
     }
 
     #[test]

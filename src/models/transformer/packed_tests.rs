@@ -1,7 +1,7 @@
 use super::{
     LlamaBatchGenerator, LlamaBatchNativeCache, LlamaBatchNativeGenerator, LlamaBatchSampling,
-    LlamaLinearWeight, LlamaMetalStepError, LlamaMetalStepPlan, LlamaModel, LlamaModelError,
-    LlamaNativeCache, LlamaNativeGenerator, LlamaNativeStageKind, LlamaSampling,
+    LlamaLinearWeight, LlamaMetalStepPlan, LlamaModel, LlamaModelError, LlamaNativeCache,
+    LlamaNativeGenerator, LlamaNativeStageKind, LlamaSampling,
     serving::{
         LlamaRequestStatus, LlamaServingConfig, LlamaServingGenerationConfig, LlamaServingSampling,
         LlamaServingScheduler,
@@ -9,7 +9,8 @@ use super::{
 };
 use crate::runtime::metal::{MetalCapabilities, MetalRenderer};
 use crate::{
-    GgmlLayout, GgmlType, QuantizedTensorData, Shape, TensorData, tokenizer::SimpleTokenizer,
+    GgmlLayout, GgmlType, Operation, QuantizedTensorData, Shape, TensorData,
+    tokenizer::SimpleTokenizer,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -320,7 +321,7 @@ fn fixture(state: &BTreeMap<String, FixtureTensor>) -> Vec<u8> {
     out
 }
 
-fn models() -> (LlamaModel, SimpleTokenizer, LlamaModel, SimpleTokenizer) {
+pub(crate) fn models() -> (LlamaModel, SimpleTokenizer, LlamaModel, SimpleTokenizer) {
     let state = packed_state();
     let packed_bytes = fixture(&state);
     let packed_file = crate::gguf::read_gguf(&packed_bytes).unwrap();
@@ -346,7 +347,7 @@ fn assert_close(actual: &TensorData, expected: &TensorData) {
 }
 
 #[test]
-fn metal_step_rejects_packed_weights_before_graph_or_resource_planning() {
+fn metal_step_captures_every_packed_weight_without_dense_residents() {
     let (packed, _, _, _) = models();
     let renderer = MetalRenderer::new(
         8,
@@ -357,9 +358,169 @@ fn metal_step_rejects_packed_weights_before_graph_or_resource_planning() {
         },
     )
     .unwrap();
+    let plan = LlamaMetalStepPlan::new(&packed, renderer).unwrap();
+    let expected = 1 + packed
+        .linear_weights()
+        .values()
+        .filter(|weight| matches!(weight, LlamaLinearWeight::Quantized(_)))
+        .count();
+    let expected_uses = expected + 1;
+    assert_eq!(plan.capture().quantized_constants.len(), expected);
+    assert_eq!(plan.summary().quantized_constant_count, expected);
+    assert_eq!(
+        plan.summary().quantized_constant_bytes,
+        plan.capture()
+            .quantized_constants
+            .values()
+            .map(|value| value.bytes().len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        plan.capture()
+            .items
+            .iter()
+            .filter(|item| !item.quantized_input_bindings.is_empty())
+            .count(),
+        expected_uses
+    );
+    assert!(
+        plan.resident_inputs()
+            .iter()
+            .all(|input| !input.name.starts_with("llama.packed."))
+    );
+    let embedding = packed.embedding_weight();
+    let LlamaLinearWeight::Quantized(embedding) = embedding else {
+        unreachable!()
+    };
+    let embedding_owner = plan
+        .capture()
+        .quantized_constants
+        .iter()
+        .find_map(|(id, value)| {
+            (value.descriptor().identity == embedding.descriptor().identity).then_some(*id)
+        })
+        .unwrap();
+    assert_eq!(
+        plan.capture()
+            .items
+            .iter()
+            .flat_map(|item| item.quantized_input_bindings.iter())
+            .filter(|binding| binding.input_node.index() as u64 == embedding_owner)
+            .count(),
+        2,
+        "tied embedding/output must authenticate both uses of one packed owner"
+    );
+    assert!(plan.capture().items.iter().any(|item| matches!(
+        item.kernel.operation(),
+        Operation::Movement(crate::MovementValue::QuantizedRowGather(_))
+    )));
+    assert_eq!(
+        plan.capture()
+            .items
+            .iter()
+            .filter(|item| matches!(
+                item.kernel.operation(),
+                Operation::Matmul(crate::MatmulValue::Quantized(_))
+            ))
+            .count(),
+        packed.linear_weights().len() + 1
+    );
+    assert_eq!(
+        plan.capture()
+            .quantized_constants
+            .values()
+            .map(|value| value.descriptor().ggml_type)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q6K,])
+    );
+    let artifact = plan.capture().to_bytes().unwrap();
+    let decoded = crate::CapturedSchedule::from_bytes(&artifact).unwrap();
+    assert_eq!(decoded.to_bytes().unwrap(), artifact);
+    assert_eq!(decoded.identity, plan.capture().identity);
+    assert_eq!(
+        decoded.quantized_constants,
+        plan.capture().quantized_constants
+    );
+    assert_eq!(plan.summary().fallback_count, 0);
+}
+
+#[test]
+fn metal_step_preserves_mixed_dense_and_packed_weight_ownership() {
+    let mut state = packed_state();
+    let dense_name = "blk.0.attn_q.weight";
+    let FixtureTensor::Packed(value) = state.remove(dense_name).unwrap() else {
+        unreachable!()
+    };
+    state.insert(
+        dense_name.to_owned(),
+        FixtureTensor::Dense(value.dequantize_f32().unwrap()),
+    );
+    state.insert(
+        super::OUTPUT_WEIGHT.to_owned(),
+        FixtureTensor::Packed(packed(GgmlType::Q8_0, [VOCAB, DIM])),
+    );
+    let bytes = fixture(&state);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (model, _) = LlamaModel::from_gguf(&file).unwrap();
+    let renderer = MetalRenderer::new(
+        8,
+        MetalCapabilities {
+            max_buffer_length: 1 << 30,
+            unified_memory: true,
+            family: "MockApple9".into(),
+        },
+    )
+    .unwrap();
+    let plan = LlamaMetalStepPlan::new(&model, renderer).unwrap();
+
+    assert_eq!(plan.output_binding(), super::LlamaOutputBinding::Explicit);
+    assert!(
+        plan.resident_inputs()
+            .iter()
+            .any(|input| input.name == dense_name)
+    );
+    assert_eq!(
+        plan.capture().quantized_constants.len(),
+        1 + model
+            .linear_weights()
+            .values()
+            .filter(|weight| matches!(weight, LlamaLinearWeight::Quantized(_)))
+            .count()
+    );
+    let explicit = model.linear_weights()[super::OUTPUT_WEIGHT]
+        .quantized_type()
+        .unwrap();
+    assert_eq!(explicit, GgmlType::Q8_0);
+    assert_eq!(plan.summary().fallback_count, 0);
+}
+
+#[test]
+fn metal_step_rejects_packed_formats_without_direct_msl_before_capture() {
+    let mut state = packed_state();
+    state.insert(
+        super::TOKEN_EMBEDDING.to_owned(),
+        FixtureTensor::Raw {
+            shape: Shape::from([VOCAB, DIM]),
+            kind: GgmlType::Q5_0,
+            bytes: vec![0; VOCAB * (DIM / 32) * 22],
+        },
+    );
+    let bytes = fixture(&state);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (model, _) = LlamaModel::from_gguf(&file).unwrap();
+    let renderer = MetalRenderer::new(
+        8,
+        MetalCapabilities {
+            max_buffer_length: 1 << 30,
+            unified_memory: true,
+            family: "MockApple9".into(),
+        },
+    )
+    .unwrap();
     assert!(matches!(
-        LlamaMetalStepPlan::new(&packed, renderer),
-        Err(LlamaMetalStepError::PackedTensor(_))
+        LlamaMetalStepPlan::new(&model, renderer),
+        Err(super::LlamaMetalStepError::PackedTensor(message))
+            if message.contains("token_embd.weight") && message.contains("Q5_0")
     ));
 }
 

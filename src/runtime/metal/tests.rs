@@ -505,6 +505,7 @@ fn portable_threefry_metal_renders_and_executes_broadcast_bits() {
 }
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
+use crate::models::transformer::{LlamaMetalStepPlan, packed_metal_fixture_models};
 use crate::nn::{Linear, Module, Parameter, StateKind};
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
@@ -1154,6 +1155,82 @@ fn metal_append_state_empty_rows_are_addressless_but_advance_logically() {
     session.run(&values).unwrap();
     assert_eq!(session.committed_state_position(), Some(1));
     assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn packed_llama_token_session_matches_dense_oracle_and_retries_atomically() {
+    let (packed, _, dense, _) = packed_metal_fixture_models();
+    let plan =
+        LlamaMetalStepPlan::new(&packed, MetalRenderer::new(8, capabilities()).unwrap()).unwrap();
+    let stable_summary = plan.summary().clone();
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock.clone())).unwrap();
+    let stable_owner = session.metal_session().device_owner_id();
+    let stable_compiled = session.metal_session().compiled_kernels().count();
+    let expected_last = |tokens: &[u32]| {
+        let all = dense.forward(tokens).unwrap();
+        let vocab = packed.config().schema().vocab_size();
+        let start = (tokens.len() - 1) * vocab;
+        TensorData::new([1, vocab], all.values()[start..start + vocab].to_vec()).unwrap()
+    };
+    let assert_logits = |actual: &TensorData, expected: &TensorData| {
+        assert_eq!(actual.shape(), expected.shape());
+        assert_eq!(actual.dtype(), DType::F32);
+        for (index, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate()
+        {
+            assert!(
+                actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= 1e-3,
+                "logit {index}: packed Metal {actual} != dense oracle {expected}"
+            );
+        }
+    };
+
+    mock.clear_calls();
+    mock.state.lock().unwrap().failures.launch = Some("packed Llama launch");
+    assert!(session.run_token(3).is_err());
+    assert_eq!(session.position(), 0);
+    assert_eq!(session.metal_session().successful_run_count(), 0);
+    mock.clear_failures();
+
+    mock.clear_calls();
+    let first = session.run_token(3).unwrap();
+    assert_logits(first.logits(), &expected_last(&[3]));
+    assert_eq!(first.position(), 0);
+    assert_eq!(session.position(), 1);
+    assert_eq!(first.report().transient_h2d_calls, 3);
+    assert_eq!(first.report().retained_d2h_calls, 1);
+    assert!(!mock.calls().iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("library_compile:")
+            || call.starts_with("pipeline_create:")
+            || call.starts_with("queue_create:")
+    }));
+
+    mock.state.lock().unwrap().failures.read = Some("packed Llama logits read");
+    assert!(session.run_token(4).is_err());
+    assert_eq!(session.position(), 1);
+    assert_eq!(session.metal_session().successful_run_count(), 1);
+    mock.clear_failures();
+
+    mock.clear_calls();
+    let retry = session.run_token(5).unwrap();
+    assert_logits(retry.logits(), &expected_last(&[3, 5]));
+    assert_eq!(retry.position(), 1);
+    assert_eq!(session.position(), 2);
+    assert_eq!(retry.report().transient_h2d_calls, 3);
+    assert_eq!(retry.report().retained_d2h_calls, 1);
+    assert_eq!(session.metal_session().device_owner_id(), stable_owner);
+    assert_eq!(session.metal_session().summary(), &stable_summary);
+    assert_eq!(
+        session.metal_session().compiled_kernels().count(),
+        stable_compiled
+    );
+    assert!(!mock.calls().iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("library_compile:")
+            || call.starts_with("pipeline_create:")
+            || call.starts_with("queue_create:")
+    }));
 }
 
 #[test]

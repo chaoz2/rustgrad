@@ -13,6 +13,8 @@ use crate::{
     AttentionOptions, CapturedAppendStateInference, CapturedInferenceError, CapturedSchedule,
     DType, Error, ExecutionPlanSummary, Graph, InferenceAppendStateLink, NodeId, ReplayInput,
     Scalar, Shape, TensorData,
+    engine::capture::QuantizedCaptureBinding,
+    gguf::{GgmlType, QuantizedTensorData},
 };
 use std::{collections::BTreeMap, error, fmt};
 
@@ -125,15 +127,20 @@ impl LlamaMetalStepPlan {
         if config.max_context() > i32::MAX as usize {
             return Err(LlamaMetalStepError::Dimension("context exceeds I32"));
         }
-        ensure_dense(model)?;
         let built = build_step_graph(model)?;
+        let host_gathers = if built.packed_embedding {
+            &[POSITION_INPUT][..]
+        } else {
+            &[TOKEN_INPUT, POSITION_INPUT][..]
+        };
         let captured = CapturedAppendStateInference::from_graph_residents(
             &built.graph,
             &[built.logits],
             &built.state_links,
             built.initial_state,
             built.residents,
-            &[TOKEN_INPUT, POSITION_INPUT],
+            &built.quantized,
+            host_gathers,
         )?;
         let inner = MetalAppendStateInferencePlan::new(captured, renderer)?;
         if inner.summary().fallback_count != 0 {
@@ -306,27 +313,12 @@ fn step_position_inputs(
 struct BuiltStepGraph {
     graph: Graph,
     residents: BTreeMap<String, (NodeId, TensorData)>,
+    quantized: Vec<QuantizedCaptureBinding>,
     initial_state: BTreeMap<String, TensorData>,
     state_links: Vec<InferenceAppendStateLink>,
     append_index_shape: Shape,
+    packed_embedding: bool,
     logits: NodeId,
-}
-
-fn ensure_dense(model: &LlamaModel) -> Result<(), LlamaMetalStepError> {
-    if let LlamaLinearWeight::Quantized(weight) = model.embedding_weight() {
-        return Err(LlamaMetalStepError::PackedTensor(format!(
-            "{TOKEN_EMBEDDING} ({:?})",
-            weight.descriptor().ggml_type
-        )));
-    }
-    if let Some((name, _)) = model
-        .linear_weights()
-        .iter()
-        .find(|(_, weight)| matches!(weight, LlamaLinearWeight::Quantized(_)))
-    {
-        return Err(LlamaMetalStepError::PackedTensor(name.clone()));
-    }
-    Ok(())
 }
 
 fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStepError> {
@@ -344,17 +336,14 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
     );
     let mut residents = BTreeMap::new();
     let mut nodes = BTreeMap::new();
-
-    let embedding = match model.embedding_weight() {
-        LlamaLinearWeight::Dense(value) => value,
-        LlamaLinearWeight::Quantized(_) => unreachable!("dense admission precedes graph build"),
-    };
-    insert_resident(
+    let mut packed = BTreeMap::new();
+    insert_weight(
         &mut graph,
         &mut residents,
         &mut nodes,
+        &mut packed,
         TOKEN_EMBEDDING,
-        embedding,
+        model.embedding_weight(),
     )?;
     for (name, value) in model
         .dense_state()
@@ -364,14 +353,19 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
         insert_resident(&mut graph, &mut residents, &mut nodes, name, value)?;
     }
     for (name, weight) in model.linear_weights() {
-        let LlamaLinearWeight::Dense(value) = weight else {
-            unreachable!("dense admission precedes graph build");
-        };
-        insert_resident(&mut graph, &mut residents, &mut nodes, name, value)?;
+        insert_weight(
+            &mut graph,
+            &mut residents,
+            &mut nodes,
+            &mut packed,
+            name,
+            weight,
+        )?;
     }
     let rope = rope_table(config.max_context(), schema.rope_dim(), config.rope_theta())?;
     insert_resident(&mut graph, &mut residents, &mut nodes, ROPE_TABLE, &rope)?;
 
+    let mut quantized = Vec::new();
     let mut x = lookup_embedding(
         &mut graph,
         nodes[TOKEN_EMBEDDING],
@@ -379,6 +373,15 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
         schema.vocab_size(),
         schema.embedding_dim(),
     )?;
+    let packed_embedding = packed.contains_key(TOKEN_EMBEDDING);
+    if let Some(weight) = packed.get(TOKEN_EMBEDDING) {
+        quantized.push(QuantizedCaptureBinding::RowGather {
+            output: x,
+            indices: token,
+            weight: nodes[TOKEN_EMBEDDING],
+            value: weight.clone(),
+        });
+    }
     let rope_row = lookup_rope_row(&mut graph, nodes[ROPE_TABLE], position, schema.rope_dim())?;
     let positions = TensorData::from_scalars(
         [config.max_context()],
@@ -420,6 +423,8 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
         let built = StepLayerBuildContext {
             graph: &mut graph,
             nodes: &nodes,
+            packed: &packed,
+            quantized: &mut quantized,
             config,
             rope_row,
             append_index,
@@ -450,16 +455,66 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
         LlamaOutputBinding::Explicit => OUTPUT_WEIGHT,
         LlamaOutputBinding::TiedToTokenEmbedding => TOKEN_EMBEDDING,
     };
-    let logits = linear(&mut graph, normalized, nodes[output_name])?;
+    let logits = model_linear(
+        &mut graph,
+        normalized,
+        output_name,
+        &nodes,
+        &packed,
+        &mut quantized,
+    )?;
     let logits = graph.reshape(logits, [1, schema.vocab_size()])?;
     Ok(BuiltStepGraph {
         graph,
         residents,
+        quantized,
         initial_state,
         state_links,
         append_index_shape,
+        packed_embedding,
         logits,
     })
+}
+
+fn insert_weight(
+    graph: &mut Graph,
+    residents: &mut BTreeMap<String, (NodeId, TensorData)>,
+    nodes: &mut BTreeMap<String, NodeId>,
+    packed: &mut BTreeMap<String, QuantizedTensorData>,
+    name: &str,
+    weight: &LlamaLinearWeight,
+) -> Result<(), LlamaMetalStepError> {
+    match weight {
+        LlamaLinearWeight::Dense(value) => insert_resident(graph, residents, nodes, name, value),
+        LlamaLinearWeight::Quantized(value) => {
+            if !matches!(
+                value.descriptor().ggml_type,
+                GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K
+            ) {
+                return Err(LlamaMetalStepError::PackedTensor(format!(
+                    "{name} ({:?})",
+                    value.descriptor().ggml_type
+                )));
+            }
+            value
+                .validate()
+                .map_err(|error| LlamaMetalStepError::PackedTensor(format!("{name} ({error})")))?;
+            if residents.contains_key(name) || packed.contains_key(name) {
+                return Err(LlamaMetalStepError::Dimension(
+                    "duplicate Llama resident name",
+                ));
+            }
+            let node = graph.input_dtype_requires_grad(
+                format!("llama.packed.{name}"),
+                value.descriptor().logical_shape.clone(),
+                DType::F32,
+                false,
+            );
+            nodes.insert(name.to_owned(), node);
+            packed.insert(name.to_owned(), value.clone());
+            Ok(())
+        }
+    }
 }
 
 fn insert_resident(
@@ -559,6 +614,8 @@ struct StepLayerNodes {
 struct StepLayerBuildContext<'a> {
     graph: &'a mut Graph,
     nodes: &'a BTreeMap<String, NodeId>,
+    packed: &'a BTreeMap<String, QuantizedTensorData>,
+    quantized: &'a mut Vec<QuantizedCaptureBinding>,
     config: &'a super::LlamaModelConfig,
     rope_row: NodeId,
     append_index: NodeId,
@@ -576,6 +633,8 @@ impl StepLayerBuildContext<'_> {
         let Self {
             graph,
             nodes,
+            packed,
+            quantized,
             config,
             rope_row,
             append_index,
@@ -590,9 +649,30 @@ impl StepLayerBuildContext<'_> {
             schema.embedding_dim(),
             config.norm_eps(),
         )?;
-        let mut query = linear(graph, attn_norm, nodes[&name("attn_q.weight")])?;
-        let mut key = linear(graph, attn_norm, nodes[&name("attn_k.weight")])?;
-        let value = linear(graph, attn_norm, nodes[&name("attn_v.weight")])?;
+        let mut query = model_linear(
+            graph,
+            attn_norm,
+            &name("attn_q.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        let mut key = model_linear(
+            graph,
+            attn_norm,
+            &name("attn_k.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        let value = model_linear(
+            graph,
+            attn_norm,
+            &name("attn_v.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
         query = permute_rope_projection(
             graph,
             query,
@@ -677,7 +757,14 @@ impl StepLayerBuildContext<'_> {
         )?;
         let attended = graph.permute(attended, vec![0, 2, 1, 3])?;
         let attended = graph.reshape(attended, [1, 1, schema.query_heads() * schema.head_dim()])?;
-        let attended = linear(graph, attended, nodes[&name("attn_output.weight")])?;
+        let attended = model_linear(
+            graph,
+            attended,
+            &name("attn_output.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
         x = graph.add(x, attended)?;
 
         let normalized = rms_norm(
@@ -687,11 +774,32 @@ impl StepLayerBuildContext<'_> {
             schema.embedding_dim(),
             config.norm_eps(),
         )?;
-        let gate = linear(graph, normalized, nodes[&name("ffn_gate.weight")])?;
+        let gate = model_linear(
+            graph,
+            normalized,
+            &name("ffn_gate.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
         let gate = graph.silu(gate)?;
-        let up = linear(graph, normalized, nodes[&name("ffn_up.weight")])?;
+        let up = model_linear(
+            graph,
+            normalized,
+            &name("ffn_up.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
         let gated = graph.mul(gate, up)?;
-        let down = linear(graph, gated, nodes[&name("ffn_down.weight")])?;
+        let down = model_linear(
+            graph,
+            gated,
+            &name("ffn_down.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
         x = graph.add(x, down)?;
         Ok(StepLayerNodes {
             output: x,
@@ -706,6 +814,27 @@ impl StepLayerBuildContext<'_> {
 fn linear(graph: &mut Graph, input: NodeId, weight: NodeId) -> Result<NodeId, Error> {
     let weight = graph.permute(weight, vec![1, 0])?;
     graph.matmul(input, weight)
+}
+
+fn model_linear(
+    graph: &mut Graph,
+    input: NodeId,
+    name: &str,
+    nodes: &BTreeMap<String, NodeId>,
+    packed: &BTreeMap<String, QuantizedTensorData>,
+    quantized: &mut Vec<QuantizedCaptureBinding>,
+) -> Result<NodeId, LlamaMetalStepError> {
+    let weight = nodes[name];
+    let output = linear(graph, input, weight)?;
+    if let Some(value) = packed.get(name) {
+        quantized.push(QuantizedCaptureBinding::Matmul {
+            output,
+            activation: input,
+            weight,
+            value: value.clone(),
+        });
+    }
+    Ok(output)
 }
 
 fn apply_resident_rope(
@@ -1023,6 +1152,7 @@ mod tests {
             &built.state_links,
             built.initial_state.clone(),
             built.residents.clone(),
+            &built.quantized,
             &[],
         )
         .unwrap();
@@ -1032,6 +1162,7 @@ mod tests {
             &built.state_links,
             built.initial_state,
             built.residents,
+            &built.quantized,
             &[TOKEN_INPUT, POSITION_INPUT],
         )
         .unwrap();
