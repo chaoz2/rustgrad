@@ -58,6 +58,19 @@ impl StaticConv2dPlan {
         else {
             return Err(StaticConv2dPlanError::NotConv2d);
         };
+        let input = graph
+            .contiguous_backward_owner(*input)
+            .map_err(|_| StaticConv2dPlanError::Geometry("input owner"))?;
+        let weight = graph
+            .contiguous_backward_owner(*weight)
+            .map_err(|_| StaticConv2dPlanError::Geometry("weight owner"))?;
+        let bias = bias
+            .map(|node| {
+                graph
+                    .contiguous_backward_owner(node)
+                    .map_err(|_| StaticConv2dPlanError::Geometry("bias owner"))
+            })
+            .transpose()?;
         if options.groups != 1 {
             return Err(StaticConv2dPlanError::Geometry("groups must be one"));
         }
@@ -68,11 +81,11 @@ impl StaticConv2dPlan {
             ));
         }
         let input_shape = graph
-            .shape(*input)
+            .shape(input)
             .map_err(|_| StaticConv2dPlanError::Geometry("input"))?
             .clone();
         let weight_shape = graph
-            .shape(*weight)
+            .shape(weight)
             .map_err(|_| StaticConv2dPlanError::Geometry("weight"))?
             .clone();
         let output_shape = graph
@@ -102,11 +115,11 @@ impl StaticConv2dPlan {
             return Err(StaticConv2dPlanError::Geometry("NCHW output geometry"));
         }
         if graph
-            .dtype(*input)
+            .dtype(input)
             .map_err(|_| StaticConv2dPlanError::DType)?
             != DType::F32
             || graph
-                .dtype(*weight)
+                .dtype(weight)
                 .map_err(|_| StaticConv2dPlanError::DType)?
                 != DType::F32
             || graph
@@ -118,14 +131,14 @@ impl StaticConv2dPlan {
         }
         let bias_shape = if let Some(bias) = bias {
             if graph
-                .dtype(*bias)
+                .dtype(bias)
                 .map_err(|_| StaticConv2dPlanError::DType)?
                 != DType::F32
             {
                 return Err(StaticConv2dPlanError::DType);
             }
             let shape = graph
-                .shape(*bias)
+                .shape(bias)
                 .map_err(|_| StaticConv2dPlanError::Geometry("bias"))?
                 .clone();
             if shape.dims() != [output_channels] {
@@ -143,9 +156,9 @@ impl StaticConv2dPlan {
             .and_then(|_| output_shape.numel())
             .map_err(|_| StaticConv2dPlanError::Overflow)?;
         let mut plan = Self {
-            input: *input,
-            weight: *weight,
-            bias: *bias,
+            input,
+            weight,
+            bias,
             output,
             input_shape,
             weight_shape,

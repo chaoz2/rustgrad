@@ -19,6 +19,14 @@ const MAX_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
 
+fn requested_materializations(capture: &CapturedSchedule) -> Vec<u64> {
+    crate::schedule::physical_requested_materializations(
+        &capture.items,
+        &capture.requested_passthroughs,
+        capture.requested.iter().copied(),
+    )
+}
+
 /// Graph-free mixed-schedule descriptor. The ordinary capture remains its
 /// canonical typed UOp/item payload; persistent identities are stored beside
 /// it so an effect runtime must prove the declared versions at replay time.
@@ -462,6 +470,7 @@ impl CapturedMixedSchedule {
         validate(self, true)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
+            requested_materializations: requested_materializations(&self.schedule),
             requested_passthroughs: self.schedule.requested_passthroughs.clone(),
             value_bindings: self.value_bindings.clone(),
             state_bindings: self.state_bindings.clone(),
@@ -560,6 +569,7 @@ impl CapturedMixedSchedule {
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
         let schedule = Schedule {
             items: self.schedule.items.clone(),
+            requested_materializations: requested_materializations(&self.schedule),
             requested_passthroughs: self.schedule.requested_passthroughs.clone(),
             value_bindings: self.value_bindings.clone(),
             state_bindings: self.state_bindings.clone(),
@@ -778,6 +788,7 @@ impl CapturedMixedSchedule {
         }
         let schedule = Schedule {
             items: self.schedule.items.clone(),
+            requested_materializations: requested_materializations(&self.schedule),
             requested_passthroughs: self.schedule.requested_passthroughs.clone(),
             value_bindings: self.value_bindings.clone(),
             state_bindings: self.state_bindings.clone(),
@@ -884,6 +895,7 @@ impl CapturedMixedSchedule {
         let native_trace = self.native_replay_trace(vectorized)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
+            requested_materializations: requested_materializations(&self.schedule),
             requested_passthroughs: self.schedule.requested_passthroughs.clone(),
             value_bindings: self.value_bindings.clone(),
             state_bindings: self.state_bindings.clone(),
@@ -1232,6 +1244,7 @@ fn recurrent_initial_frontier(
 ) -> Result<Vec<BufferState>, ReplayError> {
     let schedule = Schedule {
         items: capture.schedule.items.clone(),
+        requested_materializations: requested_materializations(&capture.schedule),
         requested_passthroughs: capture.schedule.requested_passthroughs.clone(),
         value_bindings: capture.value_bindings.clone(),
         state_bindings: capture.state_bindings.clone(),
@@ -1864,6 +1877,7 @@ mod tests {
         let base = captured_effect();
         let mixed = Schedule {
             items: base.schedule.items.clone(),
+            requested_materializations: requested_materializations(&base.schedule),
             requested_passthroughs: base.schedule.requested_passthroughs.clone(),
             value_bindings: base.value_bindings.clone(),
             state_bindings: base.state_bindings.clone(),
@@ -2449,6 +2463,7 @@ fn validate(value: &CapturedMixedSchedule, validate_keys: bool) -> Result<(), Re
     }
     let schedule = Schedule {
         items: value.schedule.items.clone(),
+        requested_materializations: requested_materializations(&value.schedule),
         requested_passthroughs: value.schedule.requested_passthroughs.clone(),
         value_bindings: value.value_bindings.clone(),
         state_bindings: value.state_bindings.clone(),

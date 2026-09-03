@@ -73,6 +73,14 @@ impl CapturedSchedule {
                 "tensor guard capture is unsupported".into(),
             ));
         }
+        let requested = requested
+            .iter()
+            .map(|node| {
+                graph
+                    .contiguous_backward_owner(*node)
+                    .map_err(|error| ReplayError::Corrupt(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut inputs = BTreeMap::new();
         let mut constants = BTreeMap::new();
         let mut produced = BTreeSet::new();
@@ -117,6 +125,26 @@ impl CapturedSchedule {
             .iter()
             .map(|node| node.index() as u64)
             .collect::<BTreeSet<_>>();
+        let expected_materializations = crate::schedule::physical_requested_materializations(
+            &schedule.items,
+            &schedule.requested_passthroughs,
+            requested_ids.iter().copied(),
+        );
+        // A schedule may deliberately contain additional retained pure outputs
+        // that are consumed by a later mixed/effect suffix.  Capture only needs
+        // to prove that every physical owner of this requested projection is
+        // retained; Schedule::validate already authenticates the full sorted,
+        // produced-only inventory.
+        if expected_materializations.iter().any(|buffer| {
+            schedule
+                .requested_materializations
+                .binary_search(buffer)
+                .is_err()
+        }) {
+            return Err(ReplayError::Corrupt(
+                "requested materialization inventory is inconsistent".into(),
+            ));
+        }
         for passthrough in &schedule.requested_passthroughs {
             passthrough
                 .validate_against_graph(graph)
@@ -179,7 +207,7 @@ impl CapturedSchedule {
         // A requested alias has no producer of its own. Its immutable source
         // stays in the replay input/constant tables, while a computed source is
         // authenticated above against its one existing schedule producer.
-        for node in requested {
+        for node in &requested {
             let id = node.index() as u64;
             if produced.contains(&id) {
                 continue;
@@ -662,6 +690,74 @@ mod tests {
             }
         };
         assert_eq!(raw_f32(&replay.outputs[1]), raw_f32(&constant_value));
+    }
+
+    #[test]
+    fn contiguous_backward_capture_uses_only_the_forward_owner_identity() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([4]), DType::F8E4M3);
+        let first = graph.contiguous_backward(input).unwrap();
+        let second = graph.contiguous_backward(first).unwrap();
+        let constant_value = TensorData::from_storage(
+            [4],
+            crate::Storage::Float8(crate::Float8Storage::from_raw(
+                crate::Float8Format::E4M3,
+                vec![0x00, 0x80, 0x7f, 0xff],
+            )),
+        )
+        .unwrap();
+        let constant = graph.constant(constant_value.clone());
+        let constant_boundary = graph.contiguous_backward(constant).unwrap();
+        let requested = [second, constant_boundary, second];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        assert!(schedule.items.is_empty());
+        assert!(schedule.requested_passthroughs.is_empty());
+
+        let capture = CapturedSchedule::capture(&graph, &schedule, &requested).unwrap();
+        assert_eq!(
+            capture.requested,
+            vec![
+                input.index() as u64,
+                constant.index() as u64,
+                input.index() as u64
+            ]
+        );
+        assert!(
+            capture
+                .inputs
+                .iter()
+                .all(|binding| binding.node != first && binding.node != second)
+        );
+        assert!(
+            !capture
+                .constants
+                .contains_key(&(constant_boundary.index() as u64))
+        );
+        let bytes = capture.to_bytes().unwrap();
+        let capture = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(capture.to_bytes().unwrap(), bytes);
+
+        let input_value = TensorData::from_storage(
+            [4],
+            crate::Storage::Float8(crate::Float8Storage::from_raw(
+                crate::Float8Format::E4M3,
+                vec![0xff, 0x7f, 0x80, 0x00],
+            )),
+        )
+        .unwrap();
+        let replay = crate::CapturedReplayExecutor::default()
+            .replay(
+                &capture,
+                &BTreeMap::from([("input".into(), input_value.clone())]),
+                crate::CapturedReplayOptions {
+                    backend: crate::CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        assert!(replay.trace.items.is_empty());
+        assert_eq!(replay.outputs[0].storage(), input_value.storage());
+        assert_eq!(replay.outputs[1].storage(), constant_value.storage());
+        assert_eq!(replay.outputs[2].storage(), input_value.storage());
     }
 
     #[test]

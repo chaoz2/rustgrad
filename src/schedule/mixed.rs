@@ -168,6 +168,7 @@ pub fn combine(
             effect.dependencies.push(binding.producer_item);
         }
     }
+    let requested_materializations = pure.requested_materializations;
     let requested_passthroughs = pure.requested_passthroughs;
     let state_bindings = pure.state_bindings;
     let mut items = pure.items;
@@ -192,6 +193,7 @@ pub fn combine(
     super::rekey_schedule_items(&mut items, &state_bindings, None)?;
     let schedule = Schedule {
         items,
+        requested_materializations,
         requested_passthroughs,
         value_bindings: bindings,
         state_bindings,
