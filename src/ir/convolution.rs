@@ -321,66 +321,6 @@ fn convolution_plan(
     })
 }
 
-/// Materializes one repeat axis through logarithmically grouped concatenations.
-///
-/// The literal expand/reshape implementation of `repeat` is periodic rather
-/// than affine, so a downstream view cannot name an owned schedule producer.
-/// Concat gives the repeated lanes distinct storage while retaining the same
-/// row-major values and keeps the number of graph nodes logarithmic in
-/// `repetitions`.
-fn materialized_repeat_axis(
-    graph: &mut Graph,
-    input: NodeId,
-    axis: usize,
-    repetitions: usize,
-) -> Result<NodeId> {
-    debug_assert!(repetitions > 0);
-    let mut remaining = repetitions;
-    let mut block = input;
-    let mut output = None;
-    while remaining != 0 {
-        if remaining & 1 != 0 {
-            output = Some(match output {
-                Some(prefix) => graph.concat([prefix, block], axis)?,
-                None => block,
-            });
-        }
-        remaining >>= 1;
-        if remaining != 0 {
-            block = graph.concat([block, block], axis)?;
-        }
-    }
-    Ok(output.expect("positive repetition count has one set bit"))
-}
-
-/// Produces exactly the requested repeated prefix, so every later reshape is
-/// affine over dense materialized storage even when several spatial axes are
-/// cropped to different repeat lengths.
-fn materialized_repeated_extent(
-    graph: &mut Graph,
-    input: NodeId,
-    axis: usize,
-    target_extent: usize,
-) -> Result<NodeId> {
-    let shape = graph.shape(input)?.clone();
-    let extent = shape.dims()[axis];
-    debug_assert!(extent > 0 && target_extent >= extent);
-    let full_repetitions = target_extent / extent;
-    let remainder = target_extent % extent;
-    let repeated = materialized_repeat_axis(graph, input, axis, full_repetitions)?;
-    if remainder == 0 {
-        return Ok(repeated);
-    }
-    let mut bounds = shape
-        .dims()
-        .iter()
-        .map(|&extent| (0, extent))
-        .collect::<Vec<_>>();
-    bounds[axis] = (0, remainder);
-    let tail = graph.shrink(input, bounds)?;
-    graph.concat([repeated, tail], axis)
-}
-
 /// Creates tinygrad's compact repeated/shrink/reshape/permute spatial windows.
 fn lower_spatial_window(
     graph: &mut Graph,
@@ -398,7 +338,7 @@ fn lower_spatial_window(
 
     let mut output = Vec::with_capacity(window.rank());
     let mut expanded_extents = Vec::with_capacity(window.rank());
-    let mut repeated_extents = Vec::with_capacity(window.rank());
+    let mut repeats = vec![1isize; padded_shape.rank()];
     for (axis, &extent) in input_spatial.iter().enumerate() {
         let dilation_span = window.dilation[axis]
             .checked_mul(window.kernel[axis] - 1)
@@ -425,15 +365,17 @@ fn lower_spatial_window(
         let repeated_target = window.kernel[axis]
             .checked_mul(expanded)
             .ok_or_else(|| Error::ShapeOverflow(padded_shape.clone()))?;
-        repeated_extents.push(repeated_target);
+        repeats[prefix + axis] = isize::try_from(repeated_target.div_ceil(extent))
+            .map_err(|_| Error::ShapeOverflow(padded_shape.clone()))?;
         output.push(count);
         expanded_extents.push(expanded);
     }
 
-    let mut node = padded;
-    for (spatial_axis, target_extent) in repeated_extents.into_iter().enumerate() {
-        node = materialized_repeated_extent(graph, node, prefix + spatial_axis, target_extent)?;
-    }
+    // Keep the exact checked-in tinygrad `_pool` structure. Projected-index
+    // lowering now authenticates the periodic repeat/reshape chain directly,
+    // so convolution windows need no eager Concat storage owners between the
+    // padded source and their reduction consumer.
+    let mut node = graph.repeat(padded, &repeats)?;
     let mut bounds = padded_shape.dims()[..prefix]
         .iter()
         .map(|&extent| (0, extent))
@@ -1502,12 +1444,19 @@ mod tests {
             .unwrap();
         let schedule = crate::schedule_many(&graph, &[output]).unwrap();
         assert!(schedule.items.iter().all(|item| item.boundary.is_none()));
+        assert!((0..graph.node_count()).all(|index| {
+            !matches!(graph.op(NodeId::from_index(index)), Ok(Op::Concat { .. }))
+        }));
         assert!(schedule.items.iter().any(|item| {
-            matches!(
-                item.kernel.operation(),
-                crate::Operation::Movement(crate::MovementValue::Plan(plan))
-                    if matches!(&plan.kind, crate::MovementKernelKind::Concat { .. })
-            )
+            item.kernel.topological().is_ok_and(|nodes| {
+                nodes
+                    .into_iter()
+                    .filter(crate::projected_index::ProjectedIndexPlan::is_projected)
+                    .filter_map(|index| {
+                        crate::projected_index::ProjectedIndexPlan::from_index(&index).ok()
+                    })
+                    .any(|plan| plan.buffer == input.index() as u64)
+            })
         }));
         assert!(
             schedule
@@ -1517,6 +1466,56 @@ mod tests {
         );
         let captured = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
         assert!(!captured.requested.is_empty());
+    }
+
+    #[test]
+    fn padded_stride_two_k7_windows_project_directly_from_the_source_image() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 3, 224, 224]);
+        let weight = graph.input("weight", [64, 3, 7, 7]);
+        let output = graph
+            .conv2d(
+                input,
+                weight,
+                None,
+                crate::Conv2dOptions {
+                    groups: 1,
+                    stride: [2, 2],
+                    dilation: [1, 1],
+                    padding: [3; 4],
+                },
+            )
+            .unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        schedule.validate().unwrap();
+        assert!(schedule.items.iter().all(|item| item.boundary.is_none()));
+        assert!((0..graph.node_count()).all(|index| {
+            !matches!(graph.op(NodeId::from_index(index)), Ok(Op::Concat { .. }))
+        }));
+        let (projection_index, projection) = schedule
+            .items
+            .iter()
+            .flat_map(|item| item.kernel.topological().unwrap())
+            .filter(crate::projected_index::ProjectedIndexPlan::is_predicated)
+            .find_map(|index| {
+                let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).ok()?;
+                (plan.buffer == input.index() as u64
+                    && plan.elements == 3 * 224 * 224
+                    && plan.output_elements == 64 * 112 * 112 * 3 * 7 * 7)
+                    .then_some((index, plan))
+            })
+            .expect("padded stem window must project from the source image");
+        let mut projected_occurrences = 0usize;
+        let mut pending = projection_index.sources()[1..].iter().collect::<Vec<_>>();
+        while let Some(node) = pending.pop() {
+            projected_occurrences += 1;
+            pending.extend(node.sources());
+        }
+        assert!(projected_occurrences < crate::projected_index::MAX_PROJECTED_INDEX_NODES);
+        assert!(projection.is_guarded());
+        assert!(!projection.valid(0).unwrap());
+        let captured = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        assert_eq!(captured.requested, vec![output.index() as u64]);
     }
 
     #[test]

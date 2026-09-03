@@ -335,6 +335,27 @@ fn range_extent(range: &UOp) -> Result<usize, RangeifyError> {
     usize::try_from(*bound).map_err(|_| RangeifyError::Invalid)
 }
 
+fn canonicalize_projected_address(
+    expression: &UOp,
+    output_elements: usize,
+    source_elements: usize,
+) -> Result<UOp, RangeifyError> {
+    crate::projected_index::canonicalize_graph_projected_address(
+        expression,
+        output_elements,
+        source_elements,
+    )
+    .map_err(|_| RangeifyError::Invalid)
+}
+
+fn canonicalize_projected_predicate(
+    predicate: &UOp,
+    output_elements: usize,
+) -> Result<UOp, RangeifyError> {
+    crate::projected_index::canonicalize_graph_projected_predicate(predicate, output_elements)
+        .map_err(|_| RangeifyError::Invalid)
+}
+
 fn logical_coordinates(
     logical: &Shape,
     output: &Shape,
@@ -378,6 +399,32 @@ fn logical_coordinates(
         .collect()
 }
 
+fn canonicalize_coordinates(
+    shape: &Shape,
+    coordinates: Vec<UOp>,
+    range: &UOp,
+) -> Result<Vec<UOp>, RangeifyError> {
+    if shape.rank() != coordinates.len() {
+        return Err(RangeifyError::Invalid);
+    }
+    let output_elements = range_extent(range)?;
+    let coordinates = coordinates
+        .into_iter()
+        .zip(shape.dims())
+        .map(|(coordinate, axis_extent)| {
+            if *axis_extent == 0 {
+                // No lane can address a zero axis. The final projected-plan
+                // check still requires either a zero output domain or an
+                // authenticated all-false predicate before admitting a load.
+                return (zero_from(range), 1);
+            }
+            (coordinate, *axis_extent)
+        })
+        .collect::<Vec<_>>();
+    crate::projected_index::canonicalize_graph_projected_coordinates(&coordinates, output_elements)
+        .map_err(|_| RangeifyError::Invalid)
+}
+
 fn recomposed_linear(
     shape: &Shape,
     coordinates: &[UOp],
@@ -395,6 +442,9 @@ fn recomposed_linear(
     for ((coordinate, dim), stride) in coordinates.iter().zip(shape.dims()).zip(&strides) {
         if *dim == 0 || *stride == 0 || *dim == 1 {
             let is_zero = matches!(
+                (coordinate.operation(), coordinate.sources()),
+                (Operation::Const(crate::uop::LiteralValue::Int(0)), [])
+            ) || matches!(
                 (coordinate.operation(), coordinate.sources()),
                 (Operation::Binary(Binary::Mul), [_, rhs])
                     if matches!(rhs.operation(), Operation::Const(crate::uop::LiteralValue::Int(0)))
@@ -444,14 +494,12 @@ fn recomposed_linear(
     let Some(decomposed) = decomposed else {
         return Ok(None);
     };
-    Ok(
-        crate::projected_index::canonicalize_graph_projected_address(
-            &decomposed,
-            range_extent(range)?,
-            shape.numel().map_err(|_| RangeifyError::Invalid)?,
-        )
-        .ok(),
+    Ok(canonicalize_projected_address(
+        &decomposed,
+        range_extent(range)?,
+        shape.numel().map_err(|_| RangeifyError::Invalid)?,
     )
+    .ok())
 }
 
 fn linearize_coordinates(
@@ -511,6 +559,96 @@ fn decompose_linear(shape: &Shape, linear: UOp, range: &UOp) -> Result<Vec<UOp>,
         .collect()
 }
 
+/// Recognizes one literal `Graph::repeat` reshape/expand/reshape stage and
+/// maps its collapsed coordinate back to the repeated source axis.  The
+/// shapes authenticate the periodic map; unrelated expand/reshape chains keep
+/// using the general projected-address path below.
+fn periodic_repeat_source(
+    graph: &Graph,
+    node: NodeId,
+    coordinates: &[UOp],
+    range: &UOp,
+) -> Result<Option<(NodeId, Vec<UOp>)>, RangeifyError> {
+    let Op::Reshape {
+        input: expanded, ..
+    } = graph.op(node).map_err(|_| RangeifyError::Invalid)?
+    else {
+        return Ok(None);
+    };
+    let Op::Expand {
+        input: unsqueezed, ..
+    } = graph.op(*expanded).map_err(|_| RangeifyError::Invalid)?
+    else {
+        return Ok(None);
+    };
+    let Op::Reshape { input: source, .. } =
+        graph.op(*unsqueezed).map_err(|_| RangeifyError::Invalid)?
+    else {
+        return Ok(None);
+    };
+
+    let source_shape = graph.shape(*source).map_err(|_| RangeifyError::Invalid)?;
+    let unsqueezed_shape = graph
+        .shape(*unsqueezed)
+        .map_err(|_| RangeifyError::Invalid)?;
+    let expanded_shape = graph.shape(*expanded).map_err(|_| RangeifyError::Invalid)?;
+    let collapsed_shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
+    if coordinates.len() != collapsed_shape.rank()
+        || collapsed_shape.rank() != source_shape.rank()
+        || unsqueezed_shape.rank() != source_shape.rank() + 1
+        || expanded_shape.rank() != unsqueezed_shape.rank()
+    {
+        return Ok(None);
+    }
+
+    let changed = unsqueezed_shape
+        .dims()
+        .iter()
+        .zip(expanded_shape.dims())
+        .enumerate()
+        .filter_map(|(axis, (before, after))| (before != after).then_some(axis))
+        .collect::<Vec<_>>();
+    let [axis] = changed.as_slice() else {
+        return Ok(None);
+    };
+    if *axis >= source_shape.rank() || unsqueezed_shape.dims()[*axis] != 1 {
+        return Ok(None);
+    }
+    let repeat = expanded_shape.dims()[*axis];
+    if repeat == 1 {
+        return Ok(None);
+    }
+
+    let mut expected_unsqueezed = source_shape.dims().to_vec();
+    expected_unsqueezed.insert(*axis, 1);
+    let mut expected_expanded = expected_unsqueezed.clone();
+    expected_expanded[*axis] = repeat;
+    let mut expected_collapsed = source_shape.dims().to_vec();
+    expected_collapsed[*axis] = expected_collapsed[*axis]
+        .checked_mul(repeat)
+        .ok_or(RangeifyError::Invalid)?;
+    if unsqueezed_shape.dims() != expected_unsqueezed
+        || expanded_shape.dims() != expected_expanded
+        || collapsed_shape.dims() != expected_collapsed
+    {
+        return Ok(None);
+    }
+
+    let source_extent = source_shape.dims()[*axis];
+    let mut source_coordinates = coordinates.to_vec();
+    source_coordinates[*axis] = if source_extent <= 1 {
+        zero_from(range)
+    } else {
+        let periodic = ibinary(
+            Binary::Mod,
+            source_coordinates[*axis].clone(),
+            iconstant(checked_i64(source_extent)?),
+        );
+        canonicalize_projected_address(&periodic, range_extent(range)?, source_extent)?
+    };
+    Ok(Some((*source, source_coordinates)))
+}
+
 /// Builds an explicit concrete output-linear to source-linear address for a
 /// movement chain that cannot collapse to one AffineView. The chain terminates
 /// at the first dense source or computed producer; ownership remains a
@@ -530,6 +668,11 @@ pub(crate) fn projected_view(
         let node = graph
             .contiguous_backward_owner(node)
             .map_err(|_| RangeifyError::Invalid)?;
+        let coordinates = canonicalize_coordinates(
+            graph.shape(node).map_err(|_| RangeifyError::Invalid)?,
+            coordinates,
+            range,
+        )?;
         match graph.op(node).map_err(|_| RangeifyError::Invalid)? {
             Op::Shrink { input, bounds } => {
                 let coordinates = coordinates
@@ -605,20 +748,23 @@ pub(crate) fn projected_view(
                 Ok((source, expression, predicate))
             }
             Op::Reshape { input, .. } => {
+                if let Some((source, coordinates)) =
+                    periodic_repeat_source(graph, node, &coordinates, range)?
+                {
+                    return go(graph, source, coordinates, range);
+                }
                 let output_shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
                 let input_shape = graph.shape(*input).map_err(|_| RangeifyError::Invalid)?;
+                let output_elements = range_extent(range)?;
                 let linear = linearize_coordinates(output_shape, &coordinates, range)?;
                 // A long reshape/decompose chain is a compact shared UOp DAG,
                 // but expanding that DAG directly into the closed projected
                 // expression tree can multiply identical quotient/remainder
                 // subtrees. Authenticate and canonicalize this complete linear
                 // map while it is still bounded by the current reshape input.
-                let linear = crate::projected_index::canonicalize_graph_projected_address(
-                    &linear,
-                    range_extent(range)?,
-                    input_shape.numel().map_err(|_| RangeifyError::Invalid)?,
-                )
-                .map_err(|_| RangeifyError::Invalid)?;
+                let input_elements = input_shape.numel().map_err(|_| RangeifyError::Invalid)?;
+                let linear =
+                    canonicalize_projected_address(&linear, output_elements, input_elements)?;
                 let coordinates = decompose_linear(input_shape, linear, range)?;
                 go(graph, *input, coordinates, range)
             }
@@ -709,6 +855,26 @@ pub(crate) fn projected_view(
     let logical_shape = graph.shape(node).map_err(|_| RangeifyError::Invalid)?;
     let coordinates = logical_coordinates(logical_shape, output_shape, range)?;
     let (source, expression, predicate) = go(graph, node, coordinates, range)?;
+    let output_elements = range_extent(range)?;
+    let source_elements = graph
+        .shape(source)
+        .map_err(|_| RangeifyError::Invalid)?
+        .numel()
+        .map_err(|_| RangeifyError::Invalid)?;
+    let expression = canonicalize_projected_address(
+        &expression,
+        output_elements,
+        // A populated Pad over an empty source carries canonical address zero
+        // behind an authenticated all-false predicate. Prove the expression
+        // itself against the singleton canonical-address domain here; the
+        // ordinary Predicated Index validator below remains responsible for
+        // admitting that addressless zero-source pair and rejects every
+        // predicate other than canonical false.
+        source_elements.max(1),
+    )?;
+    let predicate = predicate
+        .map(|predicate| canonicalize_projected_predicate(&predicate, output_elements))
+        .transpose()?;
     Ok(RangeifiedProjection {
         source,
         expression,
@@ -782,6 +948,68 @@ mod tests {
             recomposed_linear(&shape, &broadcast, &broadcast_range)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn mixed_radix_linearization_recombines_independent_add_terms() {
+        let shape = Shape::from([2, 3, 4]);
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(24)],
+        );
+        // Use separately constructed but equivalent roots so the direct
+        // shared-numerator fast path cannot hide the mixed-radix fold.
+        let equivalent_range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(24)],
+        );
+        let coordinates = vec![
+            ibinary(
+                Binary::Mod,
+                ibinary(Binary::FloorDiv, range.clone(), iconstant(12)),
+                iconstant(2),
+            ),
+            ibinary(
+                Binary::Mod,
+                ibinary(Binary::FloorDiv, equivalent_range, iconstant(4)),
+                iconstant(3),
+            ),
+            ibinary(Binary::Mod, range.clone(), iconstant(4)),
+        ];
+        let linear = linearize_coordinates(&shape, &coordinates, &range).unwrap();
+        let canonical = canonicalize_projected_address(&linear, 24, 24).unwrap();
+        let element = UType::scalar(DType::F32);
+        let index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: 0,
+                elements: 24,
+                input_shape: shape,
+                output_shape: Shape::from([24]),
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(element),
+            vec![
+                UOp::from_operation(
+                    Operation::DefineGlobal(crate::uop::AddressValue {
+                        space: crate::uop::AddressSpace::Global,
+                        name: "b0".to_owned(),
+                        element,
+                    }),
+                    Some(element),
+                    vec![],
+                ),
+                canonical,
+            ],
+        );
+        let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).unwrap();
+        assert_eq!(
+            (0..24)
+                .map(|lane| plan.offset(lane).unwrap())
+                .collect::<Vec<_>>(),
+            (0..24).collect::<Vec<_>>()
         );
     }
 
@@ -1128,6 +1356,213 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5, 4, 1, 0, 7, 6, 3, 2]
         );
+    }
+
+    #[test]
+    fn projected_view_authenticates_periodic_repeat_stages_and_empty_domains() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let repeated = graph.repeat(input, &[2, 3]).unwrap();
+        let output_shape = graph.shape(repeated).unwrap().clone();
+        assert_eq!(output_shape, Shape::from([4, 9]));
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(36)],
+        );
+        let projected = projected_view(&graph, repeated, &output_shape, &range).unwrap();
+        assert_eq!(projected.source, input);
+        assert!(projected.predicate.is_none());
+        let ty = UType::scalar(DType::F32);
+        let address = UOp::from_operation(
+            Operation::DefineGlobal(crate::uop::AddressValue {
+                space: crate::uop::AddressSpace::Global,
+                name: format!("b{}", input.index()),
+                element: ty,
+            }),
+            Some(ty),
+            vec![],
+        );
+        let index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: input.index() as u64,
+                elements: 6,
+                input_shape: Shape::from([2, 3]),
+                output_shape,
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(ty),
+            vec![address.clone(), projected.expression],
+        );
+        let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).unwrap();
+        let expected = (0..4)
+            .flat_map(|row| (0..9).map(move |column| (row % 2) * 3 + column % 3))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (0..36)
+                .map(|linear| plan.offset(linear).unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        let empty = graph.repeat(input, &[0, 2]).unwrap();
+        let empty_shape = graph.shape(empty).unwrap().clone();
+        let empty_range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(0)],
+        );
+        let empty_projection = projected_view(&graph, empty, &empty_shape, &empty_range).unwrap();
+        assert_eq!(empty_projection.source, input);
+        let empty_index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: input.index() as u64,
+                elements: 6,
+                input_shape: Shape::from([2, 3]),
+                output_shape: empty_shape,
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(ty),
+            vec![address, empty_projection.expression],
+        );
+        assert!(crate::projected_index::ProjectedIndexPlan::from_index(&empty_index).is_ok());
+    }
+
+    #[test]
+    fn periodic_repeat_normalizes_the_immediate_axis_before_padded_projection() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F32);
+        let padded = graph
+            .pad(input, [(1, 2), (2, 1)], crate::Scalar::F(0.0))
+            .unwrap();
+        let repeated = graph.repeat(padded, &[2, 3]).unwrap();
+        let output_shape = graph.shape(repeated).unwrap().clone();
+        assert_eq!(output_shape, Shape::from([10, 18]));
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(180)],
+        );
+        let projected = projected_view(&graph, repeated, &output_shape, &range).unwrap();
+        assert_eq!(projected.source, input);
+        assert!(projected.predicate.is_some());
+        let ty = UType::scalar(DType::F32);
+        let index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: input.index() as u64,
+                elements: 6,
+                input_shape: Shape::from([2, 3]),
+                output_shape,
+                addressing: crate::IndexAddressing::Predicated,
+            }),
+            Some(ty),
+            vec![
+                UOp::from_operation(
+                    Operation::DefineGlobal(crate::uop::AddressValue {
+                        space: crate::uop::AddressSpace::Global,
+                        name: format!("b{}", input.index()),
+                        element: ty,
+                    }),
+                    Some(ty),
+                    vec![],
+                ),
+                projected.expression,
+                projected.predicate.unwrap(),
+            ],
+        );
+        let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).unwrap();
+        assert!(!plan.valid(2).unwrap());
+        assert!(plan.valid(20).unwrap());
+        assert_eq!(plan.offset(20).unwrap(), 0);
+        assert!(plan.valid(22).unwrap());
+        assert_eq!(plan.offset(22).unwrap(), 2);
+        assert!(!plan.valid(23).unwrap());
+        assert!(!plan.valid(74).unwrap());
+        // Row six wraps by the immediate padded extent five. Using the final
+        // repeated extent ten would incorrectly classify this lane as pad.
+        assert!(plan.valid(110).unwrap());
+        assert_eq!(plan.offset(110).unwrap(), 0);
+
+        let unit = graph.input_dtype("unit", [1], DType::F32);
+        let repeated_unit = graph.repeat(unit, &[4]).unwrap();
+        let unit_shape = graph.shape(repeated_unit).unwrap().clone();
+        let unit_range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(4)],
+        );
+        let unit_projection =
+            projected_view(&graph, repeated_unit, &unit_shape, &unit_range).unwrap();
+        let unit_index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: unit.index() as u64,
+                elements: 1,
+                input_shape: Shape::from([1]),
+                output_shape: unit_shape,
+                addressing: crate::IndexAddressing::Projected,
+            }),
+            Some(ty),
+            vec![
+                UOp::from_operation(
+                    Operation::DefineGlobal(crate::uop::AddressValue {
+                        space: crate::uop::AddressSpace::Global,
+                        name: format!("b{}", unit.index()),
+                        element: ty,
+                    }),
+                    Some(ty),
+                    vec![],
+                ),
+                unit_projection.expression,
+            ],
+        );
+        let unit_plan =
+            crate::projected_index::ProjectedIndexPlan::from_index(&unit_index).unwrap();
+        assert_eq!(
+            (0..4)
+                .map(|linear| unit_plan.offset(linear).unwrap())
+                .collect::<Vec<_>>(),
+            vec![0; 4]
+        );
+
+        let empty_source = graph.input_dtype("empty", [0], DType::F32);
+        let padded_empty = graph
+            .pad(empty_source, [(1, 1)], crate::Scalar::F(0.0))
+            .unwrap();
+        let repeated_empty = graph.repeat(padded_empty, &[2]).unwrap();
+        let empty_output_shape = graph.shape(repeated_empty).unwrap().clone();
+        let empty_range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(4)],
+        );
+        let empty_projection =
+            projected_view(&graph, repeated_empty, &empty_output_shape, &empty_range).unwrap();
+        let empty_index = UOp::from_operation(
+            Operation::Index(crate::IndexValue::Buffer {
+                buffer: empty_source.index() as u64,
+                elements: 0,
+                input_shape: Shape::from([0]),
+                output_shape: empty_output_shape,
+                addressing: crate::IndexAddressing::Predicated,
+            }),
+            Some(ty),
+            vec![
+                UOp::from_operation(
+                    Operation::DefineGlobal(crate::uop::AddressValue {
+                        space: crate::uop::AddressSpace::Global,
+                        name: format!("b{}", empty_source.index()),
+                        element: ty,
+                    }),
+                    Some(ty),
+                    vec![],
+                ),
+                empty_projection.expression,
+                empty_projection.predicate.unwrap(),
+            ],
+        );
+        let empty_plan =
+            crate::projected_index::ProjectedIndexPlan::from_index(&empty_index).unwrap();
+        assert!((0..4).all(|linear| !empty_plan.valid(linear).unwrap()));
     }
 
     #[test]

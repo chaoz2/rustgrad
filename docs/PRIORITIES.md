@@ -48,27 +48,30 @@ workloads demonstrates that they are the next concrete blocker.
 
 ### 1. P0 — strict persistent Metal device session
 
-**Status:** first bounded vertical delivered; live-hardware validation next.
+**Status:** persistent runtime and full default ResNet-18 structural conformance
+delivered; live numerical validation next.
 
 `MetalDeviceSessionPlan` authenticates one concrete pure capture and an
 explicit resident/transient input partition before resources. Preparation
 uploads immutable weights once and owns persistent slots, pipelines, and queue;
 repeated synchronous runs stage only transients, download requested outputs,
-expose truthful host-API/planned metrics, and have no CPU fallback. The current
-semantic-mock vertical is a bounded residual-style graph, not a full model or
-performance claim. The opt-in Metal scoreboard records one exact session's
-successful prefix with first/ordered steady host-wall samples and deterministic
-plan/cache/copy/launch JSON; it is measurement plumbing, not live workload
-evidence or GPU timing.
+expose truthful host-API/planned metrics, and have no CPU fallback. Protected
+acceptance now takes the complete default Eval/F32 ResNet-18 `[1,3,224,224]`
+graph through boundary-free scheduling and capture, renders every scheduled
+item to MSL, then performs persistent resident preparation and repeated
+ABI-validating virtual-resource runs. The opt-in Metal scoreboard records one
+exact session's successful prefix with first/ordered steady host-wall samples
+and deterministic plan/cache/copy/launch JSON; it is measurement plumbing, not
+live workload evidence or GPU timing.
 
 ### 2. P0 — ResNet-18 Metal conformance
 
-Run the public ResNet-18 inference graph through that strict session on the
-Apple M5, closing only demonstrated renderer/scheduler gaps. Acceptance is
-CPU-oracle output agreement, zero fallback, stable resident weights and
-intermediates, inspectable kernels/memory/transfers, and compile/first-run/
-steady-state reporting with host-wall versus device evidence labeled exactly.
-Benchmark comparisons target the equivalent tinygrad and Candle workload.
+Run that already authenticated public graph on the Apple M5, closing only
+demonstrated live renderer/runtime gaps. Remaining acceptance is CPU-oracle
+output agreement, zero fallback, stable resident weights and intermediates,
+inspectable kernels/memory/transfers, and compile/first-run/steady-state
+reporting with host-wall versus device evidence labeled exactly. Benchmark
+comparisons target the equivalent tinygrad and Candle workload.
 
 ### 3. P0 — device-resident GGUF Llama prefill/KV/decode
 

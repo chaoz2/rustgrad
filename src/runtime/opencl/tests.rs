@@ -331,16 +331,21 @@ fn captured_grouped_convolution_executes_as_one_portable_static_transaction() {
         )
         .unwrap();
     let schedule = crate::schedule_many(&graph, &[output]).unwrap();
-    assert!(schedule.items.iter().any(|item| matches!(
-        item.kernel.operation(),
-        Operation::Movement(MovementValue::Plan(plan))
-            if matches!(&plan.kind, MovementKernelKind::Pad { .. })
-    )));
-    assert!(schedule.items.iter().any(|item| matches!(
-        item.kernel.operation(),
-        Operation::Movement(MovementValue::Plan(plan))
-            if matches!(&plan.kind, MovementKernelKind::Concat { .. })
-    )));
+    let input_projection = schedule
+        .items
+        .iter()
+        .flat_map(|item| item.kernel.topological().unwrap())
+        .filter(crate::projected_index::ProjectedIndexPlan::is_predicated)
+        .find_map(|index| {
+            let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).ok()?;
+            (plan.buffer == input.index() as u64
+                && plan.elements == 2 * 3 * 3
+                && plan.output_elements == 2 * 3 * 3 * 2 * 2)
+                .then_some(plan)
+        })
+        .expect("grouped convolution must authenticate its padded source projection");
+    assert!(input_projection.is_guarded());
+    assert!(!input_projection.valid(0).unwrap());
     let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
     let capture = crate::CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
     let input_value = TensorData::new(

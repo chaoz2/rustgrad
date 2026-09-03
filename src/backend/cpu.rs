@@ -5821,7 +5821,8 @@ mod tests {
         );
         let trace = graph.trace(y).unwrap().to_string();
         assert!(trace.contains("Sum("));
-        assert!(trace.contains("concat("));
+        assert!(trace.contains("expand("));
+        assert!(!trace.contains("concat("));
         assert!(!trace.contains("conv2d("));
     }
 

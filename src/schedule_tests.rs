@@ -1514,7 +1514,7 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         Some(crate::UType::scalar(DType::I64)),
         vec![UOp::constant(8, crate::UType::scalar(DType::I64))],
     );
-    let raw_projection = crate::rangeify::projected_view(
+    let rangeified_projection = crate::rangeify::projected_view(
         &elementwise,
         reshaped,
         elementwise.shape(output).unwrap(),
@@ -1528,12 +1528,9 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .into_iter()
         .find(crate::projected_index::ProjectedIndexPlan::is_projected)
         .unwrap();
-    assert!(
-        raw_projection.expression.topological().unwrap().len()
-            > canonical_projection.sources()[1]
-                .topological()
-                .unwrap()
-                .len()
+    assert_eq!(
+        rangeified_projection.expression,
+        canonical_projection.sources()[1]
     );
     assert_eq!(output_item.dependencies, vec![producer_item.id]);
     assert_eq!(
