@@ -103,10 +103,14 @@ bank per tensor, one host-validated monotonic I32 position, sparse complete-row
 updates, and same-capture downstream reads. Its scalar model position and every
 lane of the dedicated row-shaped append index derive from that one committed
 position. Capture-authenticated scalar embedding and RoPE lookup now removes
-the checked-Gather status/candidate path. Remaining work adds bounded prefill
-and tokenizer/generator integration, proves live-device output
-agreement, and adds stateful resident-memory/transfer accounting to scoreboard
-evidence.
+the checked-Gather status/candidate path. At the lower runtime boundary,
+capture-owned Q4_0/Q8_0/Q4_K/Q6_K row-gather and matmul plans have a direct
+persistent Metal packed-buffer ABI, one-time immutable upload,
+host-preflighted I32 lookup indices, and versioned F32-accumulating MSL. This
+is a runtime prerequisite; connecting it to the model token body remains.
+Remaining work adds bounded prefill and tokenizer/generator integration,
+proves live-device output agreement, and adds stateful
+resident-memory/transfer accounting to scoreboard evidence.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 

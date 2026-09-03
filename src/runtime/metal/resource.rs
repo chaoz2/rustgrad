@@ -219,6 +219,18 @@ impl MetalDevice {
         )
     }
 
+    pub(crate) fn allocate_static_quantized(
+        &self,
+        plan: &crate::runtime::static_schedule::StaticQuantizedBufferPlan,
+    ) -> Result<MetalBuffer, MetalError> {
+        MetalBuffer::allocate_with_handle(
+            self.inner.clone(),
+            plan.desc.bytes,
+            None,
+            plan.requires_native_handle,
+        )
+    }
+
     /// Compiles an already validated render artifact and preserves bounded
     /// native diagnostics as [`MetalError::Build`].
     pub fn compile(&self, rendered: &RenderedMetal) -> Result<MetalLibrary, MetalError> {
@@ -410,6 +422,8 @@ impl MetalLibrary {
             raw,
             Arc::new(KernelSemantics {
                 buffers: self.inner.rendered.buffers.clone(),
+                quantized_buffers: self.inner.rendered.quantized_buffers.clone(),
+                pointer_order: self.inner.rendered.pointer_order.clone(),
                 extent: self.inner.rendered.extent,
                 program: self.inner.rendered.semantic_program.clone(),
                 transaction: self.inner.rendered.transaction.clone(),
@@ -462,6 +476,25 @@ impl MetalPipeline {
         bindings: &[&'a MetalBuffer],
         local_size: usize,
     ) -> Result<Option<MetalCommand>, MetalError> {
+        self.launch_checked(queue, bindings, local_size, false)
+    }
+
+    pub(super) fn launch_capture_owned_quantized<'a>(
+        &'a self,
+        queue: &'a MetalCommandQueue,
+        bindings: &[&'a MetalBuffer],
+        local_size: usize,
+    ) -> Result<Option<MetalCommand>, MetalError> {
+        self.launch_checked(queue, bindings, local_size, true)
+    }
+
+    fn launch_checked<'a>(
+        &'a self,
+        queue: &'a MetalCommandQueue,
+        bindings: &[&'a MetalBuffer],
+        local_size: usize,
+        capture_initialized: bool,
+    ) -> Result<Option<MetalCommand>, MetalError> {
         queue.live()?;
         let device = &self.inner.library.device;
         if !Rc::ptr_eq(device, &queue.device) {
@@ -471,12 +504,17 @@ impl MetalPipeline {
             return Err(MetalError::Closed("compute pipeline"));
         }
         let rendered = &self.inner.library.rendered;
+        if !rendered.quantized_buffers.is_empty() && !capture_initialized {
+            return Err(MetalError::InvalidArgument(
+                "packed Metal kernel requires capture-owned initialization",
+            ));
+        }
         if rendered.transaction.is_some() || rendered.indexed_movement.is_some() {
             return Err(MetalError::InvalidArgument(
                 "guarded kernel requires transactional launch",
             ));
         }
-        if bindings.len() != rendered.buffers.len() {
+        if bindings.len() != rendered.pointer_order.len() {
             return Err(MetalError::InvalidBinding(
                 "Metal launch binding count mismatch".into(),
             ));
@@ -493,16 +531,23 @@ impl MetalPipeline {
         }
         let snapshots = bindings
             .iter()
-            .zip(&rendered.buffers)
-            .map(|(binding, abi)| {
-                binding.snapshot(
-                    device,
-                    0,
-                    abi.elements
-                        .checked_mul(abi.dtype.itemsize())
-                        .ok_or(MetalError::Overflow)?,
-                    Some(abi.dtype),
-                )
+            .zip(&rendered.pointer_order)
+            .map(|(binding, pointer)| match pointer {
+                super::renderer::MetalPointerAbi::Dense(index) => {
+                    let abi = &rendered.buffers[*index];
+                    binding.snapshot(
+                        device,
+                        0,
+                        abi.elements
+                            .checked_mul(abi.dtype.itemsize())
+                            .ok_or(MetalError::Overflow)?,
+                        Some(abi.dtype),
+                    )
+                }
+                super::renderer::MetalPointerAbi::Quantized(index) => {
+                    let abi = &rendered.quantized_buffers[*index];
+                    binding.snapshot(device, 0, abi.desc.bytes, None)
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         if rendered.extent == 0 {

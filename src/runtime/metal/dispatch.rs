@@ -1,6 +1,6 @@
 //! Typed substitution boundary between safe resources and Objective-C Metal.
 use super::{MetalBufferAbi, MetalError, MetalTransactionAbi};
-use crate::{UOp, random::plan::RandomKernelPlan};
+use crate::{QuantizedMatmulPlan, QuantizedRowGatherPlan, UOp, random::plan::RandomKernelPlan};
 use std::sync::Arc;
 
 macro_rules! raw_handle {
@@ -58,6 +58,8 @@ pub(super) struct LaunchGeometry {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct KernelSemantics {
     pub buffers: Vec<MetalBufferAbi>,
+    pub quantized_buffers: Vec<super::MetalQuantizedBufferAbi>,
+    pub pointer_order: Vec<super::renderer::MetalPointerAbi>,
     pub extent: usize,
     pub program: Arc<KernelSemanticProgram>,
     pub transaction: Option<MetalTransactionAbi>,
@@ -71,6 +73,8 @@ pub(super) struct KernelSemantics {
 pub(super) enum KernelSemanticProgram {
     UOp(Arc<UOp>),
     Random(Arc<RandomKernelPlan>),
+    QuantizedMatmul(Arc<QuantizedMatmulPlan>),
+    QuantizedRowGather(Arc<QuantizedRowGatherPlan>),
 }
 
 /// Native and mock dispatch contract. It is private so raw handles cannot

@@ -510,12 +510,49 @@ use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
-    CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
-    InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
-    LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation, ReduceKind, ResNet,
-    ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
-    TypedValue, UType, schedule,
+    CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, GgmlType, Graph,
+    IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
+    LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation, QuantizedTensorData,
+    ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice,
+    Storage, TensorData, TypedValue, UType, schedule,
 };
+
+fn packed_ones(kind: GgmlType, rows: usize) -> QuantizedTensorData {
+    let (columns, block_bytes) = match kind {
+        GgmlType::Q4_0 => (32, 18),
+        GgmlType::Q8_0 => (32, 34),
+        GgmlType::Q4K => (256, 144),
+        GgmlType::Q6K => (256, 210),
+        _ => panic!("test packed format"),
+    };
+    let mut bytes = vec![0u8; rows * block_bytes];
+    for block in bytes.chunks_exact_mut(block_bytes) {
+        match kind {
+            GgmlType::Q4_0 => {
+                block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                block[2..].fill(0x99);
+            }
+            GgmlType::Q8_0 => {
+                block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                block[2..].fill(1);
+            }
+            GgmlType::Q4K => {
+                block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                block[4..8].fill(1);
+                block[12..16].fill(1);
+                block[16..].fill(0x11);
+            }
+            GgmlType::Q6K => {
+                block[..128].fill(0x11);
+                block[128..192].fill(0xaa);
+                block[192..208].fill(1);
+                block[208..].copy_from_slice(&0x3c00u16.to_le_bytes());
+            }
+            _ => unreachable!("test packed format"),
+        }
+    }
+    QuantizedTensorData::new(kind, Shape::from([rows, columns]), bytes).unwrap()
+}
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
     RawLibrary, RawPipeline, RawQueue,
@@ -2307,6 +2344,381 @@ fn prepared_metal_prefix_reuses_disjoint_exact_temporary_slots() {
 }
 
 #[test]
+fn packed_gguf_constants_upload_once_and_execute_direct_metal_matmul() {
+    assert_eq!(
+        METAL_QUANTIZED_MATMUL_RENDERER_VERSION,
+        "rustgrad-metal-quantized-matmul-f32-v1"
+    );
+    assert_eq!(
+        METAL_QUANTIZED_ROW_GATHER_RENDERER_VERSION,
+        "rustgrad-metal-quantized-row-gather-v1"
+    );
+    let mut format_cache_keys = BTreeSet::new();
+    for kind in [GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q6K] {
+        let weight = packed_ones(kind, 2);
+        let columns = weight.descriptor().logical_shape.dims()[1];
+        let capture = CapturedSchedule::capture_quantized_matmul(
+            "activation",
+            NodeId::from_index(80),
+            NodeId::from_index(81),
+            NodeId::from_index(82),
+            Shape::from([1, columns]),
+            weight.clone(),
+        )
+        .unwrap();
+        let artifact = capture.to_bytes().unwrap();
+        assert_eq!(
+            CapturedSchedule::from_bytes(&artifact)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            artifact
+        );
+        let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+        let plan = MetalDeviceSessionPlan::from_capture(
+            capture.clone(),
+            Vec::<String>::new(),
+            renderer.clone(),
+        )
+        .unwrap();
+        let rendered = plan.rendered_items().next().unwrap();
+        assert!(rendered.source.contains("device const uchar* b1"));
+        assert!(
+            rendered
+                .source
+                .contains(METAL_QUANTIZED_MATMUL_RENDERER_VERSION)
+        );
+        match kind {
+            GgmlType::Q4_0 => assert!(rendered.source.contains("rg_lane < 16ul")),
+            GgmlType::Q8_0 => assert!(rendered.source.contains("as_type<char>")),
+            GgmlType::Q4K => {
+                assert!(rendered.source.contains("rg_g < 4ul"));
+                assert!(rendered.source.contains("rg_dm"));
+            }
+            GgmlType::Q6K => {
+                assert!(rendered.source.contains("rg_b + 208ul"));
+                assert!(rendered.source.contains("rg_scale"));
+            }
+            _ => unreachable!("admitted packed format"),
+        }
+        assert!(format_cache_keys.insert(rendered.cache_key.clone()));
+        assert_eq!(&rendered.quantized_buffers[0].desc, weight.descriptor());
+        assert_eq!(plan.summary().quantized_constant_count, 1);
+        assert_eq!(plan.summary().fallback_count, 0);
+        assert_eq!(
+            plan.summary().quantized_constant_bytes,
+            weight.bytes().len()
+        );
+        assert_eq!(plan.summary().planned_slot_count, 3);
+        assert_eq!(
+            plan.summary().planned_device_bytes,
+            columns * DType::F32.itemsize() + 2 * DType::F32.itemsize() + weight.bytes().len()
+        );
+
+        let mock = Arc::new(MockDispatch::default());
+        let device = test_device(mock.clone());
+        mock.clear_calls();
+        let mut session = plan.prepare(device, BTreeMap::new()).unwrap();
+        assert_eq!(session.preparation_report().resident_h2d_calls, 1);
+        assert_eq!(
+            session.preparation_report().resident_h2d_bytes,
+            weight.bytes().len()
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.starts_with("write:"))
+                .count(),
+            1
+        );
+        let cache_keys = session
+            .compiled_kernels()
+            .map(|kernel| kernel.cache_key.clone())
+            .collect::<Vec<_>>();
+        mock.clear_calls();
+        mock.clear_launch_bindings();
+        let activation = TensorData::new([1, columns], vec![1.0; columns]).unwrap();
+        let inputs = BTreeMap::from([("activation".into(), activation)]);
+        let first = session.run(&inputs).unwrap();
+        let second = session.run(&inputs).unwrap();
+        for run in [&first, &second] {
+            let Storage::F32(values) = run.outputs()[0].storage() else {
+                panic!("packed Metal matmul output")
+            };
+            assert_eq!(values.len(), 2);
+            assert!(values.iter().all(|value| {
+                (*value - columns as f32).abs() <= (columns as f32 * 1.0e-5).max(1.0e-5)
+            }));
+            assert_eq!(run.report().transient_h2d_calls, 1);
+            assert_eq!(run.report().retained_d2h_calls, 1);
+            assert_eq!(run.report().kernel_launch_count, 1);
+        }
+        assert_eq!(
+            session
+                .compiled_kernels()
+                .map(|kernel| kernel.cache_key.as_str())
+                .collect::<Vec<_>>(),
+            cache_keys.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(session.successful_run_count(), 2);
+        assert_eq!(mock.launch_bindings().len(), 2);
+        assert_eq!(mock.launch_bindings()[0], mock.launch_bindings()[1]);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.starts_with("write:"))
+                .count(),
+            2,
+            "only the two transient activations are uploaded after preparation"
+        );
+
+        let plain_mock = Arc::new(MockDispatch::default());
+        let plain_device = test_device(plain_mock.clone());
+        plain_mock.clear_calls();
+        assert!(matches!(
+            PreparedMetalPrefix::prepare(plain_device.clone(), &capture.items, renderer),
+            Err(MetalError::Unsupported(_))
+        ));
+        assert!(plain_mock.calls().is_empty());
+        drop(plain_device);
+        assert_eq!(plain_mock.calls(), vec!["device_release:1".to_owned()]);
+    }
+    assert_eq!(format_cache_keys.len(), 4);
+
+    let first = packed_ones(GgmlType::Q4_0, 1);
+    let mut changed_bytes = first.bytes().to_vec();
+    *changed_bytes.last_mut().unwrap() ^= 1;
+    let changed =
+        QuantizedTensorData::new(GgmlType::Q4_0, Shape::from([1, 32]), changed_bytes).unwrap();
+    let plans = [first, changed]
+        .into_iter()
+        .map(|weight| {
+            let capture = CapturedSchedule::capture_quantized_matmul(
+                "activation",
+                NodeId::from_index(120),
+                NodeId::from_index(121),
+                NodeId::from_index(122),
+                Shape::from([1, 32]),
+                weight,
+            )
+            .unwrap();
+            let identity = capture.identity;
+            let plan = MetalDeviceSessionPlan::from_capture(
+                capture,
+                Vec::<String>::new(),
+                MetalRenderer::new(8, capabilities()).unwrap(),
+            )
+            .unwrap();
+            (
+                identity,
+                plan.rendered_items().next().unwrap().cache_key.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(plans[0].0, plans[1].0);
+    assert_ne!(plans[0].1, plans[1].1);
+
+    let unsupported =
+        QuantizedTensorData::new(GgmlType::Q4_1, Shape::from([1, 32]), vec![0; 20]).unwrap();
+    let capture = CapturedSchedule::capture_quantized_matmul(
+        "activation",
+        NodeId::from_index(83),
+        NodeId::from_index(84),
+        NodeId::from_index(85),
+        Shape::from([1, 32]),
+        unsupported,
+    )
+    .unwrap();
+    assert!(matches!(
+        MetalDeviceSessionPlan::from_capture(
+            capture,
+            Vec::<String>::new(),
+            MetalRenderer::new(8, capabilities()).unwrap(),
+        ),
+        Err(MetalError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn packed_row_gather_preflights_indices_and_retries_without_reuploading_weight() {
+    let weight = packed_ones(GgmlType::Q4_0, 3);
+    let capture = CapturedSchedule::capture_quantized_row_gather(
+        "indices",
+        NodeId::from_index(90),
+        NodeId::from_index(91),
+        NodeId::from_index(92),
+        Shape::from([2]),
+        DType::I32,
+        weight.clone(),
+    )
+    .unwrap();
+    let mut tampered = capture.clone();
+    tampered
+        .quantized_constants
+        .insert(91, packed_ones(GgmlType::Q8_0, 3));
+    assert!(matches!(
+        MetalDeviceSessionPlan::from_capture(
+            tampered,
+            Vec::<String>::new(),
+            MetalRenderer::new(8, capabilities()).unwrap(),
+        ),
+        Err(MetalError::InvalidBinding(_))
+    ));
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let plan =
+        MetalDeviceSessionPlan::from_capture(capture.clone(), Vec::<String>::new(), renderer)
+            .unwrap();
+    let rendered = plan.rendered_items().next().unwrap();
+    assert!(
+        rendered
+            .source
+            .contains(METAL_QUANTIZED_ROW_GATHER_RENDERER_VERSION)
+    );
+    assert!(!rendered.source.contains("status"));
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    mock.state.lock().unwrap().failures.write = Some("packed resident upload");
+    assert!(plan.prepare(device.clone(), BTreeMap::new()).is_err());
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|call| call.starts_with("buffer_release:"))
+    );
+    mock.clear_failures();
+    mock.clear_calls();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        capture,
+        Vec::<String>::new(),
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    let mut session = plan.prepare(device, BTreeMap::new()).unwrap();
+    assert_eq!(session.preparation_report().resident_h2d_calls, 1);
+    mock.clear_calls();
+
+    let invalid = BTreeMap::from([(
+        "indices".into(),
+        TensorData::from_storage([2], Storage::I32(vec![0, -1])).unwrap(),
+    )]);
+    assert!(matches!(
+        session.run(&invalid),
+        Err(MetalError::IndexOutOfBounds {
+            axis: 0,
+            index: 1,
+            value: -1,
+            dim: 3
+        })
+    ));
+    assert!(mock.calls().is_empty());
+    assert_eq!(session.successful_run_count(), 0);
+
+    let valid = BTreeMap::from([(
+        "indices".into(),
+        TensorData::from_storage([2], Storage::I32(vec![2, 0])).unwrap(),
+    )]);
+    mock.state.lock().unwrap().failures.launch = Some("packed gather retry");
+    assert!(session.run(&valid).is_err());
+    assert_eq!(session.successful_run_count(), 0);
+    mock.clear_failures();
+    mock.clear_calls();
+    let run = session.run(&valid).unwrap();
+    let Storage::F32(values) = run.outputs()[0].storage() else {
+        panic!("packed Metal gather output")
+    };
+    assert_eq!(values, &vec![1.0; 64]);
+    assert_eq!(run.report().transient_h2d_calls, 1);
+    assert_eq!(run.report().retained_d2h_calls, 1);
+    assert_eq!(run.report().kernel_launch_count, 1);
+    assert_eq!(session.successful_run_count(), 1);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("write:"))
+            .count(),
+        1,
+        "retry uploads only indices, never the immutable packed weight"
+    );
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1,
+        "row-gather reads only its requested dense result"
+    );
+    assert!(
+        mock.calls()
+            .iter()
+            .all(|call| !call.starts_with("buffer_create:")),
+        "row-gather run owns no candidate or status allocation"
+    );
+}
+
+#[test]
+fn packed_zero_work_is_resource_free_and_zero_inner_dimension_uses_a_sentinel() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let weight = packed_ones(GgmlType::Q4_0, 2);
+    let capture = CapturedSchedule::capture_quantized_matmul(
+        "activation",
+        NodeId::from_index(100),
+        NodeId::from_index(101),
+        NodeId::from_index(102),
+        Shape::from([0, 32]),
+        weight,
+    )
+    .unwrap();
+    let plan =
+        MetalDeviceSessionPlan::from_capture(capture, Vec::<String>::new(), renderer.clone())
+            .unwrap();
+    assert_eq!(plan.summary().zero_item_count, 1);
+    assert_eq!(plan.summary().planned_slot_count, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device, BTreeMap::new()).unwrap();
+    assert_eq!(session.preparation_report().resident_h2d_calls, 0);
+    let run = session
+        .run(&BTreeMap::from([(
+            "activation".into(),
+            TensorData::new([0, 32], vec![]).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(run.outputs()[0].shape(), &Shape::from([0, 2]));
+    assert_eq!(run.report().kernel_launch_count, 0);
+    assert!(mock.calls().is_empty());
+
+    let empty_weight =
+        QuantizedTensorData::new(GgmlType::Q4_0, Shape::from([2, 0]), vec![]).unwrap();
+    let capture = CapturedSchedule::capture_quantized_matmul(
+        "activation",
+        NodeId::from_index(110),
+        NodeId::from_index(111),
+        NodeId::from_index(112),
+        Shape::from([1, 0]),
+        empty_weight,
+    )
+    .unwrap();
+    let plan =
+        MetalDeviceSessionPlan::from_capture(capture, Vec::<String>::new(), renderer).unwrap();
+    assert_eq!(plan.summary().zero_byte_sentinel_count, 2);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device, BTreeMap::new()).unwrap();
+    assert_eq!(session.preparation_report().resident_h2d_calls, 0);
+    let run = session
+        .run(&BTreeMap::from([(
+            "activation".into(),
+            TensorData::new([1, 0], vec![]).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(run.outputs()[0].storage(), &Storage::F32(vec![0.0; 2]));
+    assert_eq!(run.report().transient_h2d_calls, 0);
+    assert_eq!(run.report().kernel_launch_count, 1);
+}
+
+#[test]
 fn reduction_epilogue_renders_one_metal_kernel() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", Shape::from([2, 3]), DType::F32);
@@ -3111,10 +3523,10 @@ impl Dispatch for MockDispatch {
             .ok_or_else(|| MetalError::InvalidBinding("mock semantics absent".into()))?;
         let transaction = semantics.transaction.as_ref();
         let indexed_movement = semantics.indexed_movement.as_ref();
-        let expected_buffers = semantics.buffers.len()
+        let expected_buffers = semantics.pointer_order.len()
             + usize::from(transaction.is_some() || indexed_movement.is_some());
         if geometry.extent as usize != semantics.extent
-            || geometry.extent_index != semantics.buffers.len()
+            || geometry.extent_index != semantics.pointer_order.len()
             || geometry.local == 0
             || geometry.global < semantics.extent
             || !geometry.global.is_multiple_of(geometry.local)
@@ -3131,11 +3543,18 @@ impl Dispatch for MockDispatch {
                     "virtual zero execution does not admit guarded kernels".into(),
                 ));
             }
-            for (position, (raw, abi)) in buffers.iter().zip(&semantics.buffers).enumerate() {
-                let logical = abi
-                    .elements
-                    .checked_mul(abi.dtype.itemsize())
-                    .ok_or(MetalError::Overflow)?;
+            for (position, (raw, pointer)) in
+                buffers.iter().zip(&semantics.pointer_order).enumerate()
+            {
+                let logical = match pointer {
+                    renderer::MetalPointerAbi::Dense(index) => semantics.buffers[*index]
+                        .elements
+                        .checked_mul(semantics.buffers[*index].dtype.itemsize())
+                        .ok_or(MetalError::Overflow)?,
+                    renderer::MetalPointerAbi::Quantized(index) => {
+                        semantics.quantized_buffers[*index].desc.bytes
+                    }
+                };
                 let physical = if semantics.extent != 0 && logical == 0 {
                     DType::F32.itemsize()
                 } else {
@@ -3154,12 +3573,23 @@ impl Dispatch for MockDispatch {
             return Ok(Self::command(&mut state, owner));
         }
         let mut bindings = KernelBindings::default();
+        let mut quantized = BTreeMap::<u64, QuantizedTensorData>::new();
         let mut outputs = Vec::new();
-        for (position, (raw, abi)) in buffers.iter().zip(&semantics.buffers).enumerate() {
-            let logical = abi
-                .elements
-                .checked_mul(abi.dtype.itemsize())
-                .ok_or(MetalError::Overflow)?;
+        for (position, (raw, pointer)) in buffers.iter().zip(&semantics.pointer_order).enumerate() {
+            let (logical, dense) = match pointer {
+                renderer::MetalPointerAbi::Dense(index) => {
+                    let abi = &semantics.buffers[*index];
+                    (
+                        abi.elements
+                            .checked_mul(abi.dtype.itemsize())
+                            .ok_or(MetalError::Overflow)?,
+                        Some(abi),
+                    )
+                }
+                renderer::MetalPointerAbi::Quantized(index) => {
+                    (semantics.quantized_buffers[*index].desc.bytes, None)
+                }
+            };
             let physical = if semantics.extent != 0 && logical == 0 {
                 DType::F32.itemsize()
             } else {
@@ -3174,6 +3604,28 @@ impl Dispatch for MockDispatch {
                     "mock buffer {position} length mismatch"
                 )));
             }
+            let Some(abi) = dense else {
+                let packed_abi = match pointer {
+                    renderer::MetalPointerAbi::Quantized(index) => {
+                        &semantics.quantized_buffers[*index]
+                    }
+                    renderer::MetalPointerAbi::Dense(_) => unreachable!("dense handled above"),
+                };
+                let value = QuantizedTensorData::new(
+                    packed_abi.desc.ggml_type,
+                    packed_abi.desc.logical_shape.clone(),
+                    bytes[..logical].to_vec(),
+                )
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+                if value.descriptor() != &packed_abi.desc
+                    || quantized.insert(packed_abi.id, value).is_some()
+                {
+                    return Err(MetalError::InvalidBinding(
+                        "mock packed buffer descriptor mismatch".into(),
+                    ));
+                }
+                continue;
+            };
             let value =
                 TensorData::from_le_bytes(abi.source_shape.clone(), abi.dtype, &bytes[..logical])
                     .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
@@ -3313,6 +3765,36 @@ impl Dispatch for MockDispatch {
                 plan.execute()
                     .map_err(|error| MetalError::InvalidBinding(error.to_string()))?,
             ],
+            dispatch::KernelSemanticProgram::QuantizedMatmul(plan) => {
+                let activation = bindings
+                    .get(plan.activation.index() as u64)
+                    .ok_or_else(|| {
+                        MetalError::InvalidBinding("quantized matmul activation absent".into())
+                    })?;
+                let weight = quantized
+                    .get(&(plan.weight.index() as u64))
+                    .ok_or_else(|| {
+                        MetalError::InvalidBinding("quantized matmul weight absent".into())
+                    })?;
+                vec![
+                    plan.execute(activation, weight)
+                        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?,
+                ]
+            }
+            dispatch::KernelSemanticProgram::QuantizedRowGather(plan) => {
+                let indices = bindings.get(plan.indices.index() as u64).ok_or_else(|| {
+                    MetalError::InvalidBinding("quantized gather indices absent".into())
+                })?;
+                let weight = quantized
+                    .get(&(plan.weight.index() as u64))
+                    .ok_or_else(|| {
+                        MetalError::InvalidBinding("quantized gather weight absent".into())
+                    })?;
+                vec![
+                    plan.execute(indices, weight)
+                        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?,
+                ]
+            }
         };
         if outputs.is_empty() || results.len() != outputs.len() {
             return Err(MetalError::InvalidBinding(

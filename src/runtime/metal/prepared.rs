@@ -9,8 +9,8 @@ use std::{cell::Cell, collections::BTreeMap, rc::Rc, time::Duration};
 use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
     StaticBufferAllocation, StaticDeviceAdapter, StaticExecutionReport, StaticHostGather,
-    StaticPlanAdapter, StaticRendered, StaticRenderedBuffer, StaticSchedulePlan, StaticStateLink,
-    bind_rendered_buffers,
+    StaticPlanAdapter, StaticQuantizedBufferPlan, StaticRendered, StaticRenderedBuffer,
+    StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticStateLink, bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -100,6 +100,7 @@ impl StaticPlanAdapter for MetalStaticAdapter {
             (None, None) => self.renderer.render(&item.kernel)?,
         };
         rendered.validate_schedule_bindings(item.ordered_inputs())?;
+        rendered.validate_quantized_schedule_bindings(&item.quantized_input_bindings)?;
         if rendered.transaction.is_some() {
             return Err(MetalError::Unsupported(
                 "guarded Metal prefixes require a staged candidate ABI".into(),
@@ -124,10 +125,28 @@ impl StaticPlanAdapter for MetalStaticAdapter {
             MetalError::InvalidBinding,
             || MetalError::Overflow,
         )?;
+        let quantized_buffers = rendered
+            .quantized_buffers
+            .iter()
+            .map(|abi| StaticRenderedQuantizedBuffer {
+                id: abi.id,
+                desc: abi.desc.clone(),
+            })
+            .collect::<Vec<_>>();
+        let pointer_ids = rendered
+            .pointer_order
+            .iter()
+            .map(|pointer| match pointer {
+                super::renderer::MetalPointerAbi::Dense(index) => buffers[*index].id,
+                super::renderer::MetalPointerAbi::Quantized(index) => quantized_buffers[*index].id,
+            })
+            .collect();
         Ok(StaticRendered {
             cache_key: rendered.cache_key.clone(),
             extent: rendered.extent,
+            pointer_ids,
             buffers,
+            quantized_buffers,
             artifact: rendered,
         })
     }
@@ -180,6 +199,12 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
     fn allocate(&self, request: StaticBufferAllocation) -> Result<Self::Buffer, Self::Error> {
         self.device()?.allocate_static(request)
     }
+    fn allocate_quantized(
+        &self,
+        plan: &StaticQuantizedBufferPlan,
+    ) -> Result<Self::Buffer, Self::Error> {
+        self.device()?.allocate_static_quantized(plan)
+    }
     fn create_queue(&self) -> Result<Self::Queue, Self::Error> {
         self.device()?.create_queue()
     }
@@ -202,7 +227,12 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
                 .launch_transactional(queue, buffers, self.renderer.local_size)?
                 .wait();
         }
-        if let Some(command) = kernel.launch(queue, buffers, self.renderer.local_size)? {
+        let command = if !kernel.rendered().quantized_buffers.is_empty() {
+            kernel.launch_capture_owned_quantized(queue, buffers, self.renderer.local_size)?
+        } else {
+            kernel.launch(queue, buffers, self.renderer.local_size)?
+        };
+        if let Some(command) = command {
             command.collect()?;
         }
         Ok(())
@@ -230,10 +260,13 @@ impl MetalPrefixPlan {
     /// Performs deterministic renderer, schedule, and physical-buffer validation only.
     pub fn plan(items: &[ScheduleItem], renderer: MetalRenderer) -> Result<Self, MetalError> {
         let adapter = MetalStaticAdapter::planner(renderer.clone());
-        Ok(Self {
-            plan: StaticSchedulePlan::build(&adapter, items, None)?,
-            renderer,
-        })
+        let plan = StaticSchedulePlan::build(&adapter, items, None)?;
+        if !plan.quantized_buffers().is_empty() {
+            return Err(MetalError::Unsupported(
+                "packed Metal constants require capture-owned session initialization".into(),
+            ));
+        }
+        Ok(Self { plan, renderer })
     }
 
     pub(crate) fn plan_for_outputs(
@@ -242,10 +275,13 @@ impl MetalPrefixPlan {
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
         let adapter = MetalStaticAdapter::planner(renderer.clone());
-        Ok(Self {
-            plan: StaticSchedulePlan::build(&adapter, items, Some(retained))?,
-            renderer,
-        })
+        let plan = StaticSchedulePlan::build(&adapter, items, Some(retained))?;
+        if !plan.quantized_buffers().is_empty() {
+            return Err(MetalError::Unsupported(
+                "packed Metal constants require capture-owned session initialization".into(),
+            ));
+        }
+        Ok(Self { plan, renderer })
     }
 
     pub(crate) fn plan_with_output_policy(
@@ -310,16 +346,46 @@ impl MetalPrefixPlan {
 
     pub(super) fn allocation_summary(&self) -> Result<(usize, usize, usize), MetalError> {
         let slots = self.plan.allocations().slots();
+        let packed = self.plan.quantized_buffers();
         let bytes = slots.iter().try_fold(0usize, |total, allocation| {
             total
                 .checked_add(allocation.physical_bytes())
                 .ok_or(MetalError::Overflow)
         })?;
+        let allocated_packed_count = packed
+            .values()
+            .filter(|plan| plan.requires_native_handle)
+            .count();
+        let bytes = packed
+            .values()
+            .filter(|plan| plan.requires_native_handle)
+            .try_fold(bytes, |total, plan| {
+                total
+                    .checked_add(if plan.desc.bytes == 0 {
+                        4
+                    } else {
+                        plan.desc.bytes
+                    })
+                    .ok_or(MetalError::Overflow)
+            })?;
         let sentinels = slots
             .iter()
             .filter(|allocation| allocation.bytes == 0 && allocation.requires_native_handle)
             .count();
-        Ok((slots.len(), bytes, sentinels))
+        let packed_sentinels = packed
+            .values()
+            .filter(|plan| plan.requires_native_handle && plan.desc.bytes == 0)
+            .count();
+        Ok((
+            slots
+                .len()
+                .checked_add(allocated_packed_count)
+                .ok_or(MetalError::Overflow)?,
+            bytes,
+            sentinels
+                .checked_add(packed_sentinels)
+                .ok_or(MetalError::Overflow)?,
+        ))
     }
 
     pub(super) fn external_input_ids(&self) -> &[u64] {
@@ -397,8 +463,11 @@ impl PreparedMetalPrefix {
         self,
         values: &BTreeMap<u64, TensorData>,
         resident_ids: &std::collections::BTreeSet<u64>,
+        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
     ) -> Result<(InitializedMetalPrefix, StaticExecutionReport), MetalError> {
-        let (inner, report) = self.inner.initialize_resident(values, resident_ids)?;
+        let (inner, report) =
+            self.inner
+                .initialize_resident_with_quantized(values, resident_ids, quantized)?;
         Ok((InitializedMetalPrefix { inner }, report))
     }
 }

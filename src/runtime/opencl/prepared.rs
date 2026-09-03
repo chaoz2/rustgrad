@@ -59,7 +59,9 @@ impl StaticPlanAdapter for OpenClStaticAdapter {
         Ok(StaticRendered {
             cache_key: rendered.cache_key.clone(),
             extent: rendered.extent,
+            pointer_ids: buffers.iter().map(|buffer| buffer.id).collect(),
             buffers,
+            quantized_buffers: Vec::new(),
             artifact: rendered,
         })
     }

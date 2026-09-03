@@ -20,8 +20,10 @@ pub use buffer::MetalBuffer;
 pub use dispatch::{MetalCapabilities, MetalDeviceInfo};
 pub use prepared::{CapturedMetalPrefix, MetalPrefixPlan, PreparedMetalPrefix};
 pub use renderer::{
-    METAL_ABI_VERSION, METAL_APPEND_STATE_RENDERER_VERSION, METAL_RENDERER_VERSION,
-    MetalAppendStateAbi, MetalBufferAbi, MetalRenderer, RenderedMetal,
+    METAL_ABI_VERSION, METAL_APPEND_STATE_RENDERER_VERSION,
+    METAL_QUANTIZED_MATMUL_RENDERER_VERSION, METAL_QUANTIZED_ROW_GATHER_RENDERER_VERSION,
+    METAL_RENDERER_VERSION, MetalAppendStateAbi, MetalBufferAbi, MetalQuantizedBufferAbi,
+    MetalRenderer, RenderedMetal,
 };
 pub use resource::{
     MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice, MetalDiscovery,

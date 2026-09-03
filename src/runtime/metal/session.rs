@@ -54,14 +54,20 @@ pub struct MetalDeviceSessionSummary {
     pub constant_count: usize,
     /// Exact raw tensor payload bytes of capture-owned constants.
     pub constant_bytes: usize,
+    /// Capture-owned packed GGUF constants admitted without dequantizing.
+    pub quantized_constant_count: usize,
+    /// Exact raw packed GGUF payload bytes declared by the capture. Zero-work
+    /// owners can remain addressless and therefore need no device allocation.
+    pub quantized_constant_bytes: usize,
     /// Declared host payload bytes for resident named inputs.
     pub resident_input_bytes: usize,
     /// Declared host payload bytes for transient named inputs.
     pub transient_input_bytes: usize,
     /// Physical allocation slots in the static memory plan.
     pub planned_slot_count: usize,
-    /// Physical bytes planned for tensor slots, including four-byte native
-    /// sentinels where a nonzero launch needs an address for logical zero bytes.
+    /// Physical bytes planned for dense tensor slots and capture-owned packed
+    /// buffers, including four-byte native sentinels where a nonzero launch
+    /// needs an address for logical zero bytes.
     pub planned_device_bytes: usize,
     /// Private native handles planned for logically empty bindings.
     pub zero_byte_sentinel_count: usize,
@@ -109,7 +115,8 @@ pub struct MetalDevicePreparationReport {
     pub pipeline_cache_hit_count: usize,
     /// New cache entries created by this preparation.
     pub pipeline_cache_miss_count: usize,
-    /// Host API writes, not claimed PCIe transfers.
+    /// Host API writes for immutable named inputs, dense constants, and packed
+    /// constants; not claimed PCIe transfers.
     pub resident_h2d_calls: usize,
     /// Host API write bytes, not claimed PCIe traffic.
     pub resident_h2d_bytes: usize,
@@ -635,6 +642,15 @@ impl MetalDeviceSessionPlan {
                         .checked_add(value.to_le_bytes().map_err(|_| MetalError::Overflow)?.len())
                         .ok_or(MetalError::Overflow)
                 })?;
+        let quantized_constant_bytes =
+            lifetime
+                .quantized_constants()
+                .values()
+                .try_fold(0usize, |total, value| {
+                    total
+                        .checked_add(value.bytes().len())
+                        .ok_or(MetalError::Overflow)
+                })?;
         let resident_input_bytes =
             lifetime
                 .resident_inputs()
@@ -715,6 +731,8 @@ impl MetalDeviceSessionPlan {
             requested_output_count: public_output_count,
             constant_count: lifetime.capture().constants.len(),
             constant_bytes,
+            quantized_constant_count: lifetime.quantized_constants().len(),
+            quantized_constant_bytes,
             resident_input_bytes,
             transient_input_bytes,
             planned_slot_count,
@@ -823,6 +841,15 @@ impl MetalDeviceSessionPlan {
                 .stage_initialized(resident_inputs, initial_state)
         }
         .map_err(MetalError::InvalidBinding)?;
+        let transient_ids = self
+            .lifetime
+            .transient_inputs()
+            .iter()
+            .map(|input| input.desc.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.lifetime
+            .validate_quantized_gathers(&resident_values, &transient_ids)
+            .map_err(metal_quantized_gather_error)?;
         if device.info().capabilities != self.renderer_capabilities {
             return Err(MetalError::InvalidBinding(
                 "Metal session renderer/device capability identity mismatch".into(),
@@ -864,8 +891,11 @@ impl MetalDeviceSessionPlan {
         let native_prepare_wall_time = native_prepare_start.elapsed();
         let cache_miss_pipeline_build_wall_time = prepared.cache_miss_pipeline_build_wall_time();
         let initialization_upload_start = Instant::now();
-        let (prepared, resident_transfer) =
-            prepared.initialize_resident(&resident_values, &self.device_resident_ids)?;
+        let (prepared, resident_transfer) = prepared.initialize_resident(
+            &resident_values,
+            &self.device_resident_ids,
+            self.lifetime.quantized_constants(),
+        )?;
         let initialization_upload_wall_time = initialization_upload_start.elapsed();
         let initial_state_h2d_calls = self
             .lifetime
@@ -1027,6 +1057,9 @@ impl MetalDeviceSession {
             .lifetime
             .stage_transient(transient_inputs)
             .map_err(MetalError::InvalidBinding)?;
+        self.lifetime
+            .validate_quantized_gathers(&values, self.lifetime.resident_ids())
+            .map_err(metal_quantized_gather_error)?;
         let execute_start = Instant::now();
         let transfer = match self.state_policy {
             MetalSessionStatePolicy::None => self.prepared.execute(&mut values)?,
@@ -1123,4 +1156,24 @@ struct CommittedState {
     pair_count: usize,
     bytes: usize,
     work_items: usize,
+}
+
+fn metal_quantized_gather_error(
+    error: crate::runtime::static_schedule::StaticQuantizedGatherError,
+) -> MetalError {
+    match error {
+        crate::runtime::static_schedule::StaticQuantizedGatherError::Invalid(reason) => {
+            MetalError::InvalidBinding(reason)
+        }
+        crate::runtime::static_schedule::StaticQuantizedGatherError::IndexOutOfBounds {
+            position,
+            value,
+            rows,
+        } => MetalError::IndexOutOfBounds {
+            axis: 0,
+            index: position,
+            value,
+            dim: rows,
+        },
+    }
 }
