@@ -1,11 +1,314 @@
 use super::renderer::{
-    METAL_INDEXED_MOVEMENT_RENDERER_VERSION, METAL_PORTABLE_BITCAST_RENDERER_VERSION,
-    METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+    METAL_HOST_GATHER_RENDERER_VERSION, METAL_INDEXED_MOVEMENT_RENDERER_VERSION,
+    METAL_PORTABLE_BITCAST_RENDERER_VERSION, METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
     METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
     METAL_PORTABLE_SORT_RENDERER_VERSION, METAL_PORTABLE_THREEFRY_RENDERER_VERSION,
     METAL_RAW_COPY_RENDERER_VERSION, METAL_RENDERER_VERSION,
     METAL_STATIC_POSITION_RENDERER_VERSION,
 };
+
+#[test]
+fn captured_scalar_host_gather_is_direct_atomic_and_fail_closed() {
+    let mut graph = Graph::new();
+    let table = graph.input_dtype("table", [4, 3], DType::F32);
+    let token = graph.input_dtype("token", [], DType::I32);
+    let token_row = graph.reshape(token, [1, 1]).unwrap();
+    let indices = graph.expand(token_row, [1, 3]).unwrap();
+    let gathered = graph.gather(table, indices, 0).unwrap();
+    let output = graph.square(gathered).unwrap();
+    let ordinary =
+        CapturedInference::from_module_graph(&IdentityModule, &graph, &[output]).unwrap();
+    let token_desc = ordinary
+        .capture()
+        .inputs
+        .iter()
+        .find(|input| input.node == token)
+        .unwrap()
+        .desc
+        .clone();
+    let frozen_capture = ordinary.capture().to_bytes().unwrap();
+    let ordinary_identity = ordinary.deployment_identity();
+    let inference = ordinary
+        .with_authenticated_host_gathers(&["token"])
+        .unwrap();
+    assert_eq!(inference.capture().to_bytes().unwrap(), frozen_capture);
+    assert_ne!(inference.deployment_identity(), ordinary_identity);
+
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let gather_item = inference
+        .capture()
+        .items
+        .iter()
+        .find(|item| item.node == gathered)
+        .unwrap();
+    let ordinary_rendered = renderer.render(&gather_item.kernel).unwrap();
+    assert!(ordinary_rendered.indexed_movement().is_some());
+    assert!(ordinary_rendered.source.contains("rg_status"));
+    assert!(matches!(
+        renderer.render_host_gather(
+            &gather_item.kernel,
+            &crate::runtime::static_schedule::StaticHostGather {
+                input: token.index() as u64,
+                input_desc: token_desc,
+                index: indices.index() as u64,
+                output: gathered.index() as u64,
+                axis: 0,
+                axis_extent: 5,
+                index_elements: 3,
+            },
+        ),
+        Err(MetalError::InvalidBinding(_))
+    ));
+
+    let (captured, _, _, links, _) = inference.clone().into_parts();
+    let mut forged = crate::runtime::static_schedule::StaticHostGather {
+        input: links[0].input.desc.id,
+        input_desc: links[0].input.desc.clone(),
+        index: links[0].index,
+        output: links[0].output,
+        axis: links[0].axis,
+        axis_extent: links[0].axis_extent,
+        index_elements: links[0].index_elements,
+    };
+    forged.input = table.index() as u64;
+    assert!(matches!(
+        MetalPrefixPlan::plan_with_output_policy(
+            &captured.items,
+            &[output.index() as u64],
+            &[output.index() as u64],
+            &[],
+            &[forged],
+            renderer.clone(),
+        ),
+        Err(MetalError::InvalidBinding(_))
+    ));
+
+    let plan = MetalInferencePlan::new(inference, renderer).unwrap();
+    let direct = plan
+        .rendered_items()
+        .find(|rendered| rendered.source.contains(METAL_HOST_GATHER_RENDERER_VERSION))
+        .expect("authenticated Gather renderer");
+    assert!(direct.indexed_movement().is_none());
+    assert!(direct.transaction.is_none());
+    assert!(!direct.source.contains("rg_status"));
+    assert_ne!(direct.cache_key, ordinary_rendered.cache_key);
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut session = plan.prepare(device).unwrap();
+    let table_value = TensorData::new(
+        [4, 3],
+        vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
+    )
+    .unwrap();
+    let invocation = |selected: i32| {
+        BTreeMap::from([
+            ("table".into(), table_value.clone()),
+            (
+                "token".into(),
+                TensorData::from_scalars([], DType::I32, [Scalar::I(i64::from(selected))]).unwrap(),
+            ),
+        ])
+    };
+    for invalid in [-1, 4] {
+        mock.clear_calls();
+        assert!(matches!(
+            session.run(&invocation(invalid)),
+            Err(MetalError::IndexOutOfBounds {
+                axis: 0,
+                index: 0,
+                value,
+                dim: 4,
+            }) if value == invalid
+        ));
+        assert!(mock.calls().is_empty());
+        assert_eq!(session.successful_run_count(), 0);
+    }
+    for stage in ["write", "launch", "wait", "read"] {
+        mock.clear_calls();
+        let successful = session.successful_run_count();
+        {
+            let mut state = mock.state.lock().unwrap();
+            match stage {
+                "write" => state.failures.write = Some("host Gather transient upload"),
+                "launch" => state.failures.launch = Some("host Gather launch"),
+                "wait" => state.failures.wait = Some("host Gather wait"),
+                "read" => state.failures.read = Some("host Gather final read"),
+                _ => unreachable!(),
+            }
+        }
+        assert!(session.run(&invocation(2)).is_err());
+        assert_eq!(session.successful_run_count(), successful);
+        mock.clear_failures();
+        mock.clear_calls();
+        let run = session.run(&invocation(2)).unwrap();
+        assert_eq!(
+            run.outputs(),
+            &[TensorData::new([1, 3], vec![49.0, 64.0, 81.0]).unwrap()]
+        );
+        assert_eq!(session.successful_run_count(), successful + 1);
+        assert_eq!(run.report().retained_d2h_calls, 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.starts_with("read:"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn captured_scalar_host_gather_rejects_ambiguous_transformed_and_public_indices() {
+    let capture = |graph: &Graph, output| {
+        CapturedInference::from_module_graph(&IdentityModule, graph, &[output]).unwrap()
+    };
+
+    let mut wrong_name = Graph::new();
+    let table = wrong_name.input_dtype("table", [3, 2], DType::F32);
+    let token = wrong_name.input_dtype("token", [], DType::I32);
+    let row = wrong_name.reshape(token, [1, 1]).unwrap();
+    let indices = wrong_name.expand(row, [1, 2]).unwrap();
+    let gathered = wrong_name.gather(table, indices, 0).unwrap();
+    let output = wrong_name.square(gathered).unwrap();
+    assert!(matches!(
+        capture(&wrong_name, output).with_authenticated_host_gathers(&["missing"]),
+        Err(crate::CapturedInferenceError::Binding(reason))
+            if reason.contains("0 authenticated internal owners")
+    ));
+
+    let mut ambiguous = Graph::new();
+    let table = ambiguous.input_dtype("table", [3, 2], DType::F32);
+    let token = ambiguous.input_dtype("token", [], DType::I32);
+    let row = ambiguous.reshape(token, [1, 1]).unwrap();
+    let indices = ambiguous.expand(row, [1, 2]).unwrap();
+    let first = ambiguous.gather(table, indices, 0).unwrap();
+    let second = ambiguous.gather(table, indices, 0).unwrap();
+    let output = ambiguous.add(first, second).unwrap();
+    assert!(matches!(
+        capture(&ambiguous, output).with_authenticated_host_gathers(&["token"]),
+        Err(crate::CapturedInferenceError::Binding(reason))
+            if reason.contains("2 authenticated internal owners")
+    ));
+
+    let mut transformed = Graph::new();
+    let table = transformed.input_dtype("table", [3, 2], DType::F32);
+    let token = transformed.input_dtype("token", [], DType::I32);
+    let one = transformed.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+    let changed = transformed.add(token, one).unwrap();
+    let row = transformed.reshape(changed, [1, 1]).unwrap();
+    let indices = transformed.expand(row, [1, 2]).unwrap();
+    let gathered = transformed.gather(table, indices, 0).unwrap();
+    let output = transformed.square(gathered).unwrap();
+    assert!(matches!(
+        capture(&transformed, output).with_authenticated_host_gathers(&["token"]),
+        Err(crate::CapturedInferenceError::Binding(reason))
+            if reason.contains("0 authenticated internal owners")
+    ));
+
+    let mut multiple = Graph::new();
+    let table = multiple.input_dtype("table", [3, 2], DType::F32);
+    let token = multiple.input_dtype("token", [2], DType::I32);
+    let indices = multiple.reshape(token, [1, 2]).unwrap();
+    let gathered = multiple.gather(table, indices, 0).unwrap();
+    let output = multiple.square(gathered).unwrap();
+    assert!(matches!(
+        capture(&multiple, output).with_authenticated_host_gathers(&["token"]),
+        Err(crate::CapturedInferenceError::Binding(reason))
+            if reason.contains("one dense scalar I32 transient")
+    ));
+
+    let mut wrong_dtype = Graph::new();
+    let table = wrong_dtype.input_dtype("table", [3, 2], DType::F32);
+    let token = wrong_dtype.input_dtype("token", [], DType::I64);
+    let row = wrong_dtype.reshape(token, [1, 1]).unwrap();
+    let indices = wrong_dtype.expand(row, [1, 2]).unwrap();
+    let gathered = wrong_dtype.gather(table, indices, 0).unwrap();
+    let output = wrong_dtype.square(gathered).unwrap();
+    assert!(matches!(
+        capture(&wrong_dtype, output).with_authenticated_host_gathers(&["token"]),
+        Err(crate::CapturedInferenceError::Binding(reason))
+            if reason.contains("one dense scalar I32 transient")
+                || reason.contains("0 authenticated internal owners")
+    ));
+
+    let position = Parameter::new(
+        TensorData::from_scalars([], DType::I32, [Scalar::I(1)]).unwrap(),
+        false,
+    );
+    let resident_name = position.snapshot().unwrap().input_name;
+    let module = DirectParameterModule(position.clone());
+    let mut resident = Graph::new();
+    let table = resident.input_dtype("table", [3, 2], DType::F32);
+    let token = position.bind(&mut resident).unwrap();
+    let row = resident.reshape(token, [1, 1]).unwrap();
+    let indices = resident.expand(row, [1, 2]).unwrap();
+    let gathered = resident.gather(table, indices, 0).unwrap();
+    let output = resident.square(gathered).unwrap();
+    assert!(matches!(
+        CapturedInference::from_module_graph(&module, &resident, &[output])
+            .unwrap()
+            .with_authenticated_host_gathers(&[resident_name.as_str()]),
+        Err(crate::CapturedInferenceError::Binding(reason))
+            if reason.contains("0 authenticated internal owners")
+    ));
+
+    let mut public = Graph::new();
+    let table = public.input_dtype("table", [3, 2], DType::F32);
+    let token = public.input_dtype("token", [], DType::I32);
+    let row = public.reshape(token, [1, 1]).unwrap();
+    let indices = public.expand(row, [1, 2]).unwrap();
+    let gathered = public.gather(table, indices, 0).unwrap();
+    let output = public.square(gathered).unwrap();
+    let schedule = crate::schedule_many(&public, &[output, token]).unwrap();
+    let captured = CapturedSchedule::capture(&public, &schedule, &[output, token]).unwrap();
+    let inference =
+        CapturedInference::from_module_graph(&IdentityModule, &public, &[output, token]).unwrap();
+    assert_eq!(inference.capture().identity, captured.identity);
+    assert!(matches!(
+        inference.with_authenticated_host_gathers(&["token"]),
+        Err(crate::CapturedInferenceError::Binding(_))
+    ));
+}
+
+#[test]
+fn captured_scalar_host_gather_zero_domain_is_addressless() {
+    let mut graph = Graph::new();
+    let table = graph.input_dtype("table", [0, 3], DType::F32);
+    let token = graph.input_dtype("token", [], DType::I32);
+    let row = graph.reshape(token, [1, 1]).unwrap();
+    let indices = graph.expand(row, [0, 3]).unwrap();
+    let gathered = graph.gather(table, indices, 0).unwrap();
+    let output = graph.square(gathered).unwrap();
+    let inference = CapturedInference::from_module_graph(&IdentityModule, &graph, &[output])
+        .unwrap()
+        .with_authenticated_host_gathers(&["token"])
+        .unwrap();
+    let plan =
+        MetalInferencePlan::new(inference, MetalRenderer::new(8, capabilities()).unwrap()).unwrap();
+    assert_eq!(plan.summary().nonzero_item_count, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device).unwrap();
+    assert!(mock.calls().is_empty());
+    let run = session
+        .run(&BTreeMap::from([
+            (
+                "table".into(),
+                TensorData::from_storage([0, 3], Storage::F32(Vec::new())).unwrap(),
+            ),
+            (
+                "token".into(),
+                TensorData::from_scalars([], DType::I32, [Scalar::I(-1)]).unwrap(),
+            ),
+        ]))
+        .unwrap();
+    assert!(run.outputs()[0].is_empty());
+    assert!(mock.calls().is_empty());
+}
 
 #[test]
 fn predicated_projected_metal_preserves_raw_lanes_and_guards_addressless_reads() {

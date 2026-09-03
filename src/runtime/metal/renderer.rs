@@ -21,6 +21,7 @@ pub const METAL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-metal-portab
 pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-dense-materialization-v1";
 pub const METAL_INDEXED_MOVEMENT_RENDERER_VERSION: &str = "rustgrad-metal-indexed-movement-v1";
+pub const METAL_HOST_GATHER_RENDERER_VERSION: &str = "rustgrad-metal-host-gather-v1";
 pub const METAL_APPEND_STATE_RENDERER_VERSION: &str = "rustgrad-metal-append-state-v1";
 pub const METAL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-metal-static-position-v1";
 pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
@@ -720,6 +721,14 @@ impl MetalRenderer {
                 root.clone(),
             ))),
         })
+    }
+
+    pub(crate) fn render_host_gather(
+        &self,
+        root: &UOp,
+        link: &crate::runtime::static_schedule::StaticHostGather,
+    ) -> Result<RenderedMetal, MetalError> {
+        render_host_gather(self, root, link)
     }
 }
 
@@ -1673,6 +1682,113 @@ fn render_indexed_movement(
     })
 }
 
+fn render_host_gather(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    link: &crate::runtime::static_schedule::StaticHostGather,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
+        return Err(MetalError::InvalidBinding(
+            "host Gather owner is not a movement plan".into(),
+        ));
+    };
+    let portable = crate::movement_plan::PortableIndexedMovement::new(plan)
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    if portable.scatter_add().is_some()
+        || plan.output.index() as u64 != link.output
+        || portable.inputs()[portable.index_abi()].node.index() as u64 != link.index
+        || portable.axis() != link.axis
+        || portable.axis_extent() != link.axis_extent
+        || portable.index_elements() != link.index_elements
+    {
+        return Err(MetalError::InvalidBinding(
+            "host Gather movement geometry mismatch".into(),
+        ));
+    }
+    if portable.output_elements() > u32::MAX as usize {
+        return Err(MetalError::Unsupported(
+            "Metal host Gather output exceeds uint thread indexing".into(),
+        ));
+    }
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| {
+            Ok(MetalBufferAbi {
+                id: input.node.index() as u64,
+                dtype: input.dtype,
+                source_shape: input.shape.clone(),
+                elements: input.shape.numel().map_err(|_| MetalError::Overflow)?,
+                mutable: false,
+                view: None,
+            })
+        })
+        .collect::<Result<Vec<_>, MetalError>>()?;
+    let schedule_inputs = buffers.clone();
+    let output_position = buffers.len();
+    buffers.push(MetalBufferAbi {
+        id: link.output,
+        dtype: DType::F32,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.output_elements(),
+        mutable: true,
+        view: None,
+    });
+    let entry = "rg_metal_host_gather_f32_i32".to_owned();
+    let mut lines = vec![
+        format!("// {METAL_HOST_GATHER_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        format!("kernel void {entry}("),
+    ];
+    for (position, input) in portable.inputs().iter().enumerate() {
+        lines.push(format!(
+            "    device const {}* b{position} [[buffer({position})]],",
+            metal_storage_type(input.dtype)
+        ));
+    }
+    lines.extend([
+        format!("    device float* b{output_position} [[buffer({output_position})]],"),
+        format!("    constant ulong& extent [[buffer({})]],", buffers.len()),
+        "    uint rg_gid [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = (ulong)rg_gid;".into(),
+        "  if (gid >= extent) return;".into(),
+    ]);
+    if portable.output_elements() != 0 {
+        emit_metal_trusted_gather_body(&portable, output_position, &mut lines);
+    }
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_HOST_GATHER_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.plan(),
+        link,
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.output_elements(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        indexed_movement: None,
+        append_state: None,
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
 fn indexed_coordinate(linear: &str, divisor: usize, dimension: usize) -> String {
     format!("(({linear} / (ulong){divisor}ul) % (ulong){dimension}ul)")
 }
@@ -1691,6 +1807,32 @@ fn emit_metal_gather_body(
     lines.push("    atomic_fetch_min_explicit(rg_status, rg_gid, memory_order_relaxed);".into());
     lines.push("    return;".into());
     lines.push("  }".into());
+    let source = portable
+        .axes()
+        .iter()
+        .map(|axis| {
+            let coordinate = if axis.axis == portable.axis() {
+                "(ulong)rg_selected".into()
+            } else {
+                indexed_coordinate("gid", axis.index_divisor, axis.index_dimension)
+            };
+            format!("({coordinate} * (ulong){}ul)", axis.data_stride)
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    lines.push(format!(
+        "  b{output_position}[gid] = b0[{}];",
+        if source.is_empty() { "0ul" } else { &source }
+    ));
+}
+
+fn emit_metal_trusted_gather_body(
+    portable: &crate::movement_plan::PortableIndexedMovement<'_>,
+    output_position: usize,
+    lines: &mut Vec<String>,
+) {
+    let index = portable.index_abi();
+    lines.push(format!("  const int rg_selected = b{index}[gid];"));
     let source = portable
         .axes()
         .iter()

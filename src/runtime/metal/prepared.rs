@@ -8,8 +8,8 @@ use std::{collections::BTreeMap, rc::Rc};
 
 use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
-    StaticBufferAllocation, StaticDeviceAdapter, StaticExecutionReport, StaticPlanAdapter,
-    StaticRendered, StaticRenderedBuffer, StaticSchedulePlan, StaticStateLink,
+    StaticBufferAllocation, StaticDeviceAdapter, StaticExecutionReport, StaticHostGather,
+    StaticPlanAdapter, StaticRendered, StaticRenderedBuffer, StaticSchedulePlan, StaticStateLink,
     bind_rendered_buffers,
 };
 
@@ -18,6 +18,7 @@ struct MetalStaticAdapter {
     renderer: MetalRenderer,
     cache: Option<MetalCache>,
     append_state: BTreeMap<u64, StaticAppendStateLink>,
+    host_gathers: BTreeMap<u64, StaticHostGather>,
 }
 
 impl MetalStaticAdapter {
@@ -27,6 +28,7 @@ impl MetalStaticAdapter {
             renderer,
             cache: None,
             append_state: BTreeMap::new(),
+            host_gathers: BTreeMap::new(),
         }
     }
 
@@ -37,6 +39,7 @@ impl MetalStaticAdapter {
             renderer,
             cache: Some(cache),
             append_state: BTreeMap::new(),
+            host_gathers: BTreeMap::new(),
         }
     }
 
@@ -45,6 +48,21 @@ impl MetalStaticAdapter {
             if self.append_state.insert(link.output, *link).is_some() {
                 return Err(MetalError::InvalidBinding(
                     "duplicate Metal append-state output".into(),
+                ));
+            }
+        }
+        Ok(self)
+    }
+
+    fn with_host_gathers(mut self, links: &[StaticHostGather]) -> Result<Self, MetalError> {
+        for link in links {
+            if self
+                .host_gathers
+                .insert(link.output, link.clone())
+                .is_some()
+            {
+                return Err(MetalError::InvalidBinding(
+                    "duplicate Metal host Gather output".into(),
                 ));
             }
         }
@@ -65,9 +83,18 @@ impl StaticPlanAdapter for MetalStaticAdapter {
     type Rendered = super::RenderedMetal;
 
     fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
-        let rendered = match self.append_state.get(&item.outputs.primary().id) {
-            Some(link) => self.renderer.render_append_state(&item.kernel, link)?,
-            None => self.renderer.render(&item.kernel)?,
+        let rendered = match (
+            self.append_state.get(&item.outputs.primary().id),
+            self.host_gathers.get(&item.outputs.primary().id),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(MetalError::InvalidBinding(
+                    "Metal item cannot mix append state and host Gather policy".into(),
+                ));
+            }
+            (Some(link), None) => self.renderer.render_append_state(&item.kernel, link)?,
+            (None, Some(link)) => self.renderer.render_host_gather(&item.kernel, link)?,
+            (None, None) => self.renderer.render(&item.kernel)?,
         };
         rendered.validate_schedule_bindings(item.ordered_inputs())?;
         if rendered.transaction.is_some() {
@@ -110,6 +137,15 @@ impl StaticPlanAdapter for MetalStaticAdapter {
     }
     fn overflow() -> Self::Error {
         MetalError::Overflow
+    }
+
+    fn index_out_of_bounds(axis: usize, index: usize, value: i32, dim: usize) -> Self::Error {
+        MetalError::IndexOutOfBounds {
+            axis,
+            index,
+            value,
+            dim,
+        }
     }
 }
 
@@ -206,9 +242,11 @@ impl MetalPrefixPlan {
         host_outputs: &[u64],
         protected_outputs: &[u64],
         state_links: &[StaticStateLink],
+        host_gathers: &[StaticHostGather],
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
-        let adapter = MetalStaticAdapter::planner(renderer.clone());
+        let adapter =
+            MetalStaticAdapter::planner(renderer.clone()).with_host_gathers(host_gathers)?;
         Ok(Self {
             plan: StaticSchedulePlan::build_with_output_policy(
                 &adapter,
@@ -216,6 +254,7 @@ impl MetalPrefixPlan {
                 host_outputs,
                 protected_outputs,
                 state_links,
+                host_gathers,
             )?,
             renderer,
         })
@@ -226,10 +265,12 @@ impl MetalPrefixPlan {
         host_outputs: &[u64],
         protected_outputs: &[u64],
         append_state_links: &[StaticAppendStateLink],
+        host_gathers: &[StaticHostGather],
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
-        let adapter =
-            MetalStaticAdapter::planner(renderer.clone()).with_append_state(append_state_links)?;
+        let adapter = MetalStaticAdapter::planner(renderer.clone())
+            .with_append_state(append_state_links)?
+            .with_host_gathers(host_gathers)?;
         Ok(Self {
             plan: StaticSchedulePlan::build_with_append_policy(
                 &adapter,
@@ -237,6 +278,7 @@ impl MetalPrefixPlan {
                 host_outputs,
                 protected_outputs,
                 append_state_links,
+                host_gathers,
             )?,
             renderer,
         })
@@ -314,10 +356,12 @@ impl PreparedMetalPrefix {
 
     pub fn from_plan(device: MetalDevice, plan: MetalPrefixPlan) -> Result<Self, MetalError> {
         let append_state = plan.plan.append_state_links().to_vec();
+        let host_gathers = plan.plan.host_gathers().to_vec();
         Ok(Self {
             inner: PreparedStaticSchedule::from_plan(
                 MetalStaticAdapter::runtime(device, plan.renderer)
-                    .with_append_state(&append_state)?,
+                    .with_append_state(&append_state)?
+                    .with_host_gathers(&host_gathers)?,
                 plan.plan,
             )?,
         })

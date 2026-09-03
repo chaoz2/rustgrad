@@ -20,7 +20,21 @@ pub struct CapturedInference {
     execution_plan: ExecutionPlanSummary,
     resident_bindings: BTreeMap<String, TensorData>,
     transient_inputs: Vec<ReplayInput>,
+    host_gathers: Vec<CapturedHostGather>,
     identity: u64,
+}
+
+/// Capture-authenticated permission for one internal Gather to omit its
+/// device status path after its scalar host index has been checked.  This is
+/// runtime policy, not part of the captured schedule or graph operation ABI.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CapturedHostGather {
+    pub(crate) input: ReplayInput,
+    pub(crate) index: u64,
+    pub(crate) output: u64,
+    pub(crate) axis: usize,
+    pub(crate) axis_extent: usize,
+    pub(crate) index_elements: usize,
 }
 
 /// One fixed-shape recurrent value whose produced output becomes the input of
@@ -206,8 +220,144 @@ impl CapturedInference {
             execution_plan,
             resident_bindings,
             transient_inputs,
+            host_gathers: Vec::new(),
             identity,
         })
+    }
+
+    /// Adds a private, capture-derived status-free Gather policy. Every name
+    /// must denote one dense scalar I32 transient whose only admitted Gather
+    /// lineage is a value-preserving Reshape/Expand chain. The Gather itself
+    /// must be an internal single-output raw movement owner.
+    pub(crate) fn with_authenticated_host_gathers(
+        mut self,
+        names: &[&str],
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        if names.is_empty() {
+            return Ok(self);
+        }
+        if !self.host_gathers.is_empty() {
+            return Err(CapturedInferenceError::Binding(
+                "host Gather policy is already authenticated".into(),
+            ));
+        }
+        let mut requested_names = names.iter().copied().collect::<BTreeSet<_>>();
+        if requested_names.len() != names.len() {
+            return Err(CapturedInferenceError::Binding(
+                "host Gather transient names must be unique".into(),
+            ));
+        }
+        let public = self
+            .capture
+            .requested
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let passthroughs = self
+            .capture
+            .requested_passthroughs
+            .iter()
+            .map(|alias| alias.requested.index() as u64)
+            .collect::<BTreeSet<_>>();
+        let mut matches = BTreeMap::<String, Vec<CapturedHostGather>>::new();
+        for captured in self
+            .transient_inputs
+            .iter()
+            .filter(|input| requested_names.contains(input.name.as_str()))
+        {
+            let name = &captured.name;
+            let source = captured.node;
+            if public.contains(&(source.index() as u64))
+                || passthroughs.contains(&(source.index() as u64))
+            {
+                return Err(CapturedInferenceError::Binding(format!(
+                    "host Gather input {name} cannot be a public output"
+                )));
+            }
+            if captured.desc.id != source.index() as u64
+                || captured.desc.dtype != DType::I32
+                || captured
+                    .desc
+                    .shape
+                    .numel()
+                    .map_err(CapturedInferenceError::State)?
+                    != 1
+                || captured.desc.bytes != DType::I32.itemsize()
+                || !captured.desc.read_only
+            {
+                return Err(CapturedInferenceError::Binding(format!(
+                    "host Gather input {name} must be one dense scalar I32 transient"
+                )));
+            }
+            for item in &self.capture.items {
+                let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+                    item.kernel.operation()
+                else {
+                    continue;
+                };
+                let crate::MovementKernelKind::Gather { index, axis, .. } = &plan.kind else {
+                    continue;
+                };
+                if item.outputs.len() != 1
+                    || public.contains(&item.outputs.primary().id)
+                    || passthroughs.contains(&item.outputs.primary().id)
+                {
+                    continue;
+                }
+                let portable =
+                    crate::movement_plan::PortableIndexedMovement::new(plan).and_then(|portable| {
+                        portable.validate_schedule_bindings(item.ordered_inputs())?;
+                        Ok(portable)
+                    });
+                let Ok(portable) = portable else {
+                    continue;
+                };
+                let link = CapturedHostGather {
+                    input: captured.clone(),
+                    index: index.node.index() as u64,
+                    output: item.outputs.primary().id,
+                    axis: *axis,
+                    axis_extent: portable.axis_extent(),
+                    index_elements: portable.index_elements(),
+                };
+                let static_link = crate::runtime::static_schedule::StaticHostGather {
+                    input: link.input.desc.id,
+                    input_desc: link.input.desc.clone(),
+                    index: link.index,
+                    output: link.output,
+                    axis: link.axis,
+                    axis_extent: link.axis_extent,
+                    index_elements: link.index_elements,
+                };
+                if crate::runtime::static_schedule::authenticate_host_gather_lineage(
+                    &self.capture.items,
+                    &static_link,
+                )
+                .is_ok()
+                {
+                    matches.entry(name.clone()).or_default().push(link);
+                }
+            }
+        }
+        let mut host_gathers = Vec::with_capacity(names.len());
+        while let Some(name) = requested_names.pop_first() {
+            let candidates = matches.remove(name).unwrap_or_default();
+            if candidates.len() != 1 {
+                return Err(CapturedInferenceError::Binding(format!(
+                    "host Gather input {name} has {} authenticated internal owners",
+                    candidates.len()
+                )));
+            }
+            host_gathers.push(candidates.into_iter().next().expect("one candidate"));
+        }
+        host_gathers.sort_by_key(|link| link.output);
+        let mut hasher = DefaultHasher::new();
+        "rustgrad-captured-host-gather-v1".hash(&mut hasher);
+        self.identity.hash(&mut hasher);
+        host_gathers.hash(&mut hasher);
+        self.identity = hasher.finish();
+        self.host_gathers = host_gathers;
+        Ok(self)
     }
 
     /// Returns the deterministic capture plus resident-payload identity.
@@ -242,12 +392,14 @@ impl CapturedInference {
         CapturedSchedule,
         ExecutionPlanSummary,
         BTreeMap<String, TensorData>,
+        Vec<CapturedHostGather>,
         u64,
     ) {
         (
             self.capture,
             self.execution_plan,
             self.resident_bindings,
+            self.host_gathers,
             self.identity,
         )
     }
@@ -414,6 +566,26 @@ impl CapturedAppendStateInference {
         state_links: &[InferenceAppendStateLink],
         initial_state: BTreeMap<String, TensorData>,
     ) -> std::result::Result<Self, CapturedInferenceError> {
+        Self::from_graph_with_capture(
+            graph,
+            requested,
+            state_links,
+            initial_state,
+            &[],
+            |combined| CapturedInference::from_module_graph(module, graph, combined),
+        )
+    }
+
+    fn from_graph_with_capture(
+        graph: &Graph,
+        requested: &[NodeId],
+        state_links: &[InferenceAppendStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+        host_gathers: &[&str],
+        capture: impl FnOnce(
+            &[NodeId],
+        ) -> std::result::Result<CapturedInference, CapturedInferenceError>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
         if state_links.is_empty() {
             return Err(CapturedInferenceError::Binding(
                 "append-state inference requires at least one state link".into(),
@@ -441,7 +613,7 @@ impl CapturedAppendStateInference {
             }
             combined.push(link.output);
         }
-        let mut inference = CapturedInference::from_module_graph(module, graph, &combined)?;
+        let mut inference = capture(&combined)?.with_authenticated_host_gathers(host_gathers)?;
         if inference
             .capture
             .requested_passthroughs
@@ -690,24 +862,12 @@ impl CapturedAppendStateInference {
             .transient_inputs
             .retain(|input| !state_links.iter().any(|state| state.input == input.node));
 
-        let mut hasher = DefaultHasher::new();
-        "rustgrad-captured-append-state-inference-v1".hash(&mut hasher);
-        inference.identity.hash(&mut hasher);
-        requested.len().hash(&mut hasher);
-        for state in &states {
-            state.link.hash(&mut hasher);
-            state.input.hash(&mut hasher);
-            state.index.hash(&mut hasher);
-            state.updates.hash(&mut hasher);
-            state.output.hash(&mut hasher);
-            state.axis_extent.hash(&mut hasher);
-            state.row_elements.hash(&mut hasher);
-            initial_state[&state.input.name]
-                .to_le_bytes()
-                .map_err(CapturedInferenceError::State)?
-                .hash(&mut hasher);
-        }
-        let identity = hasher.finish();
+        let identity = captured_append_state_identity(
+            inference.identity,
+            requested.len(),
+            &states,
+            &initial_state,
+        )?;
         Ok(Self {
             inference,
             public_output_count: requested.len(),
@@ -766,6 +926,32 @@ impl CapturedAppendStateInference {
             self.identity,
         )
     }
+}
+
+fn captured_append_state_identity(
+    inference_identity: u64,
+    public_output_count: usize,
+    states: &[CapturedInferenceAppendState],
+    initial_state: &BTreeMap<String, TensorData>,
+) -> std::result::Result<u64, CapturedInferenceError> {
+    let mut hasher = DefaultHasher::new();
+    "rustgrad-captured-append-state-inference-v1".hash(&mut hasher);
+    inference_identity.hash(&mut hasher);
+    public_output_count.hash(&mut hasher);
+    for state in states {
+        state.link.hash(&mut hasher);
+        state.input.hash(&mut hasher);
+        state.index.hash(&mut hasher);
+        state.updates.hash(&mut hasher);
+        state.output.hash(&mut hasher);
+        state.axis_extent.hash(&mut hasher);
+        state.row_elements.hash(&mut hasher);
+        initial_state[&state.input.name]
+            .to_le_bytes()
+            .map_err(CapturedInferenceError::State)?
+            .hash(&mut hasher);
+    }
+    Ok(hasher.finish())
 }
 
 fn captured_owned_input(
@@ -1259,6 +1445,101 @@ mod tests {
         model.push(ReLU::new());
         model.push(second);
         (model, output_weight)
+    }
+
+    #[test]
+    fn host_gather_policy_authenticates_only_captured_affine_provenance() {
+        let module = Sequential::default();
+        let mut graph = Graph::new();
+        let table = graph.input_dtype("table", [4, 3], DType::F32);
+        let token = graph.input_dtype("token", [], DType::I32);
+        let row = graph.reshape(token, [1, 1]).unwrap();
+        let indices = graph.expand(row, [1, 3]).unwrap();
+        let gathered = graph.gather(table, indices, 0).unwrap();
+        let output = graph.square(gathered).unwrap();
+        let inference = CapturedInference::from_module_graph(&module, &graph, &[output]).unwrap();
+        let captured_token = inference
+            .transient_inputs()
+            .iter()
+            .find(|input| input.name == "token")
+            .unwrap();
+        let index_producer = inference
+            .capture()
+            .items
+            .iter()
+            .find(|item| item.node == indices)
+            .unwrap();
+        assert!(matches!(
+            index_producer.kernel.operation(),
+            crate::Operation::Sink
+        ));
+        assert_eq!(index_producer.ordered_inputs().len(), 1);
+        assert_eq!(index_producer.ordered_inputs()[0].desc, captured_token.desc);
+        assert!(captured_token.desc.view.is_some());
+        assert!(
+            inference
+                .clone()
+                .with_authenticated_host_gathers(&["token"])
+                .is_ok()
+        );
+
+        // A separately constructed graph may reuse every NodeId, but it is not
+        // an input to authorization. Only the already-owned captured items are
+        // inspected, so graph-local identity coincidence cannot grant policy.
+        let mut foreign = Graph::new();
+        let foreign_table = foreign.input_dtype("table", [4, 3], DType::F32);
+        let foreign_token = foreign.input_dtype("token", [], DType::I32);
+        let changed = foreign.add(foreign_token, foreign_token).unwrap();
+        let foreign_indices = foreign.expand(changed, [1, 3]).unwrap();
+        let foreign_gathered = foreign.gather(foreign_table, foreign_indices, 0).unwrap();
+        let foreign_output = foreign.square(foreign_gathered).unwrap();
+        assert_eq!(foreign_gathered, gathered);
+        let foreign_capture =
+            CapturedInference::from_module_graph(&module, &foreign, &[foreign_output]).unwrap();
+        assert!(
+            foreign_capture
+                .with_authenticated_host_gathers(&["token"])
+                .is_err()
+        );
+
+        let mut missing_dependency = inference.clone();
+        missing_dependency
+            .capture
+            .items
+            .iter_mut()
+            .find(|item| item.node == gathered)
+            .unwrap()
+            .dependencies
+            .retain(|dependency| {
+                *dependency
+                    != inference
+                        .capture
+                        .items
+                        .iter()
+                        .find(|item| item.node == indices)
+                        .unwrap()
+                        .id
+            });
+        assert!(
+            missing_dependency
+                .with_authenticated_host_gathers(&["token"])
+                .is_err()
+        );
+
+        let mut forged_producer = inference;
+        forged_producer
+            .capture
+            .items
+            .iter_mut()
+            .find(|item| item.node == indices)
+            .unwrap()
+            .consumers
+            .clear();
+        assert!(
+            forged_producer
+                .with_authenticated_host_gathers(&["token"])
+                .is_err()
+        );
     }
 
     fn configured_cifar_classifier() -> (Sequential, Parameter) {

@@ -5,7 +5,7 @@
 //! Metal, WebGPU, and fixed-schema CUDA graph paths.
 
 use crate::{
-    CapturedSchedule, DType, Operation, ReplayError, ReplayInput, RequestedPassthrough,
+    BufferDesc, CapturedSchedule, DType, Operation, ReplayError, ReplayInput, RequestedPassthrough,
     ScheduleInputBinding, ScheduleItem, Shape, SymbolicInvocation, TensorData,
     engine::{AuthenticatedSymbolicBody, AuthenticatedSymbolicInvocation},
     memory_plan::{ExactSlotPolicy, ExactSlotRequest, assign_exact_slots},
@@ -1106,7 +1106,242 @@ pub(crate) struct StaticSchedulePlan<R> {
     protected_outputs: Vec<u64>,
     state_links: Vec<StaticStateLink>,
     append_state_links: Vec<StaticAppendStateLink>,
+    host_gathers: Vec<StaticHostGather>,
     allocations: StaticAllocationPlan,
+}
+
+/// Runtime-only proof that one internal Gather consumes an affine expansion
+/// of a host-validated scalar I32 transient.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct StaticHostGather {
+    pub(crate) input: u64,
+    pub(crate) input_desc: BufferDesc,
+    pub(crate) index: u64,
+    pub(crate) output: u64,
+    pub(crate) axis: usize,
+    pub(crate) axis_extent: usize,
+    pub(crate) index_elements: usize,
+}
+
+fn authenticate_host_gather_index_producer(
+    index_item: &ScheduleItem,
+    gather_item: &ScheduleItem,
+    link: &StaticHostGather,
+    index_shape: &Shape,
+) -> Result<(), String> {
+    index_item
+        .kernel
+        .validate()
+        .map_err(|error| error.to_string())?;
+    let [store, end_range] = index_item.kernel.sources() else {
+        return Err("host Gather index producer must be one scalar store".into());
+    };
+    let crate::Operation::Sink = index_item.kernel.operation() else {
+        return Err("host Gather index producer must be a scalar sink".into());
+    };
+    let crate::Operation::Store = store.operation() else {
+        return Err("host Gather index producer must contain one store".into());
+    };
+    let [output_index, value] = store.sources() else {
+        return Err("host Gather index store is malformed".into());
+    };
+    let crate::Operation::Load = value.operation() else {
+        return Err("host Gather index producer is not value-preserving".into());
+    };
+    let [input_index] = value.sources() else {
+        return Err("host Gather index load is malformed".into());
+    };
+    let crate::Operation::EndRange = end_range.operation() else {
+        return Err("host Gather index producer has no terminal range".into());
+    };
+    let [terminal_range] = end_range.sources() else {
+        return Err("host Gather index terminal range is malformed".into());
+    };
+    let crate::Operation::Index(crate::IndexValue::Buffer {
+        buffer: output_buffer,
+        elements: output_elements,
+        input_shape: output_input_shape,
+        output_shape: output_output_shape,
+        addressing: crate::IndexAddressing::Broadcast,
+    }) = output_index.operation()
+    else {
+        return Err("host Gather index output addressing is invalid".into());
+    };
+    let crate::Operation::Index(crate::IndexValue::View {
+        buffer: input_buffer,
+        elements: input_elements,
+        input_shape,
+        output_shape,
+        view,
+    }) = input_index.operation()
+    else {
+        return Err("host Gather index source is not an affine view".into());
+    };
+    let [output_address, output_range] = output_index.sources() else {
+        return Err("host Gather index output addressing is malformed".into());
+    };
+    let [input_address, input_range] = input_index.sources() else {
+        return Err("host Gather index source addressing is malformed".into());
+    };
+    let crate::Operation::DefineGlobal(output_addressing) = output_address.operation() else {
+        return Err("host Gather index output pointer is malformed".into());
+    };
+    let crate::Operation::DefineGlobal(input_addressing) = input_address.operation() else {
+        return Err("host Gather index source pointer is malformed".into());
+    };
+    let crate::Operation::Range(0) = terminal_range.operation() else {
+        return Err("host Gather index range is invalid".into());
+    };
+    let [extent] = terminal_range.sources() else {
+        return Err("host Gather index range extent is malformed".into());
+    };
+    let crate::Operation::Const(crate::LiteralValue::Int(extent)) = extent.operation() else {
+        return Err("host Gather index range extent is not constant".into());
+    };
+    let [source_binding] = index_item.ordered_inputs() else {
+        return Err("host Gather index producer must have one ordered source".into());
+    };
+    crate::schedule::validate_buffer_desc(&source_binding.desc)
+        .map_err(|error| error.to_string())?;
+    let Some(captured_view) = link.input_desc.view.as_ref() else {
+        return Err("host Gather scalar has no authenticated affine view".into());
+    };
+    let normalized = captured_view
+        .normalized_read()
+        .map_err(|error| error.to_string())?;
+    let output = index_item.outputs.primary();
+    let elements = index_shape.numel().map_err(|error| error.to_string())?;
+    let bytes = elements
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| "host Gather index byte extent overflow".to_owned())?;
+    let scalar_ty = crate::UType::scalar(DType::I32);
+    let range_ty = crate::UType::scalar(DType::I64);
+    if index_item.outputs.len() != 1
+        || index_item.node.index() as u64 != link.index
+        || output.id != link.index
+        || output.shape != *index_shape
+        || output.dtype != DType::I32
+        || output.bytes != bytes
+        || output.alignment != DType::I32.itemsize()
+        || output.view.is_some()
+        || output.read_only
+        || source_binding.input_node.index() as u64 != link.input_desc.id
+        || source_binding.desc != link.input_desc
+        || source_binding.abi_index != 0
+        || link.input_desc.id != link.input
+        || link.input_desc.dtype != DType::I32
+        || link.input_desc.shape.numel().ok() != Some(1)
+        || link.input_desc.bytes != DType::I32.itemsize()
+        || link.input_desc.alignment != DType::I32.itemsize()
+        || !link.input_desc.read_only
+        || captured_view.source_shape != link.input_desc.shape
+        || captured_view.logical_shape != *index_shape
+        || view != captured_view
+        || *input_buffer != link.input
+        || *input_elements != elements
+        || input_shape != index_shape
+        || output_shape != index_shape
+        || *output_buffer != link.index
+        || *output_elements != elements
+        || output_input_shape != index_shape
+        || output_output_shape != index_shape
+        || output_index.ty() != Some(scalar_ty)
+        || input_index.ty() != Some(scalar_ty)
+        || value.ty() != Some(scalar_ty)
+        || output_address.ty() != Some(scalar_ty)
+        || input_address.ty() != Some(scalar_ty)
+        || terminal_range.ty() != Some(range_ty)
+        || *extent
+            != i64::try_from(elements).map_err(|_| "host Gather extent overflow".to_owned())?
+        || output_addressing.space != crate::AddressSpace::Global
+        || output_addressing.name != format!("b{}", link.index)
+        || output_addressing.element != scalar_ty
+        || input_addressing.space != crate::AddressSpace::Global
+        || input_addressing.name != format!("b{}", link.input)
+        || input_addressing.element != scalar_ty
+        || !output_range.shares_node_with(terminal_range)
+        || !input_range.shares_node_with(terminal_range)
+        || !gather_item.dependencies.contains(&index_item.id)
+        || index_item.consumers.as_slice() != [gather_item.id]
+        || normalized.offset != 0
+        || normalized
+            .axes
+            .iter()
+            .any(|axis| axis.stride != 0 || axis.reversed)
+    {
+        return Err("host Gather affine provenance is inconsistent".into());
+    }
+    Ok(())
+}
+
+/// Reauthenticates the exact capture-owned scalar expansion feeding one raw
+/// Gather. This is shared by capture policy construction and static planning;
+/// neither boundary trusts graph-local NodeId coincidence.
+pub(crate) fn authenticate_host_gather_lineage(
+    items: &[ScheduleItem],
+    link: &StaticHostGather,
+) -> Result<(), String> {
+    let gather_items = items
+        .iter()
+        .filter(|item| item.outputs.iter().any(|output| output.id == link.output))
+        .collect::<Vec<_>>();
+    let [gather_item] = gather_items.as_slice() else {
+        return Err("host Gather output must have one captured owner".into());
+    };
+    let crate::Operation::Movement(crate::MovementValue::Plan(gather_plan)) =
+        gather_item.kernel.operation()
+    else {
+        return Err("host Gather owner is not a movement plan".into());
+    };
+    let crate::MovementKernelKind::Gather { index, axis, .. } = &gather_plan.kind else {
+        return Err("host Gather owner is not Gather".into());
+    };
+    let portable = crate::movement_plan::PortableIndexedMovement::new(gather_plan)
+        .and_then(|portable| {
+            portable.validate_schedule_bindings(gather_item.ordered_inputs())?;
+            Ok(portable)
+        })
+        .map_err(|error| error.to_string())?;
+    let gather_output = gather_item.outputs.primary();
+    let gather_bytes = gather_plan
+        .output_shape
+        .numel()
+        .map_err(|error| error.to_string())?
+        .checked_mul(gather_plan.dtype.itemsize())
+        .ok_or_else(|| "host Gather output byte extent overflow".to_owned())?;
+    if gather_item.outputs.len() != 1
+        || gather_item.node != gather_plan.output
+        || gather_output.id != gather_plan.output.index() as u64
+        || gather_output.shape != gather_plan.output_shape
+        || gather_output.dtype != gather_plan.dtype
+        || gather_output.bytes != gather_bytes
+        || gather_output.alignment != gather_plan.dtype.itemsize().max(1)
+        || gather_output.view.is_some()
+        || gather_output.read_only
+        || index.node.index() as u64 != link.index
+        || *axis != link.axis
+        || portable.axis() != link.axis
+        || portable.axis_extent() != link.axis_extent
+        || portable.index_elements() != link.index_elements
+    {
+        return Err("host Gather movement geometry is inconsistent".into());
+    }
+
+    let index_items = items
+        .iter()
+        .filter(|item| item.outputs.iter().any(|output| output.id == link.index))
+        .collect::<Vec<_>>();
+    let [index_item] = index_items.as_slice() else {
+        return Err("host Gather index must have one captured producer".into());
+    };
+    let index_output = index_item.outputs.primary();
+    if index_output.shape != index.shape
+        || index_output.dtype != index.dtype
+        || index_output.id != link.index
+    {
+        return Err("host Gather affine provenance is inconsistent".into());
+    }
+    authenticate_host_gather_index_producer(index_item, gather_item, link, &index_output.shape)
 }
 
 /// One authenticated fixed-shape input/output pair whose two private slots
@@ -1136,6 +1371,7 @@ struct StaticOutputPolicy<'a> {
     protected_outputs: &'a [u64],
     state_links: &'a [StaticStateLink],
     append_state_links: &'a [StaticAppendStateLink],
+    host_gathers: &'a [StaticHostGather],
 }
 
 /// Pure renderer/planner seam shared by ordinary device execution and CUDA
@@ -1148,6 +1384,11 @@ pub(crate) trait StaticPlanAdapter: sealed::Sealed + Sized {
     fn invalid_binding(reason: String) -> Self::Error;
     fn unsupported(reason: String) -> Self::Error;
     fn overflow() -> Self::Error;
+    fn index_out_of_bounds(axis: usize, index: usize, value: i32, dim: usize) -> Self::Error {
+        Self::invalid_binding(format!(
+            "indexed movement axis {axis} has value {value} at logical index {index}, outside [0, {dim})"
+        ))
+    }
 }
 
 /// Coarse backend resource seam. Operation dispatch deliberately remains in
@@ -1222,6 +1463,10 @@ impl<R> StaticSchedulePlan<R> {
         &self.append_state_links
     }
 
+    pub(crate) fn host_gathers(&self) -> &[StaticHostGather] {
+        &self.host_gathers
+    }
+
     pub(crate) fn build<A>(
         adapter: &A,
         items: &[ScheduleItem],
@@ -1235,6 +1480,7 @@ impl<R> StaticSchedulePlan<R> {
             protected_outputs: outputs,
             state_links: &[],
             append_state_links: &[],
+            host_gathers: &[],
         });
         Self::build_with_outputs(adapter, items, outputs)
     }
@@ -1245,6 +1491,7 @@ impl<R> StaticSchedulePlan<R> {
         host_outputs: &[u64],
         protected_outputs: &[u64],
         state_links: &[StaticStateLink],
+        host_gathers: &[StaticHostGather],
     ) -> Result<Self, A::Error>
     where
         A: StaticPlanAdapter<Rendered = R>,
@@ -1257,6 +1504,7 @@ impl<R> StaticSchedulePlan<R> {
                 protected_outputs,
                 state_links,
                 append_state_links: &[],
+                host_gathers,
             }),
         )
     }
@@ -1267,6 +1515,7 @@ impl<R> StaticSchedulePlan<R> {
         host_outputs: &[u64],
         protected_outputs: &[u64],
         append_state_links: &[StaticAppendStateLink],
+        host_gathers: &[StaticHostGather],
     ) -> Result<Self, A::Error>
     where
         A: StaticPlanAdapter<Rendered = R>,
@@ -1279,6 +1528,7 @@ impl<R> StaticSchedulePlan<R> {
                 protected_outputs,
                 state_links: &[],
                 append_state_links,
+                host_gathers,
             }),
         )
     }
@@ -1507,34 +1757,36 @@ impl<R> StaticSchedulePlan<R> {
             }
             Ok(ids.to_vec())
         };
-        let (host_outputs, protected_outputs, state_links, append_state_links) = match outputs {
-            Some(policy) => {
-                let host = validate_outputs(policy.host_outputs, "host")?;
-                let protected = validate_outputs(policy.protected_outputs, "protected")?;
-                let protected_set = protected.iter().copied().collect::<BTreeSet<_>>();
-                if let Some(id) = host.iter().find(|id| !protected_set.contains(id)) {
-                    return Err(A::invalid_binding(format!(
-                        "host logical output {id} is not protected"
-                    )));
+        let (host_outputs, protected_outputs, state_links, append_state_links, host_gathers) =
+            match outputs {
+                Some(policy) => {
+                    let host = validate_outputs(policy.host_outputs, "host")?;
+                    let protected = validate_outputs(policy.protected_outputs, "protected")?;
+                    let protected_set = protected.iter().copied().collect::<BTreeSet<_>>();
+                    if let Some(id) = host.iter().find(|id| !protected_set.contains(id)) {
+                        return Err(A::invalid_binding(format!(
+                            "host logical output {id} is not protected"
+                        )));
+                    }
+                    (
+                        host,
+                        protected,
+                        policy.state_links.to_vec(),
+                        policy.append_state_links.to_vec(),
+                        policy.host_gathers.to_vec(),
+                    )
                 }
-                (
-                    host,
-                    protected,
-                    policy.state_links.to_vec(),
-                    policy.append_state_links.to_vec(),
-                )
-            }
-            // Public prepared-prefix APIs historically materialize every item
-            // output into the caller map. Exact internal consumers pass an
-            // explicit retained set through `prepare_for_outputs` instead.
-            None => {
-                let all = items
-                    .iter()
-                    .flat_map(|item| item.outputs.iter().map(|output| output.id))
-                    .collect::<Vec<_>>();
-                (all.clone(), all, Vec::new(), Vec::new())
-            }
-        };
+                // Public prepared-prefix APIs historically materialize every item
+                // output into the caller map. Exact internal consumers pass an
+                // explicit retained set through `prepare_for_outputs` instead.
+                None => {
+                    let all = items
+                        .iter()
+                        .flat_map(|item| item.outputs.iter().map(|output| output.id))
+                        .collect::<Vec<_>>();
+                    (all.clone(), all, Vec::new(), Vec::new(), Vec::new())
+                }
+            };
         if !items.is_empty() && protected_outputs.is_empty() {
             return Err(A::invalid_binding(
                 "static prefix has no protected output".into(),
@@ -1675,6 +1927,69 @@ impl<R> StaticSchedulePlan<R> {
             }
         }
 
+        let mut gather_outputs = BTreeSet::new();
+        let mut gather_inputs = BTreeSet::new();
+        for link in &host_gathers {
+            authenticate_host_gather_lineage(items, link).map_err(A::invalid_binding)?;
+            if link.axis_extent == 0 && link.index_elements != 0
+                || !gather_outputs.insert(link.output)
+                || !gather_inputs.insert(link.input)
+                || link.input == link.index
+                || host_outputs.contains(&link.output)
+                || protected_outputs.contains(&link.output)
+                || state_ids.contains(&link.input)
+                || state_ids.contains(&link.output)
+            {
+                return Err(A::invalid_binding(
+                    "static host Gather declaration is inconsistent".into(),
+                ));
+            }
+            let scalar = buffers.get(&link.input).ok_or_else(|| {
+                A::invalid_binding(format!("host Gather scalar {} is absent", link.input))
+            })?;
+            let index = buffers.get(&link.index).ok_or_else(|| {
+                A::invalid_binding(format!("host Gather index {} is absent", link.index))
+            })?;
+            let output = buffers.get(&link.output).ok_or_else(|| {
+                A::invalid_binding(format!("host Gather output {} is absent", link.output))
+            })?;
+            let index_producer = index.producer.ok_or_else(|| {
+                A::invalid_binding("host Gather index has no physical producer".into())
+            })?;
+            let producer = output
+                .producer
+                .ok_or_else(|| A::invalid_binding("host Gather output has no producer".into()))?;
+            let slots_are_distinct = index.bytes == 0
+                || match (
+                    allocations.logical_slots.get(&link.input),
+                    allocations.logical_slots.get(&link.index),
+                    allocations.logical_slots.get(&link.output),
+                ) {
+                    (Some(input), Some(index), Some(output)) => input != index && index != output,
+                    _ => false,
+                };
+            if scalar.producer.is_some()
+                || !external_inputs.contains(&link.input)
+                || scalar.dtype != DType::I32
+                || scalar.elements != 1
+                || scalar.bytes != DType::I32.itemsize()
+                || index.dtype != DType::I32
+                || index.elements != link.index_elements
+                || index_producer >= producer
+                || !items[producer]
+                    .dependencies
+                    .contains(&items[index_producer].id)
+                || !planned[producer].input_ids.contains(&link.index)
+                || items[producer].outputs.len() != 1
+                || items[producer].outputs.primary().id != link.output
+                || !slots_are_distinct
+            {
+                return Err(A::invalid_binding(
+                    "static host Gather ownership or geometry is invalid".into(),
+                ));
+            }
+        }
+
         Ok(Self {
             items: planned,
             buffers,
@@ -1683,6 +1998,7 @@ impl<R> StaticSchedulePlan<R> {
             protected_outputs,
             state_links,
             append_state_links,
+            host_gathers,
             allocations,
         })
     }
@@ -1883,6 +2199,7 @@ pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     host_outputs: Vec<u64>,
     state_links: Vec<StaticStateLink>,
     append_state_links: Vec<StaticAppendStateLink>,
+    host_gathers: Vec<StaticHostGather>,
     compiled_cache_keys: Vec<String>,
 }
 
@@ -1921,6 +2238,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             protected_outputs,
             state_links,
             append_state_links,
+            host_gathers,
             allocations,
         } = plan;
         if host_outputs
@@ -1973,6 +2291,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             host_outputs,
             state_links,
             append_state_links,
+            host_gathers,
             compiled_cache_keys,
         })
     }
@@ -2051,6 +2370,45 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         Ok(uploads)
     }
 
+    fn validate_host_gathers(&self, values: &BTreeMap<u64, TensorData>) -> Result<(), A::Error> {
+        for link in &self.host_gathers {
+            if link.index_elements == 0 {
+                continue;
+            }
+            let value = values.get(&link.input).ok_or_else(|| {
+                A::invalid_binding(format!("host Gather scalar {} is absent", link.input))
+            })?;
+            let bytes = value
+                .to_le_bytes()
+                .map_err(|_| A::invalid_binding("host Gather scalar bytes".into()))?;
+            if value.dtype() != DType::I32
+                || value.shape() != &self.buffer_plans[&link.input].source_shape
+                || bytes.len() != 4
+            {
+                return Err(A::invalid_binding(
+                    "host Gather scalar descriptor mismatch".into(),
+                ));
+            }
+            let selected = i32::from_le_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .expect("validated four-byte host Gather scalar"),
+            );
+            let in_bounds =
+                usize::try_from(selected).is_ok_and(|selected| selected < link.axis_extent);
+            if !in_bounds {
+                return Err(A::index_out_of_bounds(
+                    link.axis,
+                    0,
+                    selected,
+                    link.axis_extent,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Validates and uploads the selected immutable external inputs once. A
     /// failed upload leaves construction unpublished.
     pub(crate) fn initialize_resident(
@@ -2116,6 +2474,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         alternate_state_bank: bool,
     ) -> Result<StaticExecutionReport, A::Error> {
         // Complete all host validation before the first driver call.
+        self.validate_host_gathers(values)?;
         let uploads = self.validated_uploads(values, |id| !resident_ids.contains(&id))?;
         let mut downloads = self
             .host_outputs
@@ -3283,6 +3642,7 @@ mod tests {
             &[output.index() as u64],
             &[output.index() as u64, next.index() as u64],
             &[link],
+            &[],
         )
         .unwrap();
         assert_eq!(plan.host_outputs(), &[output.index() as u64]);
@@ -3301,6 +3661,7 @@ mod tests {
                 &[next.index() as u64],
                 &[output.index() as u64, next.index() as u64],
                 &[link],
+                &[],
             )
             .is_err()
         );
