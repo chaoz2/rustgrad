@@ -56,7 +56,10 @@ uploads immutable weights once and owns persistent slots, pipelines, and queue;
 repeated synchronous runs stage only transients, download requested outputs,
 expose truthful host-API/planned metrics, and have no CPU fallback. The current
 semantic-mock vertical is a bounded residual-style graph, not a full model or
-performance claim.
+performance claim. The opt-in Metal scoreboard records one exact session's
+successful prefix with first/ordered steady host-wall samples and deterministic
+plan/cache/copy/launch JSON; it is measurement plumbing, not live workload
+evidence or GPU timing.
 
 ### 2. P0 — ResNet-18 Metal conformance
 

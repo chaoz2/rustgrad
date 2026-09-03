@@ -79,6 +79,7 @@ layers:
 - [`examples/onnx_npy_infer.rs`](examples/onnx_npy_infer.rs)
 - [`examples/llama_prompt.rs`](examples/llama_prompt.rs)
 - [`examples/llama_chat.rs`](examples/llama_chat.rs)
+- [`examples/metal_scoreboard.rs`](examples/metal_scoreboard.rs)
 
 ## Reuse a static module on Metal
 
@@ -91,7 +92,9 @@ counts; they do not claim GPU timing or physical bus traffic.
 
 ```rust,no_run
 use rustgrad::nn::Linear;
-use rustgrad::runtime::metal::{MetalInferencePlan, MetalRuntime};
+use rustgrad::runtime::metal::{
+    MetalInferencePlan, MetalRuntime, MetalScoreboardContext, MetalSessionScoreboard,
+};
 use rustgrad::{CapturedInference, DType, Graph, TensorData};
 use std::collections::BTreeMap;
 
@@ -104,14 +107,31 @@ let captured = CapturedInference::from_module_graph(&model, &graph, &[scores])?;
 let plan = MetalInferencePlan::new(captured, device.renderer(64)?)?;
 
 println!("plan: {:?}", plan.summary());
+let mut scoreboard = MetalSessionScoreboard::new(
+    MetalScoreboardContext::new(
+        "linear-1x4",
+        env!("CARGO_PKG_VERSION"),
+        "live Metal device; host wall clock and host API counters",
+    )?,
+    &plan,
+);
 let mut session = plan.prepare(device)?;
+scoreboard.bind(&session)?;
 let input = || TensorData::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]);
 let first = session.run(&BTreeMap::from([("features".into(), input()?)]))?;
+scoreboard.record(&first)?;
 let second = session.run(&BTreeMap::from([("features".into(), input()?)]))?;
+scoreboard.record(&second)?;
 assert_eq!(session.summary().fallback_count, 0);
-println!("{:?} {:?}", first.report(), second.report());
+scoreboard.report()?.write_json("metal-scoreboard.json")?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+The opt-in scoreboard records the first successful run separately from ordered
+steady-run samples. Its JSON contains host wall-clock observations, host API
+copy counts, planned static tensor-slot bytes, launches, cache facts, and the
+strict path's zero fallback count. It does not report GPU time, compile-only
+time, physical bus traffic, process memory, energy, or throughput.
 
 ## How the system fits together
 

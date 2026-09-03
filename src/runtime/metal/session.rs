@@ -7,6 +7,7 @@ use super::{
 use crate::{CapturedInference, CapturedSchedule, ExecutionPlanSummary, ReplayInput, TensorData};
 use std::{
     collections::BTreeMap,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -104,6 +105,7 @@ pub struct MetalDeviceRunReport {
 pub struct MetalDeviceRun {
     outputs: Vec<TensorData>,
     report: MetalDeviceRunReport,
+    session_token: Rc<()>,
 }
 
 impl MetalDeviceRun {
@@ -125,6 +127,10 @@ impl MetalDeviceRun {
     /// Returns measurements committed with this successful invocation.
     pub fn report(&self) -> &MetalDeviceRunReport {
         &self.report
+    }
+
+    pub(super) fn belongs_to(&self, session_token: &Rc<()>) -> bool {
+        Rc::ptr_eq(&self.session_token, session_token)
     }
 }
 
@@ -195,7 +201,11 @@ impl MetalInferencePlan {
 
     /// Creates persistent resources and uploads the frozen residents once.
     pub fn prepare(self, device: MetalDevice) -> Result<MetalDeviceSession, MetalError> {
-        self.inner.prepare(device, self.resident_bindings)
+        self.inner.prepare_with_deployment(
+            device,
+            self.resident_bindings,
+            Some(self.deployment_identity),
+        )
     }
 }
 
@@ -343,6 +353,15 @@ impl MetalDeviceSessionPlan {
         device: MetalDevice,
         resident_inputs: BTreeMap<String, TensorData>,
     ) -> Result<MetalDeviceSession, MetalError> {
+        self.prepare_with_deployment(device, resident_inputs, None)
+    }
+
+    fn prepare_with_deployment(
+        self,
+        device: MetalDevice,
+        resident_inputs: BTreeMap<String, TensorData>,
+        inference_deployment_identity: Option<u64>,
+    ) -> Result<MetalDeviceSession, MetalError> {
         // Value and capability validation precede cache, compilation,
         // allocation, queue creation, or upload.
         let resident_values = self
@@ -412,6 +431,8 @@ impl MetalDeviceSessionPlan {
             device_info,
             device_owner_id,
             successful_runs: 0,
+            session_token: Rc::new(()),
+            inference_deployment_identity,
         })
     }
 }
@@ -426,6 +447,8 @@ pub struct MetalDeviceSession {
     device_info: MetalDeviceInfo,
     device_owner_id: u64,
     successful_runs: u64,
+    session_token: Rc<()>,
+    inference_deployment_identity: Option<u64>,
 }
 
 impl MetalDeviceSession {
@@ -474,6 +497,14 @@ impl MetalDeviceSession {
         self.successful_runs
     }
 
+    pub(super) fn session_token(&self) -> &Rc<()> {
+        &self.session_token
+    }
+
+    pub(super) const fn inference_deployment_identity(&self) -> Option<u64> {
+        self.inference_deployment_identity
+    }
+
     /// Validates exact transient inputs, executes each nonzero schedule item
     /// with an individual Metal launch/wait, and returns only requested outputs.
     pub fn run(
@@ -505,7 +536,11 @@ impl MetalDeviceSession {
             outputs.len(),
         );
         self.successful_runs = successful_invocation;
-        Ok(MetalDeviceRun { outputs, report })
+        Ok(MetalDeviceRun {
+            outputs,
+            report,
+            session_token: self.session_token.clone(),
+        })
     }
 }
 

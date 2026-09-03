@@ -12,6 +12,7 @@ mod prepared;
 mod random;
 mod renderer;
 mod resource;
+mod scoreboard;
 mod session;
 mod transaction;
 
@@ -24,6 +25,11 @@ pub use renderer::{
 pub use resource::{
     MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice, MetalDiscovery,
     MetalLibrary, MetalPipeline, MetalRuntime, MetalTransaction,
+};
+pub use scoreboard::{
+    METAL_SESSION_SCOREBOARD_FORMAT_VERSION, MetalHostWallTimeSummary, MetalScoreboardContext,
+    MetalScoreboardError, MetalScoreboardInput, MetalScoreboardInputKind, MetalSessionScoreboard,
+    MetalSessionScoreboardReport,
 };
 pub use session::{
     MetalDevicePreparationReport, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
