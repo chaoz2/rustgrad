@@ -392,12 +392,14 @@ impl CapturedStaticExecution {
 /// Runtime-only partition of one authenticated capture's named inputs.
 ///
 /// Constants and explicitly selected inputs are immutable resident values;
-/// every other named input must be supplied to each invocation. This does not
-/// alter captured bytes or schedule identities.
+/// authenticated runtime controls are session-synthesized, and every remaining
+/// named input must be supplied to each invocation. This does not alter captured
+/// bytes or schedule identities.
 pub(crate) struct StaticLifetimePlan {
     capture: CapturedStaticExecution,
     resident_inputs: Vec<ReplayInput>,
     state_inputs: Vec<ReplayInput>,
+    runtime_controls: Vec<ReplayInput>,
     transient_inputs: Vec<ReplayInput>,
     resident_ids: BTreeSet<u64>,
 }
@@ -425,6 +427,15 @@ impl StaticLifetimePlan {
         resident_names: &[String],
         state_names: &[String],
     ) -> Result<Self, String> {
+        Self::new_with_state_and_controls(capture, resident_names, state_names, &[])
+    }
+
+    pub(crate) fn new_with_state_and_controls(
+        capture: CapturedStaticExecution,
+        resident_names: &[String],
+        state_names: &[String],
+        runtime_controls: &[ReplayInput],
+    ) -> Result<Self, String> {
         if capture.owned_capture().is_none() {
             return Err("static lifetime plan requires owned capture backing".into());
         }
@@ -451,14 +462,40 @@ impl StaticLifetimePlan {
         if let Some(name) = state.iter().find(|name| !known.contains(**name)) {
             return Err(format!("state input {name} is absent from the capture"));
         }
+        let mut control_ids = BTreeSet::new();
+        for control in runtime_controls {
+            let captured_matches = capture
+                .inputs()
+                .iter()
+                .filter(|input| *input == control)
+                .count();
+            if captured_matches != 1
+                || control.desc.shape.dims() != [1]
+                || control.desc.dtype != DType::I32
+                || control.desc.bytes != DType::I32.itemsize()
+                || control.desc.alignment != DType::I32.itemsize()
+                || !control.desc.read_only
+                || names.contains(control.name.as_str())
+                || state.contains(control.name.as_str())
+                || !control_ids.insert(control.desc.id)
+            {
+                return Err("runtime controls must be exact, unique, and disjoint".into());
+            }
+        }
         let (resident_inputs, remaining): (Vec<_>, Vec<_>) = capture
             .inputs()
             .iter()
             .cloned()
             .partition(|input| names.contains(input.name.as_str()));
-        let (state_inputs, transient_inputs): (Vec<_>, Vec<_>) = remaining
+        let (state_inputs, remaining): (Vec<_>, Vec<_>) = remaining
             .into_iter()
             .partition(|input| state.contains(input.name.as_str()));
+        let (runtime_controls, transient_inputs): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
+            .partition(|input| control_ids.contains(&input.desc.id));
+        if runtime_controls.len() != control_ids.len() {
+            return Err("runtime control inventory is incomplete".into());
+        }
         let resident_ids = capture
             .constant_ids()
             .chain(capture.quantized_constant_ids())
@@ -469,6 +506,7 @@ impl StaticLifetimePlan {
             capture,
             resident_inputs,
             state_inputs,
+            runtime_controls,
             transient_inputs,
             resident_ids,
         })
@@ -494,6 +532,10 @@ impl StaticLifetimePlan {
 
     pub(crate) fn transient_inputs(&self) -> &[ReplayInput] {
         &self.transient_inputs
+    }
+
+    pub(crate) fn runtime_controls(&self) -> &[ReplayInput] {
+        &self.runtime_controls
     }
 
     pub(crate) fn resident_ids(&self) -> &BTreeSet<u64> {
@@ -601,6 +643,37 @@ impl StaticLifetimePlan {
             "transient Metal session",
         )?;
         Ok(values)
+    }
+
+    pub(crate) fn stage_committed_position(
+        &self,
+        committed_position: usize,
+        values: &mut BTreeMap<u64, TensorData>,
+    ) -> Result<(usize, usize), String> {
+        let [control] = self.runtime_controls.as_slice() else {
+            return if self.runtime_controls.is_empty() {
+                Ok((0, 0))
+            } else {
+                Err("sealed append policy requires exactly one runtime control".into())
+            };
+        };
+        if control.desc.shape.dims() != [1]
+            || control.desc.dtype != DType::I32
+            || control.desc.bytes != DType::I32.itemsize()
+            || control.desc.alignment != DType::I32.itemsize()
+            || !control.desc.read_only
+        {
+            return Err("sealed append runtime control descriptor is invalid".into());
+        }
+        let position = i32::try_from(committed_position)
+            .map_err(|_| "sealed append position exceeds I32".to_owned())?;
+        let value =
+            TensorData::from_scalars([1], DType::I32, [crate::Scalar::I(i64::from(position))])
+                .map_err(|error| error.to_string())?;
+        if values.insert(control.desc.id, value).is_some() {
+            return Err("sealed append runtime control aliases a caller input".into());
+        }
+        Ok((1, control.desc.bytes))
     }
 
     pub(crate) fn project(
@@ -2433,6 +2506,12 @@ pub(crate) struct StaticExecutionReport {
     pub(crate) kernel_launches: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StaticHostOutputSelection {
+    All,
+    None,
+}
+
 /// Prepared thread-confined resources for a fully validated static plan.
 pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     adapter: A,
@@ -2764,7 +2843,12 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         values: &mut BTreeMap<u64, TensorData>,
         resident_ids: &BTreeSet<u64>,
     ) -> Result<StaticExecutionReport, A::Error> {
-        self.execute_skipping_residents_at_epoch(values, resident_ids, false)
+        self.execute_skipping_residents_at_epoch(
+            values,
+            resident_ids,
+            false,
+            StaticHostOutputSelection::All,
+        )
     }
 
     fn execute_skipping_residents_at_epoch(
@@ -2772,15 +2856,18 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         values: &mut BTreeMap<u64, TensorData>,
         resident_ids: &BTreeSet<u64>,
         alternate_state_bank: bool,
+        host_outputs: StaticHostOutputSelection,
     ) -> Result<StaticExecutionReport, A::Error> {
         // Complete all host validation before the first driver call.
         self.validate_host_gathers(values)?;
         let uploads = self.validated_uploads(values, |id| !resident_ids.contains(&id))?;
-        let mut downloads = self
-            .host_outputs
-            .iter()
-            .map(|id| (*id, vec![0; self.buffer_plans[id].bytes]))
-            .collect::<Vec<_>>();
+        let mut downloads = match host_outputs {
+            StaticHostOutputSelection::All => self.host_outputs.as_slice(),
+            StaticHostOutputSelection::None => &[],
+        }
+        .iter()
+        .map(|id| (*id, vec![0; self.buffer_plans[id].bytes]))
+        .collect::<Vec<_>>();
         let report = if self.queue.is_some() {
             StaticExecutionReport {
                 h2d_calls: uploads.len(),
@@ -2866,6 +2953,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         values: &mut BTreeMap<u64, TensorData>,
         resident_ids: &BTreeSet<u64>,
         committed_position: usize,
+        host_outputs: StaticHostOutputSelection,
     ) -> Result<StaticExecutionReport, A::Error> {
         if self.append_state_links.is_empty() || !self.state_links.is_empty() {
             return Err(A::invalid_binding(
@@ -2899,7 +2987,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 ));
             }
         }
-        self.execute_skipping_residents_at_epoch(values, resident_ids, false)
+        self.execute_skipping_residents_at_epoch(values, resident_ids, false, host_outputs)
     }
 }
 
@@ -2925,6 +3013,7 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
             values,
             &self.resident_ids,
             alternate_state_bank,
+            StaticHostOutputSelection::All,
         )
     }
 
@@ -2932,9 +3021,14 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
         &self,
         values: &mut BTreeMap<u64, TensorData>,
         committed_position: usize,
+        host_outputs: StaticHostOutputSelection,
     ) -> Result<StaticExecutionReport, A::Error> {
-        self.prepared
-            .execute_append_state(values, &self.resident_ids, committed_position)
+        self.prepared.execute_append_state(
+            values,
+            &self.resident_ids,
+            committed_position,
+            host_outputs,
+        )
     }
 }
 
@@ -4035,6 +4129,39 @@ mod tests {
             projected[1].to_le_bytes().unwrap()
         );
         assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn static_lifetime_separates_authenticated_runtime_control() {
+        let mut graph = Graph::new();
+        let position = graph.input_dtype("position", [1], DType::I32);
+        let reshaped = graph.reshape(position, [1, 1]).unwrap();
+        let expanded = graph.expand(reshaped, [1, 2]).unwrap();
+        let output = graph.cast(expanded, DType::F32).unwrap();
+        let schedule = schedule_many(&graph, &[output]).unwrap();
+        let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        let projection = CapturedStaticExecution::from_owned(capture).unwrap();
+        let control = projection.inputs()[0].clone();
+        assert_eq!(control.node, position);
+        assert!(control.desc.view.is_some());
+        let lifetime = StaticLifetimePlan::new_with_state_and_controls(
+            projection,
+            &[],
+            &[],
+            std::slice::from_ref(&control),
+        )
+        .unwrap();
+        assert!(lifetime.transient_inputs().is_empty());
+        assert_eq!(lifetime.runtime_controls(), std::slice::from_ref(&control));
+        let mut values = lifetime.stage_transient(&BTreeMap::new()).unwrap();
+        assert_eq!(
+            lifetime.stage_committed_position(7, &mut values).unwrap(),
+            (1, 4)
+        );
+        assert_eq!(
+            values[&control.desc.id].to_le_bytes().unwrap(),
+            7i32.to_le_bytes()
+        );
     }
 
     #[test]

@@ -2580,6 +2580,15 @@ position, outputs, and metrics advance only after all launches, waits, public
 downloads, decoding, and projection succeed. Empty rows remain addressless.
 This is not generic in-place Scatter, dynamic state, or alias permission.
 
+The Llama capture may consume a private seal over that exact shared dense I32
+`[1]` graph input. Sealing removes the position only from the caller transient
+schema; it remains capture-visible and retains the same schedule, artifact,
+renderer, and kernel-cache identity. `StaticLifetimePlan` instead assigns it to
+a disjoint runtime-control partition, and the session synthesizes the committed
+position before driver work. Generic append-state sessions remain caller-
+positioned. Run reports account caller transients and runtime controls
+separately.
+
 The plan exposes exact typed input schemas, every rendered schedule item,
 nonzero compiled-kernel cache keys, planned slot bytes including private
 zero-byte sentinels, and nonzero/zero item counts. The prepared session exposes
@@ -2594,7 +2603,7 @@ reach no driver work; a failed execution publishes neither outputs nor a
 successful-run metric and the settled prefix remains retryable. Zero-work
 captures allocate, compile, upload, launch, wait, and read nothing.
 
-`MetalSessionScoreboard` v3 is an opt-in observation layer over that existing
+`MetalSessionScoreboard` v4 is an opt-in observation layer over that existing
 evidence. It snapshots either a stateless `MetalInferencePlan` or an
 append-only `MetalAppendStateInferencePlan`, binds once to the exact prepared
 deployment/session identity, and accepts only its consecutive successful
@@ -2606,9 +2615,11 @@ same records, separates the first sample, and reports integer-duration
 nearest-rank percentiles over the remaining samples. Versioned deterministic
 JSON includes caller-labelled workload, implementation revision, evidence
 provenance, selected handle-free device, captured resident/state/transient
-descriptors, distinct dense-tensor and packed-GGUF captured constant counts and
-raw bytes, one-time initial-state writes, logical schedule/peak-live facts, and
-physical Metal slot/state-bank facts.
+and runtime-control descriptors, distinct dense-tensor and packed-GGUF captured
+constant counts and raw bytes, one-time initial-state writes, logical
+schedule/peak-live facts, and physical Metal slot/state-bank facts. Version 4
+also gives runtime-control writes distinct fields without reclassifying them as
+caller transients.
 `planning_wall_time` is planning and rendering; `native_prepare_wall_time`
 includes compilation, allocation, and queue setup; and
 `cache_miss_pipeline_build_wall_time` times only successful native
@@ -2633,17 +2644,23 @@ typed packed ABI. Mixed models retain both ownership classes, and tied logits
 reuse one packed token-embedding allocation through two authenticated kernel
 bindings. One precomputed F32 RoPE table is resident. Dense embedding and RoPE
 lookups use host-range-validated native Gather items over I32 `[1,1]` token and
-`[1]` position inputs. A packed embedding instead uses the existing direct
-quantized row-Gather, while RoPE remains the sole host-Gather. Both routes
-validate their scalar indices before driver work and need no provisional
-candidate or status read.
+`[1]` position inputs. The position is sealed as session-owned runtime control,
+so token is the sole caller transient. Its source storage remains one dense
+four-byte I32 scalar, while the captured input retains its exact scheduled
+affine consumption descriptor; sealing neither normalizes nor discards that
+view. A packed embedding instead uses the
+existing direct quantized row-Gather, while RoPE remains the sole host-Gather.
+Both routes validate their scalar indices before driver work and need no
+provisional candidate or status read.
 Each layer materializes one dense
 `[1, kv_heads, 1, head_dim]` key row and value row, then authenticated raw
 Scatter-replace owners append them in place to one fixed
 `[1, kv_heads, max_context, head_dim]` physical bank per tensor. The dedicated
 row-shaped I32 append index is expanded and materialized on device from the
 scalar model position. The scalar must match the session's next position before
-driver work. Only `[1, vocab]` logits cross device-to-host.
+driver work. `run_token` downloads `[1, vocab]` logits. `commit_token` executes
+the same complete body while suppressing all host outputs, then publishes the
+typed position/report and state only after successful completion.
 Position, row-byte/work metrics, state, and output publish only after every layer's K/V
 append and logits succeed, so a partial failure retries and overwrites the same
 uncommitted row without a full-state copy.
@@ -2696,7 +2713,7 @@ oracle. The typed ResNet benchmark constructs the complete default Eval/F32
 Metal session, and checks ten repeated session outputs by default under the
 documented F32 native-compilation tolerance. The workflow runs that complete
 benchmark exactly once rather than duplicating it through the ignored live
-test, and uploads its deterministic v2 scoreboard beside the Linear report.
+test, and uploads its deterministic v4 scoreboard beside the Linear report.
 These paths prove stable resident schemas, compiled cache identities, device
 ownership, zero run-time resident upload, and zero fallback. The release profile
 keeps the one complete CPU oracle practical without weakening the device

@@ -189,6 +189,7 @@ pub use memory_space::{
 };
 pub use models::transformer::{
     LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
+    LlamaMetalTokenCommit,
 };
 pub use movement_plan::{
     MovementExecutionError, MovementKernelKind, MovementKernelPlan, MovementOperand,

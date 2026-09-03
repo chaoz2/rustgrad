@@ -60,7 +60,7 @@ expose truthful host-API/planned metrics, and have no CPU fallback. Protected
 acceptance now takes the complete default Eval/F32 ResNet-18 `[1,3,224,224]`
 graph through boundary-free scheduling and capture, renders every scheduled
 item to MSL, then performs persistent resident preparation and repeated
-ABI-validating virtual-resource runs. The opt-in Metal scoreboard v3 records
+ABI-validating virtual-resource runs. The opt-in Metal scoreboard v4 records
 one exact stateless or append-only session's successful prefix with ordered
 per-run host-wall/copy/launch and append-position/row-commit records, checked
 aggregates, successful cache-miss pipeline-build time, logical schedule/peak-live

@@ -24,10 +24,11 @@ const ROPE_TABLE: &str = "llama.rope.table";
 
 /// Resource-free deployment of one dense F32, batch-one Llama token body.
 ///
-/// The graph owns fixed-capacity K/V state and is captured exactly once. Token,
-/// scalar position are the only per-run host inputs; the row-shaped append
-/// index is derived and materialized on device from that position. All GGUF
-/// weights and the precomputed RoPE table are immutable named residents.
+/// The graph owns fixed-capacity K/V state and is captured exactly once. Token
+/// is the only caller-supplied per-run input; the session seals and synthesizes
+/// its committed scalar position, from which the row-shaped append index is
+/// derived on device. All GGUF weights and the precomputed RoPE table are
+/// immutable named residents.
 pub struct LlamaMetalStepPlan {
     inner: MetalAppendStateInferencePlan,
     max_context: usize,
@@ -49,6 +50,29 @@ pub struct LlamaMetalStep {
     logits: TensorData,
     position: usize,
     report: MetalDeviceRunReport,
+}
+
+/// One successfully committed token whose logits remained device-local.
+pub struct LlamaMetalTokenCommit {
+    position: usize,
+    report: MetalDeviceRunReport,
+}
+
+impl LlamaMetalTokenCommit {
+    /// Returns the zero-based position consumed by this invocation.
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns the exact successful underlying Metal run report.
+    pub const fn report(&self) -> &MetalDeviceRunReport {
+        &self.report
+    }
+
+    /// Consumes the commit into its position and run report.
+    pub fn into_parts(self) -> (usize, MetalDeviceRunReport) {
+        (self.position, self.report)
+    }
 }
 
 impl LlamaMetalStep {
@@ -138,7 +162,8 @@ impl LlamaMetalStepPlan {
             built.residents,
             &built.quantized,
             host_gathers,
-        )?;
+        )?
+        .seal_committed_position()?;
         let inner = MetalAppendStateInferencePlan::new(captured, renderer)?;
         if inner.summary().fallback_count != 0 {
             return Err(LlamaMetalStepError::Metal(MetalError::Unsupported(
@@ -184,7 +209,7 @@ impl LlamaMetalStepPlan {
         self.inner.state_inputs()
     }
 
-    /// Returns the token and scalar-position transient schemas.
+    /// Returns the token-only caller transient schema.
     pub fn transient_inputs(&self) -> &[ReplayInput] {
         self.inner.transient_inputs()
     }
@@ -249,27 +274,7 @@ impl LlamaMetalStepSession {
     /// Runs exactly one token. Invalid tokens, a full context, and failed
     /// device transactions preserve both position and the prior committed K/V rows.
     pub fn run_token(&mut self, token: u32) -> Result<LlamaMetalStep, LlamaMetalStepError> {
-        if token > i32::MAX as u32 || token as usize >= self.vocab_size {
-            return Err(LlamaMetalStepError::TokenOutOfRange {
-                token,
-                vocab_size: self.vocab_size,
-            });
-        }
-        let position = self.position();
-        if position >= self.max_context {
-            return Err(LlamaMetalStepError::ContextExhausted {
-                position,
-                maximum: self.max_context,
-            });
-        }
-        let position_value = step_position_input(position)?;
-        let inputs = BTreeMap::from([
-            (
-                TOKEN_INPUT.to_owned(),
-                TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))])?,
-            ),
-            (POSITION_INPUT.to_owned(), position_value),
-        ]);
+        let (position, inputs) = self.token_inputs(token)?;
         let run = self.inner.run(&inputs)?;
         let (mut outputs, report) = run.into_parts();
         debug_assert_eq!(outputs.len(), 1);
@@ -284,16 +289,45 @@ impl LlamaMetalStepSession {
             report,
         })
     }
-}
 
-fn step_position_input(position: usize) -> Result<TensorData, LlamaMetalStepError> {
-    let position = i32::try_from(position)
-        .map_err(|_| LlamaMetalStepError::Dimension("position exceeds I32"))?;
-    Ok(TensorData::from_scalars(
-        [1],
-        DType::I32,
-        [Scalar::I(i64::from(position))],
-    )?)
+    /// Commits exactly one prompt token while retaining its computed logits on
+    /// device. This advances the same atomic K/V position as [`Self::run_token`].
+    pub fn commit_token(
+        &mut self,
+        token: u32,
+    ) -> Result<LlamaMetalTokenCommit, LlamaMetalStepError> {
+        let (position, inputs) = self.token_inputs(token)?;
+        let run = self.inner.run_without_host_outputs(&inputs)?;
+        debug_assert!(run.outputs().is_empty());
+        let (_, report) = run.into_parts();
+        Ok(LlamaMetalTokenCommit { position, report })
+    }
+
+    fn token_inputs(
+        &self,
+        token: u32,
+    ) -> Result<(usize, BTreeMap<String, TensorData>), LlamaMetalStepError> {
+        if token > i32::MAX as u32 || token as usize >= self.vocab_size {
+            return Err(LlamaMetalStepError::TokenOutOfRange {
+                token,
+                vocab_size: self.vocab_size,
+            });
+        }
+        let position = self.position();
+        if position >= self.max_context {
+            return Err(LlamaMetalStepError::ContextExhausted {
+                position,
+                maximum: self.max_context,
+            });
+        }
+        Ok((
+            position,
+            BTreeMap::from([(
+                TOKEN_INPUT.to_owned(),
+                TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))])?,
+            )]),
+        ))
+    }
 }
 
 struct BuiltStepGraph {
@@ -1004,14 +1038,6 @@ mod tests {
     }
 
     #[test]
-    fn scalar_position_is_the_only_host_append_coordinate() {
-        let position = step_position_input(7).unwrap();
-        assert_eq!(position.dtype(), DType::I32);
-        assert_eq!(position.shape().dims(), [1]);
-        assert_eq!(position.to_le_bytes().unwrap(), 7i32.to_le_bytes());
-    }
-
-    #[test]
     fn plans_tied_and_explicit_outputs_with_exact_resident_state_ownership() {
         let (tied, _, _) = super::super::model_tests::make_model(4);
         let tied_plan = LlamaMetalStepPlan::new(&tied, renderer()).unwrap();
@@ -1047,11 +1073,13 @@ mod tests {
                     input.desc.shape.dims().to_vec(),
                 ))
                 .collect::<Vec<_>>(),
-            [
-                (POSITION_INPUT, DType::I32, vec![1]),
-                (TOKEN_INPUT, DType::I32, vec![1, 1]),
-            ]
+            [(TOKEN_INPUT, DType::I32, vec![1, 1])]
         );
+        assert_eq!(
+            tied_plan.summary().runtime_control_input_names,
+            [POSITION_INPUT]
+        );
+        assert_eq!(tied_plan.summary().runtime_control_input_bytes, 4);
         assert_eq!(
             tied_plan
                 .resident_inputs()
@@ -1131,6 +1159,8 @@ mod tests {
             &built.quantized,
             &[TOKEN_INPUT, POSITION_INPUT],
         )
+        .unwrap()
+        .seal_committed_position()
         .unwrap();
         assert_eq!(
             unchecked.capture().identity,
@@ -1140,5 +1170,7 @@ mod tests {
             unchecked.deployment_identity(),
             authenticated.deployment_identity()
         );
+        assert_eq!(authenticated.transient_inputs().len(), 1);
+        assert_eq!(authenticated.transient_inputs()[0].name, TOKEN_INPUT);
     }
 }
