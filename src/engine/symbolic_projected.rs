@@ -184,10 +184,12 @@ impl SymbolicProjectedIndexMap {
                 .max
                 == 0);
         }
-        Ok(concrete.canonical_expression()
-            == self
+        Ok(crate::projected_index::projected_expr_eq(
+            &concrete.canonical_expression(),
+            &self
                 .specialize_expression(environment)?
-                .canonicalized_for_output(concrete.output_elements))
+                .canonicalized_for_output(concrete.output_elements),
+        ))
     }
 
     pub(crate) fn render<E: ProjectedIndexEmitter<SymbolicExpr>>(
@@ -540,8 +542,8 @@ fn positive_dimension(dimension: &SymbolicDim) -> ProjectedExpr<SymbolicExpr> {
 fn zero() -> ProjectedExpr<SymbolicExpr> {
     ProjectedExpr::Binary {
         operation: Binary::Mul,
-        lhs: Box::new(ProjectedExpr::Linear),
-        rhs: Box::new(constant(SymbolicExpr::constant(0))),
+        lhs: std::sync::Arc::new(ProjectedExpr::Linear),
+        rhs: std::sync::Arc::new(constant(SymbolicExpr::constant(0))),
     }
 }
 

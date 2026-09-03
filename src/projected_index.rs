@@ -2,9 +2,15 @@ use crate::uop::{
     AddressSpace, AddressValue, Binary, IndexAddressing, IndexValue, LiteralValue, Operation, UOp,
     UOpError,
 };
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub(crate) const MAX_PROJECTED_INDEX_DEPTH: usize = 256;
 pub(crate) const MAX_PROJECTED_INDEX_NODES: usize = 4096;
+// Compiler construction gets a separately enforced unique-DAG budget before
+// canonicalization. It intentionally matches, rather than expands, the
+// durable artifact occurrence budget above.
+const MAX_GRAPH_PROJECTED_DAG_NODES: usize = MAX_PROJECTED_INDEX_NODES;
 
 /// One completely validated explicit physical-address expression attached to
 /// an ordinary Buffer index. Historical Buffer indices carry a Range as their
@@ -77,9 +83,78 @@ pub(crate) enum ProjectedExpr<C> {
     Constant(C),
     Binary {
         operation: Binary,
-        lhs: Box<Self>,
-        rhs: Box<Self>,
+        lhs: Arc<Self>,
+        rhs: Arc<Self>,
     },
+}
+
+fn projected_expr_eq_with_visits(
+    lhs: &ProjectedExpr<i64>,
+    rhs: &ProjectedExpr<i64>,
+) -> (bool, usize) {
+    let mut pending = vec![(lhs, rhs)];
+    let mut visited = HashSet::new();
+    while let Some((lhs, rhs)) = pending.pop() {
+        let pair = (
+            lhs as *const ProjectedExpr<i64> as usize,
+            rhs as *const ProjectedExpr<i64> as usize,
+        );
+        if !visited.insert(pair) {
+            continue;
+        }
+        match (lhs, rhs) {
+            (ProjectedExpr::Linear, ProjectedExpr::Linear) => {}
+            (ProjectedExpr::Constant(lhs), ProjectedExpr::Constant(rhs)) if lhs == rhs => {}
+            (
+                ProjectedExpr::Binary {
+                    operation: lhs_operation,
+                    lhs: lhs_lhs,
+                    rhs: lhs_rhs,
+                },
+                ProjectedExpr::Binary {
+                    operation: rhs_operation,
+                    lhs: rhs_lhs,
+                    rhs: rhs_rhs,
+                },
+            ) if lhs_operation == rhs_operation => {
+                pending.push((lhs_lhs, rhs_lhs));
+                pending.push((lhs_rhs, rhs_rhs));
+            }
+            _ => return (false, visited.len()),
+        }
+    }
+    (true, visited.len())
+}
+
+pub(crate) fn projected_expr_eq(lhs: &ProjectedExpr<i64>, rhs: &ProjectedExpr<i64>) -> bool {
+    projected_expr_eq_with_visits(lhs, rhs).0
+}
+
+fn uop_structure_eq_with_visits(lhs: &UOp, rhs: &UOp) -> (bool, usize) {
+    let mut pending = vec![(lhs, rhs)];
+    let mut visited = HashSet::new();
+    while let Some((lhs, rhs)) = pending.pop() {
+        if lhs.shares_node_with(rhs) {
+            continue;
+        }
+        let pair = (lhs.node_identity(), rhs.node_identity());
+        if !visited.insert(pair) {
+            continue;
+        }
+        if lhs.operation() != rhs.operation()
+            || lhs.ty() != rhs.ty()
+            || lhs.tag() != rhs.tag()
+            || lhs.sources().len() != rhs.sources().len()
+        {
+            return (false, visited.len());
+        }
+        pending.extend(lhs.sources().iter().zip(rhs.sources()));
+    }
+    (true, visited.len())
+}
+
+fn uop_structure_eq(lhs: &UOp, rhs: &UOp) -> bool {
+    uop_structure_eq_with_visits(lhs, rhs).0
 }
 
 impl<C> ProjectedExpr<C> {
@@ -92,8 +167,8 @@ impl<C> ProjectedExpr<C> {
         }
         Ok(Self::Binary {
             operation,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
+            lhs: Arc::new(lhs),
+            rhs: Arc::new(rhs),
         })
     }
 
@@ -150,8 +225,8 @@ impl<C> ProjectedExpr<C> {
                 rhs,
             } => ProjectedExpr::Binary {
                 operation: *operation,
-                lhs: Box::new(lhs.try_map(map)?),
-                rhs: Box::new(rhs.try_map(map)?),
+                lhs: Arc::new(lhs.try_map(map)?),
+                rhs: Arc::new(rhs.try_map(map)?),
             },
         })
     }
@@ -197,195 +272,518 @@ impl ProjectedExpr<i64> {
                 lhs,
                 rhs,
             } => {
-                let mut lhs = lhs.canonicalized_inner(output_elements);
-                let mut rhs = rhs.canonicalized_inner(output_elements);
-                if let (Self::Constant(lhs), Self::Constant(rhs)) = (&lhs, &rhs) {
-                    let folded = match operation {
-                        Binary::Add => lhs.checked_add(*rhs),
-                        Binary::Sub => lhs.checked_sub(*rhs),
-                        Binary::Mul => lhs.checked_mul(*rhs),
-                        Binary::FloorDiv if *rhs > 0 => lhs.checked_div_euclid(*rhs),
-                        Binary::Mod if *rhs > 0 => lhs.checked_rem_euclid(*rhs),
-                        _ => None,
-                    };
-                    if let Some(value) = folded {
-                        return Self::Constant(value);
-                    }
-                }
-                if let Some(extent) = output_elements.and_then(|extent| i64::try_from(extent).ok())
-                    && extent > 0
-                    && matches!(operation, Binary::FloorDiv | Binary::Mod)
-                    && matches!(&lhs, Self::Linear)
-                    && matches!(&rhs, Self::Constant(value) if *value == extent)
-                {
-                    return if matches!(operation, Binary::FloorDiv) {
-                        Self::Constant(0)
-                    } else {
-                        Self::Linear
-                    };
-                }
-                match (operation, &lhs, &rhs) {
-                    (Binary::Add | Binary::Sub, _, Self::Constant(0)) => return lhs,
-                    (Binary::Add, Self::Constant(0), _) => return rhs,
-                    (Binary::Mul, _, Self::Constant(1))
-                    | (Binary::FloorDiv, _, Self::Constant(1)) => return lhs,
-                    (Binary::Mul, Self::Constant(1), _) => return rhs,
-                    (Binary::Mul, _, Self::Constant(0))
-                    | (Binary::Mul, Self::Constant(0), _)
-                    | (Binary::Mod, _, Self::Constant(1)) => return Self::Constant(0),
-                    _ => {}
-                }
-
-                // In the authenticated linear domain `0 <= i < extent`, the
-                // remainder around a quotient is redundant when the complete
-                // quotient range already fits below the modulus. This is the
-                // unit-axis form emitted by a symbolic permutation; concrete
-                // lowering omits that axis before rebuilding the same address.
-                if matches!(operation, Binary::Mod)
-                    && let Self::Binary {
-                        operation: Binary::FloorDiv,
-                        lhs: numerator,
-                        rhs: divisor,
-                    } = &lhs
-                    && matches!(numerator.as_ref(), Self::Linear)
-                    && let (Self::Constant(divisor), Self::Constant(modulus)) =
-                        (divisor.as_ref(), &rhs)
-                    && *divisor > 0
-                    && *modulus > 0
-                    && let Some(limit) = divisor.checked_mul(*modulus)
-                    && output_elements
-                        .and_then(|extent| i64::try_from(extent).ok())
-                        .is_some_and(|extent| extent <= limit)
-                {
-                    return lhs;
-                }
-
-                // tinygrad's active symbolic rules keep repeated division and
-                // remainder chains compact. Positive constant divisors are an
-                // authenticated property of this closed address dialect.
-                if matches!(operation, Binary::Mod)
-                    && let Self::Binary {
-                        operation: Binary::Mod,
-                        lhs: _,
-                        rhs: inner_divisor,
-                    } = &lhs
-                    && inner_divisor.as_ref() == &rhs
-                {
-                    return lhs;
-                }
-                if matches!(operation, Binary::FloorDiv)
-                    && let Self::Binary {
-                        operation: Binary::FloorDiv,
-                        lhs: numerator,
-                        rhs: inner_divisor,
-                    } = &lhs
-                    && let (Self::Constant(inner), Self::Constant(outer)) =
-                        (inner_divisor.as_ref(), &rhs)
-                    && *inner > 0
-                    && *outer > 0
-                    && let Some(divisor) = inner.checked_mul(*outer)
-                {
-                    return if divisor == 1 {
-                        numerator.as_ref().clone()
-                    } else {
-                        Self::Binary {
-                            operation: Binary::FloorDiv,
-                            lhs: numerator.clone(),
-                            rhs: Box::new(Self::Constant(divisor)),
-                        }
-                    };
-                }
-
-                if matches!(operation, Binary::Add)
-                    && let Some(value) = Self::recombined_divmod(&lhs, &rhs)
-                        .or_else(|| Self::recombined_divmod(&rhs, &lhs))
-                {
-                    return value;
-                }
-
-                // Constants have one deterministic position, which exposes
-                // adjacent associative literals to one checked fold without
-                // reordering nonconstant address terms.
-                if matches!(operation, Binary::Add | Binary::Mul)
-                    && matches!(&lhs, Self::Constant(_))
-                    && !matches!(&rhs, Self::Constant(_))
-                {
-                    std::mem::swap(&mut lhs, &mut rhs);
-                }
-                if matches!(operation, Binary::Add | Binary::Mul)
-                    && let Self::Constant(outer) = &rhs
-                    && let Self::Binary {
-                        operation: inner_operation,
-                        lhs: inner_lhs,
-                        rhs: inner_rhs,
-                    } = &lhs
-                    && *inner_operation == *operation
-                    && let Self::Constant(inner) = inner_rhs.as_ref()
-                {
-                    let combined = match operation {
-                        Binary::Add => inner.checked_add(*outer),
-                        Binary::Mul => inner.checked_mul(*outer),
-                        _ => None,
-                    };
-                    if let Some(combined) = combined {
-                        return match (operation, combined) {
-                            (Binary::Add, 0) | (Binary::Mul, 1) => inner_lhs.as_ref().clone(),
-                            (Binary::Mul, 0) => Self::Constant(0),
-                            _ => Self::Binary {
-                                operation: *operation,
-                                lhs: inner_lhs.clone(),
-                                rhs: Box::new(Self::Constant(combined)),
-                            },
-                        };
-                    }
-                }
-
-                Self::Binary {
-                    operation: *operation,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                }
+                let lhs = lhs.canonicalized_inner(output_elements);
+                let rhs = rhs.canonicalized_inner(output_elements);
+                Self::canonicalized_binary(*operation, lhs, rhs, output_elements)
             }
         }
     }
 
-    fn recombined_divmod(product: &Self, remainder: &Self) -> Option<Self> {
-        let Self::Binary {
-            operation: Binary::Mod,
-            lhs: remainder_numerator,
-            rhs: remainder_divisor,
-        } = remainder
-        else {
-            return None;
-        };
-        let Self::Binary {
-            operation: Binary::Mul,
-            lhs,
-            rhs,
-        } = product
-        else {
-            return None;
-        };
-        let quotient = [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())]
-            .into_iter()
-            .find_map(|(quotient, multiplier)| {
-                let Self::Binary {
+    fn canonicalized_binary(
+        operation: Binary,
+        mut lhs: Self,
+        mut rhs: Self,
+        output_elements: Option<usize>,
+    ) -> Self {
+        if let (Self::Constant(lhs), Self::Constant(rhs)) = (&lhs, &rhs) {
+            let folded = match operation {
+                Binary::Add => lhs.checked_add(*rhs),
+                Binary::Sub => lhs.checked_sub(*rhs),
+                Binary::Mul => lhs.checked_mul(*rhs),
+                Binary::FloorDiv if *rhs > 0 => lhs.checked_div_euclid(*rhs),
+                Binary::Mod if *rhs > 0 => lhs.checked_rem_euclid(*rhs),
+                _ => None,
+            };
+            if let Some(value) = folded {
+                return Self::Constant(value);
+            }
+        }
+        if let Some(extent) = output_elements.and_then(|extent| i64::try_from(extent).ok())
+            && extent > 0
+            && matches!(operation, Binary::FloorDiv | Binary::Mod)
+            && matches!(&lhs, Self::Linear)
+            && matches!(&rhs, Self::Constant(value) if *value == extent)
+        {
+            return if matches!(operation, Binary::FloorDiv) {
+                Self::Constant(0)
+            } else {
+                Self::Linear
+            };
+        }
+        match (&operation, &lhs, &rhs) {
+            (Binary::Add | Binary::Sub, _, Self::Constant(0)) => return lhs,
+            (Binary::Add, Self::Constant(0), _) => return rhs,
+            (Binary::Mul, _, Self::Constant(1)) | (Binary::FloorDiv, _, Self::Constant(1)) => {
+                return lhs;
+            }
+            (Binary::Mul, Self::Constant(1), _) => return rhs,
+            (Binary::Mul, _, Self::Constant(0))
+            | (Binary::Mul, Self::Constant(0), _)
+            | (Binary::Mod, _, Self::Constant(1)) => return Self::Constant(0),
+            _ => {}
+        }
+
+        // In the authenticated linear domain `0 <= i < extent`, the
+        // remainder around a quotient is redundant when the complete
+        // quotient range already fits below the modulus. This is the
+        // unit-axis form emitted by a symbolic permutation; concrete
+        // lowering omits that axis before rebuilding the same address.
+        if matches!(operation, Binary::Mod)
+            && let Self::Binary {
+                operation: Binary::FloorDiv,
+                lhs: numerator,
+                rhs: divisor,
+            } = &lhs
+            && matches!(numerator.as_ref(), Self::Linear)
+            && let (Self::Constant(divisor), Self::Constant(modulus)) = (divisor.as_ref(), &rhs)
+            && *divisor > 0
+            && *modulus > 0
+            && let Some(limit) = divisor.checked_mul(*modulus)
+            && output_elements
+                .and_then(|extent| i64::try_from(extent).ok())
+                .is_some_and(|extent| extent <= limit)
+        {
+            return lhs;
+        }
+
+        // tinygrad's active symbolic rules keep repeated division and
+        // remainder chains compact. Positive constant divisors are an
+        // authenticated property of this closed address dialect.
+        if matches!(operation, Binary::Mod)
+            && let Self::Binary {
+                operation: Binary::Mod,
+                lhs: _,
+                rhs: inner_divisor,
+            } = &lhs
+            && let (Self::Constant(inner), Self::Constant(outer)) = (inner_divisor.as_ref(), &rhs)
+            && *inner > 0
+            && *outer > 0
+            && inner % outer == 0
+        {
+            let (inner, outer) = (*inner, *outer);
+            return if inner == outer {
+                lhs
+            } else {
+                Self::Binary {
+                    operation: Binary::Mod,
+                    lhs: match lhs {
+                        Self::Binary { lhs, .. } => lhs,
+                        _ => unreachable!("matched nested modulo"),
+                    },
+                    rhs: Arc::new(Self::Constant(outer)),
+                }
+            };
+        }
+        if matches!(operation, Binary::FloorDiv)
+            && let Self::Binary {
+                operation: Binary::Mod,
+                lhs: numerator,
+                rhs: inner_divisor,
+            } = &lhs
+            && let (Self::Constant(inner), Self::Constant(outer)) = (inner_divisor.as_ref(), &rhs)
+            && *inner > 0
+            && *outer > 0
+            && inner % outer == 0
+        {
+            let (inner, outer) = (*inner, *outer);
+            let modulus = inner / outer;
+            let divided = Self::canonicalized_binary(
+                Binary::FloorDiv,
+                numerator.as_ref().clone(),
+                Self::Constant(outer),
+                output_elements,
+            );
+            return if modulus == 1 {
+                divided
+            } else {
+                Self::canonicalized_binary(
+                    Binary::Mod,
+                    divided,
+                    Self::Constant(modulus),
+                    output_elements,
+                )
+            };
+        }
+        if matches!(operation, Binary::FloorDiv)
+            && let Self::Binary {
+                operation: Binary::FloorDiv,
+                lhs: numerator,
+                rhs: inner_divisor,
+            } = &lhs
+            && let (Self::Constant(inner), Self::Constant(outer)) = (inner_divisor.as_ref(), &rhs)
+            && *inner > 0
+            && *outer > 0
+            && let Some(divisor) = inner.checked_mul(*outer)
+        {
+            return if divisor == 1 {
+                numerator.as_ref().clone()
+            } else {
+                Self::Binary {
                     operation: Binary::FloorDiv,
-                    lhs: numerator,
-                    rhs: divisor,
-                } = quotient
-                else {
+                    lhs: numerator.clone(),
+                    rhs: Arc::new(Self::Constant(divisor)),
+                }
+            };
+        }
+
+        // Split an additive numerator into exact multiples of one positive
+        // divisor plus a bounded residual. Euclidean division then permits
+        // `(q*d + r)//d == q` and `(q*d + r)%d == r` exactly when the
+        // authenticated iteration domain proves `0 <= r < d`. This is the
+        // mixed-radix ladder produced by reshape/permute/Pad convolution
+        // windows; no general distributive rewrite is admitted.
+        if matches!(operation, Binary::FloorDiv | Binary::Mod)
+            && let Self::Constant(divisor) = &rhs
+            && *divisor > 0
+            && let Some(value) =
+                Self::canonicalized_divmod_sum(operation, lhs.clone(), *divisor, output_elements)
+        {
+            return value;
+        }
+
+        if matches!(operation, Binary::Add)
+            && let Some(value) = Self::canonicalized_sum(lhs.clone(), rhs.clone(), output_elements)
+        {
+            return value;
+        }
+
+        // Constants have one deterministic position, which exposes
+        // adjacent associative literals to one checked fold without
+        // reordering nonconstant address terms.
+        if matches!(operation, Binary::Add | Binary::Mul)
+            && matches!(&lhs, Self::Constant(_))
+            && !matches!(&rhs, Self::Constant(_))
+        {
+            std::mem::swap(&mut lhs, &mut rhs);
+        }
+        if matches!(operation, Binary::Add | Binary::Mul)
+            && let Self::Constant(outer) = &rhs
+            && let Self::Binary {
+                operation: inner_operation,
+                lhs: inner_lhs,
+                rhs: inner_rhs,
+            } = &lhs
+            && *inner_operation == operation
+            && let Self::Constant(inner) = inner_rhs.as_ref()
+        {
+            let combined = match operation {
+                Binary::Add => inner.checked_add(*outer),
+                Binary::Mul => inner.checked_mul(*outer),
+                _ => None,
+            };
+            if let Some(combined) = combined {
+                return match (operation, combined) {
+                    (Binary::Add, 0) | (Binary::Mul, 1) => inner_lhs.as_ref().clone(),
+                    (Binary::Mul, 0) => Self::Constant(0),
+                    _ => Self::Binary {
+                        operation,
+                        lhs: inner_lhs.clone(),
+                        rhs: Arc::new(Self::Constant(combined)),
+                    },
+                };
+            }
+        }
+
+        Self::Binary {
+            operation,
+            lhs: Arc::new(lhs),
+            rhs: Arc::new(rhs),
+        }
+    }
+
+    fn canonicalized_sum(lhs: Self, rhs: Self, output_elements: Option<usize>) -> Option<Self> {
+        const MAX_RECOMPOSITION_TERMS: usize = MAX_PROJECTED_INDEX_DEPTH;
+
+        fn append_terms(
+            expression: ProjectedExpr<i64>,
+            terms: &mut Vec<ProjectedExpr<i64>>,
+        ) -> bool {
+            let mut pending = vec![expression];
+            while let Some(expression) = pending.pop() {
+                if terms
+                    .len()
+                    .checked_add(pending.len())
+                    .is_none_or(|nodes| nodes >= MAX_RECOMPOSITION_TERMS)
+                {
+                    return false;
+                }
+                match expression {
+                    ProjectedExpr::Binary {
+                        operation: Binary::Add,
+                        lhs,
+                        rhs,
+                    } => {
+                        pending.push(rhs.as_ref().clone());
+                        pending.push(lhs.as_ref().clone());
+                    }
+                    expression => terms.push(expression),
+                }
+            }
+            true
+        }
+
+        let mut terms = Vec::new();
+        if !append_terms(lhs, &mut terms) || !append_terms(rhs, &mut terms) {
+            return None;
+        }
+        let mut changed = false;
+        'recombine: loop {
+            for remainder in 0..terms.len() {
+                for product in 0..terms.len() {
+                    if remainder == product {
+                        continue;
+                    }
+                    let Some(recombined) =
+                        Self::recombined_divmod(&terms[product], &terms[remainder])
+                    else {
+                        continue;
+                    };
+                    let recombined = recombined.canonicalized_inner(output_elements);
+                    let retained = remainder.min(product);
+                    let removed = remainder.max(product);
+                    terms[retained] = recombined;
+                    terms.remove(removed);
+                    changed = true;
+                    continue 'recombine;
+                }
+            }
+            break;
+        }
+        if !changed {
+            return None;
+        }
+        let mut terms = terms.into_iter();
+        let mut sum = terms.next().unwrap_or(Self::Constant(0));
+        for term in terms {
+            sum = Self::Binary {
+                operation: Binary::Add,
+                lhs: Arc::new(sum),
+                rhs: Arc::new(term),
+            };
+        }
+        Some(sum)
+    }
+
+    fn canonicalized_divmod_sum(
+        operation: Binary,
+        numerator: Self,
+        divisor: i64,
+        output_elements: Option<usize>,
+    ) -> Option<Self> {
+        const MAX_DIVMOD_TERMS: usize = MAX_PROJECTED_INDEX_DEPTH;
+
+        fn append_terms(
+            expression: ProjectedExpr<i64>,
+            terms: &mut Vec<ProjectedExpr<i64>>,
+        ) -> bool {
+            let mut pending = vec![expression];
+            while let Some(expression) = pending.pop() {
+                if terms
+                    .len()
+                    .checked_add(pending.len())
+                    .is_none_or(|nodes| nodes >= MAX_DIVMOD_TERMS)
+                {
+                    return false;
+                }
+                match expression {
+                    ProjectedExpr::Binary {
+                        operation: Binary::Add,
+                        lhs,
+                        rhs,
+                    } => {
+                        pending.push(rhs.as_ref().clone());
+                        pending.push(lhs.as_ref().clone());
+                    }
+                    expression => terms.push(expression),
+                }
+            }
+            true
+        }
+
+        fn exact_quotient(
+            expression: &ProjectedExpr<i64>,
+            divisor: i64,
+            output_elements: Option<usize>,
+        ) -> Option<ProjectedExpr<i64>> {
+            match expression {
+                ProjectedExpr::Constant(value) if value % divisor == 0 => {
+                    Some(ProjectedExpr::Constant(value / divisor))
+                }
+                ProjectedExpr::Binary {
+                    operation: Binary::Mul,
+                    lhs,
+                    rhs,
+                } => {
+                    let (value, factor) = match (lhs.as_ref(), rhs.as_ref()) {
+                        (value, ProjectedExpr::Constant(factor)) => (value, *factor),
+                        (ProjectedExpr::Constant(factor), value) => (value, *factor),
+                        _ => return None,
+                    };
+                    (factor % divisor == 0).then(|| {
+                        ProjectedExpr::canonicalized_binary(
+                            Binary::Mul,
+                            (*value).clone(),
+                            ProjectedExpr::Constant(factor / divisor),
+                            output_elements,
+                        )
+                    })
+                }
+                _ => None,
+            }
+        }
+
+        fn sum(
+            mut terms: impl Iterator<Item = ProjectedExpr<i64>>,
+            output_elements: Option<usize>,
+        ) -> ProjectedExpr<i64> {
+            let mut value = terms.next().unwrap_or(ProjectedExpr::Constant(0));
+            for term in terms {
+                value =
+                    ProjectedExpr::canonicalized_binary(Binary::Add, value, term, output_elements);
+            }
+            value
+        }
+
+        let mut terms = Vec::new();
+        if !append_terms(numerator, &mut terms) || terms.len() < 2 {
+            return None;
+        }
+        let mut quotients = Vec::new();
+        let mut residuals = Vec::new();
+        for term in terms {
+            if let Some(quotient) = exact_quotient(&term, divisor, output_elements) {
+                quotients.push(quotient);
+            } else {
+                residuals.push(term);
+            }
+        }
+        if quotients.is_empty() {
+            return None;
+        }
+        let residual = sum(residuals.into_iter(), output_elements);
+        let output_elements = output_elements?;
+        let mut state = ValidationState {
+            output_elements,
+            nodes: 0,
+            fits_i32: true,
+        };
+        let (minimum, maximum) = validate_expression(&residual, 0, &mut state).ok()??;
+        if minimum < 0 || maximum >= i128::from(divisor) {
+            return None;
+        }
+        match operation {
+            Binary::Mod => Some(residual),
+            Binary::FloorDiv => Some(sum(quotients.into_iter(), Some(output_elements))),
+            _ => None,
+        }
+    }
+
+    fn recombined_divmod(product: &Self, remainder: &Self) -> Option<Self> {
+        fn scaled_mod(expression: &ProjectedExpr<i64>) -> Option<(&ProjectedExpr<i64>, i64, i64)> {
+            let (modulo, scale) = match expression {
+                ProjectedExpr::Binary {
+                    operation: Binary::Mul,
+                    lhs,
+                    rhs,
+                } => match (lhs.as_ref(), rhs.as_ref()) {
+                    (modulo, ProjectedExpr::Constant(scale)) if *scale > 0 => (modulo, *scale),
+                    (ProjectedExpr::Constant(scale), modulo) if *scale > 0 => (modulo, *scale),
+                    _ => return None,
+                },
+                modulo => (modulo, 1),
+            };
+            let ProjectedExpr::Binary {
+                operation: Binary::Mod,
+                lhs: base,
+                rhs,
+            } = modulo
+            else {
+                return None;
+            };
+            let ProjectedExpr::Constant(divisor) = rhs.as_ref() else {
+                return None;
+            };
+            (*divisor > 0).then_some((base, *divisor, scale))
+        }
+
+        fn scaled_quotient(expression: &ProjectedExpr<i64>) -> Option<(&ProjectedExpr<i64>, i64)> {
+            let ProjectedExpr::Binary {
+                operation: Binary::Mul,
+                lhs,
+                rhs,
+            } = expression
+            else {
+                return None;
+            };
+            match (lhs.as_ref(), rhs.as_ref()) {
+                (quotient, ProjectedExpr::Constant(scale)) if *scale > 0 => {
+                    Some((quotient, *scale))
+                }
+                (ProjectedExpr::Constant(scale), quotient) if *scale > 0 => {
+                    Some((quotient, *scale))
+                }
+                _ => None,
+            }
+        }
+
+        fn scaled(expression: ProjectedExpr<i64>, scale: i64) -> ProjectedExpr<i64> {
+            if scale == 1 {
+                expression
+            } else {
+                ProjectedExpr::Binary {
+                    operation: Binary::Mul,
+                    lhs: Arc::new(expression),
+                    rhs: Arc::new(ProjectedExpr::Constant(scale)),
+                }
+            }
+        }
+
+        let (remainder_base, divisor, remainder_scale) = scaled_mod(remainder)?;
+        let (quotient, quotient_scale) = scaled_quotient(product)?;
+        if divisor.checked_mul(remainder_scale)? != quotient_scale {
+            return None;
+        }
+        let (quotient, partial_modulus) = match quotient {
+            ProjectedExpr::Binary {
+                operation: Binary::Mod,
+                lhs,
+                rhs,
+            } => {
+                let ProjectedExpr::Constant(modulus) = rhs.as_ref() else {
                     return None;
                 };
-                (multiplier == divisor.as_ref()).then_some((numerator.as_ref(), divisor.as_ref()))
-            })?;
-        if matches!(quotient.1, Self::Constant(divisor) if *divisor > 0)
-            && quotient.0 == remainder_numerator.as_ref()
-            && quotient.1 == remainder_divisor.as_ref()
+                if *modulus <= 0 {
+                    return None;
+                }
+                (lhs.as_ref(), Some(*modulus))
+            }
+            quotient => (quotient, None),
+        };
+        let ProjectedExpr::Binary {
+            operation: Binary::FloorDiv,
+            lhs: quotient_base,
+            rhs: quotient_divisor,
+        } = quotient
+        else {
+            return None;
+        };
+        if !matches!(quotient_divisor.as_ref(), ProjectedExpr::Constant(value) if *value == divisor)
+            || !projected_expr_eq(quotient_base, remainder_base)
         {
-            Some(quotient.0.clone())
+            return None;
+        }
+        if let Some(modulus) = partial_modulus {
+            let widened = divisor.checked_mul(modulus)?;
+            Some(scaled(
+                ProjectedExpr::Binary {
+                    operation: Binary::Mod,
+                    lhs: quotient_base.clone(),
+                    rhs: Arc::new(ProjectedExpr::Constant(widened)),
+                },
+                remainder_scale,
+            ))
         } else {
-            None
+            Some(scaled(quotient_base.as_ref().clone(), remainder_scale))
         }
     }
 
@@ -404,23 +802,72 @@ impl ProjectedExpr<i64> {
                 vec![range, UOp::constant(0, ty)],
             ));
         }
-        fn build(expression: &ProjectedExpr<i64>, range: &UOp) -> UOp {
+        Ok(self.to_uop_with_context(
+            &range,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        ))
+    }
+
+    fn to_uop_with_context(
+        &self,
+        range: &UOp,
+        pointers: &mut HashMap<usize, UOp>,
+        constants: &mut HashMap<i64, UOp>,
+        binaries: &mut HashMap<(Binary, usize, usize), UOp>,
+    ) -> UOp {
+        fn build(
+            expression: &ProjectedExpr<i64>,
+            range: &UOp,
+            pointers: &mut HashMap<usize, UOp>,
+            constants: &mut HashMap<i64, UOp>,
+            binaries: &mut HashMap<(Binary, usize, usize), UOp>,
+        ) -> UOp {
             let ty = crate::UType::scalar(crate::DType::I64);
             match expression {
                 ProjectedExpr::Linear => range.clone(),
-                ProjectedExpr::Constant(value) => UOp::constant(*value, ty),
+                ProjectedExpr::Constant(value) => constants
+                    .entry(*value)
+                    .or_insert_with(|| UOp::constant(*value, ty))
+                    .clone(),
                 ProjectedExpr::Binary {
                     operation,
                     lhs,
                     rhs,
-                } => UOp::from_operation(
-                    Operation::Binary(*operation),
-                    Some(ty),
-                    vec![build(lhs, range), build(rhs, range)],
-                ),
+                } => {
+                    let lhs = build_shared(lhs, range, pointers, constants, binaries);
+                    let rhs = build_shared(rhs, range, pointers, constants, binaries);
+                    let key = (*operation, lhs.node_identity(), rhs.node_identity());
+                    binaries
+                        .entry(key)
+                        .or_insert_with(|| {
+                            UOp::from_operation(
+                                Operation::Binary(*operation),
+                                Some(ty),
+                                vec![lhs, rhs],
+                            )
+                        })
+                        .clone()
+                }
             }
         }
-        Ok(build(self, &range))
+        fn build_shared(
+            expression: &Arc<ProjectedExpr<i64>>,
+            range: &UOp,
+            pointers: &mut HashMap<usize, UOp>,
+            constants: &mut HashMap<i64, UOp>,
+            binaries: &mut HashMap<(Binary, usize, usize), UOp>,
+        ) -> UOp {
+            let identity = Arc::as_ptr(expression) as usize;
+            if let Some(value) = pointers.get(&identity) {
+                return value.clone();
+            }
+            let value = build(expression, range, pointers, constants, binaries);
+            pointers.insert(identity, value.clone());
+            value
+        }
+        build(self, range, pointers, constants, binaries)
     }
 }
 
@@ -714,20 +1161,310 @@ impl ProjectedIndexPlan {
     }
 }
 
-/// Canonicalizes one graph-derived projected address before another movement
-/// step composes it. Repeated reshape decomposition preserves UOp DAG sharing,
-/// but its expanded expression tree can otherwise grow past the hostile-wire
-/// limit before the final Index is available to the ordinary canonicalizer.
-/// This helper retains that limit for every intermediate expression and proves
-/// its complete concrete output domain against the declared source extent.
+struct GraphProjectedCanonicalizer {
+    output_elements: usize,
+    nodes: usize,
+    active: HashSet<usize>,
+    expressions: HashMap<usize, (ProjectedExpr<i64>, usize)>,
+    predicates: HashMap<usize, (CanonicalGraphPredicate, usize)>,
+}
+
+#[derive(Clone)]
+enum CanonicalGraphPredicate {
+    Constant(bool),
+    Term(UOp),
+    And(Vec<UOp>),
+}
+
+impl CanonicalGraphPredicate {
+    fn into_uop(self) -> UOp {
+        fn boolean(value: bool) -> UOp {
+            UOp::scalar_constant(
+                crate::DType::Bool,
+                u64::from(value),
+                crate::UType::scalar(crate::DType::Bool),
+            )
+        }
+        fn balanced_and(mut terms: Vec<UOp>) -> UOp {
+            while terms.len() > 1 {
+                terms = terms
+                    .chunks(2)
+                    .map(|pair| match pair {
+                        [lhs, rhs] => UOp::from_operation(
+                            Operation::GraphLogical(crate::LogicalOp::And),
+                            Some(crate::UType::scalar(crate::DType::Bool)),
+                            vec![lhs.clone(), rhs.clone()],
+                        ),
+                        [value] => value.clone(),
+                        _ => unreachable!("chunks of two are nonempty"),
+                    })
+                    .collect();
+            }
+            terms.pop().unwrap_or_else(|| boolean(true))
+        }
+        match self {
+            Self::Constant(value) => boolean(value),
+            Self::Term(term) => term,
+            Self::And(terms) => balanced_and(terms),
+        }
+    }
+
+    fn and(lhs: Self, rhs: Self) -> Self {
+        match (lhs, rhs) {
+            (Self::Constant(false), _) | (_, Self::Constant(false)) => Self::Constant(false),
+            (Self::Constant(true), rhs) => rhs,
+            (lhs, Self::Constant(true)) => lhs,
+            (lhs, rhs) => {
+                let mut terms = Vec::new();
+                let mut extend = |predicate| match predicate {
+                    Self::Term(term) => {
+                        if !terms
+                            .iter()
+                            .any(|existing| uop_structure_eq(existing, &term))
+                        {
+                            terms.push(term);
+                        }
+                    }
+                    Self::And(values) => {
+                        for term in values {
+                            if !terms
+                                .iter()
+                                .any(|existing| uop_structure_eq(existing, &term))
+                            {
+                                terms.push(term);
+                            }
+                        }
+                    }
+                    Self::Constant(_) => unreachable!("constants were folded above"),
+                };
+                extend(lhs);
+                extend(rhs);
+                Self::And(terms)
+            }
+        }
+    }
+}
+
+impl GraphProjectedCanonicalizer {
+    fn new(output_elements: usize) -> Self {
+        Self {
+            output_elements,
+            nodes: 0,
+            active: HashSet::new(),
+            expressions: HashMap::new(),
+            predicates: HashMap::new(),
+        }
+    }
+
+    fn enter(&mut self, node: &UOp, depth: usize) -> Result<(), UOpError> {
+        let identity = node.node_identity();
+        if depth > MAX_PROJECTED_INDEX_DEPTH {
+            return Err(UOpError::InvalidIndex);
+        }
+        self.nodes = self.nodes.checked_add(1).ok_or(UOpError::InvalidIndex)?;
+        if self.nodes > MAX_GRAPH_PROJECTED_DAG_NODES || !self.active.insert(identity) {
+            return Err(UOpError::InvalidIndex);
+        }
+        Ok(())
+    }
+
+    fn expression(
+        &mut self,
+        expression: &UOp,
+        depth: usize,
+    ) -> Result<(ProjectedExpr<i64>, usize), UOpError> {
+        let identity = expression.node_identity();
+        if let Some((expression, height)) = self.expressions.get(&identity) {
+            depth
+                .checked_add(*height)
+                .filter(|deepest| *deepest <= MAX_PROJECTED_INDEX_DEPTH)
+                .ok_or(UOpError::InvalidIndex)?;
+            return Ok((expression.clone(), *height));
+        }
+        self.enter(expression, depth)?;
+        if expression.ty() != Some(crate::UType::scalar(crate::DType::I64)) {
+            return Err(UOpError::InvalidIndex);
+        }
+        let (parsed, height) = match expression.operation() {
+            Operation::Range(0) => {
+                let [bound] = expression.sources() else {
+                    return Err(UOpError::InvalidIndex);
+                };
+                let Operation::Const(LiteralValue::Int(bound)) = bound.operation() else {
+                    return Err(UOpError::InvalidIndex);
+                };
+                if usize::try_from(*bound).ok() != Some(self.output_elements) {
+                    return Err(UOpError::InvalidIndex);
+                }
+                (ProjectedExpr::Linear, 0)
+            }
+            Operation::Const(LiteralValue::Int(value)) if expression.sources().is_empty() => {
+                (ProjectedExpr::Constant(*value), 0)
+            }
+            Operation::Binary(operation) if expression.sources().len() == 2 => {
+                let (lhs, lhs_height) = self.expression(&expression.sources()[0], depth + 1)?;
+                let (rhs, rhs_height) = self.expression(&expression.sources()[1], depth + 1)?;
+                let parsed = if self.output_elements == 0 {
+                    ProjectedExpr::binary(*operation, lhs, rhs)?
+                } else {
+                    ProjectedExpr::canonicalized_binary(
+                        *operation,
+                        lhs,
+                        rhs,
+                        Some(self.output_elements),
+                    )
+                };
+                (
+                    parsed,
+                    lhs_height
+                        .max(rhs_height)
+                        .checked_add(1)
+                        .ok_or(UOpError::InvalidIndex)?,
+                )
+            }
+            _ => return Err(UOpError::InvalidIndex),
+        };
+        self.active.remove(&identity);
+        self.expressions.insert(identity, (parsed.clone(), height));
+        Ok((parsed, height))
+    }
+
+    fn checked_expression_uop(&self, expression: &ProjectedExpr<i64>) -> Result<UOp, UOpError> {
+        let mut state = ValidationState {
+            output_elements: self.output_elements,
+            nodes: 0,
+            fits_i32: true,
+        };
+        validate_expression(expression, 0, &mut state)?;
+        expression.to_uop(self.output_elements)
+    }
+
+    fn predicate(
+        &mut self,
+        predicate: &UOp,
+        depth: usize,
+    ) -> Result<(CanonicalGraphPredicate, usize), UOpError> {
+        let identity = predicate.node_identity();
+        if let Some((predicate, height)) = self.predicates.get(&identity) {
+            depth
+                .checked_add(*height)
+                .filter(|deepest| *deepest <= MAX_PROJECTED_INDEX_DEPTH)
+                .ok_or(UOpError::InvalidIndex)?;
+            return Ok((predicate.clone(), *height));
+        }
+        self.enter(predicate, depth)?;
+        if predicate.ty() != Some(crate::UType::scalar(crate::DType::Bool)) {
+            return Err(UOpError::InvalidIndex);
+        }
+        let (parsed, height) = match predicate.operation() {
+            Operation::Const(LiteralValue::Scalar {
+                dtype: crate::DType::Bool,
+                bits,
+            }) if predicate.sources().is_empty() && *bits <= 1 => {
+                (CanonicalGraphPredicate::Constant(*bits != 0), 0)
+            }
+            Operation::GraphCompare(operation) if predicate.sources().len() == 2 => {
+                let (lhs, lhs_height) = self.expression(&predicate.sources()[0], depth + 1)?;
+                let (rhs, rhs_height) = self.expression(&predicate.sources()[1], depth + 1)?;
+                let folded = match (&lhs, &rhs) {
+                    (ProjectedExpr::Constant(lhs), ProjectedExpr::Constant(rhs)) => {
+                        Some(match operation {
+                            crate::CompareOp::Eq => lhs == rhs,
+                            crate::CompareOp::Ne => lhs != rhs,
+                            crate::CompareOp::Lt => lhs < rhs,
+                            crate::CompareOp::Le => lhs <= rhs,
+                            crate::CompareOp::Gt => lhs > rhs,
+                            crate::CompareOp::Ge => lhs >= rhs,
+                        })
+                    }
+                    _ if projected_expr_eq(&lhs, &rhs) => Some(matches!(
+                        operation,
+                        crate::CompareOp::Eq | crate::CompareOp::Le | crate::CompareOp::Ge
+                    )),
+                    _ => None,
+                };
+                let parsed = if let Some(value) = folded {
+                    CanonicalGraphPredicate::Constant(value)
+                } else {
+                    CanonicalGraphPredicate::Term(UOp::from_operation(
+                        Operation::GraphCompare(*operation),
+                        Some(crate::UType::scalar(crate::DType::Bool)),
+                        vec![
+                            self.checked_expression_uop(&lhs)?,
+                            self.checked_expression_uop(&rhs)?,
+                        ],
+                    ))
+                };
+                (
+                    parsed,
+                    lhs_height
+                        .max(rhs_height)
+                        .checked_add(1)
+                        .ok_or(UOpError::InvalidIndex)?,
+                )
+            }
+            Operation::GraphLogical(operation) => {
+                let ((lhs, lhs_height), rhs) = match (operation, predicate.sources()) {
+                    (crate::LogicalOp::Not, [lhs]) => (self.predicate(lhs, depth + 1)?, None),
+                    (crate::LogicalOp::And | crate::LogicalOp::Or, [lhs, rhs]) => (
+                        self.predicate(lhs, depth + 1)?,
+                        Some(self.predicate(rhs, depth + 1)?),
+                    ),
+                    _ => return Err(UOpError::InvalidIndex),
+                };
+                let rhs_height = rhs.as_ref().map_or(0, |(_, height)| *height);
+                let parsed = match (*operation, lhs, rhs.map(|(predicate, _)| predicate)) {
+                    (crate::LogicalOp::And, lhs, Some(rhs)) => {
+                        CanonicalGraphPredicate::and(lhs, rhs)
+                    }
+                    (crate::LogicalOp::Not, CanonicalGraphPredicate::Constant(value), None) => {
+                        CanonicalGraphPredicate::Constant(!value)
+                    }
+                    (crate::LogicalOp::Or, CanonicalGraphPredicate::Constant(true), Some(_))
+                    | (crate::LogicalOp::Or, _, Some(CanonicalGraphPredicate::Constant(true))) => {
+                        CanonicalGraphPredicate::Constant(true)
+                    }
+                    (crate::LogicalOp::Or, CanonicalGraphPredicate::Constant(false), Some(rhs)) => {
+                        rhs
+                    }
+                    (crate::LogicalOp::Or, lhs, Some(CanonicalGraphPredicate::Constant(false))) => {
+                        lhs
+                    }
+                    (operation, lhs, rhs) => CanonicalGraphPredicate::Term(UOp::from_operation(
+                        Operation::GraphLogical(operation),
+                        Some(crate::UType::scalar(crate::DType::Bool)),
+                        std::iter::once(lhs.into_uop())
+                            .chain(rhs.map(CanonicalGraphPredicate::into_uop))
+                            .collect(),
+                    )),
+                };
+                (
+                    parsed,
+                    lhs_height
+                        .max(rhs_height)
+                        .checked_add(1)
+                        .ok_or(UOpError::InvalidIndex)?,
+                )
+            }
+            _ => return Err(UOpError::InvalidIndex),
+        };
+        self.active.remove(&identity);
+        self.predicates.insert(identity, (parsed.clone(), height));
+        Ok((parsed, height))
+    }
+}
+
+/// Canonicalizes one compiler-derived projected address before another
+/// movement step composes it. The trusted construction DAG is bounded by
+/// unique nodes first, then the canonical expanded expression must still pass
+/// the ordinary hostile artifact occurrence/depth limits below.
 pub(crate) fn canonicalize_graph_projected_address(
     expression: &UOp,
     output_elements: usize,
     source_elements: usize,
 ) -> Result<UOp, UOpError> {
-    let mut parsed_nodes = 0;
-    let expression = parse_expression(expression, output_elements, 0, &mut parsed_nodes)?;
-    let expression = expression.canonicalized_for_output(output_elements);
+    let (expression, _) =
+        GraphProjectedCanonicalizer::new(output_elements).expression(expression, 0)?;
     let mut state = ValidationState {
         output_elements,
         nodes: 0,
@@ -746,6 +1483,80 @@ pub(crate) fn canonicalize_graph_projected_address(
         }
     }
     expression.to_uop(output_elements)
+}
+
+/// Canonicalizes coordinates from one authenticated logical iteration as one
+/// bounded DAG. Keeping one parser and UOp conversion memo across roots
+/// preserves their exact common reshape numerator, allowing the rangeifier to
+/// recompose it before later movement stages. Every coordinate independently
+/// retains the ordinary expanded occurrence, depth, arithmetic, and bounds
+/// checks used by durable projected indices.
+pub(crate) fn canonicalize_graph_projected_coordinates(
+    coordinates: &[(UOp, usize)],
+    output_elements: usize,
+) -> Result<Vec<UOp>, UOpError> {
+    let output_elements_i64 = i64::try_from(output_elements).map_err(|_| UOpError::InvalidIndex)?;
+    let ty = crate::UType::scalar(crate::DType::I64);
+    let range = UOp::from_operation(
+        Operation::Range(0),
+        Some(ty),
+        vec![UOp::constant(output_elements_i64, ty)],
+    );
+    let mut canonicalizer = GraphProjectedCanonicalizer::new(output_elements);
+    let mut pointer_memo = HashMap::new();
+    let mut constant_memo = HashMap::new();
+    let mut binary_memo = HashMap::new();
+    coordinates
+        .iter()
+        .map(|(coordinate, source_elements)| {
+            // The complete multi-root construction shares one unique-node
+            // budget. A later root therefore cannot assemble several
+            // individually valid cached subgraphs into an oversized DAG.
+            let (expression, _) = canonicalizer.expression(coordinate, 0)?;
+            let mut state = ValidationState {
+                output_elements,
+                nodes: 0,
+                fits_i32: true,
+            };
+            let bounds = validate_expression(&expression, 0, &mut state)?;
+            match (output_elements, bounds) {
+                (0, None) => {}
+                (0, Some(_)) | (_, None) => return Err(UOpError::InvalidIndex),
+                (_, Some((minimum, maximum))) => {
+                    let source_elements =
+                        i128::try_from(*source_elements).map_err(|_| UOpError::InvalidIndex)?;
+                    if minimum < 0 || maximum >= source_elements {
+                        return Err(UOpError::InvalidIndex);
+                    }
+                }
+            }
+            if output_elements == 0 {
+                expression.to_uop(0)
+            } else {
+                Ok(expression.to_uop_with_context(
+                    &range,
+                    &mut pointer_memo,
+                    &mut constant_memo,
+                    &mut binary_memo,
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Canonicalizes one compiler-derived projected predicate without changing
+/// the public/wire dialect. Compared address expressions share the same
+/// bounded DAG parser; conjunctions are constant-folded, flattened, and
+/// deterministically deduplicated before the ordinary Index parser remains
+/// the final admission authority.
+pub(crate) fn canonicalize_graph_projected_predicate(
+    predicate: &UOp,
+    output_elements: usize,
+) -> Result<UOp, UOpError> {
+    Ok(GraphProjectedCanonicalizer::new(output_elements)
+        .predicate(predicate, 0)?
+        .0
+        .into_uop())
 }
 
 struct InfixProjectedEmitter<'a, F, B> {
@@ -1260,6 +2071,156 @@ mod tests {
     }
 
     #[test]
+    fn compiler_dag_canonicalizes_before_durable_occurrence_limits() {
+        let mut reconstructed = range(8);
+        for _ in 0..13 {
+            let quotient = binary(Binary::FloorDiv, reconstructed.clone(), integer(4));
+            reconstructed = binary(
+                Binary::Add,
+                binary(Binary::Mul, quotient, integer(4)),
+                binary(Binary::Mod, reconstructed, integer(4)),
+            );
+        }
+        assert!(
+            ProjectedIndexPlan::from_index(&index(
+                Shape::from([8]),
+                Shape::from([8]),
+                reconstructed.clone(),
+            ))
+            .is_err()
+        );
+        let compact = canonicalize_graph_projected_address(&reconstructed, 8, 8).unwrap();
+        let compact =
+            ProjectedIndexPlan::from_index(&index(Shape::from([8]), Shape::from([8]), compact))
+                .unwrap();
+        assert_eq!(
+            (0..8)
+                .map(|lane| compact.offset(lane).unwrap())
+                .collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+
+        let comparison = UOp::from_operation(
+            Operation::GraphCompare(crate::CompareOp::Lt),
+            Some(UType::scalar(DType::Bool)),
+            vec![range(8), integer(8)],
+        );
+        let mut duplicate_conjunction = comparison;
+        for _ in 0..13 {
+            duplicate_conjunction = UOp::from_operation(
+                Operation::GraphLogical(crate::LogicalOp::And),
+                Some(UType::scalar(DType::Bool)),
+                vec![duplicate_conjunction.clone(), duplicate_conjunction],
+            );
+        }
+        let compact = canonicalize_graph_projected_predicate(&duplicate_conjunction, 8).unwrap();
+        let plan =
+            ProjectedIndexPlan::from_index(&predicated_index([8], [8], range(8), compact)).unwrap();
+        assert!((0..8).all(|lane| plan.valid(lane).unwrap()));
+
+        let shared = range(1);
+        let mut deeply_reused = shared.clone();
+        for _ in 0..MAX_PROJECTED_INDEX_DEPTH {
+            deeply_reused = binary(Binary::Add, deeply_reused, integer(0));
+        }
+        let shallow_then_deep = binary(Binary::Add, shared, deeply_reused);
+        assert!(canonicalize_graph_projected_address(&shallow_then_deep, 1, 1).is_err());
+
+        let shared_predicate = UOp::from_operation(
+            Operation::GraphCompare(crate::CompareOp::Eq),
+            Some(UType::scalar(DType::Bool)),
+            vec![range(1), integer(0)],
+        );
+        let mut deeply_reused_predicate = shared_predicate.clone();
+        for _ in 0..MAX_PROJECTED_INDEX_DEPTH {
+            deeply_reused_predicate = UOp::from_operation(
+                Operation::GraphLogical(crate::LogicalOp::Not),
+                Some(UType::scalar(DType::Bool)),
+                vec![deeply_reused_predicate],
+            );
+        }
+        let shallow_then_deep_predicate = UOp::from_operation(
+            Operation::GraphLogical(crate::LogicalOp::And),
+            Some(UType::scalar(DType::Bool)),
+            vec![shared_predicate, deeply_reused_predicate],
+        );
+        assert!(canonicalize_graph_projected_predicate(&shallow_then_deep_predicate, 1).is_err());
+    }
+
+    #[test]
+    fn canonical_structural_equality_visits_shared_diamonds_once() {
+        fn projected_diamond(depth: usize) -> ProjectedExpr<i64> {
+            let mut expression = Arc::new(ProjectedExpr::Linear);
+            for _ in 0..depth {
+                expression = Arc::new(ProjectedExpr::Binary {
+                    operation: Binary::Add,
+                    lhs: expression.clone(),
+                    rhs: expression,
+                });
+            }
+            expression.as_ref().clone()
+        }
+
+        let depth = 64;
+        let lhs = projected_diamond(depth);
+        let rhs = projected_diamond(depth);
+        let (equal, visits) = projected_expr_eq_with_visits(&lhs, &rhs);
+        assert!(equal);
+        assert_eq!(visits, depth + 1);
+
+        fn uop_diamond(depth: usize) -> UOp {
+            let mut expression = range(1);
+            for _ in 0..depth {
+                expression = binary(Binary::Add, expression.clone(), expression);
+            }
+            expression
+        }
+
+        let lhs = uop_diamond(depth);
+        let rhs = uop_diamond(depth);
+        let (equal, visits) = uop_structure_eq_with_visits(&lhs, &rhs);
+        assert!(equal);
+        assert_eq!(visits, depth + 2);
+    }
+
+    #[test]
+    fn projected_expression_to_uop_preserves_shared_children() {
+        let shared = Arc::new(ProjectedExpr::Binary {
+            operation: Binary::Mod,
+            lhs: Arc::new(ProjectedExpr::Linear),
+            rhs: Arc::new(ProjectedExpr::Constant(4)),
+        });
+        let expression = ProjectedExpr::Binary {
+            operation: Binary::Add,
+            lhs: shared.clone(),
+            rhs: shared,
+        };
+        let uop = expression.to_uop(8).unwrap();
+        assert!(uop.sources()[0].shares_node_with(&uop.sources()[1]));
+    }
+
+    #[test]
+    fn coordinate_canonicalization_preserves_one_reshape_numerator() {
+        let linear = range(8);
+        let numerator = binary(Binary::Sub, integer(7), linear);
+        let coordinates = vec![
+            (
+                binary(
+                    Binary::Mod,
+                    binary(Binary::FloorDiv, numerator.clone(), integer(4)),
+                    integer(2),
+                ),
+                2,
+            ),
+            (binary(Binary::Mod, numerator, integer(4)), 4),
+        ];
+        let canonical = canonicalize_graph_projected_coordinates(&coordinates, 8).unwrap();
+        assert!(
+            canonical[0].sources()[0].sources()[0].shares_node_with(&canonical[1].sources()[0])
+        );
+    }
+
+    #[test]
     fn predicated_addresses_are_total_and_false_lanes_never_widen_bounds() {
         let linear = range(5);
         let address = binary(Binary::Mod, linear.clone(), integer(2));
@@ -1409,6 +2370,174 @@ mod tests {
             )
             .unwrap()
         );
+
+        let nested_wide_remainder = ProjectedExpr::binary(
+            Binary::Mod,
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(49),
+            )
+            .unwrap(),
+            ProjectedExpr::Constant(7),
+        )
+        .unwrap();
+        assert_eq!(
+            nested_wide_remainder.canonicalized_for_output(128),
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(7),
+            )
+            .unwrap()
+        );
+        let nested_wide_quotient = ProjectedExpr::binary(
+            Binary::FloorDiv,
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(49),
+            )
+            .unwrap(),
+            ProjectedExpr::Constant(7),
+        )
+        .unwrap();
+        assert_eq!(
+            nested_wide_quotient.canonicalized_for_output(128),
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::binary(
+                    Binary::FloorDiv,
+                    ProjectedExpr::Linear,
+                    ProjectedExpr::Constant(7),
+                )
+                .unwrap(),
+                ProjectedExpr::Constant(7),
+            )
+            .unwrap()
+        );
+
+        let low = ProjectedExpr::binary(
+            Binary::Mod,
+            ProjectedExpr::Linear,
+            ProjectedExpr::Constant(49),
+        )
+        .unwrap();
+        let middle = ProjectedExpr::binary(
+            Binary::Mul,
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::binary(
+                    Binary::FloorDiv,
+                    ProjectedExpr::Linear,
+                    ProjectedExpr::Constant(147),
+                )
+                .unwrap(),
+                ProjectedExpr::Constant(112),
+            )
+            .unwrap(),
+            ProjectedExpr::Constant(49),
+        )
+        .unwrap();
+        let high = ProjectedExpr::binary(
+            Binary::Mul,
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::binary(
+                    Binary::FloorDiv,
+                    ProjectedExpr::Linear,
+                    ProjectedExpr::Constant(49),
+                )
+                .unwrap(),
+                ProjectedExpr::Constant(3),
+            )
+            .unwrap(),
+            ProjectedExpr::Constant(614656),
+        )
+        .unwrap();
+        let ladder = ProjectedExpr::binary(
+            Binary::Add,
+            ProjectedExpr::binary(Binary::Add, high, middle).unwrap(),
+            low,
+        )
+        .unwrap();
+        let selected_axis = ProjectedExpr::binary(
+            Binary::Mod,
+            ProjectedExpr::binary(Binary::FloorDiv, ladder, ProjectedExpr::Constant(49)).unwrap(),
+            ProjectedExpr::Constant(112),
+        )
+        .unwrap()
+        .canonicalized_for_output(118013952);
+        assert_eq!(
+            selected_axis,
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::binary(
+                    Binary::FloorDiv,
+                    ProjectedExpr::Linear,
+                    ProjectedExpr::Constant(147),
+                )
+                .unwrap(),
+                ProjectedExpr::Constant(112),
+            )
+            .unwrap()
+        );
+        let unbounded_residual = ProjectedExpr::binary(
+            Binary::Add,
+            ProjectedExpr::binary(
+                Binary::Mul,
+                ProjectedExpr::Linear,
+                ProjectedExpr::Constant(49),
+            )
+            .unwrap(),
+            ProjectedExpr::Linear,
+        )
+        .unwrap();
+        assert!(
+            ProjectedExpr::canonicalized_divmod_sum(
+                Binary::FloorDiv,
+                unbounded_residual,
+                49,
+                Some(50),
+            )
+            .is_none()
+        );
+
+        let base = ProjectedExpr::Linear;
+        let low =
+            ProjectedExpr::binary(Binary::Mod, base.clone(), ProjectedExpr::Constant(4)).unwrap();
+        let middle = ProjectedExpr::binary(
+            Binary::Mul,
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::binary(Binary::FloorDiv, base.clone(), ProjectedExpr::Constant(4))
+                    .unwrap(),
+                ProjectedExpr::Constant(3),
+            )
+            .unwrap(),
+            ProjectedExpr::Constant(4),
+        )
+        .unwrap();
+        let high = ProjectedExpr::binary(
+            Binary::Mul,
+            ProjectedExpr::binary(
+                Binary::Mod,
+                ProjectedExpr::binary(Binary::FloorDiv, base.clone(), ProjectedExpr::Constant(12))
+                    .unwrap(),
+                ProjectedExpr::Constant(2),
+            )
+            .unwrap(),
+            ProjectedExpr::Constant(12),
+        )
+        .unwrap();
+        let reconstructed = ProjectedExpr::binary(
+            Binary::Add,
+            ProjectedExpr::binary(Binary::Add, high, middle).unwrap(),
+            low,
+        )
+        .unwrap()
+        .canonicalized_for_output(24);
+        assert!(projected_expr_eq(&reconstructed, &base));
 
         let constants = ProjectedExpr::binary(
             Binary::Add,

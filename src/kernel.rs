@@ -692,8 +692,9 @@ fn lower_graph_elementwise_with_substitutions(
         context: &ElementwiseLowering<'_>,
         guarded_only: bool,
     ) -> std::result::Result<Option<UOp>, UOpError> {
-        let Ok(projected) = crate::rangeify::projected_view(graph, id, out, range) else {
-            return Ok(None);
+        let projected = match crate::rangeify::projected_view(graph, id, out, range) {
+            Ok(projected) => projected,
+            Err(_) => return Ok(None),
         };
         if guarded_only && projected.predicate.is_none() {
             return Ok(None);
@@ -748,6 +749,7 @@ fn lower_graph_elementwise_with_substitutions(
             Some(source_ty),
             sources,
         );
+        crate::projected_index::ProjectedIndexPlan::from_index(&index)?;
         Ok(Some(UOp::from_operation(
             Operation::Load,
             Some(source_ty),

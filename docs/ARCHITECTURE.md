@@ -2560,10 +2560,15 @@ reordered, foreign-session, or pre-bind records cannot mutate the scoreboard.
 
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, quantized bindings, mutable training or KV state,
-state-input/state-output ping-pong, output chaining across calls, multi-device
-execution, and full ResNet/Linear/ONNX workload support remain explicit
-follow-ons. The semantic mock covers a bounded residual-style multi-layer graph;
-live device performance evidence is not claimed.
+state-input/state-output ping-pong, output chaining across calls, and
+multi-device execution remain explicit follow-ons. In addition to the bounded
+numerical semantic mock, protected acceptance lowers the complete default
+Eval/F32 ResNet-18 `[1,3,224,224]` graph through boundary-free scheduling and
+capture, renders all scheduled items to MSL, then performs resident preparation
+and two ABI-validating virtual-resource runs. That full-model test proves
+shapes, ownership, stable slot handles, and zero fallback; it deliberately
+avoids billions of host-side mock convolution operations and therefore makes
+no numerical Metal, live-device, or performance claim.
 
 `MetalRuntime::discover` is the narrow diagnostic seam for deployment setup:
 framework/symbol errors remain structured `MetalError`s, while a successfully

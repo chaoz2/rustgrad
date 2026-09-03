@@ -205,9 +205,9 @@ use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedInference, CapturedMixedBatch, CapturedReplayExecutor,
     CapturedSchedule, CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime,
-    Graph, IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, MovementKernelKind,
-    MovementValue, NodeId, Operation, ReduceKind, Scalar, Shape, Slice, Storage, TensorData,
-    TypedValue, UType, schedule,
+    Graph, IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, Mode, MovementKernelKind,
+    MovementValue, NodeId, Operation, ReduceKind, ResNet, ResNetConfig, Scalar, Shape, Slice,
+    Storage, TensorData, TypedValue, UType, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -268,6 +268,21 @@ struct DirectParameterModule(Parameter);
 impl Module for DirectParameterModule {
     fn visit(&self, _: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
         visitor("value".into(), &self.0, StateKind::Buffer);
+    }
+}
+
+fn zero_trainable_module_parameters(module: &impl Module) {
+    let mut parameters = Vec::new();
+    module.visit("", &mut |_, parameter, kind| {
+        if matches!(kind, StateKind::Parameter) {
+            parameters.push(parameter.clone());
+        }
+    });
+    for parameter in parameters {
+        let snapshot = parameter.snapshot().unwrap();
+        parameter
+            .replace(TensorData::zeros(snapshot.shape).unwrap())
+            .unwrap();
     }
 }
 
@@ -910,6 +925,154 @@ fn metal_device_session_zero_contraction_uses_pointer_sentinels_without_empty_wr
             .count(),
         1
     );
+}
+
+#[test]
+fn default_resnet18_is_one_boundary_free_resident_metal_session() {
+    let model = ResNet::new_static(ResNetConfig::default(), 19).unwrap();
+    zero_trainable_module_parameters(&model);
+    let mut graph = Graph::new();
+    let image = graph.input_dtype("image", [1, 3, 224, 224], DType::F32);
+    let forward = model.forward_mode(&mut graph, image, Mode::Eval).unwrap();
+    assert!(forward.pending.is_empty());
+    let logits = forward.output.logits().unwrap();
+    assert_eq!(graph.shape(logits).unwrap(), &Shape::new([1, 1000]));
+
+    let scheduled = crate::schedule(&graph, logits).unwrap();
+    assert!(!scheduled.items.is_empty());
+    assert!(scheduled.items.iter().all(|item| item.boundary.is_none()));
+
+    let stem_iteration_elements = 64usize * 112 * 112 * 3 * 7 * 7;
+    let stem_projection = scheduled
+        .items
+        .iter()
+        .flat_map(|item| item.kernel.topological().unwrap())
+        .filter(crate::projected_index::ProjectedIndexPlan::is_predicated)
+        .find_map(|index| {
+            let plan = crate::projected_index::ProjectedIndexPlan::from_index(&index).ok()?;
+            (plan.buffer == image.index() as u64
+                && plan.elements == 3 * 224 * 224
+                && plan.output_elements == stem_iteration_elements
+                && plan.is_guarded())
+            .then_some(plan)
+        })
+        .expect("stem convolution must retain its authenticated padded input projection");
+    assert!(!stem_projection.valid(0).unwrap());
+
+    let maxpool_window_shape = Shape::new([1, 64, 56, 56, 9]);
+    let maxpool_windows = scheduled
+        .items
+        .iter()
+        .find(|item| {
+            item.primary_output().shape == maxpool_window_shape
+                && matches!(
+                    item.kernel.operation(),
+                    Operation::Movement(MovementValue::Plan(plan))
+                        if matches!(&plan.kind, MovementKernelKind::Concat { .. })
+                )
+        })
+        .expect("stem maxpool must materialize its nine source windows");
+    let maxpool = scheduled
+        .items
+        .iter()
+        .find(|item| {
+            item.primary_output().shape == Shape::new([1, 64, 56, 56])
+                && item.dependencies.contains(&maxpool_windows.id)
+                && item.kernel.topological().is_ok_and(|nodes| {
+                    nodes
+                        .iter()
+                        .any(|node| matches!(node.operation(), Operation::ReduceFinalize))
+                })
+        })
+        .expect("stem maxpool reduction must depend on its materialized window buffer");
+    assert!(maxpool.inputs.iter().any(|input| {
+        input.id == maxpool_windows.primary_output().id && input.shape == maxpool_window_shape
+    }));
+
+    let capture = CapturedSchedule::capture(&graph, &scheduled, &[logits]).unwrap();
+    let capture_identity = capture.identity;
+    let capture = CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+    assert_eq!(capture.identity, capture_identity);
+    let residents = model
+        .input_bindings(&graph)
+        .unwrap()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let resident_names = residents.keys().cloned().collect::<Vec<_>>();
+    assert!(!resident_names.is_empty());
+    let plan = MetalDeviceSessionPlan::from_capture(
+        capture,
+        resident_names,
+        MetalRenderer::new(64, virtual_conformance_capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().capture_identity, capture_identity);
+    assert_eq!(plan.summary().fallback_count, 0);
+    assert_eq!(plan.summary().zero_item_count, 0);
+    assert_eq!(plan.rendered_items().count(), scheduled.items.len());
+    assert_eq!(
+        plan.summary().rendered_cache_keys.len(),
+        plan.summary().nonzero_item_count
+    );
+    assert_eq!(plan.resident_inputs().len(), residents.len());
+    assert_eq!(
+        plan.transient_inputs()
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>(),
+        ["image"]
+    );
+
+    // Full host evaluation is intentionally excluded here: the semantic mock
+    // validates every registered kernel/slot ABI but virtualizes large device
+    // allocations. With zero trainable parameters, exact source logits are
+    // zero for any finite image, so zero-filled retained output is observable
+    // source truth without billions of host convolution operations.
+    let mock = Arc::new(MockDispatch::virtual_zero_execution());
+    let device = test_device(mock.clone());
+    let mut session = plan.prepare(device, residents).unwrap();
+    assert!(mock.registered_semantic_program_count() > 0);
+    assert!(mock.registered_semantic_program_count() <= session.summary().nonzero_item_count);
+    assert_eq!(
+        session.compiled_kernels().count(),
+        session.summary().nonzero_item_count
+    );
+    let prepared_owner = session.device_owner_id();
+    let planned_slots = session.summary().planned_slot_count;
+
+    let mut observed_bindings = None;
+    for invocation in 0..2 {
+        mock.clear_calls();
+        mock.clear_launch_bindings();
+        let run = session
+            .run(&BTreeMap::from([(
+                "image".into(),
+                TensorData::zeros([1, 3, 224, 224]).unwrap(),
+            )]))
+            .unwrap();
+        assert_eq!(run.outputs(), &[TensorData::zeros([1, 1000]).unwrap()]);
+        assert_eq!(run.report().successful_invocation, invocation as u64 + 1);
+        assert_eq!(
+            run.report().kernel_launch_count,
+            session.summary().nonzero_item_count
+        );
+        assert_eq!(run.report().transient_h2d_calls, 1);
+        assert_eq!(run.report().retained_d2h_calls, 1);
+        assert_eq!(session.device_owner_id(), prepared_owner);
+        assert_eq!(session.summary().planned_slot_count, planned_slots);
+        assert!(!mock.calls().iter().any(|call| {
+            call.starts_with("buffer_create:")
+                || call.starts_with("library_compile:")
+                || call.starts_with("pipeline_create:")
+                || call.starts_with("queue_create:")
+        }));
+        let bindings = mock.launch_bindings();
+        assert_eq!(bindings.len(), session.summary().nonzero_item_count);
+        if let Some(previous) = &observed_bindings {
+            assert_eq!(&bindings, previous);
+        }
+        observed_bindings = Some(bindings);
+    }
 }
 
 #[test]
@@ -1760,11 +1923,14 @@ struct State {
     next_pipeline: usize,
     next_command: usize,
     buffers: BTreeMap<(u64, usize), Vec<u8>>,
+    buffer_lengths: BTreeMap<(u64, usize), usize>,
     libraries: BTreeMap<(u64, usize), String>,
     semantics: BTreeMap<(u64, usize), Arc<KernelSemantics>>,
     commands: BTreeMap<(u64, usize), bool>,
     failures: Failures,
     fault_order: Vec<usize>,
+    launch_bindings: Vec<Vec<usize>>,
+    virtual_zero_execution: bool,
 }
 
 #[derive(Default)]
@@ -1773,12 +1939,33 @@ struct MockDispatch {
 }
 
 impl MockDispatch {
+    fn virtual_zero_execution() -> Self {
+        Self {
+            state: Mutex::new(State {
+                virtual_zero_execution: true,
+                ..State::default()
+            }),
+        }
+    }
+
     fn calls(&self) -> Vec<String> {
         self.state.lock().unwrap().calls.clone()
     }
 
     fn clear_calls(&self) {
         self.state.lock().unwrap().calls.clear();
+    }
+
+    fn clear_launch_bindings(&self) {
+        self.state.lock().unwrap().launch_bindings.clear();
+    }
+
+    fn launch_bindings(&self) -> Vec<Vec<usize>> {
+        self.state.lock().unwrap().launch_bindings.clone()
+    }
+
+    fn registered_semantic_program_count(&self) -> usize {
+        self.state.lock().unwrap().semantics.len()
     }
 
     fn clear_failures(&self) {
@@ -1807,11 +1994,16 @@ impl Dispatch for MockDispatch {
     }
 
     fn device_info(&self, device: RawDevice) -> Result<MetalDeviceInfo, MetalError> {
+        let max_buffer_length = if self.state.lock().unwrap().virtual_zero_execution {
+            1usize << 40
+        } else {
+            1 << 20
+        };
         Ok(MetalDeviceInfo {
             name: format!("Mock Metal {}", device.0),
             registry_id: device.0 as u64,
             capabilities: MetalCapabilities {
-                max_buffer_length: 1 << 20,
+                max_buffer_length,
                 unified_memory: true,
                 family: "MockApple9".into(),
             },
@@ -1859,7 +2051,13 @@ impl Dispatch for MockDispatch {
         }
         state.next_buffer += 1;
         let raw = RawBuffer(100 + state.next_buffer);
-        state.buffers.insert((owner, raw.0), vec![0; bytes]);
+        state.buffer_lengths.insert((owner, raw.0), bytes);
+        let storage = if state.virtual_zero_execution {
+            Vec::new()
+        } else {
+            vec![0; bytes]
+        };
+        state.buffers.insert((owner, raw.0), storage);
         state
             .calls
             .push(format!("buffer_create:{owner}:{}:{bytes}", raw.0));
@@ -1869,6 +2067,7 @@ impl Dispatch for MockDispatch {
     fn buffer_release(&self, buffer: RawBuffer, owner: u64) {
         let mut state = self.state.lock().unwrap();
         state.buffers.remove(&(owner, buffer.0));
+        state.buffer_lengths.remove(&(owner, buffer.0));
         state
             .calls
             .push(format!("buffer_release:{owner}:{}", buffer.0));
@@ -1884,6 +2083,20 @@ impl Dispatch for MockDispatch {
         let mut state = self.state.lock().unwrap();
         if let Some(detail) = state.failures.write.take() {
             return Err(Self::failure("write", detail));
+        }
+        if state.virtual_zero_execution {
+            let limit = *state
+                .buffer_lengths
+                .get(&(owner, buffer.0))
+                .ok_or(MetalError::OwnerMismatch)?;
+            if offset
+                .checked_add(bytes.len())
+                .is_none_or(|end| end > limit)
+            {
+                return Err(MetalError::Bounds);
+            }
+            state.calls.push(format!("write:{owner}:{}", buffer.0));
+            return Ok(());
         }
         let storage = state
             .buffers
@@ -1913,6 +2126,21 @@ impl Dispatch for MockDispatch {
             }
             *remaining -= 1;
         }
+        if state.virtual_zero_execution {
+            let limit = *state
+                .buffer_lengths
+                .get(&(owner, buffer.0))
+                .ok_or(MetalError::OwnerMismatch)?;
+            if offset
+                .checked_add(bytes.len())
+                .is_none_or(|end| end > limit)
+            {
+                return Err(MetalError::Bounds);
+            }
+            bytes.fill(0);
+            state.calls.push(format!("read:{owner}:{}", buffer.0));
+            return Ok(());
+        }
         let storage = state
             .buffers
             .get(&(owner, buffer.0))
@@ -1933,6 +2161,29 @@ impl Dispatch for MockDispatch {
         let mut state = self.state.lock().unwrap();
         if let Some(detail) = state.failures.copy.take() {
             return Err(Self::failure("copy", detail));
+        }
+        if state.virtual_zero_execution {
+            let src_len = *state
+                .buffer_lengths
+                .get(&(owner, src.0))
+                .ok_or(MetalError::OwnerMismatch)?;
+            let dst_len = *state
+                .buffer_lengths
+                .get(&(owner, dst.0))
+                .ok_or(MetalError::OwnerMismatch)?;
+            if region
+                .src_offset
+                .checked_add(region.bytes)
+                .is_none_or(|end| end > src_len)
+                || region
+                    .dst_offset
+                    .checked_add(region.bytes)
+                    .is_none_or(|end| end > dst_len)
+            {
+                return Err(MetalError::Bounds);
+            }
+            state.calls.push(format!("copy:{owner}"));
+            return Ok(Self::command(&mut state, owner));
         }
         let value = state
             .buffers
@@ -2023,6 +2274,37 @@ impl Dispatch for MockDispatch {
             || buffers.len() != expected_buffers
         {
             return Err(MetalError::InvalidArgument("invalid mock launch geometry"));
+        }
+        state
+            .launch_bindings
+            .push(buffers.iter().map(|buffer| buffer.0).collect());
+        if state.virtual_zero_execution {
+            if transaction.is_some() {
+                return Err(MetalError::InvalidBinding(
+                    "virtual zero execution does not admit guarded kernels".into(),
+                ));
+            }
+            for (position, (raw, abi)) in buffers.iter().zip(&semantics.buffers).enumerate() {
+                let logical = abi
+                    .elements
+                    .checked_mul(abi.dtype.itemsize())
+                    .ok_or(MetalError::Overflow)?;
+                let physical = if semantics.extent != 0 && logical == 0 {
+                    DType::F32.itemsize()
+                } else {
+                    logical
+                };
+                if state.buffer_lengths.get(&(owner, raw.0)) != Some(&physical) {
+                    return Err(MetalError::InvalidBinding(format!(
+                        "virtual mock buffer {position} length mismatch"
+                    )));
+                }
+            }
+            state.calls.push(format!(
+                "launch:{owner}:{}:{}",
+                geometry.global, geometry.local
+            ));
+            return Ok(Self::command(&mut state, owner));
         }
         let mut bindings = KernelBindings::default();
         let mut outputs = Vec::new();
@@ -2282,6 +2564,14 @@ fn decode_mock_scalar(dtype: DType, bytes: &[u8]) -> Result<Scalar, MetalError> 
 fn capabilities() -> MetalCapabilities {
     MetalCapabilities {
         max_buffer_length: 1 << 20,
+        unified_memory: true,
+        family: "MockApple9".into(),
+    }
+}
+
+fn virtual_conformance_capabilities() -> MetalCapabilities {
+    MetalCapabilities {
+        max_buffer_length: 1usize << 40,
         unified_memory: true,
         family: "MockApple9".into(),
     }
