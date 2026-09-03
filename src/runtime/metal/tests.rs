@@ -468,6 +468,157 @@ fn metal_inference_plan_freezes_module_residents_and_preserves_inspection() {
 }
 
 #[test]
+fn metal_scoreboard_records_only_one_session_success_prefix() {
+    let model = Linear::new_static(2, 2, true, 811).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("features", [1, 2], DType::F32);
+    let output = model.forward(&mut graph, input).unwrap();
+    let inference = CapturedInference::from_module_graph(&model, &graph, &[output]).unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let plan = MetalInferencePlan::new(inference.clone(), renderer.clone()).unwrap();
+    let mut scoreboard = MetalSessionScoreboard::new(
+        MetalScoreboardContext::new("linear-1x2", "test-revision", "semantic mock").unwrap(),
+        &plan,
+    );
+    assert_eq!(
+        scoreboard.report().unwrap_err(),
+        MetalScoreboardError::NotBound
+    );
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut session = plan.prepare(device.clone()).unwrap();
+    mock.clear_calls();
+    scoreboard.bind(&session).unwrap();
+    assert!(mock.calls().is_empty());
+    assert_eq!(
+        scoreboard.bind(&session).unwrap_err(),
+        MetalScoreboardError::AlreadyBound
+    );
+    let empty = scoreboard.report().unwrap();
+    assert_eq!(empty.successful_run_count, 0);
+    assert_eq!(empty.fallback_count, 0);
+    assert_eq!(empty.inputs.len(), 3);
+    assert_eq!(
+        empty
+            .inputs
+            .iter()
+            .filter(|input| input.kind == MetalScoreboardInputKind::Resident)
+            .count(),
+        2
+    );
+
+    let other_plan = MetalInferencePlan::new(inference, renderer).unwrap();
+    let mut other_session = other_plan.prepare(device).unwrap();
+    let values = BTreeMap::from([(
+        "features".into(),
+        TensorData::new([1, 2], vec![2.0, -1.0]).unwrap(),
+    )]);
+    let other_run = other_session.run(&values).unwrap();
+    assert_eq!(
+        scoreboard.record(&other_run).unwrap_err(),
+        MetalScoreboardError::WrongSession
+    );
+
+    let malformed = BTreeMap::new();
+    assert!(session.run(&malformed).is_err());
+    assert_eq!(scoreboard.report().unwrap().successful_run_count, 0);
+    let first = session.run(&values).unwrap();
+    scoreboard.record(&first).unwrap();
+    assert_eq!(
+        scoreboard.record(&first).unwrap_err(),
+        MetalScoreboardError::OutOfOrder {
+            expected: 2,
+            actual: 1,
+        }
+    );
+    assert!(session.run(&malformed).is_err());
+    assert_eq!(scoreboard.report().unwrap().successful_run_count, 1);
+    let second = session.run(&values).unwrap();
+    let third = session.run(&values).unwrap();
+    assert_eq!(
+        scoreboard.record(&third).unwrap_err(),
+        MetalScoreboardError::OutOfOrder {
+            expected: 2,
+            actual: 3,
+        }
+    );
+    scoreboard.record(&second).unwrap();
+    scoreboard.record(&third).unwrap();
+    let report = scoreboard.report().unwrap();
+    assert_eq!(report.successful_run_count, 3);
+    assert_eq!(
+        report.first_run_host_wall_time,
+        Some(first.report().run_wall_time)
+    );
+    assert_eq!(
+        report.steady_run_host_wall_times,
+        vec![second.report().run_wall_time, third.report().run_wall_time]
+    );
+    assert_eq!(
+        report.transient_host_api_h2d_calls,
+        first.report().transient_h2d_calls
+            + second.report().transient_h2d_calls
+            + third.report().transient_h2d_calls
+    );
+    assert_eq!(
+        report.retained_host_api_d2h_bytes,
+        first.report().retained_d2h_bytes
+            + second.report().retained_d2h_bytes
+            + third.report().retained_d2h_bytes
+    );
+    assert_eq!(
+        report.host_api_h2d_calls,
+        report.resident_host_api_h2d_calls + report.transient_host_api_h2d_calls
+    );
+    assert_eq!(
+        report.host_api_d2h_calls,
+        report.retained_host_api_d2h_calls
+    );
+    assert_eq!(report.kernel_launch_count, 3 * report.planned_kernel_count);
+    assert_eq!(report.fallback_count, 0);
+}
+
+#[test]
+fn metal_scoreboard_keeps_zero_resource_passthrough_facts_exact() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("empty", [0], DType::F32);
+    let output = graph.relu(input).unwrap();
+    let inference =
+        CapturedInference::from_module_graph(&IdentityModule, &graph, &[output, output]).unwrap();
+    let plan =
+        MetalInferencePlan::new(inference, MetalRenderer::new(8, capabilities()).unwrap()).unwrap();
+    let mut scoreboard = MetalSessionScoreboard::new(
+        MetalScoreboardContext::new("empty-identity", "test-revision", "semantic mock").unwrap(),
+        &plan,
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device).unwrap();
+    scoreboard.bind(&session).unwrap();
+    let run = session
+        .run(&BTreeMap::from([(
+            "empty".into(),
+            TensorData::new([0], Vec::<f32>::new()).unwrap(),
+        )]))
+        .unwrap();
+    scoreboard.record(&run).unwrap();
+    let report = scoreboard.report().unwrap();
+    assert_eq!(report.planned_static_tensor_slot_count, 0);
+    assert_eq!(report.planned_static_tensor_slot_bytes, 0);
+    assert_eq!(report.planned_kernel_count, 0);
+    assert_eq!(report.planned_zero_item_count, 1);
+    assert_eq!(report.kernel_launch_count, 0);
+    assert_eq!(report.zero_item_count, 1);
+    assert_eq!(report.resident_host_api_h2d_calls, 0);
+    assert_eq!(report.transient_host_api_h2d_calls, 0);
+    assert_eq!(report.retained_host_api_d2h_calls, 0);
+    assert_eq!(report.fallback_count, 0);
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
 fn metal_inference_plan_runs_identity_and_direct_parameter_without_resources() {
     let mut identity_graph = Graph::new();
     let input = identity_graph.input_dtype("features", [2], DType::F32);

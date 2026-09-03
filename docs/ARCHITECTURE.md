@@ -2542,6 +2542,22 @@ reach no driver work; a failed execution publishes neither outputs nor a
 successful-run metric and the settled prefix remains retryable. Zero-work
 captures allocate, compile, upload, launch, wait, and read nothing.
 
+`MetalSessionScoreboard` is an opt-in observation layer over that existing
+evidence. It snapshots a `MetalInferencePlan`, binds once to the exact prepared
+deployment/session identity, and accepts only its consecutive successful
+`MetalDeviceRun` prefix. The immutable report preserves the first host-wall
+run separately, retains steady host-wall samples in invocation order, derives
+integer-duration nearest-rank percentiles, and aggregates the exact plan,
+pipeline-cache, launch, zero-item, and host-API copy counters already owned by
+the session. Versioned deterministic JSON includes caller-labelled workload,
+implementation revision, evidence provenance, selected handle-free device,
+and captured resident/transient descriptors. `planning_wall_time` is planning
+and rendering; `native_prepare_wall_time` includes compilation, allocation,
+and queue setup; `planned_static_tensor_slot_bytes` is neither measured peak
+memory nor process RSS. Host-wall observations are not GPU timestamps, and
+host-API copy counts/bytes are not physical-bus measurements. Failed, skipped,
+reordered, foreign-session, or pre-bind records cannot mutate the scoreboard.
+
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, quantized bindings, mutable training or KV state,
 state-input/state-output ping-pong, output chaining across calls, multi-device
