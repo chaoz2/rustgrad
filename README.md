@@ -80,6 +80,44 @@ layers:
 - [`examples/llama_prompt.rs`](examples/llama_prompt.rs)
 - [`examples/llama_chat.rs`](examples/llama_chat.rs)
 
+## Reuse a concrete capture on Metal
+
+The strict Metal device-session path keeps selected immutable inputs and
+intermediate slots resident across calls. Planning is resource-free and
+inspectable; unsupported captures return an error instead of using CPU
+fallback. Its plan summary exposes resident/transient schemas, kernels, planned
+device bytes, and a fixed fallback count of zero; successful preparation and
+run reports separate host wall-clock durations from host API copy counts. The
+current boundary is concrete pure captures, not general model inference yet.
+
+```rust,no_run
+# use rustgrad::{CapturedSchedule, TensorData};
+# use rustgrad::runtime::metal::{MetalDeviceSessionPlan, MetalDiscovery, MetalRenderer, MetalRuntime};
+# use std::collections::BTreeMap;
+# fn captured_inference() -> CapturedSchedule { unimplemented!() }
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let runtime = MetalRuntime::load()?;
+let MetalDiscovery::Devices(mut devices) = runtime.discover()? else {
+    return Err("Metal is available, but this process sees no device".into());
+};
+let device = devices.remove(0);
+let renderer = MetalRenderer::new(64, device.info().capabilities.clone())?;
+let plan = MetalDeviceSessionPlan::from_capture(
+    captured_inference(),
+    ["weight".into()],
+    renderer,
+)?;
+let weight = TensorData::new([4], vec![1.0, 2.0, 3.0, 4.0])?;
+let mut session = plan.prepare(device, BTreeMap::from([("weight".into(), weight)]))?;
+let input = || TensorData::new([4], vec![1.0, 1.0, 1.0, 1.0]);
+let first = session.run(&BTreeMap::from([("input".into(), input()?)]))?;
+let second = session.run(&BTreeMap::from([("input".into(), input()?)]))?;
+assert_eq!(session.summary().fallback_count, 0);
+println!("{:?} {:?}", first.report(), second.report());
+# Ok(())
+# }
+```
+
 ## How the system fits together
 
 1. `tensor` owns concrete dtypes, shapes, scalars, and dense values.
@@ -102,11 +140,16 @@ direction.
 
 Work is ordered by user value:
 
-1. a clear CPU-first adoption path;
-2. complete local training, inference, state, and interchange workflows;
-3. shared operations and module composition needed by those workflows;
-4. performance and deployment;
-5. specialized dtype, device, and parity breadth.
+1. a strict persistent Metal device session with no fallback;
+2. ResNet-18 Metal conformance on the Apple M5;
+3. device-resident GGUF Llama prefill, KV state, and decode;
+4. evidence-labeled performance and release hygiene.
+
+The CPU adoption, training, state, interchange, and module layers are delivered
+foundation. Hardware comparisons target tinygrad and Candle, plus llama.cpp for
+GGUF, and distinguish compile, first-run, steady-state, planned device memory,
+kernel count, host API transfer count/bytes, and fallback count. GPU timing,
+allocator RSS, or physical bus traffic is reported only when measured directly.
 
 Tinygrad is the primary semantic reference for tensor and compiler behavior.
 Rust projects are design references for API ergonomics, ownership, backend

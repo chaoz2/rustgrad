@@ -201,8 +201,8 @@ use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
-    Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CompareOp,
-    CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
+    Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule,
+    CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
     KernelBindings, KernelBufferDesc, LaneInstruction, MovementKernelKind, MovementValue, NodeId,
     Operation, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UType, schedule,
 };
@@ -215,6 +215,396 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
+
+fn captured_metal_residual_block() -> (Graph, CapturedSchedule, NodeId, NodeId) {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 4], DType::F32);
+    let scale = graph.input_dtype("scale", [2, 4], DType::F32);
+    let bias = graph
+        .constant(TensorData::new([2, 4], vec![1.0, -1.0, 0.5, 2.0, 3.0, 0.0, -2.0, 1.0]).unwrap());
+    let residual_scale = graph.input_dtype("residual_scale", [2, 4], DType::F32);
+    let scaled = graph.mul(input, scale).unwrap();
+    let shifted = graph.add(scaled, bias).unwrap();
+    let hidden = graph.relu(shifted).unwrap();
+    let residual = graph.mul(hidden, residual_scale).unwrap();
+    let skip = graph.add(residual, input).unwrap();
+    let output = graph.relu(skip).unwrap();
+    let requested = [output, scale, output];
+    let scheduled = crate::schedule_many(&graph, &requested).unwrap();
+    let capture = CapturedSchedule::capture(&graph, &scheduled, &requested).unwrap();
+    (graph, capture, input, output)
+}
+
+fn residual_residents() -> BTreeMap<String, TensorData> {
+    BTreeMap::from([
+        (
+            "scale".into(),
+            TensorData::new([2, 4], vec![0.5, 1.0, 1.5, 2.0, -0.5, 0.25, 2.0, 1.0]).unwrap(),
+        ),
+        (
+            "residual_scale".into(),
+            TensorData::new([2, 4], vec![1.0, 2.0, 0.5, 0.25, 1.5, 1.0, 0.75, 2.0]).unwrap(),
+        ),
+    ])
+}
+
+#[test]
+fn metal_device_session_reuses_residents_and_reports_exact_driver_activity() {
+    let (graph, capture, _, output) = captured_metal_residual_block();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap(),
+        ["scale".into(), "residual_scale".into()],
+        renderer,
+    )
+    .unwrap();
+    assert_eq!(plan.summary().capture_identity, capture.identity);
+    assert_eq!(plan.resident_inputs().len(), 2);
+    assert_eq!(plan.transient_inputs().len(), 1);
+    assert_eq!(plan.summary().constant_count, 1);
+    assert_eq!(plan.summary().requested_output_count, 3);
+    assert_eq!(plan.summary().fallback_count, 0);
+    assert!(plan.rendered_items().next().is_some());
+    assert_eq!(
+        plan.summary().rendered_cache_keys.len(),
+        plan.summary().nonzero_item_count
+    );
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device, residual_residents()).unwrap();
+    assert_eq!(session.device_info().registry_id, 1);
+    assert_ne!(session.device_owner_id(), 0);
+    let preparation_calls = mock.calls();
+    let preparation = session.preparation_report();
+    assert_eq!(
+        preparation.resident_h2d_calls,
+        preparation_calls
+            .iter()
+            .filter(|call| call.starts_with("write:"))
+            .count()
+    );
+    assert_eq!(
+        preparation.pipeline_cache_miss_count,
+        preparation_calls
+            .iter()
+            .filter(|call| call.starts_with("library_compile:"))
+            .count()
+    );
+
+    for (invocation, input_values) in [
+        vec![1.0, -2.0, 3.0, 4.0, -1.0, 2.0, 0.5, -3.0],
+        vec![-4.0, 1.0, 2.0, 0.0, 3.0, -2.0, 1.5, 2.5],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let input_value = TensorData::new([2, 4], input_values).unwrap();
+        let mut oracle = HashMap::from([("input".into(), input_value.clone())]);
+        oracle.extend(residual_residents());
+        let expected = CpuBackend.execute(&graph, output, &oracle).unwrap();
+        mock.clear_calls();
+        let run = session
+            .run(&BTreeMap::from([("input".into(), input_value)]))
+            .unwrap();
+        assert_eq!(run.outputs().len(), 3);
+        assert_eq!(
+            run.outputs()[0].to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap()
+        );
+        assert_eq!(
+            run.outputs()[2].to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap()
+        );
+        assert_eq!(
+            run.outputs()[1].to_le_bytes().unwrap(),
+            residual_residents()["scale"].to_le_bytes().unwrap()
+        );
+        let calls = mock.calls();
+        assert!(!calls.iter().any(|call| {
+            call.starts_with("buffer_create:")
+                || call.starts_with("library_compile:")
+                || call.starts_with("pipeline_create:")
+                || call.starts_with("queue_create:")
+        }));
+        let report = run.report();
+        assert_eq!(report.successful_invocation, invocation as u64 + 1);
+        assert_eq!(report.first_successful_run, invocation == 0);
+        assert_eq!(report.transient_h2d_calls, 1);
+        assert_eq!(report.transient_h2d_bytes, 8 * DType::F32.itemsize());
+        assert_eq!(report.retained_d2h_calls, 1);
+        assert_eq!(report.retained_d2h_bytes, 8 * DType::F32.itemsize());
+        assert_eq!(
+            report.kernel_launch_count,
+            calls
+                .iter()
+                .filter(|call| call.starts_with("launch:"))
+                .count()
+        );
+        assert_eq!(
+            report.kernel_launch_count,
+            session.summary().nonzero_item_count
+        );
+        assert_eq!(report.output_count, 3);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("write:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("read:"))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(session.successful_run_count(), 2);
+}
+
+#[test]
+fn metal_device_session_rejects_malformed_calls_before_driver_and_retries_failures() {
+    let (_, capture, _, _) = captured_metal_residual_block();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        capture,
+        ["scale".into(), "residual_scale".into()],
+        renderer,
+    )
+    .unwrap();
+    let mut session = plan.prepare(device, residual_residents()).unwrap();
+    mock.clear_calls();
+    for malformed in [
+        BTreeMap::new(),
+        BTreeMap::from([("extra".into(), TensorData::scalar(1.0))]),
+        BTreeMap::from([("input".into(), TensorData::new([1], vec![1.0]).unwrap())]),
+    ] {
+        assert!(session.run(&malformed).is_err());
+        assert!(mock.calls().is_empty());
+        assert_eq!(session.successful_run_count(), 0);
+    }
+
+    let input = BTreeMap::from([(
+        "input".into(),
+        TensorData::new([2, 4], vec![1.0; 8]).unwrap(),
+    )]);
+    for (stage, install) in [("launch", 0usize), ("wait", 1usize), ("read", 2usize)] {
+        mock.clear_calls();
+        let mut state = mock.state.lock().unwrap();
+        match install {
+            0 => state.failures.launch = Some(stage),
+            1 => state.failures.wait = Some(stage),
+            _ => state.failures.read = Some(stage),
+        }
+        drop(state);
+        assert!(session.run(&input).is_err());
+        assert_eq!(session.successful_run_count(), install as u64);
+        mock.clear_failures();
+        let run = session.run(&input).unwrap();
+        assert_eq!(run.report().successful_invocation, install as u64 + 1);
+        assert_eq!(session.successful_run_count(), install as u64 + 1);
+    }
+}
+
+#[test]
+fn metal_device_session_preparation_is_unpublished_on_validation_or_upload_failure() {
+    let (_, capture, _, _) = captured_metal_residual_block();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut tampered = capture.clone();
+    tampered.identity ^= 1;
+    assert!(matches!(
+        MetalDeviceSessionPlan::from_capture(
+            tampered,
+            ["scale".into(), "residual_scale".into()],
+            renderer.clone(),
+        ),
+        Err(MetalError::InvalidBinding(_))
+    ));
+    assert!(matches!(
+        MetalDeviceSessionPlan::from_capture(capture.clone(), ["unknown".into()], renderer.clone(),),
+        Err(MetalError::InvalidBinding(_))
+    ));
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let missing = MetalDeviceSessionPlan::from_capture(
+        capture.clone(),
+        ["scale".into(), "residual_scale".into()],
+        renderer.clone(),
+    )
+    .unwrap();
+    assert!(missing.prepare(device.clone(), BTreeMap::new()).is_err());
+    assert!(mock.calls().is_empty());
+
+    let extra = MetalDeviceSessionPlan::from_capture(
+        capture.clone(),
+        ["scale".into(), "residual_scale".into()],
+        renderer.clone(),
+    )
+    .unwrap();
+    let mut extra_values = residual_residents();
+    extra_values.insert("extra".into(), TensorData::scalar(1.0));
+    assert!(extra.prepare(device.clone(), extra_values).is_err());
+    assert!(mock.calls().is_empty());
+
+    let malformed = MetalDeviceSessionPlan::from_capture(
+        capture.clone(),
+        ["scale".into(), "residual_scale".into()],
+        renderer.clone(),
+    )
+    .unwrap();
+    let mut malformed_values = residual_residents();
+    malformed_values.insert("scale".into(), TensorData::new([1], vec![1.0]).unwrap());
+    assert!(malformed.prepare(device.clone(), malformed_values).is_err());
+    assert!(mock.calls().is_empty());
+
+    let mut mismatched_capabilities = capabilities();
+    mismatched_capabilities.family = "OtherMetalFamily".into();
+    let mismatch = MetalDeviceSessionPlan::from_capture(
+        capture.clone(),
+        ["scale".into(), "residual_scale".into()],
+        MetalRenderer::new(8, mismatched_capabilities).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        mismatch.prepare(device.clone(), residual_residents()),
+        Err(MetalError::InvalidBinding(_))
+    ));
+    assert!(mock.calls().is_empty());
+
+    let upload = MetalDeviceSessionPlan::from_capture(
+        capture.clone(),
+        ["scale".into(), "residual_scale".into()],
+        renderer.clone(),
+    )
+    .unwrap();
+    mock.state.lock().unwrap().failures.write = Some("resident upload");
+    assert!(
+        upload
+            .prepare(device.clone(), residual_residents())
+            .is_err()
+    );
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|call| call.starts_with("buffer_release:"))
+    );
+    mock.clear_failures();
+
+    let retry = MetalDeviceSessionPlan::from_capture(
+        capture,
+        ["scale".into(), "residual_scale".into()],
+        renderer,
+    )
+    .unwrap();
+    let session = retry.prepare(device, residual_residents()).unwrap();
+    assert_eq!(session.successful_run_count(), 0);
+}
+
+#[test]
+fn metal_device_session_zero_work_is_resource_free_and_projects_duplicates() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [0, 4], DType::F32);
+    let output = graph.square(input).unwrap();
+    let requested = [output, output];
+    let scheduled = crate::schedule_many(&graph, &requested).unwrap();
+    let capture = CapturedSchedule::capture(&graph, &scheduled, &requested).unwrap();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        capture,
+        std::iter::empty(),
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().nonzero_item_count, 0);
+    assert_eq!(plan.summary().planned_slot_count, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device, BTreeMap::new()).unwrap();
+    assert!(mock.calls().is_empty());
+    assert_eq!(session.preparation_report().pipeline_cache_request_count, 0);
+    assert_eq!(session.preparation_report().pipeline_cache_hit_count, 0);
+    assert_eq!(session.preparation_report().pipeline_cache_miss_count, 0);
+    let run = session
+        .run(&BTreeMap::from([(
+            "input".into(),
+            TensorData::new([0, 4], vec![]).unwrap(),
+        )]))
+        .unwrap();
+    assert!(mock.calls().is_empty());
+    assert_eq!(run.outputs().len(), 2);
+    assert_eq!(run.outputs()[0].shape(), &Shape::from([0, 4]));
+    assert_eq!(run.outputs()[0].to_le_bytes().unwrap(), Vec::<u8>::new());
+    assert_eq!(
+        run.outputs()[0].to_le_bytes().unwrap(),
+        run.outputs()[1].to_le_bytes().unwrap()
+    );
+    assert_eq!(run.report().kernel_launch_count, 0);
+    assert_eq!(run.report().transient_h2d_calls, 0);
+    assert_eq!(run.report().retained_d2h_calls, 0);
+}
+
+#[test]
+fn metal_device_session_zero_contraction_uses_pointer_sentinels_without_empty_writes() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 0], DType::F32);
+    let rhs = graph.input_dtype("rhs", [0, 3], DType::F32);
+    let output = graph.matmul(lhs, rhs).unwrap();
+    let scheduled = crate::schedule(&graph, output).unwrap();
+    let capture = CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        capture,
+        ["lhs".into(), "rhs".into()],
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().nonzero_item_count, 1);
+    assert_eq!(plan.summary().zero_byte_sentinel_count, 2);
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan
+        .prepare(
+            device,
+            BTreeMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_storage([2, 0], Storage::F32(Vec::new())).unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_storage([0, 3], Storage::F32(Vec::new())).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(session.preparation_report().resident_h2d_calls, 0);
+    assert_eq!(session.preparation_report().resident_h2d_bytes, 0);
+    assert!(!mock.calls().iter().any(|call| call.starts_with("write:")));
+
+    mock.clear_calls();
+    let run = session.run(&BTreeMap::new()).unwrap();
+    assert_eq!(run.report().transient_h2d_calls, 0);
+    assert_eq!(run.report().kernel_launch_count, 1);
+    assert_eq!(run.report().retained_d2h_calls, 1);
+    assert_eq!(run.outputs()[0].storage(), &Storage::F32(vec![0.0; 6]));
+    let calls = mock.calls();
+    assert!(!calls.iter().any(|call| call.starts_with("write:")));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("launch:"))
+            .count(),
+        1
+    );
+}
 
 #[test]
 fn captured_static_metal_preserves_requested_order_and_passthrough_storage() {

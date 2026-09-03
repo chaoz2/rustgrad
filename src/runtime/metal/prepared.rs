@@ -7,8 +7,9 @@ use crate::{ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
 use crate::runtime::static_schedule::{
-    PreparedStaticSchedule, Sealed, StaticBufferAllocation, StaticDeviceAdapter, StaticPlanAdapter,
-    StaticRendered, StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
+    InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticBufferAllocation,
+    StaticDeviceAdapter, StaticExecutionReport, StaticPlanAdapter, StaticRendered,
+    StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -180,11 +181,42 @@ impl MetalPrefixPlan {
     pub fn cache_keys(&self) -> Vec<String> {
         self.plan.compiled_cache_keys()
     }
+
+    pub(super) fn rendered_kernels(&self) -> impl ExactSizeIterator<Item = &super::RenderedMetal> {
+        self.plan.items().map(|item| item.rendered())
+    }
+
+    pub(super) fn item_counts(&self) -> (usize, usize) {
+        let nonzero = self.plan.items().filter(|item| item.extent() != 0).count();
+        (nonzero, self.plan.items().len() - nonzero)
+    }
+
+    pub(super) fn allocation_summary(&self) -> Result<(usize, usize, usize), MetalError> {
+        let slots = self.plan.allocations().slots();
+        let bytes = slots.iter().try_fold(0usize, |total, allocation| {
+            total
+                .checked_add(allocation.physical_bytes())
+                .ok_or(MetalError::Overflow)
+        })?;
+        let sentinels = slots
+            .iter()
+            .filter(|allocation| allocation.bytes == 0 && allocation.requires_native_handle)
+            .count();
+        Ok((slots.len(), bytes, sentinels))
+    }
+
+    pub(super) fn external_input_ids(&self) -> &[u64] {
+        self.plan.external_inputs()
+    }
 }
 
 /// A fully validated pure prefix whose logical intermediates remain device-resident.
 pub struct PreparedMetalPrefix {
     inner: PreparedStaticSchedule<MetalStaticAdapter>,
+}
+
+pub(super) struct InitializedMetalPrefix {
+    inner: InitializedStaticSchedule<MetalStaticAdapter>,
 }
 
 /// An authenticated captured schedule bound to one prepared Metal prefix.
@@ -232,6 +264,28 @@ impl PreparedMetalPrefix {
         self.inner.compiled_cache_keys()
     }
     pub fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), MetalError> {
+        self.inner.execute(values)
+    }
+
+    pub(super) fn initialize_resident(
+        self,
+        values: &BTreeMap<u64, TensorData>,
+        resident_ids: &std::collections::BTreeSet<u64>,
+    ) -> Result<(InitializedMetalPrefix, StaticExecutionReport), MetalError> {
+        let (inner, report) = self.inner.initialize_resident(values, resident_ids)?;
+        Ok((InitializedMetalPrefix { inner }, report))
+    }
+}
+
+impl InitializedMetalPrefix {
+    pub(super) fn rendered_kernels(&self) -> impl Iterator<Item = &super::RenderedMetal> {
+        self.inner.kernels().map(|kernel| kernel.rendered())
+    }
+
+    pub(super) fn execute(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+    ) -> Result<StaticExecutionReport, MetalError> {
         self.inner.execute(values)
     }
 }
