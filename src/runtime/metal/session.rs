@@ -15,8 +15,8 @@ use std::{
 };
 
 use crate::runtime::static_schedule::{
-    CapturedStaticExecution, StaticAppendStateLink, StaticExecutionReport, StaticLifetimePlan,
-    StaticStateLink,
+    CapturedStaticExecution, StaticAppendStateLink, StaticExecutionReport, StaticHostGather,
+    StaticLifetimePlan, StaticStateLink,
 };
 
 /// Deterministic inspection metadata for one concrete Metal session plan.
@@ -211,6 +211,29 @@ enum MetalSessionStatePolicy {
     },
 }
 
+struct MetalCapturePolicy {
+    resident_input_names: Vec<String>,
+    state_input_names: Vec<String>,
+    public_output_count: usize,
+    state_links: Vec<StaticStateLink>,
+    append_state_links: Vec<StaticAppendStateLink>,
+    host_gathers: Vec<StaticHostGather>,
+}
+
+fn static_host_gathers(links: &[crate::session::CapturedHostGather]) -> Vec<StaticHostGather> {
+    links
+        .iter()
+        .map(|link| StaticHostGather {
+            input: link.input.desc.id,
+            index: link.index,
+            output: link.output,
+            axis: link.axis,
+            axis_extent: link.axis_extent,
+            index_elements: link.index_elements,
+        })
+        .collect()
+}
+
 impl MetalAppendStateInferencePlan {
     pub fn new(
         inference: CapturedAppendStateInference,
@@ -218,7 +241,7 @@ impl MetalAppendStateInferencePlan {
     ) -> Result<Self, MetalError> {
         let (inference, public_output_count, states, initial_state, deployment_identity) =
             inference.into_parts();
-        let (capture, execution_plan, resident_bindings, _) = inference.into_parts();
+        let (capture, execution_plan, resident_bindings, host_gathers, _) = inference.into_parts();
         let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
         let state_names = states
             .iter()
@@ -243,6 +266,7 @@ impl MetalAppendStateInferencePlan {
             state_names,
             public_output_count,
             append_links,
+            static_host_gathers(&host_gathers),
             renderer,
         )?;
         Ok(Self {
@@ -303,7 +327,7 @@ impl MetalStatefulInferencePlan {
     ) -> Result<Self, MetalError> {
         let (inference, public_output_count, states, initial_state, deployment_identity) =
             inference.into_parts();
-        let (capture, execution_plan, resident_bindings, _) = inference.into_parts();
+        let (capture, execution_plan, resident_bindings, host_gathers, _) = inference.into_parts();
         let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
         let state_names = states
             .iter()
@@ -318,11 +342,14 @@ impl MetalStatefulInferencePlan {
             .collect::<Vec<_>>();
         let inner = MetalDeviceSessionPlan::from_capture_policy(
             capture,
-            resident_names,
-            state_names,
-            public_output_count,
-            state_links,
-            Vec::new(),
+            MetalCapturePolicy {
+                resident_input_names: resident_names,
+                state_input_names: state_names,
+                public_output_count,
+                state_links,
+                append_state_links: Vec::new(),
+                host_gathers: static_host_gathers(&host_gathers),
+            },
             renderer,
         )?;
         Ok(Self {
@@ -380,10 +407,21 @@ impl MetalStatefulInferencePlan {
 impl MetalInferencePlan {
     /// Renders an owned inference capture without creating a Metal resource.
     pub fn new(inference: CapturedInference, renderer: MetalRenderer) -> Result<Self, MetalError> {
-        let (capture, execution_plan, resident_bindings, deployment_identity) =
+        let (capture, execution_plan, resident_bindings, host_gathers, deployment_identity) =
             inference.into_parts();
         let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
-        let inner = MetalDeviceSessionPlan::from_capture(capture, resident_names, renderer)?;
+        let inner = MetalDeviceSessionPlan::from_capture_policy(
+            capture,
+            MetalCapturePolicy {
+                resident_input_names: resident_names,
+                state_input_names: Vec::new(),
+                public_output_count: execution_plan.requested_outputs.len(),
+                state_links: Vec::new(),
+                append_state_links: Vec::new(),
+                host_gathers: static_host_gathers(&host_gathers),
+            },
+            renderer,
+        )?;
         Ok(Self {
             inner,
             execution_plan,
@@ -462,24 +500,31 @@ impl MetalDeviceSessionPlan {
         let requested_count = capture.requested.len();
         Self::from_capture_policy(
             capture,
-            resident_input_names.into_iter().collect(),
-            Vec::new(),
-            requested_count,
-            Vec::new(),
-            Vec::new(),
+            MetalCapturePolicy {
+                resident_input_names: resident_input_names.into_iter().collect(),
+                state_input_names: Vec::new(),
+                public_output_count: requested_count,
+                state_links: Vec::new(),
+                append_state_links: Vec::new(),
+                host_gathers: Vec::new(),
+            },
             renderer,
         )
     }
 
     fn from_capture_policy(
         capture: CapturedSchedule,
-        resident_input_names: Vec<String>,
-        state_input_names: Vec<String>,
-        public_output_count: usize,
-        state_links: Vec<StaticStateLink>,
-        append_state_links: Vec<StaticAppendStateLink>,
+        policy: MetalCapturePolicy,
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
+        let MetalCapturePolicy {
+            resident_input_names,
+            state_input_names,
+            public_output_count,
+            state_links,
+            append_state_links,
+            host_gathers,
+        } = policy;
         let planning_start = Instant::now();
         let projection =
             CapturedStaticExecution::from_owned(capture).map_err(|error| match error {
@@ -506,6 +551,19 @@ impl MetalDeviceSessionPlan {
             )
         }
         .map_err(MetalError::InvalidBinding)?;
+        let transient_ids = lifetime
+            .transient_inputs()
+            .iter()
+            .map(|input| input.desc.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if host_gathers
+            .iter()
+            .any(|link| !transient_ids.contains(&link.input))
+        {
+            return Err(MetalError::InvalidBinding(
+                "Metal host Gather input is not an exact transient".into(),
+            ));
+        }
         if !state_links.is_empty() && !append_state_links.is_empty() {
             return Err(MetalError::InvalidBinding(
                 "Metal session cannot mix epoch and append state".into(),
@@ -517,6 +575,7 @@ impl MetalDeviceSessionPlan {
                 &host_outputs,
                 &protected_outputs,
                 &state_links,
+                &host_gathers,
                 renderer.clone(),
             )?
         } else {
@@ -525,6 +584,7 @@ impl MetalDeviceSessionPlan {
                 &host_outputs,
                 &protected_outputs,
                 &append_state_links,
+                &host_gathers,
                 renderer.clone(),
             )?
         };
@@ -665,15 +725,19 @@ impl MetalDeviceSessionPlan {
         state_input_names: Vec<String>,
         public_output_count: usize,
         append_state_links: Vec<StaticAppendStateLink>,
+        host_gathers: Vec<StaticHostGather>,
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
         Self::from_capture_policy(
             capture,
-            resident_input_names,
-            state_input_names,
-            public_output_count,
-            Vec::new(),
-            append_state_links,
+            MetalCapturePolicy {
+                resident_input_names,
+                state_input_names,
+                public_output_count,
+                state_links: Vec::new(),
+                append_state_links,
+                host_gathers,
+            },
             renderer,
         )
     }

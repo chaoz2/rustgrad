@@ -22,6 +22,7 @@ pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,
     MetalSessionTrace, SessionDevice, Tensor,
 };
+pub(crate) use inference::CapturedHostGather;
 pub use inference::{
     CapturedAppendStateInference, CapturedInference, CapturedInferenceError,
     CapturedStatefulInference, InferenceAppendStateLink, InferenceStateLink, ModuleInferenceResult,

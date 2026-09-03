@@ -2720,6 +2720,21 @@ compile, allocate, transfer, and submit nothing. This contract excludes I64
 indices, non-F32 values, symbolic geometry, and higher-level scatter
 compositions.
 
+A private inference-capture sidecar may authorize one narrower Gather path by
+transient input name. Authorization inspects only the already-owned captured
+schedule: it proves an exact dense scalar I32 input, one capture-owned
+`AffineCopy` whose normalized read maps every reachable index lane to physical
+offset zero, its exact dependency into one internal raw Gather owner, and the
+owner's `PortableIndexedMovement` axis and extent. Static planning repeats the
+same provenance proof over logical/physical slots. Static execution reports the
+ordinary typed `IndexOutOfBounds` error for a bad scalar before any driver call;
+only then does a separately versioned MSL kernel write its final output directly,
+without candidate/status resources or a status download. Requested Gather
+outputs, resident/state inputs,
+multi-element or transformed indices, ambiguous owners, and ordinary Gather
+rendering retain the checked transactional path. This runtime-only permission
+does not alter graph, schedule, capture, or artifact bytes.
+
 Source identity includes renderer/ABI/transaction versions, local size,
 complete device capabilities, ordered buffer/view/guard metadata, and emitted
 source. The injectable semantic mock interprets typed UOps independently of
