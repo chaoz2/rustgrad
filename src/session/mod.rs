@@ -23,10 +23,11 @@ pub use cpu::{
     MetalSessionTrace, SessionDevice, Tensor,
 };
 pub use inference::{
-    CapturedInference, CapturedInferenceError, CapturedStatefulInference, InferenceStateLink,
-    ModuleInferenceResult, NativeModuleExecutionReport, NativeModuleInferenceResult,
-    NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult, infer_module_cpu,
-    infer_module_native_cpu, infer_module_native_cpu_with_report,
+    CapturedAppendStateInference, CapturedInference, CapturedInferenceError,
+    CapturedStatefulInference, InferenceAppendStateLink, InferenceStateLink, ModuleInferenceResult,
+    NativeModuleExecutionReport, NativeModuleInferenceResult, NativeModuleInferenceTrace,
+    ReportedNativeModuleInferenceResult, infer_module_cpu, infer_module_native_cpu,
+    infer_module_native_cpu_with_report,
 };
 pub use train::{
     CpuBinaryModuleTrainer, CpuModeModuleTrainer, CpuModuleTrainer, ModuleBinaryCrossEntropy,

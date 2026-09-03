@@ -203,12 +203,12 @@ use crate::kernel::execute_lowered_elementwise;
 use crate::nn::{Linear, Module, Parameter, StateKind};
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
-    Backend, BinaryOp, BufferRole, CapturedInference, CapturedMixedBatch, CapturedReplayExecutor,
-    CapturedSchedule, CapturedStatefulInference, CompareOp, CpuBackend, CpuSession, DType,
-    EffectBatchStep, EffectRuntime, Graph, IndexValue, InferenceStateLink, KernelBindings,
-    KernelBufferDesc, LaneInstruction, Mode, MovementKernelKind, MovementValue, NodeId, Operation,
-    ReduceKind, ResNet, ResNetConfig, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UType,
-    schedule,
+    Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
+    CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
+    CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
+    InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
+    LaneInstruction, Mode, MovementKernelKind, MovementValue, NodeId, Operation, ReduceKind,
+    ResNet, ResNetConfig, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UType, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -530,6 +530,286 @@ fn metal_stateful_inference_zero_work_owns_no_native_resources() {
     assert_eq!(run.report().committed_state_pair_count, 1);
     assert_eq!(run.report().committed_state_bytes, 0);
     assert!(session.state_epoch());
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
+    let mut graph = Graph::new();
+    let state = graph.input_dtype("cache", [2, 3], DType::F32);
+    let position = graph.input_dtype("position", [1, 3], DType::I32);
+    let update_source = graph.input_dtype("updates", [1, 3], DType::F32);
+    let updates = graph.relu(update_source).unwrap();
+    let next = graph.scatter(state, position, updates, 0).unwrap();
+    let attention_read = graph.square(next).unwrap();
+    let captured = CapturedAppendStateInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[attention_read, attention_read],
+        &[InferenceAppendStateLink::new(
+            state, next, position, updates, 0,
+        )],
+        BTreeMap::from([(
+            "cache".into(),
+            TensorData::new([2, 3], vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap(),
+        )]),
+    )
+    .unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let plan = MetalAppendStateInferencePlan::new(captured, renderer.clone()).unwrap();
+    assert_eq!(plan.summary().state_pair_count, 1);
+    assert_eq!(plan.summary().state_bank_count, 1);
+    assert_eq!(plan.summary().logical_state_bytes, 24);
+    assert_eq!(plan.summary().state_device_bytes, 24);
+    assert_eq!(plan.summary().append_state_row_bytes, 12);
+    assert_eq!(plan.summary().append_state_work_items, 3);
+    let append_item = plan
+        .rendered_items()
+        .find(|rendered| rendered.append_state().is_some())
+        .unwrap();
+    let append = append_item.append_state().unwrap();
+    assert_eq!(append.axis, 0);
+    assert_eq!(append.axis_extent, 2);
+    assert_eq!(append.row_elements, 3);
+    assert!(append_item.source.contains("rg_metal_append_state_f32_i32"));
+    assert!(!append_item.source.contains("rg_value = b0[gid]"));
+    let ordinary = renderer
+        .render(
+            &plan
+                .capture()
+                .items
+                .iter()
+                .find(|item| {
+                    item.outputs
+                        .iter()
+                        .any(|output| output.id == next.index() as u64)
+                })
+                .unwrap()
+                .kernel,
+        )
+        .unwrap();
+    assert_ne!(append_item.cache_key, ordinary.cache_key);
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock.clone())).unwrap();
+    assert_eq!(session.committed_state_position(), Some(0));
+    assert_eq!(session.preparation_report().initial_state_h2d_bytes, 24);
+
+    let invocation = |position_value: i32, updates: Vec<f32>| {
+        BTreeMap::from([
+            (
+                "position".into(),
+                TensorData::from_scalars(
+                    [1, 3],
+                    DType::I32,
+                    [Scalar::I(i64::from(position_value)); 3],
+                )
+                .unwrap(),
+            ),
+            ("updates".into(), TensorData::new([1, 3], updates).unwrap()),
+        ])
+    };
+    mock.state.lock().unwrap().failures.read = Some("public read");
+    assert!(session.run(&invocation(0, vec![1.0, 2.0, 3.0])).is_err());
+    assert_eq!(session.committed_state_position(), Some(0));
+    assert_eq!(session.successful_run_count(), 0);
+    mock.clear_failures();
+
+    mock.clear_launch_bindings();
+    let first = session.run(&invocation(0, vec![4.0, 5.0, 6.0])).unwrap();
+    assert_eq!(
+        first.outputs(),
+        &[
+            TensorData::new([2, 3], vec![16.0, 25.0, 36.0, 1600.0, 2500.0, 3600.0]).unwrap(),
+            TensorData::new([2, 3], vec![16.0, 25.0, 36.0, 1600.0, 2500.0, 3600.0]).unwrap(),
+        ]
+    );
+    assert_eq!(first.report().committed_state_bytes, 12);
+    assert_eq!(first.report().committed_state_work_items, 3);
+    assert_eq!(first.report().transient_h2d_calls, 2);
+    assert_eq!(first.report().transient_h2d_bytes, 24);
+    assert_eq!(first.report().retained_d2h_calls, 1);
+    assert_eq!(first.report().retained_d2h_bytes, 24);
+    assert_eq!(session.committed_state_position(), Some(1));
+    let bindings = mock.launch_bindings();
+    let append_ordinal = bindings
+        .iter()
+        .position(|item| item.len() == 4)
+        .expect("append launch has its exact three-input/one-output ABI");
+    assert_eq!(bindings[append_ordinal][0], bindings[append_ordinal][3]);
+    assert_eq!(bindings[append_ordinal + 1][0], bindings[append_ordinal][0]);
+
+    let before = mock.calls().len();
+    assert!(session.run(&invocation(0, vec![7.0, 8.0, 9.0])).is_err());
+    assert_eq!(mock.calls().len(), before);
+    assert_eq!(session.committed_state_position(), Some(1));
+
+    let second = session.run(&invocation(1, vec![7.0, 8.0, 9.0])).unwrap();
+    assert_eq!(
+        second.outputs()[0],
+        TensorData::new([2, 3], vec![16.0, 25.0, 36.0, 49.0, 64.0, 81.0]).unwrap()
+    );
+    assert_eq!(session.committed_state_position(), Some(2));
+    let before = mock.calls().len();
+    assert!(session.run(&invocation(2, vec![10.0, 11.0, 12.0])).is_err());
+    assert_eq!(mock.calls().len(), before);
+    assert_eq!(session.successful_run_count(), 2);
+    assert!(!mock.calls().iter().any(|call| call.starts_with("copy:")));
+}
+
+#[test]
+fn metal_append_state_kv_links_commit_together_after_partial_failure() {
+    let mut graph = Graph::new();
+    let key_state = graph.input_dtype("key_cache", [2, 2], DType::F32);
+    let value_state = graph.input_dtype("value_cache", [2, 2], DType::F32);
+    let position = graph.input_dtype("position", [1, 2], DType::I32);
+    let key_source = graph.input_dtype("key_updates", [1, 2], DType::F32);
+    let value_source = graph.input_dtype("value_updates", [1, 2], DType::F32);
+    let key_updates = graph.relu(key_source).unwrap();
+    let value_updates = graph.relu(value_source).unwrap();
+    let next_keys = graph.scatter(key_state, position, key_updates, 0).unwrap();
+    let next_values = graph
+        .scatter(value_state, position, value_updates, 0)
+        .unwrap();
+    let attention_read = graph.add(next_keys, next_values).unwrap();
+    let captured = CapturedAppendStateInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[attention_read],
+        &[
+            InferenceAppendStateLink::new(key_state, next_keys, position, key_updates, 0),
+            InferenceAppendStateLink::new(value_state, next_values, position, value_updates, 0),
+        ],
+        BTreeMap::from([
+            (
+                "key_cache".into(),
+                TensorData::new([2, 2], vec![10.0, 20.0, 30.0, 40.0]).unwrap(),
+            ),
+            (
+                "value_cache".into(),
+                TensorData::new([2, 2], vec![50.0, 60.0, 70.0, 80.0]).unwrap(),
+            ),
+        ]),
+    )
+    .unwrap();
+    let plan = MetalAppendStateInferencePlan::new(
+        captured,
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().state_pair_count, 2);
+    assert_eq!(plan.summary().state_bank_count, 1);
+    assert_eq!(plan.summary().state_device_bytes, 32);
+    assert_eq!(plan.summary().append_state_row_bytes, 16);
+    assert_eq!(plan.summary().append_state_work_items, 4);
+    let append_launches = plan
+        .rendered_items()
+        .filter(|item| item.extent != 0)
+        .enumerate()
+        .filter_map(|(ordinal, item)| item.append_state().map(|_| ordinal))
+        .collect::<Vec<_>>();
+    assert_eq!(append_launches.len(), 2);
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock.clone())).unwrap();
+    let invocation = |position_value: i32, keys: Vec<f32>, values: Vec<f32>| {
+        BTreeMap::from([
+            (
+                "position".into(),
+                TensorData::from_scalars(
+                    [1, 2],
+                    DType::I32,
+                    [Scalar::I(i64::from(position_value)); 2],
+                )
+                .unwrap(),
+            ),
+            ("key_updates".into(), TensorData::new([1, 2], keys).unwrap()),
+            (
+                "value_updates".into(),
+                TensorData::new([1, 2], values).unwrap(),
+            ),
+        ])
+    };
+    mock.state.lock().unwrap().failures.launch_after = Some((append_launches[1], "second append"));
+    assert!(
+        session
+            .run(&invocation(0, vec![1.0, 2.0], vec![3.0, 4.0]))
+            .is_err()
+    );
+    assert_eq!(session.committed_state_position(), Some(0));
+    assert_eq!(session.successful_run_count(), 0);
+
+    let retry = session
+        .run(&invocation(0, vec![5.0, 6.0], vec![7.0, 8.0]))
+        .unwrap();
+    assert_eq!(
+        retry.outputs()[0],
+        TensorData::new([2, 2], vec![12.0, 14.0, 100.0, 120.0]).unwrap()
+    );
+    assert_eq!(retry.report().committed_state_pair_count, 2);
+    assert_eq!(retry.report().committed_state_bytes, 16);
+    assert_eq!(retry.report().committed_state_work_items, 4);
+    assert_eq!(session.committed_state_position(), Some(1));
+    assert_eq!(session.successful_run_count(), 1);
+
+    let second = session
+        .run(&invocation(1, vec![9.0, 10.0], vec![11.0, 12.0]))
+        .unwrap();
+    assert_eq!(
+        second.outputs()[0],
+        TensorData::new([2, 2], vec![12.0, 14.0, 20.0, 22.0]).unwrap()
+    );
+    assert_eq!(session.committed_state_position(), Some(2));
+    assert_eq!(session.successful_run_count(), 2);
+    assert!(!mock.calls().iter().any(|call| call.starts_with("copy:")));
+}
+
+#[test]
+fn metal_append_state_empty_rows_are_addressless_but_advance_logically() {
+    let mut graph = Graph::new();
+    let state = graph.input_dtype("empty_cache", [2, 0], DType::F32);
+    let position = graph.input_dtype("empty_position", [1, 0], DType::I32);
+    let update_source = graph.input_dtype("empty_updates", [1, 0], DType::F32);
+    let updates = graph.relu(update_source).unwrap();
+    let next = graph.scatter(state, position, updates, 0).unwrap();
+    let captured = CapturedAppendStateInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[update_source],
+        &[InferenceAppendStateLink::new(
+            state, next, position, updates, 0,
+        )],
+        BTreeMap::from([(
+            "empty_cache".into(),
+            TensorData::new([2, 0], Vec::new()).unwrap(),
+        )]),
+    )
+    .unwrap();
+    let plan = MetalAppendStateInferencePlan::new(
+        captured,
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().state_bank_count, 1);
+    assert_eq!(plan.summary().state_device_bytes, 0);
+    assert_eq!(plan.summary().append_state_work_items, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device).unwrap();
+    assert!(mock.calls().is_empty());
+    let values = BTreeMap::from([
+        (
+            "empty_position".into(),
+            TensorData::from_scalars([1, 0], DType::I32, std::iter::empty()).unwrap(),
+        ),
+        (
+            "empty_updates".into(),
+            TensorData::new([1, 0], Vec::new()).unwrap(),
+        ),
+    ]);
+    session.run(&values).unwrap();
+    assert_eq!(session.committed_state_position(), Some(1));
     assert!(mock.calls().is_empty());
 }
 
@@ -1631,6 +1911,7 @@ struct Failures {
     build: Option<String>,
     pipeline: Option<&'static str>,
     launch: Option<&'static str>,
+    launch_after: Option<(usize, &'static str)>,
     query: Option<&'static str>,
     wait: Option<&'static str>,
 }
@@ -2386,6 +2667,14 @@ impl Dispatch for MockDispatch {
         let mut state = self.state.lock().unwrap();
         if let Some(detail) = state.failures.launch.take() {
             return Err(Self::failure("launch", detail));
+        }
+        if let Some((remaining, detail)) = state.failures.launch_after.as_mut() {
+            if *remaining == 0 {
+                let detail = *detail;
+                state.failures.launch_after = None;
+                return Err(Self::failure("launch", detail));
+            }
+            *remaining -= 1;
         }
         let semantics = state
             .semantics

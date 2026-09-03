@@ -7,15 +7,17 @@ use crate::{ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
 use crate::runtime::static_schedule::{
-    InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticBufferAllocation,
-    StaticDeviceAdapter, StaticExecutionReport, StaticPlanAdapter, StaticRendered,
-    StaticRenderedBuffer, StaticSchedulePlan, StaticStateLink, bind_rendered_buffers,
+    InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
+    StaticBufferAllocation, StaticDeviceAdapter, StaticExecutionReport, StaticPlanAdapter,
+    StaticRendered, StaticRenderedBuffer, StaticSchedulePlan, StaticStateLink,
+    bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
     device: Option<MetalDevice>,
     renderer: MetalRenderer,
     cache: Option<MetalCache>,
+    append_state: BTreeMap<u64, StaticAppendStateLink>,
 }
 
 impl MetalStaticAdapter {
@@ -24,6 +26,7 @@ impl MetalStaticAdapter {
             device: None,
             renderer,
             cache: None,
+            append_state: BTreeMap::new(),
         }
     }
 
@@ -33,7 +36,19 @@ impl MetalStaticAdapter {
             device: Some(device),
             renderer,
             cache: Some(cache),
+            append_state: BTreeMap::new(),
         }
+    }
+
+    fn with_append_state(mut self, links: &[StaticAppendStateLink]) -> Result<Self, MetalError> {
+        for link in links {
+            if self.append_state.insert(link.output, *link).is_some() {
+                return Err(MetalError::InvalidBinding(
+                    "duplicate Metal append-state output".into(),
+                ));
+            }
+        }
+        Ok(self)
     }
 
     fn device(&self) -> Result<&MetalDevice, MetalError> {
@@ -50,7 +65,10 @@ impl StaticPlanAdapter for MetalStaticAdapter {
     type Rendered = super::RenderedMetal;
 
     fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
-        let rendered = self.renderer.render(&item.kernel)?;
+        let rendered = match self.append_state.get(&item.outputs.primary().id) {
+            Some(link) => self.renderer.render_append_state(&item.kernel, link)?,
+            None => self.renderer.render(&item.kernel)?,
+        };
         rendered.validate_schedule_bindings(item.ordered_inputs())?;
         if rendered.transaction.is_some() {
             return Err(MetalError::Unsupported(
@@ -203,6 +221,27 @@ impl MetalPrefixPlan {
         })
     }
 
+    pub(crate) fn plan_with_append_policy(
+        items: &[ScheduleItem],
+        host_outputs: &[u64],
+        protected_outputs: &[u64],
+        append_state_links: &[StaticAppendStateLink],
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
+        let adapter =
+            MetalStaticAdapter::planner(renderer.clone()).with_append_state(append_state_links)?;
+        Ok(Self {
+            plan: StaticSchedulePlan::build_with_append_policy(
+                &adapter,
+                items,
+                host_outputs,
+                protected_outputs,
+                append_state_links,
+            )?,
+            renderer,
+        })
+    }
+
     pub fn cache_keys(&self) -> Vec<String> {
         self.plan.compiled_cache_keys()
     }
@@ -274,9 +313,11 @@ impl PreparedMetalPrefix {
     }
 
     pub fn from_plan(device: MetalDevice, plan: MetalPrefixPlan) -> Result<Self, MetalError> {
+        let append_state = plan.plan.append_state_links().to_vec();
         Ok(Self {
             inner: PreparedStaticSchedule::from_plan(
-                MetalStaticAdapter::runtime(device, plan.renderer),
+                MetalStaticAdapter::runtime(device, plan.renderer)
+                    .with_append_state(&append_state)?,
                 plan.plan,
             )?,
         })
@@ -320,6 +361,14 @@ impl InitializedMetalPrefix {
         alternate_state_bank: bool,
     ) -> Result<StaticExecutionReport, MetalError> {
         self.inner.execute_stateful(values, alternate_state_bank)
+    }
+
+    pub(super) fn execute_append_state(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        committed_position: usize,
+    ) -> Result<StaticExecutionReport, MetalError> {
+        self.inner.execute_append_state(values, committed_position)
     }
 }
 

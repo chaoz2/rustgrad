@@ -20,7 +20,8 @@ pub use buffer::MetalBuffer;
 pub use dispatch::{MetalCapabilities, MetalDeviceInfo};
 pub use prepared::{CapturedMetalPrefix, MetalPrefixPlan, PreparedMetalPrefix};
 pub use renderer::{
-    METAL_ABI_VERSION, METAL_RENDERER_VERSION, MetalBufferAbi, MetalRenderer, RenderedMetal,
+    METAL_ABI_VERSION, METAL_APPEND_STATE_RENDERER_VERSION, METAL_RENDERER_VERSION,
+    MetalAppendStateAbi, MetalBufferAbi, MetalRenderer, RenderedMetal,
 };
 pub use resource::{
     MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice, MetalDiscovery,
@@ -32,9 +33,9 @@ pub use scoreboard::{
     MetalSessionScoreboardReport,
 };
 pub use session::{
-    MetalDevicePreparationReport, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
-    MetalDeviceSessionPlan, MetalDeviceSessionSummary, MetalInferencePlan,
-    MetalStatefulInferencePlan,
+    MetalAppendStateInferencePlan, MetalDevicePreparationReport, MetalDeviceRun,
+    MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionPlan, MetalDeviceSessionSummary,
+    MetalInferencePlan, MetalStatefulInferencePlan,
 };
 pub use transaction::{
     GuardedIntegerOp, METAL_INDEXED_MOVEMENT_ABI_VERSION, METAL_TRANSACTION_ABI_VERSION,

@@ -21,6 +21,7 @@ pub const METAL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-metal-portab
 pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-dense-materialization-v1";
 pub const METAL_INDEXED_MOVEMENT_RENDERER_VERSION: &str = "rustgrad-metal-indexed-movement-v1";
+pub const METAL_APPEND_STATE_RENDERER_VERSION: &str = "rustgrad-metal-append-state-v1";
 pub const METAL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-metal-static-position-v1";
 pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-f32-matmul-v1";
@@ -48,6 +49,19 @@ pub struct MetalBufferAbi {
     pub view: Option<AffineView>,
 }
 
+/// Handle-free authenticated ABI for one complete-row append into an
+/// exclusively owned recurrent state allocation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MetalAppendStateAbi {
+    pub state_input: u64,
+    pub state_output: u64,
+    pub index: u64,
+    pub updates: u64,
+    pub axis: usize,
+    pub axis_extent: usize,
+    pub row_elements: usize,
+}
+
 #[derive(Clone, Debug)]
 /// Immutable MSL source plus the complete checked launch contract.
 pub struct RenderedMetal {
@@ -73,6 +87,9 @@ pub struct RenderedMetal {
     /// Renderer-private data-dependent movement status contract. Keeping it
     /// separate preserves every historical integer-transaction cache key.
     pub(super) indexed_movement: Option<super::MetalIndexedMovementAbi>,
+    /// Authenticated sparse append-state contract. Presence means the output
+    /// aliases the state input only inside an append-state session plan.
+    pub(super) append_state: Option<MetalAppendStateAbi>,
     pub(super) schedule_inputs: Vec<MetalBufferAbi>,
     pub(super) semantic_program: Arc<super::dispatch::KernelSemanticProgram>,
 }
@@ -82,6 +99,12 @@ impl RenderedMetal {
     /// artifact uses one. Its presence requires transactional launch.
     pub fn indexed_movement(&self) -> Option<&super::MetalIndexedMovementAbi> {
         self.indexed_movement.as_ref()
+    }
+
+    /// Returns the sparse append-state ABI when this item was rendered under
+    /// that explicit resource-free policy.
+    pub fn append_state(&self) -> Option<&MetalAppendStateAbi> {
+        self.append_state.as_ref()
     }
 
     /// Validates schedule-owned first-use ordering against the Metal pointer ABI.
@@ -534,6 +557,164 @@ impl MetalRenderer {
             capabilities: self.capabilities.clone(),
             transaction,
             indexed_movement: None,
+            append_state: None,
+            schedule_inputs,
+            semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+                root.clone(),
+            ))),
+        })
+    }
+
+    pub(crate) fn render_append_state(
+        &self,
+        root: &UOp,
+        link: &crate::runtime::static_schedule::StaticAppendStateLink,
+    ) -> Result<RenderedMetal, MetalError> {
+        root.validate()
+            .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
+            return Err(MetalError::InvalidBinding(
+                "append state owner is not a movement plan".into(),
+            ));
+        };
+        let portable = crate::movement_plan::PortableIndexedMovement::new(plan)
+            .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        let crate::MovementKernelKind::Scatter {
+            base,
+            index,
+            updates,
+            axis,
+            add,
+        } = &plan.kind
+        else {
+            return Err(MetalError::InvalidBinding(
+                "append state owner is not Scatter".into(),
+            ));
+        };
+        if *add
+            || base.node.index() as u64 != link.input
+            || plan.output.index() as u64 != link.output
+            || index.node.index() as u64 != link.index
+            || updates.node.index() as u64 != link.updates
+            || *axis != link.axis
+            || portable.axis_extent() != link.axis_extent
+            || portable.index_elements() != link.row_elements
+            || index.shape != updates.shape
+            || index.shape.rank() != base.shape.rank()
+            || index.shape.dims()[*axis] != 1
+            || index
+                .shape
+                .dims()
+                .iter()
+                .zip(base.shape.dims())
+                .enumerate()
+                .any(|(position, (index, base))| position != *axis && index != base)
+        {
+            return Err(MetalError::InvalidBinding(
+                "append state movement geometry mismatch".into(),
+            ));
+        }
+        let mut buffers = portable
+            .inputs()
+            .iter()
+            .map(|input| {
+                Ok(MetalBufferAbi {
+                    id: input.node.index() as u64,
+                    dtype: input.dtype,
+                    source_shape: input.shape.clone(),
+                    elements: input.shape.numel().map_err(|_| MetalError::Overflow)?,
+                    mutable: false,
+                    view: None,
+                })
+            })
+            .collect::<Result<Vec<_>, MetalError>>()?;
+        let schedule_inputs = buffers.clone();
+        let output_position = buffers.len();
+        buffers.push(MetalBufferAbi {
+            id: link.output,
+            dtype: DType::F32,
+            source_shape: base.shape.clone(),
+            elements: portable.output_elements(),
+            mutable: true,
+            view: None,
+        });
+        let abi = MetalAppendStateAbi {
+            state_input: link.input,
+            state_output: link.output,
+            index: link.index,
+            updates: link.updates,
+            axis: link.axis,
+            axis_extent: link.axis_extent,
+            row_elements: link.row_elements,
+        };
+        let index_position = portable.index_abi();
+        let update_position = portable
+            .update_abi()
+            .ok_or_else(|| MetalError::InvalidBinding("append updates ABI is absent".into()))?;
+        let mut lines = vec![
+            format!("// {METAL_APPEND_STATE_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+            "#include <metal_stdlib>".into(),
+            "using namespace metal;".into(),
+            "kernel void rg_metal_append_state_f32_i32(".into(),
+        ];
+        for (position, input) in portable.inputs().iter().enumerate() {
+            lines.push(format!(
+                "    device const {}* b{position} [[buffer({position})]],",
+                metal_storage_type(input.dtype)
+            ));
+        }
+        lines.extend([
+            format!("    device float* b{output_position} [[buffer({output_position})]],"),
+            format!("    constant ulong& extent [[buffer({})]],", buffers.len()),
+            "    uint rg_gid [[thread_position_in_grid]]) {".into(),
+            "  const ulong gid = (ulong)rg_gid;".into(),
+            "  if (gid >= extent) return;".into(),
+            format!("  const int rg_selected = b{index_position}[gid];"),
+        ]);
+        let destination = portable
+            .axes()
+            .iter()
+            .map(|axis| {
+                let coordinate = if axis.axis == portable.axis() {
+                    "(ulong)rg_selected".into()
+                } else {
+                    indexed_coordinate("gid", axis.index_divisor, axis.index_dimension)
+                };
+                format!("({coordinate} * (ulong){}ul)", axis.data_stride)
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        lines.push(format!(
+            "  b{output_position}[{}] = b{update_position}[gid];",
+            if destination.is_empty() {
+                "0ul"
+            } else {
+                &destination
+            }
+        ));
+        lines.push("}".into());
+        let source = lines.join("\n") + "\n";
+        let cache_key = stable_key(&(
+            METAL_APPEND_STATE_RENDERER_VERSION,
+            METAL_ABI_VERSION,
+            self.local_size,
+            &self.capabilities,
+            plan,
+            &abi,
+            &source,
+            &buffers,
+        ));
+        Ok(RenderedMetal {
+            source,
+            source_map: BTreeMap::new(),
+            buffers,
+            extent: link.row_elements,
+            entry: "rg_metal_append_state_f32_i32".into(),
+            cache_key,
+            capabilities: self.capabilities.clone(),
+            transaction: None,
+            indexed_movement: None,
+            append_state: Some(abi),
             schedule_inputs,
             semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
                 root.clone(),
@@ -633,6 +814,7 @@ fn render_portable_threefry(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: None,
+        append_state: None,
         schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -756,6 +938,7 @@ fn render_portable_sort(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: None,
+        append_state: None,
         schedule_inputs: vec![input],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -855,6 +1038,7 @@ fn render_portable_prefix_scan(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: None,
+        append_state: None,
         schedule_inputs: vec![input],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1185,6 +1369,7 @@ fn render_portable_f32_matmul(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: None,
+        append_state: None,
         schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1266,6 +1451,7 @@ fn render_portable_bitcast(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: None,
+        append_state: None,
         schedule_inputs: vec![input_abi],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1362,6 +1548,7 @@ fn render_portable_dense_materialization(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: None,
+        append_state: None,
         schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1478,6 +1665,7 @@ fn render_indexed_movement(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: Some(transaction),
+        append_state: None,
         schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1748,6 +1936,7 @@ fn render_raw_copy(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: None,
+        append_state: None,
         schedule_inputs: vec![input_abi],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1880,6 +2069,7 @@ fn render_static_positions(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: None,
+        append_state: None,
         schedule_inputs: vec![input_abi],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),

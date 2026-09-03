@@ -2544,6 +2544,25 @@ does the session flip its single epoch bit and publish state counters. Failure
 leaves the active bank and all visible metrics unchanged, so retry safely
 overwrites the uncommitted candidate bank.
 
+`CapturedAppendStateInference` is a narrower Metal-first policy for fixed
+capacity KV-style state. It authenticates an existing raw Scatter-replace as
+one complete F32 row selected by a live I32 index tensor, requires a
+capture-produced dense update buffer with an exact producer dependency,
+requires the state and update to be consumed exclusively by that item, and
+retains the full state output only as a protected downstream owner. The Metal
+plan renders that exact item with a distinct append cache identity, aliases only its proven
+input/output descriptors to one physical bank, and launches one work-item per
+row element. The row-shaped index is a dedicated authenticated runtime input;
+a model wrapper that also accepts a scalar position must expand that scalar and
+enforce their equality. Before any driver call, every live index lane must equal
+the session's next committed position and that position must be in range. Later
+items in the same capture observe the updated bank. A failure may leave only
+the uncommitted row provisional; retry must name the same position and
+overwrites the complete row, while the successful-run count, committed
+position, outputs, and metrics advance only after all launches, waits, public
+downloads, decoding, and projection succeed. Empty rows remain addressless.
+This is not generic in-place Scatter, dynamic state, or alias permission.
+
 The plan exposes exact typed input schemas, every rendered schedule item,
 nonzero compiled-kernel cache keys, planned slot bytes including private
 zero-byte sentinels, and nonzero/zero item counts. The prepared session exposes
@@ -2573,7 +2592,7 @@ and queue setup; `planned_static_tensor_slot_bytes` is neither measured peak
 memory nor process RSS. Host-wall observations are not GPU timestamps, and
 host-API copy counts/bytes are not physical-bus measurements. Failed, skipped,
 reordered, foreign-session, or pre-bind records cannot mutate the scoreboard.
-Stateful scoreboard binding/schema is an explicit follow-up rather than an
+Stateful and append-state scoreboard binding/schema is an explicit follow-up rather than an
 implicit extension of the v1 report.
 
 This boundary is concrete, pure, static inference only. Symbolic programs,
