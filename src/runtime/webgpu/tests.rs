@@ -7,6 +7,7 @@ use super::renderer::{
 
 #[test]
 fn predicated_projected_wgsl_uses_control_flow_and_guards_addressless_reads() {
+    assert_eq!(WGSL_RENDERER_VERSION, "rustgrad-wgsl-static-v9");
     for (shape, values, expected) in [
         (
             Shape::from([2]),

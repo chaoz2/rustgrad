@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v7";
+pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v8";
 pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-metal-portable-bitcast-v1";
 pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
@@ -280,22 +280,23 @@ impl MetalRenderer {
             .scalar;
         supported_storage(output_dtype)?;
 
+        let common_views = crate::schedule::common_buffer_views(&nodes);
         let mut inventory = BTreeMap::<u64, MetalBufferAbi>::new();
         for node in &nodes {
-            let (buffer, source_shape, elements, view) = match node.operation() {
+            let (buffer, source_shape, elements) = match node.operation() {
                 Operation::Index(IndexValue::Buffer {
                     buffer,
                     elements,
                     input_shape,
                     ..
-                }) => (*buffer, input_shape.clone(), *elements, None),
+                }) => (*buffer, input_shape.clone(), *elements),
                 Operation::Index(IndexValue::View { buffer, view, .. }) => {
                     let access = MetalViewAccess::new(view)?;
                     let elements = access
                         .source_shape
                         .numel()
                         .map_err(|_| MetalError::Overflow)?;
-                    (*buffer, access.source_shape, elements, Some(view.clone()))
+                    (*buffer, access.source_shape, elements)
                 }
                 _ => continue,
             };
@@ -310,7 +311,7 @@ impl MetalRenderer {
                 source_shape,
                 elements,
                 mutable: buffer == *output_id,
-                view,
+                view: common_views.get(&buffer).cloned().flatten(),
             };
             if let Some(previous) = inventory.insert(buffer, abi.clone())
                 && previous != abi

@@ -382,6 +382,9 @@ fn integer_binary(
             BinaryOp::Mod | BinaryOp::FMod => lhs % rhs,
             BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
             BinaryOp::Shr => lhs.wrapping_shr(rhs as u32),
+            BinaryOp::BitAnd => lhs & rhs,
+            BinaryOp::BitOr => lhs | rhs,
+            BinaryOp::BitXor => lhs ^ rhs,
             _ => return Err(OpenClError::Unsupported("detail binary expression".into())),
         };
         return Ok(Scalar::U(if dtype == DType::U32 {
@@ -402,6 +405,9 @@ fn integer_binary(
             BinaryOp::FMod => lhs.wrapping_rem(rhs),
             BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
             BinaryOp::Shr => lhs.wrapping_shr(rhs as u32),
+            BinaryOp::BitAnd => lhs & rhs,
+            BinaryOp::BitOr => lhs | rhs,
+            BinaryOp::BitXor => lhs ^ rhs,
             _ => return Err(OpenClError::Unsupported("detail binary expression".into())),
         };
         return Ok(Scalar::I(if dtype == DType::I32 {

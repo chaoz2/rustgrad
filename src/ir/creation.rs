@@ -992,6 +992,190 @@ mod tests {
     }
 
     #[test]
+    fn live_random_bits_matches_source_words_and_is_transactional_and_registry_free() {
+        let _stream_guard = Graph::lock_implicit_random_tests();
+        Graph::manual_seed(73);
+        let mut graph = Graph::new();
+        let key = graph.input_dtype("key", [2], DType::U32);
+        let counter = graph.input_dtype("counter", [2], DType::U32);
+        let empty = graph.random_bits(key, counter, 0).unwrap();
+        let before_negative = graph.node_count();
+        let negative = graph.random_bits(key, counter, -7).unwrap();
+        assert_eq!(graph.node_count(), before_negative + 1);
+        let one = graph.random_bits(key, counter, 1).unwrap();
+        let before_even = graph.node_count();
+        let even = graph.random_bits(key, counter, 4).unwrap();
+        let after_even = graph.node_count();
+        let odd = graph.random_bits(key, counter, 7).unwrap();
+        assert_eq!(graph.shape(empty).unwrap(), &Shape::new([0]));
+        assert_eq!(graph.shape(negative).unwrap(), &Shape::new([0]));
+        assert_eq!(graph.shape(one).unwrap(), &Shape::new([1]));
+        assert_eq!(graph.shape(even).unwrap(), &Shape::new([4]));
+        assert_eq!(graph.shape(odd).unwrap(), &Shape::new([7]));
+        assert_eq!(graph.dtype(odd).unwrap(), DType::U32);
+        assert!((before_even..after_even).any(|index| {
+            matches!(graph.op(NodeId(index)), Ok(Op::PrefixScan { .. }))
+                && matches!(graph.dtype(NodeId(index)), Ok(DType::U32))
+        }));
+        assert!((before_even..after_even).all(|index| {
+            !matches!(
+                graph.op(NodeId(index)),
+                Ok(Op::Cast { input, dtype: DType::U32 })
+                    if matches!(graph.dtype(*input), Ok(DType::I32))
+            )
+        }));
+        assert!(!graph.requires_grad(odd).unwrap());
+        let before_grad = graph.node_count();
+        assert!(matches!(
+            graph.grad(odd, key),
+            Err(Error::NonDifferentiableTarget(node)) if node == odd
+        ));
+        assert_eq!(graph.node_count(), before_grad);
+        assert!(matches!(
+            graph.op(empty).unwrap(),
+            Op::Shrink { input, bounds }
+                if *input == counter && bounds.as_slice() == [(0, 0)]
+        ));
+        assert!(matches!(
+            graph.op(negative).unwrap(),
+            Op::Shrink { input, bounds }
+                if *input == counter && bounds.as_slice() == [(0, 0)]
+        ));
+
+        let key_words = [0x0123_4567, 0x89ab_cdef];
+        let counter_words = [u32::MAX - 2, 9];
+        let inputs = HashMap::from([
+            (
+                "key".into(),
+                TensorData::from_storage([2], crate::Storage::U32(key_words.to_vec())).unwrap(),
+            ),
+            (
+                "counter".into(),
+                TensorData::from_storage([2], crate::Storage::U32(counter_words.to_vec())).unwrap(),
+            ),
+        ]);
+        for (output, len) in [(empty, 0), (negative, 0), (one, 1), (even, 4), (odd, 7)] {
+            let actual = CpuBackend.execute(&graph, output, &inputs).unwrap();
+            assert_eq!(actual.shape(), &Shape::new([len]));
+            assert_eq!(
+                actual.storage(),
+                &crate::Storage::U32(crate::random::words(key_words, counter_words, len))
+            );
+        }
+        assert_eq!(
+            (0..graph.node_count())
+                .filter(|&index| matches!(graph.op(NodeId(index)).unwrap(), Op::Threefry { .. }))
+                .count(),
+            6
+        );
+        assert!((0..graph.node_count()).all(|index| !matches!(
+            graph.op(NodeId(index)).unwrap(),
+            Op::Random { .. } | Op::RandomPermutation { .. }
+        )));
+
+        // A nonpositive request never enters tinygrad's chunk loop. Its key
+        // is therefore not validated or retained, while the exact counter
+        // descriptor remains the owner of the empty Shrink.
+        let mut empty_only = Graph::new();
+        let counter = empty_only.input_dtype("counter", [2], DType::U32);
+        let mut empty_outputs = Vec::new();
+        for num in [0, -9] {
+            let before = empty_only.node_count();
+            let output = empty_only
+                .random_bits(NodeId(usize::MAX), counter, num)
+                .unwrap();
+            assert_eq!(empty_only.node_count(), before + 1);
+            assert!(matches!(
+                empty_only.op(output).unwrap(),
+                Op::Shrink { input, bounds }
+                    if *input == counter && bounds.as_slice() == [(0, 0)]
+            ));
+            assert_eq!(
+                CpuBackend
+                    .execute(
+                        &empty_only,
+                        output,
+                        &HashMap::from([(
+                            "counter".into(),
+                            TensorData::from_storage([2], crate::Storage::U32(vec![13, 21]),)
+                                .unwrap(),
+                        )]),
+                    )
+                    .unwrap(),
+                TensorData::from_storage([0], crate::Storage::U32(Vec::new())).unwrap()
+            );
+            empty_outputs.push(output);
+        }
+        let schedule = crate::schedule_many(&empty_only, &empty_outputs).unwrap();
+        assert!(schedule.items.is_empty());
+        assert_eq!(schedule.requested_passthroughs.len(), 2);
+        let capture =
+            crate::CapturedSchedule::capture(&empty_only, &schedule, &empty_outputs).unwrap();
+        assert!(capture.inputs.iter().all(|input| input.name == "counter"));
+        let replay = crate::CapturedReplayExecutor::default()
+            .replay(
+                &capture,
+                &std::collections::BTreeMap::from([(
+                    "counter".into(),
+                    TensorData::from_storage([2], crate::Storage::U32(vec![13, 21])).unwrap(),
+                )]),
+                crate::CapturedReplayOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(replay.outputs.len(), 2);
+        assert!(replay.outputs.iter().all(TensorData::is_empty));
+
+        // Explicit live inputs do not reserve the process-global stream.
+        let after_live = graph.rand_implicit([2], DType::F32).unwrap();
+        Graph::manual_seed(73);
+        let mut baseline = Graph::new();
+        let first = baseline.rand_implicit([2], DType::F32).unwrap();
+        let (
+            Op::Random {
+                kind: live_kind,
+                stream: live_stream,
+            },
+            Op::Random {
+                kind: baseline_kind,
+                stream: baseline_stream,
+            },
+        ) = (graph.op(after_live).unwrap(), baseline.op(first).unwrap())
+        else {
+            panic!("expected ambient Random nodes")
+        };
+        assert_eq!(live_kind, baseline_kind);
+        assert_eq!(live_stream, baseline_stream);
+
+        let mut malformed = Graph::new();
+        let valid = malformed.input_dtype("counter", [2], DType::U32);
+        let wrong_dtype = malformed.input_dtype("key_dtype", [2], DType::I32);
+        let wrong_shape = malformed.input_dtype("key_shape", [1], DType::U32);
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.random_bits(wrong_dtype, valid, 4),
+            Err(Error::InvalidRandom { .. })
+        ));
+        assert_eq!(malformed.node_count(), before);
+        assert!(matches!(
+            malformed.random_bits(wrong_shape, valid, 4),
+            Err(Error::InvalidRandom { .. })
+        ));
+        assert_eq!(malformed.node_count(), before);
+        assert!(matches!(
+            malformed.random_bits(NodeId(usize::MAX), valid, 4),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+        if let Ok(too_many) = isize::try_from(crate::random::MAX_CHUNK_WORDS + 1) {
+            assert!(matches!(
+                malformed.random_bits(valid, valid, too_many),
+                Err(Error::InvalidRandom { .. })
+            ));
+            assert_eq!(malformed.node_count(), before);
+        }
+    }
+
+    #[test]
     fn scaled_uniform_implicit_is_source_uniform_then_weak_scale() {
         let _stream_guard = Graph::lock_implicit_random_tests();
         Graph::manual_seed(43);
@@ -3216,6 +3400,163 @@ fn stream_words(shape: &Shape, dtype: DType, multiplier: usize) -> Result<u64> {
     Ok(bytes.div_ceil(4) as u64)
 }
 
+#[derive(Clone, Debug)]
+struct LiveRandomBitsPlan {
+    key: NodeId,
+    counter: NodeId,
+    num: usize,
+    pairs: usize,
+    output_shape: Shape,
+}
+
+fn live_random_bits_plan(
+    graph: &Graph,
+    key: NodeId,
+    counter: NodeId,
+    num: isize,
+) -> Result<LiveRandomBitsPlan> {
+    let validate_input = |name: &'static str, input: NodeId| -> Result<()> {
+        let node = graph.node(input)?;
+        if node.dtype != DType::U32 || node.shape != Shape::new([2]) {
+            return Err(Error::InvalidRandom {
+                reason: match name {
+                    "key" => "random_bits key must be U32 [2]",
+                    _ => "random_bits counter must be U32 [2]",
+                },
+            });
+        }
+        node.shape
+            .numel()?
+            .checked_mul(node.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))?;
+        Ok(())
+    };
+    // The empty source branch is exactly `counter[0:0]`: Python never enters
+    // the chunk loop, so `key` is neither inspected nor represented in the
+    // resulting graph. Counter still owns the returned view descriptor.
+    validate_input("counter", counter)?;
+    // Python's positive-step `range(0, num, ...)` is empty for every
+    // nonpositive signed bound, and the source then returns counter[0:0].
+    let num = if num <= 0 {
+        0
+    } else {
+        usize::try_from(num).map_err(|_| Error::InvalidRandom {
+            reason: "random_bits word count exceeds the host domain",
+        })?
+    };
+    if num != 0 {
+        validate_input("key", key)?;
+    }
+    let num_u64 = u64::try_from(num).map_err(|_| Error::InvalidRandom {
+        reason: "random_bits word count exceeds the source domain",
+    })?;
+    if num_u64 > crate::random::MAX_CHUNK_WORDS {
+        return Err(Error::InvalidRandom {
+            reason: "random_bits is bounded to one source chunk",
+        });
+    }
+    let output_shape = Shape::new([num]);
+    output_shape
+        .numel()?
+        .checked_mul(DType::U32.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    let pairs = num.div_ceil(2);
+    let pair_shape = Shape::new([pairs]);
+    pair_shape
+        .numel()?
+        .checked_mul(DType::U64.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(pair_shape.clone()))?;
+    Ok(LiveRandomBitsPlan {
+        key,
+        counter,
+        num,
+        pairs,
+        output_shape,
+    })
+}
+
+fn source_vector_lane(graph: &mut Graph, input: NodeId, lane: usize) -> Result<NodeId> {
+    let lane = graph.shrink(input, vec![(lane, lane + 1)])?;
+    graph.squeeze(lane, Some(0))
+}
+
+fn pack_source_u32_pair(graph: &mut Graph, low: NodeId, high: NodeId) -> Result<NodeId> {
+    let low = graph.cast(low, DType::U64)?;
+    let high = graph.cast(high, DType::U64)?;
+    let high = graph.lshift_scalar(high, Scalar::I(32))?;
+    graph.bitwise_or(high, low)
+}
+
+fn lower_source_threefry_words(
+    graph: &mut Graph,
+    key: NodeId,
+    counts0: NodeId,
+    counts1: NodeId,
+) -> Result<NodeId> {
+    let counter = pack_source_u32_pair(graph, counts0, counts1)?;
+    let key0 = source_vector_lane(graph, key, 0)?;
+    let key1 = source_vector_lane(graph, key, 1)?;
+    let key = pack_source_u32_pair(graph, key0, key1)?;
+    let mixed = graph.threefry(counter, key)?;
+    let low = graph.cast(mixed, DType::U32)?;
+    let high = graph.rshift_scalar(mixed, Scalar::I(32))?;
+    let high = graph.cast(high, DType::U32)?;
+    graph.cat(low, vec![high], 0)
+}
+
+fn lower_live_u32_range(graph: &mut Graph, len: usize) -> Result<NodeId> {
+    let shape = Shape::new([len]);
+    shape
+        .numel()?
+        .checked_mul(DType::U32.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let steps = graph.lazy_full_with_dtype(shape, Scalar::U(1), DType::U32)?;
+    let cumulative = graph.cumsum(steps, 0)?;
+    let offset = graph.constant(TensorData::scalar_with_dtype(
+        Scalar::U(u64::from(u32::MAX)),
+        DType::U32,
+    ));
+    graph.add(cumulative, offset)
+}
+
+fn lower_live_random_bits(graph: &mut Graph, plan: &LiveRandomBitsPlan) -> Result<NodeId> {
+    if plan.num == 0 {
+        return graph.shrink(plan.counter, vec![(0, 0)]);
+    }
+
+    // The public boundary is deliberately one source chunk. Preserve the
+    // checked-in construction literally even though this first chunk has a
+    // zero offset: counter low/high are sliced before carry is evaluated, and
+    // the derived key is itself the low-then-high result of live Threefry.
+    let counter_low = graph.shrink(plan.counter, vec![(0, 1)])?;
+    let counter_high = graph.shrink(plan.counter, vec![(1, 2)])?;
+    let chunk_low = graph.add_scalar(counter_low, Scalar::U(0))?;
+    let carry = graph.lt(chunk_low, counter_low)?;
+    let chunk_high = graph.add_scalar(counter_high, Scalar::U(0))?;
+    let chunk_high = graph.add(chunk_high, carry)?;
+    let derived_key = lower_source_threefry_words(graph, plan.key, chunk_low, chunk_high)?;
+
+    // Keep the source counter lanes in U32 storage from their scalar Full
+    // through cumulative Add and the wrapping -1 offset. This is the same
+    // 0..pairs value sequence without introducing an unrelated signed-range
+    // Cast into the portable integer schedule.
+    let counts0 = lower_live_u32_range(graph, plan.pairs)?;
+    let pairs_u64 = u64::try_from(plan.pairs).map_err(|_| Error::InvalidRandom {
+        reason: "random_bits pair count exceeds the source domain",
+    })?;
+    let counts1 = graph.add_scalar(counts0, Scalar::U(pairs_u64))?;
+    let words = lower_source_threefry_words(graph, derived_key, counts0, counts1)?;
+    if plan.num
+        == plan.pairs.checked_mul(2).ok_or(Error::InvalidRandom {
+            reason: "random_bits pair count exceeds the source domain",
+        })?
+    {
+        Ok(words)
+    } else {
+        graph.shrink(words, vec![(0, plan.num)])
+    }
+}
+
 fn checked_counter_end(counter: [u32; 2], words: u64) -> Result<()> {
     let start = u64::from(counter[0]) | (u64::from(counter[1]) << 32);
     start.checked_add(words).ok_or(Error::InvalidRandom {
@@ -5139,6 +5480,44 @@ impl Graph {
         shifts: RollShifts,
     ) -> Result<NodeId> {
         self.roll_tinygrad(input, shifts, RollDims::None)
+    }
+
+    /// Source-literal live-input `Tensor.random_bits(key, counter, num)`.
+    ///
+    /// `key` and `counter` are exact U32 `[2]` tensors. A positive `num`
+    /// returns U32 `[num]`; every nonpositive value follows Python's empty
+    /// range and returns the exact `counter[0:0]` alias. The implementation is
+    /// composed from the public dependency-bearing Threefry operation plus
+    /// ordinary integer/view nodes, so neither explicit input participates in
+    /// the ambient random registry. This first execution surface is bounded
+    /// to tinygrad's one-source-chunk domain; larger positive requests fail
+    /// atomically before appending graph state.
+    pub fn random_bits(&mut self, key: NodeId, counter: NodeId, num: isize) -> Result<NodeId> {
+        let plan = live_random_bits_plan(self, key, counter, num)?;
+        let mut rehearsal = self.clone();
+        let rehearsed = lower_live_random_bits(&mut rehearsal, &plan)?;
+        let rehearsed_shape = rehearsal.shape(rehearsed)?.clone();
+        let rehearsed_dtype = rehearsal.dtype(rehearsed)?;
+        rehearsed_shape
+            .numel()?
+            .checked_mul(rehearsed_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(rehearsed_shape.clone()))?;
+        if rehearsed_shape != plan.output_shape || rehearsed_dtype != DType::U32 {
+            return Err(Error::InvalidRandom {
+                reason: "random_bits lowering changed its output descriptor",
+            });
+        }
+
+        let output = lower_live_random_bits(self, &plan)?;
+        debug_assert_eq!(
+            self.shape(output).expect("random_bits shape preflighted"),
+            &plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(output).expect("random_bits dtype preflighted"),
+            DType::U32
+        );
+        Ok(output)
     }
 
     /// Uniform `[0, 1)` values from an explicit Threefry stream key.

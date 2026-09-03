@@ -9,6 +9,7 @@ use super::renderer::{
 
 #[test]
 fn predicated_projected_opencl_guards_nonempty_and_addressless_reads() {
+    assert_eq!(OPENCL_RENDERER_VERSION, "rustgrad-opencl-static-v10");
     let renderer = OpenClRenderer::default();
     for (shape, values, expected) in [
         (
@@ -644,6 +645,246 @@ fn portable_threefry_opencl_renders_broadcast_alias_and_executes_exact_bits() {
             || call.starts_with("queue_create:")
             || call.starts_with("launch:")
     }));
+}
+
+#[test]
+fn live_random_bits_opencl_executes_source_composition_with_live_inputs() {
+    let renderer = OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL).unwrap();
+    let mut graph = Graph::new();
+    let key = graph.input_dtype("key", [2], DType::U32);
+    let counter = graph.input_dtype("counter", [2], DType::U32);
+    let output = graph.random_bits(key, counter, 7).unwrap();
+    let scheduled = schedule(&graph, output).unwrap();
+    let items = &scheduled.items;
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item.kernel.operation(), crate::Operation::Threefry(_)))
+    );
+    let produced = items
+        .iter()
+        .flat_map(|item| item.outputs.iter().map(|output| output.id))
+        .collect::<BTreeSet<_>>();
+    let external = items
+        .iter()
+        .flat_map(|item| item.ordered_inputs())
+        .filter(|binding| !produced.contains(&binding.desc.id))
+        .map(|binding| binding.desc.id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        external,
+        BTreeSet::from([key.index() as u64, counter.index() as u64]),
+        "the raw prefix ABI contains only the two public graph inputs"
+    );
+    for (item_index, item) in items.iter().enumerate() {
+        for binding in item.ordered_inputs() {
+            if [key, counter].contains(&binding.input_node) {
+                continue;
+            }
+            let (producer_index, producer) = items[..item_index]
+                .iter()
+                .enumerate()
+                .find(|(_, producer)| {
+                    producer
+                        .outputs
+                        .iter()
+                        .any(|output| output.id == binding.desc.id)
+                })
+                .expect("every non-input pointer has a prior scheduled producer");
+            assert!(producer_index < item_index);
+            assert!(item.dependencies.contains(&producer.id));
+        }
+    }
+    let multi_view = items
+        .iter()
+        .find(|item| {
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.operation(),
+                        crate::Operation::Index(crate::IndexValue::View { buffer, .. })
+                            if *buffer == key.index() as u64
+                    )
+                })
+                .count()
+                > 1
+        })
+        .expect("key lanes share one physical pointer ABI");
+    let key_binding = multi_view
+        .ordered_inputs()
+        .iter()
+        .find(|binding| binding.desc.id == key.index() as u64)
+        .expect("key pointer binding");
+    assert!(key_binding.desc.view.is_none());
+
+    let mut saw_guarded_bitwise = false;
+    let mut guarded_transactions = 0usize;
+    for item in items {
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        guarded_transactions += usize::from(rendered.extent != 0 && rendered.transaction.is_some());
+        saw_guarded_bitwise |= rendered.transaction.as_ref().is_some_and(|transaction| {
+            transaction
+                .evaluation_root
+                .topological()
+                .is_ok_and(|nodes| {
+                    nodes.iter().any(|node| {
+                        matches!(
+                            node.operation(),
+                            crate::Operation::GraphBinary(
+                                crate::BinaryOp::BitAnd
+                                    | crate::BinaryOp::BitOr
+                                    | crate::BinaryOp::BitXor
+                            )
+                        )
+                    })
+                })
+        });
+    }
+    assert!(
+        saw_guarded_bitwise,
+        "source word packing exercises bitwise evaluation around a guarded shift"
+    );
+    let passthrough = scheduled
+        .requested_passthroughs
+        .iter()
+        .find(|passthrough| passthrough.requested == output)
+        .expect("odd source word count is a requested terminal Shrink");
+    assert!(produced.contains(&(passthrough.source.index() as u64)));
+    assert_eq!(passthrough.desc.id, passthrough.source.index() as u64);
+    assert_eq!(
+        passthrough
+            .desc
+            .view
+            .as_ref()
+            .expect("odd output view")
+            .logical_shape,
+        Shape::new([7])
+    );
+    let rendered = renderer.render(&multi_view.kernel).unwrap();
+    assert!(
+        rendered
+            .buffers
+            .iter()
+            .find(|buffer| buffer.id == key.index() as u64)
+            .expect("key OpenCL ABI")
+            .view
+            .is_none()
+    );
+    let mut tampered = multi_view.ordered_inputs().to_vec();
+    tampered[key_binding.abi_index].desc.view =
+        Some(crate::AffineView::identity(crate::Shape::new([2])));
+    assert!(matches!(
+        rendered.validate_schedule_bindings(&tampered),
+        Err(OpenClError::InvalidBinding(reason))
+            if reason.contains("mismatches OpenCL ABI")
+    ));
+
+    let key_words = [0x0123_4567, 0x89ab_cdef];
+    let counter_words = [u32::MAX - 2, 9];
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+    let prefix = PreparedOpenClPrefix::prepare_capture(context, &capture, renderer).unwrap();
+    let values = BTreeMap::from([
+        (
+            "key".into(),
+            TensorData::from_storage([2], Storage::U32(key_words.to_vec())).unwrap(),
+        ),
+        (
+            "counter".into(),
+            TensorData::from_storage([2], Storage::U32(counter_words.to_vec())).unwrap(),
+        ),
+    ]);
+    let before = mock.calls();
+    let outputs = prefix.execute(&values).unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        outputs[0].storage(),
+        &Storage::U32(crate::random::words(key_words, counter_words, 7))
+    );
+    let calls = mock.calls();
+    let reads = calls[before.len()..]
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call.starts_with("read:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads.len(),
+        guarded_transactions + 1,
+        "each guarded transaction reads one status before one retained physical output"
+    );
+    let (retained_read_index, retained_read) = reads.last().expect("retained output read");
+    assert!(
+        reads[..guarded_transactions]
+            .iter()
+            .all(|(index, call)| *index < *retained_read_index && call.ends_with(":4")),
+        "all four-byte transaction status reads precede retained output publication"
+    );
+    assert!(
+        retained_read.ends_with(&format!(":{}", passthrough.desc.bytes)),
+        "the final read returns the retained physical source before logical Shrink projection"
+    );
+}
+
+#[test]
+fn exact_opencl_u32_u64_casts_preserve_edge_lanes_and_reject_before_resources() {
+    let renderer = OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL).unwrap();
+    let mut graph = Graph::new();
+    let narrow_input = graph.input_dtype("narrow", [2], DType::U32);
+    let wide_input = graph.input_dtype("wide", [2], DType::U64);
+    let widened = graph.cast(narrow_input, DType::U64).unwrap();
+    let truncated = graph.cast(wide_input, DType::U32).unwrap();
+    let items = crate::schedule_many(&graph, &[widened, truncated])
+        .unwrap()
+        .items;
+    assert_eq!(items.len(), 2);
+    for item in &items {
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+    }
+
+    let mock = Arc::new(MockDispatch::default());
+    let (context, _) = setup(mock.clone());
+    let prefix = PreparedOpenClPrefix::prepare(context.clone(), &items, renderer).unwrap();
+    let mut values = BTreeMap::from([
+        (
+            narrow_input.index() as u64,
+            TensorData::from_storage([2], Storage::U32(vec![u32::MAX, 0x8000_0000])).unwrap(),
+        ),
+        (
+            wide_input.index() as u64,
+            TensorData::from_storage(
+                [2],
+                Storage::U64(vec![0xffff_ffff_0123_4567, 0x8000_0000_ffff_ffff]),
+            )
+            .unwrap(),
+        ),
+    ]);
+    prefix.execute(&mut values).unwrap();
+    assert_eq!(
+        values[&(widened.index() as u64)].storage(),
+        &Storage::U64(vec![u64::from(u32::MAX), 0x8000_0000])
+    );
+    assert_eq!(
+        values[&(truncated.index() as u64)].storage(),
+        &Storage::U32(vec![0x0123_4567, u32::MAX])
+    );
+
+    let core = OpenClRenderer::with_capabilities(8, OpenClCapabilities::CORE_32).unwrap();
+    let before = mock.calls();
+    assert!(matches!(
+        PreparedOpenClPrefix::prepare(context, &items, core),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("64-bit integer")
+    ));
+    assert_eq!(mock.calls(), before);
 }
 
 #[test]

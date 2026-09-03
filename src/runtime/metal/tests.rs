@@ -8,6 +8,7 @@ use super::renderer::{
 
 #[test]
 fn predicated_projected_metal_preserves_raw_lanes_and_guards_addressless_reads() {
+    assert_eq!(METAL_RENDERER_VERSION, "rustgrad-metal-static-v8");
     for (shape, values, expected) in [
         (
             Shape::from([2]),
