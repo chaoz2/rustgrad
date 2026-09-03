@@ -151,6 +151,26 @@ impl CapturedStaticExecution {
         &self.retained
     }
 
+    pub(crate) fn retained_for_requested_prefix(&self, count: usize) -> Result<Vec<u64>, String> {
+        if count > self.requested().len() {
+            return Err("captured static requested prefix is out of range".into());
+        }
+        let retained = self.retained.iter().copied().collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        Ok(self.requested()[..count]
+            .iter()
+            .filter_map(|id| {
+                retained.contains(id).then_some(*id).or_else(|| {
+                    self.passthroughs
+                        .get(id)
+                        .map(|alias| alias.source.index() as u64)
+                        .filter(|source| retained.contains(source))
+                })
+            })
+            .filter(|id| seen.insert(*id))
+            .collect())
+    }
+
     pub(crate) fn inputs(&self) -> &[ReplayInput] {
         match &self.backing {
             CapturedStaticBacking::Projected { inputs, .. } => inputs,
@@ -286,8 +306,29 @@ impl CapturedStaticExecution {
         self.project_with_fallback(values, &BTreeMap::new())
     }
 
+    pub(crate) fn project_prefix(
+        &self,
+        count: usize,
+        values: &BTreeMap<u64, TensorData>,
+        fallback: &BTreeMap<u64, TensorData>,
+    ) -> Result<Vec<TensorData>, String> {
+        if count > self.requested().len() {
+            return Err("captured static requested prefix is out of range".into());
+        }
+        self.project_requested(&self.requested()[..count], values, fallback)
+    }
+
     fn project_with_fallback(
         &self,
+        values: &BTreeMap<u64, TensorData>,
+        fallback: &BTreeMap<u64, TensorData>,
+    ) -> Result<Vec<TensorData>, String> {
+        self.project_requested(self.requested(), values, fallback)
+    }
+
+    fn project_requested(
+        &self,
+        requested: &[u64],
         values: &BTreeMap<u64, TensorData>,
         fallback: &BTreeMap<u64, TensorData>,
     ) -> Result<Vec<TensorData>, String> {
@@ -297,7 +338,7 @@ impl CapturedStaticExecution {
                 .or_else(|| fallback.get(&id))
                 .or_else(|| self.constants().get(&id))
         };
-        self.requested()
+        requested
             .iter()
             .map(|id| {
                 if let Some(alias) = self.passthroughs.get(id) {
@@ -338,6 +379,7 @@ impl CapturedStaticExecution {
 pub(crate) struct StaticLifetimePlan {
     capture: CapturedStaticExecution,
     resident_inputs: Vec<ReplayInput>,
+    state_inputs: Vec<ReplayInput>,
     transient_inputs: Vec<ReplayInput>,
     resident_ids: BTreeSet<u64>,
 }
@@ -346,6 +388,14 @@ impl StaticLifetimePlan {
     pub(crate) fn new(
         capture: CapturedStaticExecution,
         resident_names: &[String],
+    ) -> Result<Self, String> {
+        Self::new_with_state(capture, resident_names, &[])
+    }
+
+    pub(crate) fn new_with_state(
+        capture: CapturedStaticExecution,
+        resident_names: &[String],
+        state_names: &[String],
     ) -> Result<Self, String> {
         if capture.owned_capture().is_none() {
             return Err("static lifetime plan requires owned capture backing".into());
@@ -356,6 +406,12 @@ impl StaticLifetimePlan {
                 return Err("resident input names must be nonempty and unique".into());
             }
         }
+        let mut state = BTreeSet::new();
+        for name in state_names {
+            if name.is_empty() || !state.insert(name.as_str()) || names.contains(name.as_str()) {
+                return Err("state input names must be nonempty, unique, and nonresident".into());
+            }
+        }
         let known = capture
             .inputs()
             .iter()
@@ -364,18 +420,26 @@ impl StaticLifetimePlan {
         if let Some(name) = names.iter().find(|name| !known.contains(**name)) {
             return Err(format!("resident input {name} is absent from the capture"));
         }
-        let (resident_inputs, transient_inputs): (Vec<_>, Vec<_>) = capture
+        if let Some(name) = state.iter().find(|name| !known.contains(**name)) {
+            return Err(format!("state input {name} is absent from the capture"));
+        }
+        let (resident_inputs, remaining): (Vec<_>, Vec<_>) = capture
             .inputs()
             .iter()
             .cloned()
             .partition(|input| names.contains(input.name.as_str()));
+        let (state_inputs, transient_inputs): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
+            .partition(|input| state.contains(input.name.as_str()));
         let resident_ids = capture
             .constant_ids()
             .chain(resident_inputs.iter().map(|input| input.desc.id))
+            .chain(state_inputs.iter().map(|input| input.desc.id))
             .collect();
         Ok(Self {
             capture,
             resident_inputs,
+            state_inputs,
             transient_inputs,
             resident_ids,
         })
@@ -395,16 +459,16 @@ impl StaticLifetimePlan {
             .map(|input| input.name.as_str())
     }
 
+    pub(crate) fn state_inputs(&self) -> &[ReplayInput] {
+        &self.state_inputs
+    }
+
     pub(crate) fn transient_inputs(&self) -> &[ReplayInput] {
         &self.transient_inputs
     }
 
     pub(crate) fn resident_ids(&self) -> &BTreeSet<u64> {
         &self.resident_ids
-    }
-
-    pub(crate) fn retained(&self) -> &[u64] {
-        self.capture.retained()
     }
 
     pub(crate) fn capture(&self) -> &CapturedSchedule {
@@ -423,6 +487,27 @@ impl StaticLifetimePlan {
             provided,
             &mut values,
             "resident Metal session",
+        )?;
+        Ok(values)
+    }
+
+    pub(crate) fn stage_initialized(
+        &self,
+        residents: BTreeMap<String, TensorData>,
+        states: BTreeMap<String, TensorData>,
+    ) -> Result<BTreeMap<u64, TensorData>, String> {
+        let mut values = self.capture.constants().clone();
+        CapturedStaticExecution::insert_owned_inputs(
+            &self.resident_inputs,
+            residents,
+            &mut values,
+            "resident Metal session",
+        )?;
+        CapturedStaticExecution::insert_owned_inputs(
+            &self.state_inputs,
+            states,
+            &mut values,
+            "initial Metal state",
         )?;
         Ok(values)
     }
@@ -447,6 +532,15 @@ impl StaticLifetimePlan {
         resident_sources: &BTreeMap<u64, TensorData>,
     ) -> Result<Vec<TensorData>, String> {
         self.capture.project_with_fallback(values, resident_sources)
+    }
+
+    pub(crate) fn project_prefix(
+        &self,
+        count: usize,
+        values: &BTreeMap<u64, TensorData>,
+        resident_sources: &BTreeMap<u64, TensorData>,
+    ) -> Result<Vec<TensorData>, String> {
+        self.capture.project_prefix(count, values, resident_sources)
     }
 
     pub(crate) fn retain_projection_sources(
@@ -1008,8 +1102,18 @@ pub(crate) struct StaticSchedulePlan<R> {
     items: Vec<StaticItemPlan<R>>,
     buffers: BTreeMap<u64, StaticBufferPlan>,
     external_inputs: Vec<u64>,
-    retained_outputs: Vec<u64>,
+    host_outputs: Vec<u64>,
+    protected_outputs: Vec<u64>,
+    state_links: Vec<StaticStateLink>,
     allocations: StaticAllocationPlan,
+}
+
+/// One authenticated fixed-shape input/output pair whose two private slots
+/// alternate ownership between successful static-device invocations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StaticStateLink {
+    pub(crate) input: u64,
+    pub(crate) output: u64,
 }
 
 /// Pure renderer/planner seam shared by ordinary device execution and CUDA
@@ -1075,7 +1179,17 @@ impl<R> StaticSchedulePlan<R> {
     }
 
     pub(crate) fn retained_outputs(&self) -> &[u64] {
-        &self.retained_outputs
+        &self.host_outputs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host_outputs(&self) -> &[u64] {
+        &self.host_outputs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protected_outputs(&self) -> &[u64] {
+        &self.protected_outputs
     }
 
     pub(crate) fn allocations(&self) -> &StaticAllocationPlan {
@@ -1086,6 +1200,35 @@ impl<R> StaticSchedulePlan<R> {
         adapter: &A,
         items: &[ScheduleItem],
         retained: Option<&[u64]>,
+    ) -> Result<Self, A::Error>
+    where
+        A: StaticPlanAdapter<Rendered = R>,
+    {
+        let outputs = retained.map(|outputs| (outputs, outputs, &[] as &[StaticStateLink]));
+        Self::build_with_outputs(adapter, items, outputs)
+    }
+
+    pub(crate) fn build_with_output_policy<A>(
+        adapter: &A,
+        items: &[ScheduleItem],
+        host_outputs: &[u64],
+        protected_outputs: &[u64],
+        state_links: &[StaticStateLink],
+    ) -> Result<Self, A::Error>
+    where
+        A: StaticPlanAdapter<Rendered = R>,
+    {
+        Self::build_with_outputs(
+            adapter,
+            items,
+            Some((host_outputs, protected_outputs, state_links)),
+        )
+    }
+
+    fn build_with_outputs<A>(
+        adapter: &A,
+        items: &[ScheduleItem],
+        outputs: Option<(&[u64], &[u64], &[StaticStateLink])>,
     ) -> Result<Self, A::Error>
     where
         A: StaticPlanAdapter<Rendered = R>,
@@ -1269,39 +1412,53 @@ impl<R> StaticSchedulePlan<R> {
             let buffer = buffers.get_mut(id).expect("producer ABI was inserted");
             buffer.producer = Some(*producer);
         }
-        let retained_outputs = match retained {
-            Some(ids) => {
-                let mut unique = BTreeSet::new();
-                for id in ids {
-                    if !unique.insert(*id) {
-                        return Err(A::invalid_binding(format!(
-                            "requested logical output {id} is duplicated"
-                        )));
-                    }
-                    if !producers.contains_key(id) {
-                        return Err(A::invalid_binding(format!(
-                            "requested logical output {id} has no prefix producer"
-                        )));
-                    }
+        let validate_outputs = |ids: &[u64], label: &str| -> Result<Vec<u64>, A::Error> {
+            let mut unique = BTreeSet::new();
+            for id in ids {
+                if !unique.insert(*id) {
+                    return Err(A::invalid_binding(format!(
+                        "{label} logical output {id} is duplicated"
+                    )));
                 }
-                ids.to_vec()
+                if !producers.contains_key(id) {
+                    return Err(A::invalid_binding(format!(
+                        "{label} logical output {id} has no prefix producer"
+                    )));
+                }
+            }
+            Ok(ids.to_vec())
+        };
+        let (host_outputs, protected_outputs, state_links) = match outputs {
+            Some((host, protected, state_links)) => {
+                let host = validate_outputs(host, "host")?;
+                let protected = validate_outputs(protected, "protected")?;
+                let protected_set = protected.iter().copied().collect::<BTreeSet<_>>();
+                if let Some(id) = host.iter().find(|id| !protected_set.contains(id)) {
+                    return Err(A::invalid_binding(format!(
+                        "host logical output {id} is not protected"
+                    )));
+                }
+                (host, protected, state_links.to_vec())
             }
             // Public prepared-prefix APIs historically materialize every item
             // output into the caller map. Exact internal consumers pass an
             // explicit retained set through `prepare_for_outputs` instead.
-            None => items
-                .iter()
-                .flat_map(|item| item.outputs.iter().map(|output| output.id))
-                .collect::<Vec<_>>(),
+            None => {
+                let all = items
+                    .iter()
+                    .flat_map(|item| item.outputs.iter().map(|output| output.id))
+                    .collect::<Vec<_>>();
+                (all.clone(), all, Vec::new())
+            }
         };
-        if !items.is_empty() && retained_outputs.is_empty() {
+        if !items.is_empty() && protected_outputs.is_empty() {
             return Err(A::invalid_binding(
-                "static prefix has no terminal requested output".into(),
+                "static prefix has no protected output".into(),
             ));
         }
-        for id in &retained_outputs {
+        for id in &protected_outputs {
             buffers.get(id).ok_or_else(|| {
-                A::invalid_binding(format!("requested logical output {id} is absent"))
+                A::invalid_binding(format!("protected logical output {id} is absent"))
             })?;
         }
         let external_inputs = buffer_order
@@ -1309,19 +1466,61 @@ impl<R> StaticSchedulePlan<R> {
             .copied()
             .filter(|id| buffers[id].producer.is_none())
             .collect::<Vec<_>>();
+        let mut allocation_protected = protected_outputs.clone();
+        allocation_protected.extend(state_links.iter().map(|link| link.input));
         let allocations = build_static_allocation_plan::<A>(
             &planned,
             &buffers,
             &buffer_order,
             &external_inputs,
-            &retained_outputs,
+            &allocation_protected,
         )?;
+
+        let mut state_ids = BTreeSet::new();
+        for link in &state_links {
+            if link.input == link.output
+                || !state_ids.insert(link.input)
+                || !state_ids.insert(link.output)
+            {
+                return Err(A::invalid_binding(
+                    "static state links must own distinct logical buffers".into(),
+                ));
+            }
+            let input = buffers.get(&link.input).ok_or_else(|| {
+                A::invalid_binding(format!("static state input {} is absent", link.input))
+            })?;
+            let output = buffers.get(&link.output).ok_or_else(|| {
+                A::invalid_binding(format!("static state output {} is absent", link.output))
+            })?;
+            if input.producer.is_some()
+                || output.producer.is_none()
+                || !external_inputs.contains(&link.input)
+                || !protected_outputs.contains(&link.output)
+                || host_outputs.contains(&link.output)
+                || input.dtype != output.dtype
+                || input.source_shape != output.source_shape
+                || input.elements != output.elements
+                || input.bytes != output.bytes
+                || input.alignment != output.alignment
+                || (input.bytes != 0
+                    && (!allocations.logical_slots.contains_key(&link.input)
+                        || !allocations.logical_slots.contains_key(&link.output)
+                        || allocations.logical_slots.get(&link.input)
+                            == allocations.logical_slots.get(&link.output)))
+            {
+                return Err(A::invalid_binding(
+                    "static state link ownership or descriptor is invalid".into(),
+                ));
+            }
+        }
 
         Ok(Self {
             items: planned,
             buffers,
             external_inputs,
-            retained_outputs,
+            host_outputs,
+            protected_outputs,
+            state_links,
             allocations,
         })
     }
@@ -1496,7 +1695,8 @@ pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     logical_slots: BTreeMap<u64, usize>,
     buffer_plans: BTreeMap<u64, StaticBufferPlan>,
     external_inputs: Vec<u64>,
-    retained_outputs: Vec<u64>,
+    host_outputs: Vec<u64>,
+    state_links: Vec<StaticStateLink>,
     compiled_cache_keys: Vec<String>,
 }
 
@@ -1531,10 +1731,19 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             items,
             buffers: buffer_plans,
             external_inputs,
-            retained_outputs,
+            host_outputs,
+            protected_outputs,
+            state_links,
             allocations,
-            ..
         } = plan;
+        if host_outputs
+            .iter()
+            .any(|id| !protected_outputs.contains(id))
+        {
+            return Err(A::invalid_binding(
+                "static plan host output is not protected".into(),
+            ));
+        }
         let prepare_zero_extent = adapter.prepare_zero_extent();
         let mut prepared_items = Vec::with_capacity(items.len());
         for item in items {
@@ -1574,7 +1783,8 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             logical_slots: allocations.logical_slots,
             buffer_plans,
             external_inputs,
-            retained_outputs,
+            host_outputs,
+            state_links,
             compiled_cache_keys,
         })
     }
@@ -1595,6 +1805,19 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         self.logical_slots
             .get(&id)
             .and_then(|slot| self.slots.get(*slot))
+    }
+
+    fn buffer_for_epoch(&self, id: u64, alternate: bool) -> Option<&A::Buffer> {
+        let mapped = self.state_links.iter().find_map(|link| {
+            if id == link.input {
+                Some(if alternate { link.output } else { link.input })
+            } else if id == link.output {
+                Some(if alternate { link.input } else { link.output })
+            } else {
+                None
+            }
+        });
+        self.buffer(mapped.unwrap_or(id))
     }
 
     fn validated_uploads(
@@ -1689,10 +1912,19 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         values: &mut BTreeMap<u64, TensorData>,
         resident_ids: &BTreeSet<u64>,
     ) -> Result<StaticExecutionReport, A::Error> {
+        self.execute_skipping_residents_at_epoch(values, resident_ids, false)
+    }
+
+    fn execute_skipping_residents_at_epoch(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        resident_ids: &BTreeSet<u64>,
+        alternate_state_bank: bool,
+    ) -> Result<StaticExecutionReport, A::Error> {
         // Complete all host validation before the first driver call.
         let uploads = self.validated_uploads(values, |id| !resident_ids.contains(&id))?;
         let mut downloads = self
-            .retained_outputs
+            .host_outputs
             .iter()
             .map(|id| (*id, vec![0; self.buffer_plans[id].bytes]))
             .collect::<Vec<_>>();
@@ -1715,9 +1947,10 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             for (id, bytes) in &uploads {
                 self.adapter.write(
                     queue,
-                    self.buffer(*id).ok_or_else(|| {
-                        A::invalid_binding(format!("logical input buffer {id} is absent"))
-                    })?,
+                    self.buffer_for_epoch(*id, alternate_state_bank)
+                        .ok_or_else(|| {
+                            A::invalid_binding(format!("logical input buffer {id} is absent"))
+                        })?,
                     bytes,
                 )?;
             }
@@ -1734,20 +1967,23 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     .buffer_ids
                     .iter()
                     .map(|id| {
-                        self.buffer(*id).ok_or_else(|| {
-                            A::invalid_binding(format!("logical buffer {id} is absent"))
-                        })
+                        self.buffer_for_epoch(*id, alternate_state_bank)
+                            .ok_or_else(|| {
+                                A::invalid_binding(format!("logical buffer {id} is absent"))
+                            })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 self.adapter.launch_and_wait(queue, kernel, &bindings)?;
             }
             for (id, bytes) in &mut downloads {
                 if !bytes.is_empty() {
-                    let buffer = self.buffer(*id).ok_or_else(|| {
-                        A::invalid_binding(format!(
-                            "nonempty retained output {id} has no device allocation"
-                        ))
-                    })?;
+                    let buffer = self
+                        .buffer_for_epoch(*id, alternate_state_bank)
+                        .ok_or_else(|| {
+                            A::invalid_binding(format!(
+                                "nonempty retained output {id} has no device allocation"
+                            ))
+                        })?;
                     self.adapter.read(queue, buffer, bytes)?;
                 }
             }
@@ -1780,6 +2016,18 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
     ) -> Result<StaticExecutionReport, A::Error> {
         self.prepared
             .execute_skipping_residents(values, &self.resident_ids)
+    }
+
+    pub(crate) fn execute_stateful(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        alternate_state_bank: bool,
+    ) -> Result<StaticExecutionReport, A::Error> {
+        self.prepared.execute_skipping_residents_at_epoch(
+            values,
+            &self.resident_ids,
+            alternate_state_bank,
+        )
     }
 }
 
@@ -2611,7 +2859,7 @@ mod tests {
         );
         assert_eq!(plan.items[0].input_ids, vec![input.index() as u64]);
         assert_eq!(
-            plan.retained_outputs,
+            plan.host_outputs,
             vec![values.index() as u64, indices.index() as u64]
         );
         assert_eq!(plan.buffers[&(values.index() as u64)].producer, Some(0));
@@ -2764,6 +3012,49 @@ mod tests {
         assert_eq!(
             projected[0].to_le_bytes().unwrap(),
             projected[1].to_le_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn static_output_policy_protects_state_without_host_materialization() {
+        let mut graph = Graph::new();
+        let state = graph.input_dtype("state", [2], DType::F32);
+        let transient = graph.input_dtype("transient", [2], DType::F32);
+        let next = graph.add(state, transient).unwrap();
+        let output = graph.square(next).unwrap();
+        let schedule = schedule_many(&graph, &[output, next]).unwrap();
+        let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output, next]).unwrap();
+        let adapter = FakeAdapter(Rc::new(RefCell::new(Calls::default())));
+        let link = StaticStateLink {
+            input: state.index() as u64,
+            output: next.index() as u64,
+        };
+        let plan = StaticSchedulePlan::build_with_output_policy(
+            &adapter,
+            &capture.items,
+            &[output.index() as u64],
+            &[output.index() as u64, next.index() as u64],
+            &[link],
+        )
+        .unwrap();
+        assert_eq!(plan.host_outputs(), &[output.index() as u64]);
+        assert_eq!(
+            plan.protected_outputs(),
+            &[output.index() as u64, next.index() as u64]
+        );
+        assert_ne!(
+            plan.allocations().logical_slots()[&(state.index() as u64)],
+            plan.allocations().logical_slots()[&(next.index() as u64)]
+        );
+        assert!(
+            StaticSchedulePlan::build_with_output_policy(
+                &adapter,
+                &capture.items,
+                &[next.index() as u64],
+                &[output.index() as u64, next.index() as u64],
+                &[link],
+            )
+            .is_err()
         );
     }
 

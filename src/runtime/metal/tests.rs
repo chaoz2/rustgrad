@@ -204,10 +204,11 @@ use crate::nn::{Linear, Module, Parameter, StateKind};
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedInference, CapturedMixedBatch, CapturedReplayExecutor,
-    CapturedSchedule, CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime,
-    Graph, IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, Mode, MovementKernelKind,
-    MovementValue, NodeId, Operation, ReduceKind, ResNet, ResNetConfig, Scalar, Shape, Slice,
-    Storage, TensorData, TypedValue, UType, schedule,
+    CapturedSchedule, CapturedStatefulInference, CompareOp, CpuBackend, CpuSession, DType,
+    EffectBatchStep, EffectRuntime, Graph, IndexValue, InferenceStateLink, KernelBindings,
+    KernelBufferDesc, LaneInstruction, Mode, MovementKernelKind, MovementValue, NodeId, Operation,
+    ReduceKind, ResNet, ResNetConfig, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UType,
+    schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -401,6 +402,135 @@ fn metal_device_session_reuses_residents_and_reports_exact_driver_activity() {
         );
     }
     assert_eq!(session.successful_run_count(), 2);
+}
+
+#[test]
+fn metal_stateful_inference_commits_only_after_public_projection_and_retries() {
+    let mut graph = Graph::new();
+    let state = graph.input_dtype("cache", [2], DType::F32);
+    let token = graph.input_dtype("token", [2], DType::F32);
+    let next = graph.add(state, token).unwrap();
+    let public = graph.square(next).unwrap();
+    let captured = CapturedStatefulInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[public, public],
+        &[InferenceStateLink::new(state, next)],
+        BTreeMap::from([(
+            "cache".into(),
+            TensorData::new([2], vec![1.0, 2.0]).unwrap(),
+        )]),
+    )
+    .unwrap();
+    let identity = captured.deployment_identity();
+    let plan =
+        MetalStatefulInferencePlan::new(captured, MetalRenderer::new(8, capabilities()).unwrap())
+            .unwrap();
+    assert_eq!(plan.deployment_identity(), identity);
+    assert_eq!(plan.state_inputs()[0].name, "cache");
+    assert_eq!(plan.summary().state_pair_count, 1);
+    assert_eq!(plan.summary().state_bank_count, 2);
+    assert_eq!(plan.summary().logical_state_bytes, 8);
+    assert_eq!(plan.summary().state_device_bytes, 16);
+    assert_eq!(plan.summary().requested_output_count, 2);
+    assert_eq!(plan.rendered_items().count(), 2);
+    assert_eq!(
+        plan.transient_inputs()
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>(),
+        ["token"]
+    );
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock.clone())).unwrap();
+    assert_eq!(session.preparation_report().initial_state_h2d_calls, 1);
+    assert_eq!(session.preparation_report().initial_state_h2d_bytes, 8);
+    assert!(!session.state_epoch());
+
+    let token = BTreeMap::from([(
+        "token".into(),
+        TensorData::new([2], vec![2.0, 3.0]).unwrap(),
+    )]);
+    mock.state.lock().unwrap().failures.read = Some("public read");
+    assert!(session.run(&token).is_err());
+    assert_eq!(session.successful_run_count(), 0);
+    assert!(!session.state_epoch());
+    mock.clear_failures();
+
+    let first = session.run(&token).unwrap();
+    assert_eq!(
+        first.outputs(),
+        &[
+            TensorData::new([2], vec![9.0, 25.0]).unwrap(),
+            TensorData::new([2], vec![9.0, 25.0]).unwrap(),
+        ]
+    );
+    assert_eq!(first.report().retained_d2h_calls, 1);
+    assert_eq!(first.report().committed_state_pair_count, 1);
+    assert_eq!(first.report().committed_state_bytes, 8);
+    assert!(session.state_epoch());
+
+    let second = session
+        .run(&BTreeMap::from([(
+            "token".into(),
+            TensorData::new([2], vec![1.0, 1.0]).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(
+        second.outputs()[0],
+        TensorData::new([2], vec![16.0, 36.0]).unwrap()
+    );
+    assert_eq!(session.successful_run_count(), 2);
+    assert!(!session.state_epoch());
+}
+
+#[test]
+fn metal_stateful_inference_zero_work_owns_no_native_resources() {
+    let mut graph = Graph::new();
+    let state = graph.input_dtype("empty_cache", [0], DType::F32);
+    let token = graph.input_dtype("empty_token", [0], DType::F32);
+    let next = graph.add(state, token).unwrap();
+    let captured = CapturedStatefulInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[token, token],
+        &[InferenceStateLink::new(state, next)],
+        BTreeMap::from([(
+            "empty_cache".into(),
+            TensorData::new([0], Vec::new()).unwrap(),
+        )]),
+    )
+    .unwrap();
+    let plan =
+        MetalStatefulInferencePlan::new(captured, MetalRenderer::new(8, capabilities()).unwrap())
+            .unwrap();
+    assert_eq!(plan.summary().state_pair_count, 1);
+    assert_eq!(plan.summary().logical_state_bytes, 0);
+    assert_eq!(plan.summary().state_bank_count, 2);
+    assert_eq!(plan.summary().state_device_bytes, 0);
+    assert_eq!(plan.summary().planned_device_bytes, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    assert_eq!(
+        mock.calls(),
+        vec!["devices".to_owned(), "device_release:2".to_owned()]
+    );
+    mock.clear_calls();
+    let mut session = plan.prepare(device).unwrap();
+    assert!(mock.calls().is_empty());
+    let run = session
+        .run(&BTreeMap::from([(
+            "empty_token".into(),
+            TensorData::new([0], Vec::new()).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(run.outputs().len(), 2);
+    assert_eq!(run.report().kernel_launch_count, 0);
+    assert_eq!(run.report().committed_state_pair_count, 1);
+    assert_eq!(run.report().committed_state_bytes, 0);
+    assert!(session.state_epoch());
+    assert!(mock.calls().is_empty());
 }
 
 #[test]

@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, rc::Rc};
 use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticBufferAllocation,
     StaticDeviceAdapter, StaticExecutionReport, StaticPlanAdapter, StaticRendered,
-    StaticRenderedBuffer, StaticSchedulePlan, bind_rendered_buffers,
+    StaticRenderedBuffer, StaticSchedulePlan, StaticStateLink, bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -183,6 +183,26 @@ impl MetalPrefixPlan {
         })
     }
 
+    pub(crate) fn plan_with_output_policy(
+        items: &[ScheduleItem],
+        host_outputs: &[u64],
+        protected_outputs: &[u64],
+        state_links: &[StaticStateLink],
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
+        let adapter = MetalStaticAdapter::planner(renderer.clone());
+        Ok(Self {
+            plan: StaticSchedulePlan::build_with_output_policy(
+                &adapter,
+                items,
+                host_outputs,
+                protected_outputs,
+                state_links,
+            )?,
+            renderer,
+        })
+    }
+
     pub fn cache_keys(&self) -> Vec<String> {
         self.plan.compiled_cache_keys()
     }
@@ -292,6 +312,14 @@ impl InitializedMetalPrefix {
         values: &mut BTreeMap<u64, TensorData>,
     ) -> Result<StaticExecutionReport, MetalError> {
         self.inner.execute(values)
+    }
+
+    pub(super) fn execute_stateful(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        alternate_state_bank: bool,
+    ) -> Result<StaticExecutionReport, MetalError> {
+        self.inner.execute_stateful(values, alternate_state_bank)
     }
 }
 

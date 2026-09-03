@@ -34,6 +34,7 @@ pub use scoreboard::{
 pub use session::{
     MetalDevicePreparationReport, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
     MetalDeviceSessionPlan, MetalDeviceSessionSummary, MetalInferencePlan,
+    MetalStatefulInferencePlan,
 };
 pub use transaction::{
     GuardedIntegerOp, METAL_INDEXED_MOVEMENT_ABI_VERSION, METAL_TRANSACTION_ABI_VERSION,

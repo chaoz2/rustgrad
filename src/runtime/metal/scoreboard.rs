@@ -410,7 +410,7 @@ impl MetalSessionScoreboard {
             declared_transient_input_bytes: self.plan_summary.transient_input_bytes,
             planning_wall_time: preparation.planning_wall_time,
             native_prepare_wall_time: preparation.native_prepare_wall_time,
-            resident_upload_host_wall_time: preparation.resident_upload_wall_time,
+            resident_upload_host_wall_time: preparation.initialization_upload_wall_time,
             first_run_host_wall_time,
             steady_run_host_wall_time_summary: wall_time_summary(&steady_run_host_wall_times),
             steady_run_host_wall_times,

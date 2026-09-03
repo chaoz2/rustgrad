@@ -4,7 +4,10 @@ use super::{
     MetalDevice, MetalDeviceInfo, MetalError, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix,
     RenderedMetal, prepared::InitializedMetalPrefix,
 };
-use crate::{CapturedInference, CapturedSchedule, ExecutionPlanSummary, ReplayInput, TensorData};
+use crate::{
+    CapturedInference, CapturedSchedule, CapturedStatefulInference, ExecutionPlanSummary,
+    ReplayInput, TensorData,
+};
 use std::{
     collections::BTreeMap,
     rc::Rc,
@@ -12,7 +15,7 @@ use std::{
 };
 
 use crate::runtime::static_schedule::{
-    CapturedStaticExecution, StaticExecutionReport, StaticLifetimePlan,
+    CapturedStaticExecution, StaticExecutionReport, StaticLifetimePlan, StaticStateLink,
 };
 
 /// Deterministic inspection metadata for one concrete Metal session plan.
@@ -49,6 +52,16 @@ pub struct MetalDeviceSessionSummary {
     pub rendered_cache_keys: Vec<String>,
     /// This strict path has no CPU fallback branch.
     pub fallback_count: usize,
+    /// Number of authenticated recurrent input/output pairs.
+    pub state_pair_count: usize,
+    /// Bytes in one logical recurrent-state bank.
+    pub logical_state_bytes: usize,
+    /// Logical epoch bank sets (zero or exactly two). Empty state remains
+    /// addressless and owns no physical allocation.
+    pub state_bank_count: usize,
+    /// Logical payload bytes represented by both epoch banks. Physical slot
+    /// bytes, including any sentinels, remain in `planned_device_bytes`.
+    pub state_device_bytes: usize,
 }
 
 /// Successful Metal preparation measurements. Durations are current-thread
@@ -59,8 +72,9 @@ pub struct MetalDevicePreparationReport {
     pub planning_wall_time: Duration,
     /// Host wall-clock duration of compilation, allocation, and queue setup.
     pub native_prepare_wall_time: Duration,
-    /// Host wall-clock duration of immutable host API writes.
-    pub resident_upload_wall_time: Duration,
+    /// Host wall-clock duration of immutable resident plus initial-state host
+    /// API writes.
+    pub initialization_upload_wall_time: Duration,
     /// Number of nonzero rendered kernels requested from the device cache.
     pub pipeline_cache_request_count: usize,
     /// Requests already present in this thread-confined device cache.
@@ -71,6 +85,10 @@ pub struct MetalDevicePreparationReport {
     pub resident_h2d_calls: usize,
     /// Host API write bytes, not claimed PCIe traffic.
     pub resident_h2d_bytes: usize,
+    /// One-time host API writes for initial recurrent state.
+    pub initial_state_h2d_calls: usize,
+    /// One-time initial recurrent-state bytes written.
+    pub initial_state_h2d_bytes: usize,
 }
 
 /// Successful per-invocation measurements. Failed invocations return no run
@@ -99,6 +117,10 @@ pub struct MetalDeviceRunReport {
     pub zero_item_count: usize,
     /// Logical outputs after ordered duplicate/alias projection.
     pub output_count: usize,
+    /// Recurrent pairs atomically committed by this successful invocation.
+    pub committed_state_pair_count: usize,
+    /// Logical recurrent bytes committed by the epoch flip.
+    pub committed_state_bytes: usize,
 }
 
 /// Detached ordered outputs plus the report committed for that successful run.
@@ -146,6 +168,95 @@ pub struct MetalInferencePlan {
     execution_plan: ExecutionPlanSummary,
     resident_bindings: BTreeMap<String, TensorData>,
     deployment_identity: u64,
+}
+
+/// Resource-free deployment of one authenticated fixed-state inference body.
+pub struct MetalStatefulInferencePlan {
+    inner: MetalDeviceSessionPlan,
+    execution_plan: ExecutionPlanSummary,
+    resident_bindings: BTreeMap<String, TensorData>,
+    initial_state: BTreeMap<String, TensorData>,
+    deployment_identity: u64,
+}
+
+impl MetalStatefulInferencePlan {
+    pub fn new(
+        inference: CapturedStatefulInference,
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
+        let (inference, public_output_count, states, initial_state, deployment_identity) =
+            inference.into_parts();
+        let (capture, execution_plan, resident_bindings, _) = inference.into_parts();
+        let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
+        let state_names = states
+            .iter()
+            .map(|state| state.input.name.clone())
+            .collect::<Vec<_>>();
+        let state_links = states
+            .iter()
+            .map(|state| StaticStateLink {
+                input: state.input.desc.id,
+                output: state.output.id,
+            })
+            .collect::<Vec<_>>();
+        let inner = MetalDeviceSessionPlan::from_capture_policy(
+            capture,
+            resident_names,
+            state_names,
+            public_output_count,
+            state_links,
+            renderer,
+        )?;
+        Ok(Self {
+            inner,
+            execution_plan,
+            resident_bindings,
+            initial_state,
+            deployment_identity,
+        })
+    }
+
+    pub const fn deployment_identity(&self) -> u64 {
+        self.deployment_identity
+    }
+
+    pub fn capture(&self) -> &CapturedSchedule {
+        self.inner.capture()
+    }
+
+    pub const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.execution_plan
+    }
+
+    pub fn summary(&self) -> &MetalDeviceSessionSummary {
+        self.inner.summary()
+    }
+
+    pub fn state_inputs(&self) -> &[ReplayInput] {
+        self.inner.state_inputs()
+    }
+
+    pub fn resident_inputs(&self) -> &[ReplayInput] {
+        self.inner.resident_inputs()
+    }
+
+    pub fn transient_inputs(&self) -> &[ReplayInput] {
+        self.inner.transient_inputs()
+    }
+
+    /// Returns every rendered item, including addressless zero-work items.
+    pub fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
+        self.inner.rendered_items()
+    }
+
+    pub fn prepare(self, device: MetalDevice) -> Result<MetalDeviceSession, MetalError> {
+        self.inner.prepare_with_state_and_deployment(
+            device,
+            self.resident_bindings,
+            self.initial_state,
+            Some(self.deployment_identity),
+        )
+    }
 }
 
 impl MetalInferencePlan {
@@ -201,9 +312,10 @@ impl MetalInferencePlan {
 
     /// Creates persistent resources and uploads the frozen residents once.
     pub fn prepare(self, device: MetalDevice) -> Result<MetalDeviceSession, MetalError> {
-        self.inner.prepare_with_deployment(
+        self.inner.prepare_with_state_and_deployment(
             device,
             self.resident_bindings,
+            BTreeMap::new(),
             Some(self.deployment_identity),
         )
     }
@@ -228,8 +340,26 @@ impl MetalDeviceSessionPlan {
         resident_input_names: impl IntoIterator<Item = String>,
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
+        let requested_count = capture.requested.len();
+        Self::from_capture_policy(
+            capture,
+            resident_input_names.into_iter().collect(),
+            Vec::new(),
+            requested_count,
+            Vec::new(),
+            renderer,
+        )
+    }
+
+    fn from_capture_policy(
+        capture: CapturedSchedule,
+        resident_input_names: Vec<String>,
+        state_input_names: Vec<String>,
+        public_output_count: usize,
+        state_links: Vec<StaticStateLink>,
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
         let planning_start = Instant::now();
-        let resident_input_names = resident_input_names.into_iter().collect::<Vec<_>>();
         let projection =
             CapturedStaticExecution::from_owned(capture).map_err(|error| match error {
                 crate::runtime::static_schedule::CapturedStaticAdmissionError::Invalid(reason) => {
@@ -239,11 +369,26 @@ impl MetalDeviceSessionPlan {
                     reason,
                 ) => MetalError::Unsupported(reason),
             })?;
-        let lifetime = StaticLifetimePlan::new(projection, &resident_input_names)
+        let host_outputs = projection
+            .retained_for_requested_prefix(public_output_count)
             .map_err(MetalError::InvalidBinding)?;
-        let prefix = MetalPrefixPlan::plan_for_outputs(
+        let mut protected_outputs = host_outputs.clone();
+        protected_outputs.extend(state_links.iter().map(|state| state.output));
+        let lifetime = if state_input_names.is_empty() {
+            StaticLifetimePlan::new(projection, &resident_input_names)
+        } else {
+            StaticLifetimePlan::new_with_state(
+                projection,
+                &resident_input_names,
+                &state_input_names,
+            )
+        }
+        .map_err(MetalError::InvalidBinding)?;
+        let prefix = MetalPrefixPlan::plan_with_output_policy(
             &lifetime.capture().items,
-            lifetime.retained(),
+            &host_outputs,
+            &protected_outputs,
+            &state_links,
             renderer.clone(),
         )?;
         let external_inputs = prefix
@@ -269,34 +414,41 @@ impl MetalDeviceSessionPlan {
                         .checked_add(value.to_le_bytes().map_err(|_| MetalError::Overflow)?.len())
                         .ok_or(MetalError::Overflow)
                 })?;
-        let resident = lifetime
-            .resident_names()
-            .collect::<std::collections::BTreeSet<_>>();
-        let resident_input_bytes = lifetime
-            .capture()
-            .inputs
-            .iter()
-            .filter(|input| resident.contains(input.name.as_str()))
-            .try_fold(0usize, |total, input| {
-                total
-                    .checked_add(input.desc.bytes)
-                    .ok_or(MetalError::Overflow)
-            })?;
-        let transient_input_bytes = lifetime
-            .capture()
-            .inputs
-            .iter()
-            .filter(|input| !resident.contains(input.name.as_str()))
-            .try_fold(0usize, |total, input| {
-                total
-                    .checked_add(input.desc.bytes)
-                    .ok_or(MetalError::Overflow)
-            })?;
+        let resident_input_bytes =
+            lifetime
+                .resident_inputs()
+                .iter()
+                .try_fold(0usize, |total, input| {
+                    total
+                        .checked_add(input.desc.bytes)
+                        .ok_or(MetalError::Overflow)
+                })?;
+        let transient_input_bytes =
+            lifetime
+                .transient_inputs()
+                .iter()
+                .try_fold(0usize, |total, input| {
+                    total
+                        .checked_add(input.desc.bytes)
+                        .ok_or(MetalError::Overflow)
+                })?;
+        let logical_state_bytes =
+            lifetime
+                .state_inputs()
+                .iter()
+                .try_fold(0usize, |total, input| {
+                    total
+                        .checked_add(input.desc.bytes)
+                        .ok_or(MetalError::Overflow)
+                })?;
+        let state_device_bytes = logical_state_bytes
+            .checked_mul(2)
+            .ok_or(MetalError::Overflow)?;
         let summary = MetalDeviceSessionSummary {
             capture_identity: lifetime.capture().identity,
             resident_input_names: lifetime.resident_names().map(str::to_owned).collect(),
             transient_input_names: lifetime.transient_names().map(str::to_owned).collect(),
-            requested_output_count: lifetime.capture().requested.len(),
+            requested_output_count: public_output_count,
             constant_count: lifetime.capture().constants.len(),
             constant_bytes,
             resident_input_bytes,
@@ -308,6 +460,10 @@ impl MetalDeviceSessionPlan {
             zero_item_count,
             rendered_cache_keys: prefix.cache_keys(),
             fallback_count: 0,
+            state_pair_count: state_links.len(),
+            logical_state_bytes,
+            state_bank_count: if state_links.is_empty() { 0 } else { 2 },
+            state_device_bytes,
         };
         let renderer_capabilities = renderer.capabilities.clone();
         Ok(Self {
@@ -328,6 +484,11 @@ impl MetalDeviceSessionPlan {
     /// Returns the typed resident named-input schemas.
     pub fn resident_inputs(&self) -> &[ReplayInput] {
         self.lifetime.resident_inputs()
+    }
+
+    /// Returns the fixed state inputs initialized during preparation.
+    pub fn state_inputs(&self) -> &[ReplayInput] {
+        self.lifetime.state_inputs()
     }
 
     /// Returns the typed per-invocation named-input schemas.
@@ -353,21 +514,25 @@ impl MetalDeviceSessionPlan {
         device: MetalDevice,
         resident_inputs: BTreeMap<String, TensorData>,
     ) -> Result<MetalDeviceSession, MetalError> {
-        self.prepare_with_deployment(device, resident_inputs, None)
+        self.prepare_with_state_and_deployment(device, resident_inputs, BTreeMap::new(), None)
     }
 
-    fn prepare_with_deployment(
+    fn prepare_with_state_and_deployment(
         self,
         device: MetalDevice,
         resident_inputs: BTreeMap<String, TensorData>,
+        initial_state: BTreeMap<String, TensorData>,
         inference_deployment_identity: Option<u64>,
     ) -> Result<MetalDeviceSession, MetalError> {
         // Value and capability validation precede cache, compilation,
         // allocation, queue creation, or upload.
-        let resident_values = self
-            .lifetime
-            .stage_resident(resident_inputs)
-            .map_err(MetalError::InvalidBinding)?;
+        let resident_values = if self.lifetime.state_inputs().is_empty() {
+            self.lifetime.stage_resident(resident_inputs)
+        } else {
+            self.lifetime
+                .stage_initialized(resident_inputs, initial_state)
+        }
+        .map_err(MetalError::InvalidBinding)?;
         if device.info().capabilities != self.renderer_capabilities {
             return Err(MetalError::InvalidBinding(
                 "Metal session renderer/device capability identity mismatch".into(),
@@ -407,21 +572,36 @@ impl MetalDeviceSessionPlan {
         let native_prepare_start = Instant::now();
         let prepared = PreparedMetalPrefix::from_plan(device.clone(), self.prefix)?;
         let native_prepare_wall_time = native_prepare_start.elapsed();
-        let resident_upload_start = Instant::now();
+        let initialization_upload_start = Instant::now();
         let (prepared, resident_transfer) =
             prepared.initialize_resident(&resident_values, &self.device_resident_ids)?;
-        let resident_upload_wall_time = resident_upload_start.elapsed();
+        let initialization_upload_wall_time = initialization_upload_start.elapsed();
+        let initial_state_h2d_calls = self
+            .lifetime
+            .state_inputs()
+            .iter()
+            .filter(|input| input.desc.bytes != 0)
+            .count();
         let preparation = MetalDevicePreparationReport {
             planning_wall_time: self.planning_wall_time,
             native_prepare_wall_time,
-            resident_upload_wall_time,
+            initialization_upload_wall_time,
             pipeline_cache_request_count,
             pipeline_cache_hit_count,
             pipeline_cache_miss_count,
-            resident_h2d_calls: resident_transfer.h2d_calls,
-            resident_h2d_bytes: resident_transfer.h2d_bytes,
+            resident_h2d_calls: resident_transfer
+                .h2d_calls
+                .checked_sub(initial_state_h2d_calls)
+                .ok_or(MetalError::Overflow)?,
+            resident_h2d_bytes: resident_transfer
+                .h2d_bytes
+                .checked_sub(self.summary.logical_state_bytes)
+                .ok_or(MetalError::Overflow)?,
+            initial_state_h2d_calls,
+            initial_state_h2d_bytes: self.summary.logical_state_bytes,
         };
         let resident_sources = self.lifetime.retain_projection_sources(resident_values);
+        let public_output_count = self.summary.requested_output_count;
         Ok(MetalDeviceSession {
             lifetime: self.lifetime,
             resident_sources,
@@ -431,6 +611,8 @@ impl MetalDeviceSessionPlan {
             device_info,
             device_owner_id,
             successful_runs: 0,
+            state_epoch: false,
+            public_output_count,
             session_token: Rc::new(()),
             inference_deployment_identity,
         })
@@ -447,6 +629,8 @@ pub struct MetalDeviceSession {
     device_info: MetalDeviceInfo,
     device_owner_id: u64,
     successful_runs: u64,
+    state_epoch: bool,
+    public_output_count: usize,
     session_token: Rc<()>,
     inference_deployment_identity: Option<u64>,
 }
@@ -460,6 +644,11 @@ impl MetalDeviceSession {
     /// Returns the typed resident named-input schemas.
     pub fn resident_inputs(&self) -> &[ReplayInput] {
         self.lifetime.resident_inputs()
+    }
+
+    /// Returns the fixed state inputs initialized during preparation.
+    pub fn state_inputs(&self) -> &[ReplayInput] {
+        self.lifetime.state_inputs()
     }
 
     /// Returns the typed per-invocation named-input schemas.
@@ -505,6 +694,11 @@ impl MetalDeviceSession {
         self.inference_deployment_identity
     }
 
+    /// False/true selects which authenticated state bank is currently active.
+    pub const fn state_epoch(&self) -> bool {
+        self.state_epoch
+    }
+
     /// Validates exact transient inputs, executes each nonzero schedule item
     /// with an individual Metal launch/wait, and returns only requested outputs.
     pub fn run(
@@ -521,12 +715,20 @@ impl MetalDeviceSession {
             .stage_transient(transient_inputs)
             .map_err(MetalError::InvalidBinding)?;
         let execute_start = Instant::now();
-        let transfer = self.prepared.execute(&mut values)?;
+        let transfer = if self.summary.state_pair_count == 0 {
+            self.prepared.execute(&mut values)?
+        } else {
+            self.prepared
+                .execute_stateful(&mut values, self.state_epoch)?
+        };
         let synchronous_transaction_wall_time = execute_start.elapsed();
-        let outputs = self
-            .lifetime
-            .project(&values, &self.resident_sources)
-            .map_err(MetalError::InvalidBinding)?;
+        let outputs = if self.summary.state_pair_count == 0 {
+            self.lifetime.project(&values, &self.resident_sources)
+        } else {
+            self.lifetime
+                .project_prefix(self.public_output_count, &values, &self.resident_sources)
+        }
+        .map_err(MetalError::InvalidBinding)?;
         let report = run_report(
             successful_invocation,
             run_start.elapsed(),
@@ -534,8 +736,15 @@ impl MetalDeviceSession {
             transfer,
             self.summary.zero_item_count,
             outputs.len(),
+            CommittedState {
+                pair_count: self.summary.state_pair_count,
+                bytes: self.summary.logical_state_bytes,
+            },
         );
         self.successful_runs = successful_invocation;
+        if self.summary.state_pair_count != 0 {
+            self.state_epoch = !self.state_epoch;
+        }
         Ok(MetalDeviceRun {
             outputs,
             report,
@@ -551,6 +760,7 @@ fn run_report(
     transfer: StaticExecutionReport,
     zero_item_count: usize,
     output_count: usize,
+    committed_state: CommittedState,
 ) -> MetalDeviceRunReport {
     MetalDeviceRunReport {
         successful_invocation,
@@ -564,5 +774,13 @@ fn run_report(
         kernel_launch_count: transfer.kernel_launches,
         zero_item_count,
         output_count,
+        committed_state_pair_count: committed_state.pair_count,
+        committed_state_bytes: committed_state.bytes,
     }
+}
+
+#[derive(Clone, Copy)]
+struct CommittedState {
+    pair_count: usize,
+    bytes: usize,
 }

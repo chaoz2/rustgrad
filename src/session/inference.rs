@@ -2,7 +2,7 @@
 use crate::nn::{Module, ModuleForward, Parameter, module_input_node_bindings};
 use crate::{
     Backend, CapturedReplayExecutor, CapturedReplayTrace, CapturedSchedule, CompileTrace,
-    CpuBackend, DType, Error, ExecutionPlanSummary, ExecutionPlanSummaryError, Graph, NodeId,
+    CpuBackend, DType, Error, ExecutionPlanSummary, ExecutionPlanSummaryError, Graph, NodeId, Op,
     ReplayError, ReplayInput, Result, Schedule, ScheduleError, TensorData, schedule, schedule_many,
 };
 use std::{
@@ -20,6 +20,46 @@ pub struct CapturedInference {
     execution_plan: ExecutionPlanSummary,
     resident_bindings: BTreeMap<String, TensorData>,
     transient_inputs: Vec<ReplayInput>,
+    identity: u64,
+}
+
+/// One fixed-shape recurrent value whose produced output becomes the input of
+/// the next successful inference invocation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InferenceStateLink {
+    input: NodeId,
+    output: NodeId,
+}
+
+impl InferenceStateLink {
+    pub const fn new(input: NodeId, output: NodeId) -> Self {
+        Self { input, output }
+    }
+
+    pub const fn input(self) -> NodeId {
+        self.input
+    }
+
+    pub const fn output(self) -> NodeId {
+        self.output
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedInferenceState {
+    pub(crate) link: InferenceStateLink,
+    pub(crate) input: ReplayInput,
+    pub(crate) output: crate::BufferDesc,
+}
+
+/// Resource-free authenticated capture with fixed-shape recurrent state.
+/// State outputs are private protected owners and are never public results.
+#[derive(Clone, Debug)]
+pub struct CapturedStatefulInference {
+    inference: CapturedInference,
+    public_output_count: usize,
+    states: Vec<CapturedInferenceState>,
+    initial_state: BTreeMap<String, TensorData>,
     identity: u64,
 }
 
@@ -132,6 +172,191 @@ impl CapturedInference {
             self.capture,
             self.execution_plan,
             self.resident_bindings,
+            self.identity,
+        )
+    }
+}
+
+impl CapturedStatefulInference {
+    pub fn from_module_graph(
+        module: &(impl Module + ?Sized),
+        graph: &Graph,
+        requested: &[NodeId],
+        state_links: &[InferenceStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        if state_links.is_empty() {
+            return Err(CapturedInferenceError::Binding(
+                "stateful inference requires at least one state link".into(),
+            ));
+        }
+        let public = requested.iter().copied().collect::<BTreeSet<_>>();
+        let mut state_nodes = BTreeSet::new();
+        let mut combined = requested.to_vec();
+        for link in state_links {
+            graph
+                .op(link.input)
+                .map_err(CapturedInferenceError::State)?;
+            graph
+                .op(link.output)
+                .map_err(CapturedInferenceError::State)?;
+            if link.input == link.output
+                || public.contains(&link.input)
+                || public.contains(&link.output)
+                || !state_nodes.insert(link.input)
+                || !state_nodes.insert(link.output)
+            {
+                return Err(CapturedInferenceError::Binding(
+                    "state links and public outputs must own distinct nodes".into(),
+                ));
+            }
+            combined.push(link.output);
+        }
+        let mut inference = CapturedInference::from_module_graph(module, graph, &combined)?;
+        let mut states = Vec::with_capacity(state_links.len());
+        let mut names = BTreeSet::new();
+        for link in state_links {
+            let Op::Input { name } = graph
+                .op(link.input)
+                .map_err(CapturedInferenceError::State)?
+            else {
+                return Err(CapturedInferenceError::Binding(
+                    "state input must be a graph Input".into(),
+                ));
+            };
+            if !names.insert(name.as_str()) || inference.resident_bindings.contains_key(name) {
+                return Err(CapturedInferenceError::Binding(
+                    "state input name aliases another owned binding".into(),
+                ));
+            }
+            let input = inference
+                .capture
+                .inputs
+                .iter()
+                .find(|input| input.node == link.input && input.name == *name)
+                .cloned()
+                .ok_or_else(|| {
+                    CapturedInferenceError::Binding(
+                        "state input is absent from captured input ownership".into(),
+                    )
+                })?;
+            let output = inference
+                .capture
+                .items
+                .iter()
+                .flat_map(|item| item.outputs.iter())
+                .find(|output| output.id == link.output.index() as u64)
+                .cloned()
+                .ok_or_else(|| {
+                    CapturedInferenceError::Binding(
+                        "state output must be a directly produced capture owner".into(),
+                    )
+                })?;
+            if output.view.is_some()
+                || output.read_only
+                || input.desc.view.is_some()
+                || input.desc.shape != output.shape
+                || input.desc.dtype != output.dtype
+                || input.desc.bytes != output.bytes
+                || input.desc.alignment != output.alignment
+            {
+                return Err(CapturedInferenceError::Binding(
+                    "state input/output descriptors are not exact full-buffer peers".into(),
+                ));
+            }
+            let initial = initial_state.get(name).ok_or_else(|| {
+                CapturedInferenceError::Binding(format!("missing initial state {name}"))
+            })?;
+            validate_captured_inference_binding(&input, link.input, initial)?;
+            states.push(CapturedInferenceState {
+                link: *link,
+                input,
+                output,
+            });
+        }
+        if let Some(extra) = initial_state
+            .keys()
+            .find(|name| !names.contains(name.as_str()))
+        {
+            return Err(CapturedInferenceError::Binding(format!(
+                "unexpected initial state {extra}"
+            )));
+        }
+        inference
+            .transient_inputs
+            .retain(|input| !state_nodes.contains(&input.node));
+
+        let mut hasher = DefaultHasher::new();
+        "rustgrad-captured-stateful-inference-v1".hash(&mut hasher);
+        inference.identity.hash(&mut hasher);
+        requested.len().hash(&mut hasher);
+        for state in &states {
+            state.link.hash(&mut hasher);
+            state.input.hash(&mut hasher);
+            state.output.hash(&mut hasher);
+            initial_state[&state.input.name]
+                .to_le_bytes()
+                .map_err(CapturedInferenceError::State)?
+                .hash(&mut hasher);
+        }
+        let identity = hasher.finish();
+        Ok(Self {
+            inference,
+            public_output_count: requested.len(),
+            states,
+            initial_state,
+            identity,
+        })
+    }
+
+    pub const fn deployment_identity(&self) -> u64 {
+        self.identity
+    }
+
+    pub const fn capture(&self) -> &CapturedSchedule {
+        &self.inference.capture
+    }
+
+    pub const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.inference.execution_plan
+    }
+
+    /// Returns the ordered public-request prefix; state outputs follow it only
+    /// in the private authenticated capture inventory.
+    pub const fn public_output_count(&self) -> usize {
+        self.public_output_count
+    }
+
+    pub fn resident_bindings(&self) -> &BTreeMap<String, TensorData> {
+        &self.inference.resident_bindings
+    }
+
+    pub fn initial_state(&self) -> &BTreeMap<String, TensorData> {
+        &self.initial_state
+    }
+
+    pub fn transient_inputs(&self) -> &[ReplayInput] {
+        &self.inference.transient_inputs
+    }
+
+    pub fn state_links(&self) -> impl ExactSizeIterator<Item = InferenceStateLink> + '_ {
+        self.states.iter().map(|state| state.link)
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CapturedInference,
+        usize,
+        Vec<CapturedInferenceState>,
+        BTreeMap<String, TensorData>,
+        u64,
+    ) {
+        (
+            self.inference,
+            self.public_output_count,
+            self.states,
+            self.initial_state,
             self.identity,
         )
     }
@@ -663,6 +888,86 @@ mod tests {
         assert_ne!(changed.capture().identity, capture_identity);
         assert_ne!(changed.deployment_identity(), deployment_identity);
         assert_eq!(changed.execution_plan(), inference.execution_plan());
+    }
+
+    #[test]
+    fn stateful_capture_authenticates_distinct_full_buffer_pairs_before_publication() {
+        let module = Sequential::default();
+        let mut graph = Graph::new();
+        let state = graph.input_dtype("state", [2], DType::F32);
+        let transient = graph.input_dtype("transient", [2], DType::F32);
+        let next = graph.add(state, transient).unwrap();
+        let public = graph.square(next).unwrap();
+        let initial = BTreeMap::from([(
+            "state".into(),
+            TensorData::new([2], vec![0.0, 1.0]).unwrap(),
+        )]);
+        let count = graph.node_count();
+        let captured = CapturedStatefulInference::from_module_graph(
+            &module,
+            &graph,
+            &[public],
+            &[InferenceStateLink::new(state, next)],
+            initial.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            captured.capture().requested,
+            [public, next].map(|id| id.index() as u64)
+        );
+        assert_eq!(captured.transient_inputs()[0].name, "transient");
+        assert_eq!(
+            captured.state_links().collect::<Vec<_>>(),
+            [InferenceStateLink::new(state, next)]
+        );
+        let changed = CapturedStatefulInference::from_module_graph(
+            &module,
+            &graph,
+            &[public],
+            &[InferenceStateLink::new(state, next)],
+            BTreeMap::from([(
+                "state".into(),
+                TensorData::new([2], vec![0.0, 2.0]).unwrap(),
+            )]),
+        )
+        .unwrap();
+        assert_ne!(
+            captured.deployment_identity(),
+            changed.deployment_identity()
+        );
+        assert_eq!(graph.node_count(), count);
+
+        assert!(matches!(
+            CapturedStatefulInference::from_module_graph(
+                &module,
+                &graph,
+                &[next],
+                &[InferenceStateLink::new(state, next)],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        assert!(matches!(
+            CapturedStatefulInference::from_module_graph(
+                &module,
+                &graph,
+                &[public],
+                &[InferenceStateLink::new(state, transient)],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        assert!(matches!(
+            CapturedStatefulInference::from_module_graph(
+                &module,
+                &graph,
+                &[public],
+                &[InferenceStateLink::new(state, next)],
+                BTreeMap::from([("state".into(), TensorData::scalar(0.0))]),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        assert_eq!(graph.node_count(), count);
     }
 
     #[test]
