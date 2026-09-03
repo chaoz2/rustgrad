@@ -187,10 +187,12 @@ fn captured_scalar_host_gather_rejects_ambiguous_transformed_and_public_indices(
     let first = ambiguous.gather(table, indices, 0).unwrap();
     let second = ambiguous.gather(table, indices, 0).unwrap();
     let output = ambiguous.add(first, second).unwrap();
+    // Sharing one scalar index producer across two Gather owners violates the
+    // authenticated sole-consumer lineage, so neither owner is admissible.
     assert!(matches!(
         capture(&ambiguous, output).with_authenticated_host_gathers(&["token"]),
         Err(crate::CapturedInferenceError::Binding(reason))
-            if reason.contains("2 authenticated internal owners")
+            if reason.contains("0 authenticated internal owners")
     ));
 
     let mut transformed = Graph::new();

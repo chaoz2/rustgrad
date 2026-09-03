@@ -19,6 +19,7 @@ mod conversation;
 mod decoder;
 mod generation;
 mod layer;
+mod metal_step;
 mod model;
 mod native;
 mod native_generation;
@@ -39,6 +40,9 @@ pub use decoder::{
     LlamaDecoder, LlamaDecoderConfig, LlamaDecoderError, LlamaForwardOutput, LlamaForwardPlan,
 };
 pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, LlamaSampling};
+pub use metal_step::{
+    LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
+};
 pub use model::{
     LlamaLinearWeight, LlamaModel, LlamaModelCache, LlamaModelConfig, LlamaModelError,
     LlamaModelPlan, LlamaModelState, LlamaQkNorm, LlamaTokenIds,
@@ -368,7 +372,7 @@ fn validate_tensor(
 #[cfg(test)]
 mod decoder_tests;
 #[cfg(test)]
-mod model_tests;
+pub(crate) mod model_tests;
 #[cfg(test)]
 mod tests;
 

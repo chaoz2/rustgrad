@@ -218,7 +218,7 @@ fn metadata(context: u32) -> Vec<(&'static str, Metadata<'static>)> {
     ]
 }
 
-pub(super) fn make_model(
+pub(crate) fn make_model(
     context: u32,
 ) -> (LlamaModel, SimpleTokenizer, BTreeMap<String, TensorData>) {
     let state = fixed_state();
@@ -228,7 +228,15 @@ pub(super) fn make_model(
     (model, tokenizer, state)
 }
 
-pub(super) fn make_variant_model(
+pub(super) fn make_explicit_model(context: u32) -> LlamaModel {
+    let mut state = fixed_state();
+    state.insert(OUTPUT_WEIGHT.to_owned(), tensor(&[VOCAB, DIM], 37, 0.013));
+    let bytes = fixture(&state, &metadata(context));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    LlamaModel::from_gguf(&file).unwrap().0
+}
+
+pub(crate) fn make_variant_model(
     context: u32,
 ) -> (LlamaModel, SimpleTokenizer, BTreeMap<String, TensorData>) {
     make_variant_model_with_state_delta(context, 0.0)

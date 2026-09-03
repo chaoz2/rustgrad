@@ -180,39 +180,65 @@ impl CapturedInference {
         graph: &Graph,
         requested: &[NodeId],
     ) -> std::result::Result<Self, CapturedInferenceError> {
+        let module_bindings = module_input_node_bindings(module, graph)
+            .map_err(CapturedInferenceError::State)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        Self::from_graph_residents_impl(graph, requested, module_bindings, false)
+    }
+
+    /// Captures an exact graph-owned resident inventory. Unlike module
+    /// traversal, this internal model-composition seam requires every
+    /// declared name/node/value triple to remain an input of the capture.
+    pub(crate) fn from_graph_residents(
+        graph: &Graph,
+        requested: &[NodeId],
+        residents: BTreeMap<String, (NodeId, TensorData)>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        Self::from_graph_residents_impl(graph, requested, residents, true)
+    }
+
+    fn from_graph_residents_impl(
+        graph: &Graph,
+        requested: &[NodeId],
+        mut residents: BTreeMap<String, (NodeId, TensorData)>,
+        require_complete_inventory: bool,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
         let schedule = schedule_many(graph, requested).map_err(CapturedInferenceError::Schedule)?;
         let capture = CapturedSchedule::capture(graph, &schedule, requested)
             .map_err(CapturedInferenceError::Capture)?;
         let execution_plan = ExecutionPlanSummary::from_capture(&capture, true)
             .map_err(CapturedInferenceError::Summary)?;
-        let mut module_bindings = module_input_node_bindings(module, graph)
-            .map_err(CapturedInferenceError::State)?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        let capture_names = capture
-            .inputs
-            .iter()
-            .map(|input| input.name.as_str())
-            .collect::<BTreeSet<_>>();
-        module_bindings.retain(|name, _| capture_names.contains(name.as_str()));
 
         let mut resident_bindings = BTreeMap::new();
         let mut transient_inputs = Vec::new();
         for input in &capture.inputs {
-            let Some((node, _)) = module_bindings.get(&input.name) else {
+            let Some((node, _)) = residents.get(&input.name) else {
                 transient_inputs.push(input.clone());
                 continue;
             };
             let node = *node;
             if node != input.node || input.desc.id != node.index() as u64 {
+                if require_complete_inventory {
+                    return Err(CapturedInferenceError::Binding(format!(
+                        "resident input {} node identity mismatch",
+                        input.name
+                    )));
+                }
                 transient_inputs.push(input.clone());
                 continue;
             }
-            let (_, value) = module_bindings
+            let (_, value) = residents
                 .remove(&input.name)
-                .expect("checked module input binding exists");
+                .expect("checked resident input binding exists");
             validate_captured_inference_binding(input, node, &value)?;
             resident_bindings.insert(input.name.clone(), value);
+        }
+        if require_complete_inventory && let Some((name, _)) = residents.first_key_value() {
+            return Err(CapturedInferenceError::Binding(format!(
+                "resident input {name} is absent from captured ownership"
+            )));
         }
         let identity = captured_inference_identity(&capture, &resident_bindings)?;
         Ok(Self {
@@ -573,6 +599,24 @@ impl CapturedAppendStateInference {
             initial_state,
             &[],
             |combined| CapturedInference::from_module_graph(module, graph, combined),
+        )
+    }
+
+    pub(crate) fn from_graph_residents(
+        graph: &Graph,
+        requested: &[NodeId],
+        state_links: &[InferenceAppendStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+        residents: BTreeMap<String, (NodeId, TensorData)>,
+        host_gathers: &[&str],
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        Self::from_graph_with_capture(
+            graph,
+            requested,
+            state_links,
+            initial_state,
+            host_gathers,
+            |combined| CapturedInference::from_graph_residents(graph, combined, residents),
         )
     }
 
@@ -1852,6 +1896,46 @@ mod tests {
         );
         assert_eq!(inference.execution_plan().schedule_item_count, 0);
         assert_eq!(inference.execution_plan().requested_outputs.len(), 2);
+    }
+
+    #[test]
+    fn explicit_resident_capture_requires_exact_nodes_and_complete_ownership() {
+        let mut graph = Graph::new();
+        let resident = graph.input_dtype("resident", [2], DType::F32);
+        let collision = graph.input_dtype("resident", [2], DType::F32);
+        let transient = graph.input_dtype("transient", [2], DType::F32);
+        let output = graph.add(resident, transient).unwrap();
+        let value = TensorData::new([2], vec![1.0, 2.0]).unwrap();
+        let captured = CapturedInference::from_graph_residents(
+            &graph,
+            &[output],
+            BTreeMap::from([("resident".into(), (resident, value.clone()))]),
+        )
+        .unwrap();
+        assert_eq!(captured.resident_bindings()["resident"], value);
+        assert_eq!(captured.transient_inputs()[0].name, "transient");
+
+        assert!(matches!(
+            CapturedInference::from_graph_residents(
+                &graph,
+                &[output],
+                BTreeMap::from([("resident".into(), (collision, value.clone()))]),
+            ),
+            Err(CapturedInferenceError::Binding(reason))
+                if reason.contains("node identity mismatch")
+        ));
+        assert!(matches!(
+            CapturedInference::from_graph_residents(
+                &graph,
+                &[output],
+                BTreeMap::from([
+                    ("resident".into(), (resident, value.clone())),
+                    ("unused".into(), (collision, value)),
+                ]),
+            ),
+            Err(CapturedInferenceError::Binding(reason))
+                if reason.contains("absent from captured ownership")
+        ));
     }
 
     #[test]

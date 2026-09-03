@@ -187,6 +187,9 @@ pub use memory_space::{
     PromotionDecision, RegisterBinding, SpaceAllocation, plan_tensor_core_matmul_promotion,
     plan_tiled_matmul_promotion,
 };
+pub use models::transformer::{
+    LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
+};
 pub use movement_plan::{
     MovementExecutionError, MovementKernelKind, MovementKernelPlan, MovementOperand,
     MovementPlanError,

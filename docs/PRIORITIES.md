@@ -94,15 +94,16 @@ Candle workload.
 
 ### 3. P0 — device-resident GGUF Llama prefill/KV/decode
 
-Extend the same authenticated ownership model to immutable GGUF weights and
-the released fixed-capacity append-state foundation: one exclusively owned
-physical KV bank, one host-validated monotonic I32 position, sparse complete-row
-updates, and same-capture downstream reads. The model wrapper must expand its
-scalar position into the dedicated authenticated row-shaped index and enforce
-their equality. Remaining acceptance wires bounded
-prefill and repeated decode to that policy, proves output agreement and no
-hidden host fallback, and adds resident-memory/transfer accounting to the live
-scoreboard evidence.
+The dense F32 fixed-batch-one token body now binds exact immutable GGUF weights
+to the released append-state foundation: one exclusively owned physical KV
+bank per tensor, one host-validated monotonic I32 position, sparse complete-row
+updates, and same-capture downstream reads. Its scalar model position and every
+lane of the dedicated row-shaped append index derive from that one committed
+position. Capture-authenticated scalar embedding and RoPE lookup now removes
+the checked-Gather status/candidate path. Remaining work adds bounded prefill
+and tokenizer/generator integration, proves live-device output
+agreement, and adds stateful resident-memory/transfer accounting to scoreboard
+evidence.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 
