@@ -64,6 +64,14 @@ exact session's successful prefix with first/ordered steady host-wall samples
 and deterministic plan/cache/copy/launch JSON; it is measurement plumbing, not
 live workload evidence or GPU timing.
 
+An exact ignored Linear acceptance and a manual-only exact-SHA workflow are
+checked in for `[self-hosted, macOS, ARM64, rustgrad-metal]` behind the
+`live-metal` environment. That lane is dormant until the matching runner and
+protected environment, including reviewers and deployment-ref restrictions,
+are provisioned; the repository workflow only references those external
+controls. Ordinary macOS CI remains mock-only and no live-device result is
+claimed by the workflow definition itself.
+
 ### 2. P0 — ResNet-18 Metal conformance
 
 Run that already authenticated public graph on the Apple M5, closing only

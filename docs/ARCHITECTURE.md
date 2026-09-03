@@ -2600,6 +2600,22 @@ discovery step returns a device. `MetalRuntime::device(index)` is the concise
 selection seam over that same ordered inventory; an absent inventory remains
 `NoDevices`, while an out-of-range nonempty selection is an invalid argument.
 
+`tests/metal_live.rs` is the exact ignored public-API hardware acceptance for
+this boundary. The manual-only `metal-live.yml` workflow requires a caller-
+supplied lowercase full commit SHA, verifies that the checkout matches it, and
+targets `[self-hosted, macOS, ARM64, rustgrad-metal]` behind the protected
+`live-metal` environment. Before checkout it requires the dispatch
+`GITHUB_SHA` to equal that expected revision, then authenticates `HEAD` again
+after checkout. The repository workflow only names the environment;
+provisioning must configure its reviewers and deployment-ref restrictions. It
+treats `NoDevices` as failure, prepares one fixed Linear deployment once,
+checks two distinct invocations byte-for-byte against the CPU oracle, proves
+resident schemas and compiled cache identities remain stable with no run-time
+resident upload or fallback, and uploads deterministic scoreboard JSON. The
+workflow has no push or pull-request trigger. No matching runner or environment
+is currently provisioned, so this lane is dormant and its presence is not
+live-device evidence.
+
 `runtime/metal/mod.rs` is the facade for the first Apple Metal execution
 boundary. `ffi.rs` dynamically loads the Objective-C runtime, CoreGraphics, and
 Metal frameworks on macOS; RustGrad therefore needs neither Apple SDK headers
