@@ -19,6 +19,7 @@ mod conversation;
 mod decoder;
 mod generation;
 mod layer;
+mod metal_generation;
 mod metal_step;
 mod model;
 mod native;
@@ -40,6 +41,10 @@ pub use decoder::{
     LlamaDecoder, LlamaDecoderConfig, LlamaDecoderError, LlamaForwardOutput, LlamaForwardPlan,
 };
 pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, LlamaSampling};
+pub use metal_generation::{
+    LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage, LlamaMetalPlan,
+    LlamaMetalPrefill, LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalSession,
+};
 pub use metal_step::{
     LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
     LlamaMetalTokenCommit,
@@ -387,6 +392,8 @@ mod native_tests;
 #[cfg(test)]
 mod packed_tests;
 #[cfg(test)]
-pub(crate) use packed_tests::models as packed_metal_fixture_models;
+pub(crate) use packed_tests::{
+    models as packed_metal_fixture_models, packed_workflow_bytes as packed_metal_workflow_bytes,
+};
 #[cfg(test)]
 mod workflow_tests;

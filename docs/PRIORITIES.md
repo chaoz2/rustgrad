@@ -93,7 +93,7 @@ Provision the protected Apple-GPU lane and run the checked-in exact-SHA
 acceptance, closing only demonstrated live renderer/runtime gaps. Required
 evidence is full CPU-oracle output agreement, zero fallback, stable resident
 weights and intermediates, inspectable kernels/memory/transfers, and the
-checked-in v3 compile/prepare/first-run/ordered-steady reporting with host-wall
+checked-in v4 compile/prepare/first-run/ordered-steady reporting with host-wall
 versus device evidence labeled exactly. Benchmark comparisons target the
 equivalent tinygrad and Candle workload.
 
@@ -113,9 +113,12 @@ host-preflighted I32 lookup indices, and versioned F32-accumulating MSL. This
 is now wired through the model token body for packed embedding, q/k/v/o,
 gated-FFN, and explicit or tied output projections, including mixed
 dense/packed models. Sequential T=1 calls reuse one compiled/resident session.
-Remaining work adds chunk/final-only prefill and tokenizer/generator integration,
-proves live-device output agreement, and adds stateful
-resident-memory/transfer accounting to scoreboard evidence.
+The typed model facade now consumes the same GGUF-bound model, tokenizer, and
+chat template, prepares one persistent Metal session, suppresses intermediate
+prefill logits, and provides sequential T=1 ID/text/chat generation with host
+sampling. Remaining work adds chunk prefill, proves live-device output
+agreement, and adds a model-level adapter for the existing stateful
+resident-memory/transfer scoreboard evidence.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 

@@ -22,6 +22,10 @@ pub struct LlamaPromptWorkflow {
 }
 
 impl LlamaPromptWorkflow {
+    pub(crate) fn into_parts(self) -> (LlamaModel, SimpleTokenizer, LlamaChatTemplate) {
+        (self.model, self.tokenizer, self.chat_template)
+    }
+
     /// Parses and validates one bounded in-memory GGUF before binding the
     /// fixed supported Llama schema, tokenizer, and chat template.
     pub fn from_gguf_bytes(bytes: &[u8]) -> Result<Self, LlamaPromptWorkflowError> {
